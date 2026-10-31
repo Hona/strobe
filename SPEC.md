@@ -18,9 +18,9 @@ When a design change is agreed, update this file in the same change.
 2. **Measure the app, not strobe.** Low overhead first: no helper process where an OS API or a
    file read works; no polling where an event exists; budgets in §19 hold. strobe's own CPU, GPU
    and memory are a track in every recording.
-3. **Timing and attribution never share a round.** Profilers, heap snapshots, allocation
+3. **Timing and attribution never share a block.** Profilers, heap snapshots, allocation
    sampling, coverage, counters and instrumented builds change timing. They run in attribution
-   rounds only (§8.1). A recording that mixes them is marked `mixed`, and its timing metrics
+   blocks only (§8.1). A recording that mixes them is marked `mixed`, and its timing metrics
    are labelled `perturbed`.
 4. **One primary metric per experiment**, declared before the run. Secondary metrics get a
    verdict only through the gate in §9.3; otherwise they are descriptive.
@@ -42,7 +42,10 @@ When a design change is agreed, update this file in the same change.
 11. **One-time setup does every privileged step.** `strobe up` asks for the one UAC or sudo it
     needs. After that nothing prompts; `status` only reports problems.
 12. **Rust stable, pragmatic dependencies.** Well-known crates are fine. Each dependency has a
-    one-line reason in `Cargo.toml`. The budgets in §19 decide, not taste.
+    one-line reason in `Cargo.toml`. The budgets in §19 decide, not taste. No crate that needs a
+    C compiler: every device builds with the plain Rust toolchain (adais has no C toolchain).
+    One-time downloads shell out to `curl` (built into Windows 10+, macOS and Linux) instead of
+    linking TLS.
 13. **No backwards compatibility while pre-1.0.** Breaking changes are fine. No migration code.
 
 ## 2. Invariants
@@ -65,13 +68,16 @@ locations, not only PATH.
 | probe | One source of data: trace categories, CPU sampler, OS sampler, heap census, … (§8.1) |
 | probe set | Named group of probes: `timing`, `attribution`, `memory`, `deep` |
 | recording | Everything one capture produced, addressed by a handle `rec_…` |
+| experiment | One `bench` invocation, addressed by `exp_…` |
 | variant | One side of an experiment: a git ref, a directory, an installed app |
-| scenario | Scripted input: setup, a repeatable iteration, teardown (§9.6) |
-| phase | A named span inside an iteration, such as `scroll down` |
-| launch | One fresh start of the target process |
-| iteration | One run of the scenario's iteration inside a launch |
-| pair | One base iteration and one head iteration, adjacent in time; order alternates |
-| round | A set of pairs with one probe set: `timing` or `attribution` |
+| bench file | A `.bench.ts` file: targets, params, setup and cases (§9.6) |
+| case | One entry in a bench file's `cases`, with its `run` function |
+| series | One case × target × params combination: the unit that gets a verdict |
+| run | One call of a case's `run` (BenchmarkDotNet's iteration) |
+| phase | A named span inside a run, such as `down` |
+| block | One fresh launch of one variant: prepare, setup, warmup runs, measured runs, close |
+| pair | Two adjacent blocks of different variants; order alternates A B, B A |
+| timing / attribution block | A block with the `timing` probe set, or with profilers (§8.1) |
 | primary | The metric the experiment is about, declared before the run |
 | verdict | `faster`/`slower` (or `less`/`more`, `fewer`/`more`), `same`, `unclear`, `underpowered`, `refused` |
 | validator | A check that refuses a run (§10.1) |
@@ -90,7 +96,8 @@ Cargo.toml  build.rs
 src/            one package: lib + bins strobe, strobew (Windows windowless); §4.3
 viewer/         Solid + canvas viewer, built into src/ui/dist and embedded
 calibration/    the known-cost page (static), embedded
-sdk/            TypeScript: @strobe/web, @strobe/playwright, @strobe/electron (one Bun workspace)
+sdk/            TypeScript: @strobe/bench, @strobe/web, @strobe/electron, @strobe/playwright
+                (one Bun workspace)
 skill/SKILL.md  the built-in skill, embedded (include_str!)
 schema/         strobe.v1.json (project config), result.v1.json, bridge.v1.json
 install.sh  install.ps1
@@ -106,7 +113,7 @@ State dir: `~/.local/share/strobe/` (respect `XDG_DATA_HOME`) on Linux and macOS
 ```
 state.json          { "mcp_port", "helper", "engine", "last_calibration" }
 mcp-token           MCP bearer token, user-only
-results.db          SQLite: runs, rounds, metric values, verdicts, warnings, environments
+experiments/<exp>/  result.json per experiment; index.jsonl lists them (§14.2)
 recordings/<rec>/   §14.1
 builds/<key>/       variant build cache (§9.5)
 symbols/            source maps by debug ID, PDB cache
@@ -133,7 +140,8 @@ target/         finding and driving targets → chromium.rs (CDP), bridge.rs, in
 probe/          collecting → trace.rs, cpu.rs, heap.rs, census.rs, coverage.rs,
                 os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs, helper.rs
 engine/         trace_processor: the only place that runs it (§15)
-store/          results.db and recordings/: the only place that writes them (§14)
+store/          experiments/ and recordings/: the only place that writes them (§14)
+runner/         the bench runner link: spawns `bun`, speaks the runner protocol (§9.6)
 stats/          paired tests, intervals, modes, power, multiplicity (§9.3)
 validity/       validators, analysers, calibration, A/A (§10)
 symbol/         source maps, packages, owners, PDBs (§12)
@@ -238,14 +246,15 @@ engine, attachable targets (running apps and their bridge state, CDP endpoints f
 ### 5.5 `strobe record`
 
 ```
-strobe record <target> [--probes <set|list>] [--for <duration> | --scenario <name|file>]
+strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#<case>]
                        [--ring <duration>] [--pin] [--name <text>] [--json]
 ```
 
 - One recording; returns its handle, validity and a summary.
 - Default probe set: `timing`. `--probes attribution,memory` and friends per §8.1.
-- `--for` records for a duration; `--scenario` runs one scenario launch; neither: until Enter
-  (CLI) or `timeout` (MCP).
+- `--for` records for a duration; `--bench` runs one block of one case (the target comes from
+  the bench file when `<target>` names one of its targets); neither: until Enter (CLI) or
+  `timeout` (MCP).
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
@@ -253,25 +262,28 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --scenario <nam
 ### 5.6 `strobe bench`
 
 ```
-strobe bench <scenario> --head <variant> [--base <variant>] [--target <target>]
-             [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--launches <n>]
+strobe bench <file.bench.ts> --head <variant> [--base <variant>]
+             [--filter <case glob>] [--target <name>] [--params <k=v,...>]
+             [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--require-verdict] [--json]
 ```
 
-With `--base`: the A/B pipeline in §9. Without it: `--aa` runs `--head` against itself
-(§10.4), and `--probes memory --repeat <n>` is a leak run (§8.6). Variants are described in
-§9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
+Every series in the file (case × target × params, narrowed by `--filter`, `--target` and
+`--params`) gets its own verdict. With `--base`: the A/B pipeline in §9. Without it: `--aa`
+runs `--head` against itself (§10.4), and `--probes memory --repeat <n>` is a leak run (§8.6).
+`--runs` is the measured runs per block (default 5). Variants are described in §9.5. `--bisect`
+walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
 
 Text output (a full example):
 
 ```
-strobe bench timeline.scroll   base origin/dev@8b4d98c   head lazy-tooltip@98acaa3
+strobe bench timeline.bench.ts · scroll · desktop · turns=200   base origin/dev@8b4d98c   head lazy-tooltip@98acaa3
 env    Windows 11 26100 · Ryzen 9 9950X3D 16C/32T · RTX 5070 Ti
        OpenCode desktop Stable (bridge) · window 1600×1000 @1.5x · display 144 Hz
 plan   pinned CCD0 (V-Cache) · power plan High performance (restored) · visible, unoccluded
-run    warmup 3 (steady after 2) · 3 launches × 8 pairs · stopped: primary decided
+blocks 8 pairs (16 fresh launches) · warmup until steady · 5 runs per block · stopped: primary decided
 probes timing: frames, toplevel threads, os, gpu · overhead 0.6% main thread
 
 metric                         base       head       Δ        95% CI           verdict
@@ -286,24 +298,24 @@ metric                         base       head       Δ        95% CI           
 
 warnings
 ! MultimodalDistribution  main.script.self: 2 modes (mValue 3.4) before pinning; pinned run is unimodal
-! Background              round 5: MsMpEng.exe 31% on CPU 28–29 for 320 ms; round kept, flagged
-i Attribution             separate rounds: hotspots, allocation sites, counters → rec_91c0
+! Background              block 5: MsMpEng.exe 31% on CPU 28–29 for 320 ms; block kept, flagged
+i Attribution             separate blocks: hotspots, allocation sites, counters → rec_91c0
 ```
 
 ### 5.7 `strobe query`
 
 ```
-strobe query <handle | a..b | run_…> <view> [view arguments] [--top <n>] [--max-bytes <n>] [--json]
+strobe query <handle | a..b | exp_…> <view> [view arguments] [--top <n>] [--max-bytes <n>] [--json]
 strobe query <handle> sql "<query>"
 ```
 
-Views in §11.1. `a..b` compares two recordings. `run_…` reads a bench run, including one still
-running (`progress`).
+Views in §11.1. `a..b` compares two recordings. `exp_…` reads an experiment, including one
+still running (`progress`).
 
 ### 5.8 `strobe report`
 
 ```
-strobe report <view> <handle | run_…>… [--format md|html] [--out <path>] [--open] [--json]
+strobe report <view> <handle | exp_…>… [--format md|html] [--out <path>] [--open] [--json]
 ```
 
 Writes a self-contained artifact from a view in the catalog (§11.2) and prints its path.
@@ -354,8 +366,8 @@ Each metric declares:
 | better | `lower` or `higher` |
 | kind | `timed` (wall or CPU time), `sampled` (statistical estimate), `exact` (a count that is stable in A/A, §10.4) |
 | scale | `ratio` (compare log ratios) or `absolute` (compare differences) |
-| minimum n | e.g. a percentile p needs `⌈10 / (1 − p)⌉` frames per round |
-| phase | which phases it covers; default the whole iteration |
+| minimum n | e.g. a percentile p needs `⌈10 / (1 − p)⌉` frames per block |
+| phase | which phases it covers; default the whole run |
 
 The catalog lives in `src/model/metrics.rs` and in `strobe query <h> summary --catalog`.
 
@@ -372,14 +384,15 @@ The catalog lives in `src/model/metrics.rs` and in `strobe query <h> summary --c
 
 ### 7.3 Phases
 
-Scenario steps and `@strobe/web` emit phase marks (`performance.mark` with
-`detail: { strobe: "phase" }`). Every metric can be sliced by phase.
+Bench files (`phase(name, fn)`, §9.6) and `@strobe/web` (`phase(name)`) emit phase marks.
+The runner's marks are written by the daemon on the trace clock; in-page marks are
+`performance.mark` with `detail: { strobe: "phase" }`. Every metric can be sliced by phase.
 
 ## 8. Probes
 
 ### 8.1 Probe sets
 
-| Probe | What | Source | Round | Cost |
+| Probe | What | Source | Block | Cost |
 |---|---|---|---|---|
 | `frames` | presented frames, frame phases, vsync | trace | timing | low |
 | `threads` | top-level tasks per thread by category, long tasks | trace | timing | low |
@@ -399,8 +412,8 @@ counters. `memory` = census, heap. `deep` = deep. Probes can be listed one by on
 
 ### 8.2 Overhead
 
-Every timing round set has a measured overhead: one empty-probe round (the scenario with
-probes off, timing taken from OS counters only) against the same round with the timing probes.
+Every experiment measures its timing overhead: one empty-probe block per variant (the case with
+probes off, timing taken from OS counters only) against the same block with the timing probes.
 The difference is printed as `overhead`. Above 2% of main-thread time fails `ProbeOverhead`
 (§10.2).
 
@@ -412,7 +425,7 @@ its share. Native time stays `(program)` unless `deep` resolves it (§12.3).
 ### 8.4 Counters
 
 `@strobe/web` counters cost nothing when strobe is not attached: the counter API checks a global
-that strobe installs with `Page.addScriptToEvaluateOnNewDocument` in attribution rounds only.
+that strobe installs with `Page.addScriptToEvaluateOnNewDocument` in attribution blocks only.
 
 ### 8.5 OS and GPU sampling
 
@@ -451,20 +464,20 @@ Rules:
 
 - One process at a time, as the desktop command does: a snapshot can double a process's memory.
   Main last when the bridge serializes its own process.
-- Post-GC by construction. Never in a timing round; the target pauses while it serializes.
+- Post-GC by construction. Never in a timing block; the target pauses while it serializes.
 - Sensitive (rule 9): stored gzip, owner-only. Views return classes, counts, sizes, dominators
   and retainer paths with string values redacted.
 - Compared only within one runtime: a renderer's V8 snapshot, the Electron main process's, and
   the Bun server's are separate series.
 
-**Leaks** (`strobe bench <scenario> --head <variant> --probes memory --repeat <N>`):
+**Leaks** (`strobe bench <file> --head <variant> --probes memory --repeat <N>`), in one block:
 
 1. Warm up, then census and snapshot S0.
-2. Repeat the iteration N times; census and S1. Repeat N times; census and S2.
-3. Growth per iteration is the slope over at least 3 censuses, with an interval. Objects
-   allocated between S0 and S1 that survive in S2, grouped by constructor and retainer path
-   (and allocation site when `alloc` ran), are the suspects.
-4. Verdict: `leaks <size>/iteration` in one process and layer, or `no growth` within the bound.
+2. Call `run` (and `reset`) N times; census and S1. N more times; census and S2.
+3. Growth per run is the slope over at least 3 censuses, with an interval. Objects allocated
+   between S0 and S1 that survive in S2, grouped by constructor and retainer path (and
+   allocation site when `alloc` ran), are the suspects.
+4. Verdict: `leaks <size>/run` in one process and layer, or `no growth` within the bound.
 
 ### 8.7 Imports (`file:`)
 
@@ -477,36 +490,41 @@ They work with every view, never with `bench`.
 
 ### 9.1 Pipeline
 
+Per series (case × target × params):
+
 ```mermaid
 flowchart LR
   V[validate variants] --> B[build or resolve]
   B --> P[preflight: load, power, pin, display]
-  P --> L[launch fresh]
-  L --> W[warmup until steady]
-  W --> M[timing pairs ABAB / BABA]
-  M --> S{primary decided?}
-  S -- no, more pairs useful --> M
-  S -- next launch --> L
-  S -- yes or power says no --> A[attribution rounds]
+  P --> K[block: fresh launch of A or B]
+  K --> W[prepare, setup, warmup until steady]
+  W --> M[measured runs, then close]
+  M --> S{pair complete: primary decided?}
+  S -- no, more pairs useful --> K
+  S -- yes, or power says no --> A[attribution blocks]
   A --> R[analyse, verdicts, report]
 ```
 
-- **Warmup**: iterations until the last 3 primary values spread less than 5%, at most 10. The
-  first iteration of each launch is kept as `cold` and reported apart.
-- **Pairs**: one base and one head iteration back to back; order alternates per pair.
-- **Launches**: default 3. Each launch is a fresh process with a fresh isolated profile.
+- **Block**: one fresh launch of one variant with a fresh isolated profile or home: `prepare`,
+  `setup`, warmup runs, measured runs (`--runs`, default 5), close. Two builds never run at the
+  same time.
+- **Order**: blocks alternate A B, B A, A B, …, so drift and launch-to-launch noise hit both
+  variants equally (as `packages/desktop/script/bench-startup.ts --compare` does).
+- **Warmup**: runs until the last 3 primary values spread less than 5%, at most 10. The first
+  run of each block is kept as `cold` and reported apart.
 - **Stop rule** (`--pairs auto`): at least 6 pairs, then after each pair: stop when the primary
   has a verdict; stop as `underpowered` when the estimated pairs needed exceed the maximum
-  (default 60) or `--max-time`.
-- **Attribution rounds** run after timing, with the same scenario, on both variants.
+  (default 40) or `--max-time`.
+- **Attribution blocks**: one per variant after timing, same case, with the attribution probes.
 
 ### 9.2 Unit of analysis
 
+- Each block yields one value per metric: the median of its measured runs. Frame metrics pool
+  the frames of all measured runs in the block, so tail percentiles get the most frames.
 - Per pair, `d = ln(head / base)` for `ratio` metrics, `head − base` for `absolute` ones.
-- Frame percentiles are computed per iteration, then paired. A percentile below its minimum n
-  per iteration is refused for that metric (`TailTooShort`).
-- When the launch-to-launch spread exceeds the within-launch spread (`LaunchVariance`),
-  intervals use per-launch medians of `d` instead of pairs.
+- A percentile below its minimum n per block is refused for that metric (`TailTooShort`).
+- Launch-to-launch variance is inside every pair by construction: intervals describe what a
+  fresh start of each build does.
 
 ### 9.3 Statistics
 
@@ -522,7 +540,7 @@ flowchart LR
   intervals without verdicts.
 - **Exact metrics**: a counter that is stable in A/A (§10.4) is compared exactly; any
   difference is real and printed as `exact`. Others are treated as timed.
-- **Modes**: mValue per variant on iteration values (threshold 3.2, as BenchmarkDotNet). On a
+- **Modes**: mValue per variant on run values (threshold 3.2, as BenchmarkDotNet). On a
   multimodal result strobe names the likely cause from recorded data (core residency, GC in the
   window, background load).
 - **Outliers**: never removed. Tukey-fence outliers are listed by an analyser; the rank test is
@@ -536,11 +554,11 @@ flowchart LR
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
 | power plan for the run, restored after (also after a crash, at next daemon start) | `PowerSetActiveScheme` | governor read only; analyser | read only |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
-| window visible and unoccluded, every round | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | `visibilityState` | `visibilityState` |
+| window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | `visibilityState` | `visibilityState` |
 | throttling | frequency below the expected range (PDH % of maximum frequency) | cpufreq | analyser only |
 | battery | `GetSystemPowerStatus` | `/sys/class/power_supply` | IOKit |
 
-Provenance stored with every run: CPU, topology, pinning, power plan, OS build, GPU and driver,
+Provenance stored with every experiment and recording: CPU, topology, pinning, power plan, OS build, GPU and driver,
 displays and the adapter driving the window, window size and scale, browser or Electron and
 Chromium versions, launch flags, git SHAs, build command and env hash, probe set and overhead,
 validity verdict, strobe version.
@@ -563,13 +581,8 @@ Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`
     "cwd": "packages/app",
     "ready": "http://127.0.0.1:{port}/"
   },
-  "scenarios": {
-    "timeline.scroll": {
-      "playwright": "packages/app/e2e/performance/timeline/frame-budget-benchmark.spec.ts",
-      "grep": "scroll"
-    }
-  },
-  "metrics": { "primary": "frames.presented.p95", "equivalence": "2%" },
+  "benches": ["packages/app/perf/**/*.bench.ts"],
+  "metrics": { "equivalence": "2%" },
   "packages": { "groups": { "@kobalte/*": "kobalte" } }
 }
 ```
@@ -581,20 +594,128 @@ Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`
 - Build cache key: tree hash + build command + env hash. Both variants must share command and
   env (`VariantMismatch`).
 - `app:<id>` and `exe:<path>` need no build.
+- `build` and `serve` are what a `web()` target runs for each variant; `serve` gets a free port
+  per variant.
 
-### 9.6 Scenarios
+### 9.6 Bench files
 
-A scenario has `setup` (once per launch), `iteration` (repeated, measured, phases inside) and
-`teardown`.
+A benchmark is a small TypeScript file, in the spirit of BenchmarkDotNet:
 
-- **Playwright**: strobe launches the browser (it owns the flags, §13.1) and runs the spec;
-  `@strobe/playwright` connects with `connectOverCDP(endpoint, { noDefaults: true })` and
-  exposes `strobe.iteration(fn)` and `strobe.phase(name)`.
-- **Built-in steps** (JSON, run by strobe over CDP; work on the installed app):
-  `goto`, `click`, `type`, `press`, `scroll` (with `Input.synthesizeScrollGesture`), `wait`
-  (`idle`, a selector, a duration), `phase`. The input method is stored in provenance.
-- **Replay**: a scenario may name a recorded event-stream file that the fixture replays with
-  recorded timing, so mocked transports behave the same in every iteration.
+```ts
+// packages/app/perf/timeline.bench.ts
+import { bench, web, app } from "@strobe/bench"
+import { mockOpenCodeServer } from "../e2e/utils/mock-server"
+import { longSession } from "./fixtures"
+
+export default bench({
+  targets: {
+    web: web({
+      url: "/",
+      prepare: ({ playwright, params }) => mockOpenCodeServer(playwright.page, longSession(params.turns)),
+    }),
+    desktop: app("opencode", { home: "perf/fixtures/home-{turns}" }),
+  },
+  params: { turns: [24, 200] },
+  async setup({ page }) {
+    await page.click("[data-session-row]")
+    await page.waitFor("[data-component=timeline]")
+  },
+  cases: {
+    scroll: {
+      primary: "frames.presented.p95",
+      async run({ page, phase }) {
+        await phase("down", () => page.scroll("[data-timeline]", { by: 4000 }))
+        await phase("up", () => page.scroll("[data-timeline]", { by: -4000 }))
+      },
+    },
+    "switch-session": {
+      primary: "interaction.p95",
+      run: ({ page }) => page.click("[data-session-row]:nth-child(2)", { until: "idle" }),
+      reset: ({ page }) => page.click("[data-session-row]:nth-child(1)", { until: "idle" }),
+    },
+    idle: { primary: "cpu.process.total", run: ({ page }) => page.wait(5_000) },
+  },
+})
+```
+
+| BenchmarkDotNet | Bench file |
+|---|---|
+| `[Benchmark]` method | `cases.<name>.run` |
+| `[Params]` | `params`: every combination is its own series |
+| `[GlobalSetup]` / `[IterationSetup]` | `setup` (once per block) / `reset` (between runs, never measured) |
+| Jobs | `targets`, plus `--on` devices |
+| `Baseline = true` | `--base` |
+| Diagnosers | `--probes`, always in their own blocks |
+| Exporters | `strobe report` |
+
+**Fields:**
+
+- `targets`: named targets. `web({ url, prepare?, viewport?, scale? })` is the project's
+  production build served per variant (§9.5) in a strobe-launched Chromium. `app(id, { home? })`
+  is an Electron app: `home` is a seed directory copied into a fresh isolated home for every
+  block (`{param}` placeholders allowed; the seed must open with both variants, so create it
+  with the base build). `exe(path, { home? })` and `url(href)` also exist.
+- `prepare(ctx)`: per block, before the first page load. The only place with Playwright
+  (`ctx.playwright.page`), and only on targets with a debug port.
+- `params`: arrays of values; the cartesian product makes series.
+- `setup(ctx)`: once per block, after load, never measured.
+- `cases.<name>`: `primary` (metric name, required), `run(ctx)` (measured), `reset(ctx)`
+  (optional, between runs, never measured), `metrics` (optional extra secondaries), `probes`
+  (optional extra attribution probes).
+
+**`ctx`:** `page`, `phase(name, fn)`, `params`, `target` (its name), `variant` (`base` or
+`head`, for logging only), `playwright` (in `prepare` only).
+
+**`page` driver** (strobe's own, over CDP or the bridge, so it works on Stable):
+
+| Call | Does |
+|---|---|
+| `goto(url, opts?)` | navigate and wait for load |
+| `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre |
+| `type(selector, text, opts?)` / `press(key, opts?)` | `Input.insertText` / `Input.dispatchKeyEvent` |
+| `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
+| `waitFor(selector, opts?)` | resolves when the selector matches, through one in-page `MutationObserver` |
+| `wait(ms)` | a plain wait |
+| `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
+
+`opts.until`: `"idle"` (no presented frame and no main-thread task for 300 ms, read from the
+trace stream by the daemon, never by polling the page), `"frame"` (the next presented frame),
+or a selector. Every input call records its dispatch time on the trace clock, which the
+`interaction.*` metrics use (input → the presented frame that showed the change).
+
+**How it runs:**
+
+```mermaid
+sequenceDiagram
+  participant R as runner (bun, @strobe/bench)
+  participant D as strobe
+  participant T as target
+  D->>R: spawn with the bench file; R reports targets, params, cases
+  loop each block
+    D->>T: fresh launch (variant A or B), probes on
+    D->>R: block {series, variant}
+    R->>D: driver calls from prepare / setup / run / reset
+    D->>T: CDP or bridge
+    D-->>R: results, "until" resolved
+    R->>D: run start / end, phase start / end
+    D->>D: marks on the trace clock
+  end
+  D->>D: verdicts (§9.3)
+```
+
+- The runner is a `bun` process running `@strobe/bench`'s entry. It imports the bench file and
+  calls its functions when told to. It is pinned to the CPUs the target is not pinned to, and
+  its CPU time is a track in the recording.
+- Runner protocol: newline-delimited JSON over the runner's stdin and stdout
+  (`{ "id", "op", "args" }` → `{ "id", "ok" | "error" }`). The runner sends `console.*` to
+  stderr, which strobe keeps as the block's log.
+- A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
+- At every run start strobe reads the DOM node count; a count that drifts across runs means
+  `reset` is missing (`StateDrift`).
+
+`@strobe/playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
+`strobe.record(page, fn)` records one block. Those recordings support every view, but not
+`bench`'s verdicts.
 
 ### 9.7 Bisect
 
@@ -616,18 +737,18 @@ installed there). Results are stored locally, tagged per device, never pooled ac
 |---|---|
 | `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP, llvmpipe) and a frame or GPU metric is requested |
 | `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`) |
-| `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing round |
+| `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible` |
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup |
-| `ScenarioIncomplete` | an iteration did not reach its completion check |
+| `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
 | `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
 
 ### 10.2 Analysers (warn in the result)
 
-`MultimodalDistribution` · `HighVariance` · `Underpowered` · `LaunchVariance` · `Background` ·
+`MultimodalDistribution` · `HighVariance` · `Underpowered` · `StateDrift` · `Background` ·
 `Throttling` · `Drift` (trend across pairs) · `CounterUnstable` · `ProbeOverhead` ·
 `Unresolved` (samples without a symbol above 5%) · `PowerPlan` · `Battery` · `VirtualMachine`
 · `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed).
@@ -640,21 +761,22 @@ the bridge, inside an Electron window.
 | Case | Truth | Must recover |
 |---|---|---|
 | busy | exactly B ms of JS per frame | frame cost and `main.script.self` within max(0.2 ms, 3%) |
-| alloc | exactly M MB of short-lived objects per iteration | `alloc.bytes` within 2% |
+| alloc | exactly M MB of short-lived objects per run | `alloc.bytes` within 2% |
 | layout | exactly K forced layouts per frame | the invalidation count, exact |
 | timers | exactly N timers per second | timer count, exact |
-| leak | exactly R KB retained per iteration | leak verdict within 10% |
+| leak | exactly R KB retained per run | leak verdict within 10% |
 | idle | nothing | no presented frames; process CPU near 0 |
 | gpu | fixed WebGL fill load | GPU 3D engine use repeatable within 10% (no ground truth) |
 
-`up` runs busy, alloc and idle. `status --calibrate` runs all. Results go to `results.db`.
+`up` runs busy, alloc and idle. `status --calibrate` runs all. The last result is kept in
+`state.json` (`last_calibration`).
 
 ### 10.4 A/A
 
-`strobe bench <scenario> --aa --head <variant>` runs the same build on both sides. It prints
+`strobe bench <file> --aa --head <variant>` runs the same build on both sides. It prints
 the share of secondary metrics that claimed a change (must stay at or below the nominal rate)
 and which counters are stable. A counter is `exact` for a project and device only after an A/A
-with at least 3 launches shows zero spread.
+with at least 3 pairs shows zero spread.
 
 ## 11. Views and reports
 
@@ -674,7 +796,7 @@ with at least 3 launches shows zero spread.
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
 | `insights` | | rule hits with evidence handles |
 | `timeline` | `--from --to --thread` | bounded event list for a range |
-| `progress` | (`run_…` only) | a running bench's state and estimate |
+| `progress` | (`exp_…` only) | a running experiment's state and estimate |
 | `sql` | `"<query>"` | rows from trace_processor, row-limited |
 
 `a..b` works with `summary`, `frames`, `hotspots`, `memory`, `heap` and `gpu`.
@@ -808,7 +930,7 @@ sequenceDiagram
 
 ```
 recordings/rec_3f9a1c/
-  meta.json             target, probes, rounds, environment, validity, clock map
+  meta.json             target, probes, blocks, environment, validity, clock map
   trace.pftrace         Perfetto proto: Chrome trace + strobe packets (§15)
   trace.json.gz         when the source only gives JSON (contentTracing, imports)
   cpu-<n>.cpuprofile.gz
@@ -820,16 +942,29 @@ recordings/rec_3f9a1c/
 - Handles: `rec_` + 6 hex; any unique prefix works.
 - Retention: default cap 20 GB; oldest unpinned first. `--pin` keeps a recording.
 
-### 14.2 `results.db`
+### 14.2 Experiments
 
-Tables: `run`, `variant`, `launch`, `round`, `pair`, `value` (metric, variant, iteration,
-value), `verdict`, `warning`, `environment`, `calibration`. History per metric and device comes
-from these.
+```
+experiments/
+  index.jsonl           one line per experiment: id, time, file, series, variants, verdicts, device
+  exp_8c21d0/
+    result.json         the --json result: series, blocks (variant, values per metric, runs),
+                        pairs, intervals, verdicts, warnings, environment, recordings
+    blocks/<n>.log      the runner's stderr per block
+```
+
+- Experiment ids: `exp_` + 6 hex; any unique prefix works.
+- History per metric and device comes from scanning `index.jsonl` and the results it names.
 
 ## 15. Engine
 
-- Perfetto `trace_processor`, pinned version, downloaded by `up`, sha256-checked. The only
-  place that runs it is `engine/`.
+- Perfetto `trace_processor_shell`, pinned version (v59.1), from the `google/perfetto` GitHub
+  release asset for the OS (`windows-amd64.zip`, `linux-amd64.zip`, `linux-arm64.zip`,
+  `mac-amd64.zip`, `mac-arm64.zip`), downloaded by `up`, sha256-checked. No Windows arm64 build
+  exists: there strobe runs the x64 build under emulation. The only place that runs it is
+  `engine/`.
+- The same release's `perfetto-ui.zip` is the deep-dive viewer: the daemon serves it at
+  `/perfetto/`, connected to the recording's trace_processor.
 - One `trace_processor --httpd` per recording in use, on `127.0.0.1` and a free port, stopped
   after 5 minutes idle.
 - Ingest: Chrome's proto trace (`Tracing.start` with `streamFormat: "proto"`) with strobe's own
@@ -852,7 +987,7 @@ bridges ──────┤ user-only bridge socket        apps connect out
           ├─ samplers: OS, GPU
           ├─ ring buffers (flight recorder)
           ├─ trace_processor --httpd (on demand)
-          └─ results.db · recordings/ · symbols/
+          └─ experiments/ · recordings/ · symbols/
               │ user-only pipe
               ▼
         strobe helper (elevated, optional)
@@ -880,8 +1015,8 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | Tool | Input (beyond the CLI flags of the same name) | Output |
 |---|---|---|
 | `status` | `target?`, `calibrate?` | §5.4 JSON |
-| `record` | `target`, `probes?`, `for?`, `scenario?`, `ring?`, `pin?`, `name?`, `timeout?` | `{ handle, valid, summary, warnings }` |
-| `bench` | `scenario`, `head`, `base?`, `target?`, `primary?`, `equivalence?`, `pairs?`, `launches?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
+| `record` | `target`, `probes?`, `for?`, `bench?`, `ring?`, `pin?`, `name?`, `timeout?` | `{ handle, valid, summary, warnings }` |
+| `bench` | `file`, `head`, `base?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
 | `query` | `handle`, `view`, view arguments, `sql?`, `top?`, `max_bytes?` | view JSON |
 | `report` | `view`, `handles`, `format?` | `{ path, bytes }` |
 
@@ -912,25 +1047,26 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
+- `@strobe/bench`: `bench`, `web`, `app`, `exe`, `url` for bench files, and the runner entry
+  strobe spawns (§9.6).
 - `@strobe/web`: `phase(name)`, `mark(name)`, `count(name, n)`; free when strobe is not
   attached (§8.4). `@strobe/web/solid`: computations per component through Solid's dev hooks,
   dev builds only.
-- `@strobe/playwright`: the fixture in §9.6.
 - `@strobe/electron`: the bridge in §13.2.
+- `@strobe/playwright`: `strobe.record(page, fn)` inside existing Playwright tests (§9.6).
 
 ## 21. Open items (verify in spikes)
 
-- trace_processor: prebuilt for Windows x64 and arm64 and its download source; ingest of a Chrome
-  proto trace with appended strobe packets; JSON from `contentTracing`; V8 CPU samples inside
-  Chrome traces; memory-infra effective sizes.
+- trace_processor (prebuilts verified: v59.1 ships Windows x64, Linux and macOS): ingest of a
+  Chrome proto trace with appended strobe packets; JSON from `contentTracing`; V8 CPU samples
+  inside Chrome traces; memory-infra effective sizes.
 - The trace categories for presented frames on the Chromium in OpenCode's Electron.
 - Clock domains: Chrome's TimeTicks against QPC (Windows) and `mach_continuous_time` (macOS).
 - V8 code events in ETW for JS frames inside native stacks, on OpenCode's Electron.
 - Bun's WebKit inspector: sampling profiler and heap through it.
-- Perfetto UI against a local trace_processor on a port other than its default.
+- The self-hosted Perfetto UI against a local trace_processor on a port other than its default.
 - Solid's dev hook names for `@strobe/web/solid`.
 - macOS per-process GPU (IOReport); Linux refresh rate under Wayland.
-- `rusqlite` bundled SQLite with the windows-gnu toolchain on adais.
 - OpenCode product decisions for the bridge: where the toggle lives, who can turn it on, the
   indicator.
 
@@ -943,7 +1079,7 @@ Phase 0 runs two tracks in parallel.
 | 0a | Spike: CDP proto trace + strobe counter packets → trace_processor; presented frames by SQL | `strobe record https://… --for 5s`, then `strobe query rec_… sql "…"` returns frames and a strobe counter |
 | 0b | Bridge spike: `@strobe/electron` in a dev OpenCode desktop; `windows`, `cdp.send`, `memory.census` and `heap.snapshot` through the existing `HeapSnapshots` code | `strobe record app:opencode-dev --probes memory` writes a census and per-process snapshots |
 | 1 | Daemon, MCP, skill, `up`/`leave`, `status` with validity preflight, calibration page | agent on adais calls `status`; calibration passes |
-| 2 | `bench`: variants, Playwright fixture, pairs, statistics, verdicts, validators, A/A | A/A on `timeline.scroll` stays at the nominal rate; the claims of our merged perf PRs are re-checked |
+| 2 | `bench`: bench files, runner, `page` driver, variants, blocks and pairs, statistics, verdicts, validators, A/A | A/A on `timeline.bench.ts` stays at the nominal rate; the claims of our merged perf PRs are re-checked |
 | 3 | OpenCode Stable through the bridge (desktop change behind the opt-in), census and leaks | `strobe bench … --target app:opencode` on Stable |
 | 4 | OS and GPU samplers, viewer, reports, symbols, imports | `strobe report memory-timeline` replaces a hand-built page |
 | 5 | Insights, bisect, `top`, flight recorder | `bench --bisect` finds a planted regression |

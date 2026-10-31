@@ -153,6 +153,9 @@ struct Block {
     steps: Vec<(String, f64)>,
     /// The busiest processes outside strobe's own tree during the block: name and % of one core.
     background: Vec<(String, f64)>,
+    /// A leak run's growth verdicts and suspects (memory blocks only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leak: Option<Value>,
 }
 
 struct Ctx<'a> {
@@ -182,10 +185,13 @@ pub fn run(args: &Args) -> Result<Output> {
     let file = std::fs::canonicalize(file).map_err(|_| Error::usage(format!("no such bench file: {file}")))?;
     let head_spec = args.get("head").unwrap_or(".").to_string();
     let aa = args.has("aa");
+    // `--probes memory`: a leak run per variant (SPEC §8.6); `--base` is optional there.
+    let leak_run = args.get("probes") == Some("memory");
     let base_spec = match (args.get("base"), aa) {
-        (Some(b), false) => b.to_string(),
-        (None, true) => head_spec.clone(),
+        (Some(b), false) => Some(b.to_string()),
+        (None, true) => Some(head_spec.clone()),
         (Some(_), true) => return Err(Error::usage("--aa runs --head against itself; drop --base")),
+        (None, false) if leak_run => None,
         (None, false) => return Err(Error::usage("say what to compare: --base <variant> (or --aa for the same build on both sides)")),
     };
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
@@ -220,7 +226,8 @@ pub fn run(args: &Args) -> Result<Output> {
         browser_version: String::new(),
         baseline: validity::baseline(),
         keep_all: args.has("keep"),
-        runs: args.num("runs")?.unwrap_or(5.0).max(1.0) as usize,
+        // A leak run's N: S0, N runs, S1, N runs, S2.
+        runs: if leak_run { args.num("repeat")?.unwrap_or(10.0).max(3.0) as usize } else { args.num("runs")?.unwrap_or(5.0).max(1.0) as usize },
         warnings: Vec::new(),
         config: config.clone(),
         awake: host::Awake::start(),
@@ -253,13 +260,16 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         Some(_) => {}
     }
-    let mut variants = vec![resolve_variant("base", &base_spec, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?];
+    let mut variants = match &base_spec {
+        Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
+        None => vec![resolve_variant("head", &head_spec, &project, &config)?],
+    };
     let started = Instant::now();
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
     let mut all_decided = true;
     for s in &series {
-        let out = run_series(&mut ctx, s, &mut variants, &config, aa, started, max_time)?;
+        let out = if leak_run { leak_series(&mut ctx, s, &mut variants, &config)? } else { run_series(&mut ctx, s, &mut variants, &config, aa, started, max_time)? };
         all_decided &= out["decided"].as_bool().unwrap_or(false);
         series_out.push(out);
     }
@@ -299,6 +309,38 @@ pub fn run(args: &Args) -> Result<Output> {
         out.code = 5;
     }
     Ok(out)
+}
+
+/// A leak run (`--probes memory`, SPEC §8.6): one memory block per variant, nothing paired. Each gets
+/// growth verdicts for its post-GC JS heap and DOM nodes, and its suspects.
+fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
+    let target = ctx.describe["targets"][&s.target].clone();
+    for v in variants.iter_mut() {
+        prepare_variant(v, &target, config, false)?;
+    }
+    let n = ctx.runs;
+    progress(format!("\n{}  leak run · warmup, then S0 · {n} runs · S1 · {n} runs · S2, a post-GC census after every run", s.label()));
+    let series_started = Instant::now();
+    let mut leak = json!({});
+    let mut decided = true;
+    for v in variants.iter() {
+        let b = block_on_screen(ctx, s, v, 0, Set::Memory, true)?;
+        progress(format!("  {} block  {}", b.variant, steps_text(&b.steps)));
+        let mut entry = b.leak.clone().unwrap_or(Value::Null);
+        progress(format!("  {:<5} js heap  {}", v.role, entry["js_heap"]["verdict"].as_str().unwrap_or("")));
+        progress(format!("  {:<5} dom      {}", v.role, entry["dom_nodes"]["verdict"].as_str().unwrap_or("")));
+        decided &= entry["js_heap"]["decided"].as_bool() == Some(true);
+        entry["recording"] = json!(b.recording);
+        entry["values"] = json!(b.values);
+        leak[v.role] = entry;
+    }
+    let head = &leak["head"]["js_heap"];
+    Ok(json!({
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak",
+        "primary": { "metric": "js.heap.growth", "verdict": head["verdict"], "decided": head["decided"] },
+        "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
+        "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
+    }))
 }
 
 fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, aa: bool, started: Instant, max_time: Option<Duration>) -> Result<Value> {
@@ -601,6 +643,63 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
     }
 }
 
+/// A leak run's verdicts (SPEC §8.6): growth per run of the post-GC JS heap and of DOM nodes, as the
+/// Theil–Sen slope over the 2 × N + 1 censuses with Sen's 95% interval (each half too, since a cache
+/// that fills up grows in the first half only), and the suspects: objects allocated between S0 and
+/// S1 that are still alive in S2. Writes `census.json` and `leaks.json` into the recording.
+fn leak_analysis(census: &[Value], dir: &Path, n: usize) -> Result<Value> {
+    let series = |key: &str| -> Vec<f64> { census.iter().map(|c| key.split('.').fold(c, |v, k| &v[k]).as_f64().unwrap_or(f64::NAN)).collect() };
+    let js = series("js_heap_bytes");
+    let dom = series("dom.nodes");
+    let bytes = |v: f64| format!("{}{}", if v < 0.0 { "−" } else { "+" }, fmt::bytes(v.abs()));
+    let nodes = |v: f64| format!("{v:+.1} nodes");
+    let bound = (0.001 * metrics::median(&js)).max(16_384.0);
+    let mut js_v = growth(&js, n, bound, &bytes);
+    let dom_v = growth(&dom, n, 1.0, &nodes);
+    let s = |name: &str| dir.join(format!("{name}.heapsnapshot.gz"));
+    let suspects = crate::heapsnap::leaks(&crate::heapsnap::ids(&s("heap-s0"))?, &crate::heapsnap::ids(&s("heap-s1"))?, &crate::heapsnap::read(&s("heap-0"))?, 15, false);
+    // A growing heap is a leak only when the app's own objects explain it: V8's compiled code and
+    // internals keep growing while the JIT compiles and optimizes, and that stops on its own.
+    let app_per_run = suspects["app"]["retained_size"].as_f64().unwrap_or(0.0) / n as f64;
+    js_v["app_per_run"] = json!(app_per_run);
+    let growing = js_v["lo"].as_f64().is_some_and(|lo| lo > 0.0);
+    let undecided_or_leak = js_v["verdict"].as_str().is_some_and(|v| v.starts_with("leaks") || v.starts_with("unclear"));
+    if growing && undecided_or_leak && app_per_run <= bound {
+        js_v["verdict"] = json!(format!(
+            "no app leak: the heap grows {}/run in V8's compiled code and internals (the JIT warming up); app objects from the first {n} runs hold {}/run",
+            bytes(js_v["slope"].as_f64().unwrap_or(0.0)),
+            bytes(app_per_run)
+        ));
+        js_v["decided"] = json!(true);
+    }
+    store::write_json(&dir.join("census.json"), &json!(census))?;
+    store::write_json(&dir.join("leaks.json"), &suspects)?;
+    Ok(json!({
+        "runs": 2 * n, "censuses": census.len(), "js_heap": js_v, "dom_nodes": dom_v,
+        "js_heap_bytes": js, "dom_node_counts": dom,
+        "suspects": { "count": suspects["count"], "self_size": suspects["self_size"], "retained_size": suspects["retained_size"], "app": suspects["app"], "classes_total": suspects["classes_total"], "classes": suspects["classes"] },
+    }))
+}
+
+/// Growth per run of one census series against `bound` (per run): "leaks" when the whole interval
+/// is above it and the last N runs still grow; "grows, then levels off" when only the first N do.
+fn growth(ys: &[f64], n: usize, bound: f64, show: &dyn Fn(f64) -> String) -> Value {
+    let Some((slope, lo, hi)) = stats::theil_sen(ys, 0.95) else { return json!({ "verdict": "unclear: too few censuses", "decided": false }) };
+    let mid = n.min(ys.len().saturating_sub(1));
+    let half = |h: &[f64]| stats::theil_sen(h, 0.95).map_or(f64::NAN, |x| x.0);
+    let (first, second) = (half(&ys[..=mid]), half(&ys[mid..]));
+    let (verdict, decided) = if lo > bound && second > bound {
+        (format!("leaks {}/run", show(slope)), true)
+    } else if lo > bound {
+        (format!("grows, then levels off ({}/run in the first {n} runs, {}/run in the last {n}): a cache filling up, not a leak so far", show(first), show(second)), true)
+    } else if lo >= -bound && hi <= bound {
+        (format!("no growth (within ±{}/run)", show(bound).trim_start_matches('+')), true)
+    } else {
+        (format!("unclear: {} … {}/run; more runs (--repeat) narrow it", show(lo), show(hi)), false)
+    };
+    json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "decided": decided })
+}
+
 /// The three busiest processes outside strobe's own tree (the target, runner and servers) between two
 /// process snapshots, as % of one core, from 5% up.
 fn busiest_others(a: &(u64, Vec<host::ProcInfo>), b: &(u64, Vec<host::ProcInfo>)) -> Vec<(String, f64)> {
@@ -626,11 +725,18 @@ fn subject(v: &Variant) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
-/// Runs a block while the screen is unlocked: waits out a locked session, and redoes a block the
+/// Runs a block while the screen is unlocked and lit: waits out a locked session, redoes a block the
 /// lock screen touched (Chromium hides its windows and nothing reaches the display, so its numbers
-/// describe nothing). The block's own checks still refuse anything else.
+/// describe nothing), and wakes a display that went dark on idle, once, before a block refuses
+/// `WindowHidden`. The block's own checks still refuse anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+    let mut woken = false;
     loop {
+        host::wake_display();
+        if woken {
+            // The display and Chromium's occlusion tracking settle after the display comes back.
+            std::thread::sleep(Duration::from_secs(3));
+        }
         if host::session_locked() {
             progress("  waiting: the session is locked; strobe resumes when it is unlocked");
             let waiting = Instant::now();
@@ -643,6 +749,11 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         let before = ctx.awake.locks();
         let r = run_block(ctx, s, v, pair, set, keep);
+        if !woken && r.as_ref().err().is_some_and(|e| e.message.contains("WindowHidden")) {
+            progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
+            woken = true;
+            continue;
+        }
         if ctx.awake.locks() == before && !host::session_locked() {
             return r;
         }
@@ -755,7 +866,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             .map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
         lap("setup");
         let procs0 = (host::now_ns(), host::all_processes());
-        let tracing = probe::trace::start(&browser.cdp, set)?;
+        // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
+        // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
+        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start(&browser.cdp, set)?) };
+        let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
+        let mut census: Vec<Value> = Vec::new();
+        // A leak run measures 2 × N runs: N to S1 and N more to S2.
+        let measured_runs = if set == Set::Memory { 2 * ctx.runs } else { ctx.runs };
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
         let sampler = probe::os::Sampler::start(browser.pid);
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
@@ -817,11 +934,24 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let mut nodes_all = Vec::new();
         let mut first: Option<usize> = None;
         let mut unsteady = false;
-        while first.is_none_or(|f| runs.len() < f + ctx.runs) {
+        while first.is_none_or(|f| runs.len() < f + measured_runs) {
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
             runs.push(run_once(&format!("run:{i}"))?);
-            if first.is_some() {
+            if let Some(f) = first {
+                // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
+                if let Some(dir) = &mem_dir {
+                    let mut c = probe::census::take(&browser, &page);
+                    c["os_after_snapshot"] = json!(true);
+                    census.push(c);
+                    let done = runs.len() - f;
+                    if done == ctx.runs {
+                        probe::heap::snapshot(&page, &dir.join("heap-s1.heapsnapshot.gz"))?;
+                    }
+                    if done == 2 * ctx.runs {
+                        probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz"))?;
+                    }
+                }
                 continue;
             }
             // Within 5%, or within 1 ms of main-thread time: an idle run does about 3 ms, where 5% is noise.
@@ -831,10 +961,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             };
             if steady || i >= MAX_WARMUP {
                 unsteady = !steady;
-                first = Some(if set == Set::Attribution || !steady { i + 1 } else { i - 1 });
+                first = Some(if set == Set::Attribution || set == Set::Memory || !steady { i + 1 } else { i - 1 });
                 if set == Set::Attribution {
                     probe::cpu::start(&page)?;
                     probe::alloc::start(&page)?;
+                }
+                if let Some(dir) = &mem_dir {
+                    census.push(probe::census::take(&browser, &page));
+                    probe::heap::snapshot(&page, &dir.join("heap-s0.heapsnapshot.gz"))?;
                 }
             }
         }
@@ -878,8 +1012,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
-        let dir = if keep { store::recording_dir(&id)? } else { host::paths::run().join(&id) };
+        let dir = if keep || set == Set::Memory { store::recording_dir(&id)? } else { host::paths::run().join(&id) };
         std::fs::create_dir_all(&dir)?;
+        let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, ctx.runs)?) } else { None };
         if set == Set::Attribution {
             let profile = probe::cpu::stop(&page)?;
             let allocs = probe::alloc::stop(&page)?;
@@ -896,8 +1031,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             lap("maps");
         }
         let trace = dir.join("trace.pftrace");
-        tracing.stop(&trace)?;
-        lap("trace");
+        if let Some(tracing) = tracing {
+            tracing.stop(&trace)?;
+            lap("trace");
+        }
         if set == Set::Attribution {
             // The live objects after the runs (post-GC), once no trace subscription copies every
             // snapshot chunk (SPEC §8.6).
@@ -907,7 +1044,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             lap("heap");
         }
         let _ = ctx.runner.call("close", json!({}), t, &serve);
-        let mut data = metrics::read(&trace, &token)?;
+        let mut data = if set == Set::Memory { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
         lap("analyse");
         let mut extra = BTreeMap::new();
@@ -956,21 +1093,40 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         let intervals = metrics::run_intervals(&data);
-        let recording = if keep {
-            store::write_json(
-                &dir.join("meta.json"),
-                &json!({
-                    "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
-                    "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
-                    "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version,
-                }),
-            )?;
+        let recording = if keep || set == Set::Memory {
+            let mut meta = json!({
+                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+                "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
+                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version,
+            });
+            if let Some(l) = &leak {
+                // What `query leaks` and `query memory` read, as for a memory recording.
+                meta["census"] = json!(census);
+                meta["leaks"] = l["suspects"].clone();
+                meta["leak"] = json!({ "js_heap": l["js_heap"], "dom_nodes": l["dom_nodes"], "runs": l["runs"] });
+            }
+            store::write_json(&dir.join("meta.json"), &meta)?;
             Some(id)
         } else {
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals, steps: steps.borrow().clone(), background })
+        Ok(Block {
+            variant: v.role.to_string(),
+            pair,
+            values,
+            run_ms,
+            warmup: warm.len(),
+            speed_ratio: ratio,
+            nodes,
+            recording,
+            phases,
+            frames,
+            intervals,
+            steps: steps.borrow().clone(),
+            background,
+            leak,
+        })
     })();
     lapped.set(Instant::now());
     browser.close();
@@ -1354,6 +1510,38 @@ fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>, Option<u64
     }
 }
 
+/// A leak run's text: per variant, growth per run of the JS heap and DOM with their intervals, and the
+/// top suspects.
+fn leak_text(r: &Value, s: &Value, file: &str) -> String {
+    let n = s["runs_per_half"].as_u64().unwrap_or(0);
+    let mut out = format!("strobe bench {file} · {} · leak run\n", s["label"].as_str().unwrap_or(""));
+    out += &format!("plan   warmup, then S0 · {n} runs · S1 · {n} runs · S2 · a post-GC census after every run · {}\n", r["plan"]["pin"].as_str().unwrap_or(""));
+    out += &format!("time   {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64));
+    for v in r["variants"].as_array().into_iter().flatten() {
+        let role = v["role"].as_str().unwrap_or("");
+        let l = &s["leak"][role];
+        if l.is_null() {
+            continue;
+        }
+        let range = |g: &Value, show: &dyn Fn(f64) -> String| {
+            format!("{} [{} … {}] per run", show(g["slope"].as_f64().unwrap_or(f64::NAN)), show(g["lo"].as_f64().unwrap_or(f64::NAN)), show(g["hi"].as_f64().unwrap_or(f64::NAN)))
+        };
+        let bytes = |x: f64| format!("{}{}", if x < 0.0 { "−" } else { "+" }, fmt::bytes(x.abs()));
+        let nodes = |x: f64| format!("{x:+.1}");
+        out += &format!("\n{role} {}\n", v["label"].as_str().unwrap_or(""));
+        out += &format!("  js heap   {}  · {}\n", l["js_heap"]["verdict"].as_str().unwrap_or(""), range(&l["js_heap"], &bytes));
+        out += &format!("  dom       {}  · {}\n", l["dom_nodes"]["verdict"].as_str().unwrap_or(""), range(&l["dom_nodes"], &nodes));
+        let sus = &l["suspects"];
+        out += &format!("  suspects  {} objects from runs 1–{n} still alive after run {} · {} retained\n", sus["count"], 2 * n, fmt::bytes(sus["retained_size"].as_f64().unwrap_or(0.0)));
+        for c in sus["classes"].as_array().into_iter().flatten().take(5) {
+            out += &format!("            {:>9}  {:>6}  {}\n", fmt::bytes(c["retained_size"].as_f64().unwrap_or(0.0)), c["count"], c["class"].as_str().unwrap_or(""));
+        }
+        out += &format!("  next      strobe query {} leaks · strobe query {} memory\n", l["recording"].as_str().unwrap_or(""), l["recording"].as_str().unwrap_or(""));
+    }
+    out += "\n  slopes: Theil–Sen over the censuses, Sen's 95% interval; bound max(16 KB, 0.1% of the heap) and 1 DOM node per run\n\n";
+    out
+}
+
 fn render(r: &Value) -> String {
     let mut out = String::new();
     let file = r["file"].as_str().map(|f| Path::new(f).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()).unwrap_or_default();
@@ -1361,6 +1549,10 @@ fn render(r: &Value) -> String {
     let head = &r["variants"][1];
     let env = &r["env"];
     for s in r["series"].as_array().cloned().unwrap_or_default() {
+        if s["kind"] == "leak" {
+            out += &leak_text(r, &s, &file);
+            continue;
+        }
         out += &format!("strobe bench {file} · {}   base {}   head {}\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
         out += &format!("env    {} · {} · {} logical CPUs\n", env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), env["logical_cpus"]);
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");

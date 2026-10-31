@@ -73,7 +73,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let driver = Driver::new(page.clone(), token.clone());
     let dir = store::recording_dir(&id)?;
     if set == Set::Memory {
-        let meta = memory(&page, &browser, &driver, &dir, &id, &target, for_ms)?;
+        let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(validity::locked());
@@ -159,7 +159,7 @@ pub fn run(args: &Args) -> Result<Output> {
 /// start, the middle and the end (S0, S1, S2), no trace (SPEC §8.6). Objects allocated between S0 and
 /// S1 that are still alive in S2 are the leak suspects. Each census comes before its snapshot, which
 /// raises the memory of the process it serializes; OS memory is reported from the first census only.
-fn memory(page: &chromium::Page, browser: &chromium::Browser, driver: &Driver, dir: &std::path::Path, id: &str, target: &str, for_ms: u64) -> Result<Value> {
+fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::Path, id: &str, target: &str, for_ms: u64) -> Result<Value> {
     page.send("HeapProfiler.enable", json!({}))?;
     let started = std::time::Instant::now();
     progress(format!("recording {id} for {}: a heap snapshot at the start, middle and end", fmt::ms_duration(for_ms)));
@@ -168,10 +168,13 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, driver: &Driver, d
         if i > 0 {
             std::thread::sleep(Duration::from_millis(for_ms / 2));
         }
-        page.send("HeapProfiler.collectGarbage", json!({}))?;
-        let heap = page.send("Runtime.getHeapUsage", json!({}))?["usedSize"].as_f64().unwrap_or(f64::NAN);
-        let private = (i == 0).then(|| browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64);
-        census.push(json!({ "at_ms": started.elapsed().as_millis() as u64, "js_heap_bytes": heap, "dom_nodes": driver.nodes().ok(), "private_bytes": private }));
+        let mut c = probe::census::take(browser, page);
+        c["at_ms"] = json!(started.elapsed().as_millis() as u64);
+        c["dom_nodes"] = c["dom"]["nodes"].clone();
+        // OS memory of the snapshotted process is inflated after its first snapshot (CensusContaminated).
+        c["private_bytes"] = if i == 0 { json!(browser.processes().iter().map(|p| p.private_bytes).sum::<u64>()) } else { Value::Null };
+        c["os_after_snapshot"] = json!(i > 0);
+        census.push(c);
         probe::heap::snapshot(page, &dir.join(format!("{file}.heapsnapshot.gz")))?;
     }
     progress("finding objects that outlived their half");

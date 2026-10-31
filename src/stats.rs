@@ -85,6 +85,26 @@ fn normal_quantile(p: f64) -> f64 {
     }
 }
 
+/// Growth per step of a series taken at equal steps (a census after every run): the Theil–Sen slope,
+/// the median of all pairwise slopes, with Sen's distribution-free interval from Kendall's tau at
+/// `confidence`. Robust to a few outlying readings (a late GC). `None` below 3 points.
+pub fn theil_sen(ys: &[f64], confidence: f64) -> Option<(f64, f64, f64)> {
+    let pts: Vec<(f64, f64)> = ys.iter().enumerate().filter(|(_, y)| y.is_finite()).map(|(i, y)| (i as f64, *y)).collect();
+    let n = pts.len();
+    if n < 3 {
+        return None;
+    }
+    let mut slopes: Vec<f64> = (0..n).flat_map(|i| (i + 1..n).map(move |j| (i, j))).map(|(i, j)| (pts[j].1 - pts[i].1) / (pts[j].0 - pts[i].0)).collect();
+    slopes.sort_by(|a, b| a.total_cmp(b));
+    let m = slopes.len();
+    let median = if m % 2 == 1 { slopes[m / 2] } else { (slopes[m / 2 - 1] + slopes[m / 2]) / 2.0 };
+    let z = normal_quantile(1.0 - (1.0 - confidence) / 2.0);
+    let c = z * ((n * (n - 1) * (2 * n + 5)) as f64 / 18.0).sqrt();
+    let lo = (((m as f64 - c) / 2.0).floor().max(0.0) as usize).min(m - 1);
+    let hi = ((((m as f64 + c) / 2.0).ceil()) as usize).min(m - 1);
+    Some((median, slopes[lo], slopes[hi]))
+}
+
 /// Hodges–Lehmann estimate and its distribution-free interval (Walsh averages) at `confidence`.
 pub fn hodges_lehmann(d: &[f64], confidence: f64) -> (f64, f64, f64, f64) {
     let v: Vec<f64> = d.iter().copied().filter(|x| x.is_finite()).collect();

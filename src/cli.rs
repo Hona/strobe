@@ -87,6 +87,7 @@ Use
                                   record a target; prints a handle (rec_…)
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa] [--filter <case>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
+        [--probes memory --repeat N]   (a leak run per variant instead of pairs)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
                                   views: summary frames threads hotspots alloc layout gc heap leaks sql

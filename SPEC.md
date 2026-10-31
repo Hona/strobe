@@ -552,14 +552,27 @@ since a snapshot inflates its process) and then a snapshot (S0, S1, S2). `query 
 objects allocated between S0 and S1 that are alive in S2, by class, with retainer paths;
 `js.heap.growth` and `dom.nodes.growth` are per minute. `query <rec> heap` reads S2.
 
-**Leaks** (`strobe bench <file> --head <variant> --probes memory --repeat <N>`, planned), in one block:
+**Leaks** (`strobe bench <file> --head <variant> --probes memory --repeat <N>`, built; `--base` is
+optional and gets its own leak run, nothing is paired), in one block with no trace:
 
-1. Warm up, then census and snapshot S0.
-2. Call `run` (and `reset`) N times; census and S1. N more times; census and S2.
-3. Growth per run is the slope over at least 3 censuses, with an interval. Objects allocated
-   between S0 and S1 that survive in S2, grouped by constructor and retainer path (and
-   allocation site when `alloc` ran), are the suspects.
-4. Verdict: `leaks <size>/run` in one process and layer, or `no growth` within the bound.
+1. Warm up until steady, then census and snapshot S0.
+2. Call `run` (and `reset`) N times (default 10), a post-GC census after each; S1. N more times; S2.
+3. Growth per run of the post-GC JS heap and of DOM nodes is the Theil–Sen slope over the 2N + 1
+   censuses with Sen's 95% interval, and per half (runs 1–N, N–2N). Objects allocated between S0
+   and S1 that survive in S2, by class with retainer paths, are the suspects; they split into the
+   app's objects (objects, closures, arrays, strings, DOM) and the engine's (compiled code, hidden
+   internals, object shapes), which grow while the JIT compiles and optimizes.
+4. Verdict per layer against a bound per run (max(16 KB, 0.1% of the heap); 1 DOM node):
+   `leaks <size>/run` when the whole interval is above the bound, the last N runs still grow and the
+   app's suspects hold more than the bound per run; `no app leak: … V8's compiled code and internals`
+   when the heap grows but the app's suspects stay within the bound; `grows, then levels off` when
+   only the first N runs grow (a cache filling up); `no growth` within the bound; else `unclear`.
+   OS memory per process is in each census, but the snapshotted renderer's readings after S0 are
+   marked `os_after_snapshot` (CensusContaminated).
+
+Checked on a planted leak (800 objects kept per click, 5 clicks per run, N = 5): `leaks +356 KB/run
+[+345 … +378]`, 20,000 suspects of the planted class. A real scroll case without a leak grows about
++30 KB/run, all compiled code: `no app leak`.
 
 ### 8.7 Imports (`file:`)
 
@@ -1306,7 +1319,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 0b | — | the bridge (`@strobe/electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
 | 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`; validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
-| 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`) | the bridge, census layers, multi-process heaps, bench leak runs (`--probes memory --repeat`) |
+| 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`) | the bridge, census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top` | insights, `--bisect`, the flight recorder (`--ring`) |
 | 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |

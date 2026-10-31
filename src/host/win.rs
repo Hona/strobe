@@ -71,8 +71,8 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
             continue;
         }
         if let Some(p) = all.iter().find(|p| p.0 == pid) {
-            let (cpu_ns, cycles, private_bytes) = proc_times(pid);
-            out.push(ProcTimes { pid, parent: p.1, name: p.2.clone(), cpu_ns, cycles, private_bytes });
+            let (cpu_ns, cycles, private_bytes, working_set) = proc_times(pid);
+            out.push(ProcTimes { pid, parent: p.1, name: p.2.clone(), cpu_ns, cycles, private_bytes, working_set });
         }
         for &i in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
             // A reused parent pid can point at an older, unrelated process; children are always newer.
@@ -82,11 +82,12 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     out
 }
 
-fn proc_times(pid: u32) -> (u64, u64, u64) {
+/// CPU time (ns), CPU cycles, private bytes and working set of one process.
+fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return (0, 0, 0);
+            return (0, 0, 0, 0);
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
         let cpu = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 { ft(&k) + ft(&u) } else { 0 };
@@ -95,9 +96,9 @@ fn proc_times(pid: u32) -> (u64, u64, u64) {
         QueryProcessCycleTime(h, &mut cycles);
         let mut m: PROCESS_MEMORY_COUNTERS_EX = zeroed();
         m.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let private = if K32GetProcessMemoryInfo(h, &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) != 0 { m.PrivateUsage as u64 } else { 0 };
+        let (private, working_set) = if K32GetProcessMemoryInfo(h, &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) != 0 { (m.PrivateUsage as u64, m.WorkingSetSize as u64) } else { (0, 0) };
         CloseHandle(h);
-        (cpu, cycles, private)
+        (cpu, cycles, private, working_set)
     }
 }
 
@@ -214,6 +215,16 @@ pub fn session_locked() -> bool {
         let locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
         WTSFreeMemory(buf as _);
         locked
+    }
+}
+
+/// Turns a display that went dark on idle back on: a mouse move of zero pixels, which is user input to
+/// Windows but moves nothing. Chromium marks its windows hidden while the display is off.
+pub fn wake_display() {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{INPUT, INPUT_0, INPUT_MOUSE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput};
+    let input = INPUT { r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dx: 0, dy: 0, mouseData: 0, dwFlags: MOUSEEVENTF_MOVE, time: 0, dwExtraInfo: 0 } } };
+    unsafe {
+        SendInput(1, &input, size_of::<INPUT>() as i32);
     }
 }
 

@@ -36,7 +36,7 @@ fn tools() -> Value {
             "base": s("baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"), "aa": b("same build on both sides (checks the method)"),
             "filter": s("case glob"), "target": s("one target name from the file"), "params": s("k=v,k2=v2"),
             "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
-            "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks"),
+            "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks; memory runs a leak run per variant (no --base needed)"), "repeat": n("leak run: N runs to the middle snapshot and N more to the last (default 10)"),
             "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("keep (default) or high (High performance plan for the run, restored after)"),
             "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
             "timeout": n("seconds before returning while it keeps running (default 600)") } } },

@@ -45,6 +45,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
   "Win32_UI_WindowsAndMessaging",
+  "Win32_UI_Input_KeyboardAndMouse",
   "Win32_Graphics_Gdi",
   # OS and GPU sampler: console (top), NVML loaded at runtime, D3DKMT adapter names, NtQuerySystemInformation.
   "Win32_System_Console",

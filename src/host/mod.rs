@@ -37,6 +37,12 @@ pub fn session_locked() -> bool {
     }
 }
 
+/// Turns the display back on if it went dark on idle (a zero-pixel mouse move on Windows).
+pub fn wake_display() {
+    #[cfg(windows)]
+    win::wake_display();
+}
+
 /// While alive, keeps the machine awake and, while the session is unlocked, the display on (an
 /// unattended bench must not let the display sleep under it; a locked screen may go dark while the
 /// bench waits), and counts how often it saw the session locked, every 500 ms.
@@ -93,6 +99,7 @@ pub struct ProcTimes {
     /// CPU cycles charged so far (TSC units on x64): exact, where `cpu_ns` moves in clock ticks.
     pub cycles: u64,
     pub private_bytes: u64,
+    pub working_set: u64,
 }
 
 /// Every process in the tree rooted at `root`, with CPU times.

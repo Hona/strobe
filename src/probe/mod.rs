@@ -1,6 +1,7 @@
 //! Collecting data from a target (SPEC §8).
 
 pub mod alloc;
+pub mod census;
 pub mod cpu;
 pub mod gpu;
 pub mod heap;

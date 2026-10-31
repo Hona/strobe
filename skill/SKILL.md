@@ -13,7 +13,7 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
     strobe bench <file.bench.ts> --head <variant> [--base <variant>] [--filter <case>] [--target <name>]
                  [--params k=v] [--primary <metric>] [--aa] [--pairs auto|N] [--runs 5] [--power keep|high]
-                 [--why auto|always|never] [--trace lean|full]
+                 [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10]
         variant: a directory, a git ref, app:<id>, exe:<path>
     strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout gc heap leaks sql
         hotspots and alloc take --by function|file|package; a..b works with heap; --reveal shows heap strings
@@ -59,7 +59,8 @@ Everything about the app under test lives in its repo's `strobe.json`: `build` a
 Did my change help? `bench <file> --base origin/dev --head .` and read the verdict per series.
 Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
 Which objects are alive? `query <rec> heap` (classes by retained size, detached DOM, retainer paths); `query <base rec>..<head rec> heap` compares two.
-Is it leaking? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.
+Does a case leak? `bench <file> --filter <case> --head . --probes memory --repeat 10`: growth per run of the JS heap and DOM with an interval, and the objects from the first half still alive at the end (`query <rec> leaks`).
+Is an app leaking over time? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.
 Is the method sound here? `bench <file> --aa --head .`.
 
 ## Notes

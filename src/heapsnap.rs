@@ -788,11 +788,18 @@ fn born(s: &Snapshot, is_new: impl Fn(u32) -> bool, top: usize, reveal: bool) ->
             })
         })
         .collect();
+    // The engine's own memory (compiled code, hidden internals, object shapes) grows while the JIT
+    // compiles and optimizes; only the app's objects, closures, arrays, strings and DOM make a leak.
+    let engine: Vec<u8> = ["code", "hidden", "object shape", "synthetic"].iter().map(|t| s.node_type(t)).collect();
+    let app = |v: usize| flag[v] && !engine.contains(&s.ntype[v]);
+    let app_retained = s.exclusive(1, |v| if app(v) { 0 } else { NONE })[0];
+    let (app_count, app_self) = (0..n).filter(|&v| app(v)).fold((0u64, 0u64), |a, v| (a.0 + 1, a.1 + s.size[v] as u64));
     json!({
         "by": "id",
         "count": stats.iter().map(|x| x.0).sum::<u64>(),
         "self_size": stats.iter().map(|x| x.1).sum::<u64>(),
         "retained_size": total,
+        "app": { "count": app_count, "self_size": app_self, "retained_size": app_retained },
         "classes_total": order.len(),
         "classes": classes,
     })

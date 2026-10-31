@@ -224,7 +224,7 @@ impl Symbolizer {
             flate2::read::GzDecoder::new(f).read_to_string(&mut text).ok()?;
             SourceMap::parse(&text)
         });
-        let Some(o) = map.as_ref().and_then(|m| m.lookup(line0 as usize, col0)) else { return plain };
+        let Some(o) = map.as_ref().and_then(|m| m.lookup(line0 as usize, col0, if minified.starts_with('(') { "" } else { minified })) else { return plain };
         let file = entry["map_dir"].as_str().map(|d| normalize(&Path::new(d).join(strip_scheme(&o.source)))).filter(|p| p.is_file());
         // Without a name in the map, the original declaration on disk usually has one.
         let (name, from) = match (&o.name, &file) {
@@ -269,14 +269,25 @@ fn declared_name(line: &str, col: usize) -> Option<String> {
     if let Some(after) = trimmed.strip_prefix("function") {
         let skip = chars.len() - after.chars().count();
         let at = skip + after.chars().take_while(|c| c.is_whitespace() || *c == '*').count();
-        return ident(at);
+        // An anonymous `function (` falls through to the name it is assigned to.
+        if let Some(n) = ident(at) {
+            return Some(n);
+        }
     }
     if let Some(n) = ident(col).filter(|n| chars.get(col + n.chars().count()) == Some(&'(') && !matches!(n.as_str(), "if" | "for" | "while" | "switch" | "catch")) {
         return Some(n);
     }
-    // `name = (`, `name = async (`, `name: function (`, `name = x =>`: the identifier before `=` or `:`.
     let before: String = chars[..col.min(chars.len())].iter().collect();
-    let head = before.trim_end().trim_end_matches("async").trim_end();
+    let tail = |s: &str| -> String { s.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect() };
+    // At the parameter list (`function name(`, a method's `name(`): the identifier just before it.
+    if matches!(chars.get(col), Some('(') | Some('<')) {
+        let name = tail(before.trim_end());
+        if !name.is_empty() && !matches!(name.as_str(), "function" | "async" | "if" | "for" | "while" | "switch" | "catch" | "return") {
+            return Some(name);
+        }
+    }
+    // `name = (`, `name = async (`, `name: function (`, `name = x =>`: the identifier before `=` or `:`.
+    let head = before.trim_end().trim_end_matches("function").trim_end().trim_end_matches("async").trim_end();
     let head = head.strip_suffix('=').or_else(|| head.strip_suffix(':'))?.trim_end();
     let name: String = head.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect();
     (!name.is_empty()).then_some(name)
@@ -368,15 +379,18 @@ impl SourceMap {
     }
 
     /// The original location (0-based) and name at a generated position. V8 places a function at its
-    /// start (`function` or the parameter list), while minifiers name the identifier segment just
-    /// after it, so a name up to 40 columns on in the same source is taken too.
-    fn lookup(&self, line: usize, col: i64) -> Option<Original> {
+    /// start: the `function` keyword (coverage ranges), or the parameter list (profiles), where the
+    /// generated name `minified` ends right before it. So the name is the segment's own, else the
+    /// segment that ends exactly where `minified` does, else one up to 40 columns on in the same source.
+    fn lookup(&self, line: usize, col: i64, minified: &str) -> Option<Original> {
         let segs = self.lines.get(line)?;
         let i = segs.partition_point(|s| s[0] <= col);
         let s = segs.get(i.checked_sub(1)?)?;
         let source = self.sources.get(usize::try_from(s[1]).ok()?)?.clone();
         let named = |seg: &[i64; 5]| usize::try_from(seg[4]).ok().and_then(|n| self.names.get(n)).cloned();
-        let name = named(s).or_else(|| segs[i..].iter().take_while(|n| n[0] <= col + 40 && n[1] == s[1]).find_map(named));
+        let width = minified.encode_utf16().count() as i64;
+        let before = (width > 0).then(|| segs[..i].iter().rev().find(|n| n[0] + width == col && n[1] == s[1])).flatten().and_then(named);
+        let name = named(s).or(before).or_else(|| segs[i..].iter().take_while(|n| n[0] <= col + 40 && n[1] == s[1]).find_map(named));
         Some(Original { source, line: s[2], column: s[3], name })
     }
 }

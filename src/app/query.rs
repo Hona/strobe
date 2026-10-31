@@ -526,6 +526,10 @@ pub fn package(url: &str) -> String {
     if let Some(name) = declared {
         return name;
     }
+    // A file on disk outside any package: the app's own code.
+    if url.starts_with('/') || url.as_bytes().get(1) == Some(&b':') {
+        return "(app)".into();
+    }
     let path = short_url(url);
     let mut parts = path.split('/').filter(|s| !s.is_empty());
     match parts.next() {

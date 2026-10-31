@@ -10,7 +10,7 @@ use crate::probe::{self, Set};
 use crate::runner::Runner;
 use crate::stats::{self, Comparison};
 use crate::store;
-use crate::target::chromium::{self, Window};
+use crate::target::chromium::{self, Page, Window};
 use crate::target::electron;
 use crate::validity::{self, Warning};
 use serde::Serialize;
@@ -107,6 +107,8 @@ struct Ctx<'a> {
     describe: Value,
     runner: Runner,
     window: Window,
+    /// The window the last block actually used (a target's viewport overrides the default).
+    used: Option<Window>,
     pin: Option<u64>,
     gpu_checked: bool,
     gpu: Value,
@@ -134,6 +136,11 @@ pub fn run(args: &Args) -> Result<Output> {
     let _lock = validity::lock()?;
     let project = project_root(&file);
     let config = read_config(&project);
+    let _power = match args.get("power").unwrap_or("keep") {
+        "keep" => None,
+        "high" => Some(PowerPlan::high()?),
+        other => return Err(Error::usage(format!("--power: keep or high, not {other}"))),
+    };
     let env = host::env();
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
@@ -146,6 +153,7 @@ pub fn run(args: &Args) -> Result<Output> {
         describe: Value::Null,
         runner,
         window: Window::default(),
+        used: None,
         pin,
         gpu_checked: false,
         gpu: Value::Null,
@@ -186,7 +194,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let refresh = host::refresh_at(ctx.window.x + 20, ctx.window.y + 20);
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
-        "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.window, "refresh_hz": refresh,
+        "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
         "plan": { "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa },
         "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label })).collect::<Vec<_>>(),
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided,
@@ -217,6 +225,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         Some("auto") | None => (6usize, 40usize),
         Some(n) => {
             let n = n.parse::<usize>().map_err(|_| Error::usage("--pairs: auto or a number"))?.max(2);
+            if n < stats::min_pairs(0.95) {
+                ctx.warnings.push(validity::info("FewPairs", format!("--pairs {n}: below {} pairs no interval reaches 95%, so nothing gets a verdict (a smoke run)", stats::min_pairs(0.95))));
+            }
             (n, n)
         }
     };
@@ -378,7 +389,9 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
         if v.len() >= 3 {
             let mean = v.iter().sum::<f64>() / v.len() as f64;
             let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (v.len() - 1) as f64).sqrt();
-            if mean > 0.0 && sd / mean > 0.10 {
+            // A CV means nothing near zero: 0.1% vs 0% dropped frames is not variance worth a warning.
+            let tiny = matches!(def.unit, "%" | "count") && mean < 1.0;
+            if mean > 0.0 && !tiny && sd / mean > 0.10 {
                 w.push(validity::warn("HighVariance", format!("{role}: {} varies {:.0}% between launches (CV)", def.name, 100.0 * sd / mean)));
             }
         }
@@ -418,6 +431,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
     window.scale = target["scale"].as_f64();
+    ctx.used = Some(window.clone());
     let mut service = None;
     let browser = if app {
         let exe = variant_exe(v, &target)?;
@@ -446,6 +460,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if let Some(before) = &service {
             electron::guard(before, "after the app opened its window")?;
         }
+        if !app && target.get("viewport").is_some_and(Value::is_object) {
+            browser.fit_viewport(&page, window.width, window.height)?;
+        }
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
         let driver = Driver::new(page.clone(), token.clone());
@@ -470,9 +487,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
         };
         let t = Duration::from_secs(120);
-        ctx.runner.call("block", json!({ "params": s.params, "target": s.target, "variant": v.role }), t, &serve)?;
+        ctx.runner.call("block", json!({ "params": s.params, "target": s.target, "variant": v.role, "url": url }), t, &serve)?;
         if target["prepare"].as_bool() == Some(true) {
-            ctx.runner.call("prepare", json!({ "endpoint": browser.ws }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
+            ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
         }
         if !app {
             page.navigate(&url, Duration::from_secs(60))?;
@@ -481,7 +498,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let speed = validity::speed_check(&page)?;
         let ratio = validity::throttled(speed, ctx.baseline)?;
         validity::window_visible(&page)?;
-        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}", e.message), "fix the bench file's setup"))?;
+        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
         let tracing = probe::trace::start(&browser.cdp, set)?;
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<(f64, f64)> {
@@ -491,14 +508,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let t0 = host::now_ns();
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}", s.case, e.message), "the run threw or timed out; fix the bench file or the app"))?;
+                .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
             driver.mark(&format!("{key}:end"))?;
             let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
             if s.reset {
-                ctx.runner.call("reset", json!({ "case": s.case }), run_timeout, &serve)?;
+                ctx.runner
+                    .call("reset", json!({ "case": s.case }), run_timeout, &serve)
+                    .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "reset")), "fix the case's reset"))?;
             }
             let wall = (t1 - t0) as f64;
             Ok((wall / 1e6, if wall > 0.0 { 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall } else { f64::NAN }))
@@ -583,6 +602,50 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         electron::guard(before, "after a block")?;
     }
     result
+}
+
+/// `--power high`: the High performance plan for the run, then the previous plan again (also on error).
+/// Not the default: AMD X3D core parking relies on Balanced to keep work on the V-Cache CCD.
+struct PowerPlan {
+    previous: String,
+}
+
+impl PowerPlan {
+    fn high() -> Result<PowerPlan> {
+        if !cfg!(windows) {
+            return Err(Error::usage("--power high only switches Windows power plans"));
+        }
+        let active = host::output(Command::new("powercfg").arg("/getactivescheme")).unwrap_or_default();
+        let previous = active.split_whitespace().find(|w| w.len() == 36 && w.matches('-').count() == 4).map(str::to_string).ok_or_else(|| Error::msg("powercfg: could not read the active power plan"))?;
+        if !Command::new("powercfg").args(["/setactive", "SCHEME_MIN"]).stdout(Stdio::null()).status()?.success() {
+            return Err(Error::msg("powercfg could not switch to High performance"));
+        }
+        progress("  power plan: High performance for this run");
+        Ok(PowerPlan { previous })
+    }
+}
+
+impl Drop for PowerPlan {
+    fn drop(&mut self) {
+        let _ = Command::new("powercfg").args(["/setactive", &self.previous]).stdout(Stdio::null()).status();
+    }
+}
+
+/// What the page showed when a step failed: its URL and a screenshot saved with the experiment.
+fn snapshot(page: &Page, exp: &str, step: &str) -> String {
+    use base64::Engine;
+    let quick = Duration::from_secs(5);
+    let url = page.eval_timeout("location.href", quick).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "unresponsive".into());
+    let shot = page
+        .cdp
+        .send_timeout("Page.captureScreenshot", json!({ "format": "png" }), Some(&page.session), quick)
+        .ok()
+        .and_then(|r| r["data"].as_str().and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok()));
+    let path = store::experiment_dir(exp).ok().map(|d| d.join(format!("failed-{step}-{}.png", store::new_id("shot").trim_start_matches("shot_"))));
+    match (shot, path) {
+        (Some(png), Some(path)) if std::fs::write(&path, &png).is_ok() => format!("\n  page: {url}\n  screenshot: {}", path.display()),
+        _ => format!("\n  page: {url}"),
+    }
 }
 
 /// The executable an app target runs for a variant: the variant's own (`app:`/`exe:`), else the target's.

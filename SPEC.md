@@ -543,6 +543,9 @@ flowchart LR
 - **Verdicts**: interval entirely on the better side of 0 → `faster` (`less`, `fewer`); tagged
   `small` when it also overlaps the bound. Entirely on the worse side → `slower`. Inside the
   bound → `same`. Otherwise `unclear`.
+- **Coverage**: a verdict needs an interval that reaches the confidence level. Below 6 pairs the
+  signed-rank interval is `[min, max]` of the Walsh averages and covers only `1 − 2^(1−n)` (50% at
+  2 pairs, 94% at 5), so it never gets a verdict; `--pairs N` below 6 is a smoke run (`FewPairs`).
 - **Gate**: secondary metrics get verdict words only after the primary has a verdict
   (`faster`, `slower` or `same`), with Holm correction across secondaries. Otherwise they show
   intervals without verdicts.
@@ -612,28 +615,37 @@ A benchmark is a small TypeScript file, in the spirit of BenchmarkDotNet:
 ```ts
 // packages/app/perf/timeline.bench.ts
 import { bench, web, app } from "@strobe/bench"
-import { mockOpenCodeServer } from "../e2e/utils/mock-server"
-import { longSession } from "./fixtures"
+import { mockTimelineSession } from "../e2e/performance/timeline/session-timeline-benchmark.fixture"
 
 export default bench({
   targets: {
     web: web({
-      url: "/",
-      prepare: ({ playwright, params }) => mockOpenCodeServer(playwright.page, longSession(params.turns)),
+      viewport: { width: 1366, height: 768 },
+      prepare: ({ playwright, params, url }) =>
+        mockTimelineSession(playwright.page, { historyTurns: params.turns, server: new URL(url).origin }),
     }),
     desktop: app("opencode", { home: "perf/fixtures/home-{turns}" }),
   },
   params: { turns: [24, 200] },
-  async setup({ page }) {
-    await page.click("[data-session-row]")
-    await page.waitFor("[data-component=timeline]")
+  async setup({ page, prepared }) {
+    await page.goto(prepared.path, { until: "[data-timeline-row]" })
+    await page.idle()
   },
   cases: {
     scroll: {
-      primary: "frames.presented.p95",
+      primary: "main.busy",
       async run({ page, phase }) {
-        await phase("down", () => page.scroll("[data-timeline]", { by: 4000 }))
-        await phase("up", () => page.scroll("[data-timeline]", { by: -4000 }))
+        await phase("up", () => page.scroll("[data-timeline]", { by: -4000, speed: 3000 }))
+        await phase("down", () => page.scroll("[data-timeline]", { by: 4000, speed: 3000 }))
+      },
+    },
+    type: {
+      primary: "interaction.p95",
+      run: ({ page }) => page.type("[data-component=composer-editor]", "Refactor the timeline", { delay: 80 }),
+      async reset({ page }) {
+        await page.press("ControlOrMeta+a")
+        await page.press("Backspace")
+        await page.idle()
       },
     },
     "switch-session": {
@@ -664,7 +676,11 @@ export default bench({
   block (`{param}` placeholders allowed; the seed must open with both variants, so create it
   with the base build). `exe(path, { home? })` and `url(href)` also exist.
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
-  (`ctx.playwright.page`), and only on targets with a debug port.
+  (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
+  targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
+  its own server, so mock the API under `new URL(url).origin`. Playwright stays connected for the
+  whole block, so routes and init scripts keep working. What `prepare` returns is
+  `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
 - `params`: arrays of values; the cartesian product makes series.
 - `setup(ctx)`: once per block, after load, never measured.
 - `cases.<name>`: `primary` (metric name, required), `run(ctx)` (measured), `reset(ctx)`
@@ -672,17 +688,19 @@ export default bench({
   (optional extra attribution probes).
 
 **`ctx`:** `page`, `phase(name, fn)`, `params`, `target` (its name), `variant` (`base` or
-`head`, for logging only), `playwright` (in `prepare` only).
+`head`, for logging only), `url`, `prepared`, `playwright` (in `prepare` only).
 
 **`page` driver** (strobe's own, over CDP or the bridge, so it works on Stable):
 
 | Call | Does |
 |---|---|
-| `goto(url, opts?)` | navigate and wait for load |
+| `goto(url, opts?)` | navigate and wait for load; a relative path resolves against the page |
 | `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre |
-| `type(selector, text, opts?)` / `press(key, opts?)` | `Input.insertText` / `Input.dispatchKeyEvent` |
+| `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
+| `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P` |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
-| `waitFor(selector, opts?)` | resolves when the selector matches, through one in-page `MutationObserver` |
+| `waitFor(selector, { text?, timeout? })` | resolves when a visible element matches (and contains `text`), through one in-page `MutationObserver` |
+| `idle(opts?)` | the `"idle"` wait below, on its own |
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
 
@@ -718,6 +736,8 @@ sequenceDiagram
   (`{ "id", "op", "args" }` → `{ "id", "ok" | "error" }`). The runner sends `console.*` to
   stderr, which strobe keeps as the block's log.
 - A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
+  The refusal names the page's URL and saves a screenshot of the page next to the experiment
+  (`failed-<step>-….png`), so an agent can see what the app showed instead of guessing.
 - At every run start strobe reads the DOM node count; a count that drifts across runs means
   `reset` is missing (`StateDrift`).
 

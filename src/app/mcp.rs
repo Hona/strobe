@@ -37,7 +37,8 @@ fn tools() -> Value {
             "filter": s("case glob"), "target": s("one target name from the file"), "params": s("k=v,k2=v2"),
             "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
             "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks"),
-            "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "timeout": n("seconds before returning while it keeps running (default 600)") } } },
+            "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("keep (default) or high (High performance plan for the run, restored after)"),
+            "timeout": n("seconds before returning while it keeps running (default 600)") } } },
         { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (by function|file|package; attribution recordings), sql (Perfetto trace_processor SQL), progress (running experiments).",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
             "handle": s("rec_… or exp_… (a unique prefix works)"), "view": s("summary (default), frames, threads, hotspots, sql, progress"),

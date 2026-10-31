@@ -30,15 +30,18 @@ const page = {
   press: (key: string, o = {}) => driver("press", key, o),
   scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),
   waitFor: (selector: string, o = {}) => driver("waitFor", selector, o),
+  idle: (o = {}) => driver("idle", o),
   wait: (ms: number) => driver("wait", ms),
   eval: (fn: Function, ...args: unknown[]) => driver("eval", fn.toString(), ...args),
 }
 
-const state: { params: Record<string, unknown>; target: string; variant: string; playwright: any } = {
+const state: { params: Record<string, unknown>; target: string; variant: string; url: string; playwright: any; prepared: unknown } = {
   params: {},
   target: "",
   variant: "base",
+  url: "",
   playwright: null,
+  prepared: undefined,
 }
 
 const context = () => ({
@@ -46,6 +49,8 @@ const context = () => ({
   params: state.params,
   target: state.target,
   variant: state.variant,
+  url: state.url,
+  prepared: state.prepared,
   async phase<T>(name: string, fn: () => T | Promise<T>) {
     await request("phase", { name, edge: "start" })
     try {
@@ -69,7 +74,7 @@ function describe() {
   return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup }
 }
 
-async function playwright(endpoint: string) {
+async function playwright(endpoint: string, target: string) {
   const from = path.dirname(file)
   const names = ["playwright", "@playwright/test", "playwright-core"]
   const resolved = names.map((n) => { try { return Bun.resolveSync(n, from) } catch { return undefined } }).find(Boolean)
@@ -77,8 +82,22 @@ async function playwright(endpoint: string) {
   const { chromium } = await import(resolved)
   const browser = await chromium.connectOverCDP(endpoint)
   const context = browser.contexts()[0]
-  const page = context.pages()[0] ?? (await context.newPage())
-  return { browser, context, page }
+  return { browser, context, page: await strobePage(context, target) }
+}
+
+// The page strobe drives, by CDP target id: Playwright may attach to pages late, and a page of
+// Playwright's own would never see strobe's navigation.
+async function strobePage(context: any, target: string) {
+  const deadline = Date.now() + 10_000
+  while (Date.now() < deadline) {
+    for (const page of context.pages()) {
+      const session = await context.newCDPSession(page)
+      const info = await session.send("Target.getTargetInfo").finally(() => session.detach().catch(() => {}))
+      if (info.targetInfo.targetId === target) return page
+    }
+    await Bun.sleep(50)
+  }
+  throw new Error(`Playwright did not attach to the page strobe opened (${target}) in 10 s`)
 }
 
 async function handle(op: string, args: any) {
@@ -86,13 +105,13 @@ async function handle(op: string, args: any) {
     case "describe":
       return describe()
     case "block":
-      Object.assign(state, { params: args.params ?? {}, target: args.target, variant: args.variant })
+      Object.assign(state, { params: args.params ?? {}, target: args.target, variant: args.variant, url: args.url ?? "", prepared: undefined })
       return true
     case "prepare": {
       const target = spec.targets[state.target]
       if (!target?.prepare) return false
-      state.playwright = await playwright(args.endpoint)
-      await target.prepare({ params: state.params, target: state.target, variant: state.variant, playwright: state.playwright })
+      state.playwright = await playwright(args.endpoint, args.target)
+      state.prepared = await target.prepare({ params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
       return true
     }
     case "setup":

@@ -9,7 +9,8 @@ use std::time::Duration;
 const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
   const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 }
-  s.find = (sel) => { const el = document.querySelector(sel); return el && visible(el) ? el : null }
+  s.find = (sel, text) => [...document.querySelectorAll(sel)].find((el) => visible(el) && (text == null || (el.textContent ?? "").includes(text))) ?? null
+  s.focused = (sel) => { const el = s.find(sel); return !!el && el.contains(document.activeElement) }
   s.box = (sel) => {
     const el = s.find(sel)
     if (!el) return null
@@ -17,11 +18,11 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) { el.scrollIntoView({ block: "nearest", inline: "nearest" }); r = el.getBoundingClientRect() }
     return { x: r.left + Math.min(r.width, innerWidth) / 2, y: r.top + Math.min(r.height, innerHeight) / 2, w: r.width, h: r.height }
   }
-  s.waitFor = (sel, timeout) => new Promise((resolve, reject) => {
-    if (s.find(sel)) return resolve(true)
-    const mo = new MutationObserver(() => { if (s.find(sel)) { mo.disconnect(); clearTimeout(t); resolve(true) } })
-    mo.observe(document, { subtree: true, childList: true, attributes: true })
-    const t = setTimeout(() => { mo.disconnect(); reject(new Error("timed out waiting for " + sel)) }, timeout)
+  s.waitFor = (sel, timeout, text) => new Promise((resolve, reject) => {
+    if (s.find(sel, text)) return resolve(true)
+    const mo = new MutationObserver(() => { if (s.find(sel, text)) { mo.disconnect(); clearTimeout(t); resolve(true) } })
+    mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: text != null })
+    const t = setTimeout(() => { mo.disconnect(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : " containing " + JSON.stringify(text)))) }, timeout)
   })
   s.idle = (quiet, timeout) => new Promise((resolve, reject) => {
     let timer, po
@@ -58,6 +59,12 @@ impl Driver {
         self.page.eval(expr)
     }
 
+    /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
+    fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
+        self.helper()?;
+        self.page.eval_timeout(expr, timeout + Duration::from_secs(10))
+    }
+
     /// Writes a `performance.mark` that the trace records on its own clock.
     pub fn mark(&self, name: &str) -> Result<()> {
         let full = format!("strobe:{}:{}", self.token, name.replace(['"', '\\', '\n'], "_"));
@@ -74,7 +81,10 @@ impl Driver {
         let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
         match call {
             "goto" => {
-                self.page.navigate(&s(0), self.timeout(&opts(1)))?;
+                let to = s(0);
+                // Relative paths resolve against the page, like a link would.
+                let url = if to.contains("://") || to.starts_with("about:") { to } else { self.page.eval(&format!("new URL({}, location.href).href", json!(to)))?.as_str().unwrap_or_default().to_string() };
+                self.page.navigate(&url, self.timeout(&opts(1)))?;
                 self.until(&opts(1))
             }
             "click" => {
@@ -87,12 +97,27 @@ impl Driver {
                 self.until(&opts(1))
             }
             "type" => {
-                let (x, y) = self.locate(&s(0), &opts(2))?;
-                for kind in ["mousePressed", "mouseReleased"] {
-                    self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }))?;
+                let o = opts(2);
+                let (x, y) = self.locate(&s(0), &o)?;
+                // Click only when focus is elsewhere, so a second call keeps typing where the caret is.
+                if self.page.eval(&format!("__strobe.focused({})", json!(s(0))))?.as_bool() != Some(true) {
+                    for kind in ["mousePressed", "mouseReleased"] {
+                        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }))?;
+                    }
                 }
-                self.page.send("Input.insertText", json!({ "text": s(1) }))?;
-                self.until(&opts(2))
+                // One key event per character, like a person typing, so each keystroke is an interaction.
+                let delay = Duration::from_millis(o.get("delay").and_then(Value::as_u64).unwrap_or(0));
+                for (i, c) in s(1).chars().enumerate() {
+                    if i > 0 && !delay.is_zero() {
+                        std::thread::sleep(delay);
+                    }
+                    match c {
+                        '\n' => self.press("Enter")?,
+                        '\t' => self.press("Tab")?,
+                        c => self.press(&c.to_string())?,
+                    }
+                }
+                self.until(&o)
             }
             "press" => {
                 self.press(&s(0))?;
@@ -111,9 +136,15 @@ impl Driver {
                 self.until(&opts(2))
             }
             "waitFor" => {
-                let t = self.timeout(&opts(1)).as_millis();
-                self.call(&format!("__strobe.waitFor({}, {t})", json!(s(0))))?;
+                let o = opts(1);
+                let t = self.timeout(&o);
+                let text = o.get("text").cloned().unwrap_or(Value::Null);
+                self.wait(&format!("__strobe.waitFor({}, {}, {text})", json!(s(0)), t.as_millis()), t)?;
                 Ok(Value::Bool(true))
+            }
+            "idle" => {
+                let t = self.timeout(&opts(0));
+                self.wait(&format!("__strobe.idle(300, {})", t.as_millis()), t)
             }
             "wait" => {
                 let ms = args.first().and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
@@ -135,9 +166,9 @@ impl Driver {
 
     /// Waits for the element, then returns the point to send input at.
     fn locate(&self, selector: &str, opts: &Value) -> Result<(f64, f64)> {
-        let t = self.timeout(opts).as_millis();
+        let t = self.timeout(opts);
         let sel = json!(selector);
-        self.call(&format!("__strobe.waitFor({sel}, {t})"))?;
+        self.wait(&format!("__strobe.waitFor({sel}, {})", t.as_millis()), t)?;
         let b = self.page.eval(&format!("__strobe.box({sel})"))?;
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {selector}")));
@@ -147,24 +178,29 @@ impl Driver {
 
     fn until(&self, opts: &Value) -> Result<Value> {
         let Some(until) = opts.get("until").and_then(Value::as_str) else { return Ok(Value::Bool(true)) };
-        let t = self.timeout(opts).as_millis();
+        let t = self.timeout(opts);
         match until {
-            "idle" => self.call(&format!("__strobe.idle(300, {t})")),
+            "idle" => self.wait(&format!("__strobe.idle(300, {})", t.as_millis()), t),
             "frame" => self.call("__strobe.frame()"),
-            sel => self.call(&format!("__strobe.waitFor({}, {t})", json!(sel))),
+            sel => self.wait(&format!("__strobe.waitFor({}, {})", json!(sel), t.as_millis()), t),
         }
     }
 
     fn press(&self, chord: &str) -> Result<()> {
-        let parts: Vec<&str> = chord.split('+').collect();
-        let key = parts.last().copied().unwrap_or("");
+        // "+" alone, or as the last key of a chord ("Control++"), is the plus key.
+        let (mods, key) = match chord.strip_suffix("++") {
+            Some(rest) => (rest, "+"),
+            None if chord == "+" => ("", "+"),
+            None => chord.rsplit_once('+').unwrap_or(("", chord)),
+        };
         let mut modifiers = 0;
-        for m in &parts[..parts.len().saturating_sub(1)] {
+        for m in mods.split('+').filter(|m| !m.is_empty()) {
             modifiers |= match m.to_ascii_lowercase().as_str() {
                 "alt" => 1,
                 "control" | "ctrl" => 2,
                 "meta" | "cmd" => 4,
                 "shift" => 8,
+                "controlormeta" | "mod" => if cfg!(target_os = "macos") { 4 } else { 2 },
                 _ => 0,
             };
         }

@@ -209,6 +209,23 @@ impl Browser {
         Ok(page)
     }
 
+    /// Resizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels.
+    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32) -> Result<()> {
+        let win = self.cdp.send("Browser.getWindowForTarget", json!({ "targetId": page.target }), None)?;
+        let inner = page.eval("[innerWidth, innerHeight]")?;
+        let num = |v: &Value| v.as_f64().unwrap_or(0.0);
+        let (dw, dh) = (num(&win["bounds"]["width"]) - num(&inner[0]), num(&win["bounds"]["height"]) - num(&inner[1]));
+        if dw.abs() < 1.0 && dh.abs() < 1.0 && num(&inner[0]) as u32 == width && num(&inner[1]) as u32 == height {
+            return Ok(());
+        }
+        self.cdp.send(
+            "Browser.setWindowBounds",
+            json!({ "windowId": win["windowId"], "bounds": { "width": (width as f64 + dw).round() as u32, "height": (height as f64 + dh).round() as u32 } }),
+            None,
+        )?;
+        Ok(())
+    }
+
     /// Every process that belongs to this target, with CPU times and private bytes.
     pub fn processes(&self) -> Vec<host::ProcTimes> {
         host::process_set(self.pid, self.profile.as_deref())
@@ -275,7 +292,12 @@ impl Page {
 
     /// Evaluates an expression and returns its value (awaiting promises).
     pub fn eval(&self, expression: &str) -> Result<Value> {
-        let r = self.send("Runtime.evaluate", json!({ "expression": expression, "awaitPromise": true, "returnByValue": true }))?;
+        self.eval_timeout(expression, Duration::from_secs(60))
+    }
+
+    /// Like `eval`, for expressions that wait in the page for up to `timeout`.
+    pub fn eval_timeout(&self, expression: &str, timeout: Duration) -> Result<Value> {
+        let r = self.cdp.send_timeout("Runtime.evaluate", json!({ "expression": expression, "awaitPromise": true, "returnByValue": true }), Some(&self.session), timeout)?;
         if let Some(ex) = r.get("exceptionDetails") {
             let text = ex["exception"]["description"].as_str().or_else(|| ex["text"].as_str()).unwrap_or("exception");
             return Err(Error::msg(format!("page: {}", text.lines().next().unwrap_or(text))));

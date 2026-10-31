@@ -201,7 +201,9 @@ pub fn compare(def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f6
     let bound_abs = if relative { bound } else { (bound * base.abs()).max(0.5) };
     let good_low = def.better == Better::Lower;
     let n = d.len();
-    let (verdict, decided) = if n < 2 || !est.is_finite() {
+    // Below 6 pairs no signed-rank interval reaches 95%: its [min, max] covers only 1 − 2^(1−n).
+    let covered = achieved + 1e-9 >= confidence;
+    let (verdict, decided) = if n < 2 || !est.is_finite() || !covered {
         ("unclear".to_string(), false)
     } else if hi < 0.0 || lo > 0.0 {
         let improved = (hi < 0.0) == good_low;
@@ -218,9 +220,15 @@ pub fn compare(def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f6
         let dist_diff = est.abs();
         let dist_same = bound_abs - est.abs();
         let dist = dist_diff.max(dist_same);
-        if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize }
+        let estimate = if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize };
+        estimate.max(min_pairs(confidence))
     });
     Comparison { metric: def.name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs }
+}
+
+/// The fewest pairs whose signed-rank interval can reach `confidence` (6 at 95%).
+pub fn min_pairs(confidence: f64) -> usize {
+    (1..=50).find(|&n| 1.0 - 2f64.powi(1 - n as i32) >= confidence).unwrap_or(50)
 }
 
 fn fmt_bound(bound: f64, relative: bool, abs: f64) -> String {

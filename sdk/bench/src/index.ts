@@ -10,12 +10,18 @@ export interface Options {
 }
 
 export interface Page {
+  /** Opens `url`; a relative path resolves against the current page. */
   goto(url: string, opts?: Options): Promise<void>
   click(selector: string, opts?: Options): Promise<void>
-  type(selector: string, text: string, opts?: Options): Promise<void>
+  /** Focuses `selector` (clicking it if focus is elsewhere), then sends one key event per character. */
+  type(selector: string, text: string, opts?: Options & { delay?: number }): Promise<void>
+  /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. */
   press(key: string, opts?: Options): Promise<void>
   scroll(selector: string, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
-  waitFor(selector: string, opts?: { timeout?: number }): Promise<void>
+  /** Resolves when a visible element matches `selector` (and contains `text`, if given). */
+  waitFor(selector: string, opts?: { text?: string; timeout?: number }): Promise<void>
+  /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */
+  idle(opts?: { timeout?: number }): Promise<void>
   wait(ms: number): Promise<void>
   /** Runs `fn` in the page. Only in `prepare`, `setup` and `reset`: it costs main-thread time. */
   eval<A extends unknown[], T>(fn: (...args: A) => T, ...args: A): Promise<Awaited<T>>
@@ -28,12 +34,18 @@ export interface Context<P> {
   params: P
   target: string
   variant: "base" | "head"
+  /** The URL this block opened (empty for app targets). */
+  url: string
+  /** What the target's `prepare` returned for this block. */
+  prepared: any
 }
 
 export interface PrepareContext<P> {
   params: P
   target: string
   variant: "base" | "head"
+  /** The URL strobe opens after `prepare`, such as the variant's server; mock its API under `new URL(url).origin`. */
+  url: string
   /** Playwright, connected to this block's browser. Only on targets with a debug port. */
   playwright: { browser: any; context: any; page: any }
 }

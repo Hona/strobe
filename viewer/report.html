@@ -1,7 +1,1681 @@
 <!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>strobe report</title></head>
-<body><pre id="out"></pre>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>strobe report</title>
+<style>
+:root {
+  --bg: #ffffff; --bg-2: #f7f7f7; --bg-3: #eeeeee;
+  --fg: #171717; --fg-2: #5e5e5e; --fg-3: #8f8f8f;
+  --line: #e4e4e4; --line-2: #cdcdcd;
+  --accent: #009fff; --accent-bg: rgba(0, 159, 255, .10);
+  --ok: #1f9d55; --warn: #c88a04; --err: #e0443e;
+  --base: #8a8a8a; --head: #009fff;
+  --band: rgba(0, 0, 0, .045);
+  --sans: system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+  --mono: ui-monospace, "SF Mono", SFMono-Regular, "Cascadia Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111111; --bg-2: #171717; --bg-3: #1f1f1f;
+    --fg: #e7e7e7; --fg-2: #a6a6a6; --fg-3: #6f6f6f;
+    --line: #262626; --line-2: #383838;
+    --accent-bg: rgba(0, 159, 255, .15);
+    --ok: #3fb950; --warn: #d8a227; --err: #f25450;
+    --base: #8c8c8c;
+    --band: rgba(255, 255, 255, .055);
+  }
+}
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { background: var(--bg); color: var(--fg); font: 13px/18px var(--sans); -webkit-text-size-adjust: 100%; }
+body { min-width: 320px; }
+button { font: inherit; color: var(--fg); background: var(--bg); border: 1px solid var(--line-2); border-radius: 0; height: 24px; padding: 0 8px; cursor: pointer; white-space: nowrap; }
+button:hover { border-color: var(--fg-3); }
+:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; }
+code, .mono { font: 11px/16px var(--mono); }
+.dim { color: var(--fg-3); }
+.dim2 { color: var(--fg-2); }
+.wrap { overflow-wrap: anywhere; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* status */
+.st-better { --st: var(--ok); } .st-worse { --st: var(--err); } .st-same { --st: var(--fg-2); }
+.st-warn { --st: var(--warn); } .st-gated { --st: var(--fg-2); } .st-desc { --st: var(--fg-3); }
+.st-ok { --st: var(--ok); } .st-err { --st: var(--err); } .st-info { --st: var(--accent); }
+.c-better { color: var(--ok); } .c-worse { color: var(--err); } .c-same { color: var(--fg-2); }
+.c-warn { color: var(--warn); } .c-gated, .c-desc { color: var(--fg-3); }
+.sq { display: inline-block; width: 8px; height: 8px; background: var(--st, var(--fg-3)); flex: none; }
+.sw { display: inline-block; width: 10px; height: 10px; flex: none; }
+.sw.base { background: var(--base); } .sw.head { background: var(--head); }
+
+/* header */
+header.top { position: sticky; top: 0; z-index: 20; height: 40px; display: flex; align-items: center; gap: 12px; padding: 0 16px; background: var(--bg); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 600; flex: none; }
+.crumbs { display: flex; align-items: center; gap: 12px; min-width: 0; flex: 1 1 0; white-space: nowrap; overflow: hidden; }
+.crumbs > * { min-width: 0; overflow: hidden; text-overflow: ellipsis; flex: 0 1 auto; }
+.crumbs .id { flex: none; color: var(--fg-2); }
+.crumbs .time { color: var(--fg-3); }
+.tabs { display: flex; height: 40px; overflow-x: auto; flex: 0 1 auto; max-width: 60%; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab { height: 40px; border: 0; border-bottom: 1px solid transparent; background: none; padding: 0 10px; color: var(--fg-2); display: flex; align-items: center; gap: 6px; }
+.tab:hover { color: var(--fg); }
+.tab[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+.toggle { flex: none; color: var(--fg-2); }
+.toggle[aria-pressed="true"] { color: var(--accent); border-color: var(--accent); background: var(--accent-bg); }
+@media (max-width: 760px) { .crumbs .time { display: none; } }
+
+/* layout */
+main { max-width: 1600px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+.grid2 { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+.grid3 { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr) minmax(0, 1fr); gap: 16px; }
+@media (max-width: 1100px) { .grid2, .grid3 { grid-template-columns: minmax(0, 1fr); } }
+.panel { border: 1px solid var(--line); background: var(--bg); min-width: 0; container-type: inline-size; }
+.ph { display: flex; align-items: center; gap: 4px 10px; min-height: 37px; padding: 6px 12px; border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+.ph h2 { font-size: 13px; line-height: 18px; font-weight: 600; }
+.ph .sub { color: var(--fg-3); min-width: 0; }
+.ph .ctl { margin-left: auto; display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.pb { padding: 12px; }
+.pb.flush { padding: 0; }
+.seg { display: inline-flex; border: 1px solid var(--line-2); }
+.seg button { border: 0; height: 22px; padding: 0 8px; background: transparent; color: var(--fg-2); }
+.seg button + button { border-left: 1px solid var(--line-2); }
+.seg button:hover { color: var(--fg); }
+.seg button[aria-pressed="true"] { background: var(--accent-bg); color: var(--accent); }
+.btns { display: inline-flex; gap: 4px; }
+.btns button { height: 24px; min-width: 26px; padding: 0 7px; color: var(--fg-2); }
+.chart { position: relative; width: 100%; overflow: hidden; }
+.legend { display: flex; gap: 6px 14px; flex-wrap: wrap; align-items: center; color: var(--fg-3); }
+.legend > span { display: inline-flex; align-items: center; gap: 6px; }
+
+/* hero */
+.hero { display: grid; grid-template-columns: minmax(0, 1.5fr) minmax(280px, 1fr); border-top-color: var(--st); }
+.hero-main { padding: 14px 16px 6px; min-width: 0; }
+.hero-metric { display: flex; gap: 8px; align-items: baseline; color: var(--fg-2); flex-wrap: wrap; }
+.hero-metric .mono { color: var(--fg); font-size: 12px; }
+.hero-verdict { font-size: 32px; line-height: 40px; font-weight: 600; margin: 6px 0 2px; letter-spacing: -.01em; display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+.hero-tag { font-size: 13px; line-height: 18px; font-weight: 400; color: var(--fg-2); border: 1px solid var(--line-2); padding: 0 6px; letter-spacing: 0; }
+.hero-change { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.big-num { font-size: 18px; line-height: 24px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.hero-chart { margin-top: 6px; }
+.facts { border-left: 1px solid var(--line); padding: 14px 16px; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; align-content: start; }
+.facts dt { color: var(--fg-3); white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.facts dd { min-width: 0; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .hero { grid-template-columns: minmax(0, 1fr); } .facts { border-left: 0; border-top: 1px solid var(--line); } }
+
+/* forest */
+.forest { --fcols: minmax(150px, 1.25fr) 72px 72px minmax(170px, 3fr) 70px 168px minmax(120px, 1fr); }
+@container (max-width: 900px) {
+  .forest { --fcols: minmax(130px, 1.2fr) minmax(150px, 3fr) 70px 164px minmax(110px, 1fr); }
+  .forest .c-base, .forest .c-head { display: none; }
+}
+@container (max-width: 700px) {
+  .forest { --fcols: minmax(146px, 1.2fr) minmax(100px, 3fr) 66px minmax(96px, 1fr); }
+  .forest .c-ci { display: none; }
+}
+.frow { display: grid; grid-template-columns: var(--fcols); align-items: center; min-height: 28px; column-gap: 10px; padding: 0 12px 0 11px; border-top: 1px solid var(--line); border-left: 1px solid transparent; cursor: pointer; }
+.frow:hover { background: var(--bg-2); }
+.frow.focus { background: var(--bg-2); border-left-color: var(--accent); }
+.frow.focus .name { color: var(--accent); }
+.frow.desc { color: var(--fg-3); }
+.frow.desc .track { opacity: .55; }
+.fhead { cursor: default; color: var(--fg-3); min-height: 30px; border-top: 0; }
+.fhead:hover { background: none; }
+.fgroup { padding: 10px 12px 4px; color: var(--fg-3); border-top: 1px solid var(--line); }
+.c-metric { display: flex; gap: 6px; align-items: center; min-width: 0; }
+.c-metric .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.star { width: 10px; flex: none; color: var(--accent); }
+.c-bar { position: relative; align-self: stretch; min-height: 28px; }
+.c-ci { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.c-verdict { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.c-verdict .vt { color: var(--fg-3); }
+.track { position: absolute; top: 0; bottom: 0; left: 8px; right: 8px; }
+.track i { position: absolute; display: block; }
+.track .band { top: 5px; bottom: 5px; background: var(--band); border-left: 1px dashed var(--line-2); border-right: 1px dashed var(--line-2); }
+.track .zero { top: 3px; bottom: 3px; width: 1px; background: var(--fg-3); }
+.track .ci { top: 50%; height: 2px; margin-top: -1px; background: var(--st); }
+.track .cap { top: 50%; height: 10px; width: 1px; margin-top: -5px; background: var(--st); }
+.track .arrow { top: 50%; width: 6px; height: 9px; margin-top: -4.5px; background: var(--st); }
+.track .arrow.l { clip-path: polygon(0 50%, 100% 0, 100% 100%); }
+.track .arrow.r { clip-path: polygon(0 0, 100% 50%, 0 100%); margin-left: -6px; }
+.track .dot { top: 50%; width: 8px; height: 8px; margin: -4px 0 0 -4px; border-radius: 50%; background: var(--st); }
+.st-gated .track .dot, .st-desc .track .dot { background: var(--bg); border: 1px solid var(--st); }
+.track .scale { right: 0; bottom: 0; font: 9px/10px var(--mono); color: var(--fg-3); }
+.axis .track span { position: absolute; top: 50%; transform: translate(-50%, -50%); font: 10px/1 var(--mono); color: var(--fg-3); white-space: nowrap; }
+.forest .legend { padding: 8px 12px; border-top: 1px solid var(--line); }
+
+/* readouts */
+.readout { display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: baseline; padding-top: 8px; border-top: 1px solid var(--line); margin-top: 6px; min-height: 35px; }
+.readout b { font-weight: 600; }
+.detail { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px 14px; padding-top: 10px; border-top: 1px solid var(--line); margin-top: 6px; }
+.detail .k { color: var(--fg-3); }
+.detail .wide { grid-column: 1 / -1; }
+
+/* distributions */
+.dist { display: grid; grid-template-columns: minmax(0, 1fr) 280px; gap: 16px; align-items: start; }
+@container (max-width: 820px) { .dist { grid-template-columns: minmax(0, 1fr); } }
+table.pct { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+table.pct th, table.pct td { padding: 3px 6px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; font-weight: 400; }
+table.pct th:first-child, table.pct td:first-child { text-align: left; color: var(--fg-3); padding-left: 0; }
+table.pct thead th { color: var(--fg-3); }
+table.pct td.b { color: var(--fg-2); }
+table.pct td.h { color: var(--fg); }
+.note { color: var(--fg-3); margin-top: 8px; }
+
+/* env, warnings, commands */
+dl.kv { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 6px 14px; }
+dl.kv dt { color: var(--fg-3); white-space: nowrap; }
+dl.kv dd { min-width: 0; overflow-wrap: anywhere; }
+.topo { display: flex; gap: 10px; flex-wrap: wrap; }
+.topo .grp { display: grid; gap: 3px; }
+.topo .cells { display: flex; flex-wrap: wrap; gap: 2px; max-width: 160px; }
+.topo .cell { width: 8px; height: 8px; border: 1px solid var(--line-2); }
+.topo .cell.on { background: var(--accent); border-color: var(--accent); }
+ul.warns { list-style: none; display: grid; gap: 8px; }
+ul.warns li { display: grid; grid-template-columns: 8px minmax(0, auto) minmax(0, 1fr); gap: 4px 10px; align-items: baseline; }
+ul.warns li .sq { position: relative; top: -1px; }
+ul.warns li .wid { color: var(--fg-2); }
+.cmds { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+.cmds > div { min-width: 0; }
+.cmd-about { color: var(--fg-3); margin-bottom: 3px; }
+.cmd-line { display: flex; border: 1px solid var(--line); background: var(--bg-2); min-width: 0; }
+.cmd-line code { flex: 1; padding: 4px 8px; overflow-x: auto; white-space: nowrap; scrollbar-width: thin; }
+.cmd-line .copy { border: 0; border-left: 1px solid var(--line); height: auto; background: none; color: var(--fg-2); }
+.cmd-line .copy.done { color: var(--ok); }
+
+/* recording */
+.tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 0; border-top: 1px solid var(--line); }
+.tile { padding: 10px 12px; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); margin: 0 -1px -1px 0; min-width: 0; }
+.tile .k { color: var(--fg-3); }
+.tile .v { font-size: 20px; line-height: 28px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.tile .s { color: var(--fg-3); }
+.gauge { height: 4px; background: var(--bg-3); margin-top: 6px; position: relative; }
+.gauge i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); }
+.values { columns: 3 240px; column-gap: 24px; }
+.values .grp { break-inside: avoid; margin-bottom: 10px; }
+.values .row { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px solid var(--line); padding: 2px 0; }
+.values .row span:last-child { font-variant-numeric: tabular-nums; }
+.values .head { color: var(--fg-3); padding: 2px 0; }
+
+/* text and empty */
+pre.text { font: 11px/16px var(--mono); white-space: pre; overflow-x: auto; padding: 12px; }
+.empty { max-width: 520px; margin: 18vh auto 0; border: 1px solid var(--line); padding: 16px; display: grid; gap: 8px; }
+
+/* svg */
+svg.plot { display: block; overflow: visible; }
+svg text { font: 10px var(--mono); fill: var(--fg-3); }
+svg text.lbl { fill: var(--fg-2); }
+svg text.acc { fill: var(--accent); }
+svg .grid { stroke: var(--line); shape-rendering: crispEdges; }
+svg .zero { stroke: var(--fg-3); shape-rendering: crispEdges; }
+svg .band { fill: var(--band); }
+svg .bandline { stroke: var(--line-2); stroke-dasharray: 3 3; shape-rendering: crispEdges; }
+svg .marker { stroke: var(--fg-3); stroke-dasharray: 2 3; shape-rendering: crispEdges; }
+svg .stop { stroke: var(--fg-2); shape-rendering: crispEdges; }
+svg .cum { fill: var(--accent); fill-opacity: .09; }
+svg .cum.now { fill-opacity: .2; }
+svg .est { stroke: var(--accent); fill: none; stroke-width: 1.5; }
+svg .est.ghost { stroke-opacity: .3; }
+svg .pdot { fill: var(--fg-2); }
+svg .pdot.future { opacity: .2; }
+svg .pdot.cur { fill: var(--accent); }
+svg .v-base { color: var(--base); }
+svg .v-head { color: var(--head); }
+svg .future { opacity: .2; }
+svg .ring { fill: none; stroke: var(--fg-3); }
+svg .hit { fill: transparent; }
+svg .curpair { fill: none; stroke: var(--accent); shape-rendering: crispEdges; }
+svg .pairband { fill: var(--band); }
+svg .hair { stroke: var(--fg-2); shape-rendering: crispEdges; pointer-events: none; }
+svg .vsync { stroke: var(--fg-3); stroke-dasharray: 1 3; shape-rendering: crispEdges; }
+svg .vsync.one { stroke: var(--fg-2); stroke-dasharray: 4 3; }
+svg .pmark { stroke-dasharray: 2 2; stroke-opacity: .7; shape-rendering: crispEdges; }
+
+#tip { position: fixed; z-index: 50; pointer-events: none; background: var(--bg); border: 1px solid var(--line-2); padding: 6px 8px; font: 11px/16px var(--mono); max-width: 380px; color: var(--fg); }
+#tip[hidden] { display: none; }
+#tip .tt { color: var(--fg); margin-bottom: 3px; font-weight: 600; }
+#tip table { border-collapse: collapse; }
+#tip th { color: var(--fg-3); font-weight: 400; text-align: left; padding: 0 10px 0 0; vertical-align: top; white-space: nowrap; }
+#tip td { padding: 0; overflow-wrap: anywhere; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<div id="tip" role="tooltip" hidden></div>
 <script>
 const STROBE = /*STROBE_DATA*/null
-document.getElementById("out").textContent = STROBE?.data?.text ?? JSON.stringify(STROBE, null, 2)
-</script></body></html>
+
+const app = document.getElementById("app")
+const tip = document.getElementById("tip")
+const reduceMotion = matchMedia("(prefers-reduced-motion: reduce)").matches
+const finite = Number.isFinite
+const state = {
+  series: 0,
+  focus: null,
+  axis: "fit",
+  k: null,
+  hoverK: null,
+  hoverFrom: null,
+  hoverBlock: null,
+  block: null,
+  text: false,
+  dist: { kind: "gaps", mode: "cdf", y: "linear", range: "p99", pooled: true, phase: "" },
+}
+let observers = []
+let linked = []
+let timer = null
+
+/* ---------- dom ---------- */
+
+function h(tag, attrs, ...kids) {
+  const e = document.createElement(tag)
+  setAttrs(e, attrs)
+  append(e, kids)
+  return e
+}
+
+function S(tag, attrs, ...kids) {
+  const e = document.createElementNS("http://www.w3.org/2000/svg", tag)
+  setAttrs(e, attrs)
+  append(e, kids)
+  return e
+}
+
+function setAttrs(e, attrs) {
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue
+    if (k === "style") e.style.cssText = v
+    else if (k.startsWith("on") && typeof v === "function") e.addEventListener(k.slice(2), v)
+    else e.setAttribute(k, v === true ? "" : String(v))
+  }
+}
+
+function append(e, kids) {
+  for (const k of kids.flat(Infinity)) {
+    if (k == null || k === false) continue
+    e.append(k instanceof Node ? k : String(k))
+  }
+}
+
+const T = (x, y, str, cls, anchor) => S("text", { x, y, class: cls, "text-anchor": anchor }, str)
+const L = (x1, y1, x2, y2, cls, extra) => S("line", { x1, y1, x2, y2, class: cls, ...extra })
+
+function chart(height, draw, cls) {
+  const box = h("div", { class: "chart" + (cls ? " " + cls : ""), style: `height:${height}px` })
+  let width = 0
+  box.paint = () => {
+    if (width > 0) box.replaceChildren(draw(width))
+  }
+  box.measure = () => {
+    width = Math.floor(box.clientWidth)
+    box.paint()
+  }
+  const ro = new ResizeObserver((entries) => {
+    if (!box.isConnected) return ro.disconnect()
+    const w = Math.floor(entries[0].contentRect.width)
+    if (w === width) return
+    width = w
+    box.paint()
+  })
+  ro.observe(box)
+  observers.push(ro)
+  return box
+}
+
+function panel(title, sub, ctl, body, opts) {
+  return h("section", { class: "panel" + (opts?.cls ? " " + opts.cls : "") },
+    h("div", { class: "ph" }, h("h2", {}, title), sub ? h("span", { class: "sub" }, sub) : null, ctl && ctl.length ? h("div", { class: "ctl" }, ctl) : null),
+    h("div", { class: "pb" + (opts?.flush ? " flush" : "") }, body))
+}
+
+function seg(key, options, value, pick, label) {
+  return h("div", { class: "seg", role: "group", "aria-label": label },
+    options.map(([v, text, title]) => h("button", { type: "button", title, "data-key": `${key}:${v}`, "aria-pressed": String(v === value), onclick: () => pick(v) }, text)))
+}
+
+/* ---------- tooltip ---------- */
+
+function showTip(e, title, rows) {
+  tip.replaceChildren(
+    h("div", { class: "tt" }, title),
+    h("table", {}, rows.filter(Boolean).map(([k, v, cls]) => h("tr", {}, h("th", {}, k), h("td", { class: cls }, v)))))
+  tip.hidden = false
+  moveTip(e)
+}
+
+function moveTip(e) {
+  if (tip.hidden) return
+  const r = tip.getBoundingClientRect()
+  const x = e.clientX + 14 + r.width > innerWidth - 4 ? e.clientX - 14 - r.width : e.clientX + 14
+  const y = e.clientY + 14 + r.height > innerHeight - 4 ? e.clientY - 14 - r.height : e.clientY + 14
+  tip.style.left = Math.max(4, x) + "px"
+  tip.style.top = Math.max(4, y) + "px"
+}
+
+function hideTip() {
+  tip.hidden = true
+}
+
+function bindTip(el, fn) {
+  el.addEventListener("pointerenter", (e) => showTip(e, ...fn()))
+  el.addEventListener("pointermove", moveTip)
+  el.addEventListener("pointerleave", hideTip)
+}
+
+addEventListener("scroll", hideTip, { passive: true })
+
+/* ---------- metrics ---------- */
+
+const MIN_N = {
+  "frames.presented.p50": 20, "frames.presented.p90": 100, "frames.presented.p95": 200, "frames.presented.p99": 1000,
+  "frames.interval.p50": 20, "frames.interval.p95": 200, "frames.interval.p99": 1000, "scroll.latency.p95": 20,
+}
+
+function unitOf(name) {
+  if (name === "display.hz") return "Hz"
+  if (name === "run.duration") return "ms"
+  if (/^(frames|interaction|scroll)\./.test(name) && /\.(p50|p90|p95|p99|max)$/.test(name)) return "ms"
+  if (name === "frames.dropped.pct" || name === "main.busy" || name.startsWith("cpu.") || name === "gpu.process.3d") return "%"
+  if (name.startsWith("memory.") || name === "gpu.vram" || name === "js.heap.used") return "MB"
+  return "count"
+}
+
+const higherBetter = (name) => name === "frames.presented.count"
+const absUnit = (u) => (u === "%" ? "pp" : u)
+
+function wordsOf(name) {
+  if (name === "frames.presented.count") return ["more", "fewer"]
+  if (name.startsWith("frames.interval.") || name === "frames.dropped.pct") return ["smoother", "choppier"]
+  if (unitOf(name) === "ms") return ["faster", "slower"]
+  if (unitOf(name) === "count") return ["fewer", "more"]
+  return ["less", "more"]
+}
+
+/* ---------- numbers ---------- */
+
+function fmtValue(v, u) {
+  if (!finite(v)) return "—"
+  const d = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2
+  if (u === "ms") return v.toFixed(d) + " ms"
+  if (u === "%") return v.toFixed(d) + "%"
+  if (u === "pp") return v.toFixed(d) + " pp"
+  if (u === "count") return Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(1)
+  if (u === "MB") return v.toFixed(0) + " MB"
+  if (u === "Hz") return v.toFixed(0) + " Hz"
+  return v.toFixed(d) + (u ? " " + u : "")
+}
+
+function fmtPct(r) {
+  if (!finite(r)) return "—"
+  const p = r * 100
+  const body = Math.abs(p) < 10 ? Math.abs(p).toFixed(1) : Math.abs(p).toFixed(0)
+  return (p < -0.05 ? "−" : p > 0.05 ? "+" : "") + body + "%"
+}
+
+function fmtSigned(v, u) {
+  if (!finite(v)) return "—"
+  const body = fmtValue(Math.abs(v), u)
+  return v < 0 ? "−" + body : v > 0 ? "+" + body : body
+}
+
+const fmtDelta = (v, c, u) => (c.relative ? fmtPct(v) : fmtSigned(v, absUnit(u)))
+
+function fmtCI(c, u) {
+  if (!finite(c.lo) || !finite(c.hi)) return "—"
+  return `${fmtDelta(c.lo, c, u)} … ${fmtDelta(c.hi, c, u)}`
+}
+
+const fmtBound = (c, u) => (c.relative ? `±${num(+(c.bound * 100).toPrecision(3))}%` : `±${fmtValue(c.bound, absUnit(u))}`)
+const fmtP = (p) => (!finite(p) ? "—" : p < 0.001 ? "<0.001" : p < 0.1 ? p.toFixed(3) : p.toFixed(2))
+const num = (v) => String(parseFloat((+v).toPrecision(10)))
+const short = (v) => (!finite(v) ? "—" : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2))
+const pctTick = (v) => (v === 0 ? "0" : (v > 0 ? "+" : "−") + num(Math.abs(v)) + "%")
+const signedTick = (v, u) => (v === 0 ? "0" : (v > 0 ? "+" : "−") + num(Math.abs(v)) + (u === "count" ? "" : " " + u))
+
+function niceTicks(lo, hi, n) {
+  if (!(hi > lo)) return [lo]
+  const raw = (hi - lo) / Math.max(1, n)
+  const mag = 10 ** Math.floor(Math.log10(raw))
+  const f = raw / mag
+  const step = (f >= 7.5 ? 10 : f >= 3.5 ? 5 : f >= 1.5 ? 2 : 1) * mag
+  const out = []
+  for (let i = Math.ceil(lo / step - 1e-9); i * step <= hi + step * 1e-9; i++) out.push(i === 0 ? 0 : +(i * step).toPrecision(12))
+  return out
+}
+
+function lin(d0, d1, r0, r1) {
+  const k = (r1 - r0) / (d1 - d0 || 1)
+  const f = (v) => r0 + (v - d0) * k
+  f.inv = (p) => d0 + (p - r0) / k
+  return f
+}
+
+function quant(sorted, p) {
+  if (!sorted.length) return NaN
+  const i = (sorted.length - 1) * p
+  const lo = Math.floor(i)
+  const hi = Math.ceil(i)
+  return sorted[lo] + (sorted[hi] - sorted[lo]) * (i - lo)
+}
+
+function median(values) {
+  return quant(values.filter(finite).sort((a, b) => a - b), 0.5)
+}
+
+function upper(sorted, x) {
+  let lo = 0
+  let hi = sorted.length
+  while (lo < hi) {
+    const m = (lo + hi) >> 1
+    if (sorted[m] <= x) lo = m + 1
+    else hi = m
+  }
+  return lo
+}
+
+function pooledSorted(arrays) {
+  const out = new Float64Array(arrays.reduce((n, a) => n + a.length, 0))
+  let i = 0
+  for (const a of arrays) {
+    out.set(a, i)
+    i += a.length
+  }
+  return out.sort()
+}
+
+/* ---------- statistics (ports of src/stats.rs) ---------- */
+
+const rankCache = new Map()
+function signedRankCounts(n) {
+  if (rankCache.has(n)) return rankCache.get(n)
+  const max = (n * (n + 1)) / 2
+  const c = new Float64Array(max + 1)
+  c[0] = 1
+  for (let k = 1; k <= n; k++) for (let s = max; s >= k; s--) c[s] += c[s - k]
+  rankCache.set(n, c)
+  return c
+}
+
+function hodgesLehmann(d) {
+  const v = d.filter(finite)
+  const n = v.length
+  if (!n) return null
+  const walsh = []
+  for (let i = 0; i < n; i++) for (let j = i; j < n; j++) walsh.push((v[i] + v[j]) / 2)
+  walsh.sort((a, b) => a - b)
+  const m = walsh.length
+  const est = m % 2 ? walsh[(m - 1) / 2] : (walsh[m / 2 - 1] + walsh[m / 2]) / 2
+  let c = -1
+  if (n <= 50) {
+    const counts = signedRankCounts(n)
+    const total = 2 ** n
+    let acc = 0
+    for (let k = 0; k < counts.length; k++) {
+      if ((acc + counts[k]) / total > 0.025) break
+      acc += counts[k]
+      c = k
+    }
+  } else {
+    c = Math.floor((n * (n + 1)) / 4 - 1.959963984540054 * Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24) - 0.5)
+  }
+  const clamp = (i) => Math.max(0, Math.min(m - 1, i))
+  const loI = clamp(c + 1)
+  const hiI = clamp(m - 1 - (c + 1))
+  return { est, lo: walsh[Math.min(loI, hiI)], hi: walsh[Math.max(loI, hiI)] }
+}
+
+function compareAt(metric, ps, bound, relative) {
+  const d = ps.map((p) => (relative ? Math.log(p.b / p.a) : p.b - p.a)).filter(finite)
+  const hl = hodgesLehmann(d)
+  if (!hl) return null
+  const t = relative ? (x) => Math.exp(x) - 1 : (x) => x
+  const est = t(hl.est)
+  const lo = t(hl.lo)
+  const hi = t(hl.hi)
+  const boundAbs = relative ? bound : Math.max(bound * Math.abs(median(ps.map((p) => p.a))), 0.5)
+  const words = wordsOf(metric)
+  let verdict = "unclear"
+  // Below 6 pairs no signed-rank interval reaches 95% (src/stats.rs `covered`).
+  if (d.length >= 6 && finite(est)) {
+    if (hi < 0 || lo > 0) {
+      const word = (hi < 0) === !higherBetter(metric) ? words[0] : words[1]
+      const small = hi < 0 ? hi > -boundAbs : lo < boundAbs
+      verdict = small ? `${word} (small)` : word
+    } else if (lo > -boundAbs && hi < boundAbs) {
+      verdict = `same (±${relative ? Math.round(bound * 100) + "%" : boundAbs.toFixed(1)})`
+    }
+  }
+  const minN = MIN_N[metric]
+  if (minN > 1) {
+    const least = Math.min(...ps.flatMap((p) => [p.base.values?.["frames.n"] ?? 0, p.head.values?.["frames.n"] ?? 0]))
+    if (least < minN) verdict = `refused: ${least} frames < ${minN}`
+  }
+  return { n: d.length, est, lo, hi, bound: boundAbs, relative, verdict }
+}
+
+/* ---------- verdicts ---------- */
+
+function vclass(c, metric) {
+  const v = c?.verdict ?? ""
+  if (v === "·") return "desc"
+  if (v === "—" || !v) return "gated"
+  if (v.startsWith("same")) return "same"
+  if (/^(unclear|underpowered|refused)/.test(v)) return "warn"
+  if (!(c.hi < 0 || c.lo > 0)) return "warn"
+  return (c.hi < 0) !== higherBetter(metric) ? "better" : "worse"
+}
+
+function vsplit(v) {
+  const m = /^([^(:]+?)\s*(?:\((.*)\)|:\s*(.*))?$/.exec(v || "")
+  return m ? [m[1], m[2] || m[3] || ""] : [v || "", ""]
+}
+
+function verdictLabel(c, cls) {
+  if (cls === "gated") return h("span", { title: "no verdict word: secondaries get one only after the primary is decided, Holm-corrected" }, "—")
+  if (cls === "desc") return h("span", { title: "descriptive: an interval for context, never tested" }, "·")
+  const [word, tag] = vsplit(c.verdict)
+  return [h("span", {}, word), tag ? h("span", { class: "vt" }, " " + tag) : null]
+}
+
+const ROLE = { primary: "★ primary, declared before the run", secondary: "secondary · gated on the primary · Holm", descriptive: "descriptive · not tested" }
+
+/* ---------- data helpers ---------- */
+
+const cleanPath = (p) => String(p || "").replace(/^\\\\\?\\/, "")
+const baseName = (p) => cleanPath(p).split(/[\\/]/).pop()
+const quote = (v) => (/^[\w.:/\\=@,+~-]+$/.test(v) ? v : `"${String(v).replace(/"/g, '\\"')}"`)
+const variant = (r, role) => (r.variants || []).find((v) => v.role === role)
+const timedBlocks = (s) => (s.blocks || []).filter((b) => finite(b.pair) && b.pair < 1e6)
+
+function fmtTime(iso) {
+  const d = new Date(iso)
+  if (isNaN(d)) return String(iso || "")
+  return d.toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+}
+
+function fmtDuration(ms) {
+  if (!finite(ms)) return "—"
+  if (ms < 1000) return `${ms} ms`
+  if (ms < 120000) return `${(ms / 1000).toFixed(1)} s`
+  return `${(ms / 60000).toFixed(1)} min`
+}
+
+function comparisons(s) {
+  return [
+    { c: s.primary, role: "primary" },
+    ...(s.secondaries || []).map((c) => ({ c, role: "secondary" })),
+    ...(s.descriptive || []).map((c) => ({ c, role: "descriptive" })),
+  ].filter((x) => x.c && x.c.metric)
+}
+
+function pairsOf(s, metric) {
+  const blocks = timedBlocks(s)
+  const by = new Map()
+  blocks.forEach((b, i) => {
+    const e = by.get(b.pair) || {}
+    e[b.variant] = b
+    e[b.variant + "At"] = i
+    by.set(b.pair, e)
+  })
+  return [...by.entries()]
+    .sort((x, y) => x[0] - y[0])
+    .filter(([, e]) => e.base && e.head)
+    .map(([pair, e]) => ({ pair, base: e.base, head: e.head, a: e.base.values?.[metric], b: e.head.values?.[metric], first: e.baseAt < e.headAt ? "base" : "head" }))
+    .filter((p) => finite(p.a) && finite(p.b))
+}
+
+function displayHz(r, blocks) {
+  const hz = median((blocks || []).map((b) => b.values?.["display.hz"]))
+  return finite(hz) ? hz : finite(r.refresh_hz) ? r.refresh_hz : NaN
+}
+
+/* ---------- boot ---------- */
+
+function render() {
+  observers.forEach((o) => o.disconnect())
+  observers = []
+  linked = []
+  if (timer) clearInterval(timer)
+  timer = null
+  hideTip()
+  const key = document.activeElement?.dataset?.key
+  const y = scrollY
+  if (!STROBE || !STROBE.data) renderEmpty()
+  else if (STROBE.view === "recording") renderRecording(STROBE.data)
+  else renderExperiment(STROBE.data)
+  // Paint charts now rather than waiting for ResizeObserver, which does not fire in hidden tabs.
+  app.querySelectorAll(".chart").forEach((box) => box.measure())
+  if (key) document.querySelector(`[data-key="${CSS.escape(key)}"]`)?.focus({ preventScroll: true })
+  scrollTo(0, y)
+}
+
+function relink() {
+  linked.forEach((f) => f())
+}
+
+function renderEmpty() {
+  document.title = "strobe report"
+  app.replaceChildren(
+    h("header", { class: "top" }, h("span", { class: "brand" }, "strobe"), h("div", { class: "crumbs" }, h("span", { class: "dim" }, "report"))),
+    h("div", { class: "empty" },
+      h("div", {}, h("b", {}, "No data")),
+      h("div", { class: "dim2" }, "This is the report template without an embedded result. Write a report from an experiment or a recording:"),
+      cmdList([["an experiment", "strobe report experiment <exp_…> --open"], ["a recording", "strobe report recording <rec_…> --open"]])))
+}
+
+/* ---------- experiment ---------- */
+
+function renderExperiment(r) {
+  const series = r.series || []
+  if (state.series >= series.length) state.series = 0
+  const s = series[state.series]
+  document.title = `strobe · ${r.id || "experiment"}${s ? " · " + s.label : ""}`
+  const header = h("header", { class: "top" },
+    h("span", { class: "brand" }, "strobe"),
+    h("div", { class: "crumbs" },
+      h("span", { class: "mono id" }, r.id || "experiment"),
+      r.file ? h("span", { class: "file", title: cleanPath(r.file) }, baseName(r.file)) : null,
+      r.created ? h("span", { class: "time", title: r.created }, fmtTime(r.created)) : null),
+    series.length > 1
+      ? h("nav", { class: "tabs", role: "tablist", "aria-label": "series" }, series.map((x, i) =>
+          h("button", { class: "tab st-" + vclass(x.primary, x.primary?.metric), role: "tab", "data-key": `series:${i}`, "aria-selected": String(i === state.series), title: `${x.primary?.metric}: ${x.primary?.verdict}`, onclick: () => pickSeries(i) },
+            h("i", { class: "sq" }), x.label || `series ${i + 1}`)))
+      : null,
+    h("button", { class: "toggle", type: "button", "data-key": "text", "aria-pressed": String(state.text), title: "the CLI's plain-text summary", onclick: () => { state.text = !state.text; render() } }, "text"))
+  const main = h("main")
+  app.replaceChildren(header, main)
+  if (state.text) {
+    main.append(textPanel(r.text || "(no text in this result)"))
+    return
+  }
+  if (!s) {
+    main.append(panel("No series", null, null, h("div", { class: "dim" }, "This experiment has no series.")))
+    return
+  }
+  main.append(
+    hero(r, s),
+    forestPanel(s),
+    h("div", { class: "grid2" }, pairPanel(s), launchPanel(s)),
+    distPanel(r, s),
+    h("div", { class: "grid3" }, envPanel(r, timedBlocks(s)), warnPanel(r, s), panel("Next steps", null, null, cmdList(nextSteps(r, s)))))
+}
+
+function pickSeries(i) {
+  state.series = i
+  state.focus = null
+  state.k = null
+  state.block = null
+  state.dist.phase = ""
+  history.replaceState(null, "", "#series=" + i)
+  render()
+}
+
+function setFocus(metric) {
+  state.focus = metric
+  state.k = null
+  render()
+}
+
+function textPanel(text) {
+  const copyBtn = h("button", { type: "button", onclick: (e) => copy(text, e.currentTarget) }, "copy")
+  return panel("Text", "the CLI summary, verbatim", [copyBtn], h("pre", { class: "text" }, text), { flush: true })
+}
+
+/* hero */
+
+function hero(r, s) {
+  const c = s.primary || {}
+  const metric = c.metric || "?"
+  const u = unitOf(metric)
+  const cls = vclass(c, metric)
+  const [word, tag] = vsplit(c.verdict)
+  const base = variant(r, "base")
+  const head = variant(r, "head")
+  return h("section", { class: `panel hero st-${cls}` },
+    h("div", { class: "hero-main" },
+      h("div", { class: "hero-metric" }, h("span", { class: "star" }, "★"), h("span", { class: "mono" }, metric), h("span", { class: "dim" }, s.label || "")),
+      h("div", { class: `hero-verdict c-${cls}` }, word || "—", tag ? h("span", { class: "hero-tag" }, tag) : null),
+      h("div", { class: "hero-change" },
+        h("span", { class: "big-num" }, fmtDelta(c.estimate, c, u)),
+        h("span", { class: "dim" }, "95% CI"),
+        h("span", { class: "mono" }, fmtCI(c, u))),
+      chart(58, (w) => heroBar(w, c, u), "hero-chart")),
+    h("dl", { class: "facts" },
+      h("dt", {}, h("i", { class: "sw base" }), "base"),
+      h("dd", {}, h("b", {}, fmtValue(c.base, u)), " ", h("span", { class: "mono dim" }, base?.label || "")),
+      h("dt", {}, h("i", { class: "sw head" }), "head"),
+      h("dd", {}, h("b", {}, fmtValue(c.head, u)), " ", h("span", { class: "mono dim" }, head?.label || "")),
+      h("dt", {}, "pairs"),
+      h("dd", {}, `${s.pairs ?? "?"} pairs · ${s.launches ?? "?"} fresh launches`),
+      h("dt", {}, "stopped"),
+      h("dd", {}, s.stopped || "—"),
+      h("dt", {}, "test"),
+      h("dd", { class: "mono" }, `p ${fmtP(c.p)} · n ${c.n ?? "?"} · bound ${fmtBound(c, u)}`),
+      !c.decided && finite(c.needed_pairs) ? [h("dt", {}, "power"), h("dd", {}, `~${c.needed_pairs} pairs needed`)] : null))
+}
+
+function heroBar(w, c, u) {
+  const H = 58
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` })
+  if (!finite(c.lo) || !finite(c.hi)) {
+    svg.append(T(0, 30, "no interval", "lbl", "start"))
+    return svg
+  }
+  const span = Math.max(Math.abs(c.lo), Math.abs(c.hi), Math.abs(c.estimate) || 0, Math.abs(c.bound) || 0) * 1.25 || 1
+  const x = lin(-span, span, 30, w - 30)
+  const fmt = (v) => (c.relative ? pctTick(+(v * 100).toPrecision(12)) : signedTick(v, absUnit(u)))
+  const ticks = c.relative ? niceTicks(-span * 100, span * 100, Math.max(2, Math.floor(w / 110))).map((v) => v / 100) : niceTicks(-span, span, Math.max(2, Math.floor(w / 110)))
+  const cy = 22
+  const b = Math.abs(c.bound)
+  if (finite(b) && b > 0) {
+    svg.append(S("rect", { x: x(-b), y: 8, width: x(b) - x(-b), height: 28, class: "band" }), L(x(-b), 8, x(-b), 36, "bandline"), L(x(b), 8, x(b), 36, "bandline"))
+  }
+  svg.append(L(30, 40, w - 30, 40, "grid"))
+  for (const t of ticks) svg.append(L(x(t), 40, x(t), 44, "grid"), T(x(t), 54, fmt(t), null, "middle"))
+  svg.append(L(x(0), 4, x(0), 40, "zero"))
+  svg.append(
+    S("line", { x1: x(c.lo), y1: cy, x2: x(c.hi), y2: cy, style: "stroke:var(--st)", "stroke-width": 3 }),
+    S("line", { x1: x(c.lo), y1: cy - 7, x2: x(c.lo), y2: cy + 7, style: "stroke:var(--st)", "stroke-width": 1.5 }),
+    S("line", { x1: x(c.hi), y1: cy - 7, x2: x(c.hi), y2: cy + 7, style: "stroke:var(--st)", "stroke-width": 1.5 }),
+    finite(c.estimate) ? S("circle", { cx: x(c.estimate), cy, r: 5.5, style: "fill:var(--st)" }) : null)
+  if (finite(b) && b > 0 && x(b) - x(-b) > 70) svg.append(T((x(-b) + x(b)) / 2, 7, `equivalence ${fmtBound(c, u)}`, null, "middle"))
+  return svg
+}
+
+/* forest */
+
+function forestPanel(s) {
+  const items = comparisons(s)
+  const focus = state.focus || s.primary?.metric
+  const b = finite(s.bound) ? s.bound : 0.02
+  const rel = items.filter((x) => x.c.relative && finite(x.c.lo) && finite(x.c.hi))
+  let d0 = -5 * b
+  let d1 = 5 * b
+  if (state.axis === "fit") {
+    d0 = Math.min(-b, ...rel.map((x) => x.c.lo))
+    d1 = Math.max(b, ...rel.map((x) => x.c.hi))
+    const pad = (d1 - d0) * 0.05
+    d0 -= pad
+    d1 += pad
+  }
+  const dom = [d0, d1]
+  const ticks = niceTicks(d0 * 100, d1 * 100, 6)
+  const axis = h("div", { class: "frow fhead axis" },
+    h("div", { class: "c-metric" }, "metric"),
+    h("div", { class: "c-base num" }, "base"),
+    h("div", { class: "c-head num" }, "head"),
+    h("div", { class: "c-bar" }, h("div", { class: "track" }, ticks.map((t) => h("span", { style: `left:${((t / 100 - d0) / (d1 - d0)) * 100}%` }, pctTick(t))))),
+    h("div", { class: "c-delta num" }, "Δ"),
+    h("div", { class: "c-ci" }, "95% CI"),
+    h("div", { class: "c-verdict" }, "verdict"))
+  const tested = items.filter((x) => x.role !== "descriptive")
+  const desc = items.filter((x) => x.role === "descriptive")
+  const legend = h("div", { class: "legend" },
+    [["better", "better"], ["worse", "worse"], ["same", "same"], ["warn", "unclear"], ["gated", "no verdict"]].map(([k, t]) => h("span", { class: "st-" + k }, h("i", { class: "sq" }), t)),
+    h("span", {}, "shaded: equivalence bound"),
+    items.some((x) => !x.c.relative) ? h("span", {}, "abs: difference on its own scale") : null,
+    h("span", {}, "click a row to chart it"))
+  const axisCtl = seg("axis", [["fit", "fit"], ["near", `±${num(b * 500)}%`, "zoom to five times the equivalence bound"]], state.axis, (v) => { state.axis = v; render() }, "axis")
+  return panel("Comparisons", "head vs base, relative axis", [axisCtl],
+    h("div", { class: "forest" },
+      axis,
+      tested.map((x) => forestRow(x, dom, focus)),
+      desc.length ? h("div", { class: "fgroup" }, "descriptive · not tested") : null,
+      desc.map((x) => forestRow(x, dom, focus)),
+      legend),
+    { flush: true })
+}
+
+function forestRow(x, dom, focus) {
+  const c = x.c
+  const metric = c.metric
+  const u = unitOf(metric)
+  const cls = vclass(c, metric)
+  const abs = !c.relative
+  const span = Math.max(Math.abs(c.lo) || 0, Math.abs(c.hi) || 0, Math.abs(c.estimate) || 0, Math.abs(c.bound) || 0) * 1.15 || 1
+  const rowDom = abs ? [-span, span] : dom
+  const row = h("div", {
+    class: `frow st-${cls}${x.role === "descriptive" ? " desc" : ""}${metric === focus ? " focus" : ""}`,
+    tabindex: 0,
+    role: "button",
+    "data-key": "row:" + metric,
+    "aria-label": `${metric} ${c.verdict}`,
+    onclick: () => setFocus(metric),
+    onkeydown: (e) => {
+      if (e.key !== "Enter" && e.key !== " ") return
+      e.preventDefault()
+      setFocus(metric)
+    },
+  },
+    h("div", { class: "c-metric" }, h("span", { class: "star" }, x.role === "primary" ? "★" : ""), h("span", { class: "mono name" }, metric)),
+    h("div", { class: "c-base num mono" }, fmtValue(c.base, u)),
+    h("div", { class: "c-head num mono" }, fmtValue(c.head, u)),
+    h("div", { class: "c-bar" }, track(c, rowDom, abs ? `abs ±${short(span)}${absUnit(u) === "count" ? "" : " " + absUnit(u)}` : null)),
+    h("div", { class: "c-delta num mono" }, fmtDelta(c.estimate, c, u)),
+    h("div", { class: "c-ci mono dim" }, fmtCI(c, u)),
+    h("div", { class: `c-verdict c-${cls}` }, verdictLabel(c, cls)))
+  bindTip(row, () => [metric, [
+    ["role", ROLE[x.role]],
+    ["base", fmtValue(c.base, u) + "  median of launches"],
+    ["head", fmtValue(c.head, u)],
+    ["change", `${fmtDelta(c.estimate, c, u)}  ${c.relative ? "relative" : "difference"}`],
+    ["95% CI", fmtCI(c, u)],
+    ["p", `${fmtP(c.p)}  Wilcoxon signed-rank, n ${c.n}`],
+    ["bound", fmtBound(c, u) + "  equivalence"],
+    ["verdict", c.verdict, "c-" + cls],
+    finite(c.needed_pairs) && !c.decided ? ["power", `~${c.needed_pairs} pairs needed`] : null,
+    abs ? ["scale", `own axis ±${short(span)} ${absUnit(u)}`] : null,
+  ]])
+  return row
+}
+
+function track(c, [d0, d1], scale) {
+  const P = (v) => ((v - d0) / (d1 - d0)) * 100
+  const C = (v) => Math.max(0, Math.min(100, P(v)))
+  const t = h("div", { class: "track" })
+  const b = Math.abs(c.bound)
+  if (finite(b) && b > 0) t.append(h("i", { class: "band", style: `left:${C(-b)}%;width:${C(b) - C(-b)}%` }))
+  if (P(0) >= 0 && P(0) <= 100) t.append(h("i", { class: "zero", style: `left:${P(0)}%` }))
+  if (finite(c.lo) && finite(c.hi)) {
+    const l = C(c.lo)
+    const r = C(c.hi)
+    t.append(
+      h("i", { class: "ci", style: `left:${l}%;width:${Math.max(0, r - l)}%` }),
+      h("i", { class: P(c.lo) < 0 ? "arrow l" : "cap", style: `left:${l}%` }),
+      h("i", { class: P(c.hi) > 100 ? "arrow r" : "cap", style: `left:${r}%` }))
+  }
+  if (finite(c.estimate) && P(c.estimate) >= 0 && P(c.estimate) <= 100) t.append(h("i", { class: "dot", style: `left:${P(c.estimate)}%` }))
+  if (scale) t.append(h("i", { class: "scale" }, scale))
+  return t
+}
+
+/* pair by pair */
+
+function pairPanel(s) {
+  const metric = state.focus || s.primary?.metric
+  const comp = comparisons(s).find((x) => x.c.metric === metric)?.c
+  const relative = comp ? comp.relative !== false : true
+  const ps = pairsOf(s, metric)
+  const P = ps.length
+  const d = ps.map((p) => (relative ? p.b / p.a - 1 : p.b - p.a))
+  const cum = ps.map((_, i) => (i < 1 ? null : compareAt(metric, ps.slice(0, i + 1), s.bound ?? 0.02, relative)))
+  const last = cum[P - 1]
+  const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b))
+  const exact = !!(last && comp && close(last.lo, comp.lo) && close(last.hi, comp.hi))
+  const u = unitOf(metric)
+  const au = absUnit(u)
+  const isPrimary = metric === s.primary?.metric
+  const fmtD = (v) => (relative ? fmtPct(v) : fmtSigned(v, au))
+  const pd = { ps, d, cum, relative, comp, metric, s }
+  let geo = null
+  const box = chart(236, (w) => {
+    const out = drawPairs(w, pd)
+    geo = out.geo
+    return out.svg
+  })
+  const kOf = (e) => {
+    if (!geo) return null
+    const px = e.clientX - box.getBoundingClientRect().left
+    return Math.max(1, Math.min(P, Math.round(geo.x.inv(px))))
+  }
+  box.addEventListener("pointermove", (e) => {
+    const k = kOf(e)
+    if (!k) return
+    if (k !== state.hoverK || state.hoverFrom !== "pairs") {
+      state.hoverK = k
+      state.hoverFrom = "pairs"
+      relink()
+    }
+    const p = ps[k - 1]
+    const c = cum[k - 1]
+    showTip(e, `pair ${k}`, [
+      ["order", p.first === "base" ? "base → head" : "head → base"],
+      ["base", fmtValue(p.a, u)],
+      ["head", fmtValue(p.b, u)],
+      ["pair Δ", fmtD(d[k - 1])],
+      c ? ["after " + k, `${fmtD(c.est)}  [${fmtD(c.lo)} … ${fmtD(c.hi)}]`] : ["after 1", "one pair: no interval"],
+      c ? ["verdict", c.verdict, "c-" + vclass(c, metric)] : null,
+    ])
+  })
+  box.addEventListener("pointerleave", () => {
+    state.hoverK = null
+    state.hoverFrom = null
+    hideTip()
+    relink()
+  })
+  box.addEventListener("click", (e) => {
+    const k = kOf(e)
+    if (!k) return
+    state.k = state.k === k ? null : k
+    relink()
+  })
+  box.tabIndex = 0
+  box.setAttribute("aria-label", "pair-by-pair chart; arrow keys step through pairs")
+  box.addEventListener("keydown", (e) => {
+    const cur = state.k ?? P
+    const next = e.key === "ArrowLeft" ? cur - 1 : e.key === "ArrowRight" ? cur + 1 : e.key === "Home" ? 1 : e.key === "End" ? P : null
+    if (next == null) return
+    e.preventDefault()
+    step(next)
+  })
+  const readout = h("div", { class: "readout" })
+  function paintReadout() {
+    if (!P) return readout.replaceChildren(h("span", { class: "dim" }, `no complete pairs with ${metric}`))
+    const k = Math.max(1, Math.min(P, state.hoverK ?? state.k ?? P))
+    const c = cum[k - 1]
+    const final = k === P && comp
+    const verdict = final ? comp.verdict : c?.verdict
+    const vc = final ? vclass(comp, metric) : c ? vclass(c, metric) : "gated"
+    readout.replaceChildren(...[
+      h("span", {}, h("b", {}, `${k}`), h("span", { class: "dim" }, ` / ${P} pairs`)),
+      c ? h("span", { class: "mono" }, `${fmtD(c.est)}  [${fmtD(c.lo)} … ${fmtD(c.hi)}]`) : h("span", { class: "dim" }, "one pair: no interval yet"),
+      verdict ? h("span", { class: "c-" + vc }, final ? null : "if stopped here: ", h("b", {}, verdict)) : null,
+      isPrimary && k < 6 ? h("span", { class: "dim" }, `${6 - k} more pairs minimum`) : null,
+      final && isPrimary ? h("span", { class: "dim" }, `stopped: ${s.stopped || "—"}`) : null,
+    ].filter(Boolean))
+  }
+  function step(k) {
+    stopPlay()
+    state.k = Math.max(1, Math.min(P, k))
+    relink()
+  }
+  const playBtn = h("button", { type: "button", title: "replay the experiment pair by pair", onclick: () => (timer ? stopPlay() : play()) }, "play")
+  function play() {
+    if (!P) return
+    state.k = 1
+    playBtn.textContent = "stop"
+    relink()
+    timer = setInterval(() => {
+      if (state.k >= P) return stopPlay()
+      state.k++
+      relink()
+    }, 420)
+  }
+  function stopPlay() {
+    if (timer) clearInterval(timer)
+    timer = null
+    playBtn.textContent = "play"
+  }
+  linked.push(() => {
+    box.paint()
+    paintReadout()
+  })
+  paintReadout()
+  const ctl = h("div", { class: "btns" },
+    h("button", { type: "button", title: "previous pair", onclick: () => step((state.k ?? P) - 1) }, "‹"),
+    h("button", { type: "button", title: "next pair", onclick: () => step((state.k ?? P) + 1) }, "›"),
+    reduceMotion ? null : playBtn,
+    h("button", { type: "button", title: "show the final result", onclick: () => { stopPlay(); state.k = null; relink() } }, "final"))
+  return panel("Pair by pair", `${isPrimary ? "★ " : ""}${metric} · head ${relative ? "÷" : "−"} base · cumulative 95% CI${exact || !P ? "" : " (illustrative)"}`, [ctl], [box, readout])
+}
+
+function drawPairs(w, pd) {
+  const H = 236
+  const m = { l: 54, r: 16, t: 22, b: 26 }
+  const P = pd.ps.length
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` })
+  const x = lin(0.5, Math.max(P, 6) + 0.5, m.l, w - m.r)
+  if (!P) {
+    svg.append(T(w / 2, H / 2, "no complete pairs", "lbl", "middle"))
+    return { svg, geo: null }
+  }
+  const s = pd.s
+  const relative = pd.relative
+  const au = absUnit(unitOf(pd.metric))
+  const bnd = pd.comp && finite(pd.comp.bound) ? Math.abs(pd.comp.bound) : relative ? s.bound : NaN
+  const scrubbing = state.k != null || state.hoverFrom === "pairs"
+  const kEff = Math.max(1, Math.min(P, state.hoverK ?? state.k ?? P))
+  const vals = [0, ...pd.d, ...pd.cum.flatMap((c) => (c ? [c.lo, c.hi] : []))]
+  if (finite(bnd)) vals.push(bnd, -bnd)
+  let y0 = Math.min(...vals.filter(finite))
+  let y1 = Math.max(...vals.filter(finite))
+  if (y1 - y0 <= 0) {
+    y0 -= relative ? 0.01 : 1
+    y1 += relative ? 0.01 : 1
+  }
+  const pad = (y1 - y0) * 0.08
+  const y = lin(y0 - pad, y1 + pad, H - m.b, m.t)
+  const ticks = relative ? niceTicks((y0 - pad) * 100, (y1 + pad) * 100, 5).map((v) => v / 100) : niceTicks(y0 - pad, y1 + pad, 5)
+  for (const t of ticks) svg.append(L(m.l, y(t), w - m.r, y(t), "grid"), T(m.l - 6, y(t) + 3.5, relative ? pctTick(+(t * 100).toPrecision(12)) : signedTick(t, au), null, "end"))
+  if (finite(bnd) && bnd > 0) {
+    svg.append(S("rect", { x: m.l, y: y(bnd), width: w - m.l - m.r, height: y(-bnd) - y(bnd), class: "band" }), L(m.l, y(bnd), w - m.r, y(bnd), "bandline"), L(m.l, y(-bnd), w - m.r, y(-bnd), "bandline"))
+    svg.append(T(m.l + 4, y(bnd) - 3, `±${relative ? num(+(bnd * 100).toPrecision(3)) + "%" : short(bnd) + " " + au}`, null, "start"))
+  }
+  svg.append(L(m.l, y(0), w - m.r, y(0), "zero"))
+  const every = x(2) - x(1) >= 18 ? 1 : x(2) - x(1) >= 8 ? 5 : 10
+  for (let k = 1; k <= Math.max(P, 6); k++) if (k === 1 || k % every === 0) svg.append(T(x(k), H - m.b + 15, String(k), null, "middle"))
+  svg.append(L(x(6), m.t, x(6), H - m.b, "marker"), T(x(6) + 4, H - m.b - 5, "min 6", null, "start"))
+  const pts = pd.cum.map((c, i) => (c ? { k: i + 1, ...c } : null)).filter(Boolean)
+  const area = (list) => list.map((p) => `${x(p.k)},${y(p.hi)}`).concat(list.slice().reverse().map((p) => `${x(p.k)},${y(p.lo)}`)).join(" ")
+  if (pts.length) {
+    const now = pts.filter((p) => p.k <= kEff)
+    svg.append(S("polygon", { points: area(pts), class: "cum" }))
+    if (scrubbing && now.length) svg.append(S("polygon", { points: area(now), class: "cum now" }))
+    svg.append(S("polyline", { points: pts.map((p) => `${x(p.k)},${y(p.est)}`).join(" "), class: "est" + (scrubbing ? " ghost" : "") }))
+    if (scrubbing && now.length) svg.append(S("polyline", { points: now.map((p) => `${x(p.k)},${y(p.est)}`).join(" "), class: "est" }))
+  }
+  pd.d.forEach((v, i) => {
+    const k = i + 1
+    svg.append(S("circle", { cx: x(k), cy: y(v), r: k === kEff && scrubbing ? 4.5 : 3.5, class: "pdot" + (scrubbing && k > kEff ? " future" : "") + (scrubbing && k === kEff ? " cur" : "") }))
+  })
+  const stopLabel = `stop · ${s.stopped || "end"}`
+  svg.append(L(x(P), m.t - 4, x(P), H - m.b, "stop"), T(x(P) + (x(P) > w / 2 ? -4 : 4), m.t - 8, stopLabel, "lbl", x(P) > w / 2 ? "end" : "start"))
+  if (scrubbing) svg.append(L(x(kEff), m.t, x(kEff), H - m.b, "hair"))
+  return { svg, geo: { x } }
+}
+
+/* launches */
+
+function launchPanel(s) {
+  const metric = state.focus || s.primary?.metric
+  const blocks = timedBlocks(s)
+  const u = unitOf(metric)
+  let geo = null
+  const box = chart(236, (w) => {
+    const out = drawLaunch(w, blocks, metric, u)
+    geo = out.geo
+    return out.svg
+  })
+  const indexOf = (e) => {
+    if (!geo) return null
+    const px = e.clientX - box.getBoundingClientRect().left
+    const i = Math.round(geo.x.inv(px)) - 1
+    return i >= 0 && i < blocks.length ? i : null
+  }
+  box.addEventListener("pointermove", (e) => {
+    const i = indexOf(e)
+    if (i == null) return hideTip()
+    const b = blocks[i]
+    if (state.hoverBlock !== i) {
+      state.hoverBlock = i
+      state.hoverK = b.pair + 1
+      state.hoverFrom = "launch"
+      relink()
+    }
+    showTip(e, `launch ${i + 1} · pair ${b.pair + 1} · ${b.variant}`, blockRows(b, metric, u))
+  })
+  box.addEventListener("pointerleave", () => {
+    state.hoverBlock = null
+    state.hoverK = null
+    state.hoverFrom = null
+    hideTip()
+    relink()
+  })
+  box.addEventListener("click", (e) => {
+    const i = indexOf(e)
+    if (i == null) return
+    state.block = state.block === i ? null : i
+    paintDetail()
+  })
+  const detail = h("div")
+  function paintDetail() {
+    const i = state.block
+    if (i == null || !blocks[i]) {
+      detail.replaceChildren(h("div", { class: "readout dim" }, "hover a launch for details · click to pin it"))
+      return
+    }
+    const b = blocks[i]
+    detail.replaceChildren(h("div", { class: "detail" },
+      blockRows(b, metric, u).filter(Boolean).map(([k, v]) => h("div", {}, h("div", { class: "k" }, k), h("div", { class: "mono" }, v))),
+      b.recording ? h("div", { class: "wide" }, cmdList([["worst frames of this launch", `strobe query ${b.recording} frames`]])) : null))
+  }
+  paintDetail()
+  linked.push(() => box.paint())
+  const legend = h("div", { class: "legend" },
+    h("span", {}, h("i", { class: "sw base" }), "A base"),
+    h("span", {}, h("i", { class: "sw head" }), "B head"),
+    blocks.some((b) => b.recording) ? h("span", { title: "the trace of this launch was kept as a recording" }, "○ trace kept") : null)
+  return panel("Launches", `${metric} per fresh launch, in launch order`, [legend], [box, detail])
+}
+
+function blockRows(b, metric, u) {
+  const runs = b.run_ms || []
+  const nodes = [...new Set(b.nodes || [])]
+  return [
+    [metric, fmtValue(b.values?.[metric], u)],
+    ["warmup", `${b.warmup ?? "?"} runs`],
+    ["measured", runs.length ? runs.map((v) => short(v)).join(" · ") + " ms" : "—"],
+    ["speed", finite(b.speed_ratio) ? `${b.speed_ratio.toFixed(2)}× calibration` : "not checked"],
+    ["DOM nodes", nodes.length ? nodes.join(" → ") : "—"],
+    ["frames", finite(b.values?.["frames.n"]) ? fmtValue(b.values["frames.n"], "count") : "—"],
+    ["recording", b.recording || "not kept"],
+  ]
+}
+
+function drawLaunch(w, blocks, metric, u) {
+  const H = 236
+  const m = { l: 60, r: 16, t: 14, b: 42 }
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` })
+  const N = blocks.length
+  const x = lin(0.5, Math.max(N, 2) + 0.5, m.l, w - m.r)
+  const vals = blocks.map((b) => b.values?.[metric])
+  const whisk = metric === "run.duration" ? blocks.map((b) => ((b.run_ms || []).length ? [Math.min(...b.run_ms), Math.max(...b.run_ms)] : null)) : []
+  const all = [...vals, ...whisk.flat()].filter(finite)
+  if (!all.length) {
+    svg.append(T(w / 2, H / 2, `no ${metric} values in launches`, "lbl", "middle"))
+    return { svg, geo: null }
+  }
+  let y0 = Math.min(...all)
+  let y1 = Math.max(...all)
+  if (y1 - y0 <= 0) {
+    const e = Math.abs(y0) * 0.05 || 1
+    y0 -= e
+    y1 += e
+  }
+  const pad = (y1 - y0) * 0.12
+  const y = lin(y0 - pad, y1 + pad, H - m.b, m.t)
+  const scrubbing = state.k != null || state.hoverFrom === "pairs"
+  const kEff = state.hoverK ?? state.k
+  const pairs = new Map()
+  blocks.forEach((b, i) => pairs.set(b.pair, [...(pairs.get(b.pair) || []), i]))
+  for (const [p, idx] of pairs) {
+    const a = Math.min(...idx) + 1
+    const z = Math.max(...idx) + 1
+    if (p % 2 === 1) svg.append(S("rect", { x: x(a - 0.5), y: m.t, width: x(z + 0.5) - x(a - 0.5), height: H - m.b - m.t, class: "pairband" }))
+  }
+  for (const t of niceTicks(y0 - pad, y1 + pad, 4)) svg.append(L(m.l, y(t), w - m.r, y(t), "grid"), T(m.l - 6, y(t) + 3.5, num(t) + (u === "count" ? "" : u === "%" ? "%" : " " + u), null, "end"))
+  for (const v of ["base", "head"]) {
+    const pts = blocks.map((b, i) => (b.variant === v && finite(vals[i]) ? `${x(i + 1)},${y(vals[i])}` : null)).filter(Boolean)
+    if (pts.length > 1) svg.append(S("polyline", { points: pts.join(" "), class: "v-" + v, fill: "none", stroke: "currentColor", "stroke-opacity": 0.4 }))
+  }
+  blocks.forEach((b, i) => {
+    const future = scrubbing && kEff != null && b.pair + 1 > kEff
+    const g = S("g", { class: `v-${b.variant}${future ? " future" : ""}` })
+    if (whisk[i]) g.append(S("line", { x1: x(i + 1), y1: y(whisk[i][0]), x2: x(i + 1), y2: y(whisk[i][1]), stroke: "currentColor" }))
+    if (finite(vals[i])) {
+      if (b.recording) g.append(S("circle", { cx: x(i + 1), cy: y(vals[i]), r: 7.5, class: "ring" }))
+      g.append(S("circle", { cx: x(i + 1), cy: y(vals[i]), r: state.hoverBlock === i || state.block === i ? 5.5 : 4.5, fill: "currentColor" }))
+    }
+    svg.append(g)
+  })
+  if (kEff != null && pairs.has(kEff - 1)) {
+    const idx = pairs.get(kEff - 1)
+    const a = Math.min(...idx) + 1
+    const z = Math.max(...idx) + 1
+    svg.append(S("rect", { x: x(a - 0.5) + 0.5, y: m.t + 0.5, width: x(z + 0.5) - x(a - 0.5) - 1, height: H - m.b - m.t - 1, class: "curpair" }))
+  }
+  if (state.block != null && blocks[state.block]) svg.append(L(x(state.block + 1), m.t, x(state.block + 1), H - m.b, "hair"))
+  const gap = x(2) - x(1)
+  if (gap >= 9) blocks.forEach((b, i) => svg.append(T(x(i + 1), H - m.b + 14, b.variant === "base" ? "A" : "B", b.variant === "head" ? "acc" : "lbl", "middle")))
+  const pairGap = gap * 2
+  const every = pairGap >= 22 ? 1 : pairGap >= 10 ? 5 : 10
+  for (const [p, idx] of pairs) {
+    if (p !== 0 && (p + 1) % every !== 0) continue
+    const mid = (Math.min(...idx) + Math.max(...idx)) / 2 + 1
+    svg.append(T(x(mid), H - m.b + 30, String(p + 1), null, "middle"))
+  }
+  svg.append(T(m.l - 6, H - m.b + 30, "pair", null, "end"))
+  return { svg, geo: { x } }
+}
+
+/* frame distributions */
+
+const distCache = new Map()
+function distData(s, kind, phase) {
+  const key = `${state.series}|${kind}|${phase}`
+  if (distCache.has(key)) return distCache.get(key)
+  const blocks = timedBlocks(s)
+  const per = blocks
+    .map((b) => ({ b, variant: b.variant, arr: Float64Array.from((kind === "gaps" ? b.intervals : phase ? b.phases?.[phase] : b.frames) || []).sort() }))
+    .filter((x) => x.arr.length)
+  const pooled = {
+    base: pooledSorted(per.filter((x) => x.variant === "base").map((x) => x.arr)),
+    head: pooledSorted(per.filter((x) => x.variant === "head").map((x) => x.arr)),
+  }
+  const out = { per, pooled }
+  distCache.set(key, out)
+  return out
+}
+
+function distPanel(r, s) {
+  const blocks = timedBlocks(s)
+  const hz = displayHz(r, blocks)
+  const budget = hz > 0 ? 1000 / hz : NaN
+  const phases = [...new Set(blocks.flatMap((b) => Object.keys(b.phases || {})))]
+  const ds = state.dist
+  if (ds.phase && !phases.includes(ds.phase)) ds.phase = ""
+  const phase = ds.kind === "latency" ? ds.phase : ""
+  const data = distData(s, ds.kind, phase)
+  const set = (k, v) => {
+    ds[k] = v
+    render()
+  }
+  const ctl = [
+    seg("dk", [["gaps", "frame gaps", "time between presented frames"], ["latency", "frame latency", "begin of frame to presentation"]], ds.kind, (v) => set("kind", v), "data"),
+    ds.kind === "latency" && phases.length ? seg("dph", [["", "all"], ...phases.map((p) => [p, p])], ds.phase, (v) => set("phase", v), "phase") : null,
+    seg("dm", [["cdf", "CDF"], ["hist", "histogram"]], ds.mode, (v) => set("mode", v), "chart"),
+    ds.mode === "cdf" ? seg("dy", [["linear", "linear"], ["nines", "tail", "−log₁₀(1−F): 90%, 99%, 99.9% equally spaced"]], ds.y, (v) => set("y", v), "y scale") : null,
+    seg("dr", [["p99", "to p99.5"], ["all", "to max"]], ds.range, (v) => set("range", v), "range"),
+    seg("dp", [["pooled", "pooled"], ["blocks", "per launch"]], ds.pooled ? "pooled" : "blocks", (v) => set("pooled", v === "pooled"), "grouping"),
+  ].filter(Boolean)
+  const title = ds.kind === "gaps" ? "Frame gaps" : "Frame latency"
+  const sub = `${ds.kind === "gaps" ? "time between presented frames" : "frame begin to presentation"}${phase ? " · phase " + phase : ""} · ${ds.pooled ? "pooled over launches" : "one line per launch"}`
+  if (!data.pooled.base.length && !data.pooled.head.length) return panel(title, sub, ctl, h("div", { class: "dim" }, "no frames in these launches"))
+  let geo = null
+  const box = chart(290, (w) => {
+    const out = drawDist(w, data, budget)
+    geo = out.geo
+    return out.svg
+  })
+  box.addEventListener("pointermove", (e) => {
+    if (!geo) return
+    const px = e.clientX - box.getBoundingClientRect().left
+    if (px < geo.l || px > geo.r) {
+      geo.hair.setAttribute("visibility", "hidden")
+      return hideTip()
+    }
+    const xv = geo.x.inv(px)
+    geo.hair.setAttribute("x1", px)
+    geo.hair.setAttribute("x2", px)
+    geo.hair.setAttribute("visibility", "visible")
+    const rows = ["base", "head"].filter((v) => data.pooled[v].length).map((v) => {
+      const a = data.pooled[v]
+      if (ds.mode === "cdf") return [v, `${((upper(a, xv) / a.length) * 100).toFixed(1)}% ≤ ${short(xv)} ms`, v === "head" ? "acc" : ""]
+      const i = Math.min(geo.bins - 1, Math.floor(xv / geo.bw))
+      const lo = i * geo.bw
+      const n = upper(a, lo + geo.bw) - upper(a, lo)
+      return [v, `${((n / a.length) * 100).toFixed(1)}% in ${short(lo)}–${short(lo + geo.bw)} ms`]
+    })
+    const vs = finite(budget) ? [["vsyncs", (xv / budget).toFixed(2)]] : []
+    showTip(e, `${short(xv)} ms`, [...rows, ...vs])
+  })
+  box.addEventListener("pointerleave", () => {
+    hideTip()
+    geo?.hair.setAttribute("visibility", "hidden")
+  })
+  const legend = h("div", { class: "legend", style: "margin-top:8px" },
+    h("span", {}, h("i", { class: "sw base" }), "base"),
+    h("span", {}, h("i", { class: "sw head" }), "head"),
+    finite(budget) ? h("span", {}, `vsync ${short(budget)} ms (${Math.round(hz)} Hz)${ds.kind === "gaps" ? " and multiples" : ""}`) : null,
+    h("span", {}, "dashes: p50 · p95 · p99"))
+  return panel(title, sub, ctl, h("div", { class: "dist" }, h("div", {}, box, legend), pctTable(data.pooled, ds.kind, budget)))
+}
+
+function drawDist(w, data, budget) {
+  const H = 290
+  const m = { l: 50, r: 16, t: 36, b: 28 }
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` })
+  const ds = state.dist
+  const kinds = ["base", "head"].filter((v) => data.pooled[v].length)
+  const top = ds.range === "all" ? Math.max(...kinds.map((v) => data.pooled[v][data.pooled[v].length - 1])) : Math.max(...kinds.map((v) => quant(data.pooled[v], 0.995)))
+  let xmax = top * 1.05 || 1
+  if (finite(budget) && xmax < budget * 1.25) xmax = budget * 1.25
+  const x = lin(0, xmax, m.l, w - m.r)
+  const maxN = Math.max(...kinds.map((v) => data.pooled[v].length))
+  const ymaxN = Math.max(1, Math.min(4, Math.log10(maxN)))
+  const tf = ds.y === "nines" ? (F) => (F >= 1 ? ymaxN : Math.min(ymaxN, -Math.log10(1 - F))) : (F) => F
+  const cdf = ds.mode === "cdf"
+  const nb = Math.max(16, Math.min(120, Math.round((w - m.l - m.r) / 7)))
+  const bw = xmax / nb
+  const hist = (a) => {
+    const counts = new Array(nb).fill(0)
+    for (const v of a) if (v >= 0 && v < xmax) counts[Math.min(nb - 1, Math.floor(v / bw))]++
+    return counts.map((c) => c / a.length)
+  }
+  const series = ds.pooled ? kinds.map((v) => ({ variant: v, arr: data.pooled[v], thin: false })) : data.per.map((p) => ({ variant: p.variant, arr: p.arr, thin: true }))
+  const hists = cdf ? null : series.map((sr) => hist(sr.arr))
+  const ymax = cdf ? (ds.y === "nines" ? ymaxN : 1) : Math.max(...hists.flat(), 0.01) * 1.12
+  const y = lin(0, ymax, H - m.b, m.t)
+  // grid
+  const yt = cdf ? (ds.y === "nines" ? Array.from({ length: Math.floor(ymaxN) + 1 }, (_, i) => i) : [0, 0.25, 0.5, 0.75, 1]) : niceTicks(0, ymax, 4)
+  const ylab = (t) => (cdf ? (ds.y === "nines" ? (t === 0 ? "0%" : num(100 - 100 / 10 ** t) + "%") : num(t * 100) + "%") : num(+(t * 100).toPrecision(3)) + "%")
+  for (const t of yt) svg.append(L(m.l, y(t), w - m.r, y(t), "grid"), T(m.l - 6, y(t) + 3.5, ylab(t), null, "end"))
+  const xt = niceTicks(0, xmax, Math.max(3, Math.floor((w - m.l - m.r) / 70)))
+  for (const t of xt) svg.append(L(x(t), H - m.b, x(t), H - m.b + 4, "grid"), T(x(t), H - m.b + 15, num(t), null, "middle"))
+  svg.append(L(m.l, H - m.b, w - m.r, H - m.b, "grid"), T(w - m.r, H - m.b + 26, "ms", null, "end"))
+  // vsync multiples
+  if (finite(budget)) {
+    let lastLabel = -1e9
+    for (let k = 1; k * budget <= xmax && k <= 24; k++) {
+      if (k > 1 && ds.kind !== "gaps") break
+      const px = x(k * budget)
+      svg.append(L(px, m.t, px, H - m.b, "vsync" + (k === 1 ? " one" : "")))
+      if (px - lastLabel >= 26) {
+        svg.append(T(px + 3, m.t + 10, k === 1 ? "vsync" : `${k}×`, null, "start"))
+        lastLabel = px + (k === 1 ? 30 : 0)
+      }
+    }
+  }
+  // curves
+  series.forEach((sr, i) => {
+    const g = S("g", { class: "v-" + sr.variant })
+    if (cdf) {
+      const n = sr.arr.length
+      const pts = []
+      const stepPx = sr.thin ? 2 : 1
+      for (let px = m.l; px <= w - m.r; px += stepPx) pts.push(`${px},${y(tf(upper(sr.arr, x.inv(px)) / n))}`)
+      g.append(S("polyline", { points: pts.join(" "), fill: "none", stroke: "currentColor", "stroke-width": sr.thin ? 1 : 1.5, "stroke-opacity": sr.thin ? 0.45 : 1 }))
+    } else {
+      const f = hists[i]
+      let d = `M${x(0)},${y(0)}`
+      f.forEach((v, j) => {
+        d += `L${x(j * bw)},${y(v)}L${x((j + 1) * bw)},${y(v)}`
+      })
+      d += `L${x(nb * bw)},${y(0)}Z`
+      g.append(S("path", { d, fill: sr.thin ? "none" : "currentColor", "fill-opacity": sr.variant === "base" ? 0.22 : 0.16, stroke: "currentColor", "stroke-width": 1, "stroke-opacity": sr.thin ? 0.45 : 0.9 }))
+    }
+    svg.append(g)
+  })
+  // percentile marks
+  kinds.forEach((v, row) => {
+    const a = data.pooled[v]
+    let last = -1e9
+    for (const [p, name] of [[0.5, "p50"], [0.95, "p95"], [0.99, "p99"]]) {
+      const xv = quant(a, p)
+      if (!(xv <= xmax)) continue
+      const px = x(xv)
+      const yTo = cdf ? y(tf(p)) : m.t
+      const g = S("g", { class: "v-" + v })
+      g.append(S("line", { x1: px, y1: H - m.b, x2: px, y2: yTo, stroke: "currentColor", class: "pmark" }))
+      if (cdf) g.append(S("circle", { cx: px, cy: yTo, r: 2.5, fill: "currentColor" }))
+      if (px - last >= 28) {
+        g.append(S("text", { x: px, y: 12 + row * 12, "text-anchor": "middle", fill: "currentColor", style: "fill:currentColor" }, name))
+        last = px
+      }
+      svg.append(g)
+    }
+  })
+  const hair = L(0, m.t, 0, H - m.b, "hair", { visibility: "hidden" })
+  svg.append(hair)
+  return { svg, geo: { x, l: m.l, r: w - m.r, hair, bins: nb, bw } }
+}
+
+function pctTable(pooled, kind, budget) {
+  const b = pooled.base
+  const hd = pooled.head
+  const rows = [
+    ["frames", (a) => a.length, "count"],
+    ["p50", (a) => quant(a, 0.5), "ms"],
+    ["p90", (a) => quant(a, 0.9), "ms"],
+    ["p95", (a) => quant(a, 0.95), "ms"],
+    ["p99", (a) => quant(a, 0.99), "ms"],
+    ["max", (a) => (a.length ? a[a.length - 1] : NaN), "ms"],
+  ]
+  if (kind === "gaps" && finite(budget)) rows.push(["≥ 2 vsyncs", (a) => (a.length ? (100 * (a.length - upper(a, budget * 1.5))) / a.length : NaN), "%"])
+  return h("table", { class: "pct" },
+    h("thead", {}, h("tr", {}, h("th", {}, ""), h("th", {}, "base"), h("th", {}, "head"), h("th", {}, "Δ"))),
+    h("tbody", {}, rows.map(([name, f, u]) => {
+      const vb = b.length ? f(b) : NaN
+      const vh = hd.length ? f(hd) : NaN
+      const delta = u === "%" ? fmtSigned(vh - vb, "pp") : vb > 0 ? fmtPct(vh / vb - 1) : "—"
+      const fmt = (v) => (u === "count" ? fmtValue(v, "count") : u === "%" ? fmtValue(v, "%") : short(v))
+      return h("tr", { title: name === "≥ 2 vsyncs" ? "share of gaps longer than 1.5 vsync intervals: at least one missed vsync" : null },
+        h("td", {}, name + (u === "ms" ? " ms" : "")), h("td", { class: "b mono" }, fmt(vb)), h("td", { class: "h mono" }, fmt(vh)), h("td", { class: "mono dim" }, delta))
+    })))
+}
+
+/* environment, warnings, next steps */
+
+function envPanel(r, blocks) {
+  const env = r.env || {}
+  const gpu = r.gpu || {}
+  const win = r.window
+  const plan = r.plan || {}
+  const hz = displayHz(r, blocks)
+  const devices = gpu.devices || []
+  const rows = [
+    ["os", env.os],
+    ["cpu", env.cpu ? `${env.cpu}${env.logical_cpus ? ` · ${env.logical_cpus} logical` : ""}` : null],
+    ["topology", topology(env, plan.pin)],
+    ["pinning", plan.pin],
+    ["power", [env.power_plan, env.on_battery === true ? "on battery" : env.on_battery === false ? "on AC" : null].filter(Boolean).join(" · ") || null],
+    ["gpu", devices.length ? h("span", {}, devices[0], devices.length > 1 ? h("span", { class: "dim" }, " · " + devices.slice(1).join(" · ")) : null) : null],
+    ["compositing", gpu.compositing ? `${gpu.compositing}${gpu.software ? " · software adapter" : gpu.software === false ? " · hardware" : ""}` : null],
+    ["browser", r.browser],
+    ["window", win ? `${win.width} × ${win.height}${win.scale ? ` @${win.scale}x` : ""}` : null],
+    ["display", finite(hz) ? `${Math.round(hz)} Hz · vsync ${short(1000 / hz)} ms` : null],
+    ["runs", plan.runs_per_block ? `${plan.runs_per_block} measured per launch · warmup until steady${plan.aa ? " · A/A" : ""}` : null],
+    ["probes", r.probes],
+    ["duration", finite(r.duration_ms) ? fmtDuration(r.duration_ms) : null],
+    ["strobe", env.strobe],
+    ...(r.variants || []).map((v) => [v.role, h("span", { class: "mono" }, v.spec || v.label)]),
+  ].filter(([, v]) => v != null && v !== "")
+  return panel("Environment", null, null, h("dl", { class: "kv" }, rows.map(([k, v]) => [h("dt", {}, k), h("dd", {}, v)])))
+}
+
+function topology(env, pin) {
+  const n = env.logical_cpus || 0
+  const groups = env.l3_groups || []
+  if (!n || !groups.length || n > 256) return null
+  const owner = new Array(n).fill(-1)
+  let next = 0
+  groups.forEach((g, gi) => {
+    if (Number.isSafeInteger(g.mask) && g.mask > 0 && n <= 53) {
+      for (let c = 0; c < n; c++) if (Math.floor(g.mask / 2 ** c) % 2 === 1) owner[c] = gi
+      return
+    }
+    for (let k = 0; k < (g.cpus || 0) && next < n; k++) owner[next++] = gi
+  })
+  const pinned = new Set()
+  const ccd = /CCD(\d+)/i.exec(pin || "")
+  if (ccd) owner.forEach((o, c) => o === +ccd[1] && pinned.add(c))
+  const list = /CPUs ([\d,\- ]+)/.exec(pin || "")
+  if (list)
+    for (const part of list[1].split(",")) {
+      const [a, b] = part.trim().split("-").map(Number)
+      for (let c = a; c <= (finite(b) ? b : a); c++) pinned.add(c)
+    }
+  return h("div", { class: "topo" }, groups.map((g, gi) => h("div", { class: "grp" },
+    h("span", { class: "dim" }, `${groups.length > 1 ? "CCD" + gi : "L3"} · ${g.l3_mb ?? "?"} MB`),
+    h("div", { class: "cells" }, owner.map((o, c) => (o === gi ? h("i", { class: "cell" + (pinned.has(c) ? " on" : ""), title: `CPU ${c}${pinned.has(c) ? " · target pinned here" : ""}` }) : null))))))
+}
+
+function warnPanel(r, s) {
+  const list = [...(r.warnings || []), ...(s?.warnings || [])]
+  if (s && s.decided && finite(s.holm_pairs) && s.pairs < s.holm_pairs) list.push({ id: "Holm", level: "info", text: `secondaries can only clear Holm from ${s.holm_pairs} pairs` })
+  const level = (w) => (w.level === "warn" ? "warn" : w.level === "error" ? "err" : "info")
+  return panel("Warnings", list.length ? `${list.filter((w) => w.level === "warn").length} warn · ${list.filter((w) => w.level !== "warn").length} info` : null, null,
+    list.length
+      ? h("ul", { class: "warns" }, list.map((w) => h("li", { class: "st-" + level(w) }, h("i", { class: "sq", title: w.level }), h("span", { class: "mono wid" }, w.id), h("span", {}, w.text))))
+      : h("ul", { class: "warns" }, h("li", { class: "st-ok" }, h("i", { class: "sq" }), h("span", { class: "mono wid" }, "none"), h("span", { class: "dim" }, "no analyser flagged this run"))))
+}
+
+function nextSteps(r, s) {
+  const out = []
+  const file = cleanPath(r.file)
+  const base = variant(r, "base")
+  const head = variant(r, "head")
+  const bench = (extra) => ["strobe bench", quote(file || "<file>"), r.plan?.aa ? null : base ? `--base ${quote(base.spec)}` : null, head ? `--head ${quote(head.spec)}` : null, r.plan?.aa ? "--aa" : null, (r.series || []).length > 1 ? `--filter ${quote(s.case)}` : null, extra].filter(Boolean).join(" ")
+  const a = s.attribution || {}
+  if (a.head) out.push(["where head spends CPU", `strobe query ${a.head} hotspots --by package`])
+  if (a.base) out.push(["the same for base", `strobe query ${a.base} hotspots --by package`])
+  const tr = s.timing_recordings || []
+  const th = tr.find((t) => t.variant === "head")
+  const tb = tr.find((t) => t.variant === "base")
+  if (th) out.push(["worst frames in a head launch", `strobe query ${th.recording} frames`])
+  if (tb) out.push(["worst frames in a base launch", `strobe query ${tb.recording} frames`])
+  if (th) out.push(["main-thread work in a head launch", `strobe query ${th.recording} threads`])
+  if (s.decided && finite(s.holm_pairs) && s.pairs < s.holm_pairs) out.push([`verdicts for secondaries need ${s.holm_pairs} pairs`, bench(`--pairs ${s.holm_pairs}`)])
+  const need = s.primary?.needed_pairs
+  if (!s.decided && finite(need) && need > (s.pairs || 0) && need < 1000) out.push([`about ${need} pairs could decide the primary`, bench(`--pairs ${need}`)])
+  if ((r.warnings || []).some((w) => w.id === "StaleCalibration")) out.push(["calibrate this device (Throttled baseline)", "strobe up"])
+  out.push(["markdown for a pull request", `strobe report experiment ${r.id} --format md`])
+  return out
+}
+
+function cmdList(items) {
+  return h("div", { class: "cmds" }, items.map(([about, cmd]) => h("div", {},
+    h("div", { class: "cmd-about" }, about),
+    h("div", { class: "cmd-line" }, h("code", {}, cmd), h("button", { type: "button", class: "copy", onclick: (e) => copy(cmd, e.currentTarget) }, "copy")))))
+}
+
+function copy(text, btn) {
+  const label = btn.textContent
+  const done = () => {
+    btn.textContent = "copied"
+    btn.classList.add("done")
+    setTimeout(() => {
+      btn.textContent = label
+      btn.classList.remove("done")
+    }, 1200)
+  }
+  const fallback = () => {
+    const ta = h("textarea", { style: "position:fixed;left:-9999px;top:0" })
+    ta.value = text
+    document.body.append(ta)
+    ta.select()
+    document.execCommand("copy")
+    ta.remove()
+    done()
+  }
+  if (navigator.clipboard?.writeText) navigator.clipboard.writeText(text).then(done, fallback)
+  else fallback()
+}
+
+/* ---------- recording ---------- */
+
+function renderRecording(m) {
+  const v = m.values || {}
+  const g = (k) => (finite(v[k]) ? v[k] : NaN)
+  document.title = `strobe · ${m.id || "recording"}`
+  const header = h("header", { class: "top" },
+    h("span", { class: "brand" }, "strobe"),
+    h("div", { class: "crumbs" },
+      h("span", { class: "mono id" }, m.id || "recording"),
+      m.target ? h("span", { class: "mono", title: m.target }, m.target) : null,
+      m.created ? h("span", { class: "time", title: m.created }, fmtTime(m.created)) : null),
+    h("button", { class: "toggle", type: "button", "data-key": "text", "aria-pressed": String(state.text), onclick: () => { state.text = !state.text; render() } }, "text"))
+  const main = h("main")
+  app.replaceChildren(header, main)
+  if (state.text) {
+    main.append(textPanel(recordingText(m)))
+    return
+  }
+  const hz = g("display.hz")
+  const budget = hz > 0 ? 1000 / hz : NaN
+  const valid = m.valid === true ? ["ok", "valid"] : m.valid === false ? ["err", "invalid"] : ["warn", "validity unknown"]
+  const cores = g("cpu.app.total") / 100
+  const tile = (k, val, sub, gauge) => h("div", { class: "tile" },
+    h("div", { class: "k" }, k),
+    h("div", { class: "v" }, val),
+    sub ? h("div", { class: "s" }, sub) : null,
+    finite(gauge) ? h("div", { class: "gauge" }, h("i", { style: `width:${Math.max(0, Math.min(100, gauge))}%` })) : null)
+  const vsyncs = (ms) => (finite(ms) && finite(budget) ? `${(ms / budget).toFixed(1)} vsyncs` : null)
+  const tiles = [
+    finite(g("frames.n")) || finite(g("frames.presented.count")) ? tile("frames presented", fmtValue(finite(g("frames.n")) ? g("frames.n") : g("frames.presented.count"), "count"), finite(hz) ? `display ${Math.round(hz)} Hz` : null) : null,
+    finite(g("frames.dropped.pct")) ? tile("vsyncs dropped", fmtValue(g("frames.dropped.pct"), "%"), finite(g("frames.dropped")) ? `${fmtValue(g("frames.dropped"), "count")} dropped` : null, g("frames.dropped.pct")) : null,
+    finite(g("frames.interval.p95")) ? tile("gap p95", fmtValue(g("frames.interval.p95"), "ms"), vsyncs(g("frames.interval.p95"))) : null,
+    finite(g("frames.presented.p95")) ? tile("latency p95", fmtValue(g("frames.presented.p95"), "ms"), vsyncs(g("frames.presented.p95"))) : null,
+    finite(g("main.busy")) ? tile("main thread busy", fmtValue(g("main.busy"), "%"), finite(g("main.tasks.long")) ? `${fmtValue(g("main.tasks.long"), "count")} long tasks` : null, g("main.busy")) : null,
+    finite(cores) ? tile("cpu, all processes", fmtValue(g("cpu.app.total"), "%"), `${cores.toFixed(2)} cores`, Math.min(100, g("cpu.app.total"))) : null,
+    finite(g("interaction.p95")) ? tile("input p95", fmtValue(g("interaction.p95"), "ms"), "input → presentation") : null,
+  ].filter(Boolean)
+  const ladderRows = ladder(v)
+  main.append(
+    h("section", { class: "panel" },
+      h("div", { class: "ph" },
+        h("h2", {}, "Recording"),
+        h("span", { class: "sub" }, [m.kind, m.probes, finite(m.duration_ms) ? fmtDuration(m.duration_ms) : null].filter(Boolean).join(" · ")),
+        h("div", { class: "ctl st-" + valid[0] }, h("i", { class: "sq" }), h("span", {}, valid[1]))),
+      h("div", { class: "pb" }, h("div", { class: "mono wrap" }, m.target || ""), m.phases?.length ? h("div", { class: "dim", style: "margin-top:4px" }, "phases: " + m.phases.join(" · ")) : null),
+      tiles.length ? h("div", { class: "tiles" }, tiles) : null),
+    ladderRows.length ? panel("Percentiles", "against the vsync budget", null, chart(44 + ladderRows.length * 48, (w) => drawLadder(w, ladderRows, budget))) : null,
+    panel("All values", null, null, valuesList(v)),
+    h("div", { class: "grid2" }, envPanel(m, []), panel("Next steps", null, null, cmdList(recordingSteps(m)))))
+}
+
+function ladder(v) {
+  return [
+    ["gaps", [["p50", "frames.interval.p50"], ["p95", "frames.interval.p95"], ["p99", "frames.interval.p99"], ["max", "frames.interval.max"]]],
+    ["latency", [["p50", "frames.presented.p50"], ["p90", "frames.presented.p90"], ["p95", "frames.presented.p95"], ["p99", "frames.presented.p99"], ["max", "frames.presented.max"]]],
+    ["input", [["p50", "interaction.p50"], ["p95", "interaction.p95"]]],
+    ["scroll", [["p95", "scroll.latency.p95"]]],
+  ]
+    .map(([label, keys]) => [label, keys.map(([k, n]) => [k, v[n]]).filter(([, x]) => finite(x))])
+    .filter(([, ks]) => ks.length)
+}
+
+function drawLadder(w, rows, budget) {
+  const H = 44 + rows.length * 48
+  const m = { l: 64, r: 24, t: 24, b: 22 }
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` })
+  let xmax = Math.max(...rows.flatMap(([, ks]) => ks.map(([, x]) => x)))
+  if (finite(budget)) xmax = Math.max(xmax, budget * 1.2)
+  xmax *= 1.06
+  const x = lin(0, xmax, m.l, w - m.r)
+  for (const t of niceTicks(0, xmax, Math.max(3, Math.floor((w - m.l - m.r) / 70)))) svg.append(L(x(t), m.t, x(t), H - m.b, "grid"), T(x(t), H - m.b + 14, num(t), null, "middle"))
+  svg.append(T(w - m.r, H - m.b + 14, "ms", null, "start"))
+  if (finite(budget)) {
+    let last = -1e9
+    for (let k = 1; k * budget <= xmax && k <= 24; k++) {
+      const px = x(k * budget)
+      svg.append(L(px, m.t, px, H - m.b, "vsync" + (k === 1 ? " one" : "")))
+      if (px - last >= 26) {
+        svg.append(T(px, m.t - 8, k === 1 ? "vsync" : `${k}×`, null, "middle"))
+        last = px
+      }
+    }
+  }
+  rows.forEach(([label, ks], i) => {
+    const cy = m.t + 26 + i * 48
+    const xs = ks.map(([, v]) => x(v))
+    svg.append(T(m.l - 10, cy + 4, label, "lbl", "end"))
+    svg.append(S("line", { x1: Math.min(...xs), y1: cy, x2: Math.max(...xs), y2: cy, style: "stroke:var(--fg-3)" }))
+    const p50 = ks.find(([k]) => k === "p50")
+    const p95 = ks.find(([k]) => k === "p95")
+    if (p50 && p95) svg.append(S("rect", { x: x(p50[1]), y: cy - 4, width: Math.max(1, x(p95[1]) - x(p50[1])), height: 8, style: "fill:var(--accent)", "fill-opacity": 0.28 }))
+    const drawn = []
+    const order = ["p50", "max", "p95", "p99", "p90"]
+    for (const [k, v] of ks.slice().sort((a, b) => order.indexOf(a[0]) - order.indexOf(b[0]))) {
+      const px = x(v)
+      svg.append(S("line", { x1: px, y1: cy - 7, x2: px, y2: cy + 7, style: "stroke:var(--accent)", "stroke-width": 1.5 }))
+      if (drawn.some((d) => Math.abs(d - px) < 34)) continue
+      drawn.push(px)
+      svg.append(T(px, cy - 11, k, null, "middle"), T(px, cy + 19, short(v), "lbl", "middle"))
+    }
+  })
+  return svg
+}
+
+function valuesList(v) {
+  const groups = new Map()
+  for (const k of Object.keys(v).sort()) {
+    const area = k.split(".")[0]
+    groups.set(area, [...(groups.get(area) || []), k])
+  }
+  if (!groups.size) return h("div", { class: "dim" }, "no values")
+  return h("div", { class: "values" }, [...groups].map(([area, keys]) => h("div", { class: "grp" },
+    h("div", { class: "head" }, area),
+    keys.map((k) => h("div", { class: "row" }, h("span", { class: "mono" }, k), h("span", { class: "mono" }, fmtValue(v[k], unitOf(k))))))))
+}
+
+function recordingSteps(m) {
+  const id = m.id || "<rec_…>"
+  const out = [
+    ["worst frames, with handles", `strobe query ${id} frames`],
+    ["busy share by thread, long tasks", `strobe query ${id} threads`],
+  ]
+  if (/attribution|cpu/.test(String(m.probes || ""))) out.push(["where the CPU went", `strobe query ${id} hotspots --by package`])
+  out.push(["raw trace rows", `strobe query ${id} sql "select name, count(*) n from slice group by name order by n desc limit 20"`])
+  out.push(["markdown for a pull request", `strobe report recording ${id} --format md`])
+  return out
+}
+
+function recordingText(m) {
+  const v = m.values || {}
+  const g = (k) => (finite(v[k]) ? v[k] : NaN)
+  const lines = [
+    `${m.id} · ${m.target} · ${fmtDuration(m.duration_ms)} · ${m.probes}`,
+    `frames   ${fmtValue(g("frames.n"), "count")} presented · ${fmtValue(g("frames.dropped.pct"), "%")} of vsyncs dropped · display ${finite(g("display.hz")) ? Math.round(g("display.hz")) + " Hz" : "?"}`,
+    `interval p50 ${fmtValue(g("frames.interval.p50"), "ms")} · p95 ${fmtValue(g("frames.interval.p95"), "ms")} · max ${fmtValue(g("frames.interval.max"), "ms")}   (gap between presented frames)`,
+    `latency  p50 ${fmtValue(g("frames.presented.p50"), "ms")} · p95 ${fmtValue(g("frames.presented.p95"), "ms")} · max ${fmtValue(g("frames.presented.max"), "ms")}   (frame begin to presentation)`,
+    `main     ${fmtValue(g("main.busy"), "%")} busy · ${fmtValue(g("main.tasks.long"), "count")} long tasks`,
+    finite(g("cpu.app.total")) ? `cpu      ${fmtValue(g("cpu.app.total"), "%")} of one core, all processes` : null,
+    finite(g("interaction.p95")) ? `input    p95 ${fmtValue(g("interaction.p95"), "ms")} input → presentation` : null,
+    `next     strobe query ${m.id} frames · strobe report recording ${m.id} --open`,
+  ]
+  return lines.filter(Boolean).join("\n") + "\n"
+}
+
+/* ---------- start ---------- */
+
+{
+  const m = /series=(\d+)/.exec(location.hash)
+  if (m) state.series = +m[1]
+}
+render()
+</script>
+</body>
+</html>

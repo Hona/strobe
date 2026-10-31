@@ -305,6 +305,20 @@ fn skill_path() -> PathBuf {
     host::home().join(".config").join("opencode").join("skills").join("strobe").join("SKILL.md")
 }
 
+/// The installed skill against this build's: `current`, `outdated` (from another build, untouched),
+/// `customised` (edited by hand; `up` leaves it) or `missing`.
+pub fn skill_state() -> &'static str {
+    use sha2::Digest;
+    let hash = |text: &str| -> String { sha2::Sha256::digest(text.split_once("\n---\n").map(|x| x.1).unwrap_or(text).as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect() };
+    let Ok(existing) = std::fs::read_to_string(skill_path()) else { return "missing" };
+    let recorded = existing.lines().find_map(|l| l.trim().strip_prefix("strobe/hash: ")).map(str::to_string);
+    match recorded {
+        Some(h) if h != hash(&existing) => "customised",
+        Some(h) if h == hash(SKILL) => "current",
+        _ => "outdated",
+    }
+}
+
 fn skill_up(s: &mut Steps) -> Result<()> {
     use sha2::Digest;
     let body = SKILL.split_once("\n---\n").map(|x| x.1).unwrap_or(SKILL);

@@ -42,6 +42,8 @@ pub fn run(args: &Args) -> Result<Output> {
     if !engine::installed() {
         problems.push("trace_processor not downloaded yet (strobe up, or on first use)".into());
     }
+    let daemon = super::mcp::running();
+    let skill = super::up::skill_state();
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
         problems.push("no calibration yet (strobe up)".into());
@@ -52,6 +54,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "calibration": calibration, "recordings": recordings.iter().map(|r| &r.0).collect::<Vec<_>>(),
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
         "session_locked": locked, "valid": problems.is_empty(), "problems": problems,
+        "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill,
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
     let mut t = String::new();
@@ -67,6 +70,21 @@ pub fn run(args: &Args) -> Result<Output> {
         "  {} calibrate  {}\n",
         mark(!calibration.is_null()),
         calibration.get("speed_ms").and_then(Value::as_f64).map(|s| format!("speed check {s:.1} ms · {}", calibration["at"].as_str().unwrap_or(""))).unwrap_or_else(|| "never".into())
+    );
+    t += &format!(
+        "  {} daemon     {}\n",
+        mark(daemon),
+        if daemon { format!("running on 127.0.0.1:{} (MCP)", super::mcp::port()) } else { "not running: strobe up starts it (MCP calls need it)".into() }
+    );
+    t += &format!(
+        "  {} skill      {}\n",
+        mark(skill == "current"),
+        match skill {
+            "current" => "installed, this build's",
+            "customised" => "customised by hand: strobe up leaves it as is",
+            "outdated" => "from another build: strobe up refreshes it",
+            _ => "not installed: strobe up installs it",
+        }
     );
     t += &format!("    data       {} recordings, {} experiments shown · {}\n", recordings.len(), experiments.len(), super::fmt::bytes(disk as f64));
     for (id, _) in &experiments {

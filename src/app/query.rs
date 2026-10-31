@@ -483,13 +483,16 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
     /// (name, where) → (weight, samples, stacks).
     type Row = ((String, String), (f64, u64, Stacks));
     let mut rows: BTreeMap<(String, String), (f64, u64, Stacks)> = BTreeMap::new();
-    let (mut total, mut mapped) = (0.0, 0u64);
+    let (mut total, mut mapped, mut scripts) = (0.0, 0u64, 0u64);
     let samples: u64 = weights.iter().map(|w| w.2).sum();
     let mut packages: BTreeMap<String, String> = BTreeMap::new();
     for (stack, w, hits) in weights {
         let Some(f) = stack.last() else { continue };
         if f.mapped {
             mapped += hits;
+        }
+        if !f.url.is_empty() {
+            scripts += hits;
         }
         let key = match by {
             "file" | "package" if f.url.is_empty() => f.name.clone(),
@@ -513,7 +516,7 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
     }
     let mut rows: Vec<Row> = rows.into_iter().collect();
     rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
-    let mapped_text = if mapped > 0 { format!(" · {:.0}% source-mapped", 100.0 * mapped as f64 / samples.max(1) as f64) } else { String::new() };
+    let mapped_text = if mapped > 0 { format!(" · {:.0}% of script samples source-mapped", 100.0 * mapped as f64 / scripts.max(1) as f64) } else { String::new() };
     let mut text = header.replace("{samples}", &samples.to_string()).replace("{mapped}", &mapped_text) + "\n";
     let mut json_rows = Vec::new();
     let n = (samples as f64).max(1.0);
@@ -532,7 +535,7 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
         let stacks_json: Vec<Value> = heavy.iter().take(3).map(|(stack, (sw, sn))| json!({ "weight": sw, "samples": sn, "frames": stack.iter().map(Frame::json).collect::<Vec<_>>() })).collect();
         json_rows.push(json!({ "name": k, "weight": w, "samples": hits, "share": share, "share_ci": ci, "where": detail, "stacks": stacks_json }));
     }
-    Output::new(text, json!({ "by": by, "samples": samples, "mapped_samples": mapped, "total": total, "rows": json_rows }))
+    Output::new(text, json!({ "by": by, "samples": samples, "script_samples": scripts, "mapped_samples": mapped, "total": total, "rows": json_rows }))
 }
 
 fn short_url(url: &str) -> String {

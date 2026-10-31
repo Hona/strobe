@@ -468,7 +468,20 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress("  attribution blocks (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
         for v in variants.iter() {
             match block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) {
-                Ok(b) => recordings[v.role] = json!(b.recording),
+                Ok(b) => {
+                    // `Unresolved` (SPEC §10.2): script samples the stored source maps could not name.
+                    let hot = b.recording.as_deref().and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
+                    if let Some(h) = hot.map(|o| o.json) {
+                        let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
+                        if scripts > 0.0 && mapped / scripts < 0.95 {
+                            warnings.push(validity::warn(
+                                "Unresolved",
+                                format!("{}: {:.0}% of script samples have no source map, so their names and files stay minified; build with source maps", v.role, 100.0 * (1.0 - mapped / scripts)),
+                            ));
+                        }
+                    }
+                    recordings[v.role] = json!(b.recording);
+                }
                 Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", v.role, e.message))),
             }
         }

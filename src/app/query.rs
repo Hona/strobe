@@ -48,8 +48,13 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
-        "hotspots" => hotspots(&dir, args.get("by").unwrap_or("function"), top),
-        "alloc" => alloc(&dir, args.get("by").unwrap_or("function"), top),
+        "hotspots" | "alloc" => {
+            let by = args.get("by").unwrap_or("function");
+            if !matches!(by, "function" | "file" | "package") {
+                return Err(Error::usage(format!("--by: function, file or package, not {by}")));
+            }
+            if view == "alloc" { alloc(&dir, by, top) } else { hotspots(&dir, by, top) }
+        }
         "layout" => layout(&dir, top),
         "gc" => gc(&dir),
         "heap" => heap(&dir, top, args.has("reveal")),

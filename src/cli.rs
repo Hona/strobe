@@ -87,20 +87,25 @@ pub const HELP: &str = "strobe — measure and explain performance
 Usage: strobe <command> [flags]
 
 Use
-  status [target]                 environment, validity preflight, attachable targets
-  record <target> [--for 10s]     record a target; prints a handle (rec_…)
-  bench <file.bench.ts> --head <variant> [--base <variant>]
+  status                          environment, validity preflight, recent recordings and experiments
+  record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>]
+                                  record a target; prints a handle (rec_…)
+  bench <file.bench.ts> --head <variant> [--base <variant> | --aa] [--filter <case>] [--pairs auto|N]
+        [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
                                   run an experiment; a verdict per series
-  query <rec_…|exp_…> <view>      views: summary frames threads sql
-  report <view> <handle…>         write a markdown or HTML artifact
+  query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
+                                  views: summary frames threads hotspots alloc layout gc heap leaks sql
+                                  (a..b: heap; exp_…: summary progress)
+  report experiment|recording <handle> [--format html|md] [--out <path>] [--open]
+                                  write a self-contained HTML (or markdown) report
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
 
 Setup
-  up                              download the engine, install the skill, check this device
+  up [--skip daemon,mcp,calibrate]  install, download the engine, start the daemon, register MCP and the skill
+  leave [--yes]                   undo up (--yes also deletes recordings and experiments)
 
-Targets   https://… · cdp:<port>
-Variants  a directory · a git ref · url:<href>
-Global    --json  -q  -v  -h  -V
-
+Targets   https://… · app:<id> (a strobe.json profile) · exe:<path> [--app <id>] · cdp:<port> · cdp:ws://… · file:<path>
+Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
+Global    --json  -q  -h  -V
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable
 ";

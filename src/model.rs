@@ -119,6 +119,7 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef { name: "scroll.latency.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 20, about: "scroll update input to presentation, 95th percentile" },
     MetricDef { name: "run.duration", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "wall time of one run" },
     MetricDef { name: "cpu.app.total", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "CPU of every process of the target, % of one core, during runs" },
+    MetricDef { name: "cpu.foreign", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "other processes' work on the CPUs the target is pinned to during runs, % of one core: a validity signal, not the target's cost" },
     MetricDef { name: "cpu.process.total", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "alias of cpu.app.total" },
     MetricDef { name: "memory.app.private", unit: "MB", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "private bytes of every target process after the measured runs" },
     MetricDef { name: "gpu.process.3d", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "GPU 3D engine use by the target's processes during runs" },

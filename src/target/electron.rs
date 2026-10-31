@@ -404,7 +404,7 @@ pub fn main_page(browser: &Browser) -> Result<super::chromium::Page> {
             let page = super::chromium::Page { cdp: browser.cdp.clone(), session, target };
             page.send("Page.enable", json!({}))?;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while host::raise_windows(browser.pid) == 0 && Instant::now() < deadline {
+            while cfg!(windows) && host::raise_windows(browser.pid) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
             }
             return Ok(page);

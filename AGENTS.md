@@ -2,7 +2,7 @@
 
 - Read `SPEC.md` before any work. It is the source of truth. If a change conflicts with it, stop and ask. When the user agrees to a design change, update `SPEC.md` in the same change.
 - Rule #1 is "valid or nothing" and rule #2 is "measure the app, not strobe" (SPEC §1). A feature that prints a number strobe cannot defend is a bug.
-- Respect the module boundaries in SPEC §4.3: only `engine/` runs trace_processor, only `store/` writes `results.db` and `recordings/`, backends return `model` types.
+- Respect the module boundaries in SPEC §4.3: only `engine/` runs trace_processor, only `store/` writes `experiments/` and `recordings/`, backends return `model` types.
 - NEVER write automated tests: no unit, integration, e2e, or any other tests, no test files, no test dependencies, no CI test steps. Verify with the calibration page and A/A runs on real devices (SPEC §10.3, §10.4).
 - Iteration speed first. Smallest change that works.
 - Never experiment on the user's real app data or config. Attach to a running app only to read.

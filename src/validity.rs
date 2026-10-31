@@ -103,9 +103,14 @@ pub fn lock() -> Result<Lock> {
 
 /// The speed baseline from calibration, if any.
 pub fn baseline() -> Option<f64> {
+    calibration()?["speed_ms"].as_f64()
+}
+
+/// The device's last calibration (`at`, `ok`, `speed_ms`, checks), if any.
+pub fn calibration() -> Option<Value> {
     let state = std::fs::read_to_string(host::paths::state_dir().join("state.json")).ok()?;
     let v: Value = serde_json::from_str(&state).ok()?;
-    v["last_calibration"]["speed_ms"].as_f64()
+    v.get("last_calibration").filter(|c| c.is_object()).cloned()
 }
 
 /// Spearman's rank correlation, for drift across pairs.

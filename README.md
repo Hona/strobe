@@ -2,14 +2,15 @@
 
 Measure and explain performance: a web page, an Electron app, a Bun or Node process, or any process. strobe records everything on one clock, refuses measurements it cannot defend, and gives you, or your agent, a verdict with handles to drill into. It knows no product: what an app under test needs (how to build, serve or launch it in isolation) lives in that app's own `strobe.json`.
 
-> Pre-release. The design is in [SPEC.md](SPEC.md); nothing is built yet.
+> Pre-release, Windows first. The design is in [SPEC.md](SPEC.md); what is built is listed in the skill (`skill/SKILL.md`) and `strobe --help`.
 
 ```
-strobe bench perf/timeline.bench.ts --base origin/dev --head .   # did my change help?
+strobe bench perf/timeline.bench.ts --base origin/dev --head .   # did my change help? (and why)
 strobe record app:desktop --for 10s                              # what is the installed app doing?
-strobe query rec_3f9a hotspots --by package --phase scroll       # where did the time go?
-strobe query rec_3f9a memory --by process                        # where is the memory?
-strobe report bench-summary exp_8c21 --open                      # a page to share
+strobe query rec_3f9a hotspots --by package                      # where did the CPU time go?
+strobe query rec_3f9a layout                                     # which line forced a layout?
+strobe record app:desktop --probes memory --for 60s              # is it leaking? then: query <rec> leaks
+strobe report experiment exp_8c21 --open                         # a page to share
 strobe top                                                       # per-core, per-process, per-GPU-engine
 ```
 

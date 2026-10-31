@@ -67,7 +67,8 @@ pub fn run(args: &Args) -> Result<Output> {
         return Err(validity::locked());
     }
     let awake = host::Awake::start();
-    let id = store::new_id("rec");
+    // `--id`: a handle chosen up front, so an MCP call that outlives its timeout can be followed.
+    let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
     let dir = store::recording_dir(&id)?;
@@ -117,7 +118,7 @@ pub fn run(args: &Args) -> Result<Output> {
         probe::symbols::store_maps(&page, &scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let bytes = tracing.stop(&dir.join("trace.pftrace"))?;
-    if set == Set::Attribution || set == Set::Memory {
+    if set == Set::Attribution {
         // After tracing: a live trace subscription would copy every snapshot chunk (SPEC §8.6).
         progress("taking a heap snapshot");
         probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz"))?;
@@ -132,7 +133,7 @@ pub fn run(args: &Args) -> Result<Output> {
     progress("reading the trace");
     let data = metrics::read(&dir.join("trace.pftrace"), &token)?;
     let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    if !attach && t1 > t0 {
+    if !attach && t1 > t0 && cpu1 > 0 {
         extra.entry("cpu.app.total".into()).or_default().insert("run:0".into(), 100.0 * (cpu1 - cpu0) as f64 / (t1 - t0) as f64);
     }
     if let Some(p) = os.as_ref().and_then(|o| o.gpu_3d_pct) {
@@ -146,6 +147,8 @@ pub fn run(args: &Args) -> Result<Output> {
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
         "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
+        // Rule 3: timing taken with profilers on describes the profiled target, not the target.
+        "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
         "created": now_iso(), "valid": true,
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -250,12 +253,23 @@ pub fn summary_text(meta: &Value) -> String {
     if get("interaction.p95").is_finite() {
         s += &format!("input    p95 {} input → presentation\n", fmt::value(get("interaction.p95"), "ms"));
     }
+    if meta["timing"] == "perturbed" {
+        s += "timing   perturbed: profilers ran during this recording, so its times are not the target's; take times with --probes timing\n";
+    }
     s += &format!("next     strobe query {} frames · strobe report recording {} --open\n", meta["id"].as_str().unwrap_or(""), meta["id"].as_str().unwrap_or(""));
     s
 }
 
 pub fn now_iso() -> String {
-    let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    iso(now_secs())
+}
+
+pub fn now_secs() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// `secs` since the Unix epoch as `YYYY-MM-DDTHH:MM:SSZ`, which sorts like time.
+pub fn iso(secs: u64) -> String {
     let (days, rem) = (secs / 86400, secs % 86400);
     let (y, m, d) = civil(days as i64);
     format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z", rem / 3600, rem % 3600 / 60, rem % 60)

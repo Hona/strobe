@@ -62,7 +62,13 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
                 a.push(t);
             }
         }
-        "record" => a.push(get("target").ok_or_else(|| Error::usage("record needs target"))?),
+        "record" => {
+            a.push(get("target").ok_or_else(|| Error::usage("record needs target"))?);
+            let id = store::new_id("rec");
+            a.push("--id".into());
+            a.push(id.clone());
+            pending_id = Some(id);
+        }
         "bench" => {
             a.push(get("file").ok_or_else(|| Error::usage("bench needs file"))?);
             let id = store::new_id("exp");
@@ -136,7 +142,11 @@ fn call_tool(name: &str, input: &Value) -> Value {
         }
         Err(_) => {
             let id = pending.unwrap_or_default();
-            let text = format!("still running after {timeout} s; it continues in the daemon. Follow it with query {{ handle: \"{id}\", view: \"progress\" }}");
+            let text = if id.starts_with("rec_") {
+                format!("still recording after {timeout} s; it continues in the daemon. Read it with query {{ handle: \"{id}\" }} once it finishes")
+            } else {
+                format!("still running after {timeout} s; it continues in the daemon. Follow it with query {{ handle: \"{id}\", view: \"progress\" }}")
+            };
             json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "id": id, "state": "running" }, "isError": false })
         }
     }

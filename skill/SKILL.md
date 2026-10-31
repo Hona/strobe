@@ -5,26 +5,25 @@ description: Measure and explain performance of web pages, Electron apps, Bun or
 
 # Strobe
 
-strobe records a target on one timeline and answers with verdicts and handles (`rec_…`, `exp_…`, `fn_…`) to drill into. It refuses measurements it cannot defend: a refused run is an answer.
+strobe records a target on one timeline and answers with verdicts and handles (`rec_…`, `exp_…`) to drill into. It refuses measurements it cannot defend: a refused run is an answer.
 
 ## Reference
 
-    strobe status [target] [--calibrate]          environment, validity preflight, attachable targets
-    strobe record <target> [--probes <set>] [--for 10s | --bench <file>#<case>]
+    strobe status [--calibrate]                    environment, validity preflight, recent handles
+    strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
     strobe bench <file.bench.ts> --head <variant> [--base <variant>] [--filter <case>] [--target <name>]
                  [--params k=v] [--primary <metric>] [--aa] [--pairs auto|N] [--runs 5] [--power keep|high]
                  [--why auto|always|never] [--trace lean|full]
-                 [--probes memory --repeat 10] [--bisect a..b]
         variant: a directory, a git ref, app:<id>, exe:<path>
     strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout gc heap leaks sql
         hotspots and alloc take --by function|file|package; a..b works with heap; --reveal shows heap strings
-    strobe report <view> <handle…> [--format md|html]    writes a file; show it in the Review pane
+    strobe report experiment|recording <handle> [--format html|md]    writes a file; show it in the Review pane
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
 
-Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `apps`) · `exe:<path>` · `node:<port>` · `pid:<n>` · `file:<path>` · `<target>@<device>` (mesh)
+Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `apps`) · `exe:<path>` · `cdp:ws://…` · `file:<path>` (import a trace, .cpuprofile or .heapsnapshot)
 
-Probe sets: `timing` (default) · `attribution` (CPU stacks, allocation, invalidations, counters) · `memory` (census, heap snapshots) · `deep` (native stacks)
+Probe sets: `timing` (default) · `attribution` (CPU stacks, allocations, forced layouts, GC, a heap snapshot; its times are perturbed) · `memory` (three heap snapshots for leaks, no trace)
 
 Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (invalid; the reason is in the result) · `5` inconclusive · `124` timeout · `255` unreachable
 
@@ -60,9 +59,7 @@ Everything about the app under test lives in its repo's `strobe.json`: `build` a
 Did my change help? `bench <file> --base origin/dev --head .` and read the verdict per series.
 Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
 Which objects are alive? `query <rec> heap` (classes by retained size, detached DOM, retainer paths); `query <base rec>..<head rec> heap` compares two.
-An installed app: `status app:<id>` shows whether its bridge is on.
 Is it leaking? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.
-Which commit regressed? `bench <file> --bisect <good>..<bad>`.
 Is the method sound here? `bench <file> --aa --head .`.
 
 ## Notes

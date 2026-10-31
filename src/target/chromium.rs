@@ -187,12 +187,13 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     Ok(Browser { cdp, ws, child: Some(child), pid, profile: Some(profile), exe, version, window: window.clone() })
 }
 
-/// Attaches to a running endpoint (`cdp:<port>` or a ws:// url).
+/// Attaches to a running endpoint: `cdp:<port>`, `cdp:ws://…` or a bare `ws://…`.
 pub fn attach(endpoint: &str) -> Result<Browser> {
+    let endpoint = endpoint.strip_prefix("cdp:").unwrap_or(endpoint);
     let url = if endpoint.starts_with("ws://") {
         endpoint.to_string()
     } else {
-        let port = endpoint.trim_start_matches("cdp:");
+        let port = endpoint;
         let body = http_get(&format!("127.0.0.1:{port}"), "/json/version")?;
         let v: Value = serde_json::from_str(&body)?;
         v.get("webSocketDebuggerUrl").and_then(Value::as_str).ok_or_else(|| Error::unreachable("no webSocketDebuggerUrl"))?.to_string()
@@ -229,7 +230,7 @@ impl Browser {
         let session = attached["sessionId"].as_str().ok_or_else(|| Error::msg("attach: no session"))?.to_string();
         let page = Page { cdp: self.cdp.clone(), session, target };
         page.send("Page.enable", json!({}))?;
-        if self.pid != 0 {
+        if self.pid != 0 && cfg!(windows) {
             // An occluded Chromium window stops rendering: keep ours on top, without taking focus.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while host::raise_windows(self.pid) == 0 && std::time::Instant::now() < deadline {

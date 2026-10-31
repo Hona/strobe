@@ -425,6 +425,18 @@ pub fn leave(args: &Args) -> Result<Output> {
     s.line("✓", "mcp", "removed");
     let _ = std::fs::remove_dir_all(skill_path().parent().unwrap_or(Path::new("")));
     s.line("✓", "skill", "removed");
+    // The install folder `up` added to the user PATH (the binaries stay: this one is running).
+    #[cfg(windows)]
+    {
+        let want = install_dir().display().to_string();
+        let current = host::win::user_value("Environment", "Path").unwrap_or_default();
+        let kept: Vec<&str> = current.split(';').filter(|p| !p.is_empty() && !p.trim_end_matches('\\').eq_ignore_ascii_case(want.trim_end_matches('\\'))).collect();
+        if kept.len() != current.split(';').filter(|p| !p.is_empty()).count() {
+            host::win::set_user_value("Environment", "Path", Some(&kept.join(";")), true);
+            host::win::broadcast_env_change();
+            s.line("✓", "path", format!("removed {want}"));
+        }
+    }
     if args.has("yes") {
         let _ = std::fs::remove_dir_all(paths::state_dir());
         s.line("✓", "state", "removed (recordings and experiments included)");

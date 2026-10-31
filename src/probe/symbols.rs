@@ -98,7 +98,9 @@ fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
         r#"(async (u) => {{
   try {{
     const s = await (await fetch(u)).text()
-    const m = /\/\/[#@] sourceMappingURL=(\S+)\s*$/.exec(s.slice(-600))
+    // The last such comment, however long: an inline data: map is the whole map in base64.
+    const at = Math.max(s.lastIndexOf('//# sourceMappingURL='), s.lastIndexOf('//@ sourceMappingURL='))
+    const m = at < 0 ? null : /^\/\/[#@] sourceMappingURL=(\S+)/.exec(s.slice(at))
     if (!m) return null
     const href = new URL(m[1], u).href
     const r = await fetch(href)
@@ -117,6 +119,7 @@ fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
         lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect(),
     })
 }
+
 /// One frame, located as completely as strobe can: the original name, the absolute file on disk when
 /// known (else the source path the map records, else the script URL), 1-based line and column.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -226,17 +229,17 @@ impl Symbolizer {
         });
         let Some(o) = map.as_ref().and_then(|m| m.lookup(line0 as usize, col0, if minified.starts_with('(') { "" } else { minified })) else { return plain };
         let file = entry["map_dir"].as_str().map(|d| normalize(&Path::new(d).join(strip_scheme(&o.source)))).filter(|p| p.is_file());
-        // Without a name in the map, the original declaration on disk usually has one.
-        let (name, from) = match (&o.name, &file) {
-            (Some(n), _) => (n.clone(), Some("map")),
-            (None, Some(f)) => {
-                let mut texts = self.texts.borrow_mut();
-                let lines = texts.entry(f.clone()).or_insert_with(|| std::fs::read_to_string(f).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default());
-                match lines.get(o.line as usize).and_then(|l| declared_name(l, o.column as usize)) {
-                    Some(n) => (n, Some("source")),
-                    None => (minified.to_string(), None),
-                }
-            }
+        // The original declaration on disk decides when strobe can read it: at an arrow function's
+        // position the map's name is often its first parameter (`(event) =>` minified to `e=>`).
+        let declared = file.as_ref().map(|f| {
+            let mut texts = self.texts.borrow_mut();
+            let lines = texts.entry(f.clone()).or_insert_with(|| std::fs::read_to_string(f).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default());
+            lines.get(o.line as usize).map_or(Declared::Unknown, |l| declared_name(l, o.column as usize))
+        });
+        let (name, from) = match (declared, &o.name) {
+            (Some(Declared::Name(n)), _) => (n, Some("source")),
+            (Some(Declared::Anonymous), _) => ("(anonymous)".to_string(), Some("source")),
+            (_, Some(n)) => (n.clone(), Some("map")),
             _ => (minified.to_string(), None),
         };
         Frame {
@@ -256,43 +259,120 @@ impl Symbolizer {
     }
 }
 
-/// The name a function declared at `col` (0-based, in characters) of `line` goes by: `function name(`,
-/// `name(` (a method), or `name = …` / `name: …` just before an arrow or anonymous function.
-fn declared_name(line: &str, col: usize) -> Option<String> {
-    let chars: Vec<char> = line.chars().collect();
-    let ident = |from: usize| -> Option<String> {
-        let s: String = chars.get(from..)?.iter().take_while(|c| c.is_alphanumeric() || **c == '_' || **c == '$').collect();
-        (!s.is_empty() && !s.chars().next().is_some_and(|c| c.is_ascii_digit())).then_some(s)
-    };
-    let rest: String = chars.get(col..)?.iter().collect();
-    let trimmed = rest.trim_start_matches("async ").trim_start();
-    if let Some(after) = trimmed.strip_prefix("function") {
-        let skip = chars.len() - after.chars().count();
-        let at = skip + after.chars().take_while(|c| c.is_whitespace() || *c == '*').count();
-        // An anonymous `function (` falls through to the name it is assigned to.
-        if let Some(n) = ident(at) {
-            return Some(n);
-        }
-    }
-    if let Some(n) = ident(col).filter(|n| chars.get(col + n.chars().count()) == Some(&'(') && !matches!(n.as_str(), "if" | "for" | "while" | "switch" | "catch")) {
-        return Some(n);
-    }
-    let before: String = chars[..col.min(chars.len())].iter().collect();
-    let tail = |s: &str| -> String { s.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect() };
-    // At the parameter list (`function name(`, a method's `name(`): the identifier just before it.
-    if matches!(chars.get(col), Some('(') | Some('<')) {
-        let name = tail(before.trim_end());
-        if !name.is_empty() && !matches!(name.as_str(), "function" | "async" | "if" | "for" | "while" | "switch" | "catch" | "return") {
-            return Some(name);
-        }
-    }
-    // `name = (`, `name = async (`, `name: function (`, `name = x =>`: the identifier before `=` or `:`.
-    let head = before.trim_end().trim_end_matches("function").trim_end().trim_end_matches("async").trim_end();
-    let head = head.strip_suffix('=').or_else(|| head.strip_suffix(':'))?.trim_end();
-    let name: String = head.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect();
-    (!name.is_empty()).then_some(name)
+/// What the original source says about the function that starts at a position.
+enum Declared {
+    Name(String),
+    /// A callback or a function in an expression: it has no name to give.
+    Anonymous,
+    /// Not a function start strobe can read; the map's name, else the profile's, stands.
+    Unknown,
 }
 
+const KEYWORDS: [&str; 12] = ["function", "async", "if", "for", "while", "switch", "catch", "return", "new", "await", "typeof", "yield"];
+
+/// The name the function starting at `col` (0-based, in characters) of `line` goes by: `function name(`,
+/// a method's `name(`, `name = (…) =>`, an object key `name: function`, a JSX handler `onX={(…) =>`.
+fn declared_name(line: &str, col: usize) -> Declared {
+    let chars: Vec<char> = line.chars().collect();
+    let is_id = |c: char| c.is_alphanumeric() || c == '_' || c == '$';
+    let ident_at = |from: usize| -> Option<String> {
+        let s: String = chars.get(from..)?.iter().take_while(|c| is_id(**c)).collect();
+        (!s.is_empty() && !s.starts_with(|c: char| c.is_ascii_digit())).then_some(s)
+    };
+    let skip_ws = |from: usize| (from..chars.len()).find(|i| !chars[*i].is_whitespace()).unwrap_or(chars.len());
+    let before = || assigned_name(&chars[..col.min(chars.len())]).map_or(Declared::Anonymous, Declared::Name);
+    let mut at = col;
+    if ident_at(at).as_deref() == Some("async") {
+        at = skip_ws(at + 5);
+    }
+    if ident_at(at).as_deref() == Some("function") {
+        let after = skip_ws(at + 8);
+        let after = if chars.get(after) == Some(&'*') { skip_ws(after + 1) } else { after };
+        return ident_at(after).map_or_else(before, Declared::Name);
+    }
+    if let Some(n) = ident_at(at) {
+        // A parameter (`(e) =>`, `(a, b) =>`): the function is the arrow whose list opens before it.
+        if let Some(open) = param_list_start(&chars, at) {
+            return assigned_name(&chars[..open]).map_or(Declared::Anonymous, Declared::Name);
+        }
+        let next = skip_ws(at + n.chars().count());
+        return match (chars.get(next), chars.get(next + 1)) {
+            // `x => …`: a one-parameter arrow, positioned at its parameter.
+            (Some('='), Some('>')) => before(),
+            (Some('('), _) | (Some('<'), _) if !KEYWORDS.contains(&n.as_str()) => declares(&chars[..at], n),
+            // `name = …`, positioned at its name. (V8 never places a function at an object key.)
+            (Some('='), Some(c)) if *c != '=' => Declared::Name(n),
+            _ => Declared::Unknown,
+        };
+    }
+    if matches!(chars.get(at), Some('(') | Some('<')) {
+        // `function name(` or a method `name(`: the identifier right before the parameter list.
+        let head: String = chars[..at].iter().collect();
+        let name: String = head.trim_end().chars().rev().take_while(|c| is_id(*c)).collect::<Vec<_>>().into_iter().rev().collect();
+        if !name.is_empty() && !KEYWORDS.contains(&name.as_str()) {
+            let start = head.trim_end().chars().count() - name.chars().count();
+            return declares(&chars[..start], name);
+        }
+        return before();
+    }
+    Declared::Unknown
+}
+
+/// `name(` declares a function after `function`, at a statement or member start, or after a method
+/// modifier; anywhere else it is a call, and the function there is an anonymous callback in it.
+fn declares(lead: &[char], name: String) -> Declared {
+    let text: String = lead.iter().collect();
+    let text = text.trim_end();
+    let word: String = text.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect();
+    let declaration = matches!(word.as_str(), "function" | "async" | "static" | "get" | "set") || text.is_empty() || text.ends_with(['{', ';', '}', ',', '*']);
+    if declaration { Declared::Name(name) } else { Declared::Anonymous }
+}
+
+/// Where the parameter list opens when the identifier at `at` is a parameter: right after `(`, or after
+/// `,` inside an open `(`.
+fn param_list_start(chars: &[char], at: usize) -> Option<usize> {
+    let prev = (0..at).rev().find(|i| !chars[*i].is_whitespace())?;
+    match chars[prev] {
+        '(' => Some(prev),
+        ',' => {
+            let mut depth = 0;
+            for i in (0..prev).rev() {
+                match chars[i] {
+                    ')' | ']' | '}' => depth += 1,
+                    '(' if depth == 0 => return Some(i),
+                    '[' | '{' if depth == 0 => return None,
+                    '(' | '[' | '{' => depth -= 1,
+                    _ => {}
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// The name an anonymous function expression that starts after `before` is assigned to: `name = `,
+/// `name = async `, an object key `name: ` (never the `:` of a ternary), a JSX attribute `onX={`.
+fn assigned_name(before: &[char]) -> Option<String> {
+    let text: String = before.iter().collect();
+    let head = text.trim_end();
+    let head = head.strip_suffix("async").unwrap_or(head).trim_end();
+    let head = head.strip_suffix('{').unwrap_or(head).trim_end();
+    let (rest, key) = match (head.strip_suffix('='), head.strip_suffix(':')) {
+        // `==`, `!=`, `<=`, `>=` compare; they assign nothing.
+        (Some(h), _) if h.ends_with(['=', '!', '<', '>']) => return None,
+        (Some(h), _) => (h.trim_end(), false),
+        (None, Some(h)) => (h.trim_end(), true),
+        _ => return None,
+    };
+    let name: String = rest.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect();
+    if name.is_empty() || name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    // An object key follows `{`, `,` or a line start; `cond ? a : () =>` is a ternary, not a key.
+    let lead = rest[..rest.len() - name.len()].trim_end();
+    (!key || lead.is_empty() || lead.ends_with(['{', ','])).then_some(name)
+}
 /// The path of an http(s) URL, without query or fragment.
 fn url_path(url: &str) -> Option<String> {
     let rest = url.strip_prefix("http://").or_else(|| url.strip_prefix("https://"))?;

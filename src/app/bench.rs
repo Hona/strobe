@@ -35,6 +35,9 @@ const WORK_PARTS: [(&str, &str, f64); 5] = [
     ("style.count", "RecalcStyleCount", 1.0),
 ];
 
+/// A run with this much other work on the target's CPUs (% of one core) flags its block `Background`.
+const BACKGROUND_PCT: f64 = 25.0;
+
 /// Shown with intervals but never tested: context, not claims.
 const DESCRIPTIVE: &[&str] = &[
     "frames.interval.p50",
@@ -148,6 +151,8 @@ struct Block {
     intervals: Vec<f64>,
     /// Wall time of each step of the block (ms), in order: where a bench's time goes.
     steps: Vec<(String, f64)>,
+    /// The busiest processes outside strobe's own tree during the block: name and % of one core.
+    background: Vec<(String, f64)>,
 }
 
 struct Ctx<'a> {
@@ -168,6 +173,8 @@ struct Ctx<'a> {
     warnings: Vec<Warning>,
     config: Value,
     awake: host::Awake,
+    /// Time spent waiting for the screen to unlock (ms): not part of any series' run time.
+    waited_ms: f64,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -196,6 +203,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let env = host::env();
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
+    let _own = OwnAffinity(runner_pin.and_then(host::set_affinity));
     progress(format!("strobe bench {} · {exp}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()));
     let busy = host::system_busy(1000);
     let runner = Runner::spawn(&file, dir.join("runner.log"), runner_pin)?;
@@ -216,6 +224,7 @@ pub fn run(args: &Args) -> Result<Output> {
         warnings: Vec::new(),
         config: config.clone(),
         awake: host::Awake::start(),
+        waited_ms: 0.0,
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -231,8 +240,13 @@ pub fn run(args: &Args) -> Result<Output> {
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
     }
-    if ctx.baseline.is_none() {
-        ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)"));
+    match validity::calibration() {
+        None => ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)")),
+        Some(c) if c["ok"] == false => ctx.warnings.push(validity::warn("StaleCalibration", "the last calibration failed: strobe could not recover its known costs here (run strobe status --calibrate)")),
+        Some(c) if c["at"].as_str().is_some_and(|at| at < super::record::iso(super::record::now_secs().saturating_sub(7 * 86_400)).as_str()) => {
+            ctx.warnings.push(validity::info("StaleCalibration", format!("calibrated {} (more than 7 days ago; strobe up recalibrates)", c["at"].as_str().unwrap_or(""))))
+        }
+        Some(_) => {}
     }
     let mut variants = vec![resolve_variant("base", &base_spec, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?];
     let started = Instant::now();
@@ -265,7 +279,17 @@ pub fn run(args: &Args) -> Result<Output> {
         "id": exp, "created": result_json["created"], "file": result_json["file"],
         "verdicts": result_json["series"].as_array().map(|a| a.iter().map(|s| json!({ "series": s["label"], "primary": s["primary"]["metric"], "verdict": s["primary"]["verdict"] })).collect::<Vec<_>>()),
     }))?;
-    let mut out = Output::new(text, result_json);
+    // Handles, not payloads (SPEC §17): per-frame arrays stay in result.json for reports and views.
+    let mut brief = result_json;
+    for b in brief["series"].as_array_mut().into_iter().flatten().flat_map(|s| s["blocks"].as_array_mut().into_iter().flatten()) {
+        if let Some(o) = b.as_object_mut() {
+            for k in ["frames", "intervals", "phases"] {
+                o.remove(k);
+            }
+        }
+    }
+    brief["result"] = json!(dir.join("result.json"));
+    let mut out = Output::new(text, brief);
     if args.has("require-verdict") && !all_decided {
         out.code = 5;
     }
@@ -295,6 +319,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let min_pairs = looks[0];
     progress(format!("\n{}  primary {}", s.label(), s.primary));
     let series_started = Instant::now();
+    let waited_before = ctx.waited_ms;
     let mut blocks: Vec<Block> = Vec::new();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut stopped = String::from("max pairs");
@@ -436,7 +461,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress("  no attribution blocks: nothing to explain (--why always runs them anyway)");
     }
     if why {
-        progress("  attribution blocks (CPU stacks, invalidations; not timed)");
+        progress("  attribution blocks (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
         for v in variants.iter() {
             match block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) {
                 Ok(b) => recordings[v.role] = json!(b.recording),
@@ -449,16 +474,22 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params,
         "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
-        "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
+        "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
     }))
 }
 
+/// `TailTooShort` (SPEC §10.1): a percentile needs its minimum n of the events it is a percentile of.
 fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Comparison {
+    let (count, what) = match def.name.split('.').next() {
+        Some("interaction") => ("interaction.n", "inputs"),
+        Some("scroll") => ("scroll.n", "scroll updates"),
+        _ => ("frames.n", "frames"),
+    };
     if def.min_n > 1 {
-        let least = blocks.iter().map(|b| b.values.get("frames.n").copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
+        let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
         if least < def.min_n {
-            c.verdict = format!("refused: {least} frames < {}", def.min_n);
+            c.verdict = format!("refused (TailTooShort): {least} {what} < {}", def.min_n);
             c.decided = false;
         }
     }
@@ -525,6 +556,18 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             w.push(validity::warn("Drift", format!("the difference trends across pairs (Spearman {rho:.2}): the machine changed during the run")));
         }
     }
+    // Other work on the measured CPUs during a run: kept, flagged (SPEC §10.2).
+    let busy: Vec<String> = blocks
+        .iter()
+        .filter(|b| b.values.get("cpu.foreign.max").is_some_and(|f| *f >= BACKGROUND_PCT))
+        .map(|b| {
+            let who = b.background.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
+            format!("pair {} {}: up to {:.0}% of a core{}", b.pair + 1, b.variant, b.values["cpu.foreign.max"], if who.is_empty() { String::new() } else { format!(" (busiest elsewhere: {who})") })
+        })
+        .collect();
+    if !busy.is_empty() {
+        w.push(validity::warn("Background", format!("other work ran on the measured CPUs during {} block(s): {}; blocks kept, flagged", busy.len(), busy.join("; "))));
+    }
     for b in blocks {
         if b.nodes.len() >= 3 {
             let first = b.nodes[0] as f64;
@@ -535,6 +578,24 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             }
         }
     }
+}
+
+/// The three busiest processes outside strobe's own tree (the target, runner and servers) between two
+/// process snapshots, as % of one core, from 5% up.
+fn busiest_others(a: &(u64, Vec<host::ProcInfo>), b: &(u64, Vec<host::ProcInfo>)) -> Vec<(String, f64)> {
+    let ours: std::collections::BTreeSet<u32> = host::tree_pids(std::process::id()).into_iter().collect();
+    let before: BTreeMap<u32, u64> = a.1.iter().map(|p| (p.pid, p.cpu_ns)).collect();
+    let span = b.0.saturating_sub(a.0).max(1) as f64;
+    let mut out: Vec<(String, f64)> = b
+        .1
+        .iter()
+        .filter(|p| p.pid != 0 && !ours.contains(&p.pid))
+        .filter_map(|p| Some((p.name.clone(), 100.0 * p.cpu_ns.saturating_sub(*before.get(&p.pid)?) as f64 / span)))
+        .filter(|(_, pct)| *pct >= 5.0)
+        .collect();
+    out.sort_by(|x, y| y.1.total_cmp(&x.1));
+    out.truncate(3);
+    out
 }
 
 /// The commit subject of a git variant, so a report still says what was compared days later.
@@ -552,11 +613,13 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
     loop {
         if host::session_locked() {
             progress("  waiting: the session is locked; strobe resumes when it is unlocked");
+            let waiting = Instant::now();
             while host::session_locked() {
                 std::thread::sleep(Duration::from_secs(2));
             }
             // The desktop and the GPU settle after an unlock.
             std::thread::sleep(Duration::from_secs(5));
+            ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
         let r = run_block(ctx, s, v, pair, set, keep);
@@ -666,6 +729,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
         lap("setup");
+        let procs0 = (host::now_ns(), host::all_processes());
         let tracing = probe::trace::start(&browser.cdp, set)?;
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
         let sampler = probe::os::Sampler::start(browser.pid);
@@ -711,6 +775,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
             let wall = (t1 - t0) as f64;
             let cpu = match (tsc0, tsc1) {
+                // No process readings (an OS without a process sampler yet): unknown, never 0%.
+                _ if cyc1 == 0 && cpu1 == 0 => f64::NAN,
                 (Some(a), Some(b)) if b > a && cyc0 > 0 => 100.0 * cyc1.saturating_sub(cyc0) as f64 / (b - a) as f64,
                 _ if wall > 0.0 => 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall,
                 _ => f64::NAN,
@@ -765,7 +831,21 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let nodes = nodes_all[first.min(nodes_all.len())..].to_vec();
         let warm = runs[..first].to_vec();
         let samples = sampler.stop();
+        let procs1 = (host::now_ns(), host::all_processes());
         let gpu_runs: Vec<_> = spans.iter().map(|(k, t0, t1)| (k.clone(), samples.window(*t0, *t1))).collect();
+        // Other work on the CPUs the target is pinned to, per run (% of one core): their busy time beyond
+        // the target's own cycles (SPEC §10.2 Background). It shares the target's cores and its L3.
+        let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
+        let foreign: Vec<f64> = gpu_runs
+            .iter()
+            .zip(measured)
+            .filter(|_| !pinned.is_empty())
+            .filter_map(|((_, w), r)| {
+                let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
+                r.cpu.is_finite().then(|| (busy - r.cpu).max(0.0))
+            })
+            .collect();
+        let background = busiest_others(&procs0, &procs1);
         let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
         let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
         // The window must have stayed visible for the whole block.
@@ -843,6 +923,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if let Some(n) = dom_nodes {
             values.insert("dom.nodes".into(), n as f64);
         }
+        if !foreign.is_empty() {
+            values.insert("cpu.foreign".into(), metrics::median(&foreign));
+            values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
+        }
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         let intervals = metrics::run_intervals(&data);
@@ -860,7 +944,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals, steps: steps.borrow().clone() })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals, steps: steps.borrow().clone(), background })
     })();
     lapped.set(Instant::now());
     browser.close();
@@ -872,6 +956,19 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         g.check("after a block")?;
     }
     result
+}
+
+/// Keeps strobe itself (the driver relay, samplers, CDP) off the measured CPUs for the bench (SPEC rule
+/// 2), on the runner's; the variant servers it spawns inherit that. The previous mask comes back on
+/// drop, since the daemon runs benches in its own process.
+struct OwnAffinity(Option<u64>);
+
+impl Drop for OwnAffinity {
+    fn drop(&mut self) {
+        if let Some(mask) = self.0 {
+            host::set_affinity(mask);
+        }
+    }
 }
 
 /// `--power high`: the High performance plan for the run, then the previous plan again (also on error).

@@ -835,7 +835,9 @@ sequenceDiagram
 
 - The runner is a `bun` process running `@strobe/bench`'s entry. It imports the bench file and
   calls its functions when told to. It is pinned to the CPUs the target is not pinned to, and
-  its CPU time is a track in the recording.
+  its CPU time is a track in the recording. strobe itself (the driver relay, samplers, CDP) moves to
+  the same CPUs for the bench, so the variant servers it spawns start there too; its previous mask
+  comes back afterwards (the daemon runs benches in-process).
 - Runner protocol: newline-delimited JSON over the runner's stdin and stdout
   (`{ "id", "op", "args" }` → `{ "id", "ok" | "error" }`). The runner sends `console.*` to
   stderr, which strobe keeps as the block's log.
@@ -886,6 +888,12 @@ installed there). Results are stored locally, tagged per device, never pooled ac
 `Throttling` · `Drift` (trend across pairs) · `CounterUnstable` · `ProbeOverhead` ·
 `Unresolved` (samples without a symbol above 5%) · `PowerPlan` · `Battery` · `VirtualMachine`
 · `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed).
+
+`Background` (built): per measured run, the busy time of the CPUs the target is pinned to (the OS
+sampler's per-CPU idle cycles) minus the target's own cycles is `cpu.foreign` (% of one core); a block
+with a run at 25% or more is kept and flagged, naming the three busiest processes outside strobe's own
+tree between two process snapshots taken outside the runs. The one-second check before the first
+block stays.
 
 ### 10.3 Calibration
 
@@ -1283,3 +1291,64 @@ Phase 0 runs two tracks in parallel.
 
 Uploading or sharing recordings · hosted dashboards · Firefox and Safari · mobile · GPU frame
 capture (RenderDoc or PIX level) · macOS deep mode · any automated tests.
+
+## 24. As built (2026-10-31)
+
+What exists today, against §1–§23. The design above stays the target; this section says where the
+code is and where it chose differently, so nobody reads a promise as a feature.
+
+### 24.1 Status by phase
+
+| Phase | Built | Not yet |
+|---|---|---|
+| 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
+| 0b | — | the bridge (`@strobe/electron`) |
+| 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
+| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`; validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
+| 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`) | the bridge, census layers, multi-process heaps, bench leak runs (`--probes memory --repeat`) |
+| 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
+| 5 | `top` | insights, `--bisect`, the flight recorder (`--ring`) |
+| 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
+
+Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`, `gc`, `heap` (and
+`a..b heap`), `leaks`, `sql`, `progress`. Not yet: `stack`, `memory`, `gpu`, `cpu`, `insights`,
+`timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
+`MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
+`Battery`, `StaleCalibration`, plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:
+`Throttling`, `CounterUnstable`, `ProbeOverhead`, `Unresolved`, `VirtualMachine`, `Outliers`,
+`CensusContaminated`.
+
+Off Windows the process and GPU samplers are stubs: process CPU is reported as unknown (never 0%),
+and nothing else from them is emitted.
+
+### 24.2 Where the code differs from the design
+
+- Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:`, `pid:`, `proc:` and `@device`
+  are not built. Variants also take `url:<href>` (an already running origin).
+- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id`, `status --fast`,
+  `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
+- `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
+  removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a
+  daemon running an older build unless that daemon is mid-bench. Bun is required for bench files.
+- The daemon serves `/mcp`, `/report/<handle>` and `/health` (no `/ui`, no Perfetto UI); `up` stops
+  it with the `strobe/quit` RPC. The engine runs one `trace_processor -q` per query (no `--httpd`).
+- Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
+  are kept topmost without focus, since an occluded Chromium window stops rendering.
+- The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or a value
+  is at most 0 (then differences, with the bound max(bound × base, 0.5)). Default tested secondaries:
+  `frames.interval.p95`, `frames.dropped.pct`, `main.busy`, `interaction.p95`, `cpu.app.total`;
+  everything else in the descriptive list gets an interval and no claim.
+- `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the
+  driver's dispatch times; `display.hz` comes from vsync spacing in the trace.
+- `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` switches plans
+  with `powercfg`.
+- Storage: `cpu-0.cpuprofile` and `alloc-0.heapprofile` (plain JSON), `maps/` (source maps and
+  function ranges), `heap-0.heapsnapshot.gz` (and `heap-s0`, `heap-s1` for memory recordings),
+  `leaks.json`, census in `meta.json`, one `runner.log` and `progress.log` per experiment.
+- Profiled launches (`--why`) inflate main-thread work against the timed pairs: +12–15% on a scroll
+  case since attribution traces only layout stacks and GC phases (+39–52% with invalidation tracking,
+  `blink` and `v8.execute`, which flipped base and head). Their numbers explain where work goes inside
+  one launch; only the timed pairs say whether head is faster.
+- Cross-checks on that case agree: trace layouts and style recalcs per run match the browser's
+  `LayoutCount` and `RecalcStyleCount` within 0.2%, their time matches `LayoutDuration` +
+  `RecalcStyleDuration` within 2.5%, sampled allocations match bytes freed by GC within 15%.

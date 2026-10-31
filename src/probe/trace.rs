@@ -20,13 +20,10 @@ pub fn categories(set: Set) -> Vec<&'static str> {
         // renderer main-thread busy comes from the Performance domain instead of RunTask slices.
         Set::Lean => return vec!["disabled-by-default-devtools.timeline.frame", "input.scrolling", "blink.user_timing", "__metadata"],
         Set::Timing => {}
-        Set::Attribution => c.extend([
-            "disabled-by-default-devtools.timeline.invalidationTracking",
-            "disabled-by-default-devtools.timeline.stack",
-            "v8.execute",
-            "disabled-by-default-v8.gc",
-            "blink",
-        ]),
+        // Only what attribution views read: JS stacks on layout and style events (`query layout`) and GC
+        // phases (`query gc`). Invalidation tracking, `blink` and `v8.execute` recorded a million slices
+        // nothing read and raised a profiled run's main-thread work by 40–50% against its timed pairs.
+        Set::Attribution => c.extend(["disabled-by-default-devtools.timeline.stack", "disabled-by-default-v8.gc"]),
         Set::Memory => c.extend(["disabled-by-default-memory-infra", "disabled-by-default-v8.gc"]),
     }
     c

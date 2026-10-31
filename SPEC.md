@@ -862,8 +862,22 @@ ids on each OS). Dev and Beta builds open a debug port from
 `OPENCODE_DESKTOP_REMOTE_DEBUGGING_PORT` (`packages/desktop/src/main/diagnostics/options.ts`);
 strobe uses it there. Stable never opens one, so strobe uses the bridge.
 
-`--launch` starts an isolated copy with `OPENCODE_DESKTOP_TEST_ROOT`, which already moves every
-desktop and server directory (`packages/desktop/src/main/lifecycle/configure.ts`).
+`--launch` starts an isolated copy. **`OPENCODE_DESKTOP_TEST_ROOT` alone is not isolation**: the
+desktop deletes `XDG_STATE_HOME` on Windows, so the copy registers itself as the user's background
+service and replaces it (it happened while building strobe). Launches follow
+`packages/desktop/script/bench-startup.ts` exactly:
+
+- a fresh home per launch with `AppData/Roaming`, `AppData/Local/Temp`, `.local/share/opencode`,
+  `.local/state`, `.config/opencode`, and `.config/opencode/service.json` = `{ "port": <free port> }`
+  (a private service port);
+- env: every `OPENCODE_*`, `OTEL_*` and `SENTRY_*` variable removed, then `USERPROFILE`, `HOME`,
+  `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
+  `OPENCODE_DB`, `OPENCODE_CONFIG_DIR` pointing into that home; `HTTPS_PROXY=http://127.0.0.1:9`
+  for Beta and Stable (update checks fail fast and offline);
+- **service guard**: strobe reads the user's `~/.local/state/opencode/service.json` (pid, url)
+  before every launch and after every close. A changed pid or a service that stops answering
+  stops the experiment at once, kills the launched app, and exits 1 with what happened. Never
+  measure past a disturbed user service.
 
 **The bridge** (`@strobe/electron`, schema `bridge.v1.json`):
 

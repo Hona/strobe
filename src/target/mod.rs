@@ -2,3 +2,4 @@
 
 pub mod cdp;
 pub mod chromium;
+pub mod electron;

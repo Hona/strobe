@@ -9,6 +9,7 @@ use crate::model::{Error, Result};
 use crate::probe::{self, Set};
 use crate::store;
 use crate::target::chromium::{self, Window};
+use crate::target::electron;
 use crate::validity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -25,13 +26,32 @@ pub fn run(args: &Args) -> Result<Output> {
         None => 10_000,
     };
     let attach = target.starts_with("cdp:") || target.starts_with("ws://");
-    if !attach && !target.starts_with("http://") && !target.starts_with("https://") {
-        return Err(Error::usage(format!("unsupported target {target}: use https://…, http://…, cdp:<port> or file:<path>")));
+    let app_exe = if let Some(id) = target.strip_prefix("app:") {
+        Some(electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed (known: opencode, opencode-beta, opencode-dev)")))?)
+    } else {
+        target.strip_prefix("exe:").map(std::path::PathBuf::from)
+    };
+    if !attach && app_exe.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {
+        return Err(Error::usage(format!("unsupported target {target}: use https://…, app:<id>, exe:<path>, cdp:<port> or file:<path>")));
     }
-    let browser = if attach { chromium::attach(&target)? } else { chromium::launch(&Window::default(), args.has("headless"), None, &[])? };
+    let mut service = None;
+    let browser = if attach {
+        chromium::attach(&target)?
+    } else if let Some(exe) = &app_exe {
+        progress(format!("launching {} in an isolated home", exe.display()));
+        let (b, before) = electron::launch(exe, args.get("home").map(std::path::Path::new), &Window::default(), None)?;
+        service = Some(before);
+        b
+    } else {
+        chromium::launch(&Window::default(), args.has("headless"), None, &[])?
+    };
     let gpu = validity::software_gpu(&browser);
-    let page = browser.page()?;
-    if !attach {
+    let page = if app_exe.is_some() { electron::main_page(&browser)? } else { browser.page()? };
+    if let Some(before) = &service {
+        electron::guard(before, "after the app opened its window")?;
+        // The app loads itself; give it time to settle before recording.
+        std::thread::sleep(Duration::from_secs(3));
+    } else if !attach {
         progress(format!("loading {target}"));
         page.navigate(&target, Duration::from_secs(60))?;
     }
@@ -46,14 +66,14 @@ pub fn run(args: &Args) -> Result<Output> {
         probe::cpu::start(&page)?;
     }
     std::thread::sleep(Duration::from_millis(300));
-    let cpu0: u64 = host::process_tree(browser.pid).iter().map(|p| p.cpu_ns).sum();
+    let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let t0 = host::now_ns();
     driver.mark("run:0:start")?;
     progress(format!("recording {} for {}", id, fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     driver.mark("run:0:end")?;
     let t1 = host::now_ns();
-    let cpu1: u64 = host::process_tree(browser.pid).iter().map(|p| p.cpu_ns).sum();
+    let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
@@ -62,6 +82,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let version = browser.version.clone();
     if !attach {
         browser.close();
+    }
+    if let Some(before) = &service {
+        electron::guard(before, "after the app closed")?;
     }
     progress("reading the trace");
     let data = metrics::read(&dir.join("trace.pftrace"), &token)?;

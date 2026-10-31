@@ -219,6 +219,68 @@ pub fn system_busy(ms: u64) -> f64 {
     if total <= 0.0 { 0.0 } else { 1.0 - (i1.saturating_sub(i0) as f64 / total) }
 }
 
+/// PIDs of running processes whose executable is exactly `exe`.
+pub fn running(exe: &std::path::Path) -> Vec<u32> {
+    let name = exe.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = zeroed();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                if wide_to_string(&e.szExeFile).to_lowercase() == name && exe_of(e.th32ProcessID).is_some_and(|p| p.eq_ignore_ascii_case_path(exe)) {
+                    out.push(e.th32ProcessID);
+                }
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+/// PIDs of running processes whose executable lives under `dir`.
+pub fn running_under(dir: &std::path::Path) -> Vec<u32> {
+    let prefix = dir.to_string_lossy().to_lowercase();
+    let mut out = Vec::new();
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snap == INVALID_HANDLE_VALUE {
+            return out;
+        }
+        let mut e: PROCESSENTRY32W = zeroed();
+        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snap, &mut e) != 0 {
+            loop {
+                if exe_of(e.th32ProcessID).is_some_and(|p| p.to_string_lossy().to_lowercase().starts_with(&prefix)) {
+                    out.push(e.th32ProcessID);
+                }
+                if Process32NextW(snap, &mut e) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snap);
+    }
+    out
+}
+
+trait PathEq {
+    fn eq_ignore_ascii_case_path(&self, other: &std::path::Path) -> bool;
+}
+
+impl PathEq for std::path::PathBuf {
+    fn eq_ignore_ascii_case_path(&self, other: &std::path::Path) -> bool {
+        self.to_string_lossy().eq_ignore_ascii_case(&other.to_string_lossy())
+    }
+}
+
 /// The executable path of a running process.
 pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
     use windows_sys::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
@@ -315,5 +377,159 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
             return None;
         }
         Some(mode.dmDisplayFrequency).filter(|&f| f > 1)
+    }
+}
+
+/// One process from `NtQuerySystemInformation(SystemProcessInformation)`.
+struct SysProc {
+    pid: u32,
+    parent: u32,
+    name: String,
+    create: i64,
+    cpu_ns: u64,
+    private_bytes: u64,
+}
+
+/// The x64 layout of SYSTEM_PROCESS_INFORMATION up to PagefileUsage (private commit).
+#[repr(C)]
+#[allow(dead_code)]
+struct SysProcRaw {
+    next: u32,
+    threads: u32,
+    ws_private: i64,
+    hard_faults: u32,
+    threads_high: u32,
+    cycles: u64,
+    create: i64,
+    user: i64,
+    kernel: i64,
+    name_len: u16,
+    name_max: u16,
+    name: *const u16,
+    priority: i32,
+    pid: usize,
+    parent: usize,
+    handles: u32,
+    session: u32,
+    key: usize,
+    peak_virtual: usize,
+    virtual_size: usize,
+    faults: u32,
+    peak_ws: usize,
+    ws: usize,
+    peak_paged: usize,
+    paged: usize,
+    peak_nonpaged: usize,
+    nonpaged: usize,
+    pagefile: usize,
+}
+
+fn system_processes() -> Vec<SysProc> {
+    use std::cell::RefCell;
+    use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
+    thread_local! {
+        static BUF: RefCell<Vec<u64>> = RefCell::new(vec![0u64; 128 * 1024]);
+    }
+    BUF.with_borrow_mut(|buf| unsafe {
+        loop {
+            let mut need = 0u32;
+            let rc = NtQuerySystemInformation(SystemProcessInformation, buf.as_mut_ptr() as *mut _, (buf.len() * 8) as u32, &mut need);
+            if rc == 0xC0000004u32 as i32 && buf.len() < 64 * 1024 * 1024 {
+                buf.resize((need as usize / 8 + 1).max(buf.len()) * 5 / 4, 0);
+                continue;
+            }
+            if rc < 0 {
+                return Vec::new();
+            }
+            break;
+        }
+        let mut out = Vec::with_capacity(512);
+        let base = buf.as_ptr() as *const u8;
+        let mut off = 0usize;
+        loop {
+            let p = &*(base.add(off) as *const SysProcRaw);
+            let name = if p.name.is_null() {
+                if p.pid == 0 { "Idle".to_string() } else { String::new() }
+            } else {
+                String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2))
+            };
+            out.push(SysProc {
+                pid: p.pid as u32,
+                parent: p.parent as u32,
+                name,
+                create: p.create,
+                cpu_ns: (p.user as u64 + p.kernel as u64) * 100,
+                private_bytes: p.pagefile as u64,
+            });
+            if p.next == 0 {
+                break;
+            }
+            off += p.next as usize;
+        }
+        out
+    })
+}
+
+pub fn all_processes() -> Vec<ProcTimes> {
+    system_processes()
+        .into_iter()
+        .map(|p| ProcTimes { pid: p.pid, parent: p.parent, name: p.name, cpu_ns: p.cpu_ns, private_bytes: p.private_bytes })
+        .collect()
+}
+
+pub fn tree_pids(root: u32) -> Vec<u32> {
+    let all = system_processes();
+    let Some(r) = all.iter().position(|p| p.pid == root) else { return Vec::new() };
+    let mut out = vec![root];
+    let mut stack = vec![r];
+    while let Some(i) = stack.pop() {
+        let parent = &all[i];
+        for (j, c) in all.iter().enumerate() {
+            if c.parent == parent.pid && c.pid != parent.pid && c.create >= parent.create && !out.contains(&c.pid) {
+                out.push(c.pid);
+                stack.push(j);
+            }
+        }
+    }
+    out
+}
+
+pub fn thread_cpu_ns() -> u64 {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    unsafe {
+        let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
+        if GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) == 0 {
+            return 0;
+        }
+        ft(&k) + ft(&u)
+    }
+}
+
+pub fn enable_ansi() -> bool {
+    use windows_sys::Win32::System::Console::{ENABLE_VIRTUAL_TERMINAL_PROCESSING, GetConsoleMode, GetStdHandle, STD_OUTPUT_HANDLE, SetConsoleMode};
+    unsafe {
+        let h = GetStdHandle(STD_OUTPUT_HANDLE);
+        let mut mode = 0u32;
+        if GetConsoleMode(h, &mut mode) == 0 {
+            return false;
+        }
+        mode & ENABLE_VIRTUAL_TERMINAL_PROCESSING != 0 || SetConsoleMode(h, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING) != 0
+    }
+}
+
+pub fn on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT, SetConsoleCtrlHandler};
+    static TARGET: AtomicPtr<std::sync::atomic::AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+    unsafe extern "system" fn handler(kind: u32) -> i32 {
+        let flag = TARGET.load(Ordering::SeqCst);
+        if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) && !flag.is_null() {
+            unsafe { (*flag).store(true, Ordering::SeqCst) };
+            return 1;
+        }
+        0
+    }
+    if TARGET.swap(flag as *const _ as *mut _, Ordering::SeqCst).is_null() {
+        unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
     }
 }

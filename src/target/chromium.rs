@@ -209,6 +209,11 @@ impl Browser {
         Ok(page)
     }
 
+    /// Every process that belongs to this target, with CPU times and private bytes.
+    pub fn processes(&self) -> Vec<host::ProcTimes> {
+        host::process_set(self.pid, self.profile.as_deref())
+    }
+
     /// GPU devices and whether compositing runs on a hardware adapter.
     pub fn gpu(&self) -> Result<Gpu> {
         let info = self.cdp.send("SystemInfo.getInfo", json!({}), None)?;
@@ -233,10 +238,18 @@ impl Browser {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
+            // The whole tree: an Electron app's own service and helpers go with it.
+            super::electron::kill_tree(self.pid);
             let _ = c.kill();
             let _ = c.wait();
         }
         if let Some(p) = self.profile.take() {
+            // Detached children (an Electron app's own background service) outlive the tree: end
+            // everything that runs from the private home.
+            #[cfg(windows)]
+            for pid in crate::host::win::running_under(&p) {
+                super::electron::kill_tree(pid);
+            }
             // Chromium may hold files for a moment after exit.
             for _ in 0..20 {
                 if std::fs::remove_dir_all(&p).is_ok() {

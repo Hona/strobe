@@ -5,7 +5,8 @@
 - Respect the module boundaries in SPEC §4.3: only `engine/` runs trace_processor, only `store/` writes `results.db` and `recordings/`, backends return `model` types.
 - NEVER write automated tests: no unit, integration, e2e, or any other tests, no test files, no test dependencies, no CI test steps. Verify with the calibration page and A/A runs on real devices (SPEC §10.3, §10.4).
 - Iteration speed first. Smallest change that works.
-- Never experiment on the user's real app data or config. Launch targets with isolated homes (`OPENCODE_DESKTOP_TEST_ROOT` for OpenCode desktop); attach to a running app only to read.
+- Never experiment on the user's real app data or config. Attach to a running app only to read.
+- NEVER launch an OpenCode desktop build (Stable, Beta, Dev) by hand or in code without the full isolation recipe in SPEC §13.2 (copied from `packages/desktop/script/bench-startup.ts`). `OPENCODE_DESKTOP_TEST_ROOT` alone replaced the user's live opencode service once: the desktop deletes `XDG_STATE_HOME` on Windows. Check the user's service pid before and after.
 - Never run two benches on one device, and never bench while something heavy (a build, a test suite) runs on it.
 - Rust stable. Well-known crates are fine; give each one a one-line reason in `Cargo.toml` and keep the budgets in SPEC §19.
 

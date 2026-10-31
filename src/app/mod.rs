@@ -7,6 +7,7 @@ pub mod query;
 pub mod record;
 pub mod report;
 pub mod status;
+pub mod top;
 pub mod up;
 
 use crate::cli::{Args, HELP};
@@ -66,6 +67,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "query" => query::run(args),
         "report" => report::run(args),
         "status" => status::run(args),
+        "top" => top::run(args),
         "up" => up::run(args),
         "leave" => up::leave(args),
         "mcp" => mcp::stdio().map(|_| Output::new(String::new(), Value::Null)),

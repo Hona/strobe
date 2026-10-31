@@ -11,6 +11,7 @@ use crate::runner::Runner;
 use crate::stats::{self, Comparison};
 use crate::store;
 use crate::target::chromium::{self, Window};
+use crate::target::electron;
 use crate::validity::{self, Warning};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -61,9 +62,10 @@ impl Series {
 
 #[derive(Debug)]
 enum Kind {
-    Dir(PathBuf),
+    Dir,
     Git(String),
     Url(String),
+    Exe(PathBuf),
 }
 
 struct Variant {
@@ -408,17 +410,31 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
 fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
-    if kind == "app" || kind == "exe" {
-        return Err(Error::msg(format!("{kind} targets need the bridge or a debug port; not available in this build yet")));
-    }
-    let url = variant_url(v, &target)?;
+    let app = kind == "app" || kind == "exe";
+    let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
         window.width = vp["width"].as_u64().unwrap_or(1400) as u32;
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
     window.scale = target["scale"].as_f64();
-    let browser = chromium::launch(&window, false, ctx.pin, &[])?;
+    let mut service = None;
+    let browser = if app {
+        let exe = variant_exe(v, &target)?;
+        let seed = target["home"].as_str().map(|h| {
+            let mut h = h.to_string();
+            for (k, val) in &s.params {
+                h = h.replace(&format!("{{{k}}}"), &value_text(val));
+            }
+            let base = Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).to_path_buf();
+            base.join(h)
+        });
+        let (b, before) = electron::launch(&exe, seed.as_deref(), &window, ctx.pin)?;
+        service = Some(before);
+        b
+    } else {
+        chromium::launch(&window, false, ctx.pin, &[])?
+    };
     let result = (|| -> Result<Block> {
         if !ctx.gpu_checked {
             let gpu = validity::software_gpu(&browser)?;
@@ -426,7 +442,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             ctx.browser_version = browser.version.clone();
             ctx.gpu_checked = true;
         }
-        let page = browser.page()?;
+        let page = if app { electron::main_page(&browser)? } else { browser.page()? };
+        if let Some(before) = &service {
+            electron::guard(before, "after the app opened its window")?;
+        }
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
         let driver = Driver::new(page.clone(), token.clone());
@@ -455,7 +474,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if target["prepare"].as_bool() == Some(true) {
             ctx.runner.call("prepare", json!({ "endpoint": browser.ws }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
         }
-        page.navigate(&url, Duration::from_secs(60))?;
+        if !app {
+            page.navigate(&url, Duration::from_secs(60))?;
+        }
         validity::dev_build(&page)?;
         let speed = validity::speed_check(&page)?;
         let ratio = validity::throttled(speed, ctx.baseline)?;
@@ -465,7 +486,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<(f64, f64)> {
             *current.borrow_mut() = key.to_string();
-            let cpu0: u64 = host::process_tree(browser.pid).iter().map(|p| p.cpu_ns).sum();
+            let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner
@@ -474,7 +495,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
             driver.mark(&format!("{key}:end"))?;
-            let cpu1: u64 = host::process_tree(browser.pid).iter().map(|p| p.cpu_ns).sum();
+            let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), run_timeout, &serve)?;
@@ -512,7 +533,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         // The window must have stayed visible for the whole block.
         validity::window_visible(&page)?;
-        let private_mb = host::process_tree(browser.pid).iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
         let dir = if keep { store::recording_dir(&id)? } else { host::paths::run().join(&id) };
@@ -558,7 +579,25 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals })
     })();
     browser.close();
+    if let Some(before) = &service {
+        electron::guard(before, "after a block")?;
+    }
     result
+}
+
+/// The executable an app target runs for a variant: the variant's own (`app:`/`exe:`), else the target's.
+fn variant_exe(v: &Variant, target: &Value) -> Result<PathBuf> {
+    if let Kind::Exe(p) = &v.kind {
+        return Ok(p.clone());
+    }
+    match target["kind"].as_str() {
+        Some("app") => {
+            let id = target["id"].as_str().unwrap_or("");
+            electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed")))
+        }
+        Some("exe") => Ok(PathBuf::from(target["path"].as_str().unwrap_or(""))),
+        _ => Err(Error::usage("not an app target")),
+    }
 }
 
 fn variant_url(v: &Variant, target: &Value) -> Result<String> {
@@ -670,6 +709,11 @@ fn strip_jsonc(t: &str) -> String {
 fn resolve_variant(role: &'static str, spec: &str, project: &Path) -> Result<Variant> {
     let (kind, label, root) = if let Some(href) = spec.strip_prefix("url:") {
         (Kind::Url(href.to_string()), href.to_string(), None)
+    } else if let Some(id) = spec.strip_prefix("app:") {
+        let exe = electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed (opencode, opencode-beta, opencode-dev)")))?;
+        (Kind::Exe(exe), spec.to_string(), None)
+    } else if let Some(p) = spec.strip_prefix("exe:") {
+        (Kind::Exe(PathBuf::from(p)), p.to_string(), None)
     } else if let Some(r) = spec.strip_prefix("git:") {
         (Kind::Git(r.to_string()), r.to_string(), None)
     } else {
@@ -679,7 +723,7 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path) -> Result<Var
             let sha = host::output(Command::new("git").arg("-C").arg(&root).args(["rev-parse", "--short=10", "HEAD"])).unwrap_or_default();
             let dirty = host::output(Command::new("git").arg("-C").arg(&root).args(["status", "--porcelain", "--untracked-files=no"])).is_some_and(|s| !s.is_empty());
             let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            (Kind::Dir(root.clone()), format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }), Some(root))
+            (Kind::Dir, format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }), Some(root))
         } else {
             (Kind::Git(spec.to_string()), spec.to_string(), None)
         }

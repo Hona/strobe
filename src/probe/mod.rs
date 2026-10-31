@@ -1,6 +1,8 @@
 //! Collecting data from a target (SPEC §8).
 
 pub mod cpu;
+pub mod gpu;
+pub mod os;
 pub mod trace;
 
 /// Named probe sets (SPEC §8.1).

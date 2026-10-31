@@ -47,6 +47,84 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     }
 }
 
+/// Every process on the machine with CPU times and private bytes, from one system snapshot
+/// (no process is opened, so protected processes are included).
+pub fn all_processes() -> Vec<ProcTimes> {
+    #[cfg(windows)]
+    {
+        win::all_processes()
+    }
+    #[cfg(not(windows))]
+    {
+        Vec::new()
+    }
+}
+
+/// PIDs of the tree rooted at `root` (root first), from one system snapshot. Children created
+/// before their parent (a reused parent PID) are not followed.
+pub fn tree_pids(root: u32) -> Vec<u32> {
+    #[cfg(windows)]
+    {
+        win::tree_pids(root)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        Vec::new()
+    }
+}
+
+/// CPU time used so far by the calling thread, in nanoseconds.
+pub fn thread_cpu_ns() -> u64 {
+    #[cfg(windows)]
+    {
+        win::thread_cpu_ns()
+    }
+    #[cfg(not(windows))]
+    {
+        0
+    }
+}
+
+/// Turns on ANSI escape handling for stdout; false when stdout is not a console that has it.
+pub fn enable_ansi() -> bool {
+    #[cfg(windows)]
+    {
+        win::enable_ansi()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Installs a Ctrl+C handler (once) and returns the flag it sets instead of killing the process.
+pub fn ctrl_c() -> &'static std::sync::atomic::AtomicBool {
+    static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(windows)]
+    win::on_ctrl_c(&FLAG);
+    &FLAG
+}
+
+/// The tree rooted at `root` plus every process running from `home` (an Electron app's detached
+/// background service lives outside the tree but belongs to the target).
+pub fn process_set(root: u32, home: Option<&Path>) -> Vec<ProcTimes> {
+    let mut set = process_tree(root);
+    #[cfg(windows)]
+    if let Some(h) = home {
+        for pid in win::running_under(h) {
+            if !set.iter().any(|p| p.pid == pid) {
+                set.extend(process_tree(pid));
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = home;
+    set.sort_by_key(|p| p.pid);
+    set.dedup_by_key(|p| p.pid);
+    set
+}
+
 /// One group of logical CPUs that shares an L3 cache (a CCD on Ryzen).
 #[derive(Clone, Debug, Serialize)]
 pub struct CacheGroup {

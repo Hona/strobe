@@ -93,6 +93,7 @@ Use
                                   run an experiment; a verdict per series
   query <rec_…|exp_…> <view>      views: summary frames threads sql
   report <view> <handle…>         write a markdown or HTML artifact
+  top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
 
 Setup
   up                              download the engine, install the skill, check this device

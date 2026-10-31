@@ -47,21 +47,28 @@ fn attach_hotspots(data: &mut Value) {
     let plan_runs = data["plan"]["runs_per_block"].as_u64();
     let Some(series) = data["series"].as_array_mut() else { return };
     for s in series {
+        let recs: Vec<(&str, String, std::path::PathBuf)> =
+            ["base", "head"].into_iter().filter_map(|role| s["attribution"][role].as_str().and_then(|rec| Some((role, rec.to_string(), store::resolve(rec).ok()?)))).collect();
+        // Both sides and their heap diff at once: each view is its own trace_processor or file read.
+        let (sides, diff) = std::thread::scope(|scope| {
+            let sides: Vec<_> = recs.iter().map(|(role, rec, dir)| (*role, scope.spawn(move || attribution(dir, rec, plan_runs)))).collect();
+            let diff = match recs.as_slice() {
+                [(_, _, a), (_, _, b)] => Some(scope.spawn(move || super::query::heap_diff(a, b, 15, false).ok())),
+                _ => None,
+            };
+            let sides: Vec<(&str, Option<Value>)> = sides.into_iter().map(|(role, h)| (role, h.join().ok().flatten())).collect();
+            (sides, diff.and_then(|d| d.join().ok().flatten()))
+        });
         let mut out = json!({});
-        for role in ["base", "head"] {
-            let Some(rec) = s["attribution"][role].as_str() else { continue };
-            let Ok(dir) = store::resolve(rec) else { continue };
-            if let Some(h) = attribution(&dir, rec, plan_runs) {
+        for (role, h) in sides {
+            if let Some(h) = h {
                 out[role] = h;
             }
         }
         if out.as_object().is_some_and(|o| !o.is_empty()) {
             s["hotspots"] = out;
         }
-        let dirs: Vec<_> = ["base", "head"].iter().filter_map(|r| s["attribution"][r].as_str()).filter_map(|r| store::resolve(r).ok()).collect();
-        if let [a, b] = dirs.as_slice()
-            && let Ok(d) = super::query::heap_diff(a, b, 15, false)
-        {
+        if let Some(d) = diff {
             s["heap_diff"] = d.json;
         }
     }
@@ -70,25 +77,33 @@ fn attach_hotspots(data: &mut Value) {
 /// One attribution recording for a report: CPU by function and file, allocations by function and
 /// file, forced layouts, GC, the live heap, run count and metric values.
 fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Option<Value> {
-    let mut h = super::query::hotspots(dir, "function", 50).ok()?.json;
-    if let Ok(o) = super::query::hotspots(dir, "file", 25) {
-        h["files"] = o.json["rows"].clone();
-    }
-    if let Ok(o) = super::query::alloc(dir, "function", 25) {
-        h["alloc"] = o.json;
-        if let Ok(f) = super::query::alloc(dir, "file", 25) {
-            h["alloc"]["files"] = f.json["rows"].clone();
+    // The trace views each run trace_processor; the profile and snapshot views read files meanwhile.
+    let mut h = std::thread::scope(|scope| {
+        let layout = scope.spawn(|| super::query::layout(dir, 25));
+        let gc = scope.spawn(|| super::query::gc(dir));
+        let alloc = scope.spawn(|| (super::query::alloc(dir, "function", 25), super::query::alloc(dir, "file", 25)));
+        let heap = scope.spawn(|| super::query::heap(dir, 15, false));
+        let mut h = super::query::hotspots(dir, "function", 50).ok()?.json;
+        if let Ok(o) = super::query::hotspots(dir, "file", 25) {
+            h["files"] = o.json["rows"].clone();
         }
-    }
-    if let Ok(o) = super::query::layout(dir, 25) {
-        h["layout"] = o.json;
-    }
-    if let Ok(o) = super::query::gc(dir) {
-        h["gc"] = o.json;
-    }
-    if let Ok(o) = super::query::heap(dir, 15, false) {
-        h["heap"] = o.json;
-    }
+        if let Ok((Ok(o), files)) = alloc.join() {
+            h["alloc"] = o.json;
+            if let Ok(f) = files {
+                h["alloc"]["files"] = f.json["rows"].clone();
+            }
+        }
+        if let Ok(Ok(o)) = layout.join() {
+            h["layout"] = o.json;
+        }
+        if let Ok(Ok(o)) = gc.join() {
+            h["gc"] = o.json;
+        }
+        if let Ok(Ok(o)) = heap.join() {
+            h["heap"] = o.json;
+        }
+        Some(h)
+    })?;
     let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
     let runs = meta["runs"]
         .as_u64()
@@ -99,7 +114,11 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
         })
         .or(plan_runs);
     // A display may abbreviate (the recording and `query` keep everything): three stacks for the top
-    // rows, the heaviest one below them, and no `url` beside `file` in frames.
+    // rows, the heaviest one below them, and no `url` beside `file` in frames. Frames repeat across
+    // stacks (a framework's are in most of them), so each side keeps one `frame_table` and stacks list
+    // indices into it: lossless, and a fifth of the bytes.
+    let mut table: Vec<Value> = Vec::new();
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for key in ["rows", "files", "alloc.rows", "alloc.files", "layout.rows"] {
         let rows = key.split('.').try_fold(&mut h, |v, k| v.get_mut(k));
         for (i, row) in rows.and_then(Value::as_array_mut).into_iter().flatten().enumerate() {
@@ -109,9 +128,15 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
                 if let Some(o) = f.as_object_mut() {
                     o.remove("url");
                 }
+                let at = *seen.entry(f.to_string()).or_insert_with(|| {
+                    table.push(f.clone());
+                    table.len() - 1
+                });
+                *f = json!(at);
             }
         }
     }
+    h["frame_table"] = json!(table);
     h["recording"] = json!(rec);
     if let Some(r) = runs {
         h["runs"] = json!(r);

@@ -236,21 +236,23 @@ pub fn alloc(dir: &Path, by: &str, top: usize) -> Result<Output> {
         for s in prof["samples"].as_array().into_iter().flatten() {
             *hits.entry(s["nodeId"].as_u64().unwrap_or(0)).or_default() += 1;
         }
-        // Depth-first over the call tree, carrying each node's stack; a node's selfSize is bytes sampled there.
-        let mut todo: Vec<(&Value, Vec<Frame>)> = prof.get("head").map(|h| (h, Vec::new())).into_iter().collect();
-        while let Some((n, mut stack)) = todo.pop() {
-            let f = sym.call_frame(&n["callFrame"]);
-            if f.name != "(root)" {
-                stack.push(f);
+        // Flatten the call tree once (each node's frame and parent); a stack is built only for nodes
+        // where bytes were sampled (`selfSize`), not copied down every branch.
+        let (mut frames, mut parent, mut sampled) = (BTreeMap::new(), BTreeMap::new(), Vec::new());
+        let mut todo: Vec<(&Value, Option<u64>)> = prof.get("head").map(|h| (h, None)).into_iter().collect();
+        while let Some((n, up)) = todo.pop() {
+            let id = n["id"].as_u64().unwrap_or(0);
+            frames.insert(id, sym.call_frame(&n["callFrame"]));
+            if let Some(u) = up {
+                parent.insert(id, u);
             }
             let bytes = n["selfSize"].as_f64().unwrap_or(0.0);
             if bytes > 0.0 {
-                weights.push((stack.clone(), bytes, hits.get(&n["id"].as_u64().unwrap_or(0)).copied().unwrap_or(1)));
+                sampled.push((id, bytes));
             }
-            for c in n["children"].as_array().into_iter().flatten() {
-                todo.push((c, stack.clone()));
-            }
+            todo.extend(n["children"].as_array().into_iter().flatten().map(|c| (c, Some(id))));
         }
+        weights.extend(sampled.into_iter().map(|(id, bytes)| (chain(id, &frames, &parent), bytes, hits.get(&id).copied().unwrap_or(1))));
     }
     let header = format!("allocations by {by} · sampled every {} KB on average · {{samples}} samples{{mapped}}", crate::probe::alloc::INTERVAL_BYTES / 1024);
     let mut out = rank(weights, by, top, &header, fmt::bytes);

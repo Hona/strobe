@@ -1,0 +1,47 @@
+[package]
+name = "strobe"
+version = "0.1.0"
+edition = "2024"
+description = "Measure and explain performance: web pages, Electron apps, Bun/Node, any process"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "strobe"
+path = "src/main.rs"
+
+[dependencies]
+# JSON for every protocol strobe speaks (CDP, runner, MCP, results).
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# WebSocket client for the Chrome DevTools Protocol; plain ws:// to 127.0.0.1, no TLS.
+# 0.24: its getrandom 0.2 links bcrypt normally; newer ones need dlltool's raw-dylib on windows-gnu.
+tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# IO.read returns trace chunks base64-encoded.
+base64 = "0.22"
+# gzip for stored traces and heap snapshots; pure-Rust backend (no C compiler).
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Verifying downloaded engine archives against pinned hashes; pure Rust.
+sha2 = "0.10"
+
+[target.'cfg(windows)'.dependencies]
+# Win32: QPC clock, process CPU times, toolhelp snapshots, affinity, power plans, PDH, window state.
+windows-sys = { version = "0.59", features = [
+  "Win32_Foundation",
+  "Win32_System_Performance",
+  "Win32_System_Threading",
+  "Win32_System_Diagnostics_ToolHelp",
+  "Win32_System_SystemInformation",
+  "Win32_System_ProcessStatus",
+  "Win32_System_Power",
+  "Win32_System_Registry",
+  "Win32_UI_WindowsAndMessaging",
+  "Win32_Graphics_Gdi",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

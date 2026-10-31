@@ -1,0 +1,7 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>strobe report</title></head>
+<body><pre id="out"></pre>
+<script>
+const STROBE = /*STROBE_DATA*/null
+document.getElementById("out").textContent = STROBE?.data?.text ?? JSON.stringify(STROBE, null, 2)
+</script></body></html>

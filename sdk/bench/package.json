@@ -1,0 +1,11 @@
+{
+  "name": "@strobe/bench",
+  "version": "0.1.0",
+  "description": "Write strobe benchmarks as small TypeScript files",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./runner": "./src/runner.ts"
+  },
+  "license": "MIT"
+}

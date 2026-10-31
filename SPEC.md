@@ -47,6 +47,12 @@ When a design change is agreed, update this file in the same change.
     One-time downloads shell out to `curl` (built into Windows 10+, macOS and Linux) instead of
     linking TLS.
 13. **No backwards compatibility while pre-1.0.** Breaking changes are fine. No migration code.
+14. **Normal speed only.** strobe never slows the target: no CPU throttling, no network
+    throttling, no frame-rate caps in timing blocks. CPU throttling slows only the renderer's
+    main thread, so the bottleneck moves where no real device has it. Small effects are found
+    with more pairs, stress comes from bigger workloads (`params`), and slow hardware is measured
+    on slow hardware (`--on`). The `Throttled` validator (§10.1) catches a slowed target from any
+    cause.
 
 ## 2. Invariants
 
@@ -219,7 +225,7 @@ Steps (each checks first, prints ✓ / ! / ✗):
 $ strobe up
 strobe up · adais
   ✓ cpu        Ryzen 9 9950X3D · 16C/32T · CCD0 V-Cache (96 MB L3), CCD1 (32 MB L3)
-  ! power      Balanced: bench sets High performance per run and restores it
+  ! power      Balanced (kept; bench --power high switches it for the run)
   ✓ gpu        RTX 5070 Ti · NVML ok · PDH GPU Engine ok
   ✓ displays   2 · 144 Hz, 60 Hz
   ✓ targets    OpenCode (Stable) · OpenCode Beta · Chrome
@@ -385,8 +391,10 @@ The catalog lives in `src/model/metrics.rs` and in `strobe query <h> summary --c
 ### 7.3 Phases
 
 Bench files (`phase(name, fn)`, §9.6) and `@strobe/web` (`phase(name)`) emit phase marks.
-The runner's marks are written by the daemon on the trace clock; in-page marks are
-`performance.mark` with `detail: { strobe: "phase" }`. Every metric can be sliced by phase.
+Run and phase boundaries are `performance.mark` calls in the page (`strobe:<block>:<kind>:…`),
+one `Runtime.evaluate` per boundary, placed before the first input and after `until` resolves.
+They land on the trace clock, so windows need no clock mapping. Every metric can be sliced by
+phase.
 
 ## 8. Probes
 
@@ -552,7 +560,7 @@ flowchart LR
 | Control | Windows | Linux | macOS |
 |---|---|---|---|
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
-| power plan for the run, restored after (also after a crash, at next daemon start) | `PowerSetActiveScheme` | governor read only; analyser | read only |
+| power plan for the run with `--power high` (opt-in: AMD X3D core parking relies on Balanced), restored after, also after a crash | `PowerSetActiveScheme` | governor read only; analyser | read only |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
 | window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | `visibilityState` | `visibilityState` |
 | throttling | frequency below the expected range (PDH % of maximum frequency) | cpufreq | analyser only |
@@ -678,9 +686,9 @@ export default bench({
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
 
-`opts.until`: `"idle"` (no presented frame and no main-thread task for 300 ms, read from the
-trace stream by the daemon, never by polling the page), `"frame"` (the next presented frame),
-or a selector. Every input call records its dispatch time on the trace clock, which the
+`opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
+in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling), `"frame"`
+(two animation frames, the usual "after next paint"), or a selector. Every input call records its dispatch time on the trace clock, which the
 `interaction.*` metrics use (input → the presented frame that showed the change).
 
 **How it runs:**
@@ -742,6 +750,7 @@ installed there). Results are stored locally, tagged per device, never pooled ac
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
+| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode |
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
 | `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
@@ -769,7 +778,8 @@ the bridge, inside an Electron window.
 | gpu | fixed WebGL fill load | GPU 3D engine use repeatable within 10% (no ground truth) |
 
 `up` runs busy, alloc and idle. `status --calibrate` runs all. The last result is kept in
-`state.json` (`last_calibration`).
+`state.json` (`last_calibration`), including the speed baseline the `Throttled` check compares
+against: the median time of the fixed speed-check workload on this device.
 
 ### 10.4 A/A
 

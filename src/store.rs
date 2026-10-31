@@ -1,0 +1,78 @@
+//! Recordings and experiments on disk: the only writer (SPEC §14).
+
+use crate::host::{self, paths};
+use crate::model::{Error, Result};
+use serde_json::Value;
+use std::io::Write;
+use std::path::PathBuf;
+
+/// A short random-looking id: `<prefix>_` + 6 hex.
+pub fn new_id(prefix: &str) -> String {
+    let seed = host::now_ns() ^ (std::process::id() as u64).rotate_left(32);
+    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15);
+    x ^= x >> 29;
+    format!("{prefix}_{:06x}", x & 0xFFFFFF)
+}
+
+pub fn recording_dir(id: &str) -> Result<PathBuf> {
+    let dir = paths::recordings().join(id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn experiment_dir(id: &str) -> Result<PathBuf> {
+    let dir = paths::experiments().join(id);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+pub fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
+    std::fs::write(path, serde_json::to_vec_pretty(value)?)?;
+    Ok(())
+}
+
+pub fn append_index(line: &Value) -> Result<()> {
+    let mut f = std::fs::OpenOptions::new().create(true).append(true).open(paths::experiments().join("index.jsonl"))?;
+    writeln!(f, "{line}")?;
+    Ok(())
+}
+
+/// Resolves a handle or a unique prefix (`rec_3f`, `exp_8c`) to its directory.
+pub fn resolve(handle: &str) -> Result<PathBuf> {
+    let root = if handle.starts_with("exp_") { paths::experiments() } else { paths::recordings() };
+    let exact = root.join(handle);
+    if exact.is_dir() {
+        return Ok(exact);
+    }
+    let matches: Vec<PathBuf> = std::fs::read_dir(&root)?
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with(handle))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    match matches.len() {
+        1 => Ok(matches[0].clone()),
+        0 => Err(Error::usage(format!("no recording or experiment {handle}"))),
+        _ => Err(Error::usage(format!("{handle} is ambiguous ({} matches)", matches.len()))),
+    }
+}
+
+pub fn read_json(path: &std::path::Path) -> Result<Value> {
+    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+}
+
+/// The newest recordings or experiments, newest first.
+pub fn list(prefix: &str, limit: usize) -> Vec<(String, std::time::SystemTime)> {
+    let root = if prefix == "exp" { paths::experiments() } else { paths::recordings() };
+    let mut v: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(root)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), e.metadata().ok()?.modified().ok()?)))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.truncate(limit);
+    v
+}

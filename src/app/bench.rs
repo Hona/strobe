@@ -822,11 +822,31 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let token = id.trim_start_matches("rec_").to_string();
         let driver = Driver::new(page.clone(), token.clone());
         let current = RefCell::new(String::new());
+        // TaskDuration (ms), then WORK_PARTS: cumulative per document (`Performance.enable` comes before the runs).
+        let counters = || -> [f64; 6] {
+            let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
+            let get = |name: &str, scale: f64| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == name)).and_then(|x| x["value"].as_f64()).map_or(f64::NAN, |v| v * scale);
+            let mut out = [get("TaskDuration", 1e3), 0.0, 0.0, 0.0, 0.0, 0.0];
+            for (i, (_, name, scale)) in WORK_PARTS.iter().enumerate() {
+                out[i + 1] = get(name, *scale);
+            }
+            out
+        };
+        // A run that loads a page (`goto`) starts the counters again in the new document: what the
+        // departing document did is read just before it goes and carried into the run's totals.
+        let carried = RefCell::new([0.0f64; 6]);
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
                     let call = a["call"].as_str().unwrap_or("");
                     let args = a["args"].as_array().cloned().unwrap_or_default();
+                    if call == "goto" && !current.borrow().is_empty() {
+                        let before = counters();
+                        let mut c = carried.borrow_mut();
+                        for (sum, v) in c.iter_mut().zip(before) {
+                            *sum += v;
+                        }
+                    }
                     driver.dispatch(call, &args)
                 }
                 "phase" => {
@@ -881,16 +901,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
         page.send("Performance.enable", json!({}))?;
-        // TaskDuration (ms), then WORK_PARTS.
-        let counters = || -> [f64; 6] {
-            let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
-            let get = |name: &str, scale: f64| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == name)).and_then(|x| x["value"].as_f64()).map_or(f64::NAN, |v| v * scale);
-            let mut out = [get("TaskDuration", 1e3), 0.0, 0.0, 0.0, 0.0, 0.0];
-            for (i, (_, name, scale)) in WORK_PARTS.iter().enumerate() {
-                out[i + 1] = get(name, *scale);
-            }
-            out
-        };
+
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
@@ -900,6 +911,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
             let (cyc0, tsc0) = cycles();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+            *carried.borrow_mut() = [0.0; 6];
             let c0 = counters();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
@@ -926,8 +938,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 _ if wall > 0.0 => 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall,
                 _ => f64::NAN,
             };
-            let parts = std::array::from_fn(|i| c1[i + 1] - c0[i + 1]);
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] - c0[0], parts, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
+            let carry = *carried.borrow();
+            let parts = std::array::from_fn(|i| c1[i + 1] + carry[i + 1] - c0[i + 1]);
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing

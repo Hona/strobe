@@ -618,6 +618,8 @@ flowchart LR
   time cold or warm, while the work it costs settles over 1–4 runs (measured: scroll's main thread
   17.3% → 15.7% after one run; streaming 7.2% → 5.4% after three). After every run strobe reads the
   renderer's main-thread task time (`Performance.getMetrics` `TaskDuration`, a cumulative counter).
+  The counter starts again with every document, so when a run loads a page (`goto`), strobe reads it
+  just before the old document goes and adds that part to the run: a load is one run, never a negative one.
   Warmup ends when two consecutive runs do the same work within 5% or within 1 ms (an idle run does
   about 3 ms, where 5% is noise and warmup once ran 55 s); both count as measured, and
   the block runs until `--runs` are measured. Runs before are relabelled `warm:<i>` in the trace.

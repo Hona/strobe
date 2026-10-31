@@ -25,6 +25,7 @@ pub struct App {
     files: Vec<(String, Value)>,
     guards: Vec<GuardSpec>,
     protocols: Vec<String>,
+    args: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -99,6 +100,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         files: p["files"].as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
         guards,
         protocols: strings("protocols"),
+        args: strings("args"),
     })
 }
 
@@ -197,7 +199,7 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
         std::fs::create_dir_all(d)?;
     }
     // Windows resolves known folders under the redirected profile; Electron's app.getPath("documents")
-    // throws when the folder is missing (an isolated OpenCode desktop failed to start on exactly that).
+    // throws when the folder is missing (an isolated desktop app failed to start on exactly that).
     for d in ["Documents", "Desktop", "Downloads", "Pictures", "Music", "Videos"] {
         std::fs::create_dir_all(home.join(d))?;
     }
@@ -243,6 +245,9 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
         .env("XDG_CACHE_HOME", &cache);
     for (k, v) in &app.env {
         cmd.env(k, fill(v));
+    }
+    for a in &app.args {
+        cmd.arg(fill(a));
     }
     cmd.arg("--remote-debugging-port=0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     let previous = cpus.and_then(host::set_affinity);

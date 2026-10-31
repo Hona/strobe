@@ -3,6 +3,7 @@
 pub mod cpu;
 pub mod gpu;
 pub mod os;
+pub mod symbols;
 pub mod trace;
 
 /// Named probe sets (SPEC §8.1).

@@ -267,10 +267,14 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
     }
     discrete.sort_by(|a, b| a.total_cmp(b));
     if !discrete.is_empty() {
+        out.insert("interaction.n".into(), discrete.len() as f64);
         out.insert("interaction.p50".into(), percentile(&discrete, 0.5));
         out.insert("interaction.p95".into(), percentile(&discrete, 0.95));
     }
     scroll.sort_by(|a, b| a.total_cmp(b));
+    if !scroll.is_empty() {
+        out.insert("scroll.n".into(), scroll.len() as f64);
+    }
     if scroll.len() >= 20 {
         out.insert("scroll.latency.p95".into(), percentile(&scroll, 0.95));
     }

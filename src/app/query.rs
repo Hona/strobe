@@ -124,46 +124,146 @@ pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     if profiles.is_empty() {
         return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
     }
-    let mut self_us: BTreeMap<String, (f64, String)> = BTreeMap::new();
+    // Per row (key, where): self µs, samples, and its call stacks (root → leaf) with µs and samples.
+    type Stacks = BTreeMap<Vec<Frame>, (f64, u64)>;
+    let mut self_us: BTreeMap<(String, String), (f64, u64, Stacks)> = BTreeMap::new();
     let mut total = 0.0;
     let mut samples_total = 0u64;
+    let mut mapped = 0u64;
     for p in profiles {
         let prof = store::read_json(&p)?;
+        // `cpu-<n>.symbols.json` (source maps, SPEC §8.3): original names and locations by frame.
+        let symbols = store::read_json(&p.with_extension("symbols.json")).unwrap_or(Value::Null);
         let nodes = prof["nodes"].as_array().cloned().unwrap_or_default();
         let by_id: BTreeMap<u64, &Value> = nodes.iter().filter_map(|n| Some((n["id"].as_u64()?, n))).collect();
+        let parent: BTreeMap<u64, u64> = nodes.iter().flat_map(|n| {
+            let id = n["id"].as_u64().unwrap_or(0);
+            n["children"].as_array().into_iter().flatten().filter_map(move |c| Some((c.as_u64()?, id)))
+        }).collect();
+        let frames: BTreeMap<u64, Frame> = by_id.iter().map(|(id, n)| (*id, frame(&n["callFrame"], &symbols))).collect();
+        let mut stacks: BTreeMap<u64, Vec<Frame>> = BTreeMap::new();
         let samples = prof["samples"].as_array().cloned().unwrap_or_default();
         let deltas = prof["timeDeltas"].as_array().cloned().unwrap_or_default();
         samples_total += samples.len() as u64;
         for (i, s) in samples.iter().enumerate() {
             let dt = deltas.get(i + 1).and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-            let Some(node) = s.as_u64().and_then(|id| by_id.get(&id)) else { continue };
-            let f = &node["callFrame"];
-            let name = f["functionName"].as_str().filter(|n| !n.is_empty()).unwrap_or("(anonymous)");
-            let url = f["url"].as_str().unwrap_or("");
-            let line = f["lineNumber"].as_i64().unwrap_or(-1) + 1;
+            let Some(id) = s.as_u64() else { continue };
+            let Some(f) = frames.get(&id) else { continue };
+            if f.mapped {
+                mapped += 1;
+            }
             let key = match by {
-                "file" => short_url(url),
-                "package" => package(url),
-                _ => name.to_string(),
+                "file" | "package" if f.url.is_empty() => f.name.clone(),
+                "file" => f.file.clone(),
+                "package" if f.mapped => package(&f.file),
+                "package" => package(&f.url),
+                _ => f.name.clone(),
             };
-            let detail = if by == "function" { format!("{}:{line}", short_url(url)) } else { String::new() };
-            let e = self_us.entry(key).or_insert((0.0, detail));
+            let detail = if by == "function" { f.location() } else { String::new() };
+            let e = self_us.entry((key, detail)).or_insert((0.0, 0, Stacks::new()));
             e.0 += dt;
+            e.1 += 1;
+            if by == "function" {
+                let stack = stacks.entry(id).or_insert_with(|| {
+                    let mut chain = Vec::new();
+                    let mut at = Some(id);
+                    while let Some(n) = at {
+                        if let Some(fr) = frames.get(&n).filter(|fr| fr.name != "(root)") {
+                            chain.push(fr.clone());
+                        }
+                        at = parent.get(&n).copied();
+                    }
+                    chain.reverse();
+                    chain
+                });
+                let st = e.2.entry(stack.clone()).or_insert((0.0, 0));
+                st.0 += dt;
+                st.1 += 1;
+            }
             total += dt;
         }
     }
-    let mut rows: Vec<(String, f64, String)> = self_us.into_iter().map(|(k, (v, d))| (k, v, d)).collect();
-    rows.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let mut text = format!("hotspots by {by} · self time · {samples_total} samples at 50 µs\n");
+    let mut rows: Vec<((String, String), (f64, u64, Stacks))> = self_us.into_iter().collect();
+    rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+    let mut text = format!(
+        "hotspots by {by} · self time · {samples_total} samples at {} µs{}\n",
+        crate::probe::cpu::INTERVAL_US,
+        if mapped > 0 { format!(" · {:.0}% of samples source-mapped", 100.0 * mapped as f64 / samples_total.max(1) as f64) } else { String::new() }
+    );
     let mut json_rows = Vec::new();
-    for (k, us, detail) in rows.iter().take(top) {
+    let n = (samples_total as f64).max(1.0);
+    for ((k, detail), (us, hits, row_stacks)) in rows.iter().take(top) {
         let share = if total > 0.0 { us / total } else { 0.0 };
-        let n = (share * samples_total as f64).max(1.0);
-        let ci = 1.96 * (share * (1.0 - share) / n.max(1.0)).sqrt();
-        text += &format!("  {:>9}  {:>5.1}% ±{:>3.1}  {}  {}\n", fmt::value(us / 1000.0, "ms"), share * 100.0, ci * 100.0, k, detail);
-        json_rows.push(json!({ "name": k, "self_ms": us / 1000.0, "share": share, "share_ci": ci, "where": detail }));
+        let ci = 1.96 * (share * (1.0 - share) / n).sqrt();
+        text += &format!("  {:>9}  {:>5.1}% ±{:>4.2}  {}  {}\n", fmt::value(us / 1000.0, "ms"), share * 100.0, ci * 100.0, k, detail);
+        // The heaviest full call stacks into this function, leaf last; the text shows the first in full.
+        let mut heavy: Vec<(&Vec<Frame>, &(f64, u64))> = row_stacks.iter().collect();
+        heavy.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        if let Some((stack, (sus, _))) = heavy.first().filter(|(s, _)| s.len() > 1) {
+            text += &format!("             heaviest stack ({:.0}% of this row):\n", 100.0 * sus / us.max(1e-9));
+            for fr in stack.iter().rev().skip(1) {
+                text += &format!("               ← {}  {}\n", fr.name, fr.location());
+            }
+        }
+        let stacks_json: Vec<Value> = heavy
+            .iter()
+            .take(3)
+            .map(|(stack, (sus, sn))| json!({ "ms": sus / 1000.0, "samples": sn, "frames": stack.iter().map(Frame::json).collect::<Vec<_>>() }))
+            .collect();
+        json_rows.push(json!({ "name": k, "self_ms": us / 1000.0, "samples": hits, "share": share, "share_ci": ci, "where": detail, "stacks": stacks_json }));
     }
-    Ok(Output::new(text, json!({ "by": by, "samples": samples_total, "total_ms": total / 1000.0, "rows": json_rows })))
+    Ok(Output::new(text, json!({ "by": by, "samples": samples_total, "interval_us": crate::probe::cpu::INTERVAL_US, "mapped_samples": mapped, "total_ms": total / 1000.0, "rows": json_rows })))
+}
+
+/// One profile frame, located as completely as strobe can: the original name, the absolute file on
+/// disk when known (else the source path the map records, else the script URL), 1-based line and column.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct Frame {
+    name: String,
+    file: String,
+    line: i64,
+    column: i64,
+    url: String,
+    mapped: bool,
+    /// Where `name` came from: "map", "source" (the declaration on disk), or None (the profile's own).
+    name_from: Option<String>,
+}
+
+impl Frame {
+    /// `file:line:column`, or `(native)` for frames without a script.
+    fn location(&self) -> String {
+        if self.url.is_empty() {
+            return "(native)".into();
+        }
+        match (self.line, self.column) {
+            (l, c) if l > 0 && c > 0 => format!("{}:{l}:{c}", self.file),
+            (l, _) if l > 0 => format!("{}:{l}", self.file),
+            _ => self.file.clone(),
+        }
+    }
+
+    fn json(&self) -> Value {
+        json!({ "name": self.name, "name_from": self.name_from, "file": self.file, "line": self.line, "column": self.column, "url": self.url, "source_mapped": self.mapped })
+    }
+}
+
+fn frame(f: &Value, symbols: &Value) -> Frame {
+    let url = f["url"].as_str().unwrap_or("").to_string();
+    let (line0, col0) = (f["lineNumber"].as_i64().unwrap_or(-1), f["columnNumber"].as_i64().unwrap_or(-1));
+    let minified = f["functionName"].as_str().filter(|n| !n.is_empty()).unwrap_or("(anonymous)");
+    let sym = &symbols[format!("{url}:{line0}:{col0}")];
+    if sym.is_object() {
+        return Frame {
+            name: sym["name"].as_str().filter(|n| !n.is_empty()).unwrap_or(minified).to_string(),
+            file: sym["file"].as_str().or(sym["source"].as_str()).unwrap_or(&url).to_string(),
+            line: sym["line"].as_i64().unwrap_or(0),
+            column: sym["column"].as_i64().unwrap_or(0),
+            url,
+            mapped: true,
+            name_from: sym["name_from"].as_str().map(str::to_string),
+        };
+    }
+    Frame { name: minified.to_string(), file: url.clone(), line: line0 + 1, column: col0 + 1, url, mapped: false, name_from: None }
 }
 
 fn short_url(url: &str) -> String {
@@ -185,7 +285,12 @@ pub fn package(url: &str) -> String {
         return if first.starts_with('@') { format!("{first}/{}", parts.next().unwrap_or("")) } else { first.to_string() };
     }
     let path = short_url(url);
-    path.split('/').next().filter(|s| !s.is_empty()).unwrap_or("(app)").to_string()
+    let mut parts = path.split('/').filter(|s| !s.is_empty());
+    match parts.next() {
+        Some(scope) if scope.starts_with('@') => format!("{scope}/{}", parts.next().unwrap_or("")),
+        Some(first) => first.to_string(),
+        None => "(app)".into(),
+    }
 }
 
 /// `strobe record file:<path>`: turns an existing capture into a recording (SPEC §8.7).

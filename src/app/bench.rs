@@ -167,6 +167,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let dir = store::experiment_dir(&exp)?;
     super::progress_to(Some(dir.join("progress.log")));
     let _lock = validity::lock()?;
+    chromium::reap_orphans();
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
     let config = config::load(&project);
     let _power = match args.get("power").unwrap_or("keep") {
@@ -719,6 +720,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if set == Set::Attribution {
             let profile = probe::cpu::stop(&page)?;
             store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
+            // Original names and locations from the page's source maps, while its server still runs. The
+            // served folder (strobe.json `serve.dir`, else `build.output`) turns them into files on disk.
+            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
+            store::write_json(&dir.join("cpu-0.symbols.json"), &probe::symbols::resolve(&page, &profile, served.as_deref()))?;
         }
         let trace = dir.join("trace.pftrace");
         tracing.stop(&trace)?;
@@ -768,7 +773,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 &dir.join("meta.json"),
                 &json!({
                     "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
-                    "target": url, "probes": set, "token": token, "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
+                    "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                     "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version,
                 }),
             )?;

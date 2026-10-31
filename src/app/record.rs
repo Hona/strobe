@@ -26,6 +26,7 @@ pub fn run(args: &Args) -> Result<Output> {
         None => 10_000,
     };
     let attach = target.starts_with("cdp:") || target.starts_with("ws://");
+    chromium::reap_orphans();
     let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
     // `exe:<path> --app <id>` borrows an app profile for another build of that app.
     let app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
@@ -82,6 +83,8 @@ pub fn run(args: &Args) -> Result<Output> {
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
+        // `--served <dir>`: the folder the target's origin serves, to find original files on disk.
+        store::write_json(&dir.join("cpu-0.symbols.json"), &probe::symbols::resolve(&page, &profile, args.get("served").map(std::path::Path::new)))?;
     }
     let bytes = tracing.stop(&dir.join("trace.pftrace"))?;
     let version = browser.version.clone();

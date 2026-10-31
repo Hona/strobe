@@ -106,7 +106,7 @@ locations, not only PATH.
 ```
 Cargo.toml  build.rs
 src/            one package: lib + bins strobe, strobew (Windows windowless); §4.3
-viewer/         Solid + canvas viewer, built into src/ui/dist and embedded
+viewer/         self-contained HTML report viewer (`viewer/report.html`), embedded
 calibration/    the known-cost page (static), embedded
 sdk/            TypeScript: @strobe/bench, @strobe/web, @strobe/electron, @strobe/playwright
                 (one Bun workspace)
@@ -449,8 +449,25 @@ The difference is printed as `overhead`. Above 2% of main-thread time fails `Pro
 
 ### 8.3 CPU samples
 
-50 µs interval, line ticks kept. Every hotspot row carries its sample count and an interval for
-its share. Native time stays `(program)` unless `deep` resolves it (§12.3).
+200 µs interval, line ticks kept (at 50 µs the profiler raised a JS-heavy run's main-thread work
+by 35–45%, enough that one profiled launch moved against the timed pairs it was meant to explain).
+Every hotspot row carries its sample count and an interval for its share. Native time stays
+`(program)` unless `deep` resolves it (§12.3).
+
+**Source maps**: right after the profiler stops, while the target still serves its scripts, strobe
+asks the page to fetch each profiled script's `sourceMappingURL` (http, an app's custom protocol,
+or an inline `data:` map), decodes the VLQ mappings, and writes `cpu-<n>.symbols.json` mapping
+`"<url>:<line>:<column>"` to `{ name, name_from, source, line, column, file }`: the source path
+exactly as the map records it, the 1-based original line and column, and `file`, the absolute path
+on disk, when strobe knows the folder the origin serves (strobe.json `serve.dir`, else
+`build.output`; `record --served <dir>`) and the file exists. When the map names no identifier at a
+function's start, strobe reads the original declaration on disk (`function name(`, `name(`,
+`name = (…) =>`) and records `name_from: "source"`. A build without maps keeps minified names.
+
+**Complete over short** (for every view, because agents act on it): a frame is located by its absolute
+file, line and column, never a shortened path; hotspots by function carry their three heaviest
+full call stacks (root to leaf, every frame located), and the text view prints the heaviest one in
+full. Displays may abbreviate; the record does not.
 
 ### 8.4 Counters
 
@@ -889,8 +906,10 @@ with at least 3 pairs shows zero spread.
 
 ### 11.2 Report views
 
-`bench-summary` (also the PR block), `memory-timeline`, `frames`, `hotspots`, `flame`,
-`compare`, `leak`. HTML is self-contained (viewer subset + gzip data, default cap 2 MB);
+`experiment`, `recording` (`bench-summary` / PR block in `--format md`), `memory-timeline`,
+`frames`, `hotspots`, `flame`, `compare`, `leak`. HTML is self-contained (`viewer/report.html` +
+embedded JSON payload with the metric catalog and, for `experiment`, per-series base/head CPU
+hotspots by function `(name, location)` and by file plus attribution run counts, default cap 2 MB);
 markdown is GitHub-flavoured.
 
 ### 11.3 Insights
@@ -938,7 +957,7 @@ Strobe launches any Electron app the same way, with no change to the app:
 - **A fresh private home per launch**: `AppData/Roaming`, `AppData/Local/Temp`, `.local/share`,
   `.local/state`, `.config`, `.cache`, and the known folders `Documents`, `Desktop`, `Downloads`,
   `Pictures`, `Music`, `Videos` (Electron's `app.getPath("documents")` throws when the redirected
-  profile lacks them; an isolated OpenCode desktop showed "Failed to get 'documents' path"), with
+  profile lacks them; an isolated desktop app showed "Failed to get 'documents' path"), with
   `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and `XDG_*_HOME` pointing into it. Every path an app derives from those (its
   profile, single-instance lock, caches, its own background services' state) lands in the home,
   so the app's identity or channel does not matter.
@@ -971,7 +990,14 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
 
 - `exe`: a path or one per OS; `~`, `%VAR%` and `${VAR}` expand from the real user's environment.
 - `env`, `unset` (exact names or `PREFIX*`), `dirs` and `files` (JSON or text; a string that is
-  exactly `{port}` becomes a number) shape the copy.
+  exactly `{port}` becomes a number) shape the copy; `args` are extra command-line arguments.
+- **Background downloads are an isolation gap.** An isolated desktop app's stable channel downloaded its next
+  release mid-run, which read as "the beta channel idles at 83% less CPU" until the updater log showed the
+  download. Proxy env vars do not stop it (Electron's network stack ignores them on Windows), and
+  Chromium switches (`--proxy-server`, `--host-resolver-rules`) broke that app's own loopback
+  service. What works is in the profile: a `files` entry that puts a file where the updater wants
+  its cache folder, so its download fails at once. Check an app's own log in the private home when
+  an A/B between channels looks too good.
 - **`guard`**: before launch strobe reads each file (and the `pid` and `url` its JSON names).
   While the app starts, after its window opens and after every close, the file must be unchanged,
   the process alive and the URL answering. Otherwise the experiment stops at once, kills the copy

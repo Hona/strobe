@@ -96,6 +96,36 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
     dirs.into_iter().map(|d| d.1).collect()
 }
 
+/// Ends what a dead strobe left behind: a browser or app still running from its private profile or
+/// home (`profile-<pid>-…`, `home-<pid>-…` under `run/`), and the folder. A killed strobe once left a
+/// calibration Chromium on screen for hours.
+pub fn reap_orphans() {
+    let Ok(entries) = std::fs::read_dir(host::paths::run()) else { return };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(owner) = name.strip_prefix("profile-").or_else(|| name.strip_prefix("home-")).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        if owner == std::process::id() {
+            continue;
+        }
+        #[cfg(windows)]
+        {
+            let alive = host::win::exe_of(owner).is_some_and(|exe| exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("strobe")));
+            if alive {
+                continue;
+            }
+            for pid in host::win::running_under(&e.path()) {
+                super::electron::kill_tree(pid);
+            }
+        }
+        #[cfg(not(windows))]
+        if std::process::Command::new("kill").args(["-0", &owner.to_string()]).status().is_ok_and(|s| s.success()) {
+            continue;
+        }
+        super::electron::restore_protocols(&e.path());
+        let _ = std::fs::remove_dir_all(e.path());
+    }
+}
+
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
     let exe = find().ok_or_else(|| {

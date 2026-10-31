@@ -813,8 +813,16 @@ export default bench({
   (optional, between runs, never measured), `metrics` (optional extra secondaries), `probes`
   (optional extra attribution probes).
 
-**`ctx`:** `page`, `phase(name, fn)`, `params`, `target` (its name), `variant` (`base` or
-`head`, for logging only), `url`, `prepared`, `playwright` (in `prepare` only).
+**`ctx`:** `page`, `phase(name, fn)`, `case` (the case the block runs, also in `prepare`, `setup` and a
+`url` function, so one file can give each case its own fixture), `params`, `target` (its name),
+`variant` (`base` or `head`, for logging only), `url`, `prepared`, `playwright` (in `prepare` only).
+
+An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
+checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
+ancestor hide it, as they hide it from a person. `until` selectors and `waitFor` use the same test.
+Selectors cross shadow roots with `>>>` (`[data-component=file] >>> [data-line="11"]`), and `idle` and
+`waitFor` observe every shadow root in the page, including ones attached later, so what a component
+renders into one (a diff or code viewer) counts as a change.
 
 **`page` driver** (strobe's own, over CDP or the bridge, so it works on Stable):
 

@@ -35,7 +35,8 @@ const page = {
   eval: (fn: Function, ...args: unknown[]) => driver("eval", fn.toString(), ...args),
 }
 
-const state: { params: Record<string, unknown>; target: string; variant: string; url: string; playwright: any; prepared: unknown } = {
+const state: { case: string; params: Record<string, unknown>; target: string; variant: string; url: string; playwright: any; prepared: unknown } = {
+  case: "",
   params: {},
   target: "",
   variant: "base",
@@ -46,6 +47,7 @@ const state: { params: Record<string, unknown>; target: string; variant: string;
 
 const context = () => ({
   page,
+  case: state.case,
   params: state.params,
   target: state.target,
   variant: state.variant,
@@ -108,16 +110,16 @@ async function handle(op: string, args: any) {
     case "describe":
       return describe()
     case "block":
-      Object.assign(state, { params: args.params ?? {}, target: args.target, variant: args.variant, url: args.url ?? "", prepared: undefined })
+      Object.assign(state, { case: args.case ?? "", params: args.params ?? {}, target: args.target, variant: args.variant, url: args.url ?? "", prepared: undefined })
       return true
     case "prepare": {
       const target = spec.targets[state.target]
       if (target?.prepare) {
         state.playwright = await playwright(args.endpoint, args.target)
-        state.prepared = await target.prepare({ params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
+        state.prepared = await target.prepare({ case: state.case, params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
       }
       // A `url` function names the first page from what `prepare` returned, so the block loads one page.
-      const url = typeof target?.url === "function" ? await target.url({ prepared: state.prepared, params: state.params }) : undefined
+      const url = typeof target?.url === "function" ? await target.url({ case: state.case, prepared: state.prepared, params: state.params }) : undefined
       return { url }
     }
     case "setup":

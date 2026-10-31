@@ -842,7 +842,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
         };
         let t = Duration::from_secs(120);
-        ctx.runner.call("block", json!({ "params": s.params, "target": s.target, "variant": v.role, "url": url }), t, &serve)?;
+        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url }), t, &serve)?;
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {

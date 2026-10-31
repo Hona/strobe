@@ -29,6 +29,8 @@ export interface Page {
 
 export interface Context<P> {
   page: Page
+  /** The case this block runs: a block always belongs to one case. */
+  case: string
   /** Marks a named span inside a run; every metric can be sliced by it. */
   phase<T>(name: string, fn: () => T | Promise<T>): Promise<T>
   params: P
@@ -41,6 +43,8 @@ export interface Context<P> {
 }
 
 export interface PrepareContext<P> {
+  /** The case this block runs, so one file can give each case its own fixture. */
+  case: string
   params: P
   target: string
   variant: "base" | "head"
@@ -62,7 +66,7 @@ export interface Case<P> {
 }
 
 /** The first page a block opens: a path, or a function of what `prepare` returned. */
-export type FirstPage<P> = string | ((ctx: { prepared: any; params: P }) => string | Promise<string>)
+export type FirstPage<P> = string | ((ctx: { case: string; prepared: any; params: P }) => string | Promise<string>)
 
 export type Target<P> =
   | { kind: "web"; url: FirstPage<P>; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number }

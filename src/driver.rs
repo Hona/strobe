@@ -8,8 +8,34 @@ use std::time::Duration;
 /// Installed lazily in the page (it disappears on navigation). Observers only: nothing polls.
 const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
-  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 }
-  s.find = (sel, text) => [...document.querySelectorAll(sel)].find((el) => visible(el) && (text == null || (el.textContent ?? "").includes(text))) ?? null
+  // What a person could see: a box, and not hidden by `visibility`, `opacity: 0` or `content-visibility` on it or an ancestor.
+  const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ?? true) }
+  // Shadow roots (a diff or code viewer renders into one): every observer below watches them too, so `idle` and
+  // `waitFor` see what changes inside, and `host >>> inner` selects across them. Roots attached before this helper
+  // are found once; later ones are caught where they are created.
+  const roots = new Set()
+  const observers = new Set()
+  const watch = (root) => {
+    if (roots.has(root)) return
+    roots.add(root)
+    for (const o of observers) o.mo.observe(root, o.opts)
+    for (const el of root.querySelectorAll("*")) if (el.shadowRoot) watch(el.shadowRoot)
+  }
+  for (const el of document.querySelectorAll("*")) if (el.shadowRoot) watch(el.shadowRoot)
+  const attach = Element.prototype.attachShadow
+  Element.prototype.attachShadow = function (init) { const root = attach.call(this, init); watch(root); return root }
+  const observe = (fn, opts) => {
+    const o = { mo: new MutationObserver(fn), opts }
+    o.mo.observe(document, opts)
+    for (const r of roots) o.mo.observe(r, opts)
+    observers.add(o)
+    return () => { o.mo.disconnect(); observers.delete(o) }
+  }
+  const query = (root, [first, ...rest]) => {
+    const found = [...root.querySelectorAll(first)]
+    return rest.length ? found.flatMap((host) => (host.shadowRoot ? query(host.shadowRoot, rest) : [])) : found
+  }
+  s.find = (sel, text) => query(document, sel.split(">>>").map((part) => part.trim())).find((el) => visible(el) && (text == null || (el.textContent ?? "").includes(text))) ?? null
   s.focused = (sel) => { const el = s.find(sel); return !!el && el.contains(document.activeElement) }
   s.box = (sel) => {
     const el = s.find(sel)
@@ -20,16 +46,14 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   }
   s.waitFor = (sel, timeout, text) => new Promise((resolve, reject) => {
     if (s.find(sel, text)) return resolve(true)
-    const mo = new MutationObserver(() => { if (s.find(sel, text)) { mo.disconnect(); clearTimeout(t); resolve(true) } })
-    mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: text != null })
-    const t = setTimeout(() => { mo.disconnect(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : " containing " + JSON.stringify(text)))) }, timeout)
+    const stop = observe(() => { if (s.find(sel, text)) { stop(); clearTimeout(t); resolve(true) } }, { subtree: true, childList: true, attributes: true, characterData: text != null })
+    const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : " containing " + JSON.stringify(text)))) }, timeout)
   })
   s.idle = (quiet, timeout) => new Promise((resolve, reject) => {
     let timer, po
-    const stop = () => { mo.disconnect(); if (po) po.disconnect(); clearTimeout(timer); clearTimeout(limit) }
+    const stop = () => { unwatch(); if (po) po.disconnect(); clearTimeout(timer); clearTimeout(limit) }
     const kick = () => { clearTimeout(timer); timer = setTimeout(() => { stop(); resolve(true) }, quiet) }
-    const mo = new MutationObserver(kick)
-    mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true })
+    const unwatch = observe(kick, { subtree: true, childList: true, attributes: true, characterData: true })
     try { po = new PerformanceObserver(kick); po.observe({ type: "long-animation-frame" }) } catch {}
     const limit = setTimeout(() => { stop(); reject(new Error("the page never went idle (DOM kept changing for " + timeout + " ms)")) }, timeout)
     kick()

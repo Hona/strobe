@@ -63,7 +63,7 @@ pub fn run(args: &Args) -> Result<Output> {
         return Ok(Output::new(s.text, Value::Object(s.json)));
     }
     // Binary on PATH.
-    let installed = install_self(&mut s)?;
+    let (installed, updated) = install_self(&mut s)?;
     // Engine.
     match engine::ensure() {
         Ok(p) => s.line("✓", "engine", format!("trace_processor {} · sha256 ok · {}", engine::VERSION, p.display())),
@@ -71,7 +71,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     // Daemon: autostart and running.
     if !skip.contains(&"daemon") {
-        daemon_up(&mut s, &installed)?;
+        daemon_up(&mut s, &installed, updated)?;
     }
     // MCP in opencode.
     if !skip.contains(&"mcp") {
@@ -109,7 +109,8 @@ fn exe(name: &str) -> String {
 }
 
 /// Copies this binary (and strobew next to it) into the install dir and puts that dir on the user PATH.
-fn install_self(s: &mut Steps) -> Result<PathBuf> {
+/// Copies this build into the install folder; also says whether it replaced anything.
+fn install_self(s: &mut Steps) -> Result<(PathBuf, bool)> {
     let dir = install_dir();
     std::fs::create_dir_all(&dir)?;
     let me = std::env::current_exe()?;
@@ -133,7 +134,7 @@ fn install_self(s: &mut Steps) -> Result<PathBuf> {
     }
     let on_path = path_has(&dir);
     s.line("✓", "binary", format!("{}{}", dir.join(exe("strobe")).display(), if on_path { "" } else { " · added to PATH (new terminals)" }));
-    Ok(dir)
+    Ok((dir, !same))
 }
 
 fn path_has(dir: &Path) -> bool {
@@ -155,7 +156,7 @@ fn path_has(dir: &Path) -> bool {
     }
 }
 
-fn daemon_up(s: &mut Steps, dir: &Path) -> Result<()> {
+fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     let state_path = paths::state_dir().join("state.json");
     let mut state: Value = std::fs::read_to_string(&state_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
     if state["mcp_port"].as_u64().is_none() {
@@ -168,6 +169,20 @@ fn daemon_up(s: &mut Steps, dir: &Path) -> Result<()> {
     #[cfg(windows)]
     host::win::set_user_value(RUN_KEY, "strobe", Some(&format!("\"{}\" daemon", daemon_exe.display())), false);
     let _ = RUN_KEY;
+    // The daemon runs MCP calls in its own process: a new build only counts once it restarts.
+    if updated && mcp::running() {
+        if daemon_benching() {
+            s.line("!", "daemon", "keeps the previous build until its bench finishes; run strobe up again then");
+        } else {
+            let _ = quit_daemon();
+            for _ in 0..30 {
+                if !mcp::running() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+    }
     if !mcp::running() {
         spawn_detached(&daemon_exe, &["daemon"])?;
         for _ in 0..30 {
@@ -262,18 +277,30 @@ fn mcp_up(s: &mut Steps) {
         .and_then(|o| serde_json::from_slice::<Value>(&o.stdout).ok())
         .and_then(|v| v.as_array().map(|a| a.iter().filter_map(|l| l["directory"].as_str().map(str::to_string)).collect()))
         .unwrap_or_default();
-    let live = locations
-        .iter()
-        .filter(|dir| {
-            Command::new(&oc)
-                .args(["api", "experimental.mcp.add", "--param", "server=strobe", "--param", &format!("directory={dir}"), "--data", &entry])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .is_ok_and(|st| st.success())
+    // One CLI call per location takes seconds; eight at a time keeps `up` short with many locations.
+    let live: usize = locations
+        .chunks(8)
+        .map(|chunk| {
+            std::thread::scope(|scope| {
+                let calls: Vec<_> = chunk
+                    .iter()
+                    .map(|dir| {
+                        let (oc, entry) = (&oc, &entry);
+                        scope.spawn(move || {
+                            Command::new(oc)
+                                .args(["api", "experimental.mcp.add", "--param", "server=strobe", "--param", &format!("directory={dir}"), "--data", entry])
+                                .stdin(Stdio::null())
+                                .stdout(Stdio::null())
+                                .stderr(Stdio::null())
+                                .status()
+                                .is_ok_and(|st| st.success())
+                        })
+                    })
+                    .collect();
+                calls.into_iter().map(|c| c.join().unwrap_or(false)).filter(|ok| *ok).count()
+            })
         })
-        .count();
+        .sum();
     s.line("✓", "mcp", format!("registered \"strobe\" · {url} · live in {live} opencode location{}", if live == 1 { "" } else { "s" }));
 }
 
@@ -405,6 +432,12 @@ pub fn leave(args: &Args) -> Result<Output> {
         s.line("i", "state", format!("kept {} (pass --yes to delete recordings and experiments)", paths::state_dir().display()));
     }
     Ok(Output::new(s.text, Value::Object(s.json)))
+}
+
+/// Whether the bench holding the device's bench lock runs inside the daemon (MCP benches do).
+fn daemon_benching() -> bool {
+    let Some(pid) = std::fs::read_to_string(paths::run().join("bench.lock")).ok().and_then(|t| t.trim().parse::<u32>().ok()) else { return false };
+    host::process_tree(pid).iter().any(|p| p.pid == pid && p.name.to_lowercase().starts_with("strobew"))
 }
 
 fn quit_daemon() -> Result<()> {

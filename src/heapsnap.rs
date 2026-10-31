@@ -462,15 +462,20 @@ impl Snapshot {
         }
     }
 
-    /// Identity of a class across snapshots: name and location (by URL; script ids differ between processes).
-    fn class_key(&self, c: usize) -> String {
+    /// Identity of a class across snapshots: name and location (by URL; script ids differ between
+    /// processes). `portable` keys snapshots of two launches or builds: the origin (each variant has its
+    /// own port), the bundler's content hash in chunk names and line:column all differ there, so the key
+    /// is the name and the script's path without them.
+    fn class_key(&self, c: usize, portable: bool) -> String {
         let k = &self.classes[c];
-        match k.loc {
-            Some([sid, line, col]) => match self.scripts.get(&sid) {
+        match (k.loc, portable) {
+            (Some([sid, _, _]), true) => format!("{}\u{1}{}", portable_name(&k.name), self.scripts.get(&sid).map(|u| portable_url(u)).unwrap_or_default()),
+            (None, true) => portable_name(&k.name),
+            (Some([sid, line, col]), false) => match self.scripts.get(&sid) {
                 Some(url) => format!("{}\u{1}{url}:{line}:{col}", k.name),
                 None => format!("{}\u{1}#{sid}:{line}:{col}", k.name),
             },
-            None => k.name.clone(),
+            (None, _) => k.name.clone(),
         }
     }
 
@@ -639,15 +644,25 @@ pub fn summary(s: &Snapshot, top: usize, reveal: bool) -> Value {
 /// objects only `head` has: by node id when both come from one process (ids are stable within one
 /// V8 heap), else the classes `base` lacks.
 pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, reveal: bool) -> Value {
-    let index = |s: &Snapshot| -> HashMap<String, usize> { (0..s.classes.len()).map(|c| (s.class_key(c), c)).collect() };
+    // Several classes can share a portable key (same name in one chunk): their stats add up.
+    let index = |s: &Snapshot| -> HashMap<String, Vec<usize>> {
+        let mut m: HashMap<String, Vec<usize>> = HashMap::new();
+        for c in 0..s.classes.len() {
+            m.entry(s.class_key(c, !same_process)).or_default().push(c);
+        }
+        m
+    };
     let (bi, hi) = (index(base), index(head));
     let keys: Vec<&String> = hi.keys().chain(bi.keys().filter(|k| !hi.contains_key(*k))).collect();
-    let stats = |k: Option<&Class>| k.map(|k| (k.count as i64, k.self_size as i64, k.retained as i64)).unwrap_or((0, 0, 0));
+    let stats = |s: &Snapshot, cs: Option<&Vec<usize>>| {
+        cs.into_iter().flatten().map(|&c| &s.classes[c]).fold((0i64, 0i64, 0i64), |a, k| (a.0 + k.count as i64, a.1 + k.self_size as i64, a.2 + k.retained as i64))
+    };
     let mut rows: Vec<(i64, i64, i64, Value)> = keys
         .into_iter()
         .filter_map(|key| {
-            let (b, h) = (bi.get(key).map(|&c| &base.classes[c]), hi.get(key).map(|&c| &head.classes[c]));
-            let ((bc, bs, br), (hc, hs, hr)) = (stats(b), stats(h));
+            let (bcs, hcs) = (bi.get(key), hi.get(key));
+            let ((bc, bs, br), (hc, hs, hr)) = (stats(base, bcs), stats(head, hcs));
+            let (b, h) = (bcs.and_then(|v| v.first()).map(|&c| &base.classes[c]), hcs.and_then(|v| v.first()).map(|&c| &head.classes[c]));
             if (bc, bs, br) == (hc, hs, hr) {
                 return None;
             }
@@ -660,7 +675,7 @@ pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, re
                 return None;
             }
             let row = json!({
-                "class": k.name, "type": s.node_types.get(k.ntype as usize), "location": s.loc_json(k.loc),
+                "class": if same_process { k.name.clone() } else { portable_name(&k.name) }, "type": s.node_types.get(k.ntype as usize), "location": s.loc_json(k.loc),
                 "base": { "count": bc, "self_size": bs, "retained_size": br },
                 "head": { "count": hc, "self_size": hs, "retained_size": hr },
                 "delta": { "count": hc - bc, "self_size": hs - bs, "retained_size": hr - br },
@@ -676,7 +691,7 @@ pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, re
         let ids = base.sorted_ids();
         born(head, |id| ids.binary_search(&id).is_err(), top, reveal)
     } else {
-        let only: Vec<Value> = head.by_retained().into_iter().filter(|&c| !bi.contains_key(&head.class_key(c))).take(top).map(|c| head.class_json(c, reveal)).collect();
+        let only: Vec<Value> = head.by_retained().into_iter().filter(|&c| !bi.contains_key(&head.class_key(c, true))).take(top).map(|c| head.class_json(c, reveal)).collect();
         json!({ "by": "class", "classes": only })
     };
     json!({
@@ -688,6 +703,51 @@ pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, re
         "classes": rows.into_iter().take(top).map(|r| r.3).collect::<Vec<_>>(),
         "new": new,
     })
+}
+
+/// A class name as two launches share it: origins (`Window (global*) / http://127.0.0.1:61610`) become
+/// `<origin>`, and an element's attributes (`Detached <button id="menu-cl-1048" …>`, ids that differ per
+/// run) are dropped down to its tag.
+fn portable_name(name: &str) -> String {
+    if let Some(tag) = name.strip_prefix("Detached <").or_else(|| name.strip_prefix('<')) {
+        let tag: String = tag.chars().take_while(|c| !c.is_whitespace() && *c != '>').collect();
+        return format!("{}<{tag}>", if name.starts_with("Detached") { "Detached " } else { "" });
+    }
+    let (mut out, mut rest) = (String::new(), name);
+    while let Some(i) = rest.find("://") {
+        let start = rest[..i].rfind(|c: char| !c.is_ascii_alphabetic()).map_or(0, |j| j + 1);
+        out.push_str(&rest[..start]);
+        out.push_str("<origin>");
+        let after = &rest[i + 3..];
+        rest = &after[after.find(|c: char| c == '/' || c.is_whitespace() || c == ')').unwrap_or(after.len())..];
+    }
+    out + rest
+}
+
+/// A script URL as two launches or builds share it: the path without origin, query or the bundler's
+/// content hash (`/_assets/route-CN8YftxL.js` → `/_assets/route.js`).
+fn portable_url(url: &str) -> String {
+    let path = url.split_once("://").map(|(_, r)| r.find('/').map_or("", |i| &r[i..])).unwrap_or(url);
+    let path = path.split(['?', '#']).next().unwrap_or(path);
+    let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
+    // A hash is random: some digit or capital, never a plain word like `my-component`.
+    let random = |h: &str| h.chars().any(|c| c.is_ascii_digit() || c.is_ascii_uppercase());
+    let unhashed = |stem: &str| -> Option<String> {
+        // Vite and Rollup: `-` and 8 base64url characters, which may themselves hold `-` or `_`.
+        if let Some(h) = stem
+            .get(stem.len().saturating_sub(8)..)
+            .filter(|h| stem.len() > 9 && stem.as_bytes()[stem.len() - 9] == b'-' && h.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') && random(h))
+        {
+            return Some(stem[..stem.len() - h.len() - 1].to_string());
+        }
+        let (name, hash) = stem.rsplit_once('-')?;
+        (hash.len() >= 6 && hash.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') && random(hash)).then(|| name.to_string())
+    };
+    let file = match file.rsplit_once('.') {
+        Some((stem, ext)) => unhashed(stem).map_or_else(|| file.to_string(), |name| format!("{name}.{ext}")),
+        None => file.to_string(),
+    };
+    format!("{dir}/{file}")
 }
 
 /// Leak suspects (SPEC §8.6): objects allocated between S0 and S1 that are still alive in S2,

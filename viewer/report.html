@@ -397,7 +397,7 @@ header.topbar {
 /* Single-sided attribution & Live Heap */
 .single-row {
   display: grid;
-  grid-template-columns: minmax(180px, 1.6fr) minmax(100px, 1.2fr) 92px 72px;
+  grid-template-columns: minmax(180px, 1.6fr) minmax(100px, 1.15fr) 92px 86px;
   column-gap: 16px;
   align-items: center;
   min-height: 38px;
@@ -993,6 +993,18 @@ details[open] > summary .chev { transform: rotate(90deg); }
 /* Recording View */
 .rec-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); border-top: 1px solid var(--hairline); }
 .rec-tile { padding: 14px 18px; border-right: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); display: flex; flex-direction: column; gap: 2px; }
+.pil-val.perturbed { color: var(--ink-3); font-weight: 500; }
+.perturbed-tag { font: 400 10.5px/14px var(--mono); color: var(--ink-4); text-transform: none; letter-spacing: 0; }
+.perturbed-note {
+  padding: 9px 24px;
+  background: var(--surface-subtle);
+  border-top: 1px solid var(--hairline);
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--ink-3);
+}
+.perturbed-note b { color: var(--ink-2); font-weight: 600; }
+@media (max-width: 640px) { .perturbed-note { padding: 9px 16px; } }
 .rec-kv-cols { columns: 3 240px; column-gap: 28px; }
 .rec-kv-grp { break-inside: avoid; margin-bottom: 14px; }
 .rec-kv-row { display: flex; justify-content: space-between; gap: 12px; padding: 3px 0; border-bottom: 1px solid var(--hairline); font-size: 12px; }
@@ -1060,6 +1072,33 @@ svg .zeroline { stroke: var(--ink-4); stroke-width: 1; }
 <div id="tip" role="tooltip" hidden></div>
 <script>
 const STROBE = /*STROBE_DATA*/null;
+
+/* Expand integer frame indices against each attribution side's `frame_table` in place (keeps legacy object-frame payloads working too) */
+function hydrateAttributionSide(side) {
+  const tbl = side?.frame_table;
+  if (!Array.isArray(tbl) || !tbl.length) return;
+  const lists = [side.rows, side.files, side.alloc?.rows, side.alloc?.files, side.layout?.rows];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    for (const row of list) {
+      for (const st of row?.stacks || []) {
+        if (Array.isArray(st?.frames)) {
+          st.frames = st.frames.map((f) => (typeof f === "number" ? tbl[f] : f)).filter(Boolean);
+        }
+      }
+    }
+  }
+}
+
+(function hydratePayload(root) {
+  const d = root?.data;
+  if (!d) return;
+  if (d.attribution) hydrateAttributionSide(d.attribution);
+  for (const s of d.series || []) {
+    if (s?.hotspots?.base) hydrateAttributionSide(s.hotspots.base);
+    if (s?.hotspots?.head) hydrateAttributionSide(s.hotspots.head);
+  }
+})(STROBE);
 
 const app = document.getElementById("app");
 const tip = document.getElementById("tip");
@@ -1555,6 +1594,17 @@ function shortRef(v, other) {
 
 const timedBlocks = (s) => (s?.blocks || []).filter((b) => finite(b.pair) && b.pair < 1e6);
 
+function dedupWarnings(list) {
+  const seen = new Set();
+  return list.filter((w) => {
+    if (!w) return false;
+    const key = `${w.level || ""}\0${w.id || ""}\0${w.text || ""}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
 function allComparisons(s) {
   return [
     s.primary ? { c: s.primary, role: "primary" } : null,
@@ -1892,7 +1942,7 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
   const cl = classify(c, m, aa);
   const { pill, headline } = humanHeadline(c, m, u, cl, s, aa);
 
-  const realWarnings = [...(r.warnings || []), ...(s.warnings || [])].filter((w) => w.level === "warn" || w.level === "error");
+  const realWarnings = dedupWarnings([...(r.warnings || []), ...(s.warnings || [])]).filter((w) => w.level === "warn" || w.level === "error");
   const caveatEl = realWarnings.length
     ? h("div", { class: "caveat-bar" },
         realWarnings.map((w) => h("div", { class: "caveat-item" },
@@ -1902,10 +1952,20 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
       )
     : null;
 
-  const alpha = r.plan?.alpha ?? (finite(c.confidence) ? 1 - c.confidence : 0.05);
-  const ciPct = +(100 * (1 - alpha)).toFixed(1);
+  const rawConf = finite(c.confidence) && c.confidence > 0 && c.confidence < 0.9995
+    ? c.confidence
+    : finite(r.plan?.alpha) && r.plan.alpha > 0
+      ? 1 - r.plan.alpha
+      : finite(s.pairs) && s.pairs > 0 && s.pairs < 6
+        ? Math.max(0, 1 - 2 / (2 ** s.pairs))
+        : 0.95;
+  const ciPct = +(100 * rawConf).toFixed(1);
   const looks = (r.plan?.looks || []).filter(finite);
-  const ciExplain = looks.length > 1 && ciPct > 95.1 ? `${ciPct}% CI (${looks.length}-check adjusted)` : `${ciPct}% CI`;
+  const ciExplain = s.pairs < 6 && ciPct < 94.5
+    ? `${Math.round(ciPct)}% range (${s.pairs} pairs)`
+    : looks.length > 1 && ciPct > 95.1
+      ? `${ciPct}% CI (${looks.length}-check adjusted)`
+      : `${ciPct}% CI`;
 
   return h("section", { class: "card-surface" },
     caveatEl,
@@ -2388,7 +2448,7 @@ function renderNextStepsSection(r, s, aa) {
   ].filter(Boolean).join(" ");
 
   const items = [];
-  const realWarns = [...(r.warnings || []), ...(s.warnings || [])].filter((w) => w.level === "warn" || w.level === "error");
+  const realWarns = dedupWarnings([...(r.warnings || []), ...(s.warnings || [])]).filter((w) => w.level === "warn" || w.level === "error");
   if (realWarns.some((w) => w.id === "StateDrift" || w.id === "NotSteady")) {
     items.push({
       why: h("span", {}, h("b", {}, "Stabilize benchmark state first: "), "reset growing DOM or application state between runs so warmup reaches a steady baseline, then re-verify."),
@@ -2397,6 +2457,12 @@ function renderNextStepsSection(r, s, aa) {
   } else if (realWarns.some((w) => w.id === "HighVariance")) {
     items.push({
       why: h("span", {}, h("b", {}, "Reduce between-launch noise: "), "quiet background work or isolate unsteady timers before running a larger pair budget."),
+      cmd: null,
+    });
+  }
+  if (realWarns.some((w) => w.id === "Background")) {
+    items.push({
+      why: h("span", {}, h("b", {}, "Quiet background CPU activity: "), "other processes ran on the measured CPUs during the experiment; close competing workloads if intervals are wider than expected."),
       cmd: null,
     });
   }
@@ -2708,9 +2774,7 @@ function renderCpuHotspotsSection(s, aa) {
     noteText = `Largest individual ${byFile ? "file" : "function"} shift was under 1 ms/run (${fmtSigned(rows[0]?.delta || 0, "ms")}); the change is distributed across small calls within single-launch sampling noise.`;
   }
 
-  const mappedPct = hs.head.mapped_samples && hs.head.samples
-    ? ` · ${Math.round((hs.head.mapped_samples / hs.head.samples) * 100)}% source-mapped`
-    : "";
+  const mappedPct = (hs.head.mapped_samples || hs.base.mapped_samples) ? " · source-mapped" : "";
 
   const sysMapB = new Map(hs.base.rows.map((x) => [x.name, x]));
   const sysMapH = new Map(hs.head.rows.map((x) => [x.name, x]));
@@ -3069,8 +3133,58 @@ function fmtCount(n) {
   return finite(n) ? Math.round(n).toLocaleString("en-US") : "—";
 }
 
+function normHeapLocKey(loc) {
+  if (!loc?.url) return "";
+  return normLocationKey(loc.url) + (loc.line > 1 ? `:${loc.line}` : "");
+}
+
 function classLookupKey(name, loc) {
-  return `${name || ""}\0${loc?.url || ""}:${loc?.line || 0}`;
+  return `${name || ""}\0${normHeapLocKey(loc)}`;
+}
+
+// Coalesces class diff rows split only by ephemeral localhost port (e.g. :61607 vs :61610) or bundle chunk hash
+function coalesceHeapDiffClasses(rawRows) {
+  const list = rawRows || [];
+  const hadPortSplit = list.some((r, i) =>
+    list.some((o, j) => i !== j && r.class === o.class && normHeapLocKey(r.location) === normHeapLocKey(o.location) && r.location?.url !== o.location?.url)
+  );
+  const byKey = new Map();
+  for (const r of list) {
+    const k = `${r.class || ""}\0${r.type || ""}\0${normHeapLocKey(r.location)}`;
+    const cur = byKey.get(k);
+    if (!cur) {
+      byKey.set(k, {
+        class: r.class,
+        type: r.type,
+        location: r.location,
+        base: { ...(r.base || { count: 0, self_size: 0, retained_size: 0 }) },
+        head: { ...(r.head || { count: 0, self_size: 0, retained_size: 0 }) },
+        delta: { ...(r.delta || { count: 0, self_size: 0, retained_size: 0 }) },
+        merged: 1,
+      });
+    } else {
+      cur.base.count += r.base?.count || 0;
+      cur.base.self_size += r.base?.self_size || 0;
+      cur.base.retained_size += r.base?.retained_size || 0;
+      cur.head.count += r.head?.count || 0;
+      cur.head.self_size += r.head?.self_size || 0;
+      cur.head.retained_size += r.head?.retained_size || 0;
+      cur.delta.count += r.delta?.count || 0;
+      cur.delta.self_size += r.delta?.self_size || 0;
+      cur.delta.retained_size += r.delta?.retained_size || 0;
+      if (r.head?.count > 0 && r.location) cur.location = r.location;
+      cur.merged++;
+    }
+  }
+  return [...byKey.values()]
+    .filter((r) => {
+      // Drop unpaired tail row cut off at the top-15 boundary when ephemeral ports split every script class
+      if (hadPortSplit && list.length >= 15 && r.merged === 1 && r.location?.url && (r.base.count === 0 || r.head.count === 0)) {
+        return false;
+      }
+      return Math.abs(r.delta.retained_size) >= 4096 || Math.abs(r.delta.self_size) >= 4096;
+    })
+    .sort((a, b) => Math.abs(b.delta.retained_size) - Math.abs(a.delta.retained_size));
 }
 
 function renderLiveHeapExperimentSection(s, aa) {
@@ -3099,7 +3213,8 @@ function renderLiveHeapExperimentSection(s, aa) {
   const detH = heapH?.detached || { count: 0, retained_size: 0, classes: [] };
   const detDelta = (detH.count || 0) - (detB.count || 0);
 
-  const classRows = (diff?.classes || []).slice(0, 8);
+  const classRows = coalesceHeapDiffClasses(diff?.classes).slice(0, 8);
+  const hadPortMirror = (diff?.classes?.length || 0) > classRows.length && (diff?.classes_changed || 0) > 1000;
   const maxAbsRet = Math.max(...classRows.map((r) => Math.abs(r.delta?.retained_size || 0)), 1024);
   const scale = Math.max(maxAbsRet * 1.15, 64 * 1024);
   const posPct = (v) => 50 + (v / scale) * 50;
@@ -3148,14 +3263,19 @@ function renderLiveHeapExperimentSection(s, aa) {
       ),
       h("div", { class: "stat-cell" },
         h("span", { class: "stat-k" }, "Class footprint changes"),
-        h("span", { class: "stat-v" }, `${fmtCount(diff.classes_changed)} classes`),
+        h("span", { class: "stat-v" }, hadPortMirror ? `${fmtCount(classRows.length)} ≥ 4 KB` : `${fmtCount(diff.classes_changed)} classes`),
         h("span", { class: "stat-sub" },
-          newOnlyList.length > 0
-            ? `${newOnlyList.length} ${newOnlyList.length === 1 ? "class" : "classes"} only in head`
-            : "No head-only classes"
+          hadPortMirror
+            ? "Normalized across build origins"
+            : newOnlyList.length > 0
+              ? `${newOnlyList.length} ${newOnlyList.length === 1 ? "class" : "classes"} only in head`
+              : "No head-only classes"
         )
       )
     ),
+    !classRows.length
+      ? h("div", { class: "attr-foot", style: "border-top:0" }, "Steady post-GC class footprint: no object class shifted retained memory by ≥ 4 KB between base and head.")
+      : null,
     classRows.length
       ? h("div", { class: "attr-table" },
           h("div", { class: "attr-row hd" },
@@ -3748,7 +3868,7 @@ function renderRigFooter(r, s, imp) {
       )
     : null;
 
-  const infoNotes = [...(r.warnings || []), ...(s?.warnings || [])].filter((w) => w.level === "info");
+  const infoNotes = dedupWarnings([...(r.warnings || []), ...(s?.warnings || [])]).filter((w) => w.level === "info");
 
   const baseVar = (r.variants || []).find((v) => v.role === "base");
   const headVar = (r.variants || []).find((v) => v.role === "head");
@@ -3781,7 +3901,7 @@ function renderRigFooter(r, s, imp) {
 }
 
 /* ---------- Single-Sided Attribution Panels (`strobe report recording <rec_id>`) ---------- */
-function renderSingleMainThreadPhases(v) {
+function renderSingleMainThreadPhases(v, perturbed) {
   const sc = v["main.script"], st = v["main.style"], ly = v["main.layout"], wk = v["main.work"];
   if (!finite(sc) && !finite(st) && !finite(ly)) return null;
   const sScript = finite(sc) ? sc : 0;
@@ -3803,11 +3923,17 @@ function renderSingleMainThreadPhases(v) {
     h("div", { class: "card-hd" },
       h("div", { class: "card-hd-left" },
         h("h2", { class: "sec-title" }, "Where main-thread work went"),
-        h("span", { class: "sec-sub" }, `${fmtVal(tot, "ms")} total main-thread task work`)
+        h("span", { class: "sec-sub" }, `${fmtVal(tot, "ms")} total main-thread task work${perturbed ? " · perturbed by attribution profilers" : ""}`)
       )
     ),
+    perturbed
+      ? h("div", { class: "perturbed-note", style: "border-top:0;border-bottom:1px solid var(--hairline)" },
+          h("b", {}, "Perturbed timing: "),
+          "Profilers ran during this recording, so main-thread phase durations reflect the profiled target rather than unprofiled speed."
+        )
+      : null,
     h("div", { class: "card-bd" },
-      h("div", { class: "phase-bars" },
+      h("div", { class: "phase-bars", style: perturbed ? "opacity:0.75" : "" },
         h("div", { class: "phase-bar-row" },
           h("span", { class: "missed-lbl" }, "Work"),
           h("div", { class: "phase-track" },
@@ -3816,14 +3942,14 @@ function renderSingleMainThreadPhases(v) {
             sLayout > 0 ? h("i", { class: "phase-seg ph-layout", style: `width:${(sLayout / tot) * 100}%` }) : null,
             sOther > 0 ? h("i", { class: "phase-seg ph-other", style: `width:${(sOther / tot) * 100}%` }) : null
           ),
-          h("span", { class: "mono", style: "text-align:right;font-size:12px" }, fmtVal(tot, "ms"))
+          h("span", { class: "mono", style: `text-align:right;font-size:12px;${perturbed ? "color:var(--ink-3)" : ""}` }, fmtVal(tot, "ms"))
         )
       ),
       h("div", { class: "phase-table" },
         items.map(([name, cls, ms, note]) => h("div", { class: "phase-trow", style: "grid-template-columns:minmax(140px,1.4fr) minmax(80px,1fr) 84px 68px" },
           h("span", { style: "font-weight:500;display:flex;align-items:center" }, h("i", { class: `ph-dot ${cls}` }), name),
           h("span", { class: "mono", style: "color:var(--ink-3);font-size:11.5px" }, note || ""),
-          h("span", { class: "mono", style: "text-align:right;font-weight:500" }, fmtVal(ms, "ms")),
+          h("span", { class: "mono", style: `text-align:right;font-weight:${perturbed ? 400 : 500};${perturbed ? "color:var(--ink-3)" : ""}` }, fmtVal(ms, "ms")),
           h("span", { class: "mono ph-ci-col", style: "text-align:right;color:var(--ink-3);font-size:11.5px" }, `${Math.round((ms / tot) * 100)}%`)
         ))
       )
@@ -3846,7 +3972,7 @@ function renderSingleCpuHotspots(att) {
   const maxMs = Math.max(...activeRows.map((r) => rowMs(r) / runs), 0.1);
   const activeTotalMs = list.filter((r) => r.name !== "(idle)").reduce((s, r) => s + rowMs(r) / runs, 0) || 1;
 
-  const mappedPct = att.mapped_samples && att.samples ? ` · ${Math.round((att.mapped_samples / att.samples) * 100)}% source-mapped` : "";
+  const mappedPct = att.mapped_samples ? " · source-mapped" : "";
   const sysMap = new Map(att.rows.map((x) => [x.name, x]));
   const prog = sysMap.get("(program)"), gc = sysMap.get("(garbage collector)");
 
@@ -4142,7 +4268,7 @@ function renderMemoryRecording(m) {
     )
   );
 
-  // Derive plain-English "Is it leaking?" verdict
+  // Measured facts only (Rule 1: strobe defines no statistical verdict on a 3-snapshot recording)
   const c0 = census[0], c2 = census[census.length - 1];
   const spanMs = c0 && c2 && c2.at_ms > c0.at_ms ? c2.at_ms - c0.at_ms : (m.duration_ms || NaN);
   const heapStartBytes = finite(c0?.js_heap_bytes) ? c0.js_heap_bytes : NaN;
@@ -4160,20 +4286,6 @@ function renderMemoryRecording(m) {
   const leadSuspect = pickLeadSuspectClass(leaks?.classes);
   const leadPath = leadSuspect?.largest?.path ? compactRetainerPath(leadSuspect.largest.path) : null;
 
-  const strongLeak = (finite(suspectRetBytes) && suspectRetBytes >= 1024 * 1024 && finite(heapGrowth) && heapGrowth >= 2)
-    || (finite(suspectRetBytes) && suspectRetBytes >= 2 * 1024 * 1024)
-    || detCount >= 20;
-  const moderateLeak = !strongLeak && (
-    (finite(suspectRetBytes) && suspectRetBytes >= 128 * 1024)
-    || (finite(heapGrowth) && heapGrowth >= 1.0)
-    || (finite(domGrowth) && domGrowth >= 25)
-    || detCount > 0
-  );
-
-  let pillTone = "win";
-  let pillText = "No obvious leak detected";
-  let headline = "Post-GC memory held steady";
-
   const fmtSignedRate = (val, unit) => {
     if (!finite(val)) return "—";
     const sign = val > 0.05 ? "+" : val < -0.05 ? "−" : "";
@@ -4186,55 +4298,59 @@ function renderMemoryRecording(m) {
     return `${sign}${abs >= 10 ? Math.round(abs).toLocaleString("en-US") : abs.toFixed(1)}/min`;
   };
 
-  if (strongLeak || moderateLeak) {
-    pillTone = strongLeak ? "loss" : "warn";
-    pillText = strongLeak ? "Likely memory leak · Surviving allocations" : "Potential retention · Check if cache or leak";
-    if (leadSuspect && finite(heapGrowth) && heapGrowth > 0.5) {
-      headline = `JS heap grew ${fmtSignedRate(heapGrowth, "MB/min")} — ${fmtCount(leadSuspect.count)} ${leadSuspect.class} objects stayed alive`;
-    } else if (leadSuspect) {
-      headline = `${fmtBytes(suspectRetBytes)} of first-half allocations stayed alive, led by ${leadSuspect.class}`;
-    } else if (finite(heapGrowth) && heapGrowth > 0.5) {
-      headline = `Post-GC JS heap grew ${fmtSignedRate(heapGrowth, "MB/min")}`;
-    } else {
-      headline = `DOM grew ${fmtSignedRate(domGrowth, "count/min")} (${fmtCount(domStart)} → ${fmtCount(domEnd)} nodes)`;
-    }
+  const snapCount = census.length || 3;
+  const pillText = `Memory recording · ${snapCount} snapshots`;
+
+  let headline;
+  if (leadSuspect && leadSuspect.count > 0) {
+    headline = `${fmtCount(leadSuspect.count)} ${leadSuspect.class} ${leadSuspect.count === 1 ? "object" : "objects"} from the first half ${leadSuspect.count === 1 ? "was" : "were"} still alive at the end`;
+  } else if (finite(suspectCount) && suspectCount > 0) {
+    headline = `${fmtCount(suspectCount)} ${suspectCount === 1 ? "object" : "objects"} (${fmtBytes(suspectRetBytes)}) from the first half remained alive at the end`;
+  } else if (finite(suspectCount) && suspectCount === 0) {
+    headline = "No objects allocated in the first half were still alive at the end";
+  } else if (finite(heapStartBytes) && finite(heapEndBytes)) {
+    headline = `JS heap after GC: ${fmtBytes(heapStartBytes)} → ${fmtBytes(heapEndBytes)} (${fmtSignedRate(heapGrowth, "MB/min")})`;
+  } else {
+    headline = m.target || m.id || "Memory recording";
   }
 
-  // Plain-English narrative for an entry-level engineer
+  // Plain-English factual summary for an entry-level engineer
   const proseParts = [];
   if (finite(heapStartBytes) && finite(heapEndBytes)) {
     proseParts.push(
-      "Over ", h("strong", {}, fmtDuration(spanMs)),
-      ` (${m.target || m.id}), post-GC JS heap moved from `,
-      h("strong", {}, fmtBytes(heapStartBytes)), " to ", h("strong", {}, fmtBytes(heapEndBytes)),
+      "JS heap after GC: ",
+      h("strong", {}, `${fmtBytes(heapStartBytes)} → ${fmtBytes(heapEndBytes)}`),
       finite(heapGrowth) ? ` (${fmtSignedRate(heapGrowth, "MB/min")})` : "",
       finite(domStart) && finite(domEnd)
-        ? [", and DOM nodes moved from ", h("strong", {}, fmtCount(domStart)), " to ", h("strong", {}, fmtCount(domEnd)), finite(domGrowth) ? ` (${fmtSignedRate(domGrowth, "count/min")}). ` : ". "]
-        : ". "
+        ? [" · DOM nodes: ", h("strong", {}, `${fmtCount(domStart)} → ${fmtCount(domEnd)}`), finite(domGrowth) ? ` (${fmtSignedRate(domGrowth, "count/min")})` : ""]
+        : "",
+      finite(spanMs) ? ` over ${fmtDuration(spanMs)}. ` : ". "
     );
   }
-  if (finite(suspectRetBytes) && suspectRetBytes > 0) {
+  if (finite(suspectCount) && suspectCount > 0) {
     proseParts.push(
-      finite(suspectCount) ? [h("strong", {}, fmtCount(suspectCount)), " objects ("] : "Objects (",
+      "Across all classes, ",
+      h("strong", {}, `${fmtCount(suspectCount)} objects`),
+      " (",
       h("strong", {}, `${fmtBytes(suspectRetBytes)} retained`),
-      ") allocated during the first half (S0 → S1) were still alive after garbage collection at the end (S2)",
+      ") allocated between S0 and S1 were still alive after garbage collection at S2",
       leadSuspect
         ? [
             ", led by ", h("strong", {}, leadSuspect.class),
             ` (${fmtBytes(leadSuspect.retained_size)} across ${fmtCount(leadSuspect.count)} instances)`,
-            leadPath ? [" kept alive via ", h("code", { class: "mono", style: "font-size:12.5px" }, leadPath), "."] : ".",
+            leadPath ? [" reachable via ", h("code", { class: "mono", style: "font-size:12.5px" }, leadPath), "."] : ".",
           ]
         : "."
     );
-  } else if (!strongLeak && !moderateLeak) {
-    proseParts.push("Objects allocated in the first half were reclaimed by garbage collection before the recording ended.");
+  } else if (finite(suspectCount) && suspectCount === 0) {
+    proseParts.push("Every object allocated between S0 (start) and S1 (middle) was collected before S2 (end).");
   }
 
   const recId = m.id || "<rec_id>";
   const durSec = Math.max(30, Math.round(((m.duration_ms || 6000) * 4) / 1000));
   const cmds = [
-    ["Confirm over a longer window to separate bounded caches from unbounded leaks:", `strobe record ${quoteArg(m.target || "<target>")} --probes memory --for ${durSec}s`],
-    ["Query leak suspects from the CLI:", `strobe query ${recId} leaks`],
+    ["Record over a longer window to observe how post-GC heap and surviving objects change over time:", `strobe record ${quoteArg(m.target || "<target>")} --probes memory --for ${durSec}s`],
+    ["Query surviving first-half objects from the CLI:", `strobe query ${recId} leaks`],
     heap ? ["Query full S2 heap snapshot:", `strobe query ${recId} heap`] : null,
   ].filter(Boolean);
 
@@ -4247,32 +4363,35 @@ function renderMemoryRecording(m) {
   const shell = h("div", { class: "shell" });
   appendKids(shell, [
     topbar,
-    // 1. Leak Verdict Hero
+    // 1. Factual Memory Summary Hero
     h("section", { class: "card-surface" },
       h("div", { class: "hero-body" },
         h("div", { class: "hero-header" },
           h("div", { class: "eyebrow-row" },
-            h("span", { class: `status-pill ${pillTone}` }, pillText),
-            h("span", { class: "eyebrow-meta" }, `Memory leak hunt · ${fmtDuration(spanMs)} · S0 → S1 → S2 post-GC snapshots`)
+            h("span", { class: "status-pill" }, pillText),
+            h("span", { class: "eyebrow-meta" },
+              m.target ? [h("span", { class: "mono", style: "text-transform:none;font-size:12px" }, m.target), " · "] : null,
+              `${fmtDuration(spanMs)} · S0 → S1 → S2 post-GC snapshots`
+            )
           ),
           h("h1", { class: "hero-headline" }, headline),
           h("p", { class: "hero-prose" }, proseParts)
         ),
         h("div", { class: "leak-metrics-grid" },
           h("div", { class: "leak-mcol" },
-            h("span", { class: "leak-mk" }, "JS heap growth"),
-            h("span", { class: `leak-mv ${heapGrowth > 2 ? pillTone : ""}` }, fmtSignedRate(heapGrowth, "MB/min")),
-            h("span", { class: "leak-msub" }, finite(heapStartBytes) && finite(heapEndBytes) ? `${fmtBytes(heapStartBytes)} → ${fmtBytes(heapEndBytes)} post-GC` : `End: ${fmtVal(g("js.heap.used"), "MB")}`)
+            h("span", { class: "leak-mk" }, "JS heap after GC"),
+            h("span", { class: "leak-mv" }, fmtSignedRate(heapGrowth, "MB/min")),
+            h("span", { class: "leak-msub" }, finite(heapStartBytes) && finite(heapEndBytes) ? `${fmtBytes(heapStartBytes)} → ${fmtBytes(heapEndBytes)}` : `End: ${fmtVal(g("js.heap.used"), "MB")}`)
           ),
           h("div", { class: "leak-mcol" },
-            h("span", { class: "leak-mk" }, "DOM node growth"),
-            h("span", { class: `leak-mv ${domGrowth >= 50 ? "warn" : ""}` }, fmtSignedRate(domGrowth, "count/min")),
-            h("span", { class: "leak-msub" }, finite(domStart) && finite(domEnd) ? `${fmtCount(domStart)} → ${fmtCount(domEnd)} DOM nodes` : `${fmtCount(domEnd)} DOM nodes`)
+            h("span", { class: "leak-mk" }, "DOM nodes"),
+            h("span", { class: "leak-mv" }, fmtSignedRate(domGrowth, "count/min")),
+            h("span", { class: "leak-msub" }, finite(domStart) && finite(domEnd) ? `${fmtCount(domStart)} → ${fmtCount(domEnd)} nodes` : `${fmtCount(domEnd)} nodes`)
           ),
           h("div", { class: "leak-mcol" },
-            h("span", { class: "leak-mk" }, "Surviving S0→S1 suspects"),
-            h("span", { class: `leak-mv ${suspectRetBytes >= 256 * 1024 ? pillTone : ""}` }, fmtBytes(suspectRetBytes)),
-            h("span", { class: "leak-msub" }, finite(suspectCount) ? `${fmtCount(suspectCount)} objects still alive at S2` : "Allocated in 1st half, alive at end")
+            h("span", { class: "leak-mk" }, "S0→S1 alive at S2"),
+            h("span", { class: "leak-mv" }, fmtBytes(suspectRetBytes)),
+            h("span", { class: "leak-msub" }, finite(suspectCount) ? `${fmtCount(suspectCount)} surviving objects` : "Allocated in 1st half, alive at end")
           ),
           h("div", { class: "leak-mcol" },
             h("span", { class: "leak-mk" }, "Initial app RAM (S0)"),
@@ -4282,14 +4401,12 @@ function renderMemoryRecording(m) {
         ),
         h("div", { class: "coarse-note" },
           h("b", {}, "Three-point caveat: "),
-          "Three post-GC checkpoints (start S0, middle S1, end S2) are a coarse directional filter — lazy caches warmed in the first half or V8 snapshot serialization overhead can shift short runs. Verify steady growth with a longer ",
-          h("code", { class: "mono" }, "--for"),
-          " duration (a multi-run benchmark slope mode is planned)."
+          "Three post-GC checkpoints (start S0, middle S1, end S2) are a coarse measure — lazy caches populated in the first half or V8 snapshot serialization overhead can shift short runs. A multi-run benchmark mode with a slope over many runs is planned."
         )
       )
     ),
     // 2. Leak Suspects Table
-    leaks ? renderLeakSuspectsSection(leaks, pillTone) : null,
+    leaks ? renderLeakSuspectsSection(leaks) : null,
     // 3. Live Heap at S2
     heap ? renderLiveHeapSingleSection(heap, "Live heap at end (S2 post-GC snapshot)") : null,
     // 4. Three-point Census Chart
@@ -4328,14 +4445,14 @@ function renderMemoryRecording(m) {
   app.replaceChildren(shell);
 }
 
-function renderLeakSuspectsSection(leaks, tone) {
+function renderLeakSuspectsSection(leaks) {
   const classes = (leaks.classes || []).slice(0, 10);
   const maxRet = Math.max(...classes.map((c) => c.retained_size || 0), leaks.retained_size || 1);
 
   return h("section", { class: "card-surface", id: "leak-suspects" },
     h("div", { class: "card-hd" },
       h("div", { class: "card-hd-left" },
-        h("h2", { class: "sec-title" }, "Leak suspects (allocated S0 → S1, still alive at S2)"),
+        h("h2", { class: "sec-title" }, "First-half allocations still alive at end (S0 → S1 → S2)"),
         h("span", { class: "sec-sub" },
           `${fmtCount(leaks.count)} surviving objects · ${fmtBytes(leaks.retained_size)} retained without overlap · click any row for full GC root path`
         )
@@ -4377,12 +4494,9 @@ function renderLeakSuspectsSection(leaks, tone) {
                   : h("div", { class: "fn-caller-hint" }, `Self: ${fmtBytes(c.self_size)}`)
               ),
               h("div", { class: "share-track" },
-                h("div", { class: "share-fill" + (tone === "loss" || tone === "warn" ? " warn" : ""), style: `width:${pct}%` })
+                h("div", { class: "share-fill", style: `width:${pct}%` })
               ),
-              h("span", {
-                class: "mono",
-                style: `text-align:right;font-weight:600;color:${idx === 0 && (tone === "loss" || tone === "warn") ? "var(--warn-ink)" : "var(--ink)"}`,
-              }, fmtBytes(c.retained_size)),
+              h("span", { class: "mono", style: "text-align:right;font-weight:600;color:var(--ink)" }, fmtBytes(c.retained_size)),
               h("span", { class: "mono col-share", style: "text-align:right;color:var(--ink-3);font-size:11.5px" }, fmtCount(c.count))
             );
             return isOpen ? [rowEl, renderRetainerDrawer(path, null, c.location, c.allocations)] : [rowEl];
@@ -4427,9 +4541,9 @@ function renderCensusSection(census) {
         h("b", {}, "Why S1 can spike & why OS RAM is S0-only: "),
         "Taking snapshot S0 inside Chromium temporarily allocates inspector metadata in the renderer process (so OS private RAM — ",
         finite(census[0]?.private_bytes) ? fmtBytes(census[0].private_bytes) + " at S0" : "recorded at S0",
-        " — is intentionally omitted at S1/S2). Judge leaks primarily by ",
+        " — is intentionally omitted at S1/S2). See ",
         h("b", {}, "S0 → S1 objects still alive at S2"),
-        " above rather than 3-point curve shape alone."
+        " above for exact object-level persistence across snapshots."
       )
     )
   );
@@ -4526,32 +4640,35 @@ function renderRecording(m) {
     )
   );
 
+  const perturbed = m.timing === "perturbed";
+  const isTimingKey = (k) => /^(frames|main|cpu|interaction|scroll|run|layout|style)\./.test(k);
+
   const tiles = [
     finite(g("frames.n")) || finite(g("frames.presented.count"))
-      ? ["Presented frames", fmtVal(finite(g("frames.n")) ? g("frames.n") : g("frames.presented.count"), "count"), finite(hz) ? `${Math.round(hz)} Hz display` : null]
+      ? ["Presented frames", fmtVal(finite(g("frames.n")) ? g("frames.n") : g("frames.presented.count"), "count"), finite(hz) ? `${Math.round(hz)} Hz display` : null, true]
       : null,
     finite(g("frames.dropped.pct"))
-      ? ["Dropped refreshes", fmtVal(g("frames.dropped.pct"), "%"), finite(g("frames.dropped")) ? `${fmtVal(g("frames.dropped"), "count")} dropped` : null]
+      ? ["Dropped refreshes", fmtVal(g("frames.dropped.pct"), "%"), finite(g("frames.dropped")) ? `${fmtVal(g("frames.dropped"), "count")} dropped` : null, true]
       : null,
     finite(g("frames.interval.p95"))
-      ? ["Frame gap p95", fmtVal(g("frames.interval.p95"), "ms"), finite(vs) ? `${(g("frames.interval.p95") / vs).toFixed(1)}× vsync` : null]
+      ? ["Frame gap p95", fmtVal(g("frames.interval.p95"), "ms"), finite(vs) ? `${(g("frames.interval.p95") / vs).toFixed(1)}× vsync` : null, true]
       : null,
     finite(g("main.busy"))
-      ? ["Main-thread busy", fmtVal(g("main.busy"), "%"), finite(g("main.tasks.long")) ? `${fmtVal(g("main.tasks.long"), "count")} long tasks` : null]
+      ? ["Main-thread busy", fmtVal(g("main.busy"), "%"), finite(g("main.tasks.long")) ? `${fmtVal(g("main.tasks.long"), "count")} long tasks` : null, true]
       : null,
     finite(g("main.work"))
-      ? ["Main-thread work", fmtVal(g("main.work"), "ms"), finite(g("main.script")) ? `script ${fmtVal(g("main.script"), "ms")}` : null]
+      ? ["Main-thread work", fmtVal(g("main.work"), "ms"), finite(g("main.script")) ? `script ${fmtVal(g("main.script"), "ms")}` : null, true]
       : null,
     finite(g("js.heap.used"))
-      ? ["JS heap used", fmtVal(g("js.heap.used"), "MB"), finite(g("memory.app.private")) ? `${fmtVal(g("memory.app.private"), "MB")} app RAM` : null]
+      ? ["JS heap used", fmtVal(g("js.heap.used"), "MB"), finite(g("memory.app.private")) ? `${fmtVal(g("memory.app.private"), "MB")} app RAM` : null, false]
       : finite(att?.heap?.self_size)
-        ? ["Live JS heap", fmtBytes(att.heap.self_size), `${fmtCount(att.heap.nodes)} objects`]
+        ? ["Live JS heap", fmtBytes(att.heap.self_size), `${fmtCount(att.heap.nodes)} objects`, false]
         : null,
     finite(g("cpu.app.total"))
-      ? ["Total app CPU", fmtVal(g("cpu.app.total"), "%"), `${(g("cpu.app.total") / 100).toFixed(2)} cores`]
+      ? ["Total app CPU", fmtVal(g("cpu.app.total"), "%"), `${(g("cpu.app.total") / 100).toFixed(2)} cores`, true]
       : null,
     finite(g("interaction.p95"))
-      ? ["Input → screen p95", fmtVal(g("interaction.p95"), "ms"), "discrete input"]
+      ? ["Input → screen p95", fmtVal(g("interaction.p95"), "ms"), "discrete input", true]
       : null,
   ].filter(Boolean);
 
@@ -4572,21 +4689,35 @@ function renderRecording(m) {
     ["Raw Perfetto SQL query", `strobe query ${recId} sql "select name, count(*) n from slice group by 1 order by n desc limit 20"`],
   ].filter(Boolean);
 
-  const phaseSec = renderSingleMainThreadPhases(v);
+  const phaseSec = renderSingleMainThreadPhases(v, perturbed);
   const cpuSec = renderSingleCpuHotspots(att);
   const laySec = renderSingleForcedLayout(att?.layout, att?.runs);
   const allocSec = renderSingleAllocGc(att);
   const heapSec = renderLiveHeapSingleSection(att?.heap);
   const hasDeepDive = !!(phaseSec || cpuSec || laySec || allocSec || heapSec);
 
-  const valuesBody = h("div", { class: "rec-kv-cols" },
-    [...groups.entries()].map(([area, keys]) => h("div", { class: "rec-kv-grp" },
-      h("div", { class: "rig-hd", style: "margin-bottom:4px" }, area),
-      keys.map((k) => h("div", { class: "rec-kv-row" },
-        h("span", { class: "mono", style: "color:var(--ink-2)" }, k),
-        h("span", { class: "mono", style: "font-weight:500" }, fmtVal(v[k], unitOf(k)))
+  const valuesBody = h("div", {},
+    perturbed
+      ? h("div", { class: "perturbed-note", style: "margin:-20px -24px 16px;border-top:0;border-bottom:1px solid var(--hairline)" },
+          h("b", {}, "Perturbed timing: "),
+          "Profilers ran during this recording; frame, main-thread, and CPU counters below describe the profiled target rather than unprofiled speed."
+        )
+      : null,
+    h("div", { class: "rec-kv-cols" },
+      [...groups.entries()].map(([area, keys]) => h("div", { class: "rec-kv-grp" },
+        h("div", { class: "rig-hd", style: "margin-bottom:4px" }, area),
+        keys.map((k) => {
+          const tPert = perturbed && isTimingKey(k);
+          return h("div", { class: "rec-kv-row" },
+            h("span", { class: "mono", style: `color:${tPert ? "var(--ink-3)" : "var(--ink-2)"}` },
+              k,
+              tPert ? h("span", { class: "perturbed-tag" }, " · perturbed") : null
+            ),
+            h("span", { class: "mono", style: `font-weight:${tPert ? 400 : 500};color:${tPert ? "var(--ink-3)" : "var(--ink)"}` }, fmtVal(v[k], unitOf(k)))
+          );
+        })
       ))
-    ))
+    )
   );
 
   const valuesSection = !groups.size
@@ -4596,7 +4727,7 @@ function renderRecording(m) {
           h("summary", {},
             h("span", { class: "chev" }, makeChevSvg()),
             h("span", { class: "sec-title" }, `All ${Object.keys(v).length} recorded metric values`),
-            h("span", { class: "sec-sub" }, "Raw timing, memory, GPU, and frame counters")
+            h("span", { class: "sec-sub" }, perturbed ? "Timing counters marked perturbed (profilers attached)" : "Raw timing, memory, GPU, and frame counters")
           ),
           h("div", { class: "card-bd" }, valuesBody)
         )
@@ -4635,13 +4766,25 @@ function renderRecording(m) {
           h("h1", { class: "hero-headline", style: "font-size:26px;line-height:34px;overflow-wrap:anywhere" }, m.target || recId)
         )
       ),
+      perturbed && tiles.some(([, , , isT]) => isT)
+        ? h("div", { class: "perturbed-note" },
+            h("b", {}, "Perturbed timing: "),
+            "Attribution profilers ran during this recording, so frame, main-thread, and CPU numbers describe the profiled target rather than unprofiled speed."
+          )
+        : null,
       tiles.length
         ? h("div", { class: "rec-tiles" },
-            tiles.map(([k, val, sub]) => h("div", { class: "rec-tile" },
-              h("span", { class: "stat-k" }, k),
-              h("span", { class: "pil-val" }, val),
-              sub ? h("span", { class: "stat-sub" }, sub) : null
-            ))
+            tiles.map(([k, val, sub, isT]) => {
+              const tPert = perturbed && isT;
+              return h("div", { class: "rec-tile" },
+                h("span", { class: "stat-k" },
+                  k,
+                  tPert ? h("span", { class: "perturbed-tag" }, " · perturbed") : null
+                ),
+                h("span", { class: "pil-val" + (tPert ? " perturbed" : "") }, val),
+                sub ? h("span", { class: "stat-sub" }, sub) : null
+              );
+            })
           )
         : null
     ),

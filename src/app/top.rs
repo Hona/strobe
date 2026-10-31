@@ -6,7 +6,7 @@ use crate::cli::{Args, duration_ms};
 use crate::host::{self, Topology};
 use crate::model::{Error, Result};
 use crate::probe::gpu::DeviceSample;
-use crate::probe::os::{Probe, Sampler, Samples, Summary, Tick};
+use crate::probe::os::{Freq, Probe, Sampler, Samples, Summary, Tick};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap};
@@ -45,7 +45,7 @@ pub fn run(args: &Args) -> Result<Output> {
             "frame": frame,
             "target": summary.as_ref().map(|s| serde_json::json!({
                 "summary": s,
-                "sampler": samples.as_ref().map(|x| serde_json::json!({ "interval_ms": x.interval_ms, "ticks": x.ticks.len(), "cpu_ms": x.cpu_ms, "setup_cpu_ms": x.setup_cpu_ms })),
+                "sampler": samples.as_ref().map(|x| serde_json::json!({ "interval_ms": x.interval_ms, "ticks": x.ticks.len(), "cpu_ms": x.cpu_ms, "setup_cpu_ms": x.setup_cpu_ms, "tree_refresh_ms": x.tree_refresh_ms })),
             })),
         });
         return Ok(Output::new(text, json));
@@ -78,8 +78,13 @@ pub fn run(args: &Args) -> Result<Output> {
 
 struct Top {
     probe: Probe,
-    prev: HashMap<u32, u64>,
+    /// PID → (cpu_ns, cycles) at the last frame.
+    prev: HashMap<u32, (u64, u64)>,
     prev_t: u64,
+    /// (TSC, QPC ns) at start, to convert cycles to time.
+    tsc0: Option<(u64, u64)>,
+    /// The last frequency reading (PDH, about once a second).
+    freq: Option<Freq>,
     target: Option<u32>,
     limit: usize,
     sort: String,
@@ -102,12 +107,13 @@ struct Frame {
     total: Option<ProcRow>,
 }
 
+/// Busy from idle cycles over the frame; utility and frequency from the last PDH reading.
 #[derive(Serialize)]
 struct CoreRow {
     cpu: usize,
     busy_pct: f64,
-    util_pct: f64,
-    perf_pct: f64,
+    util_pct: Option<f64>,
+    perf_pct: Option<f64>,
     mhz: Option<f64>,
 }
 
@@ -118,7 +124,7 @@ struct GroupRow {
     l3_mb: u32,
     vcache: bool,
     busy_pct: f64,
-    perf_pct: f64,
+    perf_pct: Option<f64>,
     mhz: Option<f64>,
 }
 
@@ -142,21 +148,32 @@ struct ProcRow {
     /// The busiest engine type on any adapter (Task Manager's GPU column).
     gpu_pct: f64,
     gpu_engine: String,
-    vram_dedicated_mb: f64,
-    vram_shared_mb: f64,
+    /// Committed by the process (D3DKMT segments); None when it cannot be opened or was not read.
+    vram_dedicated_mb: Option<f64>,
+    vram_shared_mb: Option<f64>,
 }
 
 impl Top {
     fn new(target: Option<u32>, limit: usize, sort: String) -> Top {
-        let probe = Probe::new();
-        let prev = host::all_processes().into_iter().map(|p| (p.pid, p.cpu_ns)).collect();
-        Top { probe, prev, prev_t: host::now_ns(), target, limit, sort, topo: host::topology(), cpu_name: host::env().cpu }
+        let probe = Probe::new(true, &[]);
+        let prev = host::all_processes().into_iter().map(|p| (p.pid, (p.cpu_ns, p.cycles))).collect();
+        let t = host::now_ns();
+        let tsc0 = host::tsc().map(|c| (c, t));
+        Top { probe, prev, prev_t: t, tsc0, freq: None, target, limit, sort, topo: host::topology(), cpu_name: host::env().cpu }
     }
 
     fn frame(&mut self) -> Frame {
-        let tick = self.probe.tick(&|_| true);
+        let tick = self.probe.tick(&[]);
+        if tick.freq.is_some() {
+            self.freq = tick.freq.clone();
+        }
         let procs = host::all_processes();
         let t = host::now_ns();
+        // Cycle counts are exact; kernel + user times move in 15.6 ms clock ticks.
+        let tsc_hz = match (self.tsc0, host::tsc()) {
+            (Some((c0, t0)), Some(c1)) if t > t0 => Some((c1 - c0) as f64 / ((t - t0) as f64 / 1e9)),
+            _ => None,
+        };
         let dt = t.saturating_sub(self.prev_t).max(1) as f64;
         self.prev_t = t;
         let tree = self.target.map(|pid| {
@@ -164,27 +181,26 @@ impl Top {
             p.sort_unstable();
             p
         });
-        let engines = self.probe.engines();
+        let engines = self.probe.engines.clone();
         let mut gpu: HashMap<u32, HashMap<(u16, u16), f64>> = HashMap::new();
         for e in &tick.gpu {
             *gpu.entry(e.pid).or_default().entry((e.adapter, e.engine)).or_default() += e.pct as f64;
-        }
-        let mut vram: HashMap<u32, (u64, u64)> = HashMap::new();
-        for m in &tick.vram {
-            let v = vram.entry(m.pid).or_default();
-            v.0 += m.dedicated;
-            v.1 += m.shared;
         }
         let mut rows: Vec<ProcRow> = procs
             .iter()
             .filter(|p| p.pid != 0 && tree.as_ref().is_none_or(|t| t.binary_search(&p.pid).is_ok()))
             .map(|p| {
-                let cpu = self.prev.get(&p.pid).map(|&c0| p.cpu_ns.saturating_sub(c0) as f64 / dt * 100.0).unwrap_or(0.0);
+                let cpu = match (self.prev.get(&p.pid), tsc_hz) {
+                    (Some(&(_, k0)), Some(hz)) if p.cycles > 0 => p.cycles.saturating_sub(k0) as f64 / hz * 1e9 / dt * 100.0,
+                    (Some(&(c0, _)), _) => p.cpu_ns.saturating_sub(c0) as f64 / dt * 100.0,
+                    _ => 0.0,
+                };
                 let use_ = gpu.get(&p.pid);
                 let engine_name = |e: u16| engines.get(e as usize).map(String::as_str).unwrap_or("");
                 let gpu_3d = use_.map(|u| u.iter().filter(|((_, e), _)| engine_name(*e) == "3D").map(|(_, &v)| v).fold(0.0, f64::max)).unwrap_or(0.0);
                 let busiest = use_.and_then(|u| u.iter().max_by(|a, b| a.1.total_cmp(b.1)));
-                let (d, s) = vram.get(&p.pid).copied().unwrap_or_default();
+                // Without a GPU context a process has no GPU memory; others are read below.
+                let present = self.probe.present.binary_search(&p.pid).is_ok();
                 ProcRow {
                     pid: p.pid,
                     parent: p.parent,
@@ -194,21 +210,42 @@ impl Top {
                     gpu_3d_pct: gpu_3d,
                     gpu_pct: busiest.map(|b| *b.1).unwrap_or(0.0),
                     gpu_engine: busiest.map(|b| engine_name(b.0.1).to_string()).unwrap_or_default(),
-                    vram_dedicated_mb: d as f64 / MB,
-                    vram_shared_mb: s as f64 / MB,
+                    vram_dedicated_mb: (!present).then_some(0.0),
+                    vram_shared_mb: (!present).then_some(0.0),
                 }
             })
             .collect();
-        self.prev = procs.iter().map(|p| (p.pid, p.cpu_ns)).collect();
+        self.prev = procs.iter().map(|p| (p.pid, (p.cpu_ns, p.cycles))).collect();
         let key = |r: &ProcRow| match self.sort.as_str() {
             "gpu" => r.gpu_pct,
-            "vram" => r.vram_dedicated_mb,
+            "vram" => r.vram_dedicated_mb.unwrap_or(-1.0),
             "mem" => r.private_mb,
             _ => r.cpu_pct,
         };
         rows.sort_by(|a, b| key(b).total_cmp(&key(a)));
+        // GPU memory (D3DKMT) for the rows shown, or every row when sorting or totalling by it.
+        let wide = self.sort == "vram" || tree.is_some();
+        let mut want: Vec<u32> =
+            rows.iter().take(if wide { usize::MAX } else { self.limit }).filter(|r| r.vram_dedicated_mb.is_none()).map(|r| r.pid).collect();
+        want.sort_unstable();
+        let mut vram: HashMap<u32, (u64, u64)> = want.iter().map(|&p| (p, (0, 0))).collect();
+        for m in self.probe.vram(&want) {
+            let v = vram.entry(m.pid).or_default();
+            v.0 += m.dedicated;
+            v.1 += m.shared;
+        }
+        let unreadable = self.probe.gpu_unreadable().to_vec();
+        for r in rows.iter_mut().filter(|r| r.vram_dedicated_mb.is_none() && !unreadable.contains(&r.pid)) {
+            if let Some(&(d, s)) = vram.get(&r.pid) {
+                r.vram_dedicated_mb = Some(d as f64 / MB);
+                r.vram_shared_mb = Some(s as f64 / MB);
+            }
+        }
+        if self.sort == "vram" {
+            rows.sort_by(|a, b| key(b).total_cmp(&key(a)));
+        }
         let total = tree.is_some().then(|| ProcRow {
-            name: format!("tree of {}", self.target.unwrap_or(0)),
+            name: format!("total: {} processes", rows.len()),
             pid: self.target.unwrap_or(0),
             cpu_pct: rows.iter().map(|r| r.cpu_pct).sum(),
             private_mb: rows.iter().map(|r| r.private_mb).sum(),
@@ -217,9 +254,7 @@ impl Top {
             vram_shared_mb: rows.iter().map(|r| r.vram_shared_mb).sum(),
             ..ProcRow::default()
         });
-        if tree.is_none() {
-            rows.truncate(self.limit);
-        }
+        rows.truncate(self.limit);
         let mut adapters: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
         for e in &tick.gpu {
             let a = self.probe.adapters.get(e.adapter as usize).map(|a| a.name.clone()).unwrap_or_default();
@@ -231,12 +266,14 @@ impl Top {
     }
 
     fn cores(&self, tick: &Tick) -> (Vec<CoreRow>, Vec<GroupRow>) {
-        let mhz = |perf: f64| self.probe.nominal_mhz.map(|n| n * perf / 100.0);
+        let mhz = |perf: Option<f64>| self.probe.nominal_mhz.zip(perf).map(|(n, p)| n * p / 100.0);
+        let pick = |v: Option<&Vec<f32>>, i: usize| v.and_then(|v| v.get(i)).map(|&x| x as f64);
+        let (perf, util) = (self.freq.as_ref().map(|f| &f.perf), self.freq.as_ref().map(|f| &f.util));
         let cores: Vec<CoreRow> = tick
-            .cores
+            .busy
             .iter()
             .enumerate()
-            .map(|(i, c)| CoreRow { cpu: i, busy_pct: c.busy as f64, util_pct: c.util as f64, perf_pct: c.perf as f64, mhz: mhz(c.perf as f64) })
+            .map(|(i, &b)| CoreRow { cpu: i, busy_pct: b as f64, util_pct: pick(util, i), perf_pct: pick(perf, i), mhz: mhz(pick(perf, i)) })
             .collect();
         let vcache = self.topo.vcache().map(|g| g.mask);
         let mut groups: Vec<GroupRow> = self
@@ -246,7 +283,7 @@ impl Top {
             .enumerate()
             .map(|(i, g)| (format!("CCD{i}"), (0..64).filter(|b| g.mask & (1u64 << b) != 0).collect::<Vec<usize>>(), g.l3_mb, vcache == Some(g.mask)))
             .chain(std::iter::once(("CPUs".to_string(), Vec::new(), 0, false)))
-            .map(|(name, cpus, l3_mb, vcache)| GroupRow { name, cpus, l3_mb, vcache, busy_pct: 0.0, perf_pct: 0.0, mhz: None })
+            .map(|(name, cpus, l3_mb, vcache)| GroupRow { name, cpus, l3_mb, vcache, busy_pct: 0.0, perf_pct: None, mhz: None })
             .collect();
         if groups.len() == 1 {
             groups[0].cpus = (0..cores.len()).collect();
@@ -257,7 +294,7 @@ impl Top {
             g.cpus.retain(|&c| c < cores.len());
             let n = g.cpus.len().max(1) as f64;
             g.busy_pct = g.cpus.iter().map(|&c| cores[c].busy_pct).sum::<f64>() / n;
-            g.perf_pct = g.cpus.iter().map(|&c| cores[c].perf_pct).sum::<f64>() / n;
+            g.perf_pct = g.cpus.iter().map(|&c| cores[c].perf_pct).sum::<Option<f64>>().map(|s| s / n);
             g.mhz = mhz(g.perf_pct);
         }
         (cores, groups)
@@ -278,13 +315,13 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
     for g in &f.groups {
         let l3 = if g.l3_mb > 0 { format!("  {} MB L3", g.l3_mb) } else { String::new() };
         t += &format!(
-            "\n{}{}{}  {} CPUs  busy {:.0}%  freq {:.0}%{}\n",
+            "\n{}{}{}  {} CPUs  busy {:.0}%{}{}\n",
             g.name,
             l3,
             if g.vcache { "  V-Cache" } else { "" },
             g.cpus.len(),
             g.busy_pct,
-            g.perf_pct,
+            g.perf_pct.map(|p| format!("  freq {p:.0}%")).unwrap_or_default(),
             g.mhz.map(|m| format!(" ({:.2} GHz)", m / 1000.0)).unwrap_or_default()
         );
         for row in g.cpus.chunks(4) {
@@ -293,7 +330,8 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
                 .map(|&c| {
                     let core = &f.cores[c];
                     let fill = ((core.busy_pct / 100.0 * 8.0).round() as usize).min(8);
-                    format!("{c:>3} {}{} {:>3.0}% {:>3.0}%", "#".repeat(fill), ".".repeat(8 - fill), core.busy_pct, core.perf_pct)
+                    let perf = core.perf_pct.map(|p| format!("{p:>3.0}%")).unwrap_or_else(|| "   -".into());
+                    format!("{c:>3} {}{} {:>3.0}% {perf}", "#".repeat(fill), ".".repeat(8 - fill), core.busy_pct)
                 })
                 .collect();
             t += &format!("  {}\n", cells.join("    "));
@@ -340,9 +378,11 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
     );
     let line = |r: &ProcRow| {
         let name: String = r.name.chars().take(24).collect();
+        let engine: String = if r.gpu_pct >= 0.05 { r.gpu_engine.chars().take(12).collect() } else { String::new() };
+        let vram = r.vram_dedicated_mb.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "-".into());
         format!(
-            "{:>7}  {:<24} {:>6.1}% {:>7.1} MB {:>6.1}% {:>6.1}%  {:<12} {:>7.1} MB\n",
-            r.pid, name, r.cpu_pct, r.private_mb, r.gpu_3d_pct, r.gpu_pct, r.gpu_engine.chars().take(12).collect::<String>(), r.vram_dedicated_mb
+            "{:>7}  {:<24} {:>6.1}% {:>7.1} MB {:>6.1}% {:>6.1}%  {:<12} {:>10}\n",
+            r.pid, name, r.cpu_pct, r.private_mb, r.gpu_3d_pct, r.gpu_pct, engine, vram
         )
     };
     for r in &f.processes {
@@ -351,29 +391,34 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
     if let Some(total) = &f.total {
         t += &line(total);
     }
-    t += &format!("      (CPU: % of one core; 3D, GPU: % of one engine; sorted by {})\n", f.sort);
+    t += &format!(
+        "      (CPU: % of one core; 3D, GPU: % of one engine; VRAM: dedicated GPU memory it committed, - unreadable; sorted by {})\n",
+        f.sort
+    );
     if let Some((samples, s)) = target {
         let gpu = match (&s.gpu_adapter, s.gpu_3d_pct) {
             (Some(a), Some(v)) => format!("3D {v:.1}% on {a}"),
             (None, Some(_)) => "no GPU use".to_string(),
             _ => "GPU counters unavailable".to_string(),
         };
-        t += &format!(
-            "\ntarget tree  {} ticks over {:.1} s  {}  VRAM {:.1} MB dedicated, {:.1} MB shared\n",
-            s.ticks,
-            s.covered_ms / 1000.0,
-            gpu,
-            s.vram_dedicated_mb.unwrap_or(0.0),
-            s.vram_shared_mb.unwrap_or(0.0)
-        );
+        let vram = match (s.vram_dedicated_mb, s.vram_shared_mb) {
+            (Some(d), Some(sh)) => format!("  VRAM {d:.1} MB dedicated, {sh:.1} MB shared"),
+            _ => String::new(),
+        };
+        let unreadable = match s.gpu_unreadable_pids.len() {
+            0 => String::new(),
+            n => format!("  (GPU excludes {n} unreadable processes)"),
+        };
+        t += &format!("\ntarget tree  {} ticks over {:.1} s  {gpu}{vram}{unreadable}\n", s.ticks, s.covered_ms / 1000.0);
         let secs = s.covered_ms.max(1.0) / 1000.0;
-        t += &format!(
-            "sampler      every {} ms  {:.1} ms CPU ({:.3}% of one core), setup {:.1} ms\n",
-            samples.interval_ms,
-            samples.cpu_ms,
-            samples.cpu_ms / 10.0 / secs,
-            samples.setup_cpu_ms
-        );
+        if let (Some(cpu), Some(setup)) = (samples.cpu_ms, samples.setup_cpu_ms) {
+            t += &format!(
+                "sampler      every {} ms, tree every {:.1} s  {cpu:.1} ms CPU ({:.2}% of one core), setup {setup:.1} ms\n",
+                samples.interval_ms,
+                samples.tree_refresh_ms.unwrap_or(0.0) / 1000.0,
+                cpu / 10.0 / secs
+            );
+        }
     }
     t
 }

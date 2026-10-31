@@ -2,6 +2,7 @@
 
 use super::{Output, fmt, progress};
 use crate::cli::{Args, duration_ms};
+use crate::config;
 use crate::driver::Driver;
 use crate::host;
 use crate::metrics;
@@ -65,6 +66,7 @@ enum Kind {
     Dir,
     Git(String),
     Url(String),
+    App(String),
     Exe(PathBuf),
 }
 
@@ -86,6 +88,22 @@ impl Drop for Variant {
     }
 }
 
+/// Warmup runs at most, before strobe measures anyway and flags the block (`NotSteady`).
+const MAX_WARMUP: usize = 10;
+
+/// One run as the block saw it: wall time, the target's CPU (% of a core), renderer main-thread
+/// task time (ms), and its span on the host clock.
+#[derive(Clone, Debug)]
+struct Run {
+    ms: f64,
+    cpu: f64,
+    task: f64,
+    t0: u64,
+    t1: u64,
+    /// The run with its reset (ms): what it cost the block.
+    total: f64,
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct Block {
     variant: String,
@@ -99,6 +117,8 @@ struct Block {
     phases: BTreeMap<String, Vec<f64>>,
     frames: Vec<f64>,
     intervals: Vec<f64>,
+    /// Wall time of each step of the block (ms), in order: where a bench's time goes.
+    steps: Vec<(String, f64)>,
 }
 
 struct Ctx<'a> {
@@ -117,6 +137,7 @@ struct Ctx<'a> {
     keep_all: bool,
     runs: usize,
     warnings: Vec<Warning>,
+    config: Value,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -134,8 +155,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let dir = store::experiment_dir(&exp)?;
     super::progress_to(Some(dir.join("progress.log")));
     let _lock = validity::lock()?;
-    let project = project_root(&file);
-    let config = read_config(&project);
+    let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
+    let config = config::load(&project);
     let _power = match args.get("power").unwrap_or("keep") {
         "keep" => None,
         "high" => Some(PowerPlan::high()?),
@@ -162,6 +183,7 @@ pub fn run(args: &Args) -> Result<Output> {
         keep_all: args.has("keep"),
         runs: args.num("runs")?.unwrap_or(5.0).max(1.0) as usize,
         warnings: Vec::new(),
+        config: config.clone(),
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -180,7 +202,7 @@ pub fn run(args: &Args) -> Result<Output> {
     if ctx.baseline.is_none() {
         ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)"));
     }
-    let mut variants = vec![resolve_variant("base", &base_spec, &project)?, resolve_variant("head", &head_spec, &project)?];
+    let mut variants = vec![resolve_variant("base", &base_spec, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?];
     let started = Instant::now();
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
@@ -232,6 +254,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     };
     progress(format!("\n{}  primary {}", s.label(), s.primary));
+    let series_started = Instant::now();
     let mut blocks: Vec<Block> = Vec::new();
     let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut stopped = String::from("max pairs");
@@ -241,7 +264,12 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let mut idx = [0usize; 2];
         for &v in &order {
             let keep = ctx.keep_all || pair == 0;
-            let b = run_block(ctx, s, &variants[v], pair, Set::Timing, keep)?;
+            // Timing blocks trace only what the metrics read; `--trace full` keeps every timeline category.
+            let set = if ctx.args.get("trace") == Some("full") { Set::Timing } else { Set::Lean };
+            let b = run_block(ctx, s, &variants[v], pair, set, keep)?;
+            if pair == 0 {
+                progress(format!("  {} block  {}", b.variant, steps_text(&b.steps)));
+            }
             idx[v] = blocks.len();
             blocks.push(b);
         }
@@ -340,9 +368,21 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     let mut warnings: Vec<Warning> = Vec::new();
     analyse(s, def, &blocks, &pairs, &mut warnings);
-    // Attribution: one block per variant with profilers, never timed.
+    // Attribution: one block per variant with profilers, never timed. By default only when there is a
+    // difference to explain; `--why always` keeps them for every series, `--why never` (or
+    // `--probes timing`) skips them.
     let mut recordings = json!({});
-    if ctx.args.get("probes").unwrap_or("") != "timing" {
+    let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
+    let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
+        "always" => true,
+        "never" => false,
+        "auto" => differs,
+        other => return Err(Error::usage(format!("--why: auto, always or never, not {other}"))),
+    };
+    if !why && !differs {
+        progress("  no attribution blocks: nothing to explain (--why always runs them anyway)");
+    }
+    if why {
         progress("  attribution blocks (CPU stacks, invalidations; not timed)");
         for v in variants.iter() {
             match run_block(ctx, s, v, usize::MAX, Set::Attribution, true) {
@@ -356,6 +396,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params,
         "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
+        "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
     }))
 }
@@ -369,6 +410,25 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
         }
     }
     c
+}
+
+/// `launch 1.2s · attach 0.3s · …  = 31.0s`: where one block's wall time went.
+fn steps_text(steps: &[(String, f64)]) -> String {
+    let total: f64 = steps.iter().map(|s| s.1).sum();
+    format!("{}  = {:.1}s", steps.iter().map(|(n, ms)| format!("{n} {:.1}s", ms / 1e3)).collect::<Vec<_>>().join(" · "), total / 1e3)
+}
+
+/// Mean wall time per step over blocks, in step order.
+fn mean_steps(blocks: &[Block]) -> Vec<(String, f64)> {
+    let names: Vec<String> = blocks.first().map(|b| b.steps.iter().map(|s| s.0.clone()).collect()).unwrap_or_default();
+    names
+        .into_iter()
+        .map(|n| {
+            let v: Vec<f64> = blocks.iter().filter_map(|b| b.steps.iter().find(|s| s.0 == n).map(|s| s.1)).collect();
+            let mean = v.iter().sum::<f64>() / v.len().max(1) as f64;
+            (n, mean)
+        })
+        .collect()
 }
 
 fn val(b: &Block, name: &str) -> f64 {
@@ -401,6 +461,10 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             w.push(validity::warn("MultimodalDistribution", format!("{role}: {} looks multimodal (mValue {m:.1}); check pinning and background load", def.name)));
         }
     }
+    let unsteady = blocks.iter().filter(|b| b.values.contains_key("warmup.unsteady")).count();
+    if unsteady > 0 {
+        w.push(validity::warn("NotSteady", format!("{unsteady} block(s) never did the same work twice in {MAX_WARMUP} warmup runs: the case's state grows across runs; add a reset")));
+    }
     let d: Vec<f64> = pairs.iter().map(|&(a, b)| (val(&blocks[b], &s.primary) / val(&blocks[a], &s.primary)).ln()).filter(|x| x.is_finite()).collect();
     if d.len() >= 8 {
         let rho = validity::spearman(&d);
@@ -432,9 +496,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     }
     window.scale = target["scale"].as_f64();
     ctx.used = Some(window.clone());
-    let mut service = None;
+    let launched = Instant::now();
+    let mut guard = None;
     let browser = if app {
-        let exe = variant_exe(v, &target)?;
+        let launch = variant_app(v, &target, &ctx.config)?;
         let seed = target["home"].as_str().map(|h| {
             let mut h = h.to_string();
             for (k, val) in &s.params {
@@ -443,11 +508,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let base = Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).to_path_buf();
             base.join(h)
         });
-        let (b, before) = electron::launch(&exe, seed.as_deref(), &window, ctx.pin)?;
-        service = Some(before);
+        let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
+        guard = Some(g);
         b
     } else {
         chromium::launch(&window, false, ctx.pin, &[])?
+    };
+    let steps = RefCell::new(vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
+    let lapped = std::cell::Cell::new(Instant::now());
+    let lap = |name: &str| {
+        steps.borrow_mut().push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));
+        lapped.set(Instant::now());
     };
     let result = (|| -> Result<Block> {
         if !ctx.gpu_checked {
@@ -457,12 +528,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             ctx.gpu_checked = true;
         }
         let page = if app { electron::main_page(&browser)? } else { browser.page()? };
-        if let Some(before) = &service {
-            electron::guard(before, "after the app opened its window")?;
+        if let Some(g) = &guard {
+            g.check("after the app opened its window")?;
         }
         if !app && target.get("viewport").is_some_and(Value::is_object) {
             browser.fit_viewport(&page, window.width, window.height)?;
         }
+        lap("attach");
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
         let driver = Driver::new(page.clone(), token.clone());
@@ -488,22 +560,44 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         };
         let t = Duration::from_secs(120);
         ctx.runner.call("block", json!({ "params": s.params, "target": s.target, "variant": v.role, "url": url }), t, &serve)?;
+        // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
+        let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {
-            ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
+            let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
+            if let Some(u) = r.get("url").and_then(Value::as_str) {
+                first = join_url(origin(&url), u);
+            }
         }
+        lap("prepare");
         if !app {
-            page.navigate(&url, Duration::from_secs(60))?;
+            page.navigate(&first, Duration::from_secs(60))?;
         }
+        lap("load");
         validity::dev_build(&page)?;
         let speed = validity::speed_check(&page)?;
         let ratio = validity::throttled(speed, ctx.baseline)?;
         validity::window_visible(&page)?;
+        lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
+        lap("setup");
         let tracing = probe::trace::start(&browser.cdp, set)?;
+        // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
+        let sampler = probe::os::Sampler::start(browser.pid);
+        // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
+        // main.busy when the trace carries no RunTask slices.
+        page.send("Performance.enable", json!({}))?;
+        let task_ms = || -> f64 {
+            page.send("Performance.getMetrics", json!({}))
+                .ok()
+                .and_then(|m| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == "TaskDuration").and_then(|x| x["value"].as_f64())))
+                .map_or(f64::NAN, |s| s * 1e3)
+        };
         let run_timeout = Duration::from_secs(60);
-        let mut run_once = |key: &str| -> Result<(f64, f64)> {
+        let mut run_once = |key: &str| -> Result<Run> {
+            let began = Instant::now();
             *current.borrow_mut() = key.to_string();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+            let task0 = task_ms();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner
@@ -511,6 +605,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
+            let task1 = task_ms();
             driver.mark(&format!("{key}:end"))?;
             let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
@@ -520,36 +615,54 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                     .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "reset")), "fix the case's reset"))?;
             }
             let wall = (t1 - t0) as f64;
-            Ok((wall / 1e6, if wall > 0.0 { 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall } else { f64::NAN }))
+            Ok(Run { ms: wall / 1e6, cpu: if wall > 0.0 { 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall } else { f64::NAN }, task: task1 - task0, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
         };
-        // Warmup until the last three runs agree within 5%, at most 10.
-        let mut warm: Vec<f64> = Vec::new();
-        for i in 0..10 {
-            let (ms, _) = run_once(&format!("warm:{i}"))?;
-            warm.push(ms);
-            if warm.len() >= 3 {
-                let last3 = &warm[warm.len() - 3..];
-                let med = metrics::median(last3);
-                let spread = last3.iter().copied().fold(f64::NEG_INFINITY, f64::max) - last3.iter().copied().fold(f64::INFINITY, f64::min);
-                if med > 0.0 && spread / med < 0.05 {
-                    break;
+        // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
+        // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
+        // takes the same time cold or warm, while the work it costs settles over 1–4 runs. Attribution
+        // blocks start their profiler at the steady point, so they measure the runs after it.
+        let mut runs: Vec<Run> = Vec::new();
+        let mut nodes_all = Vec::new();
+        let mut first: Option<usize> = None;
+        let mut unsteady = false;
+        while first.is_none_or(|f| runs.len() < f + ctx.runs) {
+            let i = runs.len();
+            nodes_all.push(driver.nodes().unwrap_or(0));
+            runs.push(run_once(&format!("run:{i}"))?);
+            if first.is_some() {
+                continue;
+            }
+            let steady = i >= 1 && {
+                let (a, b) = (runs[i - 1].task, runs[i].task);
+                a.is_finite() && b.is_finite() && a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05
+            };
+            if steady || i + 1 >= MAX_WARMUP + 1 {
+                unsteady = !steady;
+                first = Some(if set == Set::Attribution || !steady { i + 1 } else { i - 1 });
+                if set == Set::Attribution {
+                    probe::cpu::start(&page)?;
                 }
             }
         }
-        if set == Set::Attribution {
-            probe::cpu::start(&page)?;
-        }
-        let mut run_ms = Vec::new();
-        let mut cpu: BTreeMap<String, f64> = BTreeMap::new();
-        let mut walls: BTreeMap<String, f64> = BTreeMap::new();
-        let mut nodes = Vec::new();
-        for i in 0..ctx.runs {
-            nodes.push(driver.nodes().unwrap_or(0));
-            let (ms, c) = run_once(&format!("run:{i}"))?;
-            run_ms.push(ms);
-            walls.insert(format!("run:{i}"), ms);
-            cpu.insert(format!("run:{i}"), c);
-        }
+        let first = first.unwrap_or(0);
+        // Warmup and measured runs interleave with the steadiness check: split the loop by run.
+        let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum();
+        steps.borrow_mut().push(("warmup".into(), warm_ms));
+        steps.borrow_mut().push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
+        lapped.set(Instant::now());
+        let measured = &runs[first..];
+        let key = |j: usize| format!("run:{}", first + j);
+        let run_ms: Vec<f64> = measured.iter().map(|r| r.ms).collect();
+        let walls: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.ms)).collect();
+        let cpu: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.cpu)).collect();
+        let busy: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite() && r.ms > 0.0).map(|(j, r)| (key(j), 100.0 * r.task / r.ms)).collect();
+        let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
+        let nodes = nodes_all[first.min(nodes_all.len())..].to_vec();
+        let warm = runs[..first].to_vec();
+        let samples = sampler.stop();
+        let gpu_runs: Vec<_> = spans.iter().map(|(k, t0, t1)| (k.clone(), samples.window(*t0, *t1))).collect();
+        let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
+        let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
         // The window must have stayed visible for the whole block.
         validity::window_visible(&page)?;
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
@@ -564,13 +677,33 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let trace = dir.join("trace.pftrace");
         tracing.stop(&trace)?;
         let _ = ctx.runner.call("close", json!({}), t, &serve);
-        let data = metrics::read(&trace, &token)?;
+        lap("trace");
+        let mut data = metrics::read(&trace, &token)?;
+        data.warm_below(first);
+        lap("analyse");
         let mut extra = BTreeMap::new();
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
+        if !gpu_3d.is_empty() {
+            extra.insert("gpu.process.3d".to_string(), gpu_3d);
+        }
+        let busy_cdp = metrics::median(&busy.values().copied().collect::<Vec<_>>());
+        if set == Set::Lean {
+            extra.insert("main.busy".to_string(), busy);
+        }
         let mut values = metrics::block_values(&data, "run", &extra);
+        if set != Set::Lean && busy_cdp.is_finite() {
+            // The same quantity from the Performance domain, next to the trace's: they must agree.
+            values.insert("main.busy.cdp".into(), busy_cdp);
+        }
+        if unsteady {
+            values.insert("warmup.unsteady".into(), 1.0);
+        }
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);
+        }
+        if let Some(v) = vram {
+            values.insert("gpu.vram".into(), v);
         }
         if let Some(h) = heap_mb {
             values.insert("js.heap.used".into(), h);
@@ -595,11 +728,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms, warmup: warm.len(), speed_ratio: ratio, nodes, recording, phases, frames, intervals, steps: steps.borrow().clone() })
     })();
+    lapped.set(Instant::now());
     browser.close();
-    if let Some(before) = &service {
-        electron::guard(before, "after a block")?;
+    let result = result.map(|mut b| {
+        b.steps.push(("close".into(), lapped.get().elapsed().as_secs_f64() * 1e3));
+        b
+    });
+    if let Some(g) = &guard {
+        g.check("after a block")?;
     }
     result
 }
@@ -648,18 +786,25 @@ fn snapshot(page: &Page, exp: &str, step: &str) -> String {
     }
 }
 
-/// The executable an app target runs for a variant: the variant's own (`app:`/`exe:`), else the target's.
-fn variant_exe(v: &Variant, target: &Value) -> Result<PathBuf> {
-    if let Kind::Exe(p) = &v.kind {
-        return Ok(p.clone());
+/// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
+/// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
+fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<electron::App> {
+    if let Kind::App(id) = &v.kind {
+        return electron::app(id, config);
     }
-    match target["kind"].as_str() {
-        Some("app") => {
-            let id = target["id"].as_str().unwrap_or("");
-            electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed")))
-        }
-        Some("exe") => Ok(PathBuf::from(target["path"].as_str().unwrap_or(""))),
-        _ => Err(Error::usage("not an app target")),
+    let profile = match target["kind"].as_str() {
+        Some("app") => target["id"].as_str(),
+        Some("exe") => target["app"].as_str(),
+        _ => return Err(Error::usage("not an app target")),
+    };
+    let base = match profile {
+        Some(id) => electron::app(id, config)?,
+        None => electron::App::bare(Path::new(target["path"].as_str().unwrap_or(""))),
+    };
+    match &v.kind {
+        Kind::Exe(p) => Ok(base.with_exe(p)),
+        _ if target["kind"] == "exe" => Ok(base.with_exe(Path::new(target["path"].as_str().unwrap_or("")))),
+        _ => Ok(base),
     }
 }
 
@@ -679,6 +824,12 @@ fn variant_url(v: &Variant, target: &Value) -> Result<String> {
         }
         other => Err(Error::msg(format!("target kind {other} is not supported yet"))),
     }
+}
+
+/// `http://host:port` of a URL.
+fn origin(url: &str) -> &str {
+    let start = url.find("://").map(|i| i + 3).unwrap_or(0);
+    url[start..].find('/').map(|i| &url[..start + i]).unwrap_or(url)
 }
 
 fn join_url(base: &str, path: &str) -> String {
@@ -748,33 +899,13 @@ fn glob(pattern: &str, text: &str) -> bool {
     parts.last().is_none_or(|l| l.is_empty() || text.ends_with(l))
 }
 
-fn project_root(file: &Path) -> PathBuf {
-    let mut dir = file.parent();
-    while let Some(d) = dir {
-        if d.join("strobe.json").is_file() {
-            return d.to_path_buf();
-        }
-        dir = d.parent();
-    }
-    host::output(Command::new("git").arg("-C").arg(file.parent().unwrap_or(Path::new("."))).args(["rev-parse", "--show-toplevel"]))
-        .map(PathBuf::from)
-        .unwrap_or_else(|| file.parent().unwrap_or(Path::new(".")).to_path_buf())
-}
-
-fn read_config(root: &Path) -> Value {
-    std::fs::read_to_string(root.join("strobe.json")).ok().and_then(|t| serde_json::from_str(&strip_jsonc(&t)).ok()).unwrap_or(Value::Null)
-}
-
-fn strip_jsonc(t: &str) -> String {
-    t.lines().map(|l| if l.trim_start().starts_with("//") { "" } else { l }).collect::<Vec<_>>().join("\n")
-}
-
-fn resolve_variant(role: &'static str, spec: &str, project: &Path) -> Result<Variant> {
+fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Value) -> Result<Variant> {
     let (kind, label, root) = if let Some(href) = spec.strip_prefix("url:") {
         (Kind::Url(href.to_string()), href.to_string(), None)
     } else if let Some(id) = spec.strip_prefix("app:") {
-        let exe = electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed (opencode, opencode-beta, opencode-dev)")))?;
-        (Kind::Exe(exe), spec.to_string(), None)
+        // Fails early when the profile is missing or the app is not installed.
+        electron::app(id, config)?;
+        (Kind::App(id.to_string()), spec.to_string(), None)
     } else if let Some(p) = spec.strip_prefix("exe:") {
         (Kind::Exe(PathBuf::from(p)), p.to_string(), None)
     } else if let Some(r) = spec.strip_prefix("git:") {
@@ -973,9 +1104,11 @@ fn render(r: &Value) -> String {
         out += &format!("       {} · {} · window {}×{}{}\n", r["browser"].as_str().unwrap_or(""), gpu, r["window"]["width"], r["window"]["height"], refresh);
         out += &format!("plan   {} · power plan {} · visible, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
         out += &format!(
-            "blocks {} pairs ({} fresh launches) · warmup until steady · {} runs per block · stopped: {}\n\n",
+            "blocks {} pairs ({} fresh launches) · warmup until steady · {} runs per block · stopped: {}\n",
             s["pairs"], s["launches"], r["plan"]["runs_per_block"], s["stopped"].as_str().unwrap_or("")
         );
+        let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
+        out += &format!("time   {} · per block {}\n\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
         out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("95% CI", 18), "verdict");
         let mut rows = vec![(true, s["primary"].clone())];
         rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));

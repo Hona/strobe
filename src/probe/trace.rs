@@ -15,6 +15,10 @@ use std::time::Duration;
 pub fn categories(set: Set) -> Vec<&'static str> {
     let mut c = vec!["benchmark", "devtools.timeline", "disabled-by-default-devtools.timeline", "blink.user_timing", "__metadata"];
     match set {
+        // Only what bench metrics read: PipelineReporter (frames), EventLatency (input), marks, thread
+        // names. A tenth of the full set's slices, so less tracing in the target and a faster block;
+        // renderer main-thread busy comes from the Performance domain instead of RunTask slices.
+        Set::Lean => return vec!["disabled-by-default-devtools.timeline.frame", "input.scrolling", "blink.user_timing", "__metadata"],
         Set::Timing => {}
         Set::Attribution => c.extend([
             "disabled-by-default-devtools.timeline.invalidationTracking",

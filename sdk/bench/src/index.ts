@@ -61,11 +61,14 @@ export interface Case<P> {
   reset?(ctx: Context<P>): unknown
 }
 
+/** The first page a block opens: a path, or a function of what `prepare` returned. */
+export type FirstPage<P> = string | ((ctx: { prepared: any; params: P }) => string | Promise<string>)
+
 export type Target<P> =
-  | { kind: "web"; url: string; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number }
+  | { kind: "web"; url: FirstPage<P>; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number }
   | { kind: "url"; href: string; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number }
   | { kind: "app"; id: string; home?: string; viewport?: Viewport }
-  | { kind: "exe"; path: string; home?: string; viewport?: Viewport }
+  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport }
 
 export interface Viewport {
   width: number
@@ -84,7 +87,7 @@ export interface Bench<Params extends Record<string, readonly unknown[]>> {
 }
 
 /** The project's production build, served per variant from `strobe.json`, in a strobe-launched Chromium. */
-export function web<P = any>(opts: { url?: string; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number } = {}): Target<P> {
+export function web<P = any>(opts: { url?: FirstPage<P>; prepare?: (ctx: PrepareContext<P>) => unknown; viewport?: Viewport; scale?: number } = {}): Target<P> {
   return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, viewport: opts.viewport, scale: opts.scale }
 }
 
@@ -93,13 +96,13 @@ export function url<P = any>(href: string, opts: { prepare?: (ctx: PrepareContex
   return { kind: "url", href, ...opts }
 }
 
-/** An installed Electron app, such as `opencode`, in a fresh isolated home seeded from `home`. */
+/** An installed Electron app, by its profile in strobe.json `apps`, in a fresh isolated home seeded from `home`. */
 export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport } = {}): Target<P> {
   return { kind: "app", id, ...opts }
 }
 
-/** A packaged Electron app by path. */
-export function exe<P = any>(path: string, opts: { home?: string; viewport?: Viewport } = {}): Target<P> {
+/** A packaged Electron app by path; `app` borrows a profile from strobe.json `apps` for it. */
+export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport } = {}): Target<P> {
   return { kind: "exe", path, ...opts }
 }
 

@@ -106,6 +106,24 @@ pub struct BlockData {
     pub latencies: BTreeMap<String, Vec<(i64, String)>>,
 }
 
+impl BlockData {
+    /// Relabels runs before `first` as warmup (`…:run:<i>` → `…:warm:<i>`, phases included): a block
+    /// decides where warmup ended only after the runs, from the work they did.
+    pub fn warm_below(&mut self, first: usize) {
+        let demote = |key: &str| -> String {
+            let Some((head, rest)) = key.split_once(":run:") else { return key.to_string() };
+            let index = rest.split(':').next().and_then(|i| i.parse::<usize>().ok());
+            if index.is_some_and(|i| i < first) { format!("{head}:warm:{rest}") } else { key.to_string() }
+        };
+        for w in &mut self.windows {
+            w.key = demote(&w.key);
+        }
+        self.frames = std::mem::take(&mut self.frames).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.tasks = std::mem::take(&mut self.tasks).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.latencies = std::mem::take(&mut self.latencies).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+    }
+}
+
 pub fn read(trace: &Path, token: &str) -> Result<BlockData> {
     let sql = format!(
         r#"
@@ -206,11 +224,14 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
         per_run.entry("frames.presented.count").or_default().push(presented.len() as f64);
         per_run.entry("frames.dropped").or_default().push(dropped as f64);
         per_run.entry("frames.partial").or_default().push(v.iter().filter(|s| s.outcome == Outcome::Partial).count() as f64);
-        let tasks = data.tasks.get(&w.key).map(Vec::as_slice).unwrap_or(&[]);
-        let span = (w.t1 - w.t0).max(1) as f64;
-        let busy: f64 = tasks.iter().map(|(ts, dur)| ((*ts + *dur).min(w.t1) - ts).max(0) as f64).sum();
-        per_run.entry("main.busy").or_default().push(100.0 * busy / span);
-        per_run.entry("main.tasks.long").or_default().push(tasks.iter().filter(|t| t.1 > 50_000_000).count() as f64);
+        // A lean trace has no RunTask slices: main.busy then comes from the Performance domain.
+        if !data.tasks.is_empty() {
+            let tasks = data.tasks.get(&w.key).map(Vec::as_slice).unwrap_or(&[]);
+            let span = (w.t1 - w.t0).max(1) as f64;
+            let busy: f64 = tasks.iter().map(|(ts, dur)| ((*ts + *dur).min(w.t1) - ts).max(0) as f64).sum();
+            per_run.entry("main.busy").or_default().push(100.0 * busy / span);
+            per_run.entry("main.tasks.long").or_default().push(tasks.iter().filter(|t| t.1 > 50_000_000).count() as f64);
+        }
         for (dur, ty) in data.latencies.get(&w.key).map(Vec::as_slice).unwrap_or(&[]) {
             let ms = *dur as f64 / 1e6;
             if DISCRETE.contains(&ty.as_str()) {

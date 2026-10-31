@@ -1,11 +1,11 @@
-//! GPU sampling (SPEC §8.5, §13.6): engine time and memory per process from PDH (`GPU Engine`,
-//! `GPU Process Memory`), adapter names from D3DKMT, and device clocks, power, temperature and
-//! PCIe from NVML, loaded at runtime from System32. No NVML, no device fields; never an error.
+//! GPU sampling (SPEC §8.5, §13.6). Per process: engine time and GPU memory from D3DKMT
+//! statistics for a list of PIDs (cost scales with the list, not the machine); engine time for
+//! every process from PDH `GPU Engine` (the same kernel counters, read for all). Per device:
+//! clocks, power, temperature and PCIe from NVML, loaded at runtime from System32; no NVML, no
+//! device fields, never an error.
 
 use super::os::pdh::Query;
 use serde::Serialize;
-
-const MB: f64 = 1024.0 * 1024.0;
 
 /// One graphics adapter as the OS names it. `luid` matches the `luid_` part of PDH instances.
 #[derive(Clone, Debug, Serialize)]
@@ -14,6 +14,12 @@ pub struct Adapter {
     pub name: String,
     #[serde(skip)]
     pub bus: Option<u32>,
+    /// Engine type name per node.
+    #[serde(skip)]
+    pub nodes: Vec<String>,
+    /// Per memory segment: true for an aperture segment (system memory: "shared").
+    #[serde(skip)]
+    pub apertures: Vec<bool>,
 }
 
 /// One process on one adapter over one tick: engine time summed over the engines of one type,
@@ -28,7 +34,10 @@ pub struct EngineUse {
     pub pct: f32,
 }
 
-/// One process's GPU memory on one adapter at the end of a tick, in bytes.
+/// One process's GPU memory on one adapter at the end of a tick, in bytes: what it committed in
+/// dedicated (local) and shared (aperture, system memory) segments. Allocations it only opens
+/// from another process count in their owner, so sums over processes do not double count
+/// (Task Manager's "Dedicated GPU memory" does).
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct VramUse {
     pub pid: u32,
@@ -47,7 +56,7 @@ pub struct Device {
 }
 
 /// One NVML reading. A field is absent when the device or driver does not report it.
-/// MB = 2^20 bytes. Power is the energy counter's average over the tick when available.
+/// MB = 2^20 bytes. Utilization is the driver's own average over its sample period (1/6 to 1 s).
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct DeviceSample {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -90,11 +99,11 @@ impl DeviceSample {
     }
 }
 
-/// The adapters D3DKMT enumerates, with their driver descriptions.
+/// The adapters D3DKMT enumerates, with driver descriptions, nodes and memory segments.
 pub fn adapters() -> Vec<Adapter> {
     #[cfg(windows)]
     {
-        let mut out = d3dkmt_adapters();
+        let mut out = kmt::adapters();
         for i in 1..out.len() {
             let same = out[..i].iter().filter(|a| a.name == out[i].name).count();
             if same > 0 {
@@ -109,119 +118,64 @@ pub fn adapters() -> Vec<Adapter> {
     }
 }
 
-#[cfg(windows)]
-fn d3dkmt_adapters() -> Vec<Adapter> {
-    use std::mem::{size_of, zeroed};
-    use windows_sys::Wdk::Graphics::Direct3D::{
-        D3DKMT_ADAPTERADDRESS, D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_DRIVER_DESCRIPTION, D3DKMT_ENUMADAPTERS2,
-        D3DKMT_QUERYADAPTERINFO, D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, KMTQAITYPE_ADAPTERADDRESS,
-        KMTQAITYPE_DRIVER_DESCRIPTION,
-    };
-    fn query<T>(h: u32, kind: i32, out: &mut T) -> bool {
-        let mut q = D3DKMT_QUERYADAPTERINFO { hAdapter: h, Type: kind, pPrivateDriverData: out as *mut T as *mut _, PrivateDriverDataSize: size_of::<T>() as u32 };
-        unsafe { D3DKMTQueryAdapterInfo(&mut q) >= 0 }
-    }
-    unsafe {
-        let mut e: D3DKMT_ENUMADAPTERS2 = zeroed();
-        if D3DKMTEnumAdapters2(&mut e) < 0 || e.NumAdapters == 0 {
-            return Vec::new();
+fn intern(names: &mut Vec<String>, name: &str) -> u16 {
+    match names.iter().position(|n| n == name) {
+        Some(i) => i as u16,
+        None => {
+            names.push(name.to_string());
+            (names.len() - 1) as u16
         }
-        let mut infos: Vec<D3DKMT_ADAPTERINFO> = vec![zeroed(); e.NumAdapters as usize];
-        e.pAdapters = infos.as_mut_ptr();
-        if D3DKMTEnumAdapters2(&mut e) < 0 {
-            return Vec::new();
-        }
-        infos.truncate(e.NumAdapters as usize);
-        infos
-            .iter()
-            .map(|a| {
-                let luid = ((a.AdapterLuid.HighPart as u32 as u64) << 32) | a.AdapterLuid.LowPart as u64;
-                let mut desc: Box<D3DKMT_DRIVER_DESCRIPTION> = Box::new(zeroed());
-                let name = if query(a.hAdapter, KMTQAITYPE_DRIVER_DESCRIPTION, &mut *desc) {
-                    let w = &desc.DriverDescription;
-                    String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]).trim().to_string()
-                } else {
-                    String::new()
-                };
-                let mut addr: D3DKMT_ADAPTERADDRESS = zeroed();
-                let bus = query(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut addr).then_some(addr.BusNumber);
-                D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter });
-                Adapter { luid, name: if name.is_empty() { format!("adapter 0x{luid:x}") } else { name }, bus }
-            })
-            .collect()
     }
 }
 
-/// Per-process engine time and memory from three wildcard PDH counters in the shared query.
+/// Per-process engine time for every process (including ones D3DKMT cannot open, like dwm)
+/// from the wildcard PDH counter `GPU Engine(*)\Utilization Percentage`. Costs about 0.5 ms
+/// per collection on a busy desktop. Not memory: PDH's `Dedicated Usage` also counts
+/// allocations opened from other processes (dwm shows more than the adapter holds), and its
+/// other counters split dedicated and shared differently on integrated GPUs.
 pub struct Engines {
+    q: Query,
     util: isize,
-    dedicated: isize,
-    shared: isize,
-    pub names: Vec<String>,
-    wide: Vec<Vec<u16>>,
+    wide: Vec<(Vec<u16>, u16)>,
 }
 
 impl Engines {
-    pub fn add(q: &Query) -> Option<Engines> {
-        Some(Engines {
-            util: q.add(r"\GPU Engine(*)\Utilization Percentage")?,
-            dedicated: q.add(r"\GPU Process Memory(*)\Dedicated Usage")?,
-            shared: q.add(r"\GPU Process Memory(*)\Shared Usage")?,
-            names: Vec::new(),
-            wide: Vec::new(),
-        })
+    pub fn open() -> Option<Engines> {
+        let q = Query::open()?;
+        Some(Engines { util: q.add(r"\GPU Engine(*)\Utilization Percentage")?, q, wide: Vec::new() })
     }
 
-    /// Reads the last collection for the PIDs `keep` accepts; zero rows are dropped.
-    pub fn read(&mut self, q: &mut Query, keep: &dyn Fn(u32) -> bool, adapters: &mut Vec<Adapter>, gpu: &mut Vec<EngineUse>, vram: &mut Vec<VramUse>) {
-        let (names, wide) = (&mut self.names, &mut self.wide);
+    /// Collects and reads; zero rows are dropped. Rates cover the time since the last call.
+    /// `present` gets every PID with a GPU context (an engine instance), busy or not.
+    pub fn read(&mut self, adapters: &mut Vec<Adapter>, names: &mut Vec<String>, gpu: &mut Vec<EngineUse>, present: &mut Vec<u32>) {
+        self.q.collect();
+        let (wide, q) = (&mut self.wide, &mut self.q);
         q.each(self.util, 0, |inst, v| {
+            let Some((pid, luid, rest)) = parse(inst) else { return };
+            if present.last() != Some(&pid) {
+                present.push(pid);
+            }
             if v <= 0.0 {
                 return;
             }
-            let Some((pid, luid, rest)) = parse(inst) else { return };
-            if !keep(pid) {
-                return;
-            }
             let ty = after(rest, "engtype_").unwrap_or(&[]);
-            let engine = match wide.iter().position(|w| w.as_slice() == ty) {
-                Some(i) => i,
+            let engine = match wide.iter().find(|w| w.0.as_slice() == ty) {
+                Some(w) => w.1,
                 None => {
-                    wide.push(ty.to_vec());
-                    names.push(String::from_utf16_lossy(ty));
-                    wide.len() - 1
+                    let i = intern(names, &String::from_utf16_lossy(ty));
+                    wide.push((ty.to_vec(), i));
+                    i
                 }
             };
-            gpu.push(EngineUse { pid, adapter: adapter_index(adapters, luid), engine: engine as u16, pct: v as f32 });
+            gpu.push(EngineUse { pid, adapter: adapter_index(adapters, luid), engine, pct: v as f32 });
         });
+        present.sort_unstable();
+        present.dedup();
         gpu.sort_unstable_by_key(|e| (e.pid, e.adapter, e.engine));
         gpu.dedup_by(|cur, prev| {
             let same = (cur.pid, cur.adapter, cur.engine) == (prev.pid, prev.adapter, prev.engine);
             if same {
                 prev.pct += cur.pct;
-            }
-            same
-        });
-        for (counter, dedicated) in [(self.dedicated, true), (self.shared, false)] {
-            q.each(counter, super::os::pdh::NOSCALE, |inst, v| {
-                if v <= 0.0 {
-                    return;
-                }
-                let Some((pid, luid, _)) = parse(inst) else { return };
-                if !keep(pid) {
-                    return;
-                }
-                let bytes = v as u64;
-                let (d, s) = if dedicated { (bytes, 0) } else { (0, bytes) };
-                vram.push(VramUse { pid, adapter: adapter_index(adapters, luid), dedicated: d, shared: s });
-            });
-        }
-        vram.sort_unstable_by_key(|m| (m.pid, m.adapter));
-        vram.dedup_by(|cur, prev| {
-            let same = (cur.pid, cur.adapter) == (prev.pid, prev.adapter);
-            if same {
-                prev.dedicated += cur.dedicated;
-                prev.shared += cur.shared;
             }
             same
         });
@@ -232,13 +186,13 @@ fn adapter_index(adapters: &mut Vec<Adapter>, luid: u64) -> u16 {
     match adapters.iter().position(|a| a.luid == luid) {
         Some(i) => i as u16,
         None => {
-            adapters.push(Adapter { luid, name: format!("adapter 0x{luid:x}"), bus: None });
+            adapters.push(Adapter { luid, name: format!("adapter 0x{luid:x}"), bus: None, nodes: Vec::new(), apertures: Vec::new() });
             (adapters.len() - 1) as u16
         }
     }
 }
 
-/// `pid_1234_luid_0x00000000_0x000128E7_phys_0[_eng_0_engtype_3D]` → (pid, luid, rest).
+/// `pid_1234_luid_0x00000000_0x000128E7_phys_0_eng_0_engtype_3D` → (pid, luid, rest).
 fn parse(name: &[u16]) -> Option<(u32, u64, &[u16])> {
     let rest = strip(name, "pid_")?;
     let (pid, rest) = number(rest, 10)?;
@@ -259,16 +213,31 @@ fn after<'a>(s: &'a [u16], pat: &str) -> Option<&'a [u16]> {
 }
 
 fn number(s: &[u16], radix: u32) -> Option<(u64, &[u16])> {
-    let end = s.iter().position(|&c| char::from_u32(c as u32).and_then(|c| c.to_digit(radix)).is_none()).unwrap_or(s.len());
+    let digit = |c: u16| char::from_u32(c as u32).and_then(|c| c.to_digit(radix));
+    let end = s.iter().position(|&c| digit(c).is_none()).unwrap_or(s.len());
     if end == 0 {
         return None;
     }
-    let v = s[..end].iter().fold(0u64, |acc, &c| acc.wrapping_mul(radix as u64) + char::from_u32(c as u32).and_then(|c| c.to_digit(radix)).unwrap_or(0) as u64);
-    Some((v, &s[end..]))
+    Some((s[..end].iter().fold(0u64, |acc, &c| acc.wrapping_mul(radix as u64) + digit(c).unwrap_or(0) as u64), &s[end..]))
 }
 
 #[cfg(windows)]
+pub use kmt::Kmt;
+#[cfg(windows)]
 pub use nvml::Nvml;
+
+#[cfg(not(windows))]
+pub struct Kmt {
+    pub unreadable: Vec<u32>,
+}
+
+#[cfg(not(windows))]
+impl Kmt {
+    pub fn new(_adapters: &[Adapter], _names: &mut Vec<String>) -> Option<Kmt> {
+        None
+    }
+    pub fn read(&mut self, _pids: &[u32], _dt_ns: u64, _nodes: bool, _gpu: &mut Vec<EngineUse>, _vram: &mut Vec<VramUse>) {}
+}
 
 #[cfg(not(windows))]
 pub struct Nvml {
@@ -280,18 +249,279 @@ impl Nvml {
     pub fn load(_adapters: &[Adapter]) -> Option<Nvml> {
         None
     }
-    pub fn sample(&mut self, _t_ns: u64, _out: &mut Vec<DeviceSample>) {}
+    pub fn sample(&mut self, _t_ns: u64, _pcie: bool, _out: &mut Vec<DeviceSample>) {}
+}
+
+#[cfg(windows)]
+mod kmt {
+    use super::{Adapter, EngineUse, VramUse, intern};
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Wdk::Graphics::Direct3D::{
+        D3DKMT_ADAPTERADDRESS, D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_DRIVER_DESCRIPTION, D3DKMT_ENUMADAPTERS2,
+        D3DKMT_NODEMETADATA, D3DKMT_QUERYADAPTERINFO, D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_ADAPTER,
+        D3DKMT_QUERYSTATISTICS_PROCESS_NODE, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT, D3DKMT_QUERYSTATISTICS_QUERY_NODE,
+        D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT, D3DKMT_QUERYSTATISTICS_SEGMENT,
+        D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics, KMTQAITYPE_ADAPTERADDRESS,
+        KMTQAITYPE_DRIVER_DESCRIPTION, KMTQAITYPE_NODEMETADATA,
+    };
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
+
+    fn luid64(l: LUID) -> u64 {
+        ((l.HighPart as u32 as u64) << 32) | l.LowPart as u64
+    }
+
+    fn luid(v: u64) -> LUID {
+        LUID { LowPart: v as u32, HighPart: (v >> 32) as i32 }
+    }
+
+    fn query_info<T>(h: u32, kind: i32, out: &mut T) -> bool {
+        let mut q = D3DKMT_QUERYADAPTERINFO { hAdapter: h, Type: kind, pPrivateDriverData: out as *mut T as *mut _, PrivateDriverDataSize: size_of::<T>() as u32 };
+        unsafe { D3DKMTQueryAdapterInfo(&mut q) >= 0 }
+    }
+
+    /// D3DKMTQueryStatistics writes its result into the struct it is given.
+    fn stats(st: &mut D3DKMT_QUERYSTATISTICS) -> bool {
+        unsafe { D3DKMTQueryStatistics(st as *mut D3DKMT_QUERYSTATISTICS as *const _) >= 0 }
+    }
+
+    fn wide_str(w: &[u16]) -> String {
+        String::from_utf16_lossy(&w[..w.iter().position(|&c| c == 0).unwrap_or(w.len())]).trim().to_string()
+    }
+
+    pub fn adapters() -> Vec<Adapter> {
+        unsafe {
+            let mut e: D3DKMT_ENUMADAPTERS2 = zeroed();
+            if D3DKMTEnumAdapters2(&mut e) < 0 || e.NumAdapters == 0 {
+                return Vec::new();
+            }
+            let mut infos: Vec<D3DKMT_ADAPTERINFO> = vec![zeroed(); e.NumAdapters as usize];
+            e.pAdapters = infos.as_mut_ptr();
+            if D3DKMTEnumAdapters2(&mut e) < 0 {
+                return Vec::new();
+            }
+            infos.truncate(e.NumAdapters as usize);
+            let mut st: Box<D3DKMT_QUERYSTATISTICS> = Box::new(zeroed());
+            infos
+                .iter()
+                .map(|a| {
+                    let id = luid64(a.AdapterLuid);
+                    let mut desc: Box<D3DKMT_DRIVER_DESCRIPTION> = Box::new(zeroed());
+                    let name = if query_info(a.hAdapter, KMTQAITYPE_DRIVER_DESCRIPTION, &mut *desc) { wide_str(&desc.DriverDescription) } else { String::new() };
+                    let mut addr: D3DKMT_ADAPTERADDRESS = zeroed();
+                    let bus = query_info(a.hAdapter, KMTQAITYPE_ADAPTERADDRESS, &mut addr).then_some(addr.BusNumber);
+                    *st = zeroed();
+                    st.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
+                    st.AdapterLuid = a.AdapterLuid;
+                    let (node_count, segment_count) =
+                        if stats(&mut st) { (st.QueryResult.AdapterInformation.NodeCount, st.QueryResult.AdapterInformation.NbSegments) } else { (0, 0) };
+                    let nodes = (0..node_count)
+                        .map(|n| {
+                            let mut md: D3DKMT_NODEMETADATA = zeroed();
+                            md.NodeOrdinalAndAdapterIndex = n;
+                            if !query_info(a.hAdapter, KMTQAITYPE_NODEMETADATA, &mut md) {
+                                return format!("Node {n}");
+                            }
+                            // Named like PDH's `engtype_`: the engine type, or the driver's
+                            // friendly name for engines of type Other.
+                            let friendly = wide_str(&{ md.NodeData.FriendlyName });
+                            match md.NodeData.EngineType {
+                                1 => "3D",
+                                2 => "VideoDecode",
+                                3 => "VideoEncode",
+                                4 => "VideoProcessing",
+                                5 => "SceneAssembly",
+                                6 => "Copy",
+                                7 => "Overlay",
+                                8 => "Crypto",
+                                _ if !friendly.is_empty() => return friendly,
+                                _ => "Other",
+                            }
+                            .to_string()
+                        })
+                        .collect();
+                    let apertures = (0..segment_count)
+                        .map(|s| {
+                            *st = zeroed();
+                            st.Type = D3DKMT_QUERYSTATISTICS_SEGMENT;
+                            st.AdapterLuid = a.AdapterLuid;
+                            st.Anonymous.QuerySegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT { SegmentId: s };
+                            stats(&mut st) && st.QueryResult.SegmentInformation.Aperture != 0
+                        })
+                        .collect();
+                    D3DKMTCloseAdapter(&D3DKMT_CLOSEADAPTER { hAdapter: a.hAdapter });
+                    Adapter { luid: id, name: if name.is_empty() { format!("adapter 0x{id:x}") } else { name }, bus, nodes, apertures }
+                })
+                .collect()
+        }
+    }
+
+    /// Engine time and memory for a list of PIDs from D3DKMTQueryStatistics, one call per node
+    /// and segment of each adapter a process has opened (needs PROCESS_QUERY_INFORMATION; PIDs
+    /// that cannot be opened are listed in `unreadable`). Adapters a process has not opened are
+    /// rechecked every 20 reads, and PIDs that join after the first read are born during
+    /// sampling: both start from zero, so no engine time is lost.
+    pub struct Kmt {
+        adapters: Vec<KmtAdapter>,
+        procs: Vec<Proc>,
+        st: Box<D3DKMT_QUERYSTATISTICS>,
+        started: bool,
+        pub unreadable: Vec<u32>,
+    }
+
+    // The process handles are owned and only used from the thread that holds the Kmt.
+    unsafe impl Send for Kmt {}
+
+    struct KmtAdapter {
+        luid: LUID,
+        index: u16,
+        engines: Vec<u16>,
+        apertures: Vec<bool>,
+    }
+
+    struct Proc {
+        pid: u32,
+        handle: HANDLE,
+        uses: Vec<Use>,
+    }
+
+    #[derive(Clone)]
+    struct Use {
+        open: bool,
+        checked: u32,
+        running: Vec<i64>,
+    }
+
+    impl Kmt {
+        pub fn new(adapters: &[Adapter], names: &mut Vec<String>) -> Option<Kmt> {
+            let list: Vec<KmtAdapter> = adapters
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| !a.nodes.is_empty())
+                .map(|(i, a)| KmtAdapter {
+                    luid: luid(a.luid),
+                    index: i as u16,
+                    engines: a.nodes.iter().map(|n| intern(names, n)).collect(),
+                    apertures: a.apertures.clone(),
+                })
+                .collect();
+            (!list.is_empty()).then(|| Kmt { adapters: list, procs: Vec::new(), st: Box::new(unsafe { zeroed() }), started: false, unreadable: Vec::new() })
+        }
+
+        /// Reads every PID in `pids` (sorted): memory, and with `nodes` engine time over the
+        /// `dt_ns` tick. Handles of PIDs no longer listed are closed.
+        pub fn read(&mut self, pids: &[u32], dt_ns: u64, nodes: bool, gpu: &mut Vec<EngineUse>, vram: &mut Vec<VramUse>) {
+            self.procs.retain(|p| {
+                let keep = pids.binary_search(&p.pid).is_ok();
+                if !keep && !p.handle.is_null() {
+                    unsafe { CloseHandle(p.handle) };
+                }
+                keep
+            });
+            for &pid in pids {
+                if self.procs.iter().any(|p| p.pid == pid) {
+                    continue;
+                }
+                let handle = unsafe { OpenProcess(PROCESS_QUERY_INFORMATION, 0, pid) };
+                if handle.is_null() && !self.unreadable.contains(&pid) {
+                    self.unreadable.push(pid);
+                }
+                // Processes present at the first read get a baseline (-1); later ones count from zero.
+                let base = if self.started { 0 } else { -1 };
+                let uses = self.adapters.iter().map(|a| Use { open: true, checked: 0, running: vec![base; a.engines.len()] }).collect();
+                self.procs.push(Proc { pid, handle, uses });
+            }
+            self.started = true;
+            let st = &mut *self.st;
+            for p in &mut self.procs {
+                if p.handle.is_null() {
+                    continue;
+                }
+                for (a, u) in self.adapters.iter().zip(p.uses.iter_mut()) {
+                    if !u.open {
+                        u.checked += 1;
+                        if u.checked < 20 {
+                            continue;
+                        }
+                        u.checked = 0;
+                    }
+                    let (mut dedicated, mut shared, mut any) = (0u64, 0u64, false);
+                    for (s, &aperture) in a.apertures.iter().enumerate() {
+                        st.Type = D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT;
+                        st.AdapterLuid = a.luid;
+                        st.hProcess = p.handle;
+                        st.Anonymous.QueryProcessSegment = D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT { SegmentId: s as u32 };
+                        if !stats(st) {
+                            continue;
+                        }
+                        any = true;
+                        let bytes = unsafe { st.QueryResult.ProcessSegmentInformation.BytesCommitted };
+                        if aperture { shared += bytes } else { dedicated += bytes }
+                    }
+                    if !any && !a.apertures.is_empty() {
+                        // Not opened: its counters start at zero when it is.
+                        u.open = false;
+                        u.running.iter_mut().for_each(|r| *r = 0);
+                        continue;
+                    }
+                    u.open = true;
+                    if dedicated + shared > 0 {
+                        vram.push(VramUse { pid: p.pid, adapter: a.index, dedicated, shared });
+                    }
+                    if !nodes {
+                        continue;
+                    }
+                    for (n, &engine) in a.engines.iter().enumerate() {
+                        st.Type = D3DKMT_QUERYSTATISTICS_PROCESS_NODE;
+                        st.AdapterLuid = a.luid;
+                        st.hProcess = p.handle;
+                        st.Anonymous.QueryProcessNode = D3DKMT_QUERYSTATISTICS_QUERY_NODE { NodeId: n as u32 };
+                        if !stats(st) {
+                            continue;
+                        }
+                        let running = unsafe { st.QueryResult.ProcessNodeInformation.RunningTime };
+                        let prev = std::mem::replace(&mut u.running[n], running);
+                        if prev >= 0 && running > prev && dt_ns > 0 {
+                            // RunningTime is in 100 ns units.
+                            let pct = ((running - prev) as f64 * 100.0 / dt_ns as f64 * 100.0) as f32;
+                            gpu.push(EngineUse { pid: p.pid, adapter: a.index, engine, pct });
+                        }
+                    }
+                }
+            }
+            gpu.sort_unstable_by_key(|e| (e.pid, e.adapter, e.engine));
+            gpu.dedup_by(|cur, prev| {
+                let same = (cur.pid, cur.adapter, cur.engine) == (prev.pid, prev.adapter, prev.engine);
+                if same {
+                    prev.pct += cur.pct;
+                }
+                same
+            });
+        }
+    }
+
+    impl Drop for Kmt {
+        fn drop(&mut self) {
+            for p in &self.procs {
+                if !p.handle.is_null() {
+                    unsafe { CloseHandle(p.handle) };
+                }
+            }
+        }
+    }
 }
 
 #[cfg(windows)]
 mod nvml {
-    use super::{Adapter, Device, DeviceSample, MB};
+    use super::{Adapter, Device, DeviceSample};
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{FreeLibrary, HMODULE};
     use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LOAD_LIBRARY_SEARCH_SYSTEM32, LoadLibraryExW};
 
     type Dev = *mut c_void;
     type Ret = i32;
+    const MB: f64 = 1024.0 * 1024.0;
+    const FI_POWER_INSTANT: u32 = 186;
     const FI_PCIE_TX_BYTES: u32 = 197;
     const FI_PCIE_RX_BYTES: u32 = 198;
 
@@ -320,18 +550,18 @@ mod nvml {
 
     #[derive(Clone, Copy, Default)]
     struct Last {
-        t_ns: u64,
-        energy_mj: Option<u64>,
+        pcie_ns: u64,
         pcie: Option<(u64, u64)>,
     }
 
+    /// NVML device readings. Each call is a few µs except the energy counter (~0.5 ms), which
+    /// is not read: power is the instantaneous reading, averaged over windows by the caller.
     pub struct Nvml {
         lib: HMODULE,
         shutdown: Option<unsafe extern "C" fn() -> Ret>,
         util: Option<unsafe extern "C" fn(Dev, *mut [u32; 2]) -> Ret>,
         clock: Option<unsafe extern "C" fn(Dev, u32, *mut u32) -> Ret>,
         power: Option<unsafe extern "C" fn(Dev, *mut u32) -> Ret>,
-        energy: Option<unsafe extern "C" fn(Dev, *mut u64) -> Ret>,
         temp: Option<unsafe extern "C" fn(Dev, u32, *mut u32) -> Ret>,
         mem: Option<unsafe extern "C" fn(Dev, *mut [u64; 3]) -> Ret>,
         fields: Option<unsafe extern "C" fn(Dev, i32, *mut Field) -> Ret>,
@@ -373,7 +603,6 @@ mod nvml {
                     util: sym(lib, b"nvmlDeviceGetUtilizationRates\0"),
                     clock: sym(lib, b"nvmlDeviceGetClockInfo\0"),
                     power: sym(lib, b"nvmlDeviceGetPowerUsage\0"),
-                    energy: sym(lib, b"nvmlDeviceGetTotalEnergyConsumption\0"),
                     temp: sym(lib, b"nvmlDeviceGetTemperature\0"),
                     mem: sym(lib, b"nvmlDeviceGetMemoryInfo\0"),
                     fields: sym(lib, b"nvmlDeviceGetFieldValues\0"),
@@ -415,12 +644,11 @@ mod nvml {
             }
         }
 
-        /// Reads every device once; rates (power from energy, PCIe) cover the time since the last call.
-        pub fn sample(&mut self, t_ns: u64, out: &mut Vec<DeviceSample>) {
+        /// Reads every device once. With `pcie`, also the PCIe byte counters; their rates cover
+        /// the time since the last such read.
+        pub fn sample(&mut self, t_ns: u64, pcie: bool, out: &mut Vec<DeviceSample>) {
             for (i, &h) in self.handles.iter().enumerate() {
                 let last = self.last[i];
-                let dt_s = t_ns.saturating_sub(last.t_ns) as f64 / 1e9;
-                let fresh = last.t_ns > 0 && dt_s > 0.0;
                 let mut s = DeviceSample::default();
                 unsafe {
                     let mut u = [0u32; 2];
@@ -434,23 +662,25 @@ mod nvml {
                     s.temp_c = self.temp.filter(|f| f(h, 0, &mut v) == 0).map(|_| v as f64);
                     let mut m = [0u64; 3];
                     s.vram_used_mb = self.mem.filter(|f| f(h, &mut m) == 0).map(|_| m[2] as f64 / MB);
-                    let mut e = 0u64;
-                    let energy = self.energy.filter(|f| f(h, &mut e) == 0).map(|_| e);
-                    s.power_w = match (energy, last.energy_mj) {
-                        (Some(e1), Some(e0)) if fresh && e1 >= e0 => Some((e1 - e0) as f64 / 1000.0 / dt_s),
-                        _ => self.power.filter(|f| f(h, &mut v) == 0).map(|_| v as f64 / 1000.0),
-                    };
-                    let mut fv = [Field { id: FI_PCIE_TX_BYTES, ..Default::default() }, Field { id: FI_PCIE_RX_BYTES, ..Default::default() }];
-                    let pcie = self.fields.filter(|f| f(h, 2, fv.as_mut_ptr()) == 0).and_then(|_| Some((counter(&fv[0])?, counter(&fv[1])?)));
-                    if let (Some((tx1, rx1)), Some((tx0, rx0))) = (pcie, last.pcie)
-                        && fresh
-                        && tx1 >= tx0
-                        && rx1 >= rx0
-                    {
-                        s.pcie_tx_mbs = Some((tx1 - tx0) as f64 / MB / dt_s);
-                        s.pcie_rx_mbs = Some((rx1 - rx0) as f64 / MB / dt_s);
+                    // The PCIe counters cost ~0.1 ms per read; the other fields a few µs.
+                    let mut fv = [FI_POWER_INSTANT, FI_PCIE_TX_BYTES, FI_PCIE_RX_BYTES].map(|id| Field { id, ..Field::default() });
+                    let n = if pcie { 3 } else { 1 };
+                    let ok = self.fields.is_some_and(|f| f(h, n, fv.as_mut_ptr()) == 0);
+                    let value = |f: &Field| if ok { counter(f) } else { None };
+                    s.power_w = value(&fv[0]).map(|mw| mw as f64 / 1000.0).or_else(|| self.power.filter(|f| f(h, &mut v) == 0).map(|_| v as f64 / 1000.0));
+                    if pcie {
+                        let now = value(&fv[1]).zip(value(&fv[2]));
+                        let dt_s = t_ns.saturating_sub(last.pcie_ns) as f64 / 1e9;
+                        if let (Some((tx1, rx1)), Some((tx0, rx0))) = (now, last.pcie)
+                            && dt_s > 0.0
+                            && tx1 >= tx0
+                            && rx1 >= rx0
+                        {
+                            s.pcie_tx_mbs = Some((tx1 - tx0) as f64 / MB / dt_s);
+                            s.pcie_rx_mbs = Some((rx1 - rx0) as f64 / MB / dt_s);
+                        }
+                        self.last[i] = Last { pcie_ns: t_ns, pcie: now };
                     }
-                    self.last[i] = Last { t_ns, energy_mj: energy, pcie };
                 }
                 out.push(s);
             }

@@ -382,12 +382,8 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
 
 /// One process from `NtQuerySystemInformation(SystemProcessInformation)`.
 struct SysProc {
-    pid: u32,
-    parent: u32,
-    name: String,
+    info: super::ProcInfo,
     create: i64,
-    cpu_ns: u64,
-    private_bytes: u64,
 }
 
 /// The x64 layout of SYSTEM_PROCESS_INFORMATION up to PagefileUsage (private commit).
@@ -424,7 +420,7 @@ struct SysProcRaw {
     pagefile: usize,
 }
 
-fn system_processes() -> Vec<SysProc> {
+fn system_processes(names: bool) -> Vec<SysProc> {
     use std::cell::RefCell;
     use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
     thread_local! {
@@ -448,18 +444,22 @@ fn system_processes() -> Vec<SysProc> {
         let mut off = 0usize;
         loop {
             let p = &*(base.add(off) as *const SysProcRaw);
-            let name = if p.name.is_null() {
-                if p.pid == 0 { "Idle".to_string() } else { String::new() }
-            } else {
-                String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2))
+            let name = match (names, p.name.is_null()) {
+                (false, _) => String::new(),
+                (true, true) => if p.pid == 0 { "Idle".to_string() } else { String::new() },
+                (true, false) => String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2)),
             };
             out.push(SysProc {
-                pid: p.pid as u32,
-                parent: p.parent as u32,
-                name,
+                info: super::ProcInfo {
+                    pid: p.pid as u32,
+                    parent: p.parent as u32,
+                    name,
+                    cpu_ns: (p.user as u64 + p.kernel as u64) * 100,
+                    cycles: p.cycles,
+                    private_bytes: p.pagefile as u64,
+                    threads: p.threads,
+                },
                 create: p.create,
-                cpu_ns: (p.user as u64 + p.kernel as u64) * 100,
-                private_bytes: p.pagefile as u64,
             });
             if p.next == 0 {
                 break;
@@ -470,23 +470,26 @@ fn system_processes() -> Vec<SysProc> {
     })
 }
 
-pub fn all_processes() -> Vec<ProcTimes> {
-    system_processes()
-        .into_iter()
-        .map(|p| ProcTimes { pid: p.pid, parent: p.parent, name: p.name, cpu_ns: p.cpu_ns, private_bytes: p.private_bytes })
-        .collect()
+pub fn all_processes() -> Vec<super::ProcInfo> {
+    system_processes(true).into_iter().map(|p| p.info).collect()
 }
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
-    let all = system_processes();
-    let Some(r) = all.iter().position(|p| p.pid == root) else { return Vec::new() };
+    let all = system_processes(false);
+    let Some(r) = all.iter().position(|p| p.info.pid == root) else { return Vec::new() };
+    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
+    for (i, p) in all.iter().enumerate() {
+        if p.info.parent != p.info.pid {
+            children.entry(p.info.parent).or_default().push(i);
+        }
+    }
     let mut out = vec![root];
     let mut stack = vec![r];
     while let Some(i) = stack.pop() {
         let parent = &all[i];
-        for (j, c) in all.iter().enumerate() {
-            if c.parent == parent.pid && c.pid != parent.pid && c.create >= parent.create && !out.contains(&c.pid) {
-                out.push(c.pid);
+        for &j in children.get(&parent.info.pid).map(Vec::as_slice).unwrap_or(&[]) {
+            if all[j].create >= parent.create && out.len() <= all.len() {
+                out.push(all[j].info.pid);
                 stack.push(j);
             }
         }
@@ -494,15 +497,23 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
     out
 }
 
-pub fn thread_cpu_ns() -> u64 {
-    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
-    unsafe {
-        let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
-        if GetThreadTimes(GetCurrentThread(), &mut c, &mut e, &mut k, &mut u) == 0 {
-            return 0;
-        }
-        ft(&k) + ft(&u)
-    }
+/// Idle cycles per logical CPU of processor group 0 (SystemProcessorIdleCycleTimeInformation).
+pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
+    use windows_sys::Wdk::System::SystemInformation::NtQuerySystemInformation;
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
+    out.resize(n, 0);
+    let mut len = 0u32;
+    let rc = unsafe { NtQuerySystemInformation(83, out.as_mut_ptr() as *mut _, (n * 8) as u32, &mut len) };
+    out.truncate(len as usize / 8);
+    rc >= 0
+}
+
+pub fn thread_cycles() -> u64 {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+    let mut c = 0u64;
+    unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
+    c
 }
 
 pub fn enable_ansi() -> bool {
@@ -530,6 +541,10 @@ pub fn on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) {
         0
     }
     if TARGET.swap(flag as *const _ as *mut _, Ordering::SeqCst).is_null() {
-        unsafe { SetConsoleCtrlHandler(Some(handler), 1) };
+        unsafe {
+            // A process started in a new process group inherits "ignore Ctrl+C": undo that.
+            SetConsoleCtrlHandler(None, 0);
+            SetConsoleCtrlHandler(Some(handler), 1);
+        }
     }
 }

@@ -1,12 +1,12 @@
 # strobe
 
-Measure and explain performance: a web page, an Electron app (including the installed OpenCode desktop), a Bun or Node process, or any process. strobe records everything on one clock, refuses measurements it cannot defend, and gives you, or your agent, a verdict with handles to drill into.
+Measure and explain performance: a web page, an Electron app, a Bun or Node process, or any process. strobe records everything on one clock, refuses measurements it cannot defend, and gives you, or your agent, a verdict with handles to drill into. It knows no product: what an app under test needs (how to build, serve or launch it in isolation) lives in that app's own `strobe.json`.
 
 > Pre-release. The design is in [SPEC.md](SPEC.md); nothing is built yet.
 
 ```
 strobe bench perf/timeline.bench.ts --base origin/dev --head .   # did my change help?
-strobe record app:opencode --for 10s                             # what is the installed app doing?
+strobe record app:desktop --for 10s                              # what is the installed app doing?
 strobe query rec_3f9a hotspots --by package --phase scroll       # where did the time go?
 strobe query rec_3f9a memory --by process                        # where is the memory?
 strobe report bench-summary exp_8c21 --open                      # a page to share

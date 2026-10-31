@@ -47,9 +47,23 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     }
 }
 
-/// Every process on the machine with CPU times and private bytes, from one system snapshot
-/// (no process is opened, so protected processes are included).
-pub fn all_processes() -> Vec<ProcTimes> {
+/// One process from a system snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct ProcInfo {
+    pub pid: u32,
+    pub parent: u32,
+    pub name: String,
+    /// Kernel + user time, in ns; the OS updates it per clock tick (15.6 ms on Windows).
+    pub cpu_ns: u64,
+    /// CPU cycles charged at context switches (TSC units on x64), exact where `cpu_ns` is coarse.
+    pub cycles: u64,
+    pub private_bytes: u64,
+    pub threads: u32,
+}
+
+/// Every process on the machine, from one system snapshot (no process is opened, so protected
+/// processes are included).
+pub fn all_processes() -> Vec<ProcInfo> {
     #[cfg(windows)]
     {
         win::all_processes()
@@ -74,11 +88,39 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
     }
 }
 
-/// CPU time used so far by the calling thread, in nanoseconds.
-pub fn thread_cpu_ns() -> u64 {
+/// Idle cycles (TSC units) so far per logical CPU; a CPU's busy share over an interval is
+/// `1 - Δidle / Δtsc`. False when unavailable.
+pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     #[cfg(windows)]
     {
-        win::thread_cpu_ns()
+        win::idle_cycles(out)
+    }
+    #[cfg(not(windows))]
+    {
+        out.clear();
+        false
+    }
+}
+
+/// The time stamp counter (x64), the unit of `ProcInfo::cycles`; None on other architectures.
+pub fn tsc() -> Option<u64> {
+    #[cfg(target_arch = "x86_64")]
+    {
+        #[allow(unused_unsafe)]
+        Some(unsafe { std::arch::x86_64::_rdtsc() })
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        None
+    }
+}
+
+/// CPU cycles charged so far to the calling thread (TSC units on x64; see `tsc`). Exact, where
+/// thread times move in 15.6 ms clock ticks.
+pub fn thread_cycles() -> u64 {
+    #[cfg(windows)]
+    {
+        win::thread_cycles()
     }
     #[cfg(not(windows))]
     {

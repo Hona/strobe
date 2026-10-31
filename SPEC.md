@@ -1,7 +1,7 @@
 # strobe — spec
 
-`strobe` measures and explains performance: a web page, an Electron app (including the installed
-OpenCode desktop, Stable channel), a Bun or Node process, or any process by PID. It records
+`strobe` measures and explains performance: a web page, an Electron app (installed or packaged,
+launched in isolation from an app profile), a Bun or Node process, or any process by PID. It records
 everything on one clock, refuses measurements it cannot defend, and gives people and agents a
 verdict plus handles to drill into.
 
@@ -53,6 +53,12 @@ When a design change is agreed, update this file in the same change.
     with more pairs, stress comes from bigger workloads (`params`), and slow hardware is measured
     on slow hardware (`--on`). The `Throttled` validator (§10.1) catches a slowed target from any
     cause.
+15. **Generic: strobe knows no product it measures.** Apps under test are consumers. What one of
+    them needs (its install path, env vars, seed files, the user state to guard, URL schemes it
+    registers, how to build and serve it, its mocks and benches) lives in that app's own repo:
+    `strobe.json` (`apps`, `build`, `serve`) and its bench files. Strobe has mechanisms, never a
+    product's names. The only product-specific code is on the using side: registering strobe's
+    MCP and skill with the agent harness that drives it (§5.3), as mesh does.
 
 ## 2. Invariants
 
@@ -180,11 +186,11 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 |---|---|
 | `https://…`, `http://…` | a page in a strobe-launched Chromium: isolated profile, real GPU, fixed window (§13.1) |
 | `cdp:<port>`, `cdp:ws://…` | a running CDP endpoint (Playwright's, a dev Electron's) |
-| `app:opencode`, `app:opencode-beta`, `app:opencode-dev` | OpenCode desktop: attached through the bridge or a debug port (§13.2, §13.3); `--launch` starts an isolated copy |
-| `exe:<path>` | launch a packaged Electron app in an isolated home |
+| `app:<id>` | an Electron app by its profile in strobe.json `apps` (§13.2): launched in an isolated home, or attached through its bridge (§13.3) |
+| `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app |
 | `node:<port>`, `bun:<port>` | an inspector endpoint (§13.5) |
 | `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, deep (§13.6) |
-| `file:<path>` | import an existing capture: a Chrome trace, `.cpuprofile`, `.heapsnapshot`, or an OpenCode `opencode-heap-*` folder (§8.7) |
+| `file:<path>` | import an existing capture: a Chrome trace, `.cpuprofile`, `.heapsnapshot`, or a folder of them with a `manifest.json` (§8.7) |
 | `<target>@<device>` | run on a mesh device through `mesh exec`; results come back tagged with the device |
 
 ### 5.2 Exit codes
@@ -226,9 +232,9 @@ $ strobe up
 strobe up · adais
   ✓ cpu        Ryzen 9 9950X3D · 16C/32T · CCD0 V-Cache (96 MB L3), CCD1 (32 MB L3)
   ! power      Balanced (kept; bench --power high switches it for the run)
-  ✓ gpu        RTX 5070 Ti · NVML ok · PDH GPU Engine ok
+  ✓ gpu        RTX 5070 Ti · NVML ok · D3DKMT ok
   ✓ displays   2 · 144 Hz, 60 Hz
-  ✓ targets    OpenCode (Stable) · OpenCode Beta · Chrome
+  ✓ targets    Chrome · 2 app profiles installed
   ✓ engine     trace_processor <version> · sha256 ok
   ! helper     deep mode needs admin: approve the UAC prompt
   ✓ daemon     running · starts at login
@@ -273,6 +279,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
+             [--why auto|always|never] [--trace lean|full] [--power keep|high]
              [--require-verdict] [--json]
 ```
 
@@ -287,7 +294,7 @@ Text output (a full example):
 ```
 strobe bench timeline.bench.ts · scroll · desktop · turns=200   base origin/dev@8b4d98c   head lazy-tooltip@98acaa3
 env    Windows 11 26100 · Ryzen 9 9950X3D 16C/32T · RTX 5070 Ti
-       OpenCode desktop Stable (bridge) · window 1600×1000 @1.5x · display 144 Hz
+       app:desktop (isolated launch) · window 1600×1000 @1.5x · display 144 Hz
 plan   pinned CCD0 (V-Cache) · power plan High performance (restored) · visible, unoccluded
 blocks 8 pairs (16 fresh launches) · warmup until steady · 5 runs per block · stopped: primary decided
 probes timing: frames, toplevel threads, os, gpu · overhead 0.6% main thread
@@ -418,6 +425,16 @@ phase.
 Sets: `timing` = frames, threads, os, gpu. `attribution` = cpu, alloc, invalidation,
 counters. `memory` = census, heap. `deep` = deep. Probes can be listed one by one.
 
+Bench timing blocks trace **lean**: only `disabled-by-default-devtools.timeline.frame`
+(PipelineReporter), `input.scrolling` (EventLatency, every input type), `blink.user_timing`
+(marks) and `__metadata`. The full timeline set records `RunTask` on every thread of every process
+(340,000 of 1.1 million slices in a 22 s scroll block), which costs the target main-thread time:
+lean traces measured scroll `main.busy` 12% lower on the same build, and cut trace plus analysis
+from 4.0 s to under 1 s per block. Renderer main-thread busy then comes from
+`Performance.getMetrics` `TaskDuration` per run (it agreed with the trace's `RunTask` sum within
+0.06 pp on every block checked). `--trace full` keeps the full set; `record` and attribution blocks
+always trace full.
+
 ### 8.2 Overhead
 
 Every experiment measures its timing overhead: one empty-probe block per variant (the case with
@@ -437,16 +454,20 @@ that strobe installs with `Page.addScriptToEvaluateOnNewDocument` in attribution
 
 ### 8.5 OS and GPU sampling
 
-Default 10 ms for per-core and per-process CPU, 100 ms for memory, GPU engines and VRAM.
-Samplers run in the daemon, read OS APIs directly, and never spawn processes (§13.6).
+One sampler thread, 100 ms ticks: per-CPU busy, and GPU engine time and VRAM for the target's
+process tree. CPU frequency and Task Manager's utility once a second. The tree is re-read every
+second, or less often so the re-read stays under 0.2% of a core. Budget: 0.5% of one core, and
+the sampler measures its own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers
+read OS APIs directly and never spawn processes (§13.6). Bench blocks and recordings report
+`gpu.process.3d` (per run) and `gpu.vram` (after the runs); processes the sampler cannot open are
+listed, never counted as 0.
 
 ### 8.6 Memory: census and heap snapshots
 
-The memory probes generalize OpenCode desktop's "Capture heap snapshots" command
-(`packages/gui-plugins/src/debug/main.ts`), which already writes, in Stable too, one folder with
-the desktop server's heap, every window's heap, the main process's heap, a memory-infra dump,
-per-window page stats, `app.getAppMetrics()` before and after, and GPU info. strobe keeps what
-that command gets right and adds what makes it a measurement.
+The memory probes generalize what a good in-app "capture heap snapshots" command writes (one
+folder with a backend's heap, every window's heap, the main process's heap, a memory-infra dump,
+per-window page stats, `app.getAppMetrics()` before and after, and GPU info) and add what makes
+it a measurement.
 
 **Census** (attribution, one moment):
 
@@ -470,7 +491,7 @@ Rules:
 
 **Heap snapshots** (attribution only):
 
-- One process at a time, as the desktop command does: a snapshot can double a process's memory.
+- One process at a time: a snapshot can double a process's memory.
   Main last when the bridge serializes its own process.
 - Post-GC by construction. Never in a timing block; the target pauses while it serializes.
 - Sensitive (rule 9): stored gzip, owner-only. Views return classes, counts, sizes, dominators
@@ -490,7 +511,7 @@ Rules:
 ### 8.7 Imports (`file:`)
 
 `strobe record file:<path>` turns an existing capture into a recording: a Chrome trace (JSON or
-proto), a `.cpuprofile`, a `.heapsnapshot`, or an `opencode-heap-*` folder (read through its
+proto), a `.cpuprofile`, a `.heapsnapshot`, or a folder of them (read through its
 `manifest.json`). Imported recordings get `valid: unknown`: nothing proves how they were taken.
 They work with every view, never with `bench`.
 
@@ -518,12 +539,25 @@ flowchart LR
   same time.
 - **Order**: blocks alternate A B, B A, A B, …, so drift and launch-to-launch noise hit both
   variants equally (as `packages/desktop/script/bench-startup.ts --compare` does).
-- **Warmup**: runs until the last 3 primary values spread less than 5%, at most 10. The first
-  run of each block is kept as `cold` and reported apart.
+- **Warmup** decides on work, never wall time: a fixed-speed scroll or paced typing takes the same
+  time cold or warm, while the work it costs settles over 1–4 runs (measured: scroll's main thread
+  17.3% → 15.7% after one run; streaming 7.2% → 5.4% after three). After every run strobe reads the
+  renderer's main-thread task time (`Performance.getMetrics` `TaskDuration`, a cumulative counter).
+  Warmup ends when two consecutive runs do the same work within 5%; both count as measured, and
+  the block runs until `--runs` are measured. Runs before are relabelled `warm:<i>` in the trace.
+  After 10 unsteady runs strobe measures anyway and warns `NotSteady` (the case's state grows:
+  add a reset). Attribution blocks start their profiler at the steady point and measure the
+  runs after it.
 - **Stop rule** (`--pairs auto`): at least 6 pairs, then after each pair: stop when the primary
   has a verdict; stop as `underpowered` when the estimated pairs needed exceed the maximum
   (default 40) or `--max-time`.
-- **Attribution blocks**: one per variant after timing, same case, with the attribution probes.
+- **Attribution blocks**: one per variant after timing, same case, with the attribution probes,
+  only when the primary differs (`--why auto`): a `same` or `underpowered` result has nothing to
+  explain. `--why always` runs them for every series, `--why never` skips them.
+- **Time**: every block logs how long each step took (launch, attach, prepare, load, checks,
+  setup, warmup, runs, trace, analyse, close); the result keeps the mean per step and the
+  series' wall time, so where a bench's time goes is never a guess. On adais (October 2026) a
+  2.7 s scroll case costs 22 s per block, of which 1.6 s is not runs.
 
 ### 9.2 Unit of analysis
 
@@ -543,9 +577,11 @@ flowchart LR
 - **Verdicts**: interval entirely on the better side of 0 → `faster` (`less`, `fewer`); tagged
   `small` when it also overlaps the bound. Entirely on the worse side → `slower`. Inside the
   bound → `same`. Otherwise `unclear`.
-- **Coverage**: a verdict needs an interval that reaches the confidence level. Below 6 pairs the
-  signed-rank interval is `[min, max]` of the Walsh averages and covers only `1 − 2^(1−n)` (50% at
-  2 pairs, 94% at 5), so it never gets a verdict; `--pairs N` below 6 is a smoke run (`FewPairs`).
+- **Coverage**: the interval is `[W(c), W(m−1−c)]` of the m sorted Walsh averages (0-based), with
+  c the largest value where `P(T ≤ c) ≤ α/2`; it covers `1 − 2·P(T ≤ c)` (96.9% at 6 pairs). A
+  verdict needs an interval that reaches the confidence level. Below 6 pairs no such c exists:
+  `[min, max]` covers only `1 − 2^(1−n)` (50% at 2 pairs, 94% at 5), so it never gets a verdict;
+  `--pairs N` below 6 is a smoke run (`FewPairs`).
 - **Gate**: secondary metrics get verdict words only after the primary has a verdict
   (`faster`, `slower` or `same`), with Holm correction across secondaries. Otherwise they show
   intervals without verdicts.
@@ -576,25 +612,28 @@ validity verdict, strobe version.
 
 ### 9.5 Variants and builds
 
-Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`):
+Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`). It is the
+consumer's file, in the consumer's repo (rule 15). A user's own `<state>/strobe.json` sits under
+it, for app profiles they use from anywhere; `apps` merge per app.
 
 ```jsonc
 {
   "$schema": "https://raw.githubusercontent.com/Hona/strobe/main/schema/strobe.v1.json",
   "build": {
     "command": "bun run build",
-    "cwd": "packages/app",
-    "output": "packages/app/dist",
-    "env": { "VITE_OPENCODE_TEST_FIXTURES": "1" }
+    "cwd": "packages/web",
+    "output": "packages/web/dist",
+    "env": { "VITE_SOURCEMAP": "1" }
   },
   "serve": {
-    "command": "bun e2e/utils/serve.ts --host 127.0.0.1 --port {port}",
-    "cwd": "packages/app",
+    "command": "bun serve.ts --host 127.0.0.1 --port {port}",
+    "cwd": "packages/web",
     "ready": "http://127.0.0.1:{port}/"
   },
-  "benches": ["packages/app/perf/**/*.bench.ts"],
+  "apps": { "desktop": { "exe": { "windows": "%LOCALAPPDATA%/Programs/my-app/My App.exe" } } },
+  "benches": ["packages/web/perf/**/*.bench.ts"],
   "metrics": { "equivalence": "2%" },
-  "packages": { "groups": { "@kobalte/*": "kobalte" } }
+  "packages": { "groups": { "@radix-ui/*": "radix" } }
 }
 ```
 
@@ -613,45 +652,45 @@ Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`
 A benchmark is a small TypeScript file, in the spirit of BenchmarkDotNet:
 
 ```ts
-// packages/app/perf/timeline.bench.ts
+// packages/web/perf/feed.bench.ts (in the consumer's repo)
 import { bench, web, app } from "@strobe/bench"
-import { mockTimelineSession } from "../e2e/performance/timeline/session-timeline-benchmark.fixture"
+import { mockFeed } from "../e2e/mocks"
 
 export default bench({
   targets: {
     web: web({
       viewport: { width: 1366, height: 768 },
       prepare: ({ playwright, params, url }) =>
-        mockTimelineSession(playwright.page, { historyTurns: params.turns, server: new URL(url).origin }),
+        mockFeed(playwright.page, { items: params.items, server: new URL(url).origin }),
     }),
-    desktop: app("opencode", { home: "perf/fixtures/home-{turns}" }),
+    desktop: app("desktop", { home: "perf/fixtures/home-{items}" }),
   },
-  params: { turns: [24, 200] },
+  params: { items: [24, 200] },
   async setup({ page, prepared }) {
-    await page.goto(prepared.path, { until: "[data-timeline-row]" })
+    await page.goto(prepared.path, { until: "[data-feed-row]" })
     await page.idle()
   },
   cases: {
     scroll: {
       primary: "main.busy",
       async run({ page, phase }) {
-        await phase("up", () => page.scroll("[data-timeline]", { by: -4000, speed: 3000 }))
-        await phase("down", () => page.scroll("[data-timeline]", { by: 4000, speed: 3000 }))
+        await phase("up", () => page.scroll("[data-feed]", { by: -4000, speed: 3000 }))
+        await phase("down", () => page.scroll("[data-feed]", { by: 4000, speed: 3000 }))
       },
     },
     type: {
       primary: "interaction.p95",
-      run: ({ page }) => page.type("[data-component=composer-editor]", "Refactor the timeline", { delay: 80 }),
+      run: ({ page }) => page.type("[data-composer]", "Reply to the thread", { delay: 80 }),
       async reset({ page }) {
         await page.press("ControlOrMeta+a")
         await page.press("Backspace")
         await page.idle()
       },
     },
-    "switch-session": {
-      primary: "interaction.p95",
-      run: ({ page }) => page.click("[data-session-row]:nth-child(2)", { until: "idle" }),
-      reset: ({ page }) => page.click("[data-session-row]:nth-child(1)", { until: "idle" }),
+    "switch-tab": {
+      primary: "run.duration",
+      run: ({ page }) => page.click("[data-tab]:nth-child(2)", { until: "[data-tab-ready='2']" }),
+      reset: ({ page }) => page.click("[data-tab]:nth-child(1)", { until: "[data-tab-ready='1']" }),
     },
     idle: { primary: "cpu.process.total", run: ({ page }) => page.wait(5_000) },
   },
@@ -671,10 +710,13 @@ export default bench({
 **Fields:**
 
 - `targets`: named targets. `web({ url, prepare?, viewport?, scale? })` is the project's
-  production build served per variant (§9.5) in a strobe-launched Chromium. `app(id, { home? })`
-  is an Electron app: `home` is a seed directory copied into a fresh isolated home for every
-  block (`{param}` placeholders allowed; the seed must open with both variants, so create it
-  with the base build). `exe(path, { home? })` and `url(href)` also exist.
+  production build served per variant (§9.5) in a strobe-launched Chromium. `url` is a path, or
+  a function of what `prepare` returned (`({ prepared }) => prepared.path`), so a block loads its
+  first page once instead of loading `/` and navigating again. `app(id, { home? })`
+  is an Electron app by its profile in strobe.json `apps` (§13.2): `home` is a seed directory
+  copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
+  must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
+  (`app` borrows a profile) and `url(href)` also exist.
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
@@ -875,31 +917,59 @@ resolve to native symbols; the residue stays visible as `unresolved`.
   is read from the OS for that window.
 - Isolated profile per launch.
 
-### 13.2 OpenCode desktop and the bridge
+### 13.2 Electron apps: isolated launches and app profiles
 
-Finding the app: the same install locations mesh searches for the desktop (stable and Beta app
-ids on each OS). Dev and Beta builds open a debug port from
-`OPENCODE_DESKTOP_REMOTE_DEBUGGING_PORT` (`packages/desktop/src/main/diagnostics/options.ts`);
-strobe uses it there. Stable never opens one, so strobe uses the bridge.
+Strobe launches any Electron app the same way, with no change to the app:
 
-`--launch` starts an isolated copy. **`OPENCODE_DESKTOP_TEST_ROOT` alone is not isolation**: the
-desktop deletes `XDG_STATE_HOME` on Windows, so the copy registers itself as the user's background
-service and replaces it (it happened while building strobe). Launches follow
-`packages/desktop/script/bench-startup.ts` exactly:
+- **A fresh private home per launch**: `AppData/Roaming`, `AppData/Local/Temp`, `.local/share`,
+  `.local/state`, `.config`, `.cache`, with `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`,
+  `TEMP`, `TMP` and `XDG_*_HOME` pointing into it. Every path an app derives from those (its
+  profile, single-instance lock, caches, its own background services' state) lands in the home,
+  so the app's identity or channel does not matter.
+- `--remote-debugging-port=0`; strobe finds `DevToolsActivePort` wherever the app's userData
+  folder is inside the home (a stale one from a seed is removed first).
+- **`LiveChannel`**: refuses when the executable is already running, or when a guarded process
+  (below) runs from the app's install folder or a data folder of the same name. The user's own
+  app is never the thing to experiment on.
+- On close, every process running from the home is killed (detached children outlive the tree),
+  then the home is deleted.
 
-- a fresh home per launch with `AppData/Roaming`, `AppData/Local/Temp`, `.local/share/opencode`,
-  `.local/state`, `.config/opencode`, and `.config/opencode/service.json` = `{ "port": <free port> }`
-  (a private service port);
-- env: every `OPENCODE_*`, `OTEL_*` and `SENTRY_*` variable removed, then `USERPROFILE`, `HOME`,
-  `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`,
-  `OPENCODE_DB`, `OPENCODE_CONFIG_DIR` pointing into that home; `HTTPS_PROXY=http://127.0.0.1:9`
-  for Beta and Stable (update checks fail fast and offline);
-- **service guard**: strobe reads the user's `~/.local/state/opencode/service.json` (pid, url)
-  before every launch and after every close. A changed pid or a service that stops answering
-  stops the experiment at once, kills the launched app, and exits 1 with what happened. Never
-  measure past a disturbed user service.
+What one app needs beyond that is its **app profile**, in the consumer's strobe.json (rule 15):
 
-**The bridge** (`@strobe/electron`, schema `bridge.v1.json`):
+```jsonc
+"apps": {
+  "desktop": {
+    "exe": { "windows": "%LOCALAPPDATA%/Programs/my-app/My App.exe", "macos": "/Applications/My App.app/Contents/MacOS/My App" },
+    // In the launched copy: {home} is its private home, {port} a free port.
+    "env": { "MY_APP_DB": "{home}/.local/share/my-app/app.db", "HTTPS_PROXY": "http://127.0.0.1:9" },
+    "unset": ["MY_APP_*", "OTEL_*"],
+    "dirs": [".local/share/my-app"],
+    "files": { ".config/my-app/service.json": { "port": "{port}" } },
+    // The user's own state, which must not change while a copy runs.
+    "guard": [{ "file": "~/.local/state/my-app/service.json", "pid": "pid", "url": "url" }],
+    "protocols": ["my-app"]
+  },
+  "desktop-beta": { "extends": "desktop", "exe": { "windows": "%LOCALAPPDATA%/Programs/my-app-beta/My App Beta.exe" } }
+}
+```
+
+- `exe`: a path or one per OS; `~`, `%VAR%` and `${VAR}` expand from the real user's environment.
+- `env`, `unset` (exact names or `PREFIX*`), `dirs` and `files` (JSON or text; a string that is
+  exactly `{port}` becomes a number) shape the copy.
+- **`guard`**: before launch strobe reads each file (and the `pid` and `url` its JSON names).
+  While the app starts, after its window opens and after every close, the file must be unchanged,
+  the process alive and the URL answering. Otherwise the experiment stops at once, kills the copy
+  and exits 1: an isolation gap in the profile. Never measure past disturbed user state.
+- **`protocols`**: URL schemes the app registers on start live in the per-user registry
+  (`HKCU\Software\Classes`), which no environment variable redirects. Strobe exports each key
+  into the home before launch and restores it (or deletes it, if it was absent) on close.
+- `extends` merges a parent profile (objects merge per key).
+- `app:<id>` launches a profile; `exe:<path>` with a profile (`exe(path, { app })` in a bench,
+  `--app <id>` on `record`) launches another build of the same app, such as a source build packed
+  with the app's own build flags.
+
+**The bridge** (`@strobe/electron`, schema `bridge.v1.json`), for apps that never open a debug
+port in production:
 
 ```mermaid
 sequenceDiagram
@@ -918,20 +988,20 @@ sequenceDiagram
 
 - The app connects out; it never listens on a port. The socket is the daemon's per-user bridge
   pipe (`\\.\pipe\strobe-<SID>-bridge`) or `<state>/bridge.sock`, readable by that user only.
-- Off by default. The app decides who can turn it on and shows that it is on (an OpenCode product
-  decision, §21).
+- Off by default. The embedding app decides who can turn it on and shows that it is on (its
+  product decision, §21).
 - Requests: `windows`, `displays`, `metrics` (`app.getAppMetrics`), `cdp.send` and `cdp.subscribe`
   (through `webContents.debugger`), `tracing.start` / `tracing.stop` (`contentTracing`),
   `memory.census`, `heap.snapshot`, `linked` (processes the app owns, with their own capture
   hooks).
-- OpenCode implements `memory.census` and `heap.snapshot` with the code behind its existing
-  `HeapSnapshots` IPC and the server's `debug.heapDump` endpoint.
+- An app implements `memory.census` and `heap.snapshot` with whatever it already has (an
+  in-app heap-capture command, a backend's heap-dump endpoint); the package ships defaults.
 - Frames: `[kind u8][id u32 LE][len u32 LE][JSON]`, as mesh's mux.
 
-### 13.3 Other Electron apps
+### 13.3 Attaching
 
-`exe:<path>` launches with an isolated home and `--remote-debugging-port=0` (reading
-`DevToolsActivePort`), or attaches through the bridge when the app ships it.
+`app:<id>` attaches through the bridge when the app ships it and the user turned it on; otherwise
+strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running debug port.
 
 ### 13.4 Deep mode helper
 
@@ -950,8 +1020,8 @@ sequenceDiagram
 
 - Node: the inspector protocol (`node:<port>`): CPU profile, heap, event loop delay.
 - Bun: the inspector speaks WebKit's protocol; samples and heap through it are a phase 0 spike
-  item (§21). The OpenCode server also exposes `debug.heapDump` (V8-format snapshot through
-  `node:v8`), used through the bridge's `linked` processes.
+  item (§21). An app's backend that exposes a V8-format heap dump is used through the bridge's
+  `linked` processes.
 
 ### 13.6 Outside-in (any process)
 
@@ -959,10 +1029,10 @@ sequenceDiagram
 |---|---|---|---|
 | process CPU, memory | `NtQuerySystemInformation`, PDH Process | `/proc/<pid>/stat`, `smaps_rollup` | `proc_pid_rusage`, `task_info` |
 | threads | `NtQuerySystemInformation` | `/proc/<pid>/task/*` | `proc_pidinfo` |
-| per-core load, frequency | PDH Processor Information | `/proc/stat`, cpufreq | `host_processor_info` |
+| per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | `/proc/stat`, cpufreq | `host_processor_info` |
 | topology | `GetLogicalProcessorInformationEx` (L3 per CCD) | sysfs cache | `sysctl hw.perflevel*` |
-| GPU engines per process | PDH GPU Engine | DRM fdinfo | IOReport (spike) |
-| VRAM per process | PDH GPU Process Memory | DRM fdinfo | — |
+| GPU engines per process | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM fdinfo | IOReport (spike) |
+| VRAM per process | D3DKMT committed bytes in dedicated and shared segments (PDH `Dedicated Usage` also counts allocations opened from other processes) | DRM fdinfo | — |
 | device clocks, power, PCIe | NVML, ADLX | NVML, sysfs | IOReport (spike) |
 | displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow` | DRM / XRandR (spike) | CGDisplay |
 | adapter per window | D3DKMT + DXGI | — | Metal |
@@ -1104,15 +1174,15 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - trace_processor (prebuilts verified: v59.1 ships Windows x64, Linux and macOS): ingest of a
   Chrome proto trace with appended strobe packets; JSON from `contentTracing`; V8 CPU samples
   inside Chrome traces; memory-infra effective sizes.
-- The trace categories for presented frames on the Chromium in OpenCode's Electron.
+- The trace categories for presented frames on older Electron Chromiums.
 - Clock domains: Chrome's TimeTicks against QPC (Windows) and `mach_continuous_time` (macOS).
-- V8 code events in ETW for JS frames inside native stacks, on OpenCode's Electron.
+- V8 code events in ETW for JS frames inside native stacks, on Electron.
 - Bun's WebKit inspector: sampling profiler and heap through it.
 - The self-hosted Perfetto UI against a local trace_processor on a port other than its default.
 - Solid's dev hook names for `@strobe/web/solid`.
 - macOS per-process GPU (IOReport); Linux refresh rate under Wayland.
-- OpenCode product decisions for the bridge: where the toggle lives, who can turn it on, the
-  indicator.
+- Each embedding app's product decisions for the bridge: where the toggle lives, who can turn it
+  on, the indicator.
 
 ## 22. Phases
 
@@ -1121,10 +1191,10 @@ Phase 0 runs two tracks in parallel.
 | Phase | Deliverable | Manual check |
 |---|---|---|
 | 0a | Spike: CDP proto trace + strobe counter packets → trace_processor; presented frames by SQL | `strobe record https://… --for 5s`, then `strobe query rec_… sql "…"` returns frames and a strobe counter |
-| 0b | Bridge spike: `@strobe/electron` in a dev OpenCode desktop; `windows`, `cdp.send`, `memory.census` and `heap.snapshot` through the existing `HeapSnapshots` code | `strobe record app:opencode-dev --probes memory` writes a census and per-process snapshots |
+| 0b | Bridge spike: `@strobe/electron` in a dev build of a consumer's Electron app; `windows`, `cdp.send`, `memory.census` and `heap.snapshot` through the app's existing heap-capture code | `strobe record app:<id> --probes memory` writes a census and per-process snapshots |
 | 1 | Daemon, MCP, skill, `up`/`leave`, `status` with validity preflight, calibration page | agent on adais calls `status`; calibration passes |
-| 2 | `bench`: bench files, runner, `page` driver, variants, blocks and pairs, statistics, verdicts, validators, A/A | A/A on `timeline.bench.ts` stays at the nominal rate; the claims of our merged perf PRs are re-checked |
-| 3 | OpenCode Stable through the bridge (desktop change behind the opt-in), census and leaks | `strobe bench … --target app:opencode` on Stable |
+| 2 | `bench`: bench files, runner, `page` driver, variants, blocks and pairs, statistics, verdicts, validators, A/A | A/A on a consumer's bench stays at the nominal rate; claims of merged perf PRs are re-checked |
+| 3 | A production Electron app through the bridge (an opt-in in the app), census and leaks | `strobe bench … --target app:<id>` on a production build |
 | 4 | OS and GPU samplers, viewer, reports, symbols, imports | `strobe report memory-timeline` replaces a hand-built page |
 | 5 | Insights, bisect, `top`, flight recorder | `bench --bisect` finds a planted regression |
 | 6 | Deep helper (ETW, perf), native symbols, core residency | `(program)` under 5% on the calibration page with `deep` |

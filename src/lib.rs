@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod cli;
+pub mod config;
 pub mod driver;
 pub mod engine;
 pub mod host;

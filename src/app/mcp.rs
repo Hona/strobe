@@ -16,7 +16,7 @@ pub const DEFAULT_PORT: u16 = 47575;
 
 pub fn instructions() -> String {
     let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "strobe".into());
-    format!("strobe: measure performance (web pages, Electron apps incl. installed OpenCode, any process). Load the \"strobe\" skill before using strobe tools. CLI: {exe}")
+    format!("strobe: measure performance (web pages, Electron apps, any process). Load the \"strobe\" skill before using strobe tools. CLI: {exe}")
 }
 
 fn tools() -> Value {
@@ -38,6 +38,7 @@ fn tools() -> Value {
             "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
             "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks"),
             "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("keep (default) or high (High performance plan for the run, restored after)"),
+            "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
             "timeout": n("seconds before returning while it keeps running (default 600)") } } },
         { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (by function|file|package; attribution recordings), sql (Perfetto trace_processor SQL), progress (running experiments).",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {

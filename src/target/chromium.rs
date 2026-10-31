@@ -267,6 +267,7 @@ impl Browser {
             for pid in crate::host::win::running_under(&p) {
                 super::electron::kill_tree(pid);
             }
+            super::electron::restore_protocols(&p);
             // Chromium may hold files for a moment after exit.
             for _ in 0..20 {
                 if std::fs::remove_dir_all(&p).is_ok() {

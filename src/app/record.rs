@@ -26,29 +26,32 @@ pub fn run(args: &Args) -> Result<Output> {
         None => 10_000,
     };
     let attach = target.starts_with("cdp:") || target.starts_with("ws://");
-    let app_exe = if let Some(id) = target.strip_prefix("app:") {
-        Some(electron::find_app(id).ok_or_else(|| Error::usage(format!("{id} is not installed (known: opencode, opencode-beta, opencode-dev)")))?)
-    } else {
-        target.strip_prefix("exe:").map(std::path::PathBuf::from)
+    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
+    // `exe:<path> --app <id>` borrows an app profile for another build of that app.
+    let app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
+        (Some(id), _, _) => Some(electron::app(id, &config)?),
+        (_, Some(path), Some(id)) => Some(electron::app(id, &config)?.with_exe(std::path::Path::new(path))),
+        (_, Some(path), None) => Some(electron::App::bare(std::path::Path::new(path))),
+        _ => None,
     };
-    if !attach && app_exe.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {
+    if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, app:<id>, exe:<path>, cdp:<port> or file:<path>")));
     }
-    let mut service = None;
+    let mut guard = None;
     let browser = if attach {
         chromium::attach(&target)?
-    } else if let Some(exe) = &app_exe {
-        progress(format!("launching {} in an isolated home", exe.display()));
-        let (b, before) = electron::launch(exe, args.get("home").map(std::path::Path::new), &Window::default(), None)?;
-        service = Some(before);
+    } else if let Some(app) = &app {
+        progress(format!("launching {} in an isolated home", app.exe.display()));
+        let (b, g) = electron::launch(app, args.get("home").map(std::path::Path::new), &Window::default(), None)?;
+        guard = Some(g);
         b
     } else {
         chromium::launch(&Window::default(), args.has("headless"), None, &[])?
     };
     let gpu = validity::software_gpu(&browser);
-    let page = if app_exe.is_some() { electron::main_page(&browser)? } else { browser.page()? };
-    if let Some(before) = &service {
-        electron::guard(before, "after the app opened its window")?;
+    let page = if app.is_some() { electron::main_page(&browser)? } else { browser.page()? };
+    if let Some(g) = &guard {
+        g.check("after the app opened its window")?;
         // The app loads itself; give it time to settle before recording.
         std::thread::sleep(Duration::from_secs(3));
     } else if !attach {
@@ -66,6 +69,7 @@ pub fn run(args: &Args) -> Result<Output> {
         probe::cpu::start(&page)?;
     }
     std::thread::sleep(Duration::from_millis(300));
+    let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
     let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let t0 = host::now_ns();
     driver.mark("run:0:start")?;
@@ -74,6 +78,7 @@ pub fn run(args: &Args) -> Result<Output> {
     driver.mark("run:0:end")?;
     let t1 = host::now_ns();
     let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+    let os = sampler.map(|s| s.stop().window(t0, t1));
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
@@ -83,8 +88,8 @@ pub fn run(args: &Args) -> Result<Output> {
     if !attach {
         browser.close();
     }
-    if let Some(before) = &service {
-        electron::guard(before, "after the app closed")?;
+    if let Some(g) = &guard {
+        g.check("after the app closed")?;
     }
     progress("reading the trace");
     let data = metrics::read(&dir.join("trace.pftrace"), &token)?;
@@ -92,10 +97,16 @@ pub fn run(args: &Args) -> Result<Output> {
     if !attach && t1 > t0 {
         extra.entry("cpu.app.total".into()).or_default().insert("run:0".into(), 100.0 * (cpu1 - cpu0) as f64 / (t1 - t0) as f64);
     }
-    let values = metrics::block_values(&data, "run", &extra);
+    if let Some(p) = os.as_ref().and_then(|o| o.gpu_3d_pct) {
+        extra.entry("gpu.process.3d".into()).or_default().insert("run:0".into(), p);
+    }
+    let mut values = metrics::block_values(&data, "run", &extra);
+    if let Some(v) = os.as_ref().and_then(|o| o.vram_dedicated_mb) {
+        values.insert("gpu.vram".into(), v);
+    }
     let meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
-        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values,
+        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
         "created": now_iso(), "valid": true,
     });

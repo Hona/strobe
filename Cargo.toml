@@ -48,6 +48,7 @@ windows-sys = { version = "0.59", features = [
   # OS and GPU sampler: console (top), NVML loaded at runtime, D3DKMT adapter names, NtQuerySystemInformation.
   "Win32_System_Console",
   "Win32_System_LibraryLoader",
+  "Win32_System_WindowsProgramming",
   "Wdk_Graphics_Direct3D",
   "Wdk_System_SystemInformation",
 ] }

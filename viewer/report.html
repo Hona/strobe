@@ -520,9 +520,10 @@ function hodgesLehmann(d) {
   } else {
     c = Math.floor((n * (n + 1)) / 4 - 1.959963984540054 * Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24) - 0.5)
   }
+  // [W(c), W(m-1-c)] covers 1 - 2·P(T <= c); below 6 pairs no c exists and [min, max] is shown (src/stats.rs).
   const clamp = (i) => Math.max(0, Math.min(m - 1, i))
-  const loI = clamp(c + 1)
-  const hiI = clamp(m - 1 - (c + 1))
+  const loI = clamp(Math.max(c, 0))
+  const hiI = clamp(m - 1 - Math.max(c, 0))
   return { est, lo: walsh[Math.min(loI, hiI)], hi: walsh[Math.max(loI, hiI)] }
 }
 

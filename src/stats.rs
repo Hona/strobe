@@ -102,7 +102,9 @@ pub fn hodges_lehmann(d: &[f64], confidence: f64) -> (f64, f64, f64, f64) {
     let m = walsh.len();
     let est = if m % 2 == 1 { walsh[m / 2] } else { (walsh[m / 2 - 1] + walsh[m / 2]) / 2.0 };
     let alpha = 1.0 - confidence;
-    // Largest c with P(T <= c) <= alpha/2.
+    // The interval [W(c), W(m-1-c)] (0-based, sorted Walsh averages) covers 1 - 2·P(T <= c), with c
+    // the largest value where P(T <= c) <= alpha/2. When even c = 0 is too likely (fewer than 6
+    // pairs at 95%), no interval reaches the level: [min, max] covers only 1 - 2·P(T = 0).
     let (c, achieved) = if n <= 50 {
         let counts = signed_rank_counts(n);
         let total = 2f64.powi(n as i32);
@@ -115,15 +117,15 @@ pub fn hodges_lehmann(d: &[f64], confidence: f64) -> (f64, f64, f64, f64) {
             acc += cnt;
             c = k as i64;
         }
-        (c, 1.0 - 2.0 * acc / total)
+        if c < 0 { (0, 1.0 - 2.0 * counts[0] / total) } else { (c, 1.0 - 2.0 * acc / total) }
     } else {
         let nf = n as f64;
         let mean = nf * (nf + 1.0) / 4.0;
         let sd = (nf * (nf + 1.0) * (2.0 * nf + 1.0) / 24.0).sqrt();
-        ((mean - normal_quantile(1.0 - alpha / 2.0) * sd - 0.5).floor() as i64, confidence)
+        ((mean - normal_quantile(1.0 - alpha / 2.0) * sd - 0.5).floor().max(0.0) as i64, confidence)
     };
-    let lo_i = (c + 1).clamp(0, m as i64 - 1) as usize;
-    let hi_i = (m as i64 - 1 - (c + 1)).clamp(0, m as i64 - 1) as usize;
+    let lo_i = c.clamp(0, m as i64 - 1) as usize;
+    let hi_i = (m as i64 - 1 - c).clamp(0, m as i64 - 1) as usize;
     (est, walsh[lo_i.min(hi_i)], walsh[hi_i.max(lo_i)], achieved)
 }
 

@@ -65,7 +65,10 @@ function describe() {
   const targets = Object.fromEntries(
     Object.entries(spec.targets ?? {}).map(([name, t]: [string, any]) => [
       name,
-      { kind: t.kind, url: t.url, href: t.href, id: t.id, path: t.path, home: t.home, viewport: t.viewport, scale: t.scale, prepare: !!t.prepare },
+      {
+        kind: t.kind, url: typeof t.url === "function" ? "/" : t.url, href: t.href, id: t.id, path: t.path, app: t.app, home: t.home,
+        viewport: t.viewport, scale: t.scale, prepare: !!t.prepare || typeof t.url === "function",
+      },
     ]),
   )
   const cases = Object.fromEntries(
@@ -109,10 +112,13 @@ async function handle(op: string, args: any) {
       return true
     case "prepare": {
       const target = spec.targets[state.target]
-      if (!target?.prepare) return false
-      state.playwright = await playwright(args.endpoint, args.target)
-      state.prepared = await target.prepare({ params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
-      return true
+      if (target?.prepare) {
+        state.playwright = await playwright(args.endpoint, args.target)
+        state.prepared = await target.prepare({ params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
+      }
+      // A `url` function names the first page from what `prepare` returned, so the block loads one page.
+      const url = typeof target?.url === "function" ? await target.url({ prepared: state.prepared, params: state.params }) : undefined
+      return { url }
     }
     case "setup":
       await spec.setup?.(context())

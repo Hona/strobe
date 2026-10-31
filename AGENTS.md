@@ -6,7 +6,8 @@
 - NEVER write automated tests: no unit, integration, e2e, or any other tests, no test files, no test dependencies, no CI test steps. Verify with the calibration page and A/A runs on real devices (SPEC §10.3, §10.4).
 - Iteration speed first. Smallest change that works.
 - Never experiment on the user's real app data or config. Attach to a running app only to read.
-- NEVER launch an OpenCode desktop build (Stable, Beta, Dev) by hand or in code without the full isolation recipe in SPEC §13.2 (copied from `packages/desktop/script/bench-startup.ts`). `OPENCODE_DESKTOP_TEST_ROOT` alone replaced the user's live opencode service once: the desktop deletes `XDG_STATE_HOME` on Windows. Check the user's service pid before and after.
+- Strobe is generic (SPEC rule 15). Never put a product's names, paths, env vars or quirks in strobe's code or docs: they belong in that product's own `strobe.json` (`apps`, `build`, `serve`) and bench files. The only product-specific code is registering strobe with the agent harness that uses it (`up`/`leave`).
+- NEVER launch a desktop app the user also runs (for example their OpenCode channels) by hand, or through strobe without an app profile whose `guard` covers the user's own state (SPEC §13.2). An app-specific test-root variable alone once replaced the user's live opencode service. Check the guarded state before and after.
 - Never run two benches on one device, and never bench while something heavy (a build, a test suite) runs on it.
 - Rust stable. Well-known crates are fine; give each one a one-line reason in `Cargo.toml` and keep the budgets in SPEC §19.
 
@@ -14,7 +15,7 @@
 
 - Repo lives on the Dev Drive: `D:\Hona\strobe`. Sibling: `D:\Hona\mesh`.
 - The shell PATH may be stale. Absolute paths: cargo `%USERPROFILE%\.cargo\bin`, gh `C:\Program Files\GitHub CLI`, git `C:\Program Files\Git\cmd`. opencode: the desktop install (mesh SPEC §6.4), not on PATH.
-- OpenCode source for the bridge and scenarios: `D:\anomalyco` (worktrees under `D:\anomalyco\worktrees`).
+- A consumer to verify against: the OpenCode repo at `D:\anomalyco` (worktrees under `D:\anomalyco\worktrees`); its `strobe.json` and `packages/app/perf/*.bench.ts` live there, not here.
 
 ## Devices for manual verification
 

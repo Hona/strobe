@@ -10,6 +10,8 @@ pub mod trace;
 #[serde(rename_all = "lowercase")]
 pub enum Set {
     Timing,
+    /// Bench timing blocks: the trace holds only what metrics read (SPEC §8.2).
+    Lean,
     Attribution,
     Memory,
 }

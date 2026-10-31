@@ -239,26 +239,29 @@ pub fn alloc(dir: &Path, by: &str, top: usize) -> Result<Output> {
 /// that forced them (attribution traces carry their stacks): reading geometry after a DOM write makes
 /// the browser lay out mid-script instead of once per frame.
 pub fn layout(dir: &Path, top: usize) -> Result<Output> {
-    let (meta, measured) = measured_runs(dir)?;
+    let meta = attribution_meta(dir)?;
     let sql = format!(
         "{}
+select k, null, null, null, null, null from _w
+union all
 select w.k, s.name, s.ts, s.dur, t.tid,
   (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a
      where a.arg_set_id = s.arg_set_id and a.key glob 'debug.beginData.stackTrace*') as stack
   from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
   join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
   where s.name in ('Layout', 'UpdateLayoutTree') and t.name = 'CrRendererMain'
-  order by t.tid, s.ts",
+  order by 5, 3",
         windows_sql(meta["token"].as_str().unwrap_or(""))
     );
     let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
+    let measured = measured_runs(&meta, &table.rows);
     let sym = Symbolizer::open(dir);
     let mut sites: BTreeMap<(String, i64, i64, String), Frame> = BTreeMap::new();
     let mut weights: Vec<(Vec<Frame>, f64, u64)> = Vec::new();
     // [forced, in the frame lifecycle] × [layout, style]: count and ms.
     let mut totals = [[(0u64, 0.0f64); 2]; 2];
     let mut outer_end: BTreeMap<String, i64> = BTreeMap::new();
-    for row in &table.rows {
+    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
         let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
         if !measured.contains(&cell(0)) {
             continue;
@@ -310,18 +313,21 @@ select w.k, s.name, s.ts, s.dur, t.tid,
 /// Garbage collection in the measured runs: collections, the main-thread pause they cost (incremental
 /// marking steps included) and the work they did on helper threads, from attribution traces.
 pub fn gc(dir: &Path) -> Result<Output> {
-    let (meta, measured) = measured_runs(dir)?;
+    let meta = attribution_meta(dir)?;
     let sql = format!(
         "{}
+select k, null, null, null, null, null, null from _w
+union all
 select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
   extract_arg(s.arg_set_id, 'debug.usedHeapSizeBefore') - extract_arg(s.arg_set_id, 'debug.usedHeapSizeAfter') as freed
   from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
   join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
   where s.name in ('MinorGC', 'MajorGC') or s.name glob 'V8.GC*' or s.name glob 'BlinkGC*'
-  order by t.tid, s.ts",
+  order by 5, 3",
         windows_sql(meta["token"].as_str().unwrap_or(""))
     );
     let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
+    let measured = measured_runs(&meta, &table.rows);
     #[derive(Default, Clone, Copy)]
     struct Run {
         minor: u64,
@@ -333,7 +339,7 @@ select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
     let mut runs: BTreeMap<String, Run> = measured.iter().map(|k| (k.clone(), Run::default())).collect();
     // Union of GC intervals per thread: GC phases nest inside their collection.
     let mut covered: BTreeMap<String, i64> = BTreeMap::new();
-    for row in &table.rows {
+    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
         let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
         let Some(run) = runs.get_mut(&cell(0)) else { continue };
         let (ts, dur) = (cell(2).parse::<i64>().unwrap_or(0), cell(3).parse::<i64>().unwrap_or(0));
@@ -394,19 +400,28 @@ create perfetto table _w as
     )
 }
 
-/// The recording's meta and the window keys of its measured runs: the last `runs` of its run windows
-/// (a block warms up first; its attribution profilers start at the steady point).
-fn measured_runs(dir: &Path) -> Result<(Value, Vec<String>)> {
+fn attribution_meta(dir: &Path) -> Result<Value> {
     let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
     if meta["probes"] != "attribution" {
         return Err(Error::usage("this view needs an attribution recording (stacks and GC phases); record with --probes attribution"));
     }
-    let token = meta["token"].as_str().unwrap_or("");
-    let table = engine::query(&dir.join("trace.pftrace"), &format!("{}\nselect k from _w", windows_sql(token)))?;
-    let mut keys: Vec<(usize, String)> = table.rows.iter().filter_map(|r| r.first().cloned().flatten()).filter_map(|k| Some((k.rsplit(':').next()?.parse().ok()?, k))).collect();
+    Ok(meta)
+}
+
+/// The window keys of the measured runs, from a result whose window rows (`_w`) have only their key
+/// set: the last `runs` of the run windows (a block warms up first; its attribution profilers start
+/// at the steady point).
+fn measured_runs(meta: &Value, rows: &[Vec<Option<String>>]) -> Vec<String> {
+    let mut keys: Vec<(usize, String)> = rows
+        .iter()
+        .filter(|r| r.get(1).is_none_or(Option::is_none))
+        .filter_map(|r| r.first().cloned().flatten())
+        .filter_map(|k| Some((k.rsplit(':').next()?.parse().ok()?, k)))
+        .collect();
     keys.sort();
+    keys.dedup();
     let n = meta["runs"].as_u64().map_or(keys.len(), |n| n as usize).min(keys.len());
-    Ok((meta, keys.split_off(keys.len() - n).into_iter().map(|k| k.1).collect()))
+    keys.split_off(keys.len() - n).into_iter().map(|k| k.1).collect()
 }
 
 /// Frames of a trace event's `beginData.stackTrace` from `key \x1f value` pairs joined by `\x1e`:

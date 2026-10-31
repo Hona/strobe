@@ -394,6 +394,11 @@ The catalog lives in `src/model/metrics.rs` and in `strobe query <h> summary --c
 - **Budget**: the refresh interval of the display the window is on (§13.1). No display, no
   budget metrics (`NoDisplayForBudget`).
 - `requestAnimationFrame` gaps, when wanted, are a separate metric named `raf.gap.*`.
+- **Quantization**: anything that ends on a presented frame (`run.duration` with an `until`,
+  `interaction.*`) moves in whole vsyncs (6.06 ms at 165 Hz): a tab switch measured 40 or 47 ms
+  and nothing between. Such a metric is the user's truth but decides slowly; pick `main.work`
+  (renderer main-thread task time per run, continuous) as the primary when the question is "does
+  this cost less", and keep the duration as a secondary.
 
 ### 7.3 Phases
 

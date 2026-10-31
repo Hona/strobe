@@ -32,6 +32,7 @@ const DESCRIPTIVE: &[&str] = &[
     "frames.presented.p95",
     "frames.presented.p99",
     "main.tasks.long",
+    "main.work",
     "scroll.latency.p95",
     "run.duration",
     "gpu.process.3d",
@@ -656,6 +657,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let walls: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.ms)).collect();
         let cpu: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.cpu)).collect();
         let busy: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite() && r.ms > 0.0).map(|(j, r)| (key(j), 100.0 * r.task / r.ms)).collect();
+        let work: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite()).map(|(j, r)| (key(j), r.task)).collect();
         let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
         let nodes = nodes_all[first.min(nodes_all.len())..].to_vec();
         let warm = runs[..first].to_vec();
@@ -688,6 +690,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             extra.insert("gpu.process.3d".to_string(), gpu_3d);
         }
         let busy_cdp = metrics::median(&busy.values().copied().collect::<Vec<_>>());
+        if !work.is_empty() {
+            extra.insert("main.work".to_string(), work);
+        }
         if set == Set::Lean {
             extra.insert("main.busy".to_string(), busy);
         }

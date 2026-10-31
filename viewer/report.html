@@ -955,6 +955,41 @@ details[open] > summary .chev { transform: rotate(90deg); }
 .f-row-loss .f-clip { color: var(--loss); }
 .f-row-desc .f-dot { background: var(--surface); border: 1.5px solid var(--ink-3); }
 
+/* Memory Recording (Leak Hunt) */
+.leak-metrics-grid {
+  padding-top: 20px;
+  border-top: 1px solid var(--hairline);
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 16px 24px;
+}
+@media (max-width: 860px) { .leak-metrics-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 480px) { .leak-metrics-grid { grid-template-columns: minmax(0, 1fr); } }
+
+.leak-mcol { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.leak-mk { font: 600 11px/15px var(--sans); text-transform: uppercase; letter-spacing: 0.04em; color: var(--ink-3); }
+.leak-mv { font: 600 22px/28px var(--display); letter-spacing: -0.02em; font-variant-numeric: tabular-nums; color: var(--ink); }
+.leak-mv.warn { color: var(--warn-ink); }
+.leak-mv.loss { color: var(--loss-ink); }
+.leak-mv.win { color: var(--win-ink); }
+.leak-msub { font: 12px/17px var(--sans); color: var(--ink-3); }
+
+.coarse-note {
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+  font-size: 12.5px;
+  line-height: 19px;
+  color: var(--ink-3);
+}
+.coarse-note b { color: var(--ink-2); font-weight: 600; }
+
+.census-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 28px;
+}
+@media (max-width: 780px) { .census-grid { grid-template-columns: minmax(0, 1fr); gap: 20px; } }
+
 /* Recording View */
 .rec-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(155px, 1fr)); border-top: 1px solid var(--hairline); }
 .rec-tile { padding: 14px 18px; border-right: 1px solid var(--hairline); border-bottom: 1px solid var(--hairline); display: flex; flex-direction: column; gap: 2px; }
@@ -1157,6 +1192,9 @@ const LABELS = {
   "cpu.process.total": "Total app CPU",
   "memory.app.private": "App memory (RAM)",
   "js.heap.used": "JS heap",
+  "js.heap.growth": "JS heap growth",
+  "dom.nodes.growth": "DOM node growth",
+  "leak.suspects.retained": "Surviving leak suspects",
   "gpu.vram": "GPU VRAM",
   "gpu.process.3d": "GPU 3D engine",
   "dom.nodes": "DOM nodes",
@@ -1171,7 +1209,9 @@ function unitOf(name) {
   if (name === "run.duration" || name === "main.work" || name === "main.script" || name === "main.layout" || name === "main.style") return "ms";
   if (/^(frames|interaction|scroll)\./.test(name) && /\.(p50|p90|p95|p99|max)$/.test(name)) return "ms";
   if (name === "frames.dropped.pct" || name === "main.busy" || name.startsWith("cpu.") || name === "gpu.process.3d") return "%";
-  if (name.startsWith("memory.") || name === "gpu.vram" || name === "js.heap.used") return "MB";
+  if (name === "js.heap.growth") return "MB/min";
+  if (name === "dom.nodes.growth") return "count/min";
+  if (name.startsWith("memory.") || name === "gpu.vram" || name === "js.heap.used" || name === "leak.suspects.retained") return "MB";
   return "count";
 }
 
@@ -1185,6 +1225,8 @@ function fmtVal(v, u) {
   if (u === "%") return v.toFixed(d) + "%";
   if (u === "pts") return v.toFixed(d) + " pts";
   if (u === "MB") return v.toFixed(0) + " MB";
+  if (u === "MB/min") return v.toFixed(d) + " MB/min";
+  if (u === "count/min") return (Math.abs(v) >= 10 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1)) + " /min";
   if (u === "Hz") return v.toFixed(0) + " Hz";
   if (u === "count") return Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(1);
   return v.toFixed(d) + (u ? " " + u : "");
@@ -4062,8 +4104,399 @@ function renderSingleAllocGc(att) {
   );
 }
 
+/* ---------- Memory Leak-Hunt Recording View (`strobe record --probes memory`) ---------- */
+function pickLeadSuspectClass(classes) {
+  if (!classes?.length) return null;
+  const userCls = classes.find((c) => c.class && !/^\((system|array|object shape|compiled code|string|number|sliced string|concatenated string)\)$/.test(c.class) && !/^system\s*\//.test(c.class) && c.class !== "Array" && c.class !== "Object");
+  return userCls || classes[0];
+}
+
+function renderMemoryRecording(m) {
+  const v = m.values || {};
+  const g = (k) => (finite(v[k]) ? v[k] : NaN);
+  const census = Array.isArray(m.census) ? m.census : [];
+  const leaks = m.leaks && Array.isArray(m.leaks.classes) ? m.leaks : null;
+  const leakTotals = m.leaks || {};
+  const heap = m.heap || null;
+  document.title = `strobe · ${m.id || "memory recording"}`;
+
+  const validState = m.valid === true
+    ? ["win", "Valid recording"]
+    : m.valid === false
+      ? ["loss", "Invalid recording"]
+      : ["warn", "Validity unverified"];
+
+  const createdStr = m.created
+    ? new Date(m.created).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
+    : null;
+
+  const topbar = h("header", { class: "topbar" },
+    h("div", { class: "brand-cluster" },
+      h("span", { class: "wordmark" }, "strobe"),
+      m.id ? [h("span", { class: "sep" }, "/"), h("span", { class: "mono meta-suite" }, m.id)] : null,
+      createdStr ? [h("span", { class: "sep" }, "·"), h("span", { class: "meta-dim" }, createdStr)] : null
+    ),
+    h("div", { class: "top-actions" },
+      h("span", { class: "ref-pill" }, "probes: memory"),
+      h("span", { class: `status-pill ${validState[0]}` }, validState[1])
+    )
+  );
+
+  // Derive plain-English "Is it leaking?" verdict
+  const c0 = census[0], c2 = census[census.length - 1];
+  const spanMs = c0 && c2 && c2.at_ms > c0.at_ms ? c2.at_ms - c0.at_ms : (m.duration_ms || NaN);
+  const heapStartBytes = finite(c0?.js_heap_bytes) ? c0.js_heap_bytes : NaN;
+  const heapEndBytes = finite(c2?.js_heap_bytes) ? c2.js_heap_bytes : (finite(g("js.heap.used")) ? g("js.heap.used") * 1048576 : NaN);
+  const domStart = finite(c0?.dom_nodes) ? c0.dom_nodes : NaN;
+  const domEnd = finite(c2?.dom_nodes) ? c2.dom_nodes : g("dom.nodes");
+
+  const heapGrowth = g("js.heap.growth");
+  const domGrowth = g("dom.nodes.growth");
+  const suspectRetBytes = finite(leakTotals.retained_size)
+    ? leakTotals.retained_size
+    : finite(g("leak.suspects.retained")) ? g("leak.suspects.retained") * 1048576 : NaN;
+  const suspectCount = leakTotals.count;
+  const detCount = heap?.detached?.count || 0;
+  const leadSuspect = pickLeadSuspectClass(leaks?.classes);
+  const leadPath = leadSuspect?.largest?.path ? compactRetainerPath(leadSuspect.largest.path) : null;
+
+  const strongLeak = (finite(suspectRetBytes) && suspectRetBytes >= 1024 * 1024 && finite(heapGrowth) && heapGrowth >= 2)
+    || (finite(suspectRetBytes) && suspectRetBytes >= 2 * 1024 * 1024)
+    || detCount >= 20;
+  const moderateLeak = !strongLeak && (
+    (finite(suspectRetBytes) && suspectRetBytes >= 128 * 1024)
+    || (finite(heapGrowth) && heapGrowth >= 1.0)
+    || (finite(domGrowth) && domGrowth >= 25)
+    || detCount > 0
+  );
+
+  let pillTone = "win";
+  let pillText = "No obvious leak detected";
+  let headline = "Post-GC memory held steady";
+
+  const fmtSignedRate = (val, unit) => {
+    if (!finite(val)) return "—";
+    const sign = val > 0.05 ? "+" : val < -0.05 ? "−" : "";
+    const abs = Math.abs(val);
+    if (unit === "MB/min") {
+      return abs >= 1
+        ? `${sign}${abs >= 10 ? abs.toFixed(1) : abs.toFixed(2)} MB/min`
+        : `${sign}${Math.round(abs * 1024)} KB/min`;
+    }
+    return `${sign}${abs >= 10 ? Math.round(abs).toLocaleString("en-US") : abs.toFixed(1)}/min`;
+  };
+
+  if (strongLeak || moderateLeak) {
+    pillTone = strongLeak ? "loss" : "warn";
+    pillText = strongLeak ? "Likely memory leak · Surviving allocations" : "Potential retention · Check if cache or leak";
+    if (leadSuspect && finite(heapGrowth) && heapGrowth > 0.5) {
+      headline = `JS heap grew ${fmtSignedRate(heapGrowth, "MB/min")} — ${fmtCount(leadSuspect.count)} ${leadSuspect.class} objects stayed alive`;
+    } else if (leadSuspect) {
+      headline = `${fmtBytes(suspectRetBytes)} of first-half allocations stayed alive, led by ${leadSuspect.class}`;
+    } else if (finite(heapGrowth) && heapGrowth > 0.5) {
+      headline = `Post-GC JS heap grew ${fmtSignedRate(heapGrowth, "MB/min")}`;
+    } else {
+      headline = `DOM grew ${fmtSignedRate(domGrowth, "count/min")} (${fmtCount(domStart)} → ${fmtCount(domEnd)} nodes)`;
+    }
+  }
+
+  // Plain-English narrative for an entry-level engineer
+  const proseParts = [];
+  if (finite(heapStartBytes) && finite(heapEndBytes)) {
+    proseParts.push(
+      "Over ", h("strong", {}, fmtDuration(spanMs)),
+      ` (${m.target || m.id}), post-GC JS heap moved from `,
+      h("strong", {}, fmtBytes(heapStartBytes)), " to ", h("strong", {}, fmtBytes(heapEndBytes)),
+      finite(heapGrowth) ? ` (${fmtSignedRate(heapGrowth, "MB/min")})` : "",
+      finite(domStart) && finite(domEnd)
+        ? [", and DOM nodes moved from ", h("strong", {}, fmtCount(domStart)), " to ", h("strong", {}, fmtCount(domEnd)), finite(domGrowth) ? ` (${fmtSignedRate(domGrowth, "count/min")}). ` : ". "]
+        : ". "
+    );
+  }
+  if (finite(suspectRetBytes) && suspectRetBytes > 0) {
+    proseParts.push(
+      finite(suspectCount) ? [h("strong", {}, fmtCount(suspectCount)), " objects ("] : "Objects (",
+      h("strong", {}, `${fmtBytes(suspectRetBytes)} retained`),
+      ") allocated during the first half (S0 → S1) were still alive after garbage collection at the end (S2)",
+      leadSuspect
+        ? [
+            ", led by ", h("strong", {}, leadSuspect.class),
+            ` (${fmtBytes(leadSuspect.retained_size)} across ${fmtCount(leadSuspect.count)} instances)`,
+            leadPath ? [" kept alive via ", h("code", { class: "mono", style: "font-size:12.5px" }, leadPath), "."] : ".",
+          ]
+        : "."
+    );
+  } else if (!strongLeak && !moderateLeak) {
+    proseParts.push("Objects allocated in the first half were reclaimed by garbage collection before the recording ended.");
+  }
+
+  const recId = m.id || "<rec_id>";
+  const durSec = Math.max(30, Math.round(((m.duration_ms || 6000) * 4) / 1000));
+  const cmds = [
+    ["Confirm over a longer window to separate bounded caches from unbounded leaks:", `strobe record ${quoteArg(m.target || "<target>")} --probes memory --for ${durSec}s`],
+    ["Query leak suspects from the CLI:", `strobe query ${recId} leaks`],
+    heap ? ["Query full S2 heap snapshot:", `strobe query ${recId} heap`] : null,
+  ].filter(Boolean);
+
+  const groups = new Map();
+  for (const k of Object.keys(v).sort()) {
+    const area = k.split(".")[0];
+    groups.set(area, [...(groups.get(area) || []), k]);
+  }
+
+  const shell = h("div", { class: "shell" });
+  appendKids(shell, [
+    topbar,
+    // 1. Leak Verdict Hero
+    h("section", { class: "card-surface" },
+      h("div", { class: "hero-body" },
+        h("div", { class: "hero-header" },
+          h("div", { class: "eyebrow-row" },
+            h("span", { class: `status-pill ${pillTone}` }, pillText),
+            h("span", { class: "eyebrow-meta" }, `Memory leak hunt · ${fmtDuration(spanMs)} · S0 → S1 → S2 post-GC snapshots`)
+          ),
+          h("h1", { class: "hero-headline" }, headline),
+          h("p", { class: "hero-prose" }, proseParts)
+        ),
+        h("div", { class: "leak-metrics-grid" },
+          h("div", { class: "leak-mcol" },
+            h("span", { class: "leak-mk" }, "JS heap growth"),
+            h("span", { class: `leak-mv ${heapGrowth > 2 ? pillTone : ""}` }, fmtSignedRate(heapGrowth, "MB/min")),
+            h("span", { class: "leak-msub" }, finite(heapStartBytes) && finite(heapEndBytes) ? `${fmtBytes(heapStartBytes)} → ${fmtBytes(heapEndBytes)} post-GC` : `End: ${fmtVal(g("js.heap.used"), "MB")}`)
+          ),
+          h("div", { class: "leak-mcol" },
+            h("span", { class: "leak-mk" }, "DOM node growth"),
+            h("span", { class: `leak-mv ${domGrowth >= 50 ? "warn" : ""}` }, fmtSignedRate(domGrowth, "count/min")),
+            h("span", { class: "leak-msub" }, finite(domStart) && finite(domEnd) ? `${fmtCount(domStart)} → ${fmtCount(domEnd)} DOM nodes` : `${fmtCount(domEnd)} DOM nodes`)
+          ),
+          h("div", { class: "leak-mcol" },
+            h("span", { class: "leak-mk" }, "Surviving S0→S1 suspects"),
+            h("span", { class: `leak-mv ${suspectRetBytes >= 256 * 1024 ? pillTone : ""}` }, fmtBytes(suspectRetBytes)),
+            h("span", { class: "leak-msub" }, finite(suspectCount) ? `${fmtCount(suspectCount)} objects still alive at S2` : "Allocated in 1st half, alive at end")
+          ),
+          h("div", { class: "leak-mcol" },
+            h("span", { class: "leak-mk" }, "Initial app RAM (S0)"),
+            h("span", { class: "leak-mv" }, finite(c0?.private_bytes) ? fmtBytes(c0.private_bytes) : fmtVal(g("memory.app.private"), "MB")),
+            h("span", { class: "leak-msub" }, detCount > 0 ? `${fmtCount(detCount)} detached DOM nodes at S2` : "0 detached DOM nodes at S2")
+          )
+        ),
+        h("div", { class: "coarse-note" },
+          h("b", {}, "Three-point caveat: "),
+          "Three post-GC checkpoints (start S0, middle S1, end S2) are a coarse directional filter — lazy caches warmed in the first half or V8 snapshot serialization overhead can shift short runs. Verify steady growth with a longer ",
+          h("code", { class: "mono" }, "--for"),
+          " duration (a multi-run benchmark slope mode is planned)."
+        )
+      )
+    ),
+    // 2. Leak Suspects Table
+    leaks ? renderLeakSuspectsSection(leaks, pillTone) : null,
+    // 3. Live Heap at S2
+    heap ? renderLiveHeapSingleSection(heap, "Live heap at end (S2 post-GC snapshot)") : null,
+    // 4. Three-point Census Chart
+    census.length >= 2 ? renderCensusSection(census) : null,
+    // 5. Next steps & CLI queries
+    h("section", { class: "card-surface" },
+      h("div", { class: "card-hd" }, h("div", { class: "card-hd-left" }, h("h2", { class: "sec-title" }, "Recommended next step"))),
+      h("div", { class: "card-bd" },
+        h("div", { class: "next-list" }, cmds.map(([lbl, c]) => h("div", { class: "next-item" }, h("div", { class: "next-why" }, lbl), cmdRow(c))))
+      )
+    ),
+    // 6. Raw recorded values disclosure
+    groups.size
+      ? h("details", { class: "disclosure", open: state.metricsOpen, ontoggle: (e) => { state.metricsOpen = e.currentTarget.open; } },
+          h("summary", {},
+            h("span", { class: "chev" }, makeChevSvg()),
+            h("span", { class: "sec-title" }, `All ${Object.keys(v).length} recorded metric values`),
+            h("span", { class: "sec-sub" }, "Summary rates and memory gauges")
+          ),
+          h("div", { class: "card-bd" },
+            h("div", { class: "rec-kv-cols" },
+              [...groups.entries()].map(([area, keys]) => h("div", { class: "rec-kv-grp" },
+                h("div", { class: "rig-hd", style: "margin-bottom:4px" }, area),
+                keys.map((k) => h("div", { class: "rec-kv-row" },
+                  h("span", { class: "mono", style: "color:var(--ink-2)" }, k),
+                  h("span", { class: "mono", style: "font-weight:500" }, fmtVal(v[k], unitOf(k)))
+                ))
+              ))
+            )
+          )
+        )
+      : null,
+    renderRigFooter(m, null, { hz: NaN, vs: NaN }),
+  ]);
+
+  app.replaceChildren(shell);
+}
+
+function renderLeakSuspectsSection(leaks, tone) {
+  const classes = (leaks.classes || []).slice(0, 10);
+  const maxRet = Math.max(...classes.map((c) => c.retained_size || 0), leaks.retained_size || 1);
+
+  return h("section", { class: "card-surface", id: "leak-suspects" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Leak suspects (allocated S0 → S1, still alive at S2)"),
+        h("span", { class: "sec-sub" },
+          `${fmtCount(leaks.count)} surviving objects · ${fmtBytes(leaks.retained_size)} retained without overlap · click any row for full GC root path`
+        )
+      )
+    ),
+    !classes.length
+      ? h("div", { class: "attr-foot", style: "border-top:0" }, "No objects allocated between S0 and S1 remained alive at S2.")
+      : h("div", { class: "attr-table" },
+          h("div", { class: "single-row hd" },
+            h("span", {}, "Surviving class & what keeps it alive"),
+            h("span", {}, "Retained share"),
+            h("span", { style: "text-align:right" }, "Retained"),
+            h("span", { class: "col-share", style: "text-align:right" }, "Alive at S2")
+          ),
+          classes.flatMap((c, idx) => {
+            const path = c.largest?.path || null;
+            const rowKey = `suspect:${idx}:${c.class}`;
+            const canExpand = !!(path?.length || heapLocFull(c.location) || c.allocations?.length);
+            const isOpen = canExpand && state.openRows.has(rowKey);
+            const pct = Math.min(100, Math.max(1, ((c.retained_size || 0) / maxRet) * 100));
+
+            const rowEl = h("div", {
+              class: "single-row" + (canExpand ? " clickable" : ""),
+              title: `${c.class} — ${fmtBytes(c.retained_size)} retained, ${fmtBytes(c.self_size)} self, ${fmtCount(c.count)} surviving objects`,
+              onclick: canExpand ? () => {
+                if (state.openRows.has(rowKey)) state.openRows.delete(rowKey);
+                else state.openRows.add(rowKey);
+                render();
+              } : null,
+            },
+              h("div", { class: "fn-stack-cell" },
+                h("div", { class: "fn-primary-line" },
+                  h("span", { class: "row-exp-icon" + (isOpen ? " open" : "") }, canExpand ? makeChevSvg(10) : ""),
+                  h("span", { class: "fn-name" }, c.class),
+                  c.location ? h("span", { class: "fn-where" }, heapLocShort(c.location)) : null
+                ),
+                path?.length
+                  ? h("div", { class: "fn-caller-hint" }, `↳ ${compactRetainerPath(path)}`)
+                  : h("div", { class: "fn-caller-hint" }, `Self: ${fmtBytes(c.self_size)}`)
+              ),
+              h("div", { class: "share-track" },
+                h("div", { class: "share-fill" + (tone === "loss" || tone === "warn" ? " warn" : ""), style: `width:${pct}%` })
+              ),
+              h("span", {
+                class: "mono",
+                style: `text-align:right;font-weight:600;color:${idx === 0 && (tone === "loss" || tone === "warn") ? "var(--warn-ink)" : "var(--ink)"}`,
+              }, fmtBytes(c.retained_size)),
+              h("span", { class: "mono col-share", style: "text-align:right;color:var(--ink-3);font-size:11.5px" }, fmtCount(c.count))
+            );
+            return isOpen ? [rowEl, renderRetainerDrawer(path, null, c.location, c.allocations)] : [rowEl];
+          })
+        )
+  );
+}
+
+function renderCensusSection(census) {
+  const hasHeap = census.some((c) => finite(c.js_heap_bytes));
+  const hasDom = census.some((c) => finite(c.dom_nodes));
+
+  return h("section", { class: "card-surface", id: "census" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Three-point post-GC census (S0 · S1 · S2)"),
+        h("span", { class: "sec-sub" }, "Coarse 3-checkpoint trajectory sampled immediately after GC, before each heap snapshot")
+      )
+    ),
+    h("div", { class: "card-bd" },
+      h("div", { class: "census-grid" },
+        hasHeap
+          ? h("div", { class: "plot-col" },
+              h("div", { class: "plot-caption" },
+                h("span", {}, "JS heap used after GC"),
+                h("span", { class: "dim" }, "Dashed: S0 → S2 net slope")
+              ),
+              chartBox(148, (w) => drawCensusChart(w, census, (c) => c.js_heap_bytes, fmtBytes))
+            )
+          : null,
+        hasDom
+          ? h("div", { class: "plot-col" },
+              h("div", { class: "plot-caption" },
+                h("span", {}, "Live DOM nodes"),
+                h("span", { class: "dim" }, "Document node count at S0, S1, S2")
+              ),
+              chartBox(148, (w) => drawCensusChart(w, census, (c) => c.dom_nodes, fmtCount))
+            )
+          : null
+      ),
+      h("div", { class: "coarse-note", style: "margin-top:14px" },
+        h("b", {}, "Why S1 can spike & why OS RAM is S0-only: "),
+        "Taking snapshot S0 inside Chromium temporarily allocates inspector metadata in the renderer process (so OS private RAM — ",
+        finite(census[0]?.private_bytes) ? fmtBytes(census[0].private_bytes) + " at S0" : "recorded at S0",
+        " — is intentionally omitted at S1/S2). Judge leaks primarily by ",
+        h("b", {}, "S0 → S1 objects still alive at S2"),
+        " above rather than 3-point curve shape alone."
+      )
+    )
+  );
+}
+
+function drawCensusChart(w, census, getVal, fmtFn) {
+  const H = 148;
+  const m = { l: 58, r: 28, t: 24, b: 28 };
+  const svg = S("svg", { class: "plot", width: w, height: H, viewBox: `0 0 ${w} ${H}` });
+  const pts = census
+    .map((c, idx) => ({ idx, label: `S${idx}`, sec: (c.at_ms || 0) / 1000, val: getVal(c) }))
+    .filter((p) => finite(p.val));
+
+  if (pts.length < 2) return svg;
+
+  const t0 = pts[0].sec, t1 = Math.max(pts[pts.length - 1].sec, t0 + 0.1);
+  const x = lin(t0, t1, m.l, w - m.r);
+  const vals = pts.map((p) => p.val);
+  let yMin = Math.min(0, ...vals);
+  let yMax = Math.max(...vals);
+  if (yMax - yMin <= 0) yMax = yMin + 1;
+  const y = lin(yMin, yMax * 1.16, H - m.b, m.t);
+
+  for (const tk of [yMin, (yMin + yMax) / 2, yMax]) {
+    svg.append(
+      S("line", { x1: m.l, y1: y(tk), x2: w - m.r, y2: y(tk), class: "gridline" }),
+      S("text", { x: m.l - 8, y: y(tk) + 3.5, "text-anchor": "end", style: "font-size:10px" }, fmtFn(tk))
+    );
+  }
+  svg.append(S("line", { x1: m.l, y1: H - m.b, x2: w - m.r, y2: H - m.b, class: "axisline" }));
+
+  // Net S0 -> S2 slope reference line
+  const first = pts[0], last = pts[pts.length - 1];
+  svg.append(
+    S("line", {
+      x1: x(first.sec), y1: y(first.val),
+      x2: x(last.sec), y2: y(last.val),
+      stroke: "var(--ink-4)", "stroke-width": 1.25, "stroke-dasharray": "4 3",
+    }),
+    S("polyline", {
+      points: pts.map((p) => `${x(p.sec)},${y(p.val)}`).join(" "),
+      fill: "none", stroke: "var(--accent)", "stroke-width": 2,
+    })
+  );
+
+  pts.forEach((p, i) => {
+    const cx = x(p.sec), cy = y(p.val);
+    const risingSteep = i === 0 && pts[1] && pts[1].val > p.val * 1.6;
+    const anchor = risingSteep ? "middle" : i === 0 ? "start" : i === pts.length - 1 ? "end" : "middle";
+    svg.append(
+      S("circle", { cx, cy, r: 4.5, fill: "var(--accent)", stroke: "var(--surface)", "stroke-width": 2 }),
+      S("text", {
+        x: cx, y: cy - 11, "text-anchor": anchor, class: "strong",
+        style: "font-size:11px;paint-order:stroke;stroke:var(--surface);stroke-width:4.5px;stroke-linejoin:round",
+      }, fmtFn(p.val)),
+      S("text", { x: cx, y: H - 7, "text-anchor": i === 0 ? "start" : i === pts.length - 1 ? "end" : "middle", style: "font-size:10.5px" }, `${p.label} (${p.sec.toFixed(1)}s)`)
+    );
+  });
+
+  return svg;
+}
+
 /* ---------- Single Recording View (`strobe report recording <rec_id>`) ---------- */
 function renderRecording(m) {
+  if (m.probes === "memory" || m.census || m.leaks) {
+    return renderMemoryRecording(m);
+  }
   const v = m.values || {};
   const g = (k) => (finite(v[k]) ? v[k] : NaN);
   const hz = g("display.hz");

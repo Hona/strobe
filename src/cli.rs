@@ -6,7 +6,7 @@ use std::collections::HashMap;
 /// Flags that take no value.
 const SWITCHES: &[&str] = &[
     "json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open",
-    "calibrate", "pin-runner", "headless", "keep",
+    "calibrate", "pin-runner", "headless", "keep", "fast", "once",
 ];
 
 pub struct Args {

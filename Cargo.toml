@@ -6,9 +6,17 @@ description = "Measure and explain performance: web pages, Electron apps, Bun/No
 license = "MIT"
 publish = false
 
+[lib]
+name = "strobe"
+path = "src/lib.rs"
+
 [[bin]]
 name = "strobe"
 path = "src/main.rs"
+
+[[bin]]
+name = "strobew"
+path = "src/bin/strobew.rs"
 
 [dependencies]
 # JSON for every protocol strobe speaks (CDP, runner, MCP, results).

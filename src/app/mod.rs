@@ -86,9 +86,22 @@ fn fail(e: &Error, json: bool) -> i32 {
     e.code
 }
 
+static PROGRESS_FILE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+
+/// Also appends progress lines to a file (a running experiment's progress.log).
+pub fn progress_to(path: Option<std::path::PathBuf>) {
+    *PROGRESS_FILE.lock().unwrap() = path;
+}
+
 /// Progress lines for long commands go to stderr so stdout stays the result.
 pub fn progress(msg: impl AsRef<str>) {
     if std::env::var_os("STROBE_QUIET").is_none() {
         eprintln!("{}", msg.as_ref());
+    }
+    if let Some(p) = PROGRESS_FILE.lock().unwrap().as_ref()
+        && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p)
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", msg.as_ref());
     }
 }

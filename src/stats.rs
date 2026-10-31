@@ -115,7 +115,7 @@ pub fn hodges_lehmann(d: &[f64], confidence: f64) -> (f64, f64, f64, f64) {
             acc += cnt;
             c = k as i64;
         }
-        (c, 1.0 - 2.0 * acc)
+        (c, 1.0 - 2.0 * acc / total)
     } else {
         let nf = n as f64;
         let mean = nf * (nf + 1.0) / 4.0;

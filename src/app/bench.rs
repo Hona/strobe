@@ -126,10 +126,10 @@ pub fn run(args: &Args) -> Result<Output> {
         (Some(_), true) => return Err(Error::usage("--aa runs --head against itself; drop --base")),
         (None, false) => return Err(Error::usage("say what to compare: --base <variant> (or --aa for the same build on both sides)")),
     };
-    let _lock = validity::lock()?;
-    let exp = store::new_id("exp");
+    let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
-    std::fs::create_dir_all(dir.join("blocks"))?;
+    super::progress_to(Some(dir.join("progress.log")));
+    let _lock = validity::lock()?;
     let project = project_root(&file);
     let config = read_config(&project);
     let env = host::env();

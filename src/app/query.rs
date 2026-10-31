@@ -16,6 +16,12 @@ pub fn run(args: &Args) -> Result<Output> {
     let top = args.num("top")?.unwrap_or(15.0) as usize;
     if handle.starts_with("exp_") {
         let dir = store::resolve(handle)?;
+        if !dir.join("result.json").exists() {
+            let log = std::fs::read_to_string(dir.join("progress.log")).unwrap_or_default();
+            let tail: Vec<&str> = log.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+            let text = format!("{handle} is running\n{}\n", tail.join("\n"));
+            return Ok(Output::new(text, json!({ "id": handle, "state": "running", "progress": tail })));
+        }
         let result = store::read_json(&dir.join("result.json"))?;
         return match view {
             "summary" | "progress" => Ok(Output::new(result["text"].as_str().unwrap_or("").to_string(), result)),

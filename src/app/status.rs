@@ -38,7 +38,7 @@ pub fn run(args: &Args) -> Result<Output> {
     if !engine::installed() {
         problems.push("trace_processor not downloaded yet (strobe up, or on first use)".into());
     }
-    let calibration = state.get("last_calibration").cloned().unwrap_or(Value::Null);
+    let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
         problems.push("no calibration yet (strobe up)".into());
     }

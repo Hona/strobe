@@ -219,6 +219,57 @@ pub fn system_busy(ms: u64) -> f64 {
     if total <= 0.0 { 0.0 } else { 1.0 - (i1.saturating_sub(i0) as f64 / total) }
 }
 
+/// The executable path of a running process.
+pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::Threading::{PROCESS_NAME_WIN32, QueryFullProcessImageNameW};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut buf = vec![0u16; 1024];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut len) != 0;
+        CloseHandle(h);
+        ok.then(|| std::path::PathBuf::from(String::from_utf16_lossy(&buf[..len as usize])))
+    }
+}
+
+/// Sets (or with `None`, deletes) a string value under HKEY_CURRENT_USER.
+pub fn set_user_value(key: &str, name: &str, value: Option<&str>, expand: bool) -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_EXPAND_SZ, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
+    let (k, n) = (wide(key), wide(name));
+    unsafe {
+        match value {
+            Some(v) => {
+                let w = wide(v);
+                RegSetKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr(), if expand { REG_EXPAND_SZ } else { REG_SZ }, w.as_ptr() as *const _, (w.len() * 2) as u32) == 0
+            }
+            None => RegDeleteKeyValueW(HKEY_CURRENT_USER, k.as_ptr(), n.as_ptr()) == 0,
+        }
+    }
+}
+
+pub fn user_value(key: &str, name: &str) -> Option<String> {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ};
+    let (k, v) = (wide(key), wide(name));
+    let mut buf = vec![0u16; 32768];
+    let mut size = (buf.len() * 2) as u32;
+    let rc = unsafe {
+        RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size)
+    };
+    (rc == 0).then(|| wide_to_string(&buf))
+}
+
+/// Tells running programs that environment variables changed (new terminals pick up PATH).
+pub fn broadcast_env_change() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_BROADCAST, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_SETTINGCHANGE};
+    let env = wide("Environment");
+    unsafe {
+        SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, env.as_ptr() as isize, SMTO_ABORTIFHUNG, 2000, std::ptr::null_mut());
+    }
+}
+
 /// Puts every visible top-level window of these processes on top without activating it, so the
 /// target is never occluded (an occluded Chromium window stops rendering).
 pub fn raise_windows(pids: &[u32]) -> usize {

@@ -1,5 +1,6 @@
 //! This machine: paths, the monotonic clock, processes, CPU topology, power and displays.
 
+pub mod http;
 pub mod paths;
 #[cfg(windows)]
 pub mod win;

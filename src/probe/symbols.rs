@@ -59,8 +59,11 @@ pub fn store_maps(page: &Page, scripts: &BTreeSet<String>, dir: &Path, served: O
     }
     let all: BTreeSet<String> = scripts.iter().cloned().chain(ranges.keys().filter(|u| !u.starts_with("chrome") && !u.starts_with("devtools")).cloned()).collect();
     let mut index = Map::new();
-    for (i, url) in all.iter().enumerate() {
-        let Some(fetched) = fetch_map(page, url) else { continue };
+    let all: Vec<&String> = all.iter().collect();
+    // The page fetches 16 scripts and their maps at a time: one round trip per batch, not per script.
+    let fetched: Vec<(usize, &String, Fetched)> =
+        all.chunks(16).enumerate().flat_map(|(b, urls)| fetch_maps(page, urls).into_iter().enumerate().filter_map(move |(j, f)| Some((b * 16 + j, f?)))).map(|(i, f)| (i, all[i], f)).collect();
+    for (i, url, fetched) in fetched {
         let file = format!("maps/{i}.map.gz");
         write_gz(&dir.join(&file), fetched.text.as_bytes())?;
         let mut fns = ranges.remove(url).unwrap_or_default();
@@ -92,10 +95,11 @@ struct Fetched {
     lines: Vec<i64>,
 }
 
-/// The script's map: its `sourceMappingURL` (a URL or an inline `data:` map) and text, fetched by the page.
-fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
+/// Each script's map: its `sourceMappingURL` (a URL or an inline `data:` map) and text, fetched by the
+/// page, in parallel; `None` where a script has none or the fetch failed.
+fn fetch_maps(page: &Page, urls: &[&String]) -> Vec<Option<Fetched>> {
     let js = format!(
-        r#"(async (u) => {{
+        r#"Promise.all({}.map(async (u) => {{
   try {{
     const s = await (await fetch(u)).text()
     // The last such comment, however long: an inline data: map is the whole map in base64.
@@ -109,11 +113,12 @@ fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
     for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) lines.push(i + 1)
     return {{ url: href, text: await r.text(), lines }}
   }} catch {{ return null }}
-}})({})"#,
-        json!(url)
+}}))"#,
+        json!(urls)
     );
-    let v = page.eval_timeout(&js, Duration::from_secs(30)).ok()?;
-    Some(Fetched { url: v["url"].as_str()?.to_string(), text: v["text"].as_str()?.to_string(), lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect() })
+    let v = page.eval_timeout(&js, Duration::from_secs(60)).unwrap_or(Value::Null);
+    let one = |v: &Value| Some(Fetched { url: v["url"].as_str()?.to_string(), text: v["text"].as_str()?.to_string(), lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect() });
+    (0..urls.len()).map(|i| one(&v[i])).collect()
 }
 
 /// One frame, located as completely as strobe can: the original name, the absolute file on disk when

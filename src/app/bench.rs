@@ -472,6 +472,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         for v in variants.iter() {
             match block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) {
                 Ok(b) => {
+                    progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
                     // `Unresolved` (SPEC §10.2): script samples the stored source maps could not name.
                     let hot = b.recording.as_deref().and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
@@ -892,6 +893,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             probe::symbols::urls(&profile, &mut scripts);
             probe::symbols::urls(&allocs, &mut scripts);
             probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
+            lap("maps");
         }
         let trace = dir.join("trace.pftrace");
         tracing.stop(&trace)?;

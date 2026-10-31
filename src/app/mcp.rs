@@ -28,8 +28,8 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "properties": { "target": s("optional target to check"), "fast": b("skip the 3 s idle-load sample"), "calibrate": b("run the full calibration") } } },
         { "name": "record", "description": "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), cdp:<port>, file:<path> (import).",
           "inputSchema": { "type": "object", "required": ["target"], "properties": {
-            "target": s("https://…, cdp:<port>, or file:<path>"), "for": s("duration, e.g. 10s (default 10s)"),
-            "probes": s("timing (default), attribution (adds CPU stacks) or memory"), "timeout": n("seconds before returning while it keeps running (default 600)") } } },
+            "target": s("https://…, app:<id> (a strobe.json profile), exe:<path>, cdp:<port>, or file:<path>"), "for": s("duration, e.g. 10s (default 10s)"),
+            "probes": s("timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot)"), "headless": b("draw off screen: attribution data stays meaningful, frame metrics do not"), "served": s("folder the target's http origin serves, to resolve source-mapped frames to files on disk"), "timeout": n("seconds before returning while it keeps running (default 600)") } } },
         { "name": "bench", "description": "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress.",
           "inputSchema": { "type": "object", "required": ["file"], "properties": {
             "file": s("path to the .bench.ts file"), "head": s("variant under test: a directory (default .), a git ref, url:<href>"),
@@ -43,7 +43,8 @@ fn tools() -> Value {
         { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments).",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
             "handle": s("rec_… or exp_… (a unique prefix works)"), "view": s("summary (default), frames, threads, hotspots, alloc, layout, gc, heap, sql, progress"),
-            "sql": s("SQL for the sql view"), "by": s("hotspots and alloc grouping: function, file, package"), "top": n("rows (default 15)") } } },
+            "sql": s("SQL for the sql view"), "by": s("hotspots and alloc grouping: function, file, package"), "top": n("rows (default 15)"),
+            "reveal": b("heap: show string values (redacted by default; snapshots can hold user content)") } } },
         { "name": "report", "description": "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
             "handle": s("rec_… or exp_…"), "view": s("experiment or recording (default from the handle)"), "format": s("html (default) or md") } } },

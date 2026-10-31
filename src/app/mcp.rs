@@ -40,10 +40,10 @@ fn tools() -> Value {
             "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("keep (default) or high (High performance plan for the run, restored after)"),
             "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
             "timeout": n("seconds before returning while it keeps running (default 600)") } } },
-        { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (by function|file|package; attribution recordings), sql (Perfetto trace_processor SQL), progress (running experiments).",
+        { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments).",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_… or exp_… (a unique prefix works)"), "view": s("summary (default), frames, threads, hotspots, sql, progress"),
-            "sql": s("SQL for the sql view"), "by": s("hotspots grouping: function, file, package"), "top": n("rows (default 15)") } } },
+            "handle": s("rec_… or exp_… (a unique prefix works)"), "view": s("summary (default), frames, threads, hotspots, alloc, layout, gc, heap, sql, progress"),
+            "sql": s("SQL for the sql view"), "by": s("hotspots and alloc grouping: function, file, package"), "top": n("rows (default 15)") } } },
         { "name": "report", "description": "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
             "handle": s("rec_… or exp_…"), "view": s("experiment or recording (default from the handle)"), "format": s("html (default) or md") } } },

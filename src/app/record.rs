@@ -61,6 +61,12 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let gpu = gpu?;
     validity::window_visible(&page)?;
+    // A headless target draws off screen, so only a headed one cares about the lock screen.
+    let on_screen = !args.has("headless");
+    if on_screen && host::session_locked() {
+        return Err(validity::locked());
+    }
+    let awake = host::Awake::start();
     let id = store::new_id("rec");
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
@@ -68,6 +74,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let tracing = probe::trace::start(&browser.cdp, set)?;
     if set == Set::Attribution {
         probe::cpu::start(&page)?;
+        probe::alloc::start(&page)?;
     }
     std::thread::sleep(Duration::from_millis(300));
     let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
@@ -80,13 +87,27 @@ pub fn run(args: &Args) -> Result<Output> {
     let t1 = host::now_ns();
     let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let os = sampler.map(|s| s.stop().window(t0, t1));
+    if on_screen && (awake.locks() > 0 || host::session_locked()) {
+        let _ = std::fs::remove_dir_all(&dir);
+        return Err(validity::locked());
+    }
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
+        let allocs = probe::alloc::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
+        store::write_json(&dir.join("alloc-0.heapprofile"), &allocs)?;
         // `--served <dir>`: the folder the target's origin serves, to find original files on disk.
-        store::write_json(&dir.join("cpu-0.symbols.json"), &probe::symbols::resolve(&page, &profile, args.get("served").map(std::path::Path::new)))?;
+        let mut scripts = std::collections::BTreeSet::new();
+        probe::symbols::urls(&profile, &mut scripts);
+        probe::symbols::urls(&allocs, &mut scripts);
+        probe::symbols::store_maps(&page, &scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let bytes = tracing.stop(&dir.join("trace.pftrace"))?;
+    if set == Set::Attribution || set == Set::Memory {
+        // After tracing: a live trace subscription would copy every snapshot chunk (SPEC §8.6).
+        progress("taking a heap snapshot");
+        probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz"))?;
+    }
     let version = browser.version.clone();
     if !attach {
         browser.close();

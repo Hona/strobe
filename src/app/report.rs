@@ -13,6 +13,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
     if handle.starts_with("exp_") {
         attach_hotspots(&mut data);
+    } else if let Some(a) = attribution(&dir, &data["id"].as_str().unwrap_or(handle).to_string(), None) {
+        data["attribution"] = a;
     }
     let format = args.get("format").unwrap_or("html");
     let out = match args.get("out") {
@@ -31,8 +33,8 @@ pub fn run(args: &Args) -> Result<Output> {
     Ok(Output::new(format!("{path} · {}\n", super::fmt::bytes(body.len() as f64)), json!({ "path": path, "bytes": body.len() })))
 }
 
-/// The "why": self time per function and file from each series' attribution blocks (base and head),
-/// plus the attribution block's run count and metric values so the report can show per-run ms.
+/// The "why": each series' attribution recordings (base and head) as the report shows them, plus how
+/// the two sides' live heaps differ by class.
 fn attach_hotspots(data: &mut Value) {
     let plan_runs = data["plan"]["runs_per_block"].as_u64();
     let Some(series) = data["series"].as_array_mut() else { return };
@@ -41,35 +43,62 @@ fn attach_hotspots(data: &mut Value) {
         for role in ["base", "head"] {
             let Some(rec) = s["attribution"][role].as_str() else { continue };
             let Ok(dir) = store::resolve(rec) else { continue };
-            let Ok(fn_out) = super::query::hotspots(&dir, "function", 50) else { continue };
-            let mut h = fn_out.json;
-            if let Ok(file_out) = super::query::hotspots(&dir, "file", 25) {
-                h["files"] = file_out.json["rows"].clone();
+            if let Some(h) = attribution(&dir, rec, plan_runs) {
+                out[role] = h;
             }
-            let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
-            let runs = meta["runs"]
-                .as_u64()
-                .or_else(|| {
-                    let dur = meta["duration_ms"].as_f64()?;
-                    let one = meta["values"]["run.duration"].as_f64()?;
-                    (one > 0.0).then(|| (dur / one).round().max(1.0) as u64)
-                })
-                .or(plan_runs);
-            h["recording"] = json!(rec);
-            if let Some(r) = runs {
-                h["runs"] = json!(r);
-            }
-            if meta["values"].is_object() {
-                h["values"] = meta["values"].clone();
-            }
-            out[role] = h;
         }
         if out.as_object().is_some_and(|o| !o.is_empty()) {
             s["hotspots"] = out;
         }
+        let dirs: Vec<_> = ["base", "head"].iter().filter_map(|r| s["attribution"][r].as_str()).filter_map(|r| store::resolve(r).ok()).collect();
+        if let [a, b] = dirs.as_slice()
+            && let Ok(d) = super::query::heap_diff(a, b, 15, false)
+        {
+            s["heap_diff"] = d.json;
+        }
     }
 }
 
+/// One attribution recording for a report: CPU by function and file, allocations by function and
+/// file, forced layouts, GC, the live heap, run count and metric values.
+fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Option<Value> {
+    let mut h = super::query::hotspots(dir, "function", 50).ok()?.json;
+    if let Ok(o) = super::query::hotspots(dir, "file", 25) {
+        h["files"] = o.json["rows"].clone();
+    }
+    if let Ok(o) = super::query::alloc(dir, "function", 25) {
+        h["alloc"] = o.json;
+        if let Ok(f) = super::query::alloc(dir, "file", 25) {
+            h["alloc"]["files"] = f.json["rows"].clone();
+        }
+    }
+    if let Ok(o) = super::query::layout(dir, 25) {
+        h["layout"] = o.json;
+    }
+    if let Ok(o) = super::query::gc(dir) {
+        h["gc"] = o.json;
+    }
+    if let Ok(o) = super::query::heap(dir, 15, false) {
+        h["heap"] = o.json;
+    }
+    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+    let runs = meta["runs"]
+        .as_u64()
+        .or_else(|| {
+            let dur = meta["duration_ms"].as_f64()?;
+            let one = meta["values"]["run.duration"].as_f64()?;
+            (one > 0.0).then(|| (dur / one).round().max(1.0) as u64)
+        })
+        .or(plan_runs);
+    h["recording"] = json!(rec);
+    if let Some(r) = runs {
+        h["runs"] = json!(r);
+    }
+    if meta["values"].is_object() {
+        h["values"] = meta["values"].clone();
+    }
+    Some(h)
+}
 const TEMPLATE: &str = include_str!("../../viewer/report.html");
 
 pub fn html(view: &str, data: &Value) -> String {

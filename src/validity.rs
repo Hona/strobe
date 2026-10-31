@@ -46,6 +46,10 @@ pub fn window_visible(page: &Page) -> Result<()> {
     Ok(())
 }
 
+pub fn locked() -> Error {
+    Error::refused("SessionLocked", "the session was locked while strobe measured: the lock screen covers the window, so nothing it drew reached the display", "measure on an unlocked screen; bench waits for an unlock and redoes the block by itself")
+}
+
 pub fn dev_build(page: &Page) -> Result<()> {
     let dev = page.eval(r#"!!document.querySelector('script[src*="@vite/client"]') || typeof window.__vite_plugin_react_preamble_installed__ !== "undefined""#)?;
     if dev.as_bool() == Some(true) {

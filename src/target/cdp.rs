@@ -101,7 +101,18 @@ fn read_loop(mut ws: WebSocket<TcpStream>, pending: Pending, subscribers: Subscr
             Message::Close(_) => break "closed by the browser".to_string(),
             _ => continue,
         };
-        let Ok(value) = serde_json::from_str::<Value>(&text) else { continue };
+        let value = match parse(&text) {
+            Ok(v) => v,
+            Err(e) => {
+                // A reply strobe cannot read must fail its command now, not leave it waiting out its timeout.
+                if let Some(id) = text.strip_prefix("{\"id\":").and_then(|r| r.split(|c: char| !c.is_ascii_digit()).next()).and_then(|d| d.parse::<u64>().ok())
+                    && let Some(tx) = pending.lock().unwrap().remove(&id)
+                {
+                    let _ = tx.send(json!({ "id": id, "error": { "message": format!("unreadable reply ({} bytes): {e}", text.len()) } }));
+                }
+                continue;
+            }
+        };
         if let Some(id) = value.get("id").and_then(Value::as_u64) {
             if let Some(tx) = pending.lock().unwrap().remove(&id) {
                 let _ = tx.send(value);
@@ -113,6 +124,15 @@ fn read_loop(mut ws: WebSocket<TcpStream>, pending: Pending, subscribers: Subscr
     *closed.lock().unwrap() = Some(why);
     // Wake every waiter: their replies will never come.
     pending.lock().unwrap().clear();
+}
+
+/// Parses a CDP message without serde_json's 128-level nesting limit: a sampling heap profile nests
+/// two levels per stack frame, and stacks run deeper than 64 frames.
+pub fn parse(text: &str) -> serde_json::Result<Value> {
+    use serde::Deserialize;
+    let mut de = serde_json::Deserializer::from_str(text);
+    de.disable_recursion_limit();
+    Value::deserialize(&mut de)
 }
 
 /// Waits for an event matching `method` (and an optional session) on a subscription.

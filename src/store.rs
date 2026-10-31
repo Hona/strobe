@@ -58,7 +58,12 @@ pub fn resolve(handle: &str) -> Result<PathBuf> {
 }
 
 pub fn read_json(path: &std::path::Path) -> Result<Value> {
-    Ok(serde_json::from_slice(&std::fs::read(path)?)?)
+    use serde::Deserialize;
+    let bytes = std::fs::read(path)?;
+    // Profiles nest one level per stack frame; serde_json stops at 128 by default.
+    let mut de = serde_json::Deserializer::from_slice(&bytes);
+    de.disable_recursion_limit();
+    Ok(Value::deserialize(&mut de)?)
 }
 
 /// The newest recordings or experiments, newest first.

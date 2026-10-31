@@ -149,8 +149,11 @@ app/            commands (up, status, record, bench, query, report, top, update,
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
 target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
                 process.rs, launch.rs (isolated launches)
-probe/          collecting → trace.rs, cpu.rs, heap.rs, census.rs, coverage.rs,
-                os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs, helper.rs
+probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
+                census.rs, coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
+                helper.rs
+heapsnap.rs     V8 heap snapshots: streaming parse, dominators, classes, retainer paths, diff, leaks
+metrics.rs      a block's trace → metric values
 engine/         trace_processor: the only place that runs it (§15)
 store/          experiments/ and recordings/: the only place that writes them (§14)
 runner/         the bench runner link: spawns `bun`, speaks the runner protocol (§9.6)
@@ -418,7 +421,7 @@ phase.
 | `threads` | top-level tasks per thread by category, long tasks | trace | timing | low |
 | `os` | process tree CPU and memory, threads, per-core, IO | OS sampler (§13.6) | timing | low |
 | `gpu` | engines and VRAM per process, device clocks, power, PCIe | GPU sampler | timing | low |
-| `cpu` | JS stacks at 50 µs with line ticks | V8 profiler | attribution | med |
+| `cpu` | JS stacks at 200 µs with line ticks | V8 profiler | attribution | med |
 | `alloc` | allocation sampling with stacks | HeapProfiler.startSampling | attribution | low–med |
 | `invalidation` | forced layouts and style invalidations with JS stacks | trace | attribution | med |
 | `counters` | `@strobe/web` counters, framework adapters | SDK | attribution | med |
@@ -454,16 +457,38 @@ by 35–45%, enough that one profiled launch moved against the timed pairs it wa
 Every hotspot row carries its sample count and an interval for its share. Native time stays
 `(program)` unless `deep` resolves it (§12.3).
 
-**Source maps**: right after the profiler stops, while the target still serves its scripts, strobe
-asks the page to fetch each profiled script's `sourceMappingURL` (http, an app's custom protocol,
-or an inline `data:` map), decodes the VLQ mappings, and writes `cpu-<n>.symbols.json` mapping
-`"<url>:<line>:<column>"` to `{ name, name_from, source, line, column, file }`: the source path
-exactly as the map records it, the 1-based original line and column, and `file`, the absolute path
-on disk, when strobe knows the folder the origin serves (strobe.json `serve.dir`, else
-`build.output`; `record --served <dir>`) and the file exists. When the map names no identifier at a
-function's start, strobe reads the original declaration on disk (`function name(`, `name(`,
-`name = (…) =>`) and records `name_from: "source"`. A build without maps keeps minified names.
+**Source maps**: right after the profilers stop, while the target still serves its scripts, strobe
+asks the page to fetch the `sourceMappingURL` (http, an app's custom protocol, or an inline `data:`
+map) of every script the page has run and of every script in the profiles, and stores the maps in
+the recording (`maps/index.json`, gzip files). Next to each map it stores the script's line starts
+and V8's function ranges (`Profiler.getBestEffortCoverage`, which starts nothing). Every view
+resolves frames at query time, so CPU samples, allocation sites and trace stacks resolve alike:
+`{ name, name_from, file, line, column, url, source_mapped }`, where `file` is the absolute path on
+disk when strobe knows the folder the origin serves (strobe.json `serve.dir`, else `build.output`;
+`record --served <dir>`) and the file exists, else the source path exactly as the map records it;
+line and column are 1-based. A function frame takes the map's name at the function's start; when
+the map names none, strobe reads the original declaration on disk (`function name(`, `name(`,
+`name = (…) =>`) and records `name_from: "source"`. A call site (trace stacks) is located at the
+call itself and named after the innermost function range that contains it, resolved the same way.
+A build without maps keeps minified names.
 
+**Allocations** (`alloc`): `HeapProfiler.startSampling` every 32 KB on average, objects already
+collected by minor or major GC included, so short-lived garbage counts; `query alloc` ranks bytes by
+function, file or package with full stacks. Stacks keep their innermost 128 frames: the profile is a
+tree nested two levels per frame, and Chrome's protocol serializer refuses replies nested deeper than
+300 levels. strobe parses CDP replies and stored profiles without a nesting limit (serde_json stops at
+128 by default, which dropped such a reply and left the command waiting out its timeout), and a reply
+it cannot parse fails its command at once.
+
+**Forced layout and GC** (`invalidation`): attribution traces carry `Layout` and `UpdateLayoutTree`
+with the JavaScript stack that forced them (`devtools.timeline.stack`) and every V8 GC phase.
+`query layout` ranks forced layouts and style recalculations by call site; `query gc` gives
+collections, main-thread GC time (union of GC slices, incremental marking included) and helper
+thread GC time per measured run.
+
+**Where work went, in every block**: `Performance.getMetrics` at each run's start and end gives
+`main.script`, `main.layout`, `main.style` (ms per run) and `layout.count`, `style.count`, cheap
+enough for timing blocks, so they carry intervals like any descriptive metric.
 **Complete over short** (for every view, because agents act on it): a frame is located by its absolute
 file, line and column, never a shortened path; hotspots by function carry their three heaviest
 full call stacks (root to leaf, every frame located), and the text view prints the heaviest one in
@@ -840,6 +865,7 @@ installed there). Results are stored locally, tagged per device, never pooled ac
 | `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`) |
 | `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible` |
+| `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: it waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run |
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
@@ -891,9 +917,12 @@ with at least 3 pairs shows zero spread.
 | `frames` | `--phase` | frame percentiles, dropped vsyncs, budget misses, worst frames with handles |
 | `threads` | `--phase` | busy share by thread and category, long tasks |
 | `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` | rows with self and total time, sample counts, intervals, handles |
+| `alloc` | `--by function\|file\|package` | bytes allocated per row from sampled allocations (collected objects included), with complete locations and the three heaviest full stacks per function |
+| `layout` | | forced (synchronous) layouts and style recalculations by the JavaScript call site that forced them, with full stacks; per-run counts and time, forced and in the frame lifecycle |
+| `gc` | | per measured run: minor and major collections, main-thread GC time (pauses and incremental marking), helper-thread GC time, bytes freed |
 | `stack` | `<id>` | callers to the root, with source locations and packages |
 | `memory` | `--by process\|layer\|allocator` | census per process and layer |
-| `heap` | `classes` · `retainers <id>` · `diff a..b` | aggregates; strings redacted unless `--reveal` |
+| `heap` | `--top` `--reveal`; `a..b heap` | live objects by class (count, self and retained size), detached DOM, the largest owners with complete retainer paths; `a..b` diffs two recordings by class; strings redacted unless `--reveal`. Bench attribution blocks and `record --probes attribution\|memory` take one post-GC snapshot after the trace stops |
 | `leaks` | | per process and layer: slope, interval, suspects |
 | `gpu` | | adapter, engines and VRAM per process, device counters |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
@@ -909,7 +938,8 @@ with at least 3 pairs shows zero spread.
 `experiment`, `recording` (`bench-summary` / PR block in `--format md`), `memory-timeline`,
 `frames`, `hotspots`, `flame`, `compare`, `leak`. HTML is self-contained (`viewer/report.html` +
 embedded JSON payload with the metric catalog and, for `experiment`, per-series base/head CPU
-hotspots by function `(name, location)` and by file plus attribution run counts, default cap 2 MB);
+hotspots by function `(name, location)` and by file, allocation sites, forced layouts, GC and
+attribution run counts, default cap 2 MB);
 markdown is GitHub-flavoured.
 
 ### 11.3 Insights

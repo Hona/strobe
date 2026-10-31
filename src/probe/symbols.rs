@@ -1,61 +1,259 @@
-//! Original names and locations for CPU-profile frames, from the page's own source maps (SPEC §8.3).
+//! Original names and locations for profile frames, from the page's own source maps (SPEC §8.3).
 //!
 //! A production bundle profiles as minified names in hashed chunks (`go` in `file-oSEU8O4T.js`). Right
-//! after an attribution block's profiler stops, strobe asks the page to fetch each script's map (so it
-//! works for http and for an Electron app's custom protocol alike), decodes it, and writes
-//! `cpu-<n>.symbols.json`: `"<url>:<line>:<column>"` (as in the profile, 0-based) to
-//! `{ name, source, line, column, file }`: the original name when the map has one, the source path
-//! exactly as the map records it, the 1-based original line and column, and the absolute file on
-//! disk when strobe knows which folder the origin serves and the file exists. Complete over short:
-//! displays may abbreviate, the record does not.
+//! after an attribution block's profilers stop, while the target still serves its scripts, strobe asks
+//! the page to fetch each profiled script's source map (so it works for http and for an Electron app's
+//! custom protocol alike) and stores the maps in the recording (`maps/index.json` and gzip files). Any
+//! view can then turn any frame (CPU samples, allocation sites, layout stacks) into its original name,
+//! the absolute file on disk, line and column. Complete over short: displays may abbreviate, records
+//! do not.
 
+use crate::model::Result;
 use crate::target::chromium::Page;
 use serde_json::{Map, Value, json};
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
-/// Symbols for every frame of `profile` whose script has a source map. `served` is the folder the
-/// page's http origin serves (a web build's output), used to find the original files on disk.
-pub fn resolve(page: &Page, profile: &Value, served: Option<&Path>) -> Value {
-    let mut by_url: BTreeMap<String, Vec<(i64, i64)>> = BTreeMap::new();
+/// Script URLs in a V8 profile (`.cpuprofile` node list or a sampling heap profile tree).
+pub fn urls(profile: &Value, out: &mut BTreeSet<String>) {
+    let mut visit = |f: &Value| {
+        if let Some(u) = f["url"].as_str().filter(|u| !u.is_empty() && !u.starts_with("chrome") && !u.starts_with("devtools")) {
+            out.insert(u.to_string());
+        }
+    };
     for n in profile["nodes"].as_array().into_iter().flatten() {
-        let f = &n["callFrame"];
-        let url = f["url"].as_str().unwrap_or("");
-        let (line, col) = (f["lineNumber"].as_i64().unwrap_or(-1), f["columnNumber"].as_i64().unwrap_or(-1));
-        if url.is_empty() || line < 0 || col < 0 || url.starts_with("chrome") || url.starts_with("devtools") {
-            continue;
-        }
-        by_url.entry(url.to_string()).or_default().push((line, col));
+        visit(&n["callFrame"]);
     }
-    let mut out = Map::new();
-    let mut texts: BTreeMap<PathBuf, Vec<String>> = BTreeMap::new();
-    for (url, positions) in by_url {
-        let Some((map_url, text)) = fetch_map(page, &url) else { continue };
-        let Some(map) = SourceMap::parse(&text) else { continue };
+    let mut stack: Vec<&Value> = profile.get("head").into_iter().collect();
+    while let Some(n) = stack.pop() {
+        visit(&n["callFrame"]);
+        stack.extend(n["children"].as_array().into_iter().flatten());
+    }
+}
+
+/// Saves the source maps of every script the page has run, and of `scripts` (profile URLs), into
+/// `dir/maps/`, with each script's function ranges: a stack frame that is a call site (layout and style
+/// stacks in the trace) is then named after the function containing it, not the identifier at the
+/// call. `served` is the folder the page's http origin serves (a web build's output); with it, original
+/// sources resolve to files on disk. Returns how many maps were stored.
+pub fn store_maps(page: &Page, scripts: &BTreeSet<String>, dir: &Path, served: Option<&Path>) -> Result<usize> {
+    let maps = dir.join("maps");
+    std::fs::create_dir_all(&maps)?;
+    // V8's own function ranges per script (UTF-16 offsets), without starting anything that would change
+    // how the page runs.
+    page.send("Profiler.enable", json!({}))?;
+    let coverage = page.send_timeout("Profiler.getBestEffortCoverage", json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
+    let mut ranges: BTreeMap<String, Vec<(i64, i64, String)>> = BTreeMap::new();
+    for s in coverage["result"].as_array().into_iter().flatten() {
+        let Some(url) = s["url"].as_str().filter(|u| !u.is_empty()) else { continue };
+        let fns = ranges.entry(url.to_string()).or_default();
+        for f in s["functions"].as_array().into_iter().flatten() {
+            let r = &f["ranges"][0];
+            if let (Some(a), Some(b)) = (r["startOffset"].as_i64(), r["endOffset"].as_i64()) {
+                fns.push((a, b, f["functionName"].as_str().unwrap_or("").to_string()));
+            }
+        }
+    }
+    let all: BTreeSet<String> = scripts.iter().cloned().chain(ranges.keys().filter(|u| !u.starts_with("chrome") && !u.starts_with("devtools")).cloned()).collect();
+    let mut index = Map::new();
+    for (i, url) in all.iter().enumerate() {
+        let Some(fetched) = fetch_map(page, url) else { continue };
+        let file = format!("maps/{i}.map.gz");
+        write_gz(&dir.join(&file), fetched.text.as_bytes())?;
+        let mut fns = ranges.remove(url).unwrap_or_default();
+        fns.sort();
+        fns.dedup();
+        let scopes = format!("maps/{i}.scopes.json.gz");
+        let body = json!({ "lines": fetched.lines, "functions": fns.iter().map(|(a, b, n)| json!([a, b, n])).collect::<Vec<_>>() });
+        write_gz(&dir.join(&scopes), body.to_string().as_bytes())?;
         // The map's folder on disk: its URL path under the served folder (http origins only).
-        let map_dir = served.zip(url_path(&map_url)).map(|(root, p)| root.join(p.trim_start_matches('/'))).and_then(|p| p.parent().map(Path::to_path_buf));
-        for (line, col) in positions {
-            let Some(o) = map.lookup(line as usize, col) else { continue };
-            let file = map_dir.as_ref().map(|d| normalize(&d.join(strip_scheme(&o.source)))).filter(|p| p.is_file());
-            // Without a name in the map, the original declaration on disk usually has one.
-            let (name, from) = match (&o.name, &file) {
-                (Some(n), _) => (Some(n.clone()), Some("map")),
-                (None, Some(f)) => {
-                    let lines = texts.entry(f.clone()).or_insert_with(|| std::fs::read_to_string(f).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default());
-                    let n = lines.get(o.line as usize).and_then(|l| declared_name(l, o.column as usize));
-                    let from = n.as_ref().map(|_| "source");
-                    (n, from)
-                }
-                _ => (None, None),
-            };
-            out.insert(
-                format!("{url}:{line}:{col}"),
-                json!({ "name": name, "name_from": from, "source": o.source, "line": o.line + 1, "column": o.column + 1, "file": file.map(|p| p.display().to_string()) }),
-            );
+        let map_dir = served.zip(url_path(&fetched.url)).map(|(root, p)| root.join(p.trim_start_matches('/'))).and_then(|p| p.parent().map(|d| d.display().to_string()));
+        index.insert(url.clone(), json!({ "map": file, "map_url": fetched.url, "map_dir": map_dir, "scopes": scopes }));
+    }
+    let n = index.len();
+    crate::store::write_json(&maps.join("index.json"), &Value::Object(index))?;
+    Ok(n)
+}
+
+fn write_gz(path: &Path, bytes: &[u8]) -> Result<()> {
+    let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(path)?, flate2::Compression::fast());
+    gz.write_all(bytes)?;
+    gz.finish()?;
+    Ok(())
+}
+
+struct Fetched {
+    url: String,
+    text: String,
+    /// The script's line start offsets (UTF-16), to turn a line and column into a function range offset.
+    lines: Vec<i64>,
+}
+
+/// The script's map: its `sourceMappingURL` (a URL or an inline `data:` map) and text, fetched by the page.
+fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
+    let js = format!(
+        r#"(async (u) => {{
+  try {{
+    const s = await (await fetch(u)).text()
+    const m = /\/\/[#@] sourceMappingURL=(\S+)\s*$/.exec(s.slice(-600))
+    if (!m) return null
+    const href = new URL(m[1], u).href
+    const r = await fetch(href)
+    if (!r.ok) return null
+    const lines = [0]
+    for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) lines.push(i + 1)
+    return {{ url: href, text: await r.text(), lines }}
+  }} catch {{ return null }}
+}})({})"#,
+        json!(url)
+    );
+    let v = page.eval_timeout(&js, Duration::from_secs(30)).ok()?;
+    Some(Fetched {
+        url: v["url"].as_str()?.to_string(),
+        text: v["text"].as_str()?.to_string(),
+        lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect(),
+    })
+}
+/// One frame, located as completely as strobe can: the original name, the absolute file on disk when
+/// known (else the source path the map records, else the script URL), 1-based line and column.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Frame {
+    pub name: String,
+    pub file: String,
+    pub line: i64,
+    pub column: i64,
+    pub url: String,
+    pub mapped: bool,
+    /// Where `name` came from: "map", "source" (the declaration on disk), or None (the profile's own).
+    pub name_from: Option<String>,
+}
+
+impl Frame {
+    /// `file:line:column`, or `(native)` for frames without a script.
+    pub fn location(&self) -> String {
+        if self.url.is_empty() {
+            return "(native)".into();
+        }
+        match (self.line, self.column) {
+            (l, c) if l > 0 && c > 0 => format!("{}:{l}:{c}", self.file),
+            (l, _) if l > 0 => format!("{}:{l}", self.file),
+            _ => self.file.clone(),
         }
     }
-    Value::Object(out)
+
+    pub fn json(&self) -> Value {
+        json!({ "name": self.name, "name_from": self.name_from, "file": self.file, "line": self.line, "column": self.column, "url": self.url, "source_mapped": self.mapped })
+    }
+}
+
+/// Resolves frames through a recording's stored maps (loaded lazily, one decode per script).
+pub struct Symbolizer {
+    dir: PathBuf,
+    index: Value,
+    maps: RefCell<BTreeMap<String, Option<SourceMap>>>,
+    texts: RefCell<BTreeMap<PathBuf, Vec<String>>>,
+    scopes: RefCell<BTreeMap<String, Option<Scopes>>>,
+}
+
+/// A script's line starts and V8's function ranges (start, end, minified name), sorted by start.
+struct Scopes {
+    lines: Vec<i64>,
+    functions: Vec<(i64, i64, String)>,
+}
+
+impl Symbolizer {
+    pub fn open(dir: &Path) -> Symbolizer {
+        let index = crate::store::read_json(&dir.join("maps").join("index.json")).unwrap_or(Value::Null);
+        Symbolizer { dir: dir.to_path_buf(), index, maps: RefCell::new(BTreeMap::new()), texts: RefCell::new(BTreeMap::new()), scopes: RefCell::new(BTreeMap::new()) }
+    }
+
+    /// A call site from a trace stack (`url`, 0-based line and column, the minified function name): the
+    /// original file, line and column of the call itself, named after the innermost function that
+    /// contains it, resolved the way `frame` resolves a function start.
+    pub fn call_site(&self, url: &str, line0: i64, col0: i64, minified: &str) -> Frame {
+        let at = self.frame(url, line0, col0, minified);
+        let enclosing = self.enclosing(url, line0, col0);
+        let named = enclosing.map(|(l, c, n)| self.frame(url, l, c, if minified.is_empty() { &n } else { minified }));
+        match named {
+            Some(f) => Frame { name: f.name, name_from: f.name_from, ..at },
+            None => Frame { name: if minified.is_empty() { "(anonymous)".into() } else { minified.to_string() }, name_from: None, ..at },
+        }
+    }
+
+    /// The start (0-based line and column) and minified name of the innermost function around a position.
+    fn enclosing(&self, url: &str, line0: i64, col0: i64) -> Option<(i64, i64, String)> {
+        let file = self.index[url]["scopes"].as_str()?;
+        let mut cache = self.scopes.borrow_mut();
+        let scopes = cache
+            .entry(url.to_string())
+            .or_insert_with(|| {
+                let mut text = String::new();
+                flate2::read::GzDecoder::new(std::fs::File::open(self.dir.join(file)).ok()?).read_to_string(&mut text).ok()?;
+                let v: Value = serde_json::from_str(&text).ok()?;
+                let lines = v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect();
+                let functions = v["functions"].as_array()?.iter().filter_map(|f| Some((f[0].as_i64()?, f[1].as_i64()?, f[2].as_str()?.to_string()))).collect();
+                Some(Scopes { lines, functions })
+            })
+            .as_ref()?;
+        let offset = scopes.lines.get(usize::try_from(line0).ok()?)? + col0;
+        // Ranges nest, so the containing range that starts last is the innermost.
+        let end = scopes.functions.partition_point(|f| f.0 <= offset);
+        let f = scopes.functions[..end].iter().rev().find(|f| offset < f.1)?;
+        let line = scopes.lines.partition_point(|s| *s <= f.0).checked_sub(1)?;
+        Some((line as i64, f.0 - scopes.lines[line], f.2.clone()))
+    }
+
+    /// A frame from a V8 call frame: `url`, 0-based `line` and `col`, and the profile's own name.
+    pub fn frame(&self, url: &str, line0: i64, col0: i64, minified: &str) -> Frame {
+        let minified = if minified.is_empty() { "(anonymous)" } else { minified };
+        let plain = Frame { name: minified.to_string(), file: url.to_string(), line: line0 + 1, column: col0 + 1, url: url.to_string(), mapped: false, name_from: None };
+        if url.is_empty() || line0 < 0 || col0 < 0 {
+            return plain;
+        }
+        let entry = &self.index[url];
+        if !entry.is_object() {
+            return plain;
+        }
+        let mut maps = self.maps.borrow_mut();
+        let map = maps.entry(url.to_string()).or_insert_with(|| {
+            let mut text = String::new();
+            let f = std::fs::File::open(self.dir.join(entry["map"].as_str().unwrap_or(""))).ok()?;
+            flate2::read::GzDecoder::new(f).read_to_string(&mut text).ok()?;
+            SourceMap::parse(&text)
+        });
+        let Some(o) = map.as_ref().and_then(|m| m.lookup(line0 as usize, col0)) else { return plain };
+        let file = entry["map_dir"].as_str().map(|d| normalize(&Path::new(d).join(strip_scheme(&o.source)))).filter(|p| p.is_file());
+        // Without a name in the map, the original declaration on disk usually has one.
+        let (name, from) = match (&o.name, &file) {
+            (Some(n), _) => (n.clone(), Some("map")),
+            (None, Some(f)) => {
+                let mut texts = self.texts.borrow_mut();
+                let lines = texts.entry(f.clone()).or_insert_with(|| std::fs::read_to_string(f).map(|t| t.lines().map(str::to_string).collect()).unwrap_or_default());
+                match lines.get(o.line as usize).and_then(|l| declared_name(l, o.column as usize)) {
+                    Some(n) => (n, Some("source")),
+                    None => (minified.to_string(), None),
+                }
+            }
+            _ => (minified.to_string(), None),
+        };
+        Frame {
+            name,
+            file: file.map(|p| p.display().to_string()).unwrap_or(o.source),
+            line: o.line + 1,
+            column: o.column + 1,
+            url: url.to_string(),
+            mapped: true,
+            name_from: from.map(str::to_string),
+        }
+    }
+
+    /// A frame from a V8 `callFrame` object.
+    pub fn call_frame(&self, f: &Value) -> Frame {
+        self.frame(f["url"].as_str().unwrap_or(""), f["lineNumber"].as_i64().unwrap_or(-1), f["columnNumber"].as_i64().unwrap_or(-1), f["functionName"].as_str().unwrap_or(""))
+    }
 }
 
 /// The name a function declared at `col` (0-based, in characters) of `line` goes by: `function name(`,
@@ -82,25 +280,6 @@ fn declared_name(line: &str, col: usize) -> Option<String> {
     let head = head.strip_suffix('=').or_else(|| head.strip_suffix(':'))?.trim_end();
     let name: String = head.chars().rev().take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$').collect::<Vec<_>>().into_iter().rev().collect();
     (!name.is_empty()).then_some(name)
-}
-
-/// The script's map: its `sourceMappingURL` (a URL or an inline `data:` map) and text, fetched by the page.
-fn fetch_map(page: &Page, url: &str) -> Option<(String, String)> {
-    let js = format!(
-        r#"(async (u) => {{
-  try {{
-    const s = await (await fetch(u)).text()
-    const m = /\/\/[#@] sourceMappingURL=(\S+)\s*$/.exec(s.slice(-600))
-    if (!m) return null
-    const href = new URL(m[1], u).href
-    const r = await fetch(href)
-    return r.ok ? {{ url: href, text: await r.text() }} : null
-  }} catch {{ return null }}
-}})({})"#,
-        json!(url)
-    );
-    let v = page.eval_timeout(&js, Duration::from_secs(30)).ok()?;
-    Some((v["url"].as_str()?.to_string(), v["text"].as_str()?.to_string()))
 }
 
 /// The path of an http(s) URL, without query or fragment.

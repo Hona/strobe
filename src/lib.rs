@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod driver;
 pub mod engine;
+pub mod heapsnap;
 pub mod host;
 pub mod metrics;
 pub mod model;

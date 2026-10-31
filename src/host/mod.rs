@@ -24,6 +24,65 @@ pub fn now_ns() -> u64 {
     }
 }
 
+/// Whether the user's session shows the lock screen: it covers every window, so nothing the target
+/// draws reaches the display and Chromium treats its windows as hidden.
+pub fn session_locked() -> bool {
+    #[cfg(windows)]
+    {
+        win::session_locked()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// While alive, keeps the machine awake and, while the session is unlocked, the display on (an
+/// unattended bench must not let the display sleep under it; a locked screen may go dark while the
+/// bench waits), and counts how often it saw the session locked, every 500 ms.
+pub struct Awake {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    locked: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Awake {
+    pub fn start() -> Awake {
+        use std::sync::atomic::Ordering;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let locked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, l) = (stop.clone(), locked.clone());
+        std::thread::spawn(move || {
+            let mut was: Option<bool> = None;
+            while !s.load(Ordering::Relaxed) {
+                let locked = session_locked();
+                if locked {
+                    l.fetch_add(1, Ordering::Relaxed);
+                }
+                if was != Some(locked) {
+                    #[cfg(windows)]
+                    win::keep_awake(true, !locked);
+                    was = Some(locked);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
+            }
+            #[cfg(windows)]
+            win::keep_awake(false, false);
+        });
+        Awake { stop, locked }
+    }
+
+    /// Lock observations so far: a block during which this changed saw the lock screen.
+    pub fn locks(&self) -> u64 {
+        self.locked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+impl Drop for Awake {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// CPU time used so far by one process, in nanoseconds.
 #[derive(Clone, Debug, Default)]
 pub struct ProcTimes {

@@ -21,7 +21,7 @@ path = "src/bin/strobew.rs"
 [dependencies]
 # JSON for every protocol strobe speaks (CDP, runner, MCP, results).
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["unbounded_depth"] }
 # WebSocket client for the Chrome DevTools Protocol; plain ws:// to 127.0.0.1, no TLS.
 # 0.24: its getrandom 0.2 links bcrypt normally; newer ones need dlltool's raw-dylib on windows-gnu.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
@@ -43,6 +43,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_ProcessStatus",
   "Win32_System_Power",
   "Win32_System_Registry",
+  "Win32_System_RemoteDesktop",
   "Win32_UI_WindowsAndMessaging",
   "Win32_Graphics_Gdi",
   # OS and GPU sampler: console (top), NVML loaded at runtime, D3DKMT adapter names, NtQuerySystemInformation.

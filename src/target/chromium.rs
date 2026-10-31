@@ -321,6 +321,10 @@ impl Page {
         self.cdp.send(method, params, Some(&self.session))
     }
 
+    pub fn send_timeout(&self, method: &str, params: Value, timeout: Duration) -> Result<Value> {
+        self.cdp.send_timeout(method, params, Some(&self.session), timeout)
+    }
+
     /// Evaluates an expression and returns its value (awaiting promises).
     pub fn eval(&self, expression: &str) -> Result<Value> {
         self.eval_timeout(expression, Duration::from_secs(60))

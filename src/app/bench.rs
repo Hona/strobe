@@ -25,6 +25,16 @@ use std::time::{Duration, Instant};
 /// Secondaries that get tested (Holm across these only). Fewer tests keep the correction reachable.
 const DEFAULT_SECONDARIES: &[&str] = &["frames.interval.p95", "frames.dropped.pct", "main.busy", "interaction.p95", "cpu.app.total"];
 
+/// Where main-thread work went, from the Performance domain's cumulative counters (metric, counter,
+/// scale): seconds to ms, counts as they are. Cheap enough for every block, so they carry intervals.
+const WORK_PARTS: [(&str, &str, f64); 5] = [
+    ("main.script", "ScriptDuration", 1e3),
+    ("main.layout", "LayoutDuration", 1e3),
+    ("main.style", "RecalcStyleDuration", 1e3),
+    ("layout.count", "LayoutCount", 1.0),
+    ("style.count", "RecalcStyleCount", 1.0),
+];
+
 /// Shown with intervals but never tested: context, not claims.
 const DESCRIPTIVE: &[&str] = &[
     "frames.interval.p50",
@@ -33,6 +43,11 @@ const DESCRIPTIVE: &[&str] = &[
     "frames.presented.p99",
     "main.tasks.long",
     "main.work",
+    "main.script",
+    "main.layout",
+    "main.style",
+    "layout.count",
+    "style.count",
     "scroll.latency.p95",
     "run.duration",
     "gpu.process.3d",
@@ -110,6 +125,8 @@ struct Run {
     ms: f64,
     cpu: f64,
     task: f64,
+    /// Per run, the Performance domain's other counters in `WORK_PARTS` order.
+    parts: [f64; 5],
     t0: u64,
     t1: u64,
     /// The run with its reset (ms): what it cost the block.
@@ -150,6 +167,7 @@ struct Ctx<'a> {
     runs: usize,
     warnings: Vec<Warning>,
     config: Value,
+    awake: host::Awake,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -197,6 +215,7 @@ pub fn run(args: &Args) -> Result<Output> {
         runs: args.num("runs")?.unwrap_or(5.0).max(1.0) as usize,
         warnings: Vec::new(),
         config: config.clone(),
+        awake: host::Awake::start(),
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -235,7 +254,7 @@ pub fn run(args: &Args) -> Result<Output> {
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
         },
-        "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label })).collect::<Vec<_>>(),
+        "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v) })).collect::<Vec<_>>(),
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided,
     });
     let text = render(&result_json);
@@ -287,7 +306,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             let keep = ctx.keep_all || pair == 0;
             // Timing blocks trace only what the metrics read; `--trace full` keeps every timeline category.
             let set = if ctx.args.get("trace") == Some("full") { Set::Timing } else { Set::Lean };
-            let b = run_block(ctx, s, &variants[v], pair, set, keep)?;
+            let b = block_on_screen(ctx, s, &variants[v], pair, set, keep)?;
             if pair == 0 {
                 progress(format!("  {} block  {}", b.variant, steps_text(&b.steps)));
             }
@@ -419,7 +438,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if why {
         progress("  attribution blocks (CPU stacks, invalidations; not timed)");
         for v in variants.iter() {
-            match run_block(ctx, s, v, usize::MAX, Set::Attribution, true) {
+            match block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) {
                 Ok(b) => recordings[v.role] = json!(b.recording),
                 Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", v.role, e.message))),
             }
@@ -515,6 +534,39 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
                 break;
             }
         }
+    }
+}
+
+/// The commit subject of a git variant, so a report still says what was compared days later.
+fn subject(v: &Variant) -> Option<String> {
+    let root = v.root.as_ref()?;
+    let out = Command::new("git").arg("-C").arg(root).args(["log", "-1", "--format=%s"]).output().ok()?;
+    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    (out.status.success() && !s.is_empty()).then_some(s)
+}
+
+/// Runs a block while the screen is unlocked: waits out a locked session, and redoes a block the
+/// lock screen touched (Chromium hides its windows and nothing reaches the display, so its numbers
+/// describe nothing). The block's own checks still refuse anything else.
+fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+    loop {
+        if host::session_locked() {
+            progress("  waiting: the session is locked; strobe resumes when it is unlocked");
+            while host::session_locked() {
+                std::thread::sleep(Duration::from_secs(2));
+            }
+            // The desktop and the GPU settle after an unlock.
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        let before = ctx.awake.locks();
+        let r = run_block(ctx, s, v, pair, set, keep);
+        if ctx.awake.locks() == before && !host::session_locked() {
+            return r;
+        }
+        if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
     }
 }
 
@@ -620,11 +672,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
         page.send("Performance.enable", json!({}))?;
-        let task_ms = || -> f64 {
-            page.send("Performance.getMetrics", json!({}))
-                .ok()
-                .and_then(|m| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == "TaskDuration").and_then(|x| x["value"].as_f64())))
-                .map_or(f64::NAN, |s| s * 1e3)
+        // TaskDuration (ms), then WORK_PARTS.
+        let counters = || -> [f64; 6] {
+            let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
+            let get = |name: &str, scale: f64| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == name)).and_then(|x| x["value"].as_f64()).map_or(f64::NAN, |v| v * scale);
+            let mut out = [get("TaskDuration", 1e3), 0.0, 0.0, 0.0, 0.0, 0.0];
+            for (i, (_, name, scale)) in WORK_PARTS.iter().enumerate() {
+                out[i + 1] = get(name, *scale);
+            }
+            out
         };
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<Run> {
@@ -635,7 +691,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
             let (cyc0, tsc0) = cycles();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
-            let task0 = task_ms();
+            let c0 = counters();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner
@@ -643,7 +699,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
-            let task1 = task_ms();
+            let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
             let (cyc1, tsc1) = cycles();
             let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
@@ -659,7 +715,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 _ if wall > 0.0 => 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall,
                 _ => f64::NAN,
             };
-            Ok(Run { ms: wall / 1e6, cpu, task: task1 - task0, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
+            let parts = std::array::from_fn(|i| c1[i + 1] - c0[i + 1]);
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] - c0[0], parts, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -686,6 +743,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 first = Some(if set == Set::Attribution || !steady { i + 1 } else { i - 1 });
                 if set == Set::Attribution {
                     probe::cpu::start(&page)?;
+                    probe::alloc::start(&page)?;
                 }
             }
         }
@@ -719,16 +777,30 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         std::fs::create_dir_all(&dir)?;
         if set == Set::Attribution {
             let profile = probe::cpu::stop(&page)?;
+            let allocs = probe::alloc::stop(&page)?;
             store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
-            // Original names and locations from the page's source maps, while its server still runs. The
-            // served folder (strobe.json `serve.dir`, else `build.output`) turns them into files on disk.
+            store::write_json(&dir.join("alloc-0.heapprofile"), &allocs)?;
+            // The page's source maps, kept with the recording while its server still runs, so any view
+            // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
+            // `build.output`) turns original sources into files on disk.
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
-            store::write_json(&dir.join("cpu-0.symbols.json"), &probe::symbols::resolve(&page, &profile, served.as_deref()))?;
+            let mut scripts = std::collections::BTreeSet::new();
+            probe::symbols::urls(&profile, &mut scripts);
+            probe::symbols::urls(&allocs, &mut scripts);
+            probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
         }
         let trace = dir.join("trace.pftrace");
         tracing.stop(&trace)?;
-        let _ = ctx.runner.call("close", json!({}), t, &serve);
         lap("trace");
+        if set == Set::Attribution {
+            // The live objects after the runs (post-GC), once no trace subscription copies every
+            // snapshot chunk (SPEC §8.6).
+            if let Err(e) = probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz")) {
+                ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", v.role, e.message)));
+            }
+            lap("heap");
+        }
+        let _ = ctx.runner.call("close", json!({}), t, &serve);
         let mut data = metrics::read(&trace, &token)?;
         data.warm_below(first);
         lap("analyse");
@@ -741,6 +813,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let busy_cdp = metrics::median(&busy.values().copied().collect::<Vec<_>>());
         if !work.is_empty() {
             extra.insert("main.work".to_string(), work);
+        }
+        for (i, (metric, _, _)) in WORK_PARTS.iter().enumerate() {
+            let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.parts[i].is_finite()).map(|(j, r)| (key(j), r.parts[i])).collect();
+            if !per_run.is_empty() {
+                extra.insert(metric.to_string(), per_run);
+            }
         }
         if set == Set::Lean {
             extra.insert("main.busy".to_string(), busy);

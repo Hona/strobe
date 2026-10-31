@@ -1,7 +1,9 @@
 //! Collecting data from a target (SPEC §8).
 
+pub mod alloc;
 pub mod cpu;
 pub mod gpu;
+pub mod heap;
 pub mod os;
 pub mod symbols;
 pub mod trace;

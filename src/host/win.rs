@@ -210,6 +210,34 @@ pub fn on_battery() -> bool {
     }
 }
 
+/// Whether this process's session shows the lock screen.
+pub fn session_locked() -> bool {
+    use windows_sys::Win32::System::RemoteDesktop::{
+        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
+    };
+    unsafe {
+        let mut buf: *mut u16 = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut bytes) == 0 || buf.is_null() {
+            return false;
+        }
+        let info = &*(buf as *const WTSINFOEXW);
+        let locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
+        WTSFreeMemory(buf as _);
+        locked
+    }
+}
+
+/// For as long as the calling thread lives (or until changed): keeps the machine awake when `system`,
+/// and the display on as well when `display`.
+pub fn keep_awake(system: bool, display: bool) {
+    use windows_sys::Win32::System::Power::{ES_CONTINUOUS, ES_DISPLAY_REQUIRED, ES_SYSTEM_REQUIRED, SetThreadExecutionState};
+    let flags = ES_CONTINUOUS | if system { ES_SYSTEM_REQUIRED } else { 0 } | if display { ES_DISPLAY_REQUIRED } else { 0 };
+    unsafe {
+        SetThreadExecutionState(flags);
+    }
+}
+
 pub fn system_busy(ms: u64) -> f64 {
     let read = || unsafe {
         let (mut i, mut k, mut u): (FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed());

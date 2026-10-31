@@ -228,6 +228,25 @@ pub fn compare(def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f6
     Comparison { metric: def.name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs }
 }
 
+/// Pairs a verdict needs, projected from a robust spread of the differences so far (1.4826·MAD,
+/// HL efficiency 0.955): a small-n interval is [min, max] of Walsh averages, so one odd pair would
+/// make a width-based projection give up early. `d` and `bound` are in the comparison's scale
+/// (log ratios for ratio metrics).
+pub fn pairs_needed(d: &[f64], bound: f64, confidence: f64) -> usize {
+    let v: Vec<f64> = d.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.len() < 2 {
+        return usize::MAX;
+    }
+    let med = crate::metrics::median(&v);
+    let sigma = 1.4826 * crate::metrics::median(&v.iter().map(|x| (x - med).abs()).collect::<Vec<_>>());
+    let dist = med.abs().max(bound - med.abs());
+    if dist <= 0.0 {
+        return usize::MAX;
+    }
+    let z = normal_quantile(1.0 - (1.0 - confidence) / 2.0);
+    (((z * sigma / dist).powi(2) / 0.955).ceil() as usize).max(min_pairs(confidence))
+}
+
 /// The fewest pairs whose signed-rank interval can reach `confidence` (6 at 95%).
 pub fn min_pairs(confidence: f64) -> usize {
     (1..=50).find(|&n| 1.0 - 2f64.powi(1 - n as i32) >= confidence).unwrap_or(50)

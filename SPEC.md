@@ -553,9 +553,17 @@ flowchart LR
   After 10 unsteady runs strobe measures anyway and warns `NotSteady` (the case's state grows:
   add a reset). Attribution blocks start their profiler at the steady point and measure the
   runs after it.
-- **Stop rule** (`--pairs auto`): at least 6 pairs, then after each pair: stop when the primary
-  has a verdict; stop as `underpowered` when the estimated pairs needed exceed the maximum
-  (default 40) or `--max-time`.
+- **Stop rule** (`--pairs auto`): verdicts only at planned looks, after pairs 8, 12, 18, 26 and
+  40, each with a 98.42% interval (Pocock's constant level for 5 looks, 5% overall). Looking after
+  every pair at 95% inflates false positives: simulated A/A runs came out "different" 10.4% of the
+  time when the noise is near the bound, and one did on adais (scroll, +0.7% [+0.1 … +3.7] at
+  pair 7). Five Pocock looks keep it at 1.5–3.7% and still decide a 3% effect by pair 8–9. At a
+  look: stop when the primary has a verdict; from 12 pairs, stop as `underpowered` when the pairs
+  needed exceed 40, or at `--max-time`. Pairs needed are projected from a robust spread of the
+  differences (1.4826·MAD), not the interval width: early intervals are [min, max] of few Walsh
+  averages, and one odd pair once stopped a series (a tab switch, "~78 pairs needed") that its
+  A/A twin decided as `same` at 19. `--pairs N` is one look at N at 95%. Secondaries and
+  descriptive rows use 95% intervals at the final pair.
 - **Attribution blocks**: one per variant after timing, same case, with the attribution probes,
   only when the primary differs (`--why auto`): a `same` or `underpowered` result has nothing to
   explain. `--why always` runs them for every series, `--why never` skips them.

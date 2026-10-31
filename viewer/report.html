@@ -375,7 +375,7 @@ const MIN_N = {
 
 function unitOf(name) {
   if (name === "display.hz") return "Hz"
-  if (name === "run.duration") return "ms"
+  if (name === "run.duration" || name === "main.work") return "ms"
   if (/^(frames|interaction|scroll)\./.test(name) && /\.(p50|p90|p95|p99|max)$/.test(name)) return "ms"
   if (name === "frames.dropped.pct" || name === "main.busy" || name.startsWith("cpu.") || name === "gpu.process.3d") return "%"
   if (name.startsWith("memory.") || name === "gpu.vram" || name === "js.heap.used") return "MB"
@@ -498,7 +498,19 @@ function signedRankCounts(n) {
   return c
 }
 
-function hodgesLehmann(d) {
+// Two-sided normal quantile for the large-n branch (Acklam's approximation, as src/stats.rs).
+function zOf(alpha) {
+  const p = 1 - alpha / 2
+  const q = p - 0.5
+  if (Math.abs(q) <= 0.47575) {
+    const r = q * q
+    return (((((-39.69683028665376 * r + 220.9460984245205) * r - 275.9285104469687) * r + 138.357751867269) * r - 30.66479806614716) * r + 2.506628277459239) * q / (((((-54.47609879822406 * r + 161.5858368580409) * r - 155.6989798598866) * r + 66.80131188771972) * r - 13.28068155288572) * r + 1)
+  }
+  const t = Math.sqrt(-2 * Math.log(1 - p))
+  return -(((((-0.007784894002430293 * t - 0.3223964580411365) * t - 2.400758277161838) * t - 2.549732539343734) * t + 4.374664141464968) * t + 2.938163982698783) / ((((0.007784695709041462 * t + 0.3224671290700398) * t + 2.445134137142996) * t + 3.754408661907416) * t + 1)
+}
+
+function hodgesLehmann(d, alpha = 0.05) {
   const v = d.filter(finite)
   const n = v.length
   if (!n) return null
@@ -513,23 +525,27 @@ function hodgesLehmann(d) {
     const total = 2 ** n
     let acc = 0
     for (let k = 0; k < counts.length; k++) {
-      if ((acc + counts[k]) / total > 0.025) break
+      if ((acc + counts[k]) / total > alpha / 2) break
       acc += counts[k]
       c = k
     }
   } else {
-    c = Math.floor((n * (n + 1)) / 4 - 1.959963984540054 * Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24) - 0.5)
+    c = Math.max(0, Math.floor((n * (n + 1)) / 4 - zOf(alpha) * Math.sqrt((n * (n + 1) * (2 * n + 1)) / 24) - 0.5))
   }
-  // [W(c), W(m-1-c)] covers 1 - 2·P(T <= c); below 6 pairs no c exists and [min, max] is shown (src/stats.rs).
+  // [W(c), W(m-1-c)] covers 1 - 2·P(T <= c); with no valid c the level is out of reach and [min, max] is shown (src/stats.rs).
   const clamp = (i) => Math.max(0, Math.min(m - 1, i))
   const loI = clamp(Math.max(c, 0))
   const hiI = clamp(m - 1 - Math.max(c, 0))
-  return { est, lo: walsh[Math.min(loI, hiI)], hi: walsh[Math.max(loI, hiI)] }
+  return { est, lo: walsh[Math.min(loI, hiI)], hi: walsh[Math.max(loI, hiI)], covered: c >= 0 }
 }
 
-function compareAt(metric, ps, bound, relative) {
+// The primary's per-look level: Pocock across planned looks (src/app/bench.rs); everything else 95%.
+const levelOf = (metric, s) => (metric === s?.primary?.metric ? STROBE?.plan?.alpha ?? 0.05 : 0.05)
+const ciLabel = (metric, s) => `${+(100 * (1 - levelOf(metric, s))).toFixed(1)}% CI`
+
+function compareAt(metric, ps, bound, relative, alpha = 0.05) {
   const d = ps.map((p) => (relative ? Math.log(p.b / p.a) : p.b - p.a)).filter(finite)
-  const hl = hodgesLehmann(d)
+  const hl = hodgesLehmann(d, alpha)
   if (!hl) return null
   const t = relative ? (x) => Math.exp(x) - 1 : (x) => x
   const est = t(hl.est)
@@ -538,8 +554,8 @@ function compareAt(metric, ps, bound, relative) {
   const boundAbs = relative ? bound : Math.max(bound * Math.abs(median(ps.map((p) => p.a))), 0.5)
   const words = wordsOf(metric)
   let verdict = "unclear"
-  // Below 6 pairs no signed-rank interval reaches 95% (src/stats.rs `covered`).
-  if (d.length >= 6 && finite(est)) {
+  // An interval that cannot reach its level gets no verdict (src/stats.rs `covered`): below 6 pairs at 95%.
+  if (hl.covered && finite(est)) {
     if (hi < 0 || lo > 0) {
       const word = (hi < 0) === !higherBetter(metric) ? words[0] : words[1]
       const small = hi < 0 ? hi > -boundAbs : lo < boundAbs
@@ -740,7 +756,7 @@ function hero(r, s) {
       h("div", { class: `hero-verdict c-${cls}` }, word || "—", tag ? h("span", { class: "hero-tag" }, tag) : null),
       h("div", { class: "hero-change" },
         h("span", { class: "big-num" }, fmtDelta(c.estimate, c, u)),
-        h("span", { class: "dim" }, "95% CI"),
+        h("span", { class: "dim" }, `${ciLabel(metric, s)}`),
         h("span", { class: "mono" }, fmtCI(c, u))),
       chart(58, (w) => heroBar(w, c, u), "hero-chart")),
     h("dl", { class: "facts" },
@@ -809,7 +825,7 @@ function forestPanel(s) {
     h("div", { class: "c-head num" }, "head"),
     h("div", { class: "c-bar" }, h("div", { class: "track" }, ticks.map((t) => h("span", { style: `left:${((t / 100 - d0) / (d1 - d0)) * 100}%` }, pctTick(t))))),
     h("div", { class: "c-delta num" }, "Δ"),
-    h("div", { class: "c-ci" }, "95% CI"),
+    h("div", { class: "c-ci" }, "CI"),
     h("div", { class: "c-verdict" }, "verdict"))
   const tested = items.filter((x) => x.role !== "descriptive")
   const desc = items.filter((x) => x.role === "descriptive")
@@ -862,7 +878,7 @@ function forestRow(x, dom, focus) {
     ["base", fmtValue(c.base, u) + "  median of launches"],
     ["head", fmtValue(c.head, u)],
     ["change", `${fmtDelta(c.estimate, c, u)}  ${c.relative ? "relative" : "difference"}`],
-    ["95% CI", fmtCI(c, u)],
+    [x.role === "primary" ? ciLabel(metric, { primary: c }) : "95% CI", fmtCI(c, u)],
     ["p", `${fmtP(c.p)}  Wilcoxon signed-rank, n ${c.n}`],
     ["bound", fmtBound(c, u) + "  equivalence"],
     ["verdict", c.verdict, "c-" + cls],
@@ -901,7 +917,7 @@ function pairPanel(s) {
   const ps = pairsOf(s, metric)
   const P = ps.length
   const d = ps.map((p) => (relative ? p.b / p.a - 1 : p.b - p.a))
-  const cum = ps.map((_, i) => (i < 1 ? null : compareAt(metric, ps.slice(0, i + 1), s.bound ?? 0.02, relative)))
+  const cum = ps.map((_, i) => (i < 1 ? null : compareAt(metric, ps.slice(0, i + 1), s.bound ?? 0.02, relative, levelOf(metric, s))))
   const last = cum[P - 1]
   const close = (a, b) => Math.abs(a - b) <= 1e-9 * Math.max(1, Math.abs(a), Math.abs(b))
   const exact = !!(last && comp && close(last.lo, comp.lo) && close(last.hi, comp.hi))
@@ -1009,7 +1025,7 @@ function pairPanel(s) {
     h("button", { type: "button", title: "next pair", onclick: () => step((state.k ?? P) + 1) }, "›"),
     reduceMotion ? null : playBtn,
     h("button", { type: "button", title: "show the final result", onclick: () => { stopPlay(); state.k = null; relink() } }, "final"))
-  return panel("Pair by pair", `${isPrimary ? "★ " : ""}${metric} · head ${relative ? "÷" : "−"} base · cumulative 95% CI${exact || !P ? "" : " (illustrative)"}`, [ctl], [box, readout])
+  return panel("Pair by pair", `${isPrimary ? "★ " : ""}${metric} · head ${relative ? "÷" : "−"} base · cumulative ${ciLabel(metric, s)}${exact || !P ? "" : " (illustrative)"}`, [ctl], [box, readout])
 }
 
 function drawPairs(w, pd) {

@@ -92,6 +92,17 @@ impl Drop for Variant {
 /// Warmup runs at most, before strobe measures anyway and flags the block (`NotSteady`).
 const MAX_WARMUP: usize = 10;
 
+/// Pairs before a series may stop as underpowered.
+const FUTILITY_FROM: usize = 12;
+
+/// Planned looks (pairs) for `--pairs auto`. Verdicts happen only here.
+const LOOKS: [usize; 5] = [8, 12, 18, 26, 40];
+
+/// Pocock's constant nominal level for 5 looks at 5% overall, two-sided: each look's interval is
+/// 98.4%. Looking after every pair at 95% called A/A runs different 10% of the time (simulated, and
+/// once on adais); five Pocock looks keep it at 1.5–3.7% and still catch a 3% effect by pair 8–9.
+const POCOCK_ALPHA: f64 = 0.0158;
+
 /// One run as the block saw it: wall time, the target's CPU (% of a core), renderer main-thread
 /// task time (ms), and its span on the host clock.
 #[derive(Clone, Debug)]
@@ -218,7 +229,11 @@ pub fn run(args: &Args) -> Result<Output> {
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
         "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
-        "plan": { "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa },
+        "plan": {
+            "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa,
+            "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
+            "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
+        },
         "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label })).collect::<Vec<_>>(),
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided,
     });
@@ -244,16 +259,20 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         prepare_variant(v, &target, config, aa)?;
     }
     let bound = ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
-    let (min_pairs, max_pairs) = match ctx.args.get("pairs") {
-        Some("auto") | None => (6usize, 40usize),
+    // Verdicts only at planned looks, each at a Pocock level, so looking more than once keeps the
+    // overall false-positive rate at 5% (SPEC §9.1). `--pairs N` is one look at N at 95%.
+    let (looks, confidence): (Vec<usize>, f64) = match ctx.args.get("pairs") {
+        Some("auto") | None => (LOOKS.to_vec(), 1.0 - POCOCK_ALPHA),
         Some(n) => {
             let n = n.parse::<usize>().map_err(|_| Error::usage("--pairs: auto or a number"))?.max(2);
             if n < stats::min_pairs(0.95) {
                 ctx.warnings.push(validity::info("FewPairs", format!("--pairs {n}: below {} pairs no interval reaches 95%, so nothing gets a verdict (a smoke run)", stats::min_pairs(0.95))));
             }
-            (n, n)
+            (vec![n], 0.95)
         }
     };
+    let max_pairs = *looks.last().unwrap_or(&40);
+    let min_pairs = looks[0];
     progress(format!("\n{}  primary {}", s.label(), s.primary));
     let series_started = Instant::now();
     let mut blocks: Vec<Block> = Vec::new();
@@ -276,20 +295,33 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
         pairs.push((idx[0], idx[1]));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
-        let cmp = stats::compare(def, &primary_pairs, bound, 0.95);
+        let n = pair + 1;
+        let look = looks.contains(&n);
+        let cmp = stats::compare(def, &primary_pairs, bound, confidence);
+        let next = looks.iter().find(|&&l| l > n).copied();
         progress(format!(
             "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {}",
-            pair + 1,
+            n,
             fmt::value(val(&blocks[idx[0]], &s.primary), def.unit),
             fmt::value(val(&blocks[idx[1]], &s.primary), def.unit),
             change(&cmp),
             bound_text(cmp.lo, &cmp, def),
             bound_text(cmp.hi, &cmp, def),
-            if cmp.n >= min_pairs { cmp.verdict.clone() } else { format!("({} more pairs minimum)", min_pairs - cmp.n) }
+            match (look, next) {
+                (true, _) => format!("look: {}", cmp.verdict),
+                (false, Some(l)) => format!("(next look at pair {l})"),
+                (false, None) => String::new(),
+            }
         ));
-        let n = pair + 1;
-        let decided = n >= min_pairs && cmp.decided;
-        let hopeless = n >= min_pairs && cmp.needed_pairs.is_some_and(|need| need > max_pairs);
+        let decided = look && cmp.decided;
+        // Give up only at a look from 12 pairs, on a robust projection: early intervals are [min, max]
+        // of few Walsh averages, so one odd pair would stop a series that more pairs decide.
+        let d: Vec<f64> = primary_pairs.iter().map(|&(a, b)| if cmp.relative { (b / a).ln() } else { b - a }).collect();
+        let mut cmp = cmp;
+        if !cmp.decided {
+            cmp.needed_pairs = Some(stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence));
+        }
+        let hopeless = look && n >= FUTILITY_FROM && cmp.needed_pairs.is_some_and(|need| need > max_pairs);
         last = Some(cmp);
         if decided {
             stopped = "primary decided".into();
@@ -305,7 +337,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     }
     let primary = last.ok_or_else(|| Error::msg("no pairs completed"))?;
-    let primary_decided = primary.decided && pairs.len() >= min_pairs;
+    let primary_decided = stopped == "primary decided" && pairs.len() >= min_pairs;
     let mut primary = primary;
     if !primary_decided {
         primary.verdict = if stopped == "more pairs cannot decide it" || stopped == "max pairs" || stopped == "max time" {
@@ -1114,7 +1146,7 @@ fn render(r: &Value) -> String {
         );
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
-        out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("95% CI", 18), "verdict");
+        out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
         let mut rows = vec![(true, s["primary"].clone())];
         rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));
         let descriptive = s["descriptive"].as_array().cloned().unwrap_or_default();
@@ -1146,6 +1178,11 @@ fn render(r: &Value) -> String {
         }
         out += "\n★ primary, declared before the run · secondaries gated on the primary, Holm-corrected\n";
         out += "  intervals over pairs of fresh launches (Wilcoxon signed-rank, Hodges–Lehmann)\n";
+        let alpha = r["plan"]["alpha"].as_f64().unwrap_or(0.05);
+        let looks: Vec<String> = r["plan"]["looks"].as_array().map(|a| a.iter().map(|l| l.to_string()).collect()).unwrap_or_default();
+        if looks.len() > 1 {
+            out += &format!("  primary: {:.1}% intervals at planned looks ({} pairs), 95% overall (Pocock); others 95%\n", 100.0 * (1.0 - alpha), looks.join(", "));
+        }
         let holm = s["holm_pairs"].as_u64().unwrap_or(0);
         if s["pairs"].as_u64().unwrap_or(0) < holm && s["decided"].as_bool() == Some(true) {
             out += &format!("  secondaries can only clear Holm from {holm} pairs: add --pairs {holm} for their verdicts\n");

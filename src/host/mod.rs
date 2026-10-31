@@ -287,6 +287,8 @@ pub struct Env {
     pub l3_groups: Vec<CacheGroup>,
     pub power_plan: String,
     pub on_battery: bool,
+    /// The hypervisor, when this is a virtual machine.
+    pub virtual_machine: Option<String>,
     pub strobe: String,
 }
 
@@ -296,7 +298,11 @@ pub fn env() -> Env {
     let (os, cpu, power_plan, on_battery) = (win::os_name(), win::cpu_name(), win::power_plan(), win::on_battery());
     #[cfg(not(windows))]
     let (os, cpu, power_plan, on_battery) = (std::env::consts::OS.to_string(), String::new(), String::new(), false);
-    Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, strobe: env!("CARGO_PKG_VERSION").to_string() }
+    #[cfg(windows)]
+    let virtual_machine = win::virtual_machine();
+    #[cfg(not(windows))]
+    let virtual_machine = None;
+    Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, virtual_machine, strobe: env!("CARGO_PKG_VERSION").to_string() }
 }
 
 /// Share of all CPUs busy over `ms`, 0..1.

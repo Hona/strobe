@@ -164,6 +164,13 @@ pub fn os_name() -> String {
     format!("{name} {build}{}", if version.is_empty() { String::new() } else { format!(" ({version})") })
 }
 
+/// The hypervisor's name when this machine is a virtual one, from the firmware strings.
+pub fn virtual_machine() -> Option<String> {
+    let bios = r"HARDWARE\DESCRIPTION\System\BIOS";
+    let text = format!("{} {}", reg_string(bios, "SystemManufacturer").unwrap_or_default(), reg_string(bios, "SystemProductName").unwrap_or_default());
+    ["VMware", "VirtualBox", "QEMU", "KVM", "Xen", "Parallels", "Virtual Machine", "Bochs"].iter().any(|m| text.contains(m)).then(|| text.trim().to_string())
+}
+
 pub fn cpu_name() -> String {
     reg_string(r"HARDWARE\DESCRIPTION\System\CentralProcessor\0", "ProcessorNameString").unwrap_or_default()
 }

@@ -240,6 +240,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
     }
+    if let Some(vm) = &env.virtual_machine {
+        ctx.warnings.push(validity::warn("VirtualMachine", format!("running in a virtual machine ({vm}): its timings move with the host's load; prefer bare metal")));
+    }
     match validity::calibration() {
         None => ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)")),
         Some(c) if c["ok"] == false => {

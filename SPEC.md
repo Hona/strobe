@@ -1315,9 +1315,9 @@ Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`
 `a..b heap`), `leaks`, `sql`, `progress`. Not yet: `stack`, `memory`, `gpu`, `cpu`, `insights`,
 `timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
 `MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
-`Battery`, `StaleCalibration`, plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:
-`Throttling`, `CounterUnstable`, `ProbeOverhead`, `Unresolved`, `VirtualMachine`, `Outliers`,
-`CensusContaminated`.
+`Battery`, `StaleCalibration`, `Unresolved` (script samples without a source map, from 5%),
+`VirtualMachine` (firmware strings), plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:
+`Throttling`, `CounterUnstable`, `ProbeOverhead`, `Outliers`, `CensusContaminated`.
 
 Off Windows the process and GPU samplers are stubs: process CPU is reported as unknown (never 0%),
 and nothing else from them is emitted.

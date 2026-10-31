@@ -6,6 +6,7 @@ use std::collections::HashMap;
 /// Flags that take no value.
 const SWITCHES: &[&str] = &["json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open", "calibrate", "pin-runner", "headless", "keep", "fast", "once"];
 
+#[derive(Clone)]
 pub struct Args {
     pub command: String,
     pub pos: Vec<String>,
@@ -43,6 +44,15 @@ impl Args {
         }
         let command = if pos.is_empty() { String::new() } else { pos.remove(0) };
         Ok(Args { command, pos, flags })
+    }
+
+    /// Sets a flag (a derived command line, such as one bisect step).
+    pub fn set(&mut self, name: &str, value: &str) {
+        self.flags.insert(name.to_string(), value.to_string());
+    }
+
+    pub fn remove(&mut self, name: &str) {
+        self.flags.remove(name);
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -88,10 +98,11 @@ Use
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa] [--filter <case>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
+        [--bisect good..bad]           (the commit that moved the primary; one series)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
-                                  views: summary frames threads hotspots alloc layout gc heap leaks sql
-                                  (a..b: heap; exp_…: summary progress)
+                                  views: summary frames threads hotspots alloc layout gc heap leaks memory insights sql
+                                  (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM

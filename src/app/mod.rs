@@ -1,6 +1,7 @@
 //! Commands: orchestration only. Each returns an `Output` that the CLI prints and MCP returns (SPEC §17).
 
 pub mod bench;
+pub mod bisect;
 pub mod fmt;
 pub mod mcp;
 pub mod query;

@@ -12,10 +12,31 @@ pub fn run(args: &Args) -> Result<Output> {
     let dir = store::resolve(handle)?;
     let mut data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
     if handle.starts_with("exp_") {
-        attach_hotspots(&mut data);
+        // Insights read the same recordings: in parallel with the per-side views.
+        let snapshot = data.clone();
+        let insights = std::thread::scope(|scope| {
+            let insights = scope.spawn(|| super::query::experiment_insights(&snapshot));
+            attach_hotspots(&mut data);
+            insights.join().ok().and_then(|r| r.ok())
+        });
+        if let Some(i) = insights {
+            data["insights"] = i.json;
+        }
     } else if let Some(a) = attribution(&dir, data["id"].as_str().unwrap_or(handle), None) {
         data["attribution"] = a;
+        if let Ok(i) = super::query::insights(&dir) {
+            data["insights"] = i.json;
+        }
     } else if data["probes"] == "memory" {
+        if let Ok(i) = super::query::insights(&dir) {
+            data["insights"] = i.json;
+        }
+        if let Ok(m) = super::query::memory(&dir, "process", 30, None) {
+            data["memory"] = m.json;
+        }
+        if let Ok(m) = super::query::memory(&dir, "layer", 30, None) {
+            data["memory_layers"] = m.json;
+        }
         // A memory recording: its live heap at the end and the objects that outlived their half.
         if let Ok(o) = super::query::heap(&dir, 15, false) {
             data["heap"] = o.json;
@@ -101,6 +122,12 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
         }
         if let Ok(Ok(o)) = heap.join() {
             h["heap"] = o.json;
+        }
+        if let Ok(o) = super::query::memory(dir, "process", 30, None) {
+            h["memory"] = o.json;
+        }
+        if let Ok(o) = super::query::memory(dir, "layer", 30, None) {
+            h["memory_layers"] = o.json;
         }
         Some(h)
     })?;

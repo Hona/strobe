@@ -536,6 +536,15 @@ Rules:
 - `performance.memory` is quantized unless the app runs with `--enable-precise-memory-info`;
   without it strobe does not report it.
 
+As built (`probe::census`): the page's JS heap after a forced GC (`Runtime.getHeapUsage`), its DOM
+counters (`Memory.getDOMCounters`), and every target process's OS private bytes and working set
+labelled with Chromium's process type (`SystemInfo.getProcessInfo`). The allocator layer is a
+detailed memory-infra dump through a short trace of its own, read as effective sizes per process:
+top-level allocators are layers, their children allocators; the `tracing` allocator (the dump's own
+trace buffers) is left out. Taken at each point of a memory recording, after every run of a leak
+run (with a dump at S0 and S2 only) and once at the end of every attribution block (before its
+heap snapshot). GPU and page (images, canvases) layers are not built.
+
 **Heap snapshots** (attribution only):
 
 - One process at a time: a snapshot can double a process's memory.
@@ -871,6 +880,13 @@ against `good` with the same settings. A step that moves the primary in the dire
 did moves `bad` there; otherwise `good`. Ends with the culprit commit and its bench, or
 `unclear` with the remaining range.
 
+As built: step 0 benches `bad` against `good` to learn the direction (no move: `no change`, nothing
+to bisect). The midpoint is never `bad` itself. Every step is a full experiment of its own
+(`<id>_s<k>`, with the bisect's flags; `--why never` unless given), and the file must narrow to
+one series. A step without a verdict counts as "not moved" and makes the result `unclear`, naming
+the range the culprit may still hide in. `--require-verdict` exits 5 unless the result is `found`
+or `no change`.
+
 ### 9.8 Devices
 
 `--on blade,air` runs `mesh exec <device> strobe bench … --json` on each device (strobe
@@ -948,12 +964,12 @@ with at least 3 pairs shows zero spread.
 | `layout` | | forced (synchronous) layouts and style recalculations by the JavaScript call site that forced them, with full stacks; per-run counts and time, forced and in the frame lifecycle |
 | `gc` | | per measured run: minor and major collections, main-thread GC time (pauses and incremental marking), helper-thread GC time, bytes freed |
 | `stack` | `<id>` | callers to the root, with source locations and packages |
-| `memory` | `--by process\|layer\|allocator` | census per process and layer |
+| `memory` | `--by process\|layer\|allocator` `--at <i>`; `a..b memory` | a census (default the last): per process OS private bytes, working set, Chromium allocators by effective size and the unexplained rest (an estimate); by layer across processes; by allocator; `a..b` by layer and process type. Readings of the snapshotted renderer after its first snapshot are starred (CensusContaminated) |
 | `heap` | `--top` `--reveal`; `a..b heap` | live objects by class (count, self and retained size), detached DOM, the largest owners with complete retainer paths; `a..b` diffs two recordings by class; strings redacted unless `--reveal`. Bench attribution blocks and `record --probes attribution\|memory` take one post-GC snapshot after the trace stops |
 | `leaks` | `--top` `--reveal` | a memory recording's suspects: objects allocated between its first and middle snapshots and alive at the end, by class, with retainer paths (bench slopes per process and layer: planned) |
 | `gpu` | | adapter, engines and VRAM per process, device counters |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
-| `insights` | | rule hits with evidence handles |
+| `insights` | (`exp_…` too) | rule hits with their numbers and the commands that show the evidence; for an experiment, the largest base/head movers per series first |
 | `timeline` | `--from --to --thread` | bounded event list for a range |
 | `progress` | (`exp_…` only) | a running experiment's state and estimate |
 | `sql` | `"<query>"` | rows from trace_processor, row-limited |
@@ -976,6 +992,23 @@ markdown is GitHub-flavoured.
 Rules with evidence: forced layout with its initiator stack; work while idle (frames that change
 nothing); long tasks; GC pressure with top allocation sites; core migration during a phase;
 background load; unresolved time. Each hit carries handles into the recording.
+
+As built (`query <rec> insights`, `query <exp> insights`):
+
+| Rule | Fires when | Evidence |
+|---|---|---|
+| `forced-layout` | forced layout + style ≥ 5 ms or ≥ 5% of `main.work` per run (warn from 10%) | counts and ms per run, the top call site with its stack |
+| `gc-pressure` | main-thread GC ≥ 10 ms or ≥ 5% of `main.work` per run | GC ms, collections, the top 3 allocation sites per run |
+| `long-tasks` | renderer main-thread tasks over 50 ms in the runs | count, the longest |
+| `work-while-idle` | a `record` with no input that presents ≥ 1 frame/s or keeps the main thread ≥ 5% busy | frames/s, busy share |
+| `detached-dom` | the heap snapshot holds detached DOM nodes | count, retained size, the largest's retainer path |
+| `background` | `cpu.foreign.max` ≥ 25% | the busiest processes outside strobe's tree |
+| `unresolved` / `native-time` | < 95% of script samples mapped / `(program)` ≥ 30% of busy samples | shares |
+| `leak` | a memory recording or leak run | its facts and verdict |
+
+An experiment's insights start with the largest base/head movers per series: CPU self time,
+forced layout (≥ 1 ms/run) and allocations (≥ 64 KB/run) by function, matched by name and file
+name. Core migration needs the deep helper and is not built.
 
 ## 12. Symbols
 
@@ -1319,14 +1352,14 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 0b | — | the bridge (`@strobe/electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
 | 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`; validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
-| 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`) | the bridge, census layers, multi-process heaps |
+| 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
-| 5 | `top` | insights, `--bisect`, the flight recorder (`--ring`) |
+| 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
 | 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
 
 Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`, `gc`, `heap` (and
-`a..b heap`), `leaks`, `sql`, `progress`. Not yet: `stack`, `memory`, `gpu`, `cpu`, `insights`,
-`timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
+`a..b heap`), `leaks`, `memory` (and `a..b memory`), `insights`, `sql`, `progress`. Not yet: `stack`,
+`gpu`, `cpu`, `timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
 `MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
 `Battery`, `StaleCalibration`, `Unresolved` (script samples without a source map, from 5%),
 `VirtualMachine` (firmware strings), plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:

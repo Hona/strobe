@@ -181,6 +181,9 @@ struct Ctx<'a> {
 }
 
 pub fn run(args: &Args) -> Result<Output> {
+    if let Some(range) = args.get("bisect") {
+        return super::bisect::run(args, range);
+    }
     let file = args.pos.first().ok_or_else(|| Error::usage("bench needs a bench file: strobe bench perf/x.bench.ts --base <variant> --head <variant>"))?;
     let file = std::fs::canonicalize(file).map_err(|_| Error::usage(format!("no such bench file: {file}")))?;
     let head_spec = args.get("head").unwrap_or(".").to_string();
@@ -943,8 +946,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 if let Some(dir) = &mem_dir {
                     let mut c = probe::census::take(&browser, &page);
                     c["os_after_snapshot"] = json!(true);
-                    census.push(c);
                     let done = runs.len() - f;
+                    if done == 2 * ctx.runs {
+                        c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-s2.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                    }
+                    census.push(c);
                     if done == ctx.runs {
                         probe::heap::snapshot(&page, &dir.join("heap-s1.heapsnapshot.gz"))?;
                     }
@@ -967,7 +973,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                     probe::alloc::start(&page)?;
                 }
                 if let Some(dir) = &mem_dir {
-                    census.push(probe::census::take(&browser, &page));
+                    let mut c = probe::census::take(&browser, &page);
+                    c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                    census.push(c);
                     probe::heap::snapshot(&page, &dir.join("heap-s0.heapsnapshot.gz"))?;
                 }
             }
@@ -1036,6 +1044,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             lap("trace");
         }
         if set == Set::Attribution {
+            // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
+            let mut c = probe::census::take(&browser, &page);
+            c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+            census.push(c);
             // The live objects after the runs (post-GC), once no trace subscription copies every
             // snapshot chunk (SPEC §8.6).
             if let Err(e) = probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz")) {
@@ -1097,11 +1109,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let mut meta = json!({
                 "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
-                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version,
+                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version, "background": background,
             });
-            if let Some(l) = &leak {
-                // What `query leaks` and `query memory` read, as for a memory recording.
+            if !census.is_empty() {
                 meta["census"] = json!(census);
+            }
+            if let Some(l) = &leak {
+                // What `query leaks` reads, as for a memory recording.
                 meta["leaks"] = l["suspects"].clone();
                 meta["leak"] = json!({ "js_heap": l["js_heap"], "dom_nodes": l["dom_nodes"], "runs": l["runs"] });
             }

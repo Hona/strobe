@@ -13,10 +13,11 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
     strobe bench <file.bench.ts> --head <variant> [--base <variant>] [--filter <case>] [--target <name>]
                  [--params k=v] [--primary <metric>] [--aa] [--pairs auto|N] [--runs 5] [--power keep|high]
-                 [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10]
+                 [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
         variant: a directory, a git ref, app:<id>, exe:<path>
-    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout gc heap leaks sql
-        hotspots and alloc take --by function|file|package; a..b works with heap; --reveal shows heap strings
+    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout gc heap leaks memory insights sql
+        hotspots and alloc take --by function|file|package; memory takes --by process|layer|allocator and --at <i>;
+        a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
     strobe report experiment|recording <handle> [--format html|md]    writes a file; show it in the Review pane
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
@@ -58,6 +59,9 @@ Everything about the app under test lives in its repo's `strobe.json`: `build` a
 
 Did my change help? `bench <file> --base origin/dev --head .` and read the verdict per series.
 Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
+What stands out? `query <rec or exp> insights`: forced layout, GC pressure, long tasks, work while idle, detached DOM, background load, unresolved time, and for an experiment the biggest base/head movers, each with the command that shows it.
+Where is the memory? `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting).
+Which commit moved it? `bench <file> --filter <case> --bisect <good>..<bad>` (one series; each step is a full experiment).
 Which objects are alive? `query <rec> heap` (classes by retained size, detached DOM, retainer paths); `query <base rec>..<head rec> heap` compares two.
 Does a case leak? `bench <file> --filter <case> --head . --probes memory --repeat 10`: growth per run of the JS heap and DOM with an interval, and the objects from the first half still alive at the end (`query <rec> leaks`).
 Is an app leaking over time? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.

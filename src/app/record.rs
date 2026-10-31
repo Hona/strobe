@@ -174,6 +174,7 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
         // OS memory of the snapshotted process is inflated after its first snapshot (CensusContaminated).
         c["private_bytes"] = if i == 0 { json!(browser.processes().iter().map(|p| p.private_bytes).sum::<u64>()) } else { Value::Null };
         c["os_after_snapshot"] = json!(i > 0);
+        c["allocators"] = probe::census::allocators(browser, &dir.join(format!("memdump-{i}.pftrace"))).unwrap_or_else(|e| json!({ "error": e.message }));
         census.push(c);
         probe::heap::snapshot(page, &dir.join(format!("{file}.heapsnapshot.gz")))?;
     }

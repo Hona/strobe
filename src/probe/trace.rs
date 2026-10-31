@@ -35,14 +35,19 @@ pub struct Tracing {
 }
 
 pub fn start(cdp: &Arc<Cdp>, set: Set) -> Result<Tracing> {
+    // Attribution traces of long runs (stacks, invalidations) overflowed the default buffer.
+    start_categories(cdp, &categories(set), if set == Set::Attribution || set == Set::Memory { 1_000_000 } else { 200_000 })
+}
+
+/// A browser-wide trace of exactly `categories` into a buffer of `buffer_kb`.
+pub fn start_categories(cdp: &Arc<Cdp>, categories: &[&str], buffer_kb: u64) -> Result<Tracing> {
     let events = cdp.events();
     cdp.send(
         "Tracing.start",
         json!({
             "transferMode": "ReturnAsStream",
             "streamFormat": "proto",
-            // Attribution traces of long runs (stacks, invalidations) overflowed the default buffer.
-            "traceConfig": { "recordMode": "recordAsMuchAsPossible", "includedCategories": categories(set), "traceBufferSizeInKb": if set == Set::Attribution || set == Set::Memory { 1_000_000 } else { 200_000 } },
+            "traceConfig": { "recordMode": "recordAsMuchAsPossible", "includedCategories": categories, "traceBufferSizeInKb": buffer_kb },
         }),
         None,
     )?;

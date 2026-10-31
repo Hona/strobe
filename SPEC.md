@@ -938,8 +938,9 @@ with at least 3 pairs shows zero spread.
 `experiment`, `recording` (`bench-summary` / PR block in `--format md`), `memory-timeline`,
 `frames`, `hotspots`, `flame`, `compare`, `leak`. HTML is self-contained (`viewer/report.html` +
 embedded JSON payload with the metric catalog and, for `experiment`, per-series base/head CPU
-hotspots by function `(name, location)` and by file, allocation sites, forced layouts, GC and
-attribution run counts, default cap 2 MB);
+hotspots by function `(name, location)` and by file, allocation sites, forced layouts, GC, the live
+heap and its base/head diff, and attribution run counts, default cap 2 MB: a report keeps three full
+stacks for its top 15 rows and the heaviest below them, while recordings and `query` keep all);
 markdown is GitHub-flavoured.
 
 ### 11.3 Insights

@@ -90,6 +90,20 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
             (one > 0.0).then(|| (dur / one).round().max(1.0) as u64)
         })
         .or(plan_runs);
+    // A display may abbreviate (the recording and `query` keep everything): three stacks for the top
+    // rows, the heaviest one below them, and no `url` beside `file` in frames.
+    for key in ["rows", "files", "alloc.rows", "alloc.files", "layout.rows"] {
+        let rows = key.split('.').fold(Some(&mut h), |v, k| v.and_then(|v| v.get_mut(k)));
+        for (i, row) in rows.and_then(Value::as_array_mut).into_iter().flatten().enumerate() {
+            let Some(stacks) = row["stacks"].as_array_mut() else { continue };
+            stacks.truncate(if i < 15 { 3 } else { 1 });
+            for f in stacks.iter_mut().flat_map(|s| s["frames"].as_array_mut().into_iter().flatten()) {
+                if let Some(o) = f.as_object_mut() {
+                    o.remove("url");
+                }
+            }
+        }
+    }
     h["recording"] = json!(rec);
     if let Some(r) = runs {
         h["runs"] = json!(r);

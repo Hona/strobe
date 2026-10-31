@@ -29,6 +29,8 @@ pub fn run(args: &Args, range: &str) -> Result<Output> {
         return Err(Error::usage(format!("{range}: no commits from good to bad on the first-parent line")));
     }
     progress(format!("strobe bisect {range} · {} commits on the first-parent line · {id}", candidates.len()));
+    let line: Vec<Value> = candidates.iter().map(|c| json!({ "commit": c, "short": short(c), "subject": subject(&root, c) })).collect();
+    let first_good = good.clone();
     let first = step(args, &id, &log, &root, 0, &good, &bad)?;
     let direction = moved(&first);
     let mut steps = vec![first];
@@ -67,9 +69,12 @@ pub fn run(args: &Args, range: &str) -> Result<Output> {
             short(&bad)
         ),
     };
+    // Where the culprit may still be: from the first undecided step's `good` (or the last `good`) to `bad`.
+    let remaining = culprit.as_ref().map(|_| json!({ "good": undecided.first().map_or(&good, |u| &u.1), "bad": bad }));
     let result = json!({
         "id": id, "kind": "bisect", "file": file, "range": range, "created": super::record::now_iso(),
         "metric": steps[0]["metric"], "series": steps[0]["series"], "steps": steps, "culprit": culprit, "verdict": verdict,
+        "good": first_good, "commits": line, "remaining": remaining,
     });
     let text = text(&result);
     let mut result = result;

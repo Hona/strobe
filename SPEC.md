@@ -548,7 +548,8 @@ flowchart LR
   time cold or warm, while the work it costs settles over 1–4 runs (measured: scroll's main thread
   17.3% → 15.7% after one run; streaming 7.2% → 5.4% after three). After every run strobe reads the
   renderer's main-thread task time (`Performance.getMetrics` `TaskDuration`, a cumulative counter).
-  Warmup ends when two consecutive runs do the same work within 5%; both count as measured, and
+  Warmup ends when two consecutive runs do the same work within 5% or within 1 ms (an idle run does
+  about 3 ms, where 5% is noise and warmup once ran 55 s); both count as measured, and
   the block runs until `--runs` are measured. Runs before are relabelled `warm:<i>` in the trace.
   After 10 unsteady runs strobe measures anyway and warns `NotSteady` (the case's state grows:
   add a reset). Attribution blocks start their profiler at the steady point and measure the
@@ -935,8 +936,10 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 Strobe launches any Electron app the same way, with no change to the app:
 
 - **A fresh private home per launch**: `AppData/Roaming`, `AppData/Local/Temp`, `.local/share`,
-  `.local/state`, `.config`, `.cache`, with `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`,
-  `TEMP`, `TMP` and `XDG_*_HOME` pointing into it. Every path an app derives from those (its
+  `.local/state`, `.config`, `.cache`, and the known folders `Documents`, `Desktop`, `Downloads`,
+  `Pictures`, `Music`, `Videos` (Electron's `app.getPath("documents")` throws when the redirected
+  profile lacks them; an isolated OpenCode desktop showed "Failed to get 'documents' path"), with
+  `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and `XDG_*_HOME` pointing into it. Every path an app derives from those (its
   profile, single-instance lock, caches, its own background services' state) lands in the home,
   so the app's identity or channel does not matter.
 - `--remote-debugging-port=0`; strobe finds `DevToolsActivePort` wherever the app's userData
@@ -1040,7 +1043,7 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 
 | Signal | Windows | Linux | macOS |
 |---|---|---|---|
-| process CPU, memory | `NtQuerySystemInformation`, PDH Process | `/proc/<pid>/stat`, `smaps_rollup` | `proc_pid_rusage`, `task_info` |
+| process CPU, memory | `QueryProcessCycleTime` over the TSC for `cpu.app.total` per run (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between); `NtQuerySystemInformation`, PDH Process | `/proc/<pid>/stat`, `smaps_rollup` | `proc_pid_rusage`, `task_info` |
 | threads | `NtQuerySystemInformation` | `/proc/<pid>/task/*` | `proc_pidinfo` |
 | per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | `/proc/stat`, cpufreq | `host_processor_info` |
 | topology | `GetLogicalProcessorInformationEx` (L3 per CCD) | sysfs cache | `sysctl hw.perflevel*` |

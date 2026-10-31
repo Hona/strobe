@@ -629,6 +629,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
             *current.borrow_mut() = key.to_string();
+            // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
+            // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between.
+            let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+            let (cyc0, tsc0) = cycles();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             let task0 = task_ms();
             driver.mark(&format!("{key}:start"))?;
@@ -640,6 +644,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let t1 = host::now_ns();
             let task1 = task_ms();
             driver.mark(&format!("{key}:end"))?;
+            let (cyc1, tsc1) = cycles();
             let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
             if s.reset {
@@ -648,7 +653,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                     .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "reset")), "fix the case's reset"))?;
             }
             let wall = (t1 - t0) as f64;
-            Ok(Run { ms: wall / 1e6, cpu: if wall > 0.0 { 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall } else { f64::NAN }, task: task1 - task0, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
+            let cpu = match (tsc0, tsc1) {
+                (Some(a), Some(b)) if b > a && cyc0 > 0 => 100.0 * cyc1.saturating_sub(cyc0) as f64 / (b - a) as f64,
+                _ if wall > 0.0 => 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall,
+                _ => f64::NAN,
+            };
+            Ok(Run { ms: wall / 1e6, cpu, task: task1 - task0, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -665,9 +675,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             if first.is_some() {
                 continue;
             }
+            // Within 5%, or within 1 ms of main-thread time: an idle run does about 3 ms, where 5% is noise.
             let steady = i >= 1 && {
                 let (a, b) = (runs[i - 1].task, runs[i].task);
-                a.is_finite() && b.is_finite() && a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05
+                a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
             };
             if steady || i + 1 >= MAX_WARMUP + 1 {
                 unsteady = !steady;
@@ -679,7 +690,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         let first = first.unwrap_or(0);
         // Warmup and measured runs interleave with the steadiness check: split the loop by run.
-        let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum();
+        // `+ 0.0`: an empty f64 sum is -0.0, which would print as "-0.0s".
+        let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
         steps.borrow_mut().push(("warmup".into(), warm_ms));
         steps.borrow_mut().push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
         lapped.set(Instant::now());

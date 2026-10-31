@@ -23,6 +23,7 @@ use windows_sys::Win32::System::Threading::{
     GetCurrentProcess, GetProcessAffinityMask, GetProcessTimes, GetSystemTimes, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, SetProcessAffinityMask,
 };
+use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
 
 pub fn qpc_ns() -> u64 {
     static FREQ: OnceLock<i64> = OnceLock::new();
@@ -80,8 +81,8 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
             continue;
         }
         if let Some(p) = all.iter().find(|p| p.0 == pid) {
-            let (cpu_ns, private_bytes) = proc_times(pid);
-            out.push(ProcTimes { pid, parent: p.1, name: p.2.clone(), cpu_ns, private_bytes });
+            let (cpu_ns, cycles, private_bytes) = proc_times(pid);
+            out.push(ProcTimes { pid, parent: p.1, name: p.2.clone(), cpu_ns, cycles, private_bytes });
         }
         for &i in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
             // A reused parent pid can point at an older, unrelated process; children are always newer.
@@ -91,14 +92,17 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     out
 }
 
-fn proc_times(pid: u32) -> (u64, u64) {
+fn proc_times(pid: u32) -> (u64, u64, u64) {
     unsafe {
         let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if h.is_null() {
-            return (0, 0);
+            return (0, 0, 0);
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
         let cpu = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 { ft(&k) + ft(&u) } else { 0 };
+        // Cycle time in TSC units, charged at every context switch: exact where process times move in 15.6 ms ticks.
+        let mut cycles = 0u64;
+        QueryProcessCycleTime(h, &mut cycles);
         let mut m: PROCESS_MEMORY_COUNTERS_EX = zeroed();
         m.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
         let private = if K32GetProcessMemoryInfo(h, &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) != 0 {
@@ -107,7 +111,7 @@ fn proc_times(pid: u32) -> (u64, u64) {
             0
         };
         CloseHandle(h);
-        (cpu, private)
+        (cpu, cycles, private)
     }
 }
 

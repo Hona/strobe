@@ -31,6 +31,8 @@ pub struct ProcTimes {
     pub parent: u32,
     pub name: String,
     pub cpu_ns: u64,
+    /// CPU cycles charged so far (TSC units on x64): exact, where `cpu_ns` moves in clock ticks.
+    pub cycles: u64,
     pub private_bytes: u64,
 }
 

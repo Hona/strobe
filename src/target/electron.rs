@@ -196,6 +196,11 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
     for d in [&appdata, &temp, &data, &state, &config, &cache] {
         std::fs::create_dir_all(d)?;
     }
+    // Windows resolves known folders under the redirected profile; Electron's app.getPath("documents")
+    // throws when the folder is missing (an isolated OpenCode desktop failed to start on exactly that).
+    for d in ["Documents", "Desktop", "Downloads", "Pictures", "Music", "Videos"] {
+        std::fs::create_dir_all(home.join(d))?;
+    }
     for d in &app.dirs {
         std::fs::create_dir_all(home.join(d))?;
     }

@@ -44,7 +44,8 @@ pub fn start(cdp: &Arc<Cdp>, set: Set) -> Result<Tracing> {
         json!({
             "transferMode": "ReturnAsStream",
             "streamFormat": "proto",
-            "traceConfig": { "recordMode": "recordAsMuchAsPossible", "includedCategories": categories(set) },
+            // Attribution traces of long runs (stacks, invalidations) overflowed the default buffer.
+            "traceConfig": { "recordMode": "recordAsMuchAsPossible", "includedCategories": categories(set), "traceBufferSizeInKb": if set == Set::Attribution || set == Set::Memory { 1_000_000 } else { 200_000 } },
         }),
         None,
     )?;

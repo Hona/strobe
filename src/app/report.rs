@@ -10,7 +10,10 @@ pub fn run(args: &Args) -> Result<Output> {
     let view = args.pos.first().ok_or_else(|| Error::usage("report <view> <handle…>: views experiment, recording"))?;
     let handle = args.pos.get(1).ok_or_else(|| Error::usage("report needs a handle"))?;
     let dir = store::resolve(handle)?;
-    let data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
+    let mut data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
+    if handle.starts_with("exp_") {
+        attach_hotspots(&mut data);
+    }
     let format = args.get("format").unwrap_or("html");
     let out = match args.get("out") {
         Some(p) => std::path::PathBuf::from(p),
@@ -26,6 +29,25 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let path = out.display().to_string();
     Ok(Output::new(format!("{path} · {}\n", super::fmt::bytes(body.len() as f64)), json!({ "path": path, "bytes": body.len() })))
+}
+
+/// The "why": self time per function from each series' attribution blocks (base and head), so the
+/// report can show where head spends less or more without a second command.
+fn attach_hotspots(data: &mut Value) {
+    let Some(series) = data["series"].as_array_mut() else { return };
+    for s in series {
+        let mut out = json!({});
+        for role in ["base", "head"] {
+            let Some(rec) = s["attribution"][role].as_str() else { continue };
+            let Ok(dir) = store::resolve(rec) else { continue };
+            if let Ok(o) = super::query::hotspots(&dir, "function", 40) {
+                out[role] = o.json;
+            }
+        }
+        if out.as_object().is_some_and(|o| !o.is_empty()) {
+            s["hotspots"] = out;
+        }
+    }
 }
 
 const TEMPLATE: &str = include_str!("../../viewer/report.html");

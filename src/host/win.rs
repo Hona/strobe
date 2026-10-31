@@ -5,24 +5,14 @@ use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::sync::OnceLock;
 use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, INVALID_HANDLE_VALUE, LocalFree, POINT};
-use windows_sys::Win32::Graphics::Gdi::{
-    DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW,
-    MonitorFromPoint,
-};
-use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
-};
+use windows_sys::Win32::Graphics::Gdi::{DEVMODEW, ENUM_CURRENT_SETTINGS, EnumDisplaySettingsW, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFOEXW, MonitorFromPoint};
+use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, PowerGetActiveScheme, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-use windows_sys::Win32::System::SystemInformation::{
-    GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX,
-};
-use windows_sys::Win32::System::Threading::{
-    GetCurrentProcess, GetProcessAffinityMask, GetProcessTimes, GetSystemTimes, OpenProcess,
-    PROCESS_QUERY_LIMITED_INFORMATION, SetProcessAffinityMask,
-};
+use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
+use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask, GetProcessTimes, GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetProcessAffinityMask};
 use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
 
 pub fn qpc_ns() -> u64 {
@@ -105,11 +95,7 @@ fn proc_times(pid: u32) -> (u64, u64, u64) {
         QueryProcessCycleTime(h, &mut cycles);
         let mut m: PROCESS_MEMORY_COUNTERS_EX = zeroed();
         m.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let private = if K32GetProcessMemoryInfo(h, &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) != 0 {
-            m.PrivateUsage as u64
-        } else {
-            0
-        };
+        let private = if K32GetProcessMemoryInfo(h, &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) != 0 { m.PrivateUsage as u64 } else { 0 };
         CloseHandle(h);
         (cpu, cycles, private)
     }
@@ -166,9 +152,7 @@ fn reg_string(key: &str, value: &str) -> Option<String> {
     let (k, v) = (wide(key), wide(value));
     let mut buf = vec![0u16; 512];
     let mut size = (buf.len() * 2) as u32;
-    let rc = unsafe {
-        RegGetValueW(HKEY_LOCAL_MACHINE, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size)
-    };
+    let rc = unsafe { RegGetValueW(HKEY_LOCAL_MACHINE, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size) };
     (rc == 0).then(|| wide_to_string(&buf).trim().to_string())
 }
 
@@ -212,9 +196,7 @@ pub fn on_battery() -> bool {
 
 /// Whether this process's session shows the lock screen.
 pub fn session_locked() -> bool {
-    use windows_sys::Win32::System::RemoteDesktop::{
-        WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx,
-    };
+    use windows_sys::Win32::System::RemoteDesktop::{WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx};
     unsafe {
         let mut buf: *mut u16 = std::ptr::null_mut();
         let mut bytes = 0u32;
@@ -349,9 +331,7 @@ pub fn user_value(key: &str, name: &str) -> Option<String> {
     let (k, v) = (wide(key), wide(name));
     let mut buf = vec![0u16; 32768];
     let mut size = (buf.len() * 2) as u32;
-    let rc = unsafe {
-        RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size)
-    };
+    let rc = unsafe { RegGetValueW(HKEY_CURRENT_USER, k.as_ptr(), v.as_ptr(), RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND, std::ptr::null_mut(), buf.as_mut_ptr() as *mut _, &mut size) };
     (rc == 0).then(|| wide_to_string(&buf))
 }
 
@@ -369,8 +349,7 @@ pub fn broadcast_env_change() {
 pub fn raise_windows(pids: &[u32]) -> usize {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE,
-        SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
     };
     struct State<'a> {
         pids: &'a [u32],
@@ -478,7 +457,13 @@ fn system_processes(names: bool) -> Vec<SysProc> {
             let p = &*(base.add(off) as *const SysProcRaw);
             let name = match (names, p.name.is_null()) {
                 (false, _) => String::new(),
-                (true, true) => if p.pid == 0 { "Idle".to_string() } else { String::new() },
+                (true, true) => {
+                    if p.pid == 0 {
+                        "Idle".to_string()
+                    } else {
+                        String::new()
+                    }
+                }
                 (true, false) => String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2)),
             };
             out.push(SysProc {

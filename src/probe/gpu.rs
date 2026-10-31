@@ -85,17 +85,7 @@ impl DeviceSample {
     }
 
     pub fn from_fields(f: [Option<f64>; 9]) -> DeviceSample {
-        DeviceSample {
-            gpu_pct: f[0],
-            mem_pct: f[1],
-            gfx_mhz: f[2],
-            mem_mhz: f[3],
-            power_w: f[4],
-            temp_c: f[5],
-            pcie_tx_mbs: f[6],
-            pcie_rx_mbs: f[7],
-            vram_used_mb: f[8],
-        }
+        DeviceSample { gpu_pct: f[0], mem_pct: f[1], gfx_mhz: f[2], mem_mhz: f[3], power_w: f[4], temp_c: f[5], pcie_tx_mbs: f[6], pcie_rx_mbs: f[7], vram_used_mb: f[8] }
     }
 }
 
@@ -257,12 +247,10 @@ mod kmt {
     use super::{Adapter, EngineUse, VramUse, intern};
     use std::mem::{size_of, zeroed};
     use windows_sys::Wdk::Graphics::Direct3D::{
-        D3DKMT_ADAPTERADDRESS, D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_DRIVER_DESCRIPTION, D3DKMT_ENUMADAPTERS2,
-        D3DKMT_NODEMETADATA, D3DKMT_QUERYADAPTERINFO, D3DKMT_QUERYSTATISTICS, D3DKMT_QUERYSTATISTICS_ADAPTER,
-        D3DKMT_QUERYSTATISTICS_PROCESS_NODE, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT, D3DKMT_QUERYSTATISTICS_QUERY_NODE,
-        D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT, D3DKMT_QUERYSTATISTICS_SEGMENT,
-        D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics, KMTQAITYPE_ADAPTERADDRESS,
-        KMTQAITYPE_DRIVER_DESCRIPTION, KMTQAITYPE_NODEMETADATA,
+        D3DKMT_ADAPTERADDRESS, D3DKMT_ADAPTERINFO, D3DKMT_CLOSEADAPTER, D3DKMT_DRIVER_DESCRIPTION, D3DKMT_ENUMADAPTERS2, D3DKMT_NODEMETADATA, D3DKMT_QUERYADAPTERINFO, D3DKMT_QUERYSTATISTICS,
+        D3DKMT_QUERYSTATISTICS_ADAPTER, D3DKMT_QUERYSTATISTICS_PROCESS_NODE, D3DKMT_QUERYSTATISTICS_PROCESS_SEGMENT, D3DKMT_QUERYSTATISTICS_QUERY_NODE, D3DKMT_QUERYSTATISTICS_QUERY_SEGMENT,
+        D3DKMT_QUERYSTATISTICS_SEGMENT, D3DKMTCloseAdapter, D3DKMTEnumAdapters2, D3DKMTQueryAdapterInfo, D3DKMTQueryStatistics, KMTQAITYPE_ADAPTERADDRESS, KMTQAITYPE_DRIVER_DESCRIPTION,
+        KMTQAITYPE_NODEMETADATA,
     };
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LUID};
     use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_INFORMATION};
@@ -313,8 +301,7 @@ mod kmt {
                     *st = zeroed();
                     st.Type = D3DKMT_QUERYSTATISTICS_ADAPTER;
                     st.AdapterLuid = a.AdapterLuid;
-                    let (node_count, segment_count) =
-                        if stats(&mut st) { (st.QueryResult.AdapterInformation.NodeCount, st.QueryResult.AdapterInformation.NbSegments) } else { (0, 0) };
+                    let (node_count, segment_count) = if stats(&mut st) { (st.QueryResult.AdapterInformation.NodeCount, st.QueryResult.AdapterInformation.NbSegments) } else { (0, 0) };
                     let nodes = (0..node_count)
                         .map(|n| {
                             let mut md: D3DKMT_NODEMETADATA = zeroed();
@@ -398,12 +385,7 @@ mod kmt {
                 .iter()
                 .enumerate()
                 .filter(|(_, a)| !a.nodes.is_empty())
-                .map(|(i, a)| KmtAdapter {
-                    luid: luid(a.luid),
-                    index: i as u16,
-                    engines: a.nodes.iter().map(|n| intern(names, n)).collect(),
-                    apertures: a.apertures.clone(),
-                })
+                .map(|(i, a)| KmtAdapter { luid: luid(a.luid), index: i as u16, engines: a.nodes.iter().map(|n| intern(names, n)).collect(), apertures: a.apertures.clone() })
                 .collect();
             (!list.is_empty()).then(|| Kmt { adapters: list, procs: Vec::new(), st: Box::new(unsafe { zeroed() }), started: false, unreadable: Vec::new() })
         }
@@ -623,9 +605,7 @@ mod nvml {
                     }
                     let mut buf = [0u8; 96];
                     let name = match name_fn {
-                        Some(f) if f(h, buf.as_mut_ptr(), buf.len() as u32) == 0 => {
-                            String::from_utf8_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]).to_string()
-                        }
+                        Some(f) if f(h, buf.as_mut_ptr(), buf.len() as u32) == 0 => String::from_utf8_lossy(&buf[..buf.iter().position(|&c| c == 0).unwrap_or(buf.len())]).to_string(),
                         _ => format!("NVIDIA GPU {i}"),
                     };
                     let mut pci: PciInfo = std::mem::zeroed();

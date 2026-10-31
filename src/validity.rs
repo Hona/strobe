@@ -47,7 +47,11 @@ pub fn window_visible(page: &Page) -> Result<()> {
 }
 
 pub fn locked() -> Error {
-    Error::refused("SessionLocked", "the session was locked while strobe measured: the lock screen covers the window, so nothing it drew reached the display", "measure on an unlocked screen; bench waits for an unlock and redoes the block by itself")
+    Error::refused(
+        "SessionLocked",
+        "the session was locked while strobe measured: the lock screen covers the window, so nothing it drew reached the display",
+        "measure on an unlocked screen; bench waits for an unlock and redoes the block by itself",
+    )
 }
 
 pub fn dev_build(page: &Page) -> Result<()> {

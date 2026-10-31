@@ -296,15 +296,7 @@ pub fn env() -> Env {
     let (os, cpu, power_plan, on_battery) = (win::os_name(), win::cpu_name(), win::power_plan(), win::on_battery());
     #[cfg(not(windows))]
     let (os, cpu, power_plan, on_battery) = (std::env::consts::OS.to_string(), String::new(), String::new(), false);
-    Env {
-        os,
-        cpu,
-        logical_cpus: topo.logical,
-        l3_groups: topo.groups,
-        power_plan,
-        on_battery,
-        strobe: env!("CARGO_PKG_VERSION").to_string(),
-    }
+    Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, strobe: env!("CARGO_PKG_VERSION").to_string() }
 }
 
 /// Share of all CPUs busy over `ms`, 0..1.

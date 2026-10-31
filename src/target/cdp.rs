@@ -39,9 +39,7 @@ impl Cdp {
             closed: Arc::new(Mutex::new(None)),
         });
         let (pending, subscribers, closed) = (cdp.pending.clone(), cdp.subscribers.clone(), cdp.closed.clone());
-        std::thread::Builder::new()
-            .name("cdp-reader".into())
-            .spawn(move || read_loop(reader, pending, subscribers, closed))?;
+        std::thread::Builder::new().name("cdp-reader".into()).spawn(move || read_loop(reader, pending, subscribers, closed))?;
         Ok(cdp)
     }
 
@@ -61,11 +59,7 @@ impl Cdp {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        self.writer
-            .lock()
-            .unwrap()
-            .send(Message::text(msg.to_string()))
-            .map_err(|e| Error::unreachable(format!("cdp send {method}: {e}")))?;
+        self.writer.lock().unwrap().send(Message::text(msg.to_string())).map_err(|e| Error::unreachable(format!("cdp send {method}: {e}")))?;
         let reply = rx.recv_timeout(timeout).map_err(|_| {
             self.pending.lock().unwrap().remove(&id);
             Error { code: 124, message: format!("cdp {method}: no reply in {}s", timeout.as_secs()), hint: None }

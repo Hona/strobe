@@ -339,8 +339,7 @@ impl Snapshot {
     /// function and location, detached DOM apart, the rest by node type.
     fn build_classes(&mut self) {
         let n = self.ntype.len();
-        let (object, native, closure, hidden, code) =
-            (self.node_type("object"), self.node_type("native"), self.node_type("closure"), self.node_type("hidden"), self.node_type("code"));
+        let (object, native, closure, hidden, code) = (self.node_type("object"), self.node_type("native"), self.node_type("closure"), self.node_type("hidden"), self.node_type("code"));
         let mut keys: HashMap<(u8, u32, Option<[u32; 3]>), u32> = HashMap::new();
         let mut classes: Vec<Class> = Vec::new();
         let mut class = Vec::with_capacity(n);
@@ -799,13 +798,7 @@ pub fn leaks_text(v: &Value, top: usize) -> String {
 }
 
 fn born_text(v: &Value, top: usize) -> String {
-    format!(
-        "{} objects · {} self · {} retained\n{}",
-        v["count"],
-        bytes(v["self_size"].as_f64().unwrap_or(0.0)),
-        bytes(v["retained_size"].as_f64().unwrap_or(0.0)),
-        class_rows(&v["classes"], top)
-    )
+    format!("{} objects · {} self · {} retained\n{}", v["count"], bytes(v["self_size"].as_f64().unwrap_or(0.0)), bytes(v["retained_size"].as_f64().unwrap_or(0.0)), class_rows(&v["classes"], top))
 }
 
 fn class_rows(rows: &Value, top: usize) -> String {
@@ -828,7 +821,13 @@ fn class_rows(rows: &Value, top: usize) -> String {
                 .into_iter()
                 .flatten()
                 .take(3)
-                .map(|f| format!("{} {}", f["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("(anonymous)"), location(&json!({ "url": f["url"], "script_id": f["script_id"], "line": f["line"], "column": f["column"] })).trim()))
+                .map(|f| {
+                    format!(
+                        "{} {}",
+                        f["name"].as_str().filter(|n| !n.is_empty()).unwrap_or("(anonymous)"),
+                        location(&json!({ "url": f["url"], "script_id": f["script_id"], "line": f["line"], "column": f["column"] })).trim()
+                    )
+                })
                 .collect();
             t += &format!("  {:>32}allocated ×{} at {}\n", "", a["count"], frames.join(" ← "));
         }
@@ -890,7 +889,13 @@ fn bytes(v: f64) -> String {
 }
 
 fn signed_bytes(v: f64) -> String {
-    if v > 0.0 { format!("+{}", bytes(v)) } else if v < 0.0 { format!("−{}", bytes(-v)) } else { "0 B".into() }
+    if v > 0.0 {
+        format!("+{}", bytes(v))
+    } else if v < 0.0 {
+        format!("−{}", bytes(-v))
+    } else {
+        "0 B".into()
+    }
 }
 
 fn parse(path: &Path) -> Result<Snapshot> {
@@ -945,7 +950,15 @@ fn document(sc: &mut Scan) -> Result<Snapshot> {
                         _ => 9,
                     })
                     .collect();
-                ecol = names(&meta["edge_fields"]).iter().map(|f| match f.as_str() { "type" => 0u8, "name_or_index" => 1, "to_node" => 2, _ => 9 }).collect();
+                ecol = names(&meta["edge_fields"])
+                    .iter()
+                    .map(|f| match f.as_str() {
+                        "type" => 0u8,
+                        "name_or_index" => 1,
+                        "to_node" => 2,
+                        _ => 9,
+                    })
+                    .collect();
                 if !ncol.contains(&4) || !ecol.contains(&2) {
                     return Err(Error::msg("heap snapshot: meta lacks edge_count or to_node"));
                 }

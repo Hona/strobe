@@ -209,12 +209,13 @@ pub fn summary_text(meta: &Value) -> String {
     if meta["probes"] == "memory" {
         let id = meta["id"].as_str().unwrap_or("");
         let l = &meta["leaks"];
+        let growth = format!("{}{}", if get("js.heap.growth") < 0.0 { "−" } else { "+" }, fmt::bytes(get("js.heap.growth").abs() * 1048576.0));
         return format!(
             "{id} · {} · {} · memory\njs heap  {} after GC · {} per minute\ndom      {} nodes · {} per minute\nsuspects {} objects allocated in the first half and alive at the end · {} retained\nnext     strobe query {id} leaks · strobe query {id} heap\n",
             meta["target"].as_str().unwrap_or(""),
             fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
             fmt::bytes(get("js.heap.used") * 1048576.0),
-            format!("{}{}", if get("js.heap.growth") < 0.0 { "−" } else { "+" }, fmt::bytes(get("js.heap.growth").abs() * 1048576.0)),
+            growth,
             fmt::value(get("dom.nodes"), "count"),
             fmt::signed(get("dom.nodes.growth"), "count"),
             l["count"].as_u64().unwrap_or(0),

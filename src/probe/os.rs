@@ -231,10 +231,7 @@ impl Sampler {
     pub fn every(root_pid: u32, interval: Duration) -> Sampler {
         let (stop, stop_rx) = mpsc::channel();
         let (ready, ready_rx) = mpsc::channel();
-        let thread = std::thread::Builder::new()
-            .name("strobe-sampler".into())
-            .spawn(move || run(root_pid, interval, stop_rx, ready))
-            .expect("spawn the sampler thread");
+        let thread = std::thread::Builder::new().name("strobe-sampler".into()).spawn(move || run(root_pid, interval, stop_rx, ready)).expect("spawn the sampler thread");
         let _ = ready_rx.recv();
         Sampler { stop, thread }
     }
@@ -434,13 +431,7 @@ impl Samples {
         s.covered_ms = total / 1e6;
         let avg = |acc: &Vec<(f64, f64)>, i: usize| acc.get(i).filter(|a| a.1 > 0.0).map(|a| a.0 / a.1);
         s.cores = (0..busy.len().max(perf.len()))
-            .map(|i| CoreAvg {
-                cpu: i as u32,
-                busy_pct: avg(&busy, i),
-                util_pct: avg(&util, i),
-                perf_pct: avg(&perf, i),
-                mhz: self.nominal_mhz.zip(avg(&perf, i)).map(|(n, p)| n * p / 100.0),
-            })
+            .map(|i| CoreAvg { cpu: i as u32, busy_pct: avg(&busy, i), util_pct: avg(&util, i), perf_pct: avg(&perf, i), mhz: self.nominal_mhz.zip(avg(&perf, i)).map(|(n, p)| n * p / 100.0) })
             .collect();
         let adapter_name = |i: u16| self.adapters.get(i as usize).map(|a| a.name.clone()).unwrap_or_else(|| format!("adapter {i}"));
         let mut by_adapter: BTreeMap<u16, (f64, BTreeMap<String, f64>)> = BTreeMap::new();
@@ -453,11 +444,7 @@ impl Samples {
         for m in &last.vram {
             *dedicated.entry(m.adapter).or_default() += m.dedicated;
         }
-        let primary = by_adapter
-            .iter()
-            .max_by(|a, b| a.1.0.total_cmp(&b.1.0))
-            .map(|(&a, _)| a)
-            .or_else(|| dedicated.iter().filter(|d| *d.1 > 0).max_by_key(|d| *d.1).map(|(&a, _)| a));
+        let primary = by_adapter.iter().max_by(|a, b| a.1.0.total_cmp(&b.1.0)).map(|(&a, _)| a).or_else(|| dedicated.iter().filter(|d| *d.1 > 0).max_by_key(|d| *d.1).map(|(&a, _)| a));
         if self.gpu_available {
             s.gpu_adapter = primary.map(adapter_name);
             s.gpu_engines = primary.and_then(|p| by_adapter.get(&p)).map(|a| a.1.clone()).unwrap_or_default();
@@ -484,8 +471,7 @@ impl Samples {
 #[cfg(windows)]
 pub mod pdh {
     use windows_sys::Win32::System::Performance::{
-        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData,
-        PdhGetFormattedCounterArrayW, PdhOpenQueryW,
+        PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_DOUBLE, PDH_MORE_DATA, PdhAddEnglishCounterW, PdhCloseQuery, PdhCollectQueryData, PdhGetFormattedCounterArrayW, PdhOpenQueryW,
     };
 
     pub const NOSCALE: u32 = 0x1000;
@@ -518,9 +504,7 @@ pub mod pdh {
             let mut rc = PDH_MORE_DATA;
             for _ in 0..3 {
                 let mut size = (self.buf.len() * 8) as u32;
-                rc = unsafe {
-                    PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | flags, &mut size, &mut count, self.buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W)
-                };
+                rc = unsafe { PdhGetFormattedCounterArrayW(counter, PDH_FMT_DOUBLE | flags, &mut size, &mut count, self.buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W) };
                 if rc != PDH_MORE_DATA {
                     break;
                 }

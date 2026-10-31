@@ -225,8 +225,7 @@ impl Top {
         rows.sort_by(|a, b| key(b).total_cmp(&key(a)));
         // GPU memory (D3DKMT) for the rows shown, or every row when sorting or totalling by it.
         let wide = self.sort == "vram" || tree.is_some();
-        let mut want: Vec<u32> =
-            rows.iter().take(if wide { usize::MAX } else { self.limit }).filter(|r| r.vram_dedicated_mb.is_none()).map(|r| r.pid).collect();
+        let mut want: Vec<u32> = rows.iter().take(if wide { usize::MAX } else { self.limit }).filter(|r| r.vram_dedicated_mb.is_none()).map(|r| r.pid).collect();
         want.sort_unstable();
         let mut vram: HashMap<u32, (u64, u64)> = want.iter().map(|&p| (p, (0, 0))).collect();
         for m in self.probe.vram(&want) {
@@ -269,12 +268,8 @@ impl Top {
         let mhz = |perf: Option<f64>| self.probe.nominal_mhz.zip(perf).map(|(n, p)| n * p / 100.0);
         let pick = |v: Option<&Vec<f32>>, i: usize| v.and_then(|v| v.get(i)).map(|&x| x as f64);
         let (perf, util) = (self.freq.as_ref().map(|f| &f.perf), self.freq.as_ref().map(|f| &f.util));
-        let cores: Vec<CoreRow> = tick
-            .busy
-            .iter()
-            .enumerate()
-            .map(|(i, &b)| CoreRow { cpu: i, busy_pct: b as f64, util_pct: pick(util, i), perf_pct: pick(perf, i), mhz: mhz(pick(perf, i)) })
-            .collect();
+        let cores: Vec<CoreRow> =
+            tick.busy.iter().enumerate().map(|(i, &b)| CoreRow { cpu: i, busy_pct: b as f64, util_pct: pick(util, i), perf_pct: pick(perf, i), mhz: mhz(pick(perf, i)) }).collect();
         let vcache = self.topo.vcache().map(|g| g.mask);
         let mut groups: Vec<GroupRow> = self
             .topo
@@ -304,14 +299,7 @@ impl Top {
 fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, &Summary)>, live: bool) -> String {
     let mut t = String::new();
     let busy = f.cores.iter().map(|c| c.busy_pct).sum::<f64>() / f.cores.len().max(1) as f64;
-    t += &format!(
-        "strobe top  {:.1} s  {}  {} logical CPUs  {:.0}% busy{}\n",
-        f.elapsed_ms / 1000.0,
-        cpu_name,
-        topo.logical,
-        busy,
-        if live { "  (Ctrl+C quits)" } else { "" }
-    );
+    t += &format!("strobe top  {:.1} s  {}  {} logical CPUs  {:.0}% busy{}\n", f.elapsed_ms / 1000.0, cpu_name, topo.logical, busy, if live { "  (Ctrl+C quits)" } else { "" });
     for g in &f.groups {
         let l3 = if g.l3_mb > 0 { format!("  {} MB L3", g.l3_mb) } else { String::new() };
         t += &format!(
@@ -372,18 +360,12 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
             t += &format!("      {adapter}: {}\n", list.join("  "));
         }
     }
-    t += &format!(
-        "\n{:>7}  {:<24} {:>7} {:>10} {:>7} {:>7}  {:<12} {:>10}\n",
-        "PID", "NAME", "CPU", "PRIVATE", "3D", "GPU", "ENGINE", "VRAM"
-    );
+    t += &format!("\n{:>7}  {:<24} {:>7} {:>10} {:>7} {:>7}  {:<12} {:>10}\n", "PID", "NAME", "CPU", "PRIVATE", "3D", "GPU", "ENGINE", "VRAM");
     let line = |r: &ProcRow| {
         let name: String = r.name.chars().take(24).collect();
         let engine: String = if r.gpu_pct >= 0.05 { r.gpu_engine.chars().take(12).collect() } else { String::new() };
         let vram = r.vram_dedicated_mb.map(|v| format!("{v:.1} MB")).unwrap_or_else(|| "-".into());
-        format!(
-            "{:>7}  {:<24} {:>6.1}% {:>7.1} MB {:>6.1}% {:>6.1}%  {:<12} {:>10}\n",
-            r.pid, name, r.cpu_pct, r.private_mb, r.gpu_3d_pct, r.gpu_pct, engine, vram
-        )
+        format!("{:>7}  {:<24} {:>6.1}% {:>7.1} MB {:>6.1}% {:>6.1}%  {:<12} {:>10}\n", r.pid, name, r.cpu_pct, r.private_mb, r.gpu_3d_pct, r.gpu_pct, engine, vram)
     };
     for r in &f.processes {
         t += &line(r);
@@ -391,10 +373,7 @@ fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, 
     if let Some(total) = &f.total {
         t += &line(total);
     }
-    t += &format!(
-        "      (CPU: % of one core; 3D, GPU: % of one engine; VRAM: dedicated GPU memory it committed, - unreadable; sorted by {})\n",
-        f.sort
-    );
+    t += &format!("      (CPU: % of one core; 3D, GPU: % of one engine; VRAM: dedicated GPU memory it committed, - unreadable; sorted by {})\n", f.sort);
     if let Some((samples, s)) = target {
         let gpu = match (&s.gpu_adapter, s.gpu_3d_pct) {
             (Some(a), Some(v)) => format!("3D {v:.1}% on {a}"),

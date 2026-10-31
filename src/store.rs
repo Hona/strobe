@@ -44,12 +44,7 @@ pub fn resolve(handle: &str) -> Result<PathBuf> {
     if exact.is_dir() {
         return Ok(exact);
     }
-    let matches: Vec<PathBuf> = std::fs::read_dir(&root)?
-        .flatten()
-        .filter(|e| e.file_name().to_string_lossy().starts_with(handle))
-        .map(|e| e.path())
-        .filter(|p| p.is_dir())
-        .collect();
+    let matches: Vec<PathBuf> = std::fs::read_dir(&root)?.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(handle)).map(|e| e.path()).filter(|p| p.is_dir()).collect();
     match matches.len() {
         1 => Ok(matches[0].clone()),
         0 => Err(Error::usage(format!("no recording or experiment {handle}"))),
@@ -70,14 +65,9 @@ pub fn read_json(path: &std::path::Path) -> Result<Value> {
 pub fn list(prefix: &str, limit: usize) -> Vec<(String, std::time::SystemTime)> {
     let root = if prefix == "exp" { paths::experiments() } else { paths::recordings() };
     let mut v: Vec<(String, std::time::SystemTime)> = std::fs::read_dir(root)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.path().is_dir())
-                .filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), e.metadata().ok()?.modified().ok()?)))
-                .collect()
-        })
+        .map(|rd| rd.flatten().filter(|e| e.path().is_dir()).filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), e.metadata().ok()?.modified().ok()?))).collect())
         .unwrap_or_default();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|x| std::cmp::Reverse(x.1));
     v.truncate(limit);
     v
 }

@@ -92,7 +92,7 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
             Some((rev, e.path().join(rel)))
         })
         .collect();
-    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
     dirs.into_iter().map(|d| d.1).collect()
 }
 
@@ -128,9 +128,7 @@ pub fn reap_orphans() {
 
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
-    let exe = find().ok_or_else(|| {
-        Error::msg("no Chromium found").hint("install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER")
-    })?;
+    let exe = find().ok_or_else(|| Error::msg("no Chromium found").hint("install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER"))?;
     let profile = host::paths::run().join(format!("profile-{}-{}", std::process::id(), host::now_ns()));
     std::fs::create_dir_all(&profile)?;
     let mut args: Vec<String> = vec![
@@ -217,11 +215,7 @@ impl Browser {
     /// The first page target, attached with a flat session.
     pub fn page(&self) -> Result<Page> {
         let targets = self.cdp.send("Target.getTargets", json!({}), None)?;
-        let target = targets["targetInfos"]
-            .as_array()
-            .and_then(|a| a.iter().find(|t| t["type"] == "page"))
-            .and_then(|t| t["targetId"].as_str())
-            .map(str::to_string);
+        let target = targets["targetInfos"].as_array().and_then(|a| a.iter().find(|t| t["type"] == "page")).and_then(|t| t["targetId"].as_str()).map(str::to_string);
         let target = match target {
             Some(t) => t,
             None => self.cdp.send("Target.createTarget", json!({ "url": "about:blank" }), None)?["targetId"].as_str().unwrap_or("").to_string(),
@@ -265,10 +259,8 @@ impl Browser {
     /// GPU devices and whether compositing runs on a hardware adapter.
     pub fn gpu(&self) -> Result<Gpu> {
         let info = self.cdp.send("SystemInfo.getInfo", json!({}), None)?;
-        let devices: Vec<String> = info["gpu"]["devices"]
-            .as_array()
-            .map(|a| a.iter().map(|d| d["deviceString"].as_str().unwrap_or("").to_string()).filter(|s| !s.is_empty()).collect())
-            .unwrap_or_default();
+        let devices: Vec<String> =
+            info["gpu"]["devices"].as_array().map(|a| a.iter().map(|d| d["deviceString"].as_str().unwrap_or("").to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default();
         let compositing = info["gpu"]["featureStatus"]["gpu_compositing"].as_str().unwrap_or("").to_string();
         // Element 0 is the adapter Chromium uses; the rest are every other adapter on the system.
         let active = devices.first().map(|d| d.to_lowercase()).unwrap_or_default();

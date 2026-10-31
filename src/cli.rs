@@ -4,10 +4,7 @@ use crate::model::{Error, Result};
 use std::collections::HashMap;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &[
-    "json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open",
-    "calibrate", "pin-runner", "headless", "keep", "fast", "once",
-];
+const SWITCHES: &[&str] = &["json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open", "calibrate", "pin-runner", "headless", "keep", "fast", "once"];
 
 pub struct Args {
     pub command: String,
@@ -57,9 +54,7 @@ impl Args {
     }
 
     pub fn num(&self, name: &str) -> Result<Option<f64>> {
-        self.get(name)
-            .map(|v| v.trim_end_matches('%').parse::<f64>().map_err(|_| Error::usage(format!("--{name}: not a number: {v}"))))
-            .transpose()
+        self.get(name).map(|v| v.trim_end_matches('%').parse::<f64>().map_err(|_| Error::usage(format!("--{name}: not a number: {v}")))).transpose()
     }
 
     pub fn json(&self) -> bool {

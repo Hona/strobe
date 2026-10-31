@@ -77,12 +77,7 @@ pub fn write_response(stream: &mut TcpStream, r: &Response) {
         415 => "Unsupported Media Type",
         _ => "Error",
     };
-    let head = format!(
-        "HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
-        r.status,
-        r.content_type,
-        r.body.len()
-    );
+    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", r.status, r.content_type, r.body.len());
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&r.body);
     let _ = stream.flush();

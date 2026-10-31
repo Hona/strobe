@@ -165,13 +165,7 @@ select 'lat', w.k, s.ts, s.dur, null, extract_arg(s.arg_set_id, 'event_latency.e
             "frame" => {
                 let raw = row[5].clone().unwrap_or_default();
                 let (state, kind) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-                data.frames.entry(key).or_default().push(Frame {
-                    ts: num(&row[2]),
-                    dur: num(&row[3]),
-                    state: state.to_string(),
-                    seq: row[4].clone().unwrap_or_default(),
-                    forked: kind == "FORKED",
-                });
+                data.frames.entry(key).or_default().push(Frame { ts: num(&row[2]), dur: num(&row[3]), state: state.to_string(), seq: row[4].clone().unwrap_or_default(), forked: kind == "FORKED" });
             }
             "task" => data.tasks.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),

@@ -13,7 +13,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
     if handle.starts_with("exp_") {
         attach_hotspots(&mut data);
-    } else if let Some(a) = attribution(&dir, &data["id"].as_str().unwrap_or(handle).to_string(), None) {
+    } else if let Some(a) = attribution(&dir, data["id"].as_str().unwrap_or(handle), None) {
         data["attribution"] = a;
     } else if data["probes"] == "memory" {
         // A memory recording: its live heap at the end and the objects that outlived their half.
@@ -101,7 +101,7 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
     // A display may abbreviate (the recording and `query` keep everything): three stacks for the top
     // rows, the heaviest one below them, and no `url` beside `file` in frames.
     for key in ["rows", "files", "alloc.rows", "alloc.files", "layout.rows"] {
-        let rows = key.split('.').fold(Some(&mut h), |v, k| v.and_then(|v| v.get_mut(k)));
+        let rows = key.split('.').try_fold(&mut h, |v, k| v.get_mut(k));
         for (i, row) in rows.and_then(Value::as_array_mut).into_iter().flatten().enumerate() {
             let Some(stacks) = row["stacks"].as_array_mut() else { continue };
             stacks.truncate(if i < 15 { 3 } else { 1 });

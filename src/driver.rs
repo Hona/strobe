@@ -83,7 +83,8 @@ impl Driver {
             "goto" => {
                 let to = s(0);
                 // Relative paths resolve against the page, like a link would.
-                let url = if to.contains("://") || to.starts_with("about:") { to } else { self.page.eval(&format!("new URL({}, location.href).href", json!(to)))?.as_str().unwrap_or_default().to_string() };
+                let url =
+                    if to.contains("://") || to.starts_with("about:") { to } else { self.page.eval(&format!("new URL({}, location.href).href", json!(to)))?.as_str().unwrap_or_default().to_string() };
                 self.page.navigate(&url, self.timeout(&opts(1)))?;
                 self.until(&opts(1))
             }
@@ -129,10 +130,8 @@ impl Driver {
                 let by = o.get("by").and_then(Value::as_f64).unwrap_or(0.0);
                 let by_x = o.get("byX").and_then(Value::as_f64).unwrap_or(0.0);
                 let speed = o.get("speed").and_then(Value::as_f64).unwrap_or(2000.0);
-                self.page.send_long(
-                    "Input.synthesizeScrollGesture",
-                    json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }),
-                )?;
+                self.page
+                    .send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
                 self.until(&opts(2))
             }
             "waitFor" => {
@@ -200,7 +199,13 @@ impl Driver {
                 "control" | "ctrl" => 2,
                 "meta" | "cmd" => 4,
                 "shift" => 8,
-                "controlormeta" | "mod" => if cfg!(target_os = "macos") { 4 } else { 2 },
+                "controlormeta" | "mod" => {
+                    if cfg!(target_os = "macos") {
+                        4
+                    } else {
+                        2
+                    }
+                }
                 _ => 0,
             };
         }

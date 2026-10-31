@@ -157,7 +157,7 @@ fn frames(trace: &Path, meta: &Value, top: usize) -> Result<Output> {
             text += &format!("  {:<14} {:>5} frames · p50 {} · p95 {}\n", name, v.len(), fmt::value(metrics::percentile(&v, 0.5), "ms"), fmt::value(metrics::percentile(&v, 0.95), "ms"));
         }
     }
-    all.sort_by(|a, b| b.cost.cmp(&a.cost));
+    all.sort_by_key(|f| std::cmp::Reverse(f.cost));
     let t0 = data.windows.first().map(|w| w.t0).unwrap_or(0);
     text += "worst\n";
     let worst: Vec<Value> = all.iter().take(top.min(10)).map(|f| json!({ "at_ms": (f.ts - t0) as f64 / 1e6, "ms": f.cost as f64 / 1e6 })).collect();
@@ -165,7 +165,10 @@ fn frames(trace: &Path, meta: &Value, top: usize) -> Result<Output> {
         text += &format!("  {:>9} at {:>8.1} ms\n", fmt::value(w["ms"].as_f64().unwrap_or(0.0), "ms"), w["at_ms"].as_f64().unwrap_or(0.0));
     }
     let phase_json: BTreeMap<&String, usize> = phases.iter().map(|(k, v)| (k, v.len())).collect();
-    Ok(Output::new(text, json!({ "presented": ms.len(), "dropped_pct": dropped, "latency": { "p50": q(0.5), "p95": q(0.95), "p99": q(0.99) }, "values": values, "worst": worst, "phases": phase_json })))
+    Ok(Output::new(
+        text,
+        json!({ "presented": ms.len(), "dropped_pct": dropped, "latency": { "p50": q(0.5), "p95": q(0.95), "p99": q(0.99) }, "values": values, "worst": worst, "phases": phase_json }),
+    ))
 }
 
 fn threads(trace: &Path, top: usize) -> Result<Output> {
@@ -302,11 +305,7 @@ select w.k, s.name, s.ts, s.dur, t.tid,
             continue;
         }
         // Trace stacks are innermost first with 1-based lines and columns; `rank` wants root first.
-        let frames: Vec<Frame> = stack
-            .into_iter()
-            .rev()
-            .map(|f| sites.entry(f.clone()).or_insert_with(|| sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3)).clone())
-            .collect();
+        let frames: Vec<Frame> = stack.into_iter().rev().map(|f| sites.entry(f.clone()).or_insert_with(|| sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3)).clone()).collect();
         weights.push((frames, dur as f64 / 1e3, 1));
     }
     let runs = measured.len().max(1) as f64;
@@ -432,12 +431,8 @@ fn attribution_meta(dir: &Path) -> Result<Value> {
 /// set: the last `runs` of the run windows (a block warms up first; its attribution profilers start
 /// at the steady point).
 fn measured_runs(meta: &Value, rows: &[Vec<Option<String>>]) -> Vec<String> {
-    let mut keys: Vec<(usize, String)> = rows
-        .iter()
-        .filter(|r| r.get(1).is_none_or(Option::is_none))
-        .filter_map(|r| r.first().cloned().flatten())
-        .filter_map(|k| Some((k.rsplit(':').next()?.parse().ok()?, k)))
-        .collect();
+    let mut keys: Vec<(usize, String)> =
+        rows.iter().filter(|r| r.get(1).is_none_or(Option::is_none)).filter_map(|r| r.first().cloned().flatten()).filter_map(|k| Some((k.rsplit(':').next()?.parse().ok()?, k))).collect();
     keys.sort();
     keys.dedup();
     let n = meta["runs"].as_u64().map_or(keys.len(), |n| n as usize).min(keys.len());
@@ -483,6 +478,8 @@ fn chain(id: u64, frames: &BTreeMap<u64, Frame>, parent: &BTreeMap<u64, u64>) ->
 /// and the text prints the heaviest in full. `header` may use `{samples}` and `{mapped}`.
 fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str, show: impl Fn(f64) -> String) -> Output {
     type Stacks = BTreeMap<Vec<Frame>, (f64, u64)>;
+    /// (name, where) → (weight, samples, stacks).
+    type Row = ((String, String), (f64, u64, Stacks));
     let mut rows: BTreeMap<(String, String), (f64, u64, Stacks)> = BTreeMap::new();
     let (mut total, mut mapped) = (0.0, 0u64);
     let samples: u64 = weights.iter().map(|w| w.2).sum();
@@ -512,7 +509,7 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
         }
         total += w;
     }
-    let mut rows: Vec<((String, String), (f64, u64, Stacks))> = rows.into_iter().collect();
+    let mut rows: Vec<Row> = rows.into_iter().collect();
     rows.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
     let mapped_text = if mapped > 0 { format!(" · {:.0}% source-mapped", 100.0 * mapped as f64 / samples.max(1) as f64) } else { String::new() };
     let mut text = header.replace("{samples}", &samples.to_string()).replace("{mapped}", &mapped_text) + "\n";
@@ -612,6 +609,9 @@ pub fn import(path: &str) -> Result<Output> {
     }
     let meta = json!({ "id": id, "kind": "import", "target": format!("file:{path}"), "probes": "import", "token": "", "valid": "unknown", "files": kinds, "values": {}, "duration_ms": 0, "created": super::record::now_iso() });
     store::write_json(&dir.join("meta.json"), &meta)?;
-    let text = format!("{id} · imported {} · valid: unknown (nothing proves how it was taken)\nnext     strobe query {id} sql \"select name, count(*) from slice group by 1 order by 2 desc limit 20\"\n", path);
+    let text = format!(
+        "{id} · imported {} · valid: unknown (nothing proves how it was taken)\nnext     strobe query {id} sql \"select name, count(*) from slice group by 1 order by 2 desc limit 20\"\n",
+        path
+    );
     Ok(Output::new(text, meta))
 }

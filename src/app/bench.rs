@@ -242,7 +242,9 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     match validity::calibration() {
         None => ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)")),
-        Some(c) if c["ok"] == false => ctx.warnings.push(validity::warn("StaleCalibration", "the last calibration failed: strobe could not recover its known costs here (run strobe status --calibrate)")),
+        Some(c) if c["ok"] == false => {
+            ctx.warnings.push(validity::warn("StaleCalibration", "the last calibration failed: strobe could not recover its known costs here (run strobe status --calibrate)"))
+        }
         Some(c) if c["at"].as_str().is_some_and(|at| at < super::record::iso(super::record::now_secs().saturating_sub(7 * 86_400)).as_str()) => {
             ctx.warnings.push(validity::info("StaleCalibration", format!("calibrated {} (more than 7 days ago; strobe up recalibrates)", c["at"].as_str().unwrap_or(""))))
         }
@@ -297,12 +299,14 @@ pub fn run(args: &Args) -> Result<Output> {
 }
 
 fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, aa: bool, started: Instant, max_time: Option<Duration>) -> Result<Value> {
-    let def = model::metric(&s.primary).ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
+    let def = model::metric(&s.primary)
+        .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, aa)?;
     }
-    let bound = ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
+    let bound =
+        ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
     // Verdicts only at planned looks, each at a Pocock level, so looking more than once keeps the
     // overall false-positive rate at 5% (SPEC §9.1). `--pairs N` is one look at N at 95%.
     let (looks, confidence): (Vec<usize>, f64) = match ctx.args.get("pairs") {
@@ -426,7 +430,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     // Smallest n whose exact signed-rank test can clear Holm's first step across the tested set.
     let tests = secondaries.len().max(1);
-    let holm_pairs = (2..=60).find(|n| 2.0 / 2f64.powi(*n as i32) <= 0.05 / tests as f64).unwrap_or(60);
+    let holm_pairs = (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests as f64).unwrap_or(60);
     let mut descriptive: Vec<Comparison> = Vec::new();
     for name in DESCRIPTIVE {
         if *name == s.primary || names.iter().any(|n| n == name) {
@@ -586,13 +590,12 @@ fn busiest_others(a: &(u64, Vec<host::ProcInfo>), b: &(u64, Vec<host::ProcInfo>)
     let ours: std::collections::BTreeSet<u32> = host::tree_pids(std::process::id()).into_iter().collect();
     let before: BTreeMap<u32, u64> = a.1.iter().map(|p| (p.pid, p.cpu_ns)).collect();
     let span = b.0.saturating_sub(a.0).max(1) as f64;
-    let mut out: Vec<(String, f64)> = b
-        .1
-        .iter()
-        .filter(|p| p.pid != 0 && !ours.contains(&p.pid))
-        .filter_map(|p| Some((p.name.clone(), 100.0 * p.cpu_ns.saturating_sub(*before.get(&p.pid)?) as f64 / span)))
-        .filter(|(_, pct)| *pct >= 5.0)
-        .collect();
+    let mut out: Vec<(String, f64)> =
+        b.1.iter()
+            .filter(|p| p.pid != 0 && !ours.contains(&p.pid))
+            .filter_map(|p| Some((p.name.clone(), 100.0 * p.cpu_ns.saturating_sub(*before.get(&p.pid)?) as f64 / span)))
+            .filter(|(_, pct)| *pct >= 5.0)
+            .collect();
     out.sort_by(|x, y| y.1.total_cmp(&x.1));
     out.truncate(3);
     out
@@ -712,7 +715,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {
-            let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
+            let r = ctx
+                .runner
+                .call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve)
+                .map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 first = join_url(origin(&url), u);
             }
@@ -727,7 +733,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let ratio = validity::throttled(speed, ctx.baseline)?;
         validity::window_visible(&page)?;
         lap("checks");
-        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
+        ctx.runner
+            .call("setup", json!({}), t, &serve)
+            .map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
         lap("setup");
         let procs0 = (host::now_ns(), host::all_processes());
         let tracing = probe::trace::start(&browser.cdp, set)?;
@@ -758,9 +766,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let c0 = counters();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
-            ctx.runner
-                .call("run", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app"))?;
+            ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve).map_err(|e| {
+                Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app")
+            })?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
             let c1 = counters();
@@ -804,7 +812,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 let (a, b) = (runs[i - 1].task, runs[i].task);
                 a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
             };
-            if steady || i + 1 >= MAX_WARMUP + 1 {
+            if steady || i >= MAX_WARMUP {
                 unsteady = !steady;
                 first = Some(if set == Set::Attribution || !steady { i + 1 } else { i - 1 });
                 if set == Set::Attribution {
@@ -983,7 +991,8 @@ impl PowerPlan {
             return Err(Error::usage("--power high only switches Windows power plans"));
         }
         let active = host::output(Command::new("powercfg").arg("/getactivescheme")).unwrap_or_default();
-        let previous = active.split_whitespace().find(|w| w.len() == 36 && w.matches('-').count() == 4).map(str::to_string).ok_or_else(|| Error::msg("powercfg: could not read the active power plan"))?;
+        let previous =
+            active.split_whitespace().find(|w| w.len() == 36 && w.matches('-').count() == 4).map(str::to_string).ok_or_else(|| Error::msg("powercfg: could not read the active power plan"))?;
         if !Command::new("powercfg").args(["/setactive", "SCHEME_MIN"]).stdout(Stdio::null()).status()?.success() {
             return Err(Error::msg("powercfg could not switch to High performance"));
         }
@@ -1071,15 +1080,22 @@ fn join_url(base: &str, path: &str) -> String {
 fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
     let filter = args.get("filter");
     let only_target = args.get("target");
-    let fixed: BTreeMap<String, String> = args
-        .get("params")
-        .map(|p| p.split(',').filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect())
-        .unwrap_or_default();
+    let fixed: BTreeMap<String, String> =
+        args.get("params").map(|p| p.split(',').filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect()).unwrap_or_default();
     let params = describe["params"].as_object().cloned().unwrap_or_default();
     let mut combos: Vec<BTreeMap<String, Value>> = vec![BTreeMap::new()];
     for (k, values) in &params {
         let values: Vec<Value> = values.as_array().cloned().unwrap_or_default().into_iter().filter(|v| fixed.get(k).is_none_or(|f| value_text(v) == *f)).collect();
-        combos = combos.into_iter().flat_map(|c| values.iter().map(move |v| { let mut c = c.clone(); c.insert(k.clone(), v.clone()); c })).collect();
+        combos = combos
+            .into_iter()
+            .flat_map(|c| {
+                values.iter().map(move |v| {
+                    let mut c = c.clone();
+                    c.insert(k.clone(), v.clone());
+                    c
+                })
+            })
+            .collect();
     }
     let mut out = Vec::new();
     let targets = describe["targets"].as_object().cloned().unwrap_or_default();
@@ -1153,7 +1169,8 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
     };
     let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None };
     if let Kind::Git(r) = &v.kind {
-        let sha = host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", "--short=10", r])).ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
+        let sha = host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", "--short=10", r]))
+            .ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
         v.label = format!("{r}@{sha}");
     }
     Ok(v)
@@ -1334,7 +1351,10 @@ fn render(r: &Value) -> String {
         out += &format!("plan   {} · power plan {} · visible, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
         out += &format!(
             "blocks {} pairs ({} fresh launches) · warmup until steady · {} runs per block · stopped: {}\n",
-            s["pairs"], s["launches"], r["plan"]["runs_per_block"], s["stopped"].as_str().unwrap_or("")
+            s["pairs"],
+            s["launches"],
+            r["plan"]["runs_per_block"],
+            s["stopped"].as_str().unwrap_or("")
         );
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));

@@ -71,7 +71,13 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         }
     }
     let p = Value::Object(merged);
-    let os = if cfg!(windows) { "windows" } else if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let os = if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    };
     let exe = match &p["exe"] {
         Value::String(s) => Some(s.clone()),
         Value::Object(m) => m.get(os).and_then(Value::as_str).map(str::to_string),
@@ -85,11 +91,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
     let strings = |k: &str| p[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let guards = p["guard"]
         .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|g| Some(GuardSpec { file: expand(g["file"].as_str()?), pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) }))
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(|g| Some(GuardSpec { file: expand(g["file"].as_str()?), pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) })).collect())
         .unwrap_or_default();
     Ok(App {
         id: id.to_string(),
@@ -152,7 +154,13 @@ impl Guard {
             let stopped = c.pid.is_some_and(|p| !alive(p));
             let silent = c.addr.is_some_and(|a| TcpStream::connect_timeout(&a, Duration::from_secs(2)).is_err());
             if changed || stopped || silent {
-                let what = if changed { "changed" } else if stopped { "lost its process" } else { "stopped answering" };
+                let what = if changed {
+                    "changed"
+                } else if stopped {
+                    "lost its process"
+                } else {
+                    "stopped answering"
+                };
                 return Err(Error::msg(format!("stopped {when}: {} {what}; strobe never measures past disturbed user state", c.file.display()))
                     .hint("an isolation gap: the app reached your own state; add the env var or file it escaped through to its profile in strobe.json apps"));
             }
@@ -351,7 +359,14 @@ fn save_protocols(home: &Path, schemes: &[String]) {
     #[cfg(windows)]
     for scheme in schemes {
         let key = format!(r"HKCU\Software\Classes\{scheme}");
-        let saved = Command::new("reg").args(["export", &key]).arg(home.join(format!(".strobe-protocol-{scheme}.reg"))).arg("/y").stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        let saved = Command::new("reg")
+            .args(["export", &key])
+            .arg(home.join(format!(".strobe-protocol-{scheme}.reg")))
+            .arg("/y")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
         if !saved {
             let _ = std::fs::write(home.join(format!(".strobe-protocol-{scheme}.absent")), "");
         }
@@ -392,12 +407,9 @@ pub fn main_page(browser: &Browser) -> Result<super::chromium::Page> {
     let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let targets = browser.cdp.send("Target.getTargets", json!({}), None)?;
-        let found = targets["targetInfos"].as_array().and_then(|a| {
-            a.iter()
-                .filter(|t| t["type"] == "page" && !t["url"].as_str().unwrap_or("").starts_with("devtools://"))
-                .map(|t| t["targetId"].as_str().unwrap_or("").to_string())
-                .next()
-        });
+        let found = targets["targetInfos"]
+            .as_array()
+            .and_then(|a| a.iter().filter(|t| t["type"] == "page" && !t["url"].as_str().unwrap_or("").starts_with("devtools://")).map(|t| t["targetId"].as_str().unwrap_or("").to_string()).next());
         if let Some(target) = found {
             let attached = browser.cdp.send("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None)?;
             let session = attached["sessionId"].as_str().ok_or_else(|| Error::msg("attach: no session"))?.to_string();

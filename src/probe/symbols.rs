@@ -113,11 +113,7 @@ fn fetch_map(page: &Page, url: &str) -> Option<Fetched> {
         json!(url)
     );
     let v = page.eval_timeout(&js, Duration::from_secs(30)).ok()?;
-    Some(Fetched {
-        url: v["url"].as_str()?.to_string(),
-        text: v["text"].as_str()?.to_string(),
-        lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect(),
-    })
+    Some(Fetched { url: v["url"].as_str()?.to_string(), text: v["text"].as_str()?.to_string(), lines: v["lines"].as_array()?.iter().filter_map(Value::as_i64).collect() })
 }
 
 /// One frame, located as completely as strobe can: the original name, the absolute file on disk when
@@ -242,15 +238,7 @@ impl Symbolizer {
             (_, Some(n)) => (n.clone(), Some("map")),
             _ => (minified.to_string(), None),
         };
-        Frame {
-            name,
-            file: file.map(|p| p.display().to_string()).unwrap_or(o.source),
-            line: o.line + 1,
-            column: o.column + 1,
-            url: url.to_string(),
-            mapped: true,
-            name_from: from.map(str::to_string),
-        }
+        Frame { name, file: file.map(|p| p.display().to_string()).unwrap_or(o.source), line: o.line + 1, column: o.column + 1, url: url.to_string(), mapped: true, name_from: from.map(str::to_string) }
     }
 
     /// A frame from a V8 `callFrame` object.

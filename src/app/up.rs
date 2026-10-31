@@ -47,7 +47,8 @@ pub fn run(args: &Args) -> Result<Output> {
     eprint!("{}", s.text);
     let env = host::env();
     let topo = host::topology();
-    let groups: Vec<String> = topo.groups.iter().enumerate().map(|(i, g)| format!("CCD{i} {} MB L3{}", g.l3_mb, if topo.vcache().is_some_and(|v| v.mask == g.mask) { " (V-Cache)" } else { "" })).collect();
+    let groups: Vec<String> =
+        topo.groups.iter().enumerate().map(|(i, g)| format!("CCD{i} {} MB L3{}", g.l3_mb, if topo.vcache().is_some_and(|v| v.mask == g.mask) { " (V-Cache)" } else { "" })).collect();
     s.line("✓", "cpu", format!("{} · {} logical{}", env.cpu, env.logical_cpus, if groups.is_empty() { String::new() } else { format!(" · {}", groups.join(", ")) }));
     let fast = env.power_plan.contains("performance");
     s.line(if fast { "✓" } else { "i" }, "power", if fast { env.power_plan.clone() } else { format!("{} (kept; bench --power high switches it for the run)", env.power_plan) });
@@ -97,11 +98,7 @@ pub fn run(args: &Args) -> Result<Output> {
 }
 
 fn install_dir() -> PathBuf {
-    if cfg!(windows) {
-        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(host::home).join("Programs").join("strobe")
-    } else {
-        host::home().join(".local").join("bin")
-    }
+    if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(host::home).join("Programs").join("strobe") } else { host::home().join(".local").join("bin") }
 }
 
 fn exe(name: &str) -> String {
@@ -378,11 +375,7 @@ pub fn calibrate(full: bool) -> Result<Value> {
         }
         let ok = checks.iter().all(|c| c["ok"].as_bool() == Some(true));
         let hz = light.get("display.hz").copied().unwrap_or(f64::NAN);
-        let summary = format!(
-            "speed check {speed:.1} ms · display {hz:.0} Hz · {}/{} cases within tolerance",
-            checks.iter().filter(|c| c["ok"].as_bool() == Some(true)).count(),
-            checks.len()
-        );
+        let summary = format!("speed check {speed:.1} ms · display {hz:.0} Hz · {}/{} cases within tolerance", checks.iter().filter(|c| c["ok"].as_bool() == Some(true)).count(), checks.len());
         Ok(json!({ "at": super::record::now_iso(), "speed_ms": speed, "display_hz": hz, "checks": checks, "ok": ok, "summary": summary }))
     })();
     browser.close();

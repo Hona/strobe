@@ -53,7 +53,8 @@ pub fn run(args: &Args) -> Result<Output> {
         "layout" => layout(&dir, top),
         "gc" => gc(&dir),
         "heap" => heap(&dir, top, args.has("reveal")),
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads hotspots alloc layout gc heap sql"))),
+        "leaks" => leaks(&dir, top, args.has("reveal")),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads hotspots alloc layout gc heap leaks sql"))),
     }
 }
 
@@ -73,8 +74,22 @@ pub fn heap_diff(a: &Path, b: &Path, top: usize, reveal: bool) -> Result<Output>
     Ok(Output::new(crate::heapsnap::diff_text(&v, top), v))
 }
 
-/// The recording's heap snapshot: `heap-0.heapsnapshot.gz`, or an imported `.heapsnapshot`.
+/// Leak suspects of a memory recording: objects allocated between its first and middle snapshots that
+/// are still alive in the last, by class, with retainer paths (SPEC §8.6).
+pub fn leaks(dir: &Path, top: usize, reveal: bool) -> Result<Output> {
+    let s = |name: &str| dir.join(format!("{name}.heapsnapshot.gz"));
+    if !s("heap-s0").exists() || !s("heap-s1").exists() {
+        return Err(Error::usage("this recording has no leak snapshots; record with --probes memory"));
+    }
+    let v = crate::heapsnap::leaks(&crate::heapsnap::ids(&s("heap-s0"))?, &crate::heapsnap::ids(&s("heap-s1"))?, &crate::heapsnap::read(&s("heap-0"))?, top, reveal);
+    Ok(Output::new(crate::heapsnap::leaks_text(&v, top), v))
+}
+
+/// The recording's heap snapshot: `heap-0.heapsnapshot.gz` (the last one), or an imported `.heapsnapshot`.
 fn heap_file(dir: &Path) -> Result<std::path::PathBuf> {
+    if dir.join("heap-0.heapsnapshot.gz").is_file() {
+        return Ok(dir.join("heap-0.heapsnapshot.gz"));
+    }
     [dir.to_path_buf(), dir.join("import")]
         .iter()
         .filter_map(|d| std::fs::read_dir(d).ok())

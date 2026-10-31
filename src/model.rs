@@ -125,6 +125,9 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef { name: "gpu.vram", unit: "MB", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "dedicated VRAM of the target's processes after the measured runs" },
     MetricDef { name: "js.heap.used", unit: "MB", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "renderer JS heap in use after the measured runs" },
     MetricDef { name: "dom.nodes", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "DOM nodes after the measured runs" },
+    MetricDef { name: "js.heap.growth", unit: "MB/min", better: Better::Lower, kind: Kind::Sampled, words: AMOUNT, min_n: 0, about: "post-GC JS heap growth per minute over a memory recording" },
+    MetricDef { name: "dom.nodes.growth", unit: "count/min", better: Better::Lower, kind: Kind::Sampled, words: COUNT, min_n: 0, about: "DOM node growth per minute over a memory recording" },
+    MetricDef { name: "leak.suspects.retained", unit: "MB", better: Better::Lower, kind: Kind::Sampled, words: AMOUNT, min_n: 0, about: "memory retained by objects allocated in a memory recording's first half and still alive at its end" },
 ];
 
 pub fn metric(name: &str) -> Option<&'static MetricDef> {

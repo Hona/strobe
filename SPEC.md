@@ -546,7 +546,13 @@ Rules:
 - Compared only within one runtime: a renderer's V8 snapshot, the Electron main process's, and
   the Bun server's are separate series.
 
-**Leaks** (`strobe bench <file> --head <variant> --probes memory --repeat <N>`), in one block:
+**Leaks over time** (`strobe record <target> --probes memory --for <d>`, built): no trace; at the start, the
+middle and the end, a post-GC census (JS heap, DOM nodes; OS private bytes at the start only,
+since a snapshot inflates its process) and then a snapshot (S0, S1, S2). `query <rec> leaks` lists
+objects allocated between S0 and S1 that are alive in S2, by class, with retainer paths;
+`js.heap.growth` and `dom.nodes.growth` are per minute. `query <rec> heap` reads S2.
+
+**Leaks** (`strobe bench <file> --head <variant> --probes memory --repeat <N>`, planned), in one block:
 
 1. Warm up, then census and snapshot S0.
 2. Call `run` (and `reset`) N times; census and S1. N more times; census and S2.
@@ -923,7 +929,7 @@ with at least 3 pairs shows zero spread.
 | `stack` | `<id>` | callers to the root, with source locations and packages |
 | `memory` | `--by process\|layer\|allocator` | census per process and layer |
 | `heap` | `--top` `--reveal`; `a..b heap` | live objects by class (count, self and retained size), detached DOM, the largest owners with complete retainer paths; `a..b` diffs two recordings by class; strings redacted unless `--reveal`. Bench attribution blocks and `record --probes attribution\|memory` take one post-GC snapshot after the trace stops |
-| `leaks` | | per process and layer: slope, interval, suspects |
+| `leaks` | `--top` `--reveal` | a memory recording's suspects: objects allocated between its first and middle snapshots and alive at the end, by class, with retainer paths (bench slopes per process and layer: planned) |
 | `gpu` | | adapter, engines and VRAM per process, device counters |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
 | `insights` | | rule hits with evidence handles |

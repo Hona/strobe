@@ -15,6 +15,14 @@ pub fn run(args: &Args) -> Result<Output> {
         attach_hotspots(&mut data);
     } else if let Some(a) = attribution(&dir, &data["id"].as_str().unwrap_or(handle).to_string(), None) {
         data["attribution"] = a;
+    } else if data["probes"] == "memory" {
+        // A memory recording: its live heap at the end and the objects that outlived their half.
+        if let Ok(o) = super::query::heap(&dir, 15, false) {
+            data["heap"] = o.json;
+        }
+        if let Ok(o) = super::query::leaks(&dir, 15, false) {
+            data["leaks"] = o.json;
+        }
     }
     let format = args.get("format").unwrap_or("html");
     let out = match args.get("out") {

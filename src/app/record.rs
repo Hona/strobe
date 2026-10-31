@@ -71,6 +71,20 @@ pub fn run(args: &Args) -> Result<Output> {
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
     let dir = store::recording_dir(&id)?;
+    if set == Set::Memory {
+        let meta = memory(&page, &browser, &driver, &dir, &id, &target, for_ms)?;
+        if on_screen && (awake.locks() > 0 || host::session_locked()) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(validity::locked());
+        }
+        if !attach {
+            browser.close();
+        }
+        if let Some(g) = &guard {
+            g.check("after the app closed")?;
+        }
+        return Ok(Output::new(summary_text(&meta), meta));
+    }
     let tracing = probe::trace::start(&browser.cdp, set)?;
     if set == Set::Attribution {
         probe::cpu::start(&page)?;
@@ -138,9 +152,72 @@ pub fn run(args: &Args) -> Result<Output> {
     Ok(Output::new(summary_text(&meta), meta))
 }
 
+/// `--probes memory`: does the target keep what it allocates? A census and a heap snapshot at the
+/// start, the middle and the end (S0, S1, S2), no trace (SPEC §8.6). Objects allocated between S0 and
+/// S1 that are still alive in S2 are the leak suspects. Each census comes before its snapshot, which
+/// raises the memory of the process it serializes; OS memory is reported from the first census only.
+fn memory(page: &chromium::Page, browser: &chromium::Browser, driver: &Driver, dir: &std::path::Path, id: &str, target: &str, for_ms: u64) -> Result<Value> {
+    page.send("HeapProfiler.enable", json!({}))?;
+    let started = std::time::Instant::now();
+    progress(format!("recording {id} for {}: a heap snapshot at the start, middle and end", fmt::ms_duration(for_ms)));
+    let mut census = Vec::new();
+    for (i, file) in ["heap-s0", "heap-s1", "heap-0"].iter().enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(for_ms / 2));
+        }
+        page.send("HeapProfiler.collectGarbage", json!({}))?;
+        let heap = page.send("Runtime.getHeapUsage", json!({}))?["usedSize"].as_f64().unwrap_or(f64::NAN);
+        let private = (i == 0).then(|| browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64);
+        census.push(json!({ "at_ms": started.elapsed().as_millis() as u64, "js_heap_bytes": heap, "dom_nodes": driver.nodes().ok(), "private_bytes": private }));
+        probe::heap::snapshot(page, &dir.join(format!("{file}.heapsnapshot.gz")))?;
+    }
+    progress("finding objects that outlived their half");
+    let leaks = crate::heapsnap::leaks(
+        &crate::heapsnap::ids(&dir.join("heap-s0.heapsnapshot.gz"))?,
+        &crate::heapsnap::ids(&dir.join("heap-s1.heapsnapshot.gz"))?,
+        &crate::heapsnap::read(&dir.join("heap-0.heapsnapshot.gz"))?,
+        25,
+        false,
+    );
+    store::write_json(&dir.join("leaks.json"), &leaks)?;
+    let at = |i: usize, k: &str| census[i][k].as_f64().unwrap_or(f64::NAN);
+    let minutes = (at(2, "at_ms") - at(0, "at_ms")) / 60_000.0;
+    let mut values = BTreeMap::new();
+    values.insert("js.heap.used", at(2, "js_heap_bytes") / (1024.0 * 1024.0));
+    values.insert("js.heap.growth", (at(2, "js_heap_bytes") - at(0, "js_heap_bytes")) / (1024.0 * 1024.0) / minutes);
+    values.insert("dom.nodes", at(2, "dom_nodes"));
+    values.insert("dom.nodes.growth", (at(2, "dom_nodes") - at(0, "dom_nodes")) / minutes);
+    values.insert("memory.app.private", at(0, "private_bytes") / (1024.0 * 1024.0));
+    values.insert("leak.suspects.retained", leaks["retained_size"].as_f64().unwrap_or(0.0) / (1024.0 * 1024.0));
+    let values: BTreeMap<&str, f64> = values.into_iter().filter(|(_, v)| v.is_finite()).collect();
+    let meta = json!({
+        "id": id, "kind": "record", "target": target, "probes": "memory", "token": "", "duration_ms": for_ms,
+        "browser": browser.version, "env": host::env(), "values": values, "census": census,
+        "leaks": { "count": leaks["count"], "self_size": leaks["self_size"], "retained_size": leaks["retained_size"], "classes_total": leaks["classes_total"] },
+        "created": now_iso(), "valid": true,
+    });
+    store::write_json(&dir.join("meta.json"), &meta)?;
+    Ok(meta)
+}
+
 pub fn summary_text(meta: &Value) -> String {
     let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    if meta["probes"] == "memory" {
+        let id = meta["id"].as_str().unwrap_or("");
+        let l = &meta["leaks"];
+        return format!(
+            "{id} · {} · {} · memory\njs heap  {} after GC · {} per minute\ndom      {} nodes · {} per minute\nsuspects {} objects allocated in the first half and alive at the end · {} retained\nnext     strobe query {id} leaks · strobe query {id} heap\n",
+            meta["target"].as_str().unwrap_or(""),
+            fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
+            fmt::bytes(get("js.heap.used") * 1048576.0),
+            format!("{}{}", if get("js.heap.growth") < 0.0 { "−" } else { "+" }, fmt::bytes(get("js.heap.growth").abs() * 1048576.0)),
+            fmt::value(get("dom.nodes"), "count"),
+            fmt::signed(get("dom.nodes.growth"), "count"),
+            l["count"].as_u64().unwrap_or(0),
+            fmt::bytes(l["retained_size"].as_f64().unwrap_or(0.0)),
+        );
+    }
     let mut s = format!(
         "{} · {} · {} · {}\n",
         meta["id"].as_str().unwrap_or(""),

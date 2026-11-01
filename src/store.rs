@@ -37,19 +37,37 @@ pub fn append_index(line: &Value) -> Result<()> {
     Ok(())
 }
 
-/// Resolves a handle or a unique prefix (`rec_3f`, `exp_8c`) to its directory.
+/// Resolves a handle or a unique prefix (`rec_3f`, `exp_8c`) to its directory. `bench --id` names an
+/// experiment freely, so a handle without either prefix may be a recording or an experiment.
 pub fn resolve(handle: &str) -> Result<PathBuf> {
-    let root = if handle.starts_with("exp_") { paths::experiments() } else { paths::recordings() };
-    let exact = root.join(handle);
-    if exact.is_dir() {
+    let roots = if handle.starts_with("exp_") {
+        vec![paths::experiments()]
+    } else if handle.starts_with("rec_") {
+        vec![paths::recordings()]
+    } else {
+        vec![paths::recordings(), paths::experiments()]
+    };
+    if let Some(exact) = roots.iter().map(|root| root.join(handle)).find(|p| p.is_dir()) {
         return Ok(exact);
     }
-    let matches: Vec<PathBuf> = std::fs::read_dir(&root)?.flatten().filter(|e| e.file_name().to_string_lossy().starts_with(handle)).map(|e| e.path()).filter(|p| p.is_dir()).collect();
+    let matches: Vec<PathBuf> = roots
+        .iter()
+        .filter_map(|root| std::fs::read_dir(root).ok())
+        .flat_map(|entries| entries.flatten())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(handle))
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
     match matches.len() {
         1 => Ok(matches[0].clone()),
         0 => Err(Error::usage(format!("no recording or experiment {handle}"))),
         _ => Err(Error::usage(format!("{handle} is ambiguous ({} matches)", matches.len()))),
     }
+}
+
+/// Whether a resolved handle is an experiment (bench or bisect) rather than a recording.
+pub fn is_experiment(dir: &std::path::Path) -> bool {
+    dir.parent().is_some_and(|parent| parent == paths::experiments())
 }
 
 pub fn read_json(path: &std::path::Path) -> Result<Value> {

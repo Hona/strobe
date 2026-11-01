@@ -10,8 +10,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let view = args.pos.first().ok_or_else(|| Error::usage("report <view> <handle…>: views experiment, recording"))?;
     let handle = args.pos.get(1).ok_or_else(|| Error::usage("report needs a handle"))?;
     let dir = store::resolve(handle)?;
-    let mut data: Value = if handle.starts_with("exp_") { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
-    if handle.starts_with("exp_") {
+    let experiment = store::is_experiment(&dir);
+    let mut data: Value = if experiment { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
+    if experiment {
         // Insights read the same recordings: in parallel with the per-side views.
         let snapshot = data.clone();
         let insights = std::thread::scope(|scope| {

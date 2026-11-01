@@ -86,7 +86,7 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
         }
         "report" => {
             let h = get("handle").ok_or_else(|| Error::usage("report needs handle"))?;
-            let view = get("view").unwrap_or_else(|| if h.starts_with("exp_") { "experiment".into() } else { "recording".into() });
+            let view = get("view").unwrap_or_else(|| if store::resolve(&h).is_ok_and(|d| store::is_experiment(&d)) { "experiment".into() } else { "recording".into() });
             a.push(view);
             a.push(h);
         }
@@ -287,7 +287,7 @@ fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
 
 fn report_html(handle: &str) -> Result<String> {
     let dir = store::resolve(handle)?;
-    let (view, data) = if handle.starts_with("exp_") { ("experiment", store::read_json(&dir.join("result.json"))?) } else { ("recording", store::read_json(&dir.join("meta.json"))?) };
+    let (view, data) = if store::is_experiment(&dir) { ("experiment", store::read_json(&dir.join("result.json"))?) } else { ("recording", store::read_json(&dir.join("meta.json"))?) };
     Ok(super::report::html(view, &data))
 }
 

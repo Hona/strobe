@@ -1763,7 +1763,11 @@ fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
 
 fn build_key(root: &Path, build: &Value) -> String {
     let git = |a: &[&str]| host::output(Command::new("git").arg("-C").arg(root).args(a)).unwrap_or_default();
-    hash_str(&format!("{}\n{}\n{}\n{}", git(&["rev-parse", "HEAD"]), git(&["status", "--porcelain"]), git(&["diff"]), build))
+    // In a worktree strobe made for a git ref, untracked files are strobe's own (a script target's
+    // harness): they do not change what the build sees.
+    let owned = std::fs::canonicalize(root).ok().zip(std::fs::canonicalize(host::paths::sub("builds")).ok()).is_some_and(|(r, b)| r.starts_with(b));
+    let status = if owned { git(&["status", "--porcelain", "--untracked-files=no"]) } else { git(&["status", "--porcelain"]) };
+    hash_str(&format!("{}\n{}\n{}\n{}", git(&["rev-parse", "HEAD"]), status, git(&["diff"]), build))
 }
 
 fn hash_str(s: &str) -> String {

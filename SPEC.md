@@ -948,13 +948,25 @@ into `run` and `env`; `unset` removes variables (`PREFIX_*` for a family); `buil
 variant. The command's whole process tree ends with the block. Run cases and launch cases both
 work on it.
 
-**Script targets** (`script(entry, { runtime?, env?, build? })`): a Bun (default) or Node module of
-the variant, loaded by strobe's host in a fresh process per block, pinned like any target. Cases
-call its exports with `ctx.call(name, ...args)` (JSON in and out). Runs are timed by the host
-tree's CPU in cycles (`cpu.work`, the primary to use) and wall clock (`run.duration`); warmup and
-pairs work as for pages. Attribution blocks start the process with `--cpu-prof` (200 µs) and
-`--heap-prof`, whose profiles cover the whole process; their frames name the variant's own source
-files, so nothing needs a source map.
+**Script targets** (`script(entry, { runtime?, env?, build? })`): a Bun (default) or Node harness
+module, loaded by strobe's host in a fresh process per block, pinned like any target. Cases call
+its exports with `ctx.call(name, ...args)` (JSON in and out); its console output goes to the
+experiment's `script.log`.
+
+- **One harness, two variants:** `entry` resolves from the bench file, like the rest of it. In a
+  worktree strobe made for a git ref, strobe writes the same file at the same path, so its
+  relative imports reach that variant's code and a base that predates the harness still runs.
+  Those untracked files do not change the worktree's build key. A directory variant is the user's
+  own checkout: strobe never writes there, and the harness must exist.
+- **Timing:** the host tree's CPU in cycles (`cpu.work`, the primary for compute) and wall clock
+  (`run.duration`, the primary for work that waits on children or I/O: CPU of a child that exited
+  during the run is not in the tree any more). Warmup and pairs work as for pages.
+- **Memory:** `js.heap.retained` is the heap after a full collection (`Bun.gc(true)`, Node's
+  `gc()` under `--expose-gc`) after a run minus before it, read outside the run's span: what each
+  run keeps alive. `memory.app.private` is the host tree's private bytes after the runs.
+- **Attribution:** the process starts with `--cpu-prof` (200 µs) and `--heap-prof`; the profiles
+  cover the whole process and name the harness's and the variant's own source files, so nothing
+  needs a source map.
 
 **How it runs:**
 

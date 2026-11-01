@@ -179,6 +179,15 @@ pub const METRICS: &[MetricDef] = &[
         about: "CPU time of the target's processes per run (all threads): a script target's main.work, a launch's total",
     },
     MetricDef {
+        name: "js.heap.retained",
+        unit: "MB",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        about: "script targets: the JS heap a run leaves behind, after a full collection before and after it",
+    },
+    MetricDef {
         name: "layout.shift",
         unit: "score",
         better: Better::Lower,

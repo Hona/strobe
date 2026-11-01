@@ -16,12 +16,34 @@ struct Host {
     next: u64,
 }
 
-impl Host {
-    fn spawn(target: &Value, root: &Path, cpus: Option<u64>, profiles: Option<&Path>) -> Result<Host> {
-        let entry = root.join(target["entry"].as_str().ok_or_else(|| Error::usage("a script target needs `entry`, the module whose exports the cases call"))?);
-        if !entry.is_file() {
-            return Err(Error::usage(format!("script target entry {} does not exist in this variant", entry.display())));
+/// The harness module for `root`. The entry resolves from the bench file, like everything else in it,
+/// so both variants run the same harness; in a worktree strobe made for a git ref the file is placed
+/// at the same path, so its relative imports resolve to that variant's code. A directory variant is
+/// the user's own checkout: strobe never writes there, and the file must already exist.
+fn place(bench_file: &Path, entry: &str, root: &Path) -> Result<PathBuf> {
+    let dir = bench_file.parent().unwrap_or(Path::new("."));
+    let source = std::fs::canonicalize(dir.join(entry)).map_err(|_| Error::usage(format!("script entry {entry}: no such file next to {}", bench_file.display())))?;
+    let project = std::fs::canonicalize(config::project_root(dir))?;
+    let rel = source.strip_prefix(&project).map_err(|_| Error::usage(format!("script entry {} is outside the project {}", source.display(), project.display())))?;
+    let placed = root.join(rel);
+    let owned = std::fs::canonicalize(root).ok().zip(std::fs::canonicalize(host::paths::sub("builds")).ok()).is_some_and(|(r, b)| r.starts_with(b));
+    if owned {
+        let body = std::fs::read(&source)?;
+        if std::fs::read(&placed).ok().as_deref() != Some(body.as_slice()) {
+            if let Some(p) = placed.parent() {
+                std::fs::create_dir_all(p)?;
+            }
+            std::fs::write(&placed, body)?;
         }
+    }
+    if !placed.is_file() {
+        return Err(Error::usage(format!("the harness {} is missing in {}: commit it there, or compare against a git ref", rel.display(), root.display())));
+    }
+    Ok(placed)
+}
+
+impl Host {
+    fn spawn(target: &Value, entry: &Path, root: &Path, cpus: Option<u64>, profiles: Option<&Path>, log: &Path) -> Result<Host> {
         let runtime = target["runtime"].as_str().unwrap_or("bun");
         let exe = match runtime {
             "bun" => crate::runner::find_bun().ok_or_else(|| Error::msg("script targets on Bun need Bun").hint("install it from https://bun.sh"))?,
@@ -29,18 +51,24 @@ impl Host {
             other => return Err(Error::usage(format!("script runtime: bun or node, not {other}"))),
         };
         let mut cmd = Command::new(exe);
+        // `js.heap.retained` collects garbage between runs: Bun has `Bun.gc`, Node needs the flag.
+        if runtime == "node" {
+            cmd.arg("--expose-gc");
+        }
         if let Some(dir) = profiles {
             // The whole process's profiles, written on a normal exit; 200 µs samples as for pages.
             cmd.args(["--cpu-prof", &format!("--cpu-prof-interval={}", probe::cpu::INTERVAL_US), "--heap-prof"])
                 .arg(format!("--cpu-prof-dir={}", dir.display()))
                 .arg(format!("--heap-prof-dir={}", dir.display()));
         }
-        cmd.arg(crate::runner::sdk_dir()?.join("host.mjs")).arg(&entry).current_dir(root);
+        cmd.arg(crate::runner::sdk_dir()?.join("host.mjs")).arg(entry).current_dir(root);
         for (k, v) in target["env"].as_object().into_iter().flatten() {
             cmd.env(k, v.as_str().unwrap_or(""));
         }
+        // The module's console output and errors, per experiment, next to the runner's log.
+        let err = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
         let previous = cpus.and_then(host::set_affinity);
-        let spawned = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null()).spawn();
+        let spawned = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err).spawn();
         if previous.is_some() {
             host::set_affinity(previous.unwrap_or(0));
         }
@@ -57,7 +85,11 @@ impl Host {
         });
         let host = Host { child, stdin, lines, next: 1 };
         loop {
-            let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| Error::msg(format!("the process host did not load {}", entry.display())))?;
+            // A module that fails to import ends the process: its error is the log's last lines.
+            let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| {
+                let tail: Vec<String> = std::fs::read_to_string(log).unwrap_or_default().lines().rev().take(12).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect();
+                Error::msg(format!("the script host did not load {}:\n{}", entry.display(), tail.join("\n")))
+            })?;
             if serde_json::from_str::<Value>(&line).ok().is_some_and(|v| v["ready"] == true) {
                 return Ok(host);
             }
@@ -128,7 +160,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     }
     let mut steps: Vec<(String, f64)> = Vec::new();
     let launched = Instant::now();
-    let host = RefCell::new(Host::spawn(&target, &root, ctx.pin, profiles.as_deref())?);
+    let entry = place(Path::new(ctx.describe["file"].as_str().unwrap_or(".")), target["entry"].as_str().unwrap_or(""), &root)?;
+    let log = store::experiment_dir(&ctx.exp)?.join("script.log");
+    let host = RefCell::new(Host::spawn(&target, &entry, &root, ctx.pin, profiles.as_deref(), &log)?);
+    // `js.heap.retained`: the post-GC heap a run leaves behind, read outside its timed span.
+    let heap = std::iter::once(&s.primary).chain(&s.metrics).any(|m| m == "js.heap.retained");
+    let heap_mb = || -> Result<f64> { Ok(host.borrow_mut().request(json!({ "op": "heap" }), Duration::from_secs(120))?.as_f64().unwrap_or(f64::NAN) / (1024.0 * 1024.0)) };
     steps.push(("launch".into(), launched.elapsed().as_secs_f64() * 1e3));
     let pid = host.borrow().pid();
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
@@ -156,9 +193,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
         let measured_runs = ctx.runs;
-        let mut runs: Vec<(f64, f64, BTreeMap<String, f64>)> = Vec::new();
+        let mut runs: Vec<(f64, f64, BTreeMap<String, f64>, f64)> = Vec::new();
         let mut first: Option<usize> = None;
         while first.is_none_or(|f| runs.len() < f + measured_runs) {
+            let h0 = if heap { heap_mb()? } else { f64::NAN };
             counts.borrow_mut().clear();
             counting.set(true);
             let (c0, t0) = (cpu(pid), Instant::now());
@@ -166,7 +204,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             let wall = t0.elapsed().as_secs_f64() * 1e3;
             let used = cpu_ms(c0, cpu(pid), wall);
             counting.set(false);
-            runs.push((wall, used, counts.borrow().clone()));
+            let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
+            runs.push((wall, used, counts.borrow().clone(), retained));
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}", s.case, e.message), "fix the case's reset"))?;
             }
@@ -192,6 +231,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         extra.insert("run.duration".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.0)).collect());
         extra.insert("cpu.work".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.1)).collect());
         extra.insert("cpu.app.total".into(), measured.iter().enumerate().filter(|(_, r)| r.0 > 0.0).map(|(j, r)| (key(j), 100.0 * r.1 / r.0)).collect());
+        if heap {
+            extra.insert("js.heap.retained".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.3)).collect());
+        }
         for name in s.metrics.iter().chain(std::iter::once(&s.primary)).filter(|m| m.starts_with("count.")) {
             let counter = name.trim_start_matches("count.");
             extra.insert(name.clone(), measured.iter().enumerate().map(|(j, r)| (key(j), r.2.get(counter).copied().unwrap_or(0.0))).collect());

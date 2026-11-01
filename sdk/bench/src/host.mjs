@@ -13,6 +13,13 @@ const mod = await import(pathToFileURL(process.argv[2]).href)
 createInterface({ input: process.stdin }).on("line", async (line) => {
   if (!line.trim()) return
   const { id, op, name, args } = JSON.parse(line)
+  // `js.heap.retained`: the heap after a full collection, between runs.
+  if (op === "heap") {
+    if (globalThis.Bun) Bun.gc(true)
+    else globalThis.gc?.()
+    write({ id, ok: process.memoryUsage().heapUsed })
+    return
+  }
   if (op === "exit") {
     write({ id, ok: true })
     // A normal exit, so --cpu-prof and --heap-prof write their profiles.

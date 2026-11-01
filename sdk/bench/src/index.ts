@@ -135,7 +135,7 @@ export interface Launch<P> {
 interface CaseBase {
   /** The metric this case is about, declared before the run. */
   primary: string
-  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`. */
+  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
   metrics?: string[]
   /** The targets this case runs on. Default: every target. */
   targets?: string[]
@@ -200,7 +200,11 @@ export interface CommandOptions {
 }
 
 export interface ScriptOptions {
-  /** The module whose exports cases call (`ctx.call`), relative to the variant's folder. */
+  /**
+   * The harness module whose exports cases call (`ctx.call`), relative to the bench file. strobe
+   * runs the same file for both variants, placed at the same path in a git ref's worktree, so its
+   * relative imports reach that variant's code. Keep the harness in one file.
+   */
   entry: string
   /** Default `"bun"`. */
   runtime?: "bun" | "node"

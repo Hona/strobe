@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "@strobe/bench",
+      "name": "@hona/strobe-bench",
       "devDependencies": {
         "typescript": "^5.9.0",
       },

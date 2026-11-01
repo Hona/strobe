@@ -11,14 +11,17 @@ strobe records a target on one timeline and answers with verdicts and handles (`
 
     strobe status [--calibrate]                    environment, validity preflight, recent handles
     strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
+    strobe record --bench <file.bench.ts>#<case> [--head <variant>]   a bench case (clicks, keys) under the attribution probes
     strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--target <name>]
                  [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power keep|high]
                  [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
-        variant: a directory, a git ref, app:<id>, exe:<path>
-    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql
+                 [--pixels | --pixels-only]
+        variant: a directory, a git ref, app:<id>, exe:<path>; every variant builds and serves with head's harness
+        (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works
+    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
         hotspots and alloc take --by function|file|package; memory takes --by process|layer|allocator and --at <i>;
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
-    strobe report experiment|recording <handle> [--format html|md]    writes a file; show it in the Review pane
+    strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
 
@@ -49,13 +52,15 @@ Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (i
       },
     })
 
-`page`: `goto` (relative paths resolve against the page) `click` `hover` `move(x, y)` `type` (one key event per character; `delay` ms between) `press` (`"ControlOrMeta+Shift+P"`) `scroll` `waitFor` (`{ text, exact }`; `:focus` works) `idle` `wait`; input calls take `{ until: "idle" | "frame" | selector | { selector, text, exact } }`. `reset` puts state back between runs and is never measured. Playwright only in `prepare` on `web` targets; what `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working for the whole block. Mock APIs with `ctx.mock(pattern, handler)` in `prepare`: Playwright's `page.route` turns the HTTP cache off, so reloads refetch every script. `teardown` (target or file) stops what `prepare` started. Never call `page.eval` in `run`.
+`page`: `goto` (relative paths resolve against the page) `click` `hover` `move(x, y)` `type` (one key event per character; `delay` ms between) `press` (`"ControlOrMeta+Shift+P"`) `down(key)`/`up(key)` (hold a key across calls: a game's `w`, a held `Shift`) `scroll` `waitFor` (`{ text, exact }`; `:focus` works) `idle` `wait` `snapshot(name)` (pixels for `--pixels`; nothing in timed runs); input calls take `{ until: "idle" | "frame" | selector | { selector, text, exact } }`. `reset` puts state back between runs and is never measured. Playwright only in `prepare` on `web` targets; what `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working for the whole block. Mock APIs with `ctx.mock(pattern, handler)` in `prepare`: Playwright's `page.route` turns the HTTP cache off, so reloads refetch every script. `teardown` (target or file) stops what `prepare` started. Never call `page.eval` in `run`.
 
 More in a bench file:
 - `launch: { until, milestones?, profile?, before?, inspect? }` instead of `run`: one cold launch per block, timed from spawn to `until` (`launch.ready`); milestones `{ match: "text" | /re/, in: "output" | "page" | "<log glob under the home>" }` become `launch.<name>`; `launch.painted`/`launch.settled` from the window's pixels.
 - `command("bun run dev:desktop", { cwd, env: { X: "{home}" }, unset: ["APP_*"] })`: an app started by a dev command, attached where it prints `DevTools listening on ws://…`; `before(ctx)` deletes caches for a cold start.
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
 - Exact counters: `ctx.count(name)` in `run`, `globalThis.__strobeCount?.(name)` in the app → `count.<name>`; `net.requests{/api/*/message}` and `net.bytes`; `layout.shift` (then `query <rec> shifts` names what moved). A stable count is compared exactly.
+- A WebGPU canvas's own frames, at its own frame rate: `canvas.frames`, `canvas.interval.p95` (a 60 fps game or a 30 fps animation on a faster display; presented frames count the display's vsyncs instead). Where the CPU goes by process: `cpu.renderer`, `cpu.gpu`, `cpu.browser`. Shader and pipeline work in the GPU process: `gpu.compile`.
+- Source maps without changing what ships: strobe builds with `STROBE_SOURCEMAP=hidden`; let the bundler read it (Vite: `build: { sourcemap: process.env.STROBE_SOURCEMAP }`).
 - `params: { files: { run: [100, 10_000], more: [1, 1_000] } }`: `more` only with `--params all`. `targets: ["web"]` on a case limits where it runs.
 - `bun add -d @hona/strobe` pins strobe for the project: `bunx strobe …` runs that version, and editors and
   `tsc` get the bench types. strobe runs a bench file with its own SDK copy either way.
@@ -75,6 +80,9 @@ Which objects are alive? `query <rec> heap` (classes by retained size, detached 
 Does a case leak? `bench <file> --filter <case> --head . --probes memory --repeat 10`: growth per run of the JS heap and DOM with an interval, and the objects from the first half still alive at the end (`query <rec> leaks`).
 Is an app leaking over time? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.
 Is the method sound here? `bench <file> --aa --head .`.
+Does it still look the same? Snapshot deterministic states with `page.snapshot(name)` (a still page, an app's own frame stepper), then `bench <file> --base … --head . --pixels-only`: each snapshot is `same` within the launch noise strobe measures (base run twice), or `differ` with a diff image.
+Where does the GPU process spend time (a frozen first frame, a slow canvas)? `query <rec> gpu` on an attribution recording, and `gpu.compile` as a bench metric.
+Writing the PR? `report experiment <exp> --format pr` gives the tables and the command that reruns them.
 
 ## Notes
 

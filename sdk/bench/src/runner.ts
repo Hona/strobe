@@ -47,11 +47,13 @@ const state: {
   url: string
   root: string
   home: string | null
+  env: Record<string, string> | null
+  exe: string | null
   playwright: any
   prepared: unknown
   mocks: { pattern: string; test: RegExp; handler: Function }[]
   session: any
-} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, playwright: null, prepared: undefined, mocks: [], session: null }
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null }
 
 const context = () => ({
   page,
@@ -171,7 +173,8 @@ async function answer(session: any, event: any) {
   const body: string | undefined = r.postData ?? (r.postDataEntries ? r.postDataEntries.map((e: any) => Buffer.from(e.bytes ?? "", "base64").toString()).join("") : undefined)
   const req = { url: r.url, method: r.method, headers, body, json: () => JSON.parse(body ?? "null") }
   try {
-    for (const m of state.mocks) {
+    // The latest pattern answers first, and `undefined` passes to earlier ones, as Playwright's routes do.
+    for (const m of state.mocks.toReversed()) {
       if (!m.test.test(r.url)) continue
       const res = await m.handler(req)
       if (res === undefined) continue
@@ -206,6 +209,8 @@ async function handle(op: string, args: any) {
         url: args.url ?? "",
         root: args.root ?? "",
         home: args.home ?? null,
+        env: args.env ?? null,
+        exe: args.exe ?? null,
         prepared: undefined,
         mocks: [],
         session: null,
@@ -219,6 +224,8 @@ async function handle(op: string, args: any) {
         variant: state.variant,
         root: state.root,
         home: state.home,
+        env: state.env,
+        exe: state.exe,
       })
       return true
     case "prepare": {

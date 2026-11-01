@@ -848,7 +848,9 @@ export default bench({
   `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
 - `teardown(ctx)`: on a target (with `prepare`'s context) and on the file (with the run
   context), when the block closes and while the browser is still open, for what `prepare` started.
-  A teardown that throws does not stop the others; it is reported once as a `Teardown` warning.
+  In a launch case it runs after the app has closed and before its home is removed, so it can stop
+  a service whose registration lives there. A teardown that throws does not stop the others; it
+  is reported once as a `Teardown` warning.
 - `params`: arrays of values; the cartesian product makes series. A parameter may be
   `{ run: [...], more: [...] }`: `run` values make series by default, `more` values only with
   `--params all` or when `--params k=v` names one, so a scaling sweep keeps a short default run.
@@ -870,7 +872,8 @@ paused. Playwright's `page.route` turns the HTTP cache off for the whole page, s
 reloads in `reset` refetched every script, which no person does; with `mock` the scripts come from
 the cache. A handler gets `{ url, method, headers, body, json() }` and returns `{ status?, headers?,
 body? }` (text, bytes, or any other value as JSON) or `undefined` to let the request through.
-Patterns accumulate; the first that answers wins. Streams (an event source) are not mockable this
+Patterns accumulate and the latest is asked first; `undefined` passes the request to earlier
+ones, as Playwright's `route` and `fallback` do, so existing route-based mocks port unchanged. Streams (an event source) are not mockable this
 way: serve them from a real local server and tear it down in `teardown`.
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
@@ -917,23 +920,35 @@ discarded first, so the OS has read the build from disk before any timed launch.
 - **Milestones** (`{ name: { match, in? } }`): the first line matching `match` (text, or a RegExp)
   in `in`: `"output"` (stdout and stderr, colour codes removed; the default), `"page"` (the main
   page's `performance.mark` names) or a glob of files under the launch's home (an app's log).
-  Each is a metric `launch.<name>` from spawn. Lines are read until 1 s after ready, up to 3 s
+  Each is a metric `launch.<name>` from spawn. A group named `at` holding epoch ms
+  (`/entry: (?<at>\d{13})/`) is the milestone's time, for marks an app writes into its log before
+  or after the line itself; otherwise it is when strobe read the line (files are polled every
+  10 ms, output as it arrives). Lines are read until 1 s after ready, up to 3 s
   while one is missing; a milestone the case declares as a metric must appear, the rest are context.
   `ready`, `painted`, `settled` and `node.*` are strobe's own names.
 - **Screen** (Windows, app targets, default on): the largest window's pixels, shrunk to 16×16 by
-  the GPU's halftone average, every 30 ms. `launch.painted` is the first sample that differs from
-  the window's first (a splash or a fade counts: it is what a person sees) and `launch.settled`
-  the last change up to 1 s after ready. The windows stay on top without focus for the whole
+  halftone averaging, every 30 ms. Two samples differ when a cell moves by more than 8 levels in a
+  colour channel: a panel filling in moves several cells far more, a blinking caret moves its cell
+  by under one. `launch.painted` is the first sample that differs from the window's first (a
+  splash or a fade counts: it is what a person sees) and `launch.settled` the last change up to
+  1 s after ready. The windows stay on top without focus for the whole
   launch, raised asynchronously so a busy UI thread never blocks strobe.
 - **`inspect`** (app and exe targets): starts the main process with `--inspect` and reads Node's
   own bootstrap timing after the launch: `launch.node.created`, `.start`, `.bootstrapped`. It adds
-  Node's inspector to every timed launch of both variants.
+  Node's inspector to every timed launch of both variants. A build that ignores `--inspect` (an
+  Electron fuse turns it off in some release builds) still times its launches, with an `Inspect`
+  warning and no `launch.node.*`.
 - **`profile`**: `fresh` (default), a new home every launch, seeded from the target's `home`;
   `warm`, one home per series and variant kept across its launches (the discarded launch fills
   it), as a person's next launch. Homes are removed when the experiment ends.
 - **`before(ctx)`**: before every launch, never timed, with `root` (the variant's folder) and
   `home` (the launch's home, `null` for web): delete caches for a cold dev start, seed state, start
-  or stop a service.
+  or stop a service. For app and exe targets the home is ready first (seed and profile files in)
+  and the hook also gets `env`, the whole environment the app launches with, and `exe`, the
+  variant's executable, so it can start what the app expects to find (its background service from
+  the bundled CLI) as the app would. A warm home keeps its `{port}` across launches, so such a
+  service is still found; what a hook starts is the bench file's to stop (`teardown`, or a process
+  exit handler for one kept across launches).
 - `cpu.work` is the CPU of the target's processes from spawn (or navigation) to ready, in cycles.
 - **Attribution:** a launch of its own, never timed. An app's main process starts paused under
   `--inspect-brk` with its CPU profiler on (`cpu-main.cpuprofile`), and every page starts paused

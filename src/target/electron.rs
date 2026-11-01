@@ -207,6 +207,9 @@ pub struct Extra {
     pub args: Vec<String>,
     pub output: bool,
     pub home: Option<PathBuf>,
+    /// A home [`prepare_home`] already made ready (a hook ran against it); `home` and the seed are
+    /// then not used.
+    pub prepared: Option<Home>,
     /// Starts the main process paused (`--inspect-brk` on this port) and runs it once a CPU profile of
     /// it is recording from its first statement: an attribution launch.
     pub profile_main: Option<u16>,
@@ -313,12 +316,35 @@ pub fn strip_ansi(text: &str) -> String {
     out
 }
 
-/// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
-pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
-    let guard = Guard::take(&app.guards);
-    live(app, &guard)?;
-    let home = extra.home.clone().unwrap_or_else(new_home);
-    // A home launched before (a warm profile) keeps its state: the seed went in the first time.
+/// A home ready for a launch: its folders, seed and profile files are in place, and `env` is what
+/// the app's environment sets (on top of strobe's own, less the profile's `unset`).
+#[derive(Clone, Debug)]
+pub struct Home {
+    pub dir: PathBuf,
+    pub port: u16,
+    pub env: Vec<(String, String)>,
+}
+
+impl Home {
+    /// The app's whole environment, for a hook that starts something the app would see as its own
+    /// (a background service).
+    pub fn environment(&self, app: &App) -> std::collections::BTreeMap<String, String> {
+        let mut out: std::collections::BTreeMap<String, String> = std::env::vars().filter(|(k, _)| !app.unsets(k)).collect();
+        out.extend(self.env.iter().cloned());
+        out
+    }
+}
+
+impl App {
+    fn unsets(&self, key: &str) -> bool {
+        self.unset.iter().any(|u| u.strip_suffix('*').map_or(u == key, |prefix| key.starts_with(prefix)))
+    }
+}
+
+/// Prepares `home` (a new one when `None`) for `app`. A home launched before (a warm profile) keeps
+/// its state, and keeps its `{port}`: something started for it (a service) is still found there.
+pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Result<Home> {
+    let home = home.unwrap_or_else(new_home);
     let fresh = !home.join(".strobe-home").exists();
     let appdata = home.join("AppData").join("Roaming");
     let local = home.join("AppData").join("Local");
@@ -343,7 +369,12 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     for stale in find(&home, "DevToolsActivePort", 6) {
         let _ = std::fs::remove_file(stale);
     }
-    let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
+    let kept = std::fs::read_to_string(home.join(".strobe-port")).ok().and_then(|p| p.trim().parse::<u16>().ok());
+    let port = match kept {
+        Some(p) => p,
+        None => std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port(),
+    };
+    std::fs::write(home.join(".strobe-port"), port.to_string())?;
     let fill = |s: &str| s.replace("{home}", &home.display().to_string()).replace("{port}", &port.to_string());
     for (rel, content) in &app.files {
         let path = home.join(rel);
@@ -357,24 +388,44 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         std::fs::write(path, text)?;
     }
     save_protocols(&home, &app.protocols);
+    let text = |p: &Path| p.display().to_string();
+    let mut env: Vec<(String, String)> = [
+        ("USERPROFILE", text(&home)),
+        ("HOME", text(&home)),
+        ("APPDATA", text(&appdata)),
+        ("LOCALAPPDATA", text(&local)),
+        ("TEMP", text(&temp)),
+        ("TMP", text(&temp)),
+        ("XDG_DATA_HOME", text(&data)),
+        ("XDG_STATE_HOME", text(&state)),
+        ("XDG_CONFIG_HOME", text(&config)),
+        ("XDG_CACHE_HOME", text(&cache)),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v))
+    .collect();
+    env.extend(app.env.iter().map(|(k, v)| (k.clone(), fill(v))));
+    Ok(Home { dir: home, port, env })
+}
+
+/// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
+pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
+    let guard = Guard::take(&app.guards);
+    live(app, &guard)?;
+    let prepared = match &extra.prepared {
+        Some(h) => h.clone(),
+        None => prepare_home(app, seed, extra.home.clone())?,
+    };
+    let (home, port) = (prepared.dir.clone(), prepared.port);
+    let fill = |s: &str| s.replace("{home}", &home.display().to_string()).replace("{port}", &port.to_string());
     let mut cmd = Command::new(&app.exe);
     for (k, _) in std::env::vars() {
-        if app.unset.iter().any(|u| u.strip_suffix('*').map_or(*u == k, |prefix| k.starts_with(prefix))) {
+        if app.unsets(&k) {
             cmd.env_remove(&k);
         }
     }
-    cmd.env("USERPROFILE", &home)
-        .env("HOME", &home)
-        .env("APPDATA", &appdata)
-        .env("LOCALAPPDATA", &local)
-        .env("TEMP", &temp)
-        .env("TMP", &temp)
-        .env("XDG_DATA_HOME", &data)
-        .env("XDG_STATE_HOME", &state)
-        .env("XDG_CONFIG_HOME", &config)
-        .env("XDG_CACHE_HOME", &cache);
-    for (k, v) in &app.env {
-        cmd.env(k, fill(v));
+    for (k, v) in &prepared.env {
+        cmd.env(k, v);
     }
     for a in &app.args {
         cmd.arg(fill(a));

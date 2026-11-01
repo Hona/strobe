@@ -68,8 +68,22 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     if let Some(h) = &home {
         std::fs::create_dir_all(h)?;
     }
+    // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
+    // keeps), and the hook gets the environment and executable the app launches with, so it can start
+    // what the app expects to find (a background service) the way the app would.
+    let app = if kind == "app" || kind == "exe" { Some(variant_app(v, &target, &ctx.config)?) } else { None };
+    let seed = target["home"].as_str().map(|h| {
+        let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
+        Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
+    });
+    let prepared = match &app {
+        Some(a) => Some(electron::prepare_home(a, seed.as_deref(), home.clone())?),
+        None => None,
+    };
+    let env = app.as_ref().zip(prepared.as_ref()).map(|(a, h)| h.environment(a));
     let root = v.root.as_ref().map(|r| r.display().to_string());
-    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root, "home": home }), t, &no_page)?;
+    let exe = app.as_ref().map(|a| a.exe.display().to_string());
+    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root, "home": home, "env": env, "exe": exe }), t, &no_page)?;
     if spec["before"] == true {
         ctx.runner
             .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
@@ -89,18 +103,15 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let clock = (host::tsc(), Instant::now());
     let (mut browser, started) = match kind.as_str() {
         "app" | "exe" => {
-            let app = variant_app(v, &target, &ctx.config)?;
-            let seed = target["home"].as_str().map(|h| {
-                let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
-                Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
-            });
+            let app = app.as_ref().ok_or_else(|| Error::msg("internal: an app target without its app"))?;
             let extra = Extra {
                 args: inspect_port.map(|p| vec![format!("--inspect={p}")]).unwrap_or_default(),
                 output: true,
                 home: home.clone(),
+                prepared: prepared.clone(),
                 profile_main: if profile { Some(free_port()?) } else { None },
             };
-            let (b, g, st) = electron::launch_with(&app, seed.as_deref(), &window, ctx.pin, &extra)?;
+            let (b, g, st) = electron::launch_with(app, seed.as_deref(), &window, ctx.pin, &extra)?;
             guard = Some(g);
             (b, st)
         }
@@ -205,7 +216,13 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         values.insert("launch.ready".to_string(), ready_ms);
         values.insert("cpu.work".to_string(), cpu_ms);
         for m in &milestones {
-            let first = lines.iter().filter(|(_, l, src)| *src == m.source && m.pattern.is_match(l)).map(|(at, _, _)| *at).min_by(f64::total_cmp);
+            // A capture named `at` holding epoch ms (a mark the app wrote into its log) is the time;
+            // otherwise the time strobe read the line.
+            let first = lines
+                .iter()
+                .filter(|(_, _, src)| *src == m.source)
+                .filter_map(|(at, l, _)| m.pattern.captures(l).map(|c| c.name("at").and_then(|v| v.as_str().parse::<f64>().ok()).filter(|v| *v > 1e12).unwrap_or(*at)))
+                .min_by(f64::total_cmp);
             match first {
                 Some(at) => {
                     values.insert(format!("launch.{}", m.name), at - started_ms);
@@ -220,14 +237,21 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             values.insert("launch.painted".into(), painted - started_ms);
             values.insert("launch.settled".into(), settled - started_ms);
         }
+        // Node's timing is context: an app that ignores `--inspect` (an Electron fuse turns it off in
+        // some release builds) still has a valid launch, without `launch.node.*`.
         if let Some(port) = inspect_port {
-            for (name, at) in node_timing(port)? {
-                values.insert(format!("launch.node.{name}"), at - started_ms);
+            match node_timing(port) {
+                Ok(timing) => {
+                    for (name, at) in timing {
+                        values.insert(format!("launch.node.{name}"), at - started_ms);
+                    }
+                }
+                Err(e) if !ctx.warnings.iter().any(|w| w.id == "Inspect") => ctx.warnings.push(validity::warn("Inspect", format!("{}: {}", v.role, e.message))),
+                Err(_) => {}
             }
             lap("node", &mut steps);
         }
         let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
-        let _ = ctx.runner.call("close", json!({}), t, &no_page);
         Ok(Block {
             variant: v.role.to_string(),
             pair,
@@ -245,14 +269,29 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             leak: None,
         })
     })();
-    // A warm home outlives the launch; whatever still runs from it ends with the launch.
-    let kept = if warm { browser.profile.take() } else { None };
+    // The app closes first, then the bench file's teardown runs while the home still exists (it may
+    // stop a service whose registration is in there), then a fresh home goes; a warm one stays.
+    let home = browser.profile.take();
     browser.close();
-    if let Some(h) = kept {
-        electron::release_home(&h);
+    if let Some(h) = &home {
+        electron::release_home(h);
+    }
+    let closed = ctx.runner.call("close", json!({}), t, &no_page);
+    if let Some(h) = home.filter(|_| !warm) {
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&h).is_ok() || !h.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     if let Some(g) = &guard {
         g.check("after a launch")?;
+    }
+    if let Err(e) = closed
+        && !ctx.warnings.iter().any(|w| w.id == "Teardown")
+    {
+        ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", v.role, e.message)));
     }
     result
 }
@@ -454,8 +493,10 @@ fn sample_screen(pid: u32, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8
 /// sampled (epoch ms). A splash or a fade counts as painted: it is what a person sees.
 fn screen_times(samples: &[(f64, Vec<u8>)]) -> Option<(f64, f64)> {
     let (first_at, first) = samples.first()?;
-    // About 3 levels per channel on average over the window: more than compression noise.
-    let differs = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u32).sum::<u32>() > 16 * 16 * 12;
+    // A cell (a 16th of the window each way, averaged) moving by more than 8 levels in a colour
+    // channel: a panel or a list filling in moves several cells by far more, a blinking caret moves
+    // its cell by under one level. Alpha is ignored.
+    let differs = |a: &[u8], b: &[u8]| a.chunks(4).zip(b.chunks(4)).any(|(x, y)| x.iter().zip(y).take(3).any(|(p, q)| p.abs_diff(*q) > 8));
     let painted = samples.iter().find(|(_, px)| differs(px, first)).map_or(*first_at, |(at, _)| *at);
     let settled = samples.windows(2).rev().find(|w| differs(&w[0].1, &w[1].1)).map_or(painted, |w| w[1].0).max(painted);
     Some((painted, settled))
@@ -549,7 +590,7 @@ fn walk(dir: &Path, parts: &[&str], out: &mut Vec<PathBuf>, depth: usize) {
 /// bootstrapping, as epoch ms.
 fn node_timing(port: u16) -> Result<Vec<(String, f64)>> {
     let body = chromium::http_get(&format!("127.0.0.1:{port}"), "/json/list")
-        .map_err(|_| Error::msg("the main process opened no inspector").hint("an Electron fuse (EnableNodeCliInspectArguments) may turn --inspect off in this build"))?;
+        .map_err(|_| Error::msg("the main process opened no inspector, so there is no launch.node.* (an Electron fuse, EnableNodeCliInspectArguments, may turn --inspect off in this build)"))?;
     let list: Value = serde_json::from_str(&body)?;
     let ws = list.as_array().and_then(|a| a.first()).and_then(|t| t["webSocketDebuggerUrl"].as_str()).ok_or_else(|| Error::msg("the main process has no inspector target"))?.to_string();
     let cdp = Cdp::connect(&ws)?;

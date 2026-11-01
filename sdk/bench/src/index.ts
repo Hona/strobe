@@ -90,7 +90,8 @@ export interface PrepareContext<P> {
   /**
    * Answers requests whose URL matches `pattern` (`*` is any run of characters) in this block's page.
    * Unlike Playwright's `page.route`, the browser's HTTP cache stays on: scripts and styles a reload
-   * fetches come from the cache, as for a person. Later calls add patterns; the first match answers.
+   * fetches come from the cache, as for a person. Later calls add patterns and are asked first; a
+   * handler that returns `undefined` passes the request to earlier ones, as Playwright's routes do.
    */
   mock(pattern: string, handler: MockHandler): Promise<void>
 }
@@ -103,13 +104,17 @@ export interface LaunchContext<P> {
   variant: "base" | "head"
   /** The variant's folder: a git ref's worktree, or the directory it names. */
   root: string
-  /** The private home the app launches in (its `HOME`, `APPDATA`, XDG folders); null for web targets. */
+  /** The private home the app launches in (its `HOME`, `APPDATA`, XDG folders); null for web targets. Ready before the hook: seed and profile files are in. */
   home: string | null
+  /** App and exe targets: the whole environment the app launches with, to start what it expects to find (a background service) as it would. */
+  env: Record<string, string> | null
+  /** App and exe targets: the executable this variant launches. */
+  exe: string | null
 }
 
 /** A point in a launch: the first line matching `match` in `in`, timed from process spawn. */
 export interface Milestone {
-  /** Text the line contains, or a regular expression it matches. */
+  /** Text the line contains, or a regular expression it matches. A group named `at` holding epoch ms (`/entry: (?<at>\d{13})/`) is the time, for marks an app writes into its log; otherwise the time strobe read the line. */
   match: string | RegExp
   /** `"output"` (stdout and stderr, the default), `"page"` (the page's `performance.mark` names), or a glob of files under the launch's home. */
   in?: "output" | "page" | (string & {})

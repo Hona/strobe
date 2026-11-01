@@ -115,7 +115,15 @@ impl Driver {
     /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
     fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
         self.helper()?;
-        self.page.eval_timeout(expr, timeout + Duration::from_secs(10))
+        // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
+        // a destroyed context, which says nothing about what happened to the page.
+        self.page.eval_timeout(expr, timeout + Duration::from_secs(10)).map_err(|e| {
+            if e.message.contains("Promise was collected") || e.message.contains("context was destroyed") {
+                Error::msg(format!("the page reloaded or navigated away while strobe waited ({expr}): the app replaced the document on its own"))
+            } else {
+                e
+            }
+        })
     }
 
     /// Writes a `performance.mark` that the trace records on its own clock.

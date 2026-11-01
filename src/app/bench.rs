@@ -42,6 +42,24 @@ const WORK_PARTS: [(&str, &str, f64); 5] = [
 /// code costs one optional call when strobe is not attached, and adds to this run's totals when it is.
 const COUNT_SCRIPT: &str = "globalThis.__strobeCount ??= (name, n = 1) => { const c = (globalThis.__strobeCounts ??= {}); c[name] = (c[name] ?? 0) + n }";
 
+/// `canvas.*` metrics (SPEC §8.4): when the page takes a WebGPU canvas's texture for a new frame. Calls in one
+/// task are one frame, however many canvases it draws.
+const CANVAS_SCRIPT: &str = r#"(() => {
+  if (globalThis.__strobeCanvasHooked || typeof GPUCanvasContext === "undefined") return
+  globalThis.__strobeCanvasHooked = true
+  globalThis.__strobeCanvas ??= []
+  const take = GPUCanvasContext.prototype.getCurrentTexture
+  let open = false
+  GPUCanvasContext.prototype.getCurrentTexture = function () {
+    if (!open) {
+      open = true
+      globalThis.__strobeCanvas.push(performance.now())
+      queueMicrotask(() => (open = false))
+    }
+    return take.call(this)
+  }
+})()"#;
+
 /// A run with this much other work on the target's CPUs (% of one core) flags its block `Background`.
 const BACKGROUND_PCT: f64 = 25.0;
 
@@ -316,6 +334,7 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
         None => vec![resolve_variant("head", &head_spec, &project, &config)?],
     };
+    let _ = HARNESS.set(harness(&file, &project, &config));
     let started = Instant::now();
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
@@ -704,6 +723,7 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
     let (count, what) = match def.name.split('.').next() {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
+        Some("canvas") => ("canvas.n", "canvas frame gaps"),
         _ => ("frames.n", "frames"),
     };
     if def.min_n > 1 {
@@ -947,6 +967,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     let nets: Vec<String> = declared.iter().filter(|m| m.starts_with("net.")).map(|m| m.to_string()).collect();
     let shift = declared.iter().any(|m| *m == "layout.shift");
     let gc = declared.iter().any(|m| *m == "main.gc");
+    let canvas = declared.iter().any(|m| m.starts_with("canvas."));
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -1003,6 +1024,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": COUNT_SCRIPT }))?;
             page.eval(COUNT_SCRIPT)?;
         }
+        if canvas {
+            page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": CANVAS_SCRIPT }))?;
+            page.eval(CANVAS_SCRIPT)?;
+        }
         lap("attach");
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
@@ -1031,6 +1056,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 *c.entry(k).or_default() += n;
             }
         };
+        // This run's canvas frame times, one list per document it showed (a page load starts a new clock).
+        let canvas_docs: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
+        let take_canvas = || {
+            if canvas {
+                let times: Vec<f64> = page.eval("JSON.stringify(globalThis.__strobeCanvas?.splice(0) ?? [])").ok().and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok())).unwrap_or_default();
+                canvas_docs.borrow_mut().push(times);
+            }
+        };
         // An attribution block's profiles, one pair per document: a page load ends the V8 profilers with
         // their document, so each `goto` (in a run or a reset) closes a segment and starts the next.
         let profiling = Cell::new(false);
@@ -1049,6 +1082,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                         if !counted.is_empty() {
                             add_counts(page_counts());
                         }
+                        take_canvas();
                     }
                     let segment = call == "goto" && profiling.get();
                     if segment {
@@ -1129,6 +1163,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             Some(RefCell::new(Net::new(rx, page.session.clone())))
         };
         let run_counts: RefCell<Vec<BTreeMap<String, f64>>> = RefCell::new(Vec::new());
+        let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
 
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<Run> {
@@ -1155,6 +1190,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             if !counted.is_empty() {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
             }
+            if canvas {
+                page.eval("globalThis.__strobeCanvas = [], true")?;
+                canvas_docs.borrow_mut().clear();
+            }
             if let Some(n) = &net {
                 n.borrow_mut().drain(None);
             }
@@ -1175,6 +1214,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             if !counted.is_empty() {
                 add_counts(page_counts());
             }
+            take_canvas();
+            run_canvas.borrow_mut().push(canvas_docs.take());
             let index = run_counts.borrow().len();
             run_counts.borrow_mut().push(counts.borrow().clone());
             if let Some(n) = &net {
@@ -1397,7 +1438,28 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if set == Set::Lean {
             extra.insert("main.busy".to_string(), busy);
         }
+        // canvas.*: frames per run, and gaps between consecutive frames pooled over the measured runs, as
+        // frames.interval pools presented frames. A gap never spans two documents.
+        let run_canvas = run_canvas.into_inner();
+        let mut canvas_gaps: Vec<f64> = Vec::new();
+        if canvas {
+            let measured_canvas = &run_canvas[first.min(run_canvas.len())..];
+            extra.insert("canvas.frames".to_string(), measured_canvas.iter().enumerate().map(|(j, docs)| (key(j), docs.iter().map(Vec::len).sum::<usize>() as f64)).collect());
+            for doc in measured_canvas.iter().flatten() {
+                canvas_gaps.extend(doc.windows(2).map(|w| w[1] - w[0]));
+            }
+            canvas_gaps.sort_by(f64::total_cmp);
+        }
         let mut values = metrics::block_values(&data, "run", &extra);
+        if canvas {
+            values.insert("canvas.n".into(), canvas_gaps.len() as f64);
+            if !canvas_gaps.is_empty() {
+                for (name, p) in [("canvas.interval.p50", 0.50), ("canvas.interval.p95", 0.95), ("canvas.interval.p99", 0.99)] {
+                    values.insert(name.into(), metrics::percentile(&canvas_gaps, p));
+                }
+                values.insert("canvas.interval.max".into(), canvas_gaps.last().copied().unwrap_or(0.0));
+            }
+        }
         if set != Set::Lean && busy_cdp.is_finite() {
             // The same quantity from the Performance domain, next to the trace's: they must agree.
             values.insert("main.busy.cdp".into(), busy_cdp);
@@ -1795,6 +1857,92 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
     Ok(v)
 }
 
+/// The bench's harness: the bench file's folder, the strobe.json in use and strobe.json's `harness` paths, in
+/// the checkout that holds the bench file. Every variant builds and serves with it (`overlay_harness`).
+struct Harness {
+    from: PathBuf,
+    paths: Vec<PathBuf>,
+}
+
+static HARNESS: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
+
+fn harness(file: &Path, project: &Path, config: &Value) -> Harness {
+    let dir = file.parent().unwrap_or(Path::new("."));
+    let from = host::output(Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]))
+        .map(PathBuf::from)
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .unwrap_or_else(|| project.to_path_buf());
+    let rel = |p: &Path| std::fs::canonicalize(p).ok().and_then(|c| c.strip_prefix(&from).ok().map(Path::to_path_buf));
+    let mut paths: Vec<PathBuf> = [rel(dir), rel(&project.join("strobe.json"))].into_iter().flatten().filter(|p| !p.as_os_str().is_empty()).collect();
+    paths.extend(config["harness"].as_array().into_iter().flatten().filter_map(Value::as_str).map(PathBuf::from));
+    Harness { from, paths }
+}
+
+/// Copies the harness into a variant's folder, so a base from before the bench existed (its serve script, its
+/// strobe.json) builds and serves the way head does. A worktree strobe made is strobe's own: head's harness
+/// replaces whatever the ref had. A folder of the user's only gets the files it lacks.
+fn overlay_harness(v: &Variant, root: &Path) -> Result<()> {
+    let Some(h) = HARNESS.get() else { return Ok(()) };
+    let root = std::fs::canonicalize(root)?;
+    if root == h.from {
+        return Ok(());
+    }
+    let owned = std::fs::canonicalize(host::paths::sub("builds")).is_ok_and(|b| root.starts_with(b));
+    let mut copied = 0;
+    let mut kept = Vec::new();
+    let mut copy = |src: &Path, dst: &Path| -> Result<()> {
+        let same = std::fs::read(dst).ok().is_some_and(|d| std::fs::read(src).is_ok_and(|s| s == d));
+        if same {
+            return Ok(());
+        }
+        if dst.exists() && !owned {
+            kept.push(dst.strip_prefix(&root).unwrap_or(dst).display().to_string());
+            return Ok(());
+        }
+        if let Some(p) = dst.parent() {
+            std::fs::create_dir_all(p)?;
+        }
+        std::fs::copy(src, dst)?;
+        copied += 1;
+        Ok(())
+    };
+    for p in &h.paths {
+        let src = h.from.join(p);
+        if src.is_dir() {
+            for f in walk(&src) {
+                copy(&f, &root.join(p).join(f.strip_prefix(&src).unwrap_or(&f)))?;
+            }
+        } else if src.is_file() {
+            copy(&src, &root.join(p))?;
+        }
+    }
+    if copied > 0 {
+        progress(format!("  harness {}: {copied} file(s) from {}", v.role, h.from.display()));
+    }
+    if !kept.is_empty() {
+        progress(format!("  harness {}: kept its own {}", v.role, kept.join(", ")));
+    }
+    Ok(())
+}
+
+/// Every file under `dir`, skipping dependency and output folders a harness never needs.
+fn walk(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else { return out };
+    for e in entries.flatten() {
+        let p = e.path();
+        let name = e.file_name().to_string_lossy().to_string();
+        if p.is_dir() {
+            if !matches!(name.as_str(), "node_modules" | ".git" | "dist" | "target") {
+                out.extend(walk(&p));
+            }
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// Builds and serves a variant for `web` targets (once per experiment).
 fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) -> Result<()> {
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
@@ -1804,6 +1952,9 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
             && v.root.is_none()
         {
             v.root = Some(worktree(r)?);
+        }
+        if let Some(root) = v.root.clone() {
+            overlay_harness(v, &root)?;
         }
         if let (Some(root), Some(cmd)) = (v.root.clone(), target["build"].as_str()) {
             build_variant(v.role, &root, &json!({ "command": cmd }))?;
@@ -1817,6 +1968,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
         v.root = Some(worktree(r)?);
     }
     let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
+    overlay_harness(v, &root)?;
     let _ = aa;
     if let Some(build) = config.get("build").filter(|b| b.is_object()) {
         build_variant(v.role, &root, build)?;
@@ -1852,6 +2004,12 @@ fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(key.as_str()) && output.as_ref().is_none_or(|o| o.exists()) {
         progress(format!("  build {role}: unchanged, reusing"));
         return Ok(());
+    }
+    // A package with its own lockfile below the repository root (a site in a Rust repo) gets its own install:
+    // a fresh worktree has none.
+    if (cwd.join("bun.lock").exists() || cwd.join("bun.lockb").exists()) && !cwd.join("node_modules").exists() {
+        progress(format!("  bun install ({role}, {})", build["cwd"].as_str().unwrap_or(".")));
+        Command::new(crate::runner::find_bun().unwrap_or_else(|| "bun".into())).args(["install", "--frozen-lockfile"]).current_dir(&cwd).stdout(Stdio::null()).status()?;
     }
     progress(format!("  build {role}: {cmd}"));
     let mut c = shell(cmd);

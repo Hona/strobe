@@ -108,7 +108,7 @@ Cargo.toml  build.rs
 src/            one package: lib + bins strobe, strobew (Windows windowless); §4.3
 viewer/         self-contained HTML report viewer (`viewer/report.html`), embedded
 calibration/    the known-cost page (static), embedded
-sdk/            TypeScript: @hona/strobe-bench, @hona/strobe-web, @hona/strobe-electron, @hona/strobe-playwright
+sdk/            TypeScript: @hona/strobe (the CLI launcher and bench SDK), @hona/strobe-web, @hona/strobe-electron, @hona/strobe-playwright
                 (one Bun workspace)
 skill/SKILL.md  the built-in skill, embedded (include_str!)
 schema/         strobe.v1.json (project config), result.v1.json, bridge.v1.json
@@ -395,7 +395,7 @@ The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`.
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
 `net.bytes` with an optional `{<url glob>}` (§8.1), and `launch.<milestone>` (§9.6). Metrics a
 series declares beyond the defaults may switch on what measures them: `count.*` installs the page
-counter, `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
+counter, `canvas.*` the canvas frame hook (§8.4), `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
 `disabled-by-default-v8.gc` category. Only that series' blocks pay for it, base and head alike.
 
 ### 7.2 Frames
@@ -521,6 +521,16 @@ A counter is an exact metric per run, `count.<name>`. Two sources add to it:
 
 A counter the page never touched reads 0. Compare builds that both count: a base without the
 counter reads 0, not "unknown".
+
+**Canvas frames** (`canvas.frames`, `canvas.interval.p50|p95|p99|max`): the page's own frames, at its own
+frame rate. Presented frames count compositor vsyncs, so a game drawing 60 frames a second on a
+165 Hz display, or a 30 fps idle animation, reads as the display's rate there. strobe installs a
+wrapper on `GPUCanvasContext.prototype.getCurrentTexture` at document start, only for a series that
+declares a `canvas.*` metric. Each task that takes a texture is one frame, however many canvases it
+draws. `canvas.frames` is per run. The interval percentiles pool the gaps between consecutive
+frames over the measured runs, as `frames.interval` pools presented frames, and need their minimum
+n of gaps (`TailTooShort`). A gap never spans two documents. WebGPU canvases only for now: a WebGL
+or 2D canvas has no per-frame call to hook.
 
 **Network** (`net.requests`, `net.bytes`): the Network domain, enabled only for a series that
 declares a `net.*` metric. A request belongs to the run whose span it started in; its bytes on
@@ -775,6 +785,15 @@ it, for app profiles they use from anywhere; `apps` merge per app.
 - `app:<id>` and `exe:<path>` need no build.
 - `build` and `serve` are what a `web()` target runs for each variant; `serve` gets a free port
   per variant.
+- **Harness:** the bench file's folder, the `strobe.json` in use and the paths in its `harness`
+  list (repository-relative), all from the checkout that holds the bench file. Before a variant
+  builds and serves, strobe copies the harness into its folder, so a base from before the bench
+  existed (no serve script, no `strobe.json`) runs the way head does. A worktree strobe made for a
+  git ref is strobe's own: head's harness replaces the ref's. A directory of the user's only gets
+  the files it lacks, and strobe names any it kept.
+- A build folder (`build.cwd`) with its own `bun.lock` and no `node_modules` gets
+  `bun install --frozen-lockfile` before the build: a package below the repository root has none in
+  a fresh worktree.
 
 ### 9.6 Bench files
 
@@ -782,7 +801,7 @@ A benchmark is a small TypeScript file, in the spirit of BenchmarkDotNet:
 
 ```ts
 // packages/web/perf/feed.bench.ts (in the consumer's repo)
-import { bench, web, app } from "@hona/strobe-bench"
+import { bench, web, app } from "@hona/strobe"
 import { mockFeed } from "../e2e/mocks"
 
 export default bench({
@@ -994,7 +1013,7 @@ experiment's `script.log`.
 
 ```mermaid
 sequenceDiagram
-  participant R as runner (bun, @hona/strobe-bench)
+  participant R as runner (bun, @hona/strobe)
   participant D as strobe
   participant T as target
   D->>R: spawn with the bench file; R reports targets, params, cases
@@ -1010,7 +1029,7 @@ sequenceDiagram
   D->>D: verdicts (§9.3)
 ```
 
-- The runner is a `bun` process running `@hona/strobe-bench`'s entry. It imports the bench file and
+- The runner is a `bun` process running `@hona/strobe`'s entry. It imports the bench file and
   calls its functions when told to. It is pinned to the CPUs the target is not pinned to, and
   its CPU time is a track in the recording. strobe itself (the driver relay, samplers, CDP) moves to
   the same CPUs for the bench, so the variant servers it spawns start there too; its previous mask
@@ -1462,11 +1481,21 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
-- `@hona/strobe-bench`: `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of
-  bench files (§9.6). strobe embeds the SDK, the runner and the script host and rewrites a bench
-  file's `@hona/strobe-bench` import to its own copy, so bench files run without installing anything.
-  The npm package (built from `sdk/bench`: `dist/index.js` and `dist/index.d.ts`, version equal to
-  strobe's) gives editors and `tsc` the same types.
+- `@hona/strobe`: the `strobe` command and the bench SDK, one npm package so a project pins one
+  strobe for its people, agents and CI (`bun add -d @hona/strobe`, then `bunx strobe bench …`).
+  - **The command:** `bin/strobe.js` runs the binary from `@hona/strobe-<platform>-<arch>`, an
+    optional dependency, so each machine installs only its own (win32-x64 so far).
+    `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
+    install folder (§5.3), so the daemon never runs from a project's `node_modules`.
+  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of bench
+    files (§9.6), built from `sdk/bench` (`dist/index.js`, `dist/index.d.ts`). strobe embeds the
+    SDK, the runner and the script host and rewrites a bench file's `@hona/strobe` import (or the old
+    `@hona/strobe-bench`) to its own copy, so a bench file runs with the SDK of the binary running it,
+    installed or not.
+  - **Versions:** every package has Cargo.toml's version. A `v<version>` tag runs
+    `.github/workflows/release.yml`: build, then `scripts/release.ts --publish` publishes the
+    platform packages, `@hona/strobe` and the `@hona/strobe-bench` alias (a re-export, deprecated),
+    skipping any already on npm.
 - `@hona/strobe-web`: `phase(name)`, `mark(name)`, `count(name, n)`; free when strobe is not
   attached (§8.4). `@hona/strobe-web/solid`: computations per component through Solid's dev hooks,
   dev builds only.
@@ -1521,7 +1550,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
 | 0b | — | the bridge (`@hona/strobe-electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
-| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe-bench` on npm (types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
+| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe` on npm (CLI and types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |

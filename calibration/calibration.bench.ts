@@ -1,5 +1,5 @@
 // strobe's own calibration bench: known costs that every probe must recover (SPEC §10.3).
-import { bench, url } from "@hona/strobe-bench"
+import { bench, url } from "@hona/strobe"
 
 const page = (query: string) => `http://127.0.0.1:${process.env.STROBE_CALIBRATION_PORT ?? 4821}/?${query}`
 

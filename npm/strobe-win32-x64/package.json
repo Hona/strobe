@@ -1,0 +1,13 @@
+{
+  "name": "@hona/strobe-win32-x64",
+  "version": "0.2.0",
+  "description": "The strobe binary for Windows x64; installed by @hona/strobe",
+  "files": ["strobe.exe", "strobew.exe"],
+  "os": ["win32"],
+  "cpu": ["x64"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Hona/strobe.git" },
+  "publishConfig": {
+    "access": "public"
+  }
+}

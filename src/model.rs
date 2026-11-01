@@ -107,6 +107,11 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef { name: "frames.presented.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1000, about: "99th percentile frame cost" },
     MetricDef { name: "frames.presented.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1, about: "worst presented frame cost" },
     MetricDef { name: "frames.presented.count", unit: "count", better: Better::Higher, kind: Kind::Timed, words: ("more", "fewer"), min_n: 0, about: "presented frames per run" },
+    MetricDef { name: "canvas.frames", unit: "count", better: Better::Higher, kind: Kind::Timed, words: ("more", "fewer"), min_n: 0, about: "frames the page drew into a WebGPU canvas, per run" },
+    MetricDef { name: "canvas.interval.p50", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 20, about: "median gap between the page's own canvas frames" },
+    MetricDef { name: "canvas.interval.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 200, about: "95th percentile gap between the page's own canvas frames (its stutter, at its own frame rate)" },
+    MetricDef { name: "canvas.interval.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1000, about: "99th percentile gap between the page's own canvas frames" },
+    MetricDef { name: "canvas.interval.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1, about: "longest gap between the page's own canvas frames" },
     MetricDef {
         name: "frames.interval.p50",
         unit: "ms",

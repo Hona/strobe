@@ -4,6 +4,13 @@ Measure and explain performance: a web page, an Electron app, a Bun or Node proc
 
 > Pre-release, Windows first. The design is in [SPEC.md](SPEC.md); what is built is listed in the skill (`skill/SKILL.md`) and `strobe --help`.
 
+Install it per project, so everyone who runs the project's benches runs the same strobe:
+
+```sh
+bun add -d @hona/strobe       # the strobe command and the bench file types; Windows x64 so far
+bunx strobe up                # once per machine: engine, daemon, MCP and the skill
+```
+
 ```
 strobe bench perf/timeline.bench.ts --base origin/dev --head .   # did my change help? (and why)
 strobe record app:desktop --for 10s                              # what is the installed app doing?
@@ -17,7 +24,7 @@ strobe top                                                       # per-core, per
 A benchmark is a small TypeScript file, like BenchmarkDotNet:
 
 ```ts
-import { bench, web } from "@hona/strobe-bench"
+import { bench, web } from "@hona/strobe"
 
 export default bench({
   targets: { web: web({ url: "/" }) },

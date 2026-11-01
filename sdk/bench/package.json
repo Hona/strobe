@@ -1,9 +1,12 @@
 {
-  "name": "@hona/strobe-bench",
-  "version": "0.1.1",
-  "description": "Types and helpers for strobe bench files: measure web pages, Electron apps and scripts with paired, valid statistics",
+  "name": "@hona/strobe",
+  "version": "0.2.0",
+  "description": "Measure and explain performance: the strobe CLI and the types and helpers for its bench files",
   "type": "module",
   "types": "./dist/index.d.ts",
+  "bin": {
+    "strobe": "bin/strobe.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/index.d.ts",
@@ -12,17 +15,20 @@
     },
     "./package.json": "./package.json"
   },
-  "files": ["dist", "README.md"],
+  "files": ["dist", "bin", "README.md"],
   "sideEffects": false,
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json",
-    "prepublishOnly": "bun run build"
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json"
+  },
+  "optionalDependencies": {
+    "@hona/strobe-win32-x64": "0.2.0"
   },
   "devDependencies": {
     "typescript": "^5.9.0"
   },
   "keywords": ["benchmark", "performance", "strobe", "playwright", "electron", "chromium"],
   "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Hona/strobe.git" },
   "publishConfig": {
     "access": "public"
   }

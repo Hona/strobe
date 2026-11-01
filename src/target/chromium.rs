@@ -144,6 +144,11 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--disable-client-side-phishing-detection".into(),
         "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,EdgeCollections,msEdgeShopping,EdgeWallet,msImplicitSignin".into(),
         "--metrics-recording-only".into(),
+        // A measurement never plays sound on the user's speakers; Web Audio still renders.
+        "--mute-audio".into(),
+        // The page runs as it does for a person: `navigator.webdriver` stays false, so an app that hides its
+        // menus or skips work under automation is measured the way people use it.
+        "--disable-blink-features=AutomationControlled".into(),
         "--password-store=basic".into(),
         "--use-mock-keychain".into(),
         format!("--window-position={},{}", window.x, window.y),

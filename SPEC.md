@@ -1193,6 +1193,11 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 - Fixed window size and scale per run, placed on a chosen display; the display's refresh rate
   is read from the OS for that window.
 - Isolated profile per launch.
+- Muted (`--mute-audio`): a game or video under test never plays on the user's speakers. Web Audio
+  still renders its graph, so its cost stays in the measurement.
+- Not marked as automated (`--disable-blink-features=AutomationControlled`): `navigator.webdriver`
+  is false, as for a person. Apps branch on it (a game shell hid its menus and started muted under
+  it), and a measurement of that mode is a measurement of strobe.
 
 ### 13.2 Electron apps: isolated launches and app profiles
 

@@ -139,7 +139,8 @@ async function playwright(endpoint: string, target: string) {
   const names = ["playwright", "@playwright/test", "playwright-core"]
   const resolved = names.map((n) => { try { return Bun.resolveSync(n, from) } catch { return undefined } }).find(Boolean)
   if (!resolved) throw new Error(`prepare needs Playwright: install playwright or @playwright/test next to ${file}`)
-  const { chromium } = await import(resolved)
+  // A bench path canonicalized on Windows starts with \\?\, which Bun's import() cannot load.
+  const { chromium } = await import(resolved.replace(/^\\\\\?\\/, ""))
   const browser = await chromium.connectOverCDP(endpoint)
   const context = browser.contexts()[0]
   return { browser, context, page: await strobePage(context, target) }

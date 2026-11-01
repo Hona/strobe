@@ -106,6 +106,8 @@ pub struct BlockData {
     pub latencies: BTreeMap<String, Vec<(i64, String)>>,
     /// Layout shifts per window key: (ts, score). Only in traces with the `loading` category.
     pub shifts: BTreeMap<String, Vec<(i64, f64)>>,
+    /// Main-thread GC slice durations per window key (ns). Only in traces with `disabled-by-default-v8.gc`.
+    pub gc: BTreeMap<String, Vec<i64>>,
 }
 
 impl BlockData {
@@ -124,6 +126,16 @@ impl BlockData {
         self.tasks = std::mem::take(&mut self.tasks).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.latencies = std::mem::take(&mut self.latencies).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.shifts = std::mem::take(&mut self.shifts).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.gc = std::mem::take(&mut self.gc).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+    }
+
+    /// Main-thread GC time of each run window (ms), 0 for a run without a collection.
+    pub fn gc_per_run(&self, prefix: &str) -> BTreeMap<String, f64> {
+        self.windows
+            .iter()
+            .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
+            .map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gc.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6)))
+            .collect()
     }
 
     /// The summed layout-shift score of each run window, 0 for a run without shifts.
@@ -170,7 +182,13 @@ select 'shift', w.k, s.ts, null, null,
   coalesce(extract_arg(s.arg_set_id, 'debug.data.weighted_score_delta'), extract_arg(s.arg_set_id, 'debug.data.score'))
   from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
   join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where s.name = 'LayoutShift';
+  where s.name = 'LayoutShift'
+union all
+select 'gc', w.k, s.ts, s.dur, null, null
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  left join slice p on p.id = s.parent_id
+  where s.name glob 'V8.GC_*' and t.name = 'CrRendererMain' and (p.name is null or p.name not glob 'V8.GC_*');
 "#
     );
     let table = engine::query(trace, &sql)?;
@@ -188,6 +206,7 @@ select 'shift', w.k, s.ts, null, null,
             "task" => data.tasks.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),
             "shift" => data.shifts.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))),
+            "gc" => data.gc.entry(key).or_default().push(num(&row[3])),
             _ => {}
         }
     }

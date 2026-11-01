@@ -906,6 +906,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
     let nets: Vec<String> = declared.iter().filter(|m| m.starts_with("net.")).map(|m| m.to_string()).collect();
     let shift = declared.iter().any(|m| *m == "layout.shift");
+    let gc = declared.iter().any(|m| *m == "main.gc");
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -1055,7 +1056,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
-        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, if shift { &["loading"] } else { &[] })?) };
+        let extra_categories: Vec<&str> = [(shift, "loading"), (gc, "disabled-by-default-v8.gc")].into_iter().filter(|c| c.0).map(|c| c.1).collect();
+        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         let mut census: Vec<Value> = Vec::new();
         // A leak run measures 2 × N runs: N to S1 and N more to S2.
@@ -1288,6 +1290,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         if shift && set != Set::Memory {
             extra.insert("layout.shift".to_string(), data.shift_per_run("run"));
+        }
+        if gc && set != Set::Memory {
+            extra.insert("main.gc".to_string(), data.gc_per_run("run"));
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);

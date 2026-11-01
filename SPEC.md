@@ -393,8 +393,8 @@ The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`.
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
 `net.bytes` with an optional `{<url glob>}` (§8.1), and `launch.<milestone>` (§9.6). Metrics a
 series declares beyond the defaults may switch on what measures them: `count.*` installs the page
-counter, `net.*` the Network domain, `layout.shift` the trace's `loading` category. Only that
-series' blocks pay for it, base and head alike.
+counter, `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
+`disabled-by-default-v8.gc` category. Only that series' blocks pay for it, base and head alike.
 
 ### 7.2 Frames
 
@@ -526,6 +526,11 @@ the wire (`loadingFinished.encodedDataLength`, else its chunks so far) may arriv
 and still count for it. `data:` and `blob:` requests are not network requests. A glob without
 `://` matches the URL's path; `*` stays within a path segment, `**` crosses them, and the query
 string never takes part: `net.requests{/api/session/*/message}`.
+
+**Garbage collection** (`main.gc`): the summed duration of V8's top-level `V8.GC_*` slices on the
+renderer main thread in the run's span (a GC slice inside another counts once), the pauses a frame
+waits through. Concurrent marking on helper threads is not in it. An allocation fix shows here and in
+`main.work`; the attribution view `query <rec> gc` names the phases.
 
 **Layout shift** (`layout.shift`): the sum of `LayoutShift` scores in the run's span, from the
 trace's `loading` category. Shifts right after input count: a run starts with its input, and a

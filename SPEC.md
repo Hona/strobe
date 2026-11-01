@@ -919,6 +919,8 @@ renders into one (a diff or code viewer) counts as a change.
 | `move(x, y, opts?)` | the pointer moves to a viewport point: parks it away from anything that reacts to hover (an app that prefetches what the pointer rests on) |
 | `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
 | `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P` |
+| `down(key, opts?)`, `up(key, opts?)` | one key held across other calls until its `up` (a game's `w`); a held `Shift`, `Control`, `Alt` or `Meta` marks the key events sent while it is down. No auto-repeat: Chromium's input sends none |
+| `snapshot(name)` | the page's pixels as `name`, for `--pixels` (§9.9); nothing outside a pixels block, so timed runs never pay for it |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
 | `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too. While a CSS animation or transition runs it also checks once per frame: a fade in from `opacity: 0` makes an element visible on a frame, not on a mutation (a game menu's buttons were seen only at the next unrelated DOM change, 13 ms late on one build and not the other). Frame waits use the browser's own rAF, kept before the page's scripts run, so a page that replaces rAF (a frame pacer) does not set strobe's clock |
 | `idle(opts?)` | the `"idle"` wait below, on its own |
@@ -1068,6 +1070,27 @@ or `no change`.
 
 `--on blade,air` runs `mesh exec <device> strobe bench … --json` on each device (strobe
 installed there). Results are stored locally, tagged per device, never pooled across devices.
+
+### 9.9 Pixels
+
+A change made for speed should not change what the page draws. `--pixels` checks it after a
+series' verdict; `--pixels-only` checks it with no timed pairs at all.
+
+- **Snapshots:** `page.snapshot(name)` in a case captures the page (`Page.captureScreenshot`, PNG)
+  in a pixels block and does nothing anywhere else.
+- **Blocks:** one run each, untimed, in fresh launches: base, base again, then head.
+- **Launch noise:** one build does not draw bit for bit the same in two launches (blending and
+  rasterization vary; an A/A of a WebGPU show differed in 4 to 109 pixels by 1 or 2 of 255). The
+  noise is base's largest channel change against itself at any snapshot of the series: one pair per
+  snapshot underestimates it (a snapshot that drew the same twice read as noise 0, and head then
+  moved 3 pixels by 1 of 255).
+- **Verdict per snapshot:** `same` when no pixel of head moved further from base than that noise;
+  `differ` with how many did, by how much, and a diff image (head in grey, those pixels red) in the
+  experiment's `pixels/` folder; `only base` or `only head` when one side took no such snapshot.
+  Any `differ` adds the `PixelsDiffer` warning, and `--pixels-only` exits 1.
+- **Determinism is the bench's:** snapshot a state that does not depend on time, such as a still
+  page or an app's own deterministic step. Two builds caught at different moments of an animation
+  differ for reasons of their own.
 
 ## 10. Validity
 

@@ -24,6 +24,16 @@ export interface Page {
   type(selector: string, text: string, opts?: Options & { delay?: number }): Promise<void>
   /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. */
   press(key: string, opts?: Options): Promise<void>
+  /** Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys). */
+  down(key: string, opts?: Options): Promise<void>
+  /** Lets go of a key `down` pressed. */
+  up(key: string, opts?: Options): Promise<void>
+  /**
+   * The page's pixels as `name`, for `--pixels`: an untimed block per variant captures each snapshot and strobe
+   * compares base with head. Elsewhere it does nothing. Snapshot a state that does not depend on time (a still
+   * page, an app's deterministic step), or the two builds differ for reasons of their own.
+   */
+  snapshot(name: string): Promise<void>
   scroll(selector: string, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
   waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>

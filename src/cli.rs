@@ -4,7 +4,7 @@ use crate::model::{Error, Result};
 use std::collections::HashMap;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open", "calibrate", "pin-runner", "headless", "keep", "fast", "once"];
+const SWITCHES: &[&str] = &["json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open", "calibrate", "pin-runner", "headless", "keep", "fast", "once", "pixels", "pixels-only"];
 
 #[derive(Clone)]
 pub struct Args {
@@ -99,6 +99,7 @@ Use
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
+        [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--bisect good..bad]           (the commit that moved the primary; one series)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]

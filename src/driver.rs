@@ -96,11 +96,15 @@ pub struct Driver {
     pub page: Page,
     pub token: String,
     pub op_timeout: Duration,
+    /// A pixels block's folder: `snapshot(name)` writes `<name>.png` there. Elsewhere a snapshot does nothing.
+    pub pixels: Option<std::path::PathBuf>,
+    /// Modifiers held down by `down` (CDP's bits: Alt 1, Control 2, Meta 4, Shift 8).
+    held: std::cell::Cell<i64>,
 }
 
 impl Driver {
     pub fn new(page: Page, token: String) -> Driver {
-        Driver { page, token, op_timeout: Duration::from_secs(30) }
+        Driver { page, token, op_timeout: Duration::from_secs(30), pixels: None, held: std::cell::Cell::new(0) }
     }
 
     fn helper(&self) -> Result<()> {
@@ -228,6 +232,22 @@ impl Driver {
                 self.page.eval(&format!("({})(...{})", s(0), Value::Array(rest)))
             }
             "frame" => self.call("__strobe.frame()"),
+            // A key held across other calls (a game's WASD, a held shortcut): `down` presses it, `up` lets go.
+            "down" | "up" => {
+                self.key(&s(0), call == "down")?;
+                self.until(&opts(1))
+            }
+            // The page's pixels for `--pixels`: only a pixels block captures, so timed runs never pay for it.
+            "snapshot" => {
+                let Some(dir) = &self.pixels else { return Ok(Value::Bool(false)) };
+                let name: String = s(0).chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+                let shot = self.page.send_long("Page.captureScreenshot", json!({ "format": "png" }))?;
+                let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap_or(""))
+                    .map_err(|e| Error::msg(format!("snapshot {name}: {e}")))?;
+                std::fs::create_dir_all(dir)?;
+                std::fs::write(dir.join(format!("{name}.png")), png)?;
+                Ok(Value::Bool(true))
+            }
             other => Err(Error::msg(format!("unknown page call {other}"))),
         }
     }
@@ -289,6 +309,7 @@ impl Driver {
                 _ => 0,
             };
         }
+        let modifiers = modifiers | self.held.get();
         let (code, key_code, text) = key_info(key);
         let down_text = if modifiers & 0b0111 == 0 { text.clone() } else { None };
         let mut down = json!({ "type": if down_text.is_some() { "keyDown" } else { "rawKeyDown" }, "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": modifiers });
@@ -297,6 +318,34 @@ impl Driver {
         }
         self.page.send("Input.dispatchKeyEvent", down)?;
         self.page.send("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": modifiers }))?;
+        Ok(())
+    }
+
+    /// One key, pressed (`down`) or let go: a held key stays down across other calls until its `up`. A held
+    /// modifier (Shift, Control, Alt, Meta) also marks the key events sent while it is down. Chromium sends no
+    /// auto-repeat, as a game reading key state does not need.
+    fn key(&self, key: &str, down: bool) -> Result<()> {
+        let bit = match key {
+            "Alt" => 1,
+            "Control" => 2,
+            "Meta" => 4,
+            "Shift" => 8,
+            _ => 0,
+        };
+        let held = if down { self.held.get() | bit } else { self.held.get() & !bit };
+        self.held.set(held);
+        let (code, key_code, text) = key_info(key);
+        let mut e = json!({ "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": held });
+        if down {
+            let text = text.filter(|_| held & 0b0111 == 0);
+            e["type"] = json!(if text.is_some() { "keyDown" } else { "rawKeyDown" });
+            if let Some(t) = text {
+                e["text"] = json!(t);
+            }
+        } else {
+            e["type"] = json!("keyUp");
+        }
+        self.page.send("Input.dispatchKeyEvent", e)?;
         Ok(())
     }
 }
@@ -324,6 +373,10 @@ fn key_info(key: &str) -> (String, u32, Option<String>) {
         ("End", "End", 35, None),
         ("Space", "Space", 32, Some(" ")),
         (" ", "Space", 32, Some(" ")),
+        ("Shift", "ShiftLeft", 16, None),
+        ("Control", "ControlLeft", 17, None),
+        ("Alt", "AltLeft", 18, None),
+        ("Meta", "MetaLeft", 91, None),
     ];
     if let Some(n) = named.iter().find(|n| n.0 == key) {
         return (n.1.to_string(), n.2, n.3.map(str::to_string));

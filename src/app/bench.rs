@@ -7,6 +7,7 @@ use crate::driver::Driver;
 use crate::host;
 use crate::metrics;
 use crate::model::{self, Error, MetricDef, Result};
+use crate::png;
 use crate::probe::{self, Set};
 use crate::runner::Runner;
 use crate::stats::{self, Comparison};
@@ -230,6 +231,8 @@ struct Ctx<'a> {
     homes: BTreeMap<String, PathBuf>,
     /// `--check`: one block per series on head, one run per case, no statistics.
     check: bool,
+    /// A pixels block's snapshot folder (`--pixels`); `None` in every timed block.
+    pixels_dir: Option<PathBuf>,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -302,6 +305,7 @@ pub fn run(args: &Args) -> Result<Output> {
         launched: Default::default(),
         homes: BTreeMap::new(),
         check,
+        pixels_dir: None,
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -339,9 +343,20 @@ pub fn run(args: &Args) -> Result<Output> {
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
     let mut all_decided = true;
+    let pixels_only = args.has("pixels-only");
+    if pixels_only && variants.len() < 2 {
+        return Err(Error::usage("--pixels-only compares base with head: add --base <variant>"));
+    }
     for s in &series {
         let out = if check {
             check_series(&mut ctx, s, &mut variants, &config)?
+        } else if pixels_only {
+            let target = ctx.describe["targets"][&s.target].clone();
+            for v in variants.iter_mut() {
+                prepare_variant(v, &target, &config, false)?;
+            }
+            let pixels = pixels_series(&mut ctx, s, &variants)?;
+            json!({ "label": s.label(), "case": s.case, "kind": "pixels", "pixels": pixels, "decided": pixels.as_array().is_some_and(|a| a.iter().all(|p| p["state"] == "same")) })
         } else if leak_run {
             leak_series(&mut ctx, s, &mut variants, &config)?
         } else {
@@ -356,6 +371,23 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     if check {
         return check_output(&exp, &dir, &file, series_out, ctx.warnings);
+    }
+    if pixels_only {
+        let mut text = String::new();
+        for s in &series_out {
+            text += &format!("{}\n", s["label"].as_str().unwrap_or(""));
+            for p in s["pixels"].as_array().into_iter().flatten() {
+                text += &pixel_line(p);
+            }
+        }
+        text += &format!("\n{exp}\n");
+        let result = json!({ "id": exp, "kind": "pixels", "file": file, "created": super::record::now_iso(), "series": series_out, "warnings": ctx.warnings, "text": text });
+        store::write_json(&dir.join("result.json"), &result)?;
+        let mut out = Output::new(text, result);
+        if !all_decided {
+            out.code = 1;
+        }
+        return Ok(out);
     }
     let refresh = host::refresh_at(ctx.window.x + 20, ctx.window.y + 20);
     let result_json = json!({
@@ -709,13 +741,98 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     }
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
+    let pixels = if ctx.args.has("pixels") && variants.len() > 1 { pixels_series(ctx, s, variants)? } else { Value::Null };
+    if pixels.as_array().is_some_and(|a| a.iter().any(|p| p["state"] != "same")) {
+        warnings.push(validity::warn("PixelsDiffer", "base and head drew different pixels at a snapshot: see pixels"));
+    }
     Ok(json!({
+        "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
         "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
     }))
+}
+
+/// `--pixels`: untimed blocks run the case once each with `page.snapshot(name)` capturing the page: base twice,
+/// then head. The same build does not draw bit for bit the same twice (a GPU's blending and rasterization vary
+/// between launches: an A/A once differed in 4 to 109 pixels by 1 or 2 of 255), so base's two runs measure that
+/// noise per snapshot, and head differs only where it moves a pixel further than base moved against itself.
+fn pixels_series(ctx: &mut Ctx, s: &Series, variants: &[Variant]) -> Result<Value> {
+    let slug: String = s.label().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let root = store::experiment_dir(&ctx.exp)?.join("pixels").join(slug);
+    progress("  pixels blocks (one run each, untimed: base twice for the noise between launches, then head)");
+    let (check, runs) = (ctx.check, ctx.runs);
+    ctx.check = true;
+    ctx.runs = 1;
+    let mut failed = None;
+    for (v, folder) in [(&variants[0], "base"), (&variants[0], "base-again"), (&variants[1], "head")] {
+        ctx.pixels_dir = Some(root.join(folder));
+        if let Err(e) = block_on_screen(ctx, s, v, usize::MAX, Set::Lean, false) {
+            failed = Some(e);
+            break;
+        }
+    }
+    ctx.pixels_dir = None;
+    ctx.check = check;
+    ctx.runs = runs;
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let shots = |role: &str| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root.join(role)).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".png").map(str::to_string)).collect();
+        names.sort();
+        names
+    };
+    let (base_shots, head_shots) = (shots("base"), shots("head"));
+    let mut names: Vec<String> = base_shots.iter().chain(&head_shots).cloned().collect();
+    names.sort();
+    names.dedup();
+    let read = |role: &str, name: &str| std::fs::read(root.join(role).join(format!("{name}.png"))).ok().and_then(|b| png::read(&b).ok());
+    // The launch noise: the largest channel change base made against itself at any snapshot. One pair per
+    // snapshot underestimates it (a snapshot that drew the same twice once read as noise 0, then head moved 3
+    // pixels by 1 of 255), so it is the series', not each snapshot's.
+    let noise = names.iter().filter_map(|n| Some(png::diff(&read("base", n)?, &read("base-again", n)?, 0).max_delta)).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for name in names {
+        let entry = match (read("base", &name), read("head", &name)) {
+            (Some(b), Some(h)) => {
+                let d = png::diff(&b, &h, noise);
+                let diff_path = root.join(format!("{name}.diff.png"));
+                if let Some(img) = &d.image {
+                    std::fs::write(&diff_path, png::write(img)?)?;
+                }
+                json!({
+                    "name": name, "state": if d.differing == 0 { "same" } else { "differ" }, "differing": d.differing, "total": d.total, "max_delta": d.max_delta, "noise": noise,
+                    "diff": d.image.as_ref().map(|_| diff_path.display().to_string()), "base": root.join("base").join(format!("{name}.png")), "head": root.join("head").join(format!("{name}.png")),
+                })
+            }
+            (b, _) => json!({ "name": name, "state": if b.is_some() { "only base" } else { "only head" } }),
+        };
+        progress(format!("  pixels {name}: {}", entry["state"].as_str().unwrap_or("")));
+        out.push(entry);
+    }
+    Ok(Value::Array(out))
+}
+
+/// One snapshot's line: `same`, `differ` with how many pixels moved beyond the launch noise, or only one side.
+fn pixel_line(p: &Value) -> String {
+    let name = p["name"].as_str().unwrap_or("");
+    let n = |k: &str| p[k].as_u64().unwrap_or(0);
+    match p["state"].as_str().unwrap_or("") {
+        "same" if n("noise") > 0 => format!("  same     {name} (within launch noise, ±{} of 255)\n", n("noise")),
+        "same" => format!("  same     {name}\n"),
+        "differ" => format!(
+            "  differ   {name}: {} of {} pixels moved beyond launch noise (±{}), by up to {} of 255 → {}\n",
+            n("differing"),
+            n("total"),
+            n("noise"),
+            n("max_delta"),
+            p["diff"].as_str().unwrap_or("")
+        ),
+        other => format!("  {other:<8} {name}\n"),
+    }
 }
 
 /// `TailTooShort` (SPEC §10.1): a percentile needs its minimum n of the events it is a percentile of.
@@ -1031,7 +1148,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         lap("attach");
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
-        let driver = Driver::new(page.clone(), token.clone());
+        let mut driver = Driver::new(page.clone(), token.clone());
+        driver.pixels = ctx.pixels_dir.clone();
         let current = RefCell::new(String::new());
         // TaskDuration (ms), then WORK_PARTS: cumulative per document (`Performance.enable` comes before the runs).
         let counters = || -> [f64; 6] {
@@ -2241,6 +2359,12 @@ fn render(r: &Value) -> String {
                 attr["head"].as_str().unwrap_or("—"),
                 attr["head"].as_str().unwrap_or("rec_…")
             );
+        }
+        if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {
+            out += "\npixels\n";
+            for p in shots {
+                out += &pixel_line(p);
+            }
         }
         out += "\n";
     }

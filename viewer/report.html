@@ -1418,6 +1418,7 @@ const LABELS = {
   "main.tasks.long": "Long tasks (>50 ms)",
   "cpu.app.total": "Total app CPU",
   "cpu.process.total": "Total app CPU",
+  "cpu.work": "CPU time per run",
   "memory.app.private": "App memory (RAM)",
   "js.heap.used": "JS heap",
   "js.heap.growth": "JS heap growth",
@@ -2360,6 +2361,8 @@ function renderImpactStrip(s, imp, aa) {
     smoothCol = rp95 && !/^refused/.test(rp95.c.verdict || "")
       ? pillarEl("Smoothness", rp95, [], aa, `Frame render p95 · ~${Math.round(fpl)} paints/launch`)
       : inactivePillar("Smoothness", "Idle / static", `~${Math.round(fpl)} isolated paints per launch; no continuous animation stream.`);
+  } else if (s.target_kind === "script") {
+    smoothCol = inactivePillar("Smoothness", "No frames", "A script draws nothing on screen.");
   } else {
     smoothCol = inactivePillar("Smoothness", "Brief update", finite(fpl) && fpl > 0 ? `~${Math.round(fpl)} frames painted per launch (<30 needed to score pacing).` : "No frames recorded.");
   }
@@ -2369,11 +2372,13 @@ function renderImpactStrip(s, imp, aa) {
   const respCol = respCands.length
     ? (() => {
         const lead = pickHeadline(respCands);
-        return pillarEl("Responsiveness", lead, respCands.filter((x) => x !== lead).map((x) => metricSubRow(x, aa)), aa);
+        return pillarEl(s.target_kind === "script" ? "Duration" : "Responsiveness", lead, respCands.filter((x) => x !== lead).map((x) => metricSubRow(x, aa)), aa);
       })()
     : inactivePillar("Responsiveness", "Passive case", "Workload has no discrete user input events.");
 
-  const compCands = [find("main.work"), find("main.busy"), find("cpu.app.total")].filter(Boolean);
+  // CPU spent per run before CPU over run time: the second moves with run length (strobe tests it only
+  // when runs held their length).
+  const compCands = [find("main.work"), find("main.busy"), find("cpu.work"), find("cpu.app.total")].filter(Boolean);
   const compLead = pickHeadline(compCands);
   const compCol = compLead ? pillarEl("Compute", compLead, compCands.filter((x) => x !== compLead).map((x) => metricSubRow(x, aa)), aa) : inactivePillar("Compute", "—", "No CPU metrics recorded.");
 
@@ -2519,7 +2524,7 @@ function renderEvidenceSection(r, s, aa) {
       h("div", { class: "card-hd-left" },
         h("h2", { class: "sec-title" }, "Pair-by-pair consistency"),
         h("span", { class: `win-count-pill ${winTone}` }, winSummary),
-        h("span", { class: "sec-sub" }, "Alternating fresh browser launches (AB / BA)")
+        h("span", { class: "sec-sub" }, "Alternating fresh launches (AB / BA)")
       ),
       h("div", { class: "card-hd-right" }, picker)
     ),

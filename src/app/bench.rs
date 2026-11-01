@@ -540,10 +540,16 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     // Tail percentiles need enough frames in every block.
     let primary = tail_check(def, &blocks, primary);
-    // Secondaries: gated on the primary, Holm-corrected.
+    // Secondaries: gated on the primary, Holm-corrected. A script's CPU per run is its main.work, so it
+    // is tested like main.busy is for a page.
+    let script = target["kind"] == "script";
+    // `cpu.app.total` is CPU over run time: once runs get shorter or longer, its move says nothing about
+    // the CPU they spent (a run 84% shorter for 80% less CPU reads +28%), so it is then context.
+    let rate_context = !same(&blocks, &pairs, "run.duration", bound);
     let mut names: Vec<String> = s.metrics.clone();
-    for m in DEFAULT_SECONDARIES {
-        if !names.iter().any(|n| n == m) && *m != s.primary && !(s.primary == "cpu.process.total" && *m == "cpu.app.total") {
+    for m in DEFAULT_SECONDARIES.iter().copied().chain(script.then_some("cpu.work")) {
+        let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context);
+        if !skip {
             names.push(m.to_string());
         }
     }
@@ -576,7 +582,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let holm_pairs = (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests as f64).unwrap_or(60);
     let mut descriptive: Vec<Comparison> = Vec::new();
     // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
-    let found: Vec<String> = blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work").cloned().collect()).unwrap_or_default();
+    let found: Vec<String> =
+        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
         if name == s.primary || names.iter().any(|n| n == name) {
@@ -644,7 +651,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
-        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
+        "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
         "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
@@ -690,6 +697,16 @@ fn mean_steps(blocks: &[Block]) -> Vec<(String, f64)> {
 
 fn val(b: &Block, name: &str) -> f64 {
     b.values.get(name).copied().unwrap_or(f64::NAN)
+}
+
+/// Whether `name` held on both sides: within the equivalence bound, or absent from the blocks.
+fn same(blocks: &[Block], pairs: &[(usize, usize)], name: &str, bound: f64) -> bool {
+    let Some(d) = model::metric(name) else { return true };
+    if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
+        return true;
+    }
+    let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
+    stats::compare(name, d, &pp, bound, 0.95).verdict.starts_with("same")
 }
 
 fn change(c: &Comparison) -> String {

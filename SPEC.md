@@ -1548,8 +1548,11 @@ and nothing else from them is emitted.
 - `command()` targets and every strobe.json command go to `cmd /d /s /c "<line>"` verbatim on
   Windows (`raw_arg`): Rust's argument quoting escaped a line's own quotes the way cmd does not read
   them. Default tested secondaries:
-  `frames.interval.p95`, `frames.dropped.pct`, `main.busy`, `interaction.p95`, `cpu.app.total`;
-  everything else in the descriptive list gets an interval and no claim.
+  `frames.interval.p95`, `frames.dropped.pct`, `main.busy`, `interaction.p95`, `cpu.app.total`, and
+  `cpu.work` for script targets (a script's main.work); everything else in the descriptive list gets
+  an interval and no claim. `cpu.app.total` is CPU over run time, so it is tested only while
+  `run.duration` is the same on both sides: a run 84% shorter for 80% less CPU read +28% "more".
+  Otherwise it is context.
 - `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the
   driver's dispatch times; `display.hz` comes from vsync spacing in the trace.
 - `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` switches plans

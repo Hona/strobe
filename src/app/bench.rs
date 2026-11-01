@@ -730,7 +730,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                         if scripts > 0.0 && mapped / scripts < 0.95 {
                             warnings.push(validity::warn(
                                 "Unresolved",
-                                format!("{}: {:.0}% of script samples have no source map, so their names and files stay minified; build with source maps", v.role, 100.0 * (1.0 - mapped / scripts)),
+                                format!(
+                                    "{}: {:.0}% of script samples have no source map, so their names and files stay minified; strobe builds with STROBE_SOURCEMAP=hidden: let the bundler read it (Vite: build: {{ sourcemap: process.env.STROBE_SOURCEMAP }}), which ships the same scripts",
+                                    v.role,
+                                    100.0 * (1.0 - mapped / scripts)
+                                ),
                             ));
                         }
                     }
@@ -2220,6 +2224,10 @@ fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
     progress(format!("  build {role}: {cmd}"));
     let mut c = shell(cmd);
     c.current_dir(&cwd);
+    // Source maps for attribution without changing what ships: a bundler config that reads this (Vite:
+    // `build: { sourcemap: process.env.STROBE_SOURCEMAP }`) writes each map beside its script without the
+    // `sourceMappingURL` comment, so the served scripts stay byte for byte the production ones.
+    c.env("STROBE_SOURCEMAP", "hidden");
     if let Some(env) = build["env"].as_object() {
         for (k, v) in env {
             c.env(k, v.as_str().unwrap_or(""));

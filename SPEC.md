@@ -801,6 +801,11 @@ it, for app profiles they use from anywhere; `apps` merge per app.
   existed (no serve script, no `strobe.json`) runs the way head does. A worktree strobe made for a
   git ref is strobe's own: head's harness replaces the ref's. A directory of the user's only gets
   the files it lacks, and strobe names any it kept.
+- **Source maps:** every build strobe runs has `STROBE_SOURCEMAP=hidden` in its environment. A
+  bundler config that reads it (Vite: `build: { sourcemap: process.env.STROBE_SOURCEMAP }`) writes
+  each map beside its script without the `sourceMappingURL` comment, so the scripts served are
+  byte for byte the production ones while attribution names every frame. strobe finds a map
+  through the comment, else at `<script>.map`. The `Unresolved` warning says this.
 - A build folder (`build.cwd`) with its own `bun.lock` and no `node_modules` gets
   `bun install --frozen-lockfile` before the build: a package below the repository root has none in
   a fresh worktree.

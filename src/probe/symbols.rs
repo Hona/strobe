@@ -105,10 +105,10 @@ fn fetch_maps(page: &Page, urls: &[&String]) -> Vec<Option<Fetched>> {
     // The last such comment, however long: an inline data: map is the whole map in base64.
     const at = Math.max(s.lastIndexOf('//# sourceMappingURL='), s.lastIndexOf('//@ sourceMappingURL='))
     const m = at < 0 ? null : /^\/\/[#@] sourceMappingURL=(\S+)/.exec(s.slice(at))
-    if (!m) return null
-    const href = new URL(m[1], u).href
+    // Without the comment, a hidden map (STROBE_SOURCEMAP=hidden) sits beside its script as <script>.map.
+    const href = m ? new URL(m[1], u).href : u.split(/[?#]/)[0] + '.map'
     const r = await fetch(href)
-    if (!r.ok) return null
+    if (!r.ok || (!m && !/^\s*\{{/.test(await r.clone().text()))) return null
     const lines = [0]
     for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) lines.push(i + 1)
     return {{ url: href, text: await r.text(), lines }}

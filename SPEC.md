@@ -292,6 +292,8 @@ runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak 
 `--check` validates the file: one block per series on `--head`, one run per case, no warmup and
 no statistics. Each case passes, with its declared metrics' values from that run, or fails with
 the refusal, the page's URL and its screenshot; the next case still runs, and any failure exits 1.
+`--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
+a bench) and prints its recording, to profile one build before there is anything to compare.
 `--head` alone is an error that suggests `--base` or `--check`. `--runs` is the measured runs per
 block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
 described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
@@ -1563,6 +1565,16 @@ and nothing else from them is emitted.
   an interval and no claim. `cpu.app.total` is CPU over run time, so it is tested only while
   `run.duration` is the same on both sides: a run 84% shorter for 80% less CPU read +28% "more".
   Otherwise it is context.
+- `frames.dropped` counts vsyncs Chromium reports `STATE_DROPPED` (PipelineReporter), except one
+  followed by a vsync where the page wanted no update (`STATE_NO_UPDATE_DESIRED`): no content was
+  waiting for it, so nothing on screen was late. A page drawing at 30 fps on a 165 Hz display asks
+  for a frame between its updates, and Chromium reported the vsync it missed as dropped (BACKFILL):
+  20% "choppier" for updates that came every 36.4 ms, as before.
+- `cpu.renderer`, `cpu.gpu` and `cpu.browser` split a Chromium target's CPU by process type, from
+  the same cycle counter, with each pid's type from `SystemInfo.getProcessInfo` at the start and
+  end of every run (a process born during a run counts from zero). Descriptive unless declared:
+  they say where `cpu.app.total` goes (an idle page drawing at 30 fps spent most of it in the GPU
+  process, not the renderer).
 - `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the
   driver's dispatch times; `display.hz` comes from vsync spacing in the trace.
 - `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` switches plans

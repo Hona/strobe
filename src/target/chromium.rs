@@ -142,7 +142,8 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--disable-sync".into(),
         "--disable-default-apps".into(),
         "--disable-client-side-phishing-detection".into(),
-        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,EdgeCollections,msEdgeShopping,EdgeWallet,msImplicitSignin".into(),
+        // LaunchOnStartup*: Chrome's "launches when Windows starts" offer, a banner over the page.
+        "--disable-features=Translate,OptimizationHints,MediaRouter,DialMediaRouteProvider,AutofillServerCommunication,EdgeCollections,msEdgeShopping,EdgeWallet,msImplicitSignin,LaunchOnStartup,LaunchOnStartupInfoBar".into(),
         "--metrics-recording-only".into(),
         // A measurement never plays sound on the user's speakers; Web Audio still renders.
         "--mute-audio".into(),
@@ -151,6 +152,12 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--disable-blink-features=AutomationControlled".into(),
         "--password-store=basic".into(),
         "--use-mock-keychain".into(),
+        // No banners over the page (Chrome for Testing's notice, launch-at-login offers) and nothing that
+        // registers to run at login: a banner shrinks the viewport, and one dismissed mid-run resizes it.
+        "--disable-infobars".into(),
+        "--no-service-autorun".into(),
+        "--disable-component-update".into(),
+        "--disable-search-engine-choice-screen".into(),
         format!("--window-position={},{}", window.x, window.y),
         format!("--window-size={},{}", window.width, window.height),
     ];
@@ -219,8 +226,17 @@ pub fn http_get(host: &str, path: &str) -> Result<String> {
 impl Browser {
     /// The first page target, attached with a flat session.
     pub fn page(&self) -> Result<Page> {
-        let targets = self.cdp.send("Target.getTargets", json!({}), None)?;
-        let target = targets["targetInfos"].as_array().and_then(|a| a.iter().find(|t| t["type"] == "page")).and_then(|t| t["targetId"].as_str()).map(str::to_string);
+        // A browser strobe launched opens its about:blank window a moment after its debugging port: wait for
+        // that page rather than create a second window beside it, which stayed open and blank all run.
+        let deadline = std::time::Instant::now() + Duration::from_secs(if self.child.is_some() { 5 } else { 0 });
+        let target = loop {
+            let targets = self.cdp.send("Target.getTargets", json!({}), None)?;
+            let found = targets["targetInfos"].as_array().and_then(|a| a.iter().find(|t| t["type"] == "page")).and_then(|t| t["targetId"].as_str()).map(str::to_string);
+            if found.is_some() || std::time::Instant::now() >= deadline {
+                break found;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        };
         let target = match target {
             Some(t) => t,
             None => self.cdp.send("Target.createTarget", json!({ "url": "about:blank" }), None)?["targetId"].as_str().unwrap_or("").to_string(),

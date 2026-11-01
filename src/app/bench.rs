@@ -16,7 +16,7 @@ use crate::target::electron;
 use crate::validity::{self, Warning};
 use serde::Serialize;
 use serde_json::{Value, json};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -60,6 +60,9 @@ const DESCRIPTIVE: &[&str] = &[
     "style.count",
     "scroll.latency.p95",
     "run.duration",
+    "cpu.renderer",
+    "cpu.gpu",
+    "cpu.browser",
     "gpu.process.3d",
     "gpu.vram",
     "memory.app.private",
@@ -139,10 +142,26 @@ struct Run {
     task: f64,
     /// Per run, the Performance domain's other counters in `WORK_PARTS` order.
     parts: [f64; 5],
+    /// CPU (% of a core) of the browser's renderer, GPU and browser processes, in `PROCESS_ROLES` order.
+    roles: [f64; 3],
     t0: u64,
     t1: u64,
     /// The run with its reset (ms): what it cost the block.
     total: f64,
+}
+
+/// Chromium process types (`SystemInfo.getProcessInfo`) and the metric each one's CPU goes to.
+const PROCESS_ROLES: [(&str, &str); 3] = [("renderer", "cpu.renderer"), ("GPU", "cpu.gpu"), ("browser", "cpu.browser")];
+
+/// Each Chromium process's index in `PROCESS_ROLES`, by pid; empty where the browser does not say.
+fn process_roles(browser: &chromium::Browser) -> BTreeMap<u32, usize> {
+    let info = browser.cdp.send("SystemInfo.getProcessInfo", json!({}), None).unwrap_or(Value::Null);
+    info["processInfo"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| Some((p["id"].as_u64()? as u32, PROCESS_ROLES.iter().position(|(t, _)| p["type"].as_str() == Some(*t))?)))
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -371,10 +390,28 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         Err(e) => (false, json!(e.message), Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
+    // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
+    // where a single build spends its time before there is anything to compare.
+    let mut attribution = Value::Null;
+    if passed && ctx.args.get("why") == Some("always") {
+        progress("  attribution block (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
+        let v = &variants[0];
+        // Warmed and run as in a bench: `--check`'s single cold run would start no profiler.
+        ctx.check = false;
+        let attributed = if s.launch.is_object() { launch::attribution(ctx, s, v) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+        ctx.check = true;
+        match attributed {
+            Ok(b) => {
+                progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
+                attribution = json!(b.recording);
+            }
+            Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", v.role, e.message))),
+        }
+    }
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "values": values, "elapsed_ms": elapsed_ms,
+        "passed": passed, "decided": passed, "error": error, "values": values, "elapsed_ms": elapsed_ms, "attribution": attribution,
     }))
 }
 
@@ -388,6 +425,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!("pass  {}  {value}  {secs:.1} s\n", s["label"].as_str().unwrap_or(""));
+            if let Some(rec) = s["attribution"].as_str() {
+                text += &format!("      why  {rec} · strobe query {rec} hotspots --by package\n");
+            }
         } else {
             text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
         }
@@ -991,6 +1031,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 *c.entry(k).or_default() += n;
             }
         };
+        // An attribution block's profiles, one pair per document: a page load ends the V8 profilers with
+        // their document, so each `goto` (in a run or a reset) closes a segment and starts the next.
+        let profiling = Cell::new(false);
+        let segments: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -1006,7 +1050,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                             add_counts(page_counts());
                         }
                     }
-                    driver.dispatch(call, &args)
+                    let segment = call == "goto" && profiling.get();
+                    if segment {
+                        segments.borrow_mut().push((probe::cpu::stop(&page)?, probe::alloc::stop(&page)?));
+                    }
+                    let r = driver.dispatch(call, &args);
+                    if segment {
+                        probe::cpu::start(&page)?;
+                        probe::alloc::start(&page)?;
+                    }
+                    r
                 }
                 "count" => {
                     if !current.borrow().is_empty() {
@@ -1084,6 +1137,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
             // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between.
             let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+            let by_role = |procs: &[host::ProcTimes], roles: &BTreeMap<u32, usize>| -> [u64; 3] {
+                let mut out = [0u64; 3];
+                for p in procs {
+                    if let Some(i) = roles.get(&p.pid) {
+                        out[*i] += p.cycles;
+                    }
+                }
+                out
+            };
+            let mut roles = process_roles(&browser);
+            let procs_start = browser.processes();
             let (cyc0, tsc0) = cycles();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             *carried.borrow_mut() = [0.0; 6];
@@ -1105,6 +1169,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
             let (cyc1, tsc1) = cycles();
+            let procs_end = browser.processes();
+            roles.extend(process_roles(&browser));
+            let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
                 add_counts(page_counts());
             }
@@ -1130,7 +1197,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             };
             let carry = *carried.borrow();
             let parts = std::array::from_fn(|i| c1[i + 1] + carry[i + 1] - c0[i + 1]);
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
+            // Cycles only: a process's share needs the exact counter, and a process born during the run
+            // (a renderer after a cross-site navigation) counts from zero.
+            let roles = std::array::from_fn(|i| match (tsc0, tsc1) {
+                (Some(a), Some(b)) if b > a && !roles.is_empty() => 100.0 * role1[i].saturating_sub(role0[i]) as f64 / (b - a) as f64,
+                _ => f64::NAN,
+            });
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -1177,6 +1250,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 if set == Set::Attribution {
                     probe::cpu::start(&page)?;
                     probe::alloc::start(&page)?;
+                    profiling.set(true);
                 }
                 if let Some(dir) = &mem_dir {
                     let mut c = probe::census::take(&browser, &page);
@@ -1230,17 +1304,22 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         std::fs::create_dir_all(&dir)?;
         let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, ctx.runs)?) } else { None };
         if set == Set::Attribution {
-            let profile = probe::cpu::stop(&page)?;
-            let allocs = probe::alloc::stop(&page)?;
-            store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
-            store::write_json(&dir.join("alloc-0.heapprofile"), &allocs)?;
+            profiling.set(false);
+            let mut segments = segments.take();
+            segments.push((probe::cpu::stop(&page)?, probe::alloc::stop(&page)?));
+            for (k, (profile, allocs)) in segments.iter().enumerate() {
+                store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
+                store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
+            }
             // The page's source maps, kept with the recording while its server still runs, so any view
             // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
             // `build.output`) turns original sources into files on disk.
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
             let mut scripts = std::collections::BTreeSet::new();
-            probe::symbols::urls(&profile, &mut scripts);
-            probe::symbols::urls(&allocs, &mut scripts);
+            for (profile, allocs) in &segments {
+                probe::symbols::urls(profile, &mut scripts);
+                probe::symbols::urls(allocs, &mut scripts);
+            }
             probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
             lap("maps");
         }
@@ -1296,6 +1375,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
+        for (i, (_, metric)) in PROCESS_ROLES.iter().enumerate() {
+            let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.roles[i].is_finite()).map(|(j, r)| (key(j), r.roles[i])).collect();
+            if !per_run.is_empty() {
+                extra.insert(metric.to_string(), per_run);
+            }
+        }
         if !gpu_3d.is_empty() {
             extra.insert("gpu.process.3d".to_string(), gpu_3d);
         }

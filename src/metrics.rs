@@ -65,6 +65,15 @@ pub fn vsyncs(frames: &[Frame]) -> Vec<Vsync> {
         })
         .collect();
     out.sort_by_key(|v| v.ts);
+    // A dropped vsync followed by one where the page wanted no update lost nothing on screen: no content was
+    // waiting for it. A page drawing at 30 fps on a 165 Hz display asked for a frame between its updates and
+    // Chromium reported the vsync it missed as dropped (BACKFILL), which read as 20% "choppier" for a page
+    // whose updates came every 36.4 ms, as before.
+    for i in 0..out.len().saturating_sub(1) {
+        if out[i].outcome == Outcome::Dropped && out[i + 1].outcome == Outcome::NoUpdate {
+            out[i].outcome = Outcome::NoUpdate;
+        }
+    }
     out
 }
 

@@ -95,6 +95,8 @@ Use
   status                          environment, validity preflight, recent recordings and experiments
   record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>]
                                   record a target; prints a handle (rec_…)
+  record --bench <file.bench.ts>#<case> [--head <variant>]
+                                  record one bench case (it drives the page: clicks, keys) with the attribution probes
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)

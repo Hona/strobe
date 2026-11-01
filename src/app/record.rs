@@ -15,11 +15,42 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+/// `record --bench <file.bench.ts>#<case>`: one bench case on this checkout (or `--head <variant>`), recorded with
+/// the attribution probes (CPU and allocation profiles, forced layouts, GC, the GPU process's work, a heap
+/// snapshot). The case drives the page, so a flow behind a click or a key records as easily as a URL. It is a
+/// bench `--check` with an attribution block: setup, warmup until steady, then the measured runs under the
+/// profilers.
+fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
+    let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
+    b.set("filter", case);
+    for k in ["target", "params", "id", "pin", "power"] {
+        if let Some(v) = args.get(k) {
+            b.set(k, v);
+        }
+    }
+    let out = super::bench::run(&b)?;
+    let recordings: Vec<Value> = out.json["series"].as_array().into_iter().flatten().filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()? }))).collect();
+    if recordings.is_empty() {
+        return Err(Error::msg(format!("{case}: no recording (the case failed or matched nothing):\n{}", out.text)));
+    }
+    let mut text = String::new();
+    for r in &recordings {
+        let rec = r["recording"].as_str().unwrap_or("");
+        text += &format!("{rec} · {} · attribution\nnext     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n", r["case"].as_str().unwrap_or(""));
+    }
+    Ok(Output::new(text, json!({ "recordings": recordings })))
+}
+
 pub fn run(args: &Args) -> Result<Output> {
-    let target = args.pos.first().ok_or_else(|| Error::usage("record needs a target: strobe record https://… [--for 10s]"))?.clone();
+    if let Some(spec) = args.get("bench") {
+        let (file, case) = spec.rsplit_once('#').ok_or_else(|| Error::usage("--bench <file.bench.ts>#<case> (a case glob such as show* works)"))?;
+        return bench_case(args, file, case);
+    }
+    let target = args.pos.first().ok_or_else(|| Error::usage("record needs a target: strobe record https://… [--for 10s], or --bench <file>#<case>"))?.clone();
     if let Some(path) = target.strip_prefix("file:") {
         return super::query::import(path);
     }
+
     let set = Set::parse(args.get("probes").unwrap_or("timing")).ok_or_else(|| Error::usage("--probes: timing, attribution or memory"))?;
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,

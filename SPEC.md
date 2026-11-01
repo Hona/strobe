@@ -267,9 +267,11 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 
 - One recording; returns its handle, validity and a summary.
 - Default probe set: `timing`. `--probes attribution,memory` and friends per §8.1.
-- `--for` records for a duration; `--bench` runs one block of one case (the target comes from
-  the bench file when `<target>` names one of its targets); neither: until Enter (CLI) or
-  `timeout` (MCP).
+- `--for` records for a duration; neither it nor `--bench`: until Enter (CLI) or `timeout` (MCP).
+- `--bench <file>#<case>` records a bench case (a case glob matches) on `--head` (default `.`),
+  so a flow behind clicks or keys records as easily as a URL. It runs as `bench --check --why
+  always`: setup, warmup until steady, then the measured runs under the attribution probes; it
+  prints the recording handle per matching series. No `<target>` is needed: the bench file names it.
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).

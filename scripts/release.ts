@@ -11,7 +11,8 @@ import { copyFileSync } from "node:fs"
 import { join } from "node:path"
 import { parseArgs } from "node:util"
 
-const { values } = parseArgs({ options: { bin: { type: "string" }, publish: { type: "boolean", default: false } } })
+// --otp: npm's one-time password for an account with two-factor publishing (CI uses a token instead).
+const { values } = parseArgs({ options: { bin: { type: "string" }, publish: { type: "boolean", default: false }, otp: { type: "string" } } })
 const root = join(import.meta.dir, "..")
 const cargo = await Bun.file(join(root, "Cargo.toml")).text()
 const version = cargo.match(/^version = "([^"]+)"/m)?.[1]
@@ -42,6 +43,7 @@ for (const dir of packages) {
     console.log(`${name}@${version}: already on npm`)
     continue
   }
-  if (values.publish) await $`npm publish --access public`.cwd(join(root, dir))
+  const otp = values.otp ? ["--otp", values.otp] : []
+  if (values.publish) await $`npm publish --access public ${otp}`.cwd(join(root, dir))
   else await $`npm pack --dry-run`.cwd(join(root, dir))
 }

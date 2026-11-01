@@ -955,6 +955,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if !app && target.get("viewport").is_some_and(Value::is_object) {
             browser.fit_viewport(&page, window.width, window.height)?;
         }
+        // The driver's frame waits use the browser's own rAF, kept before the page's scripts can replace it.
+        page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": crate::driver::NATIVE_RAF }))?;
         // `count.<name>` metrics: the page counts through a global installed in every document it loads.
         if !counted.is_empty() {
             page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": COUNT_SCRIPT }))?;

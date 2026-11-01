@@ -5,9 +5,15 @@ use crate::target::chromium::Page;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// Installed lazily in the page (it disappears on navigation). Observers only: nothing polls.
+/// Installed in every document before its scripts run: the browser's own rAF, which a page may replace (a game
+/// frame pacer does) and so delay the driver's waits on its own schedule.
+pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFrame.bind(window)";
+
+/// Installed lazily in the page (it disappears on navigation). Observers only: nothing polls, except a check per
+/// frame while a CSS animation or transition runs, since those change what is visible without a mutation.
 const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
+  const raf = window.__strobeRaf ?? window.requestAnimationFrame.bind(window)
   // What a person could see: a box, and not hidden by `visibility`, `opacity: 0` or `content-visibility` on it or an ancestor.
   const visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (el.checkVisibility?.({ checkOpacity: true, checkVisibilityCSS: true }) ?? true) }
   // Shadow roots (a diff or code viewer renders into one): every observer below watches them too, so `idle` and
@@ -50,11 +56,26 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   // `:focus` selector would otherwise never resolve.
   s.waitFor = (sel, timeout, text, exact) => new Promise((resolve, reject) => {
     if (s.find(sel, text, exact)) return resolve(true)
-    const check = () => { if (s.find(sel, text, exact)) { stop(); clearTimeout(t); resolve(true) } }
-    const unwatch = observe(check, { subtree: true, childList: true, attributes: true, characterData: text != null })
-    document.addEventListener("focusin", check, true)
-    document.addEventListener("focusout", check, true)
-    const stop = () => { unwatch(); document.removeEventListener("focusin", check, true); document.removeEventListener("focusout", check, true) }
+    let done = false
+    const check = () => { if (!done && s.find(sel, text, exact)) { stop(); clearTimeout(t); resolve(true) } }
+    // A fade in (opacity from 0) makes an element visible on a frame, not on a mutation: while any animation or
+    // transition runs, check each frame.
+    let ticking = false
+    const tick = () => {
+      check()
+      if (!done && document.getAnimations().some((a) => a.playState === "running")) raf(tick)
+      else ticking = false
+    }
+    const animating = () => { if (!ticking && !done) { ticking = true; raf(tick) } }
+    const unwatch = observe(() => { check(); animating() }, { subtree: true, childList: true, attributes: true, characterData: text != null })
+    const events = ["focusin", "focusout", "animationstart", "transitionrun"]
+    for (const e of events) document.addEventListener(e, e.startsWith("focus") ? check : animating, true)
+    const stop = () => {
+      done = true
+      unwatch()
+      for (const e of events) document.removeEventListener(e, e.startsWith("focus") ? check : animating, true)
+    }
+    animating()
     const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : (exact ? " with exactly " : " containing ") + JSON.stringify(text)))) }, timeout)
   })
   s.idle = (quiet, timeout) => new Promise((resolve, reject) => {
@@ -66,7 +87,7 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     const limit = setTimeout(() => { stop(); reject(new Error("the page never went idle (DOM kept changing for " + timeout + " ms)")) }, timeout)
     kick()
   })
-  s.frame = () => new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))
+  s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))
   s.nodes = () => document.getElementsByTagName("*").length
   return s
 })(), true"#;

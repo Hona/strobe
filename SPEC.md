@@ -894,7 +894,7 @@ renders into one (a diff or code viewer) counts as a change.
 | `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
 | `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P` |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
-| `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too |
+| `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too. While a CSS animation or transition runs it also checks once per frame: a fade in from `opacity: 0` makes an element visible on a frame, not on a mutation (a game menu's buttons were seen only at the next unrelated DOM change, 13 ms late on one build and not the other). Frame waits use the browser's own rAF, kept before the page's scripts run, so a page that replaces rAF (a frame pacer) does not set strobe's clock |
 | `idle(opts?)` | the `"idle"` wait below, on its own |
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |

@@ -117,6 +117,9 @@ pub struct BlockData {
     pub shifts: BTreeMap<String, Vec<(i64, f64)>>,
     /// Main-thread GC slice durations per window key (ns). Only in traces with `disabled-by-default-v8.gc`.
     pub gc: BTreeMap<String, Vec<i64>>,
+    /// The GPU process's outermost shader and pipeline compile slices per window key (ns), on any of its
+    /// threads. Only in traces with the Dawn categories.
+    pub gpu_compile: BTreeMap<String, Vec<i64>>,
 }
 
 impl BlockData {
@@ -136,6 +139,16 @@ impl BlockData {
         self.latencies = std::mem::take(&mut self.latencies).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.shifts = std::mem::take(&mut self.shifts).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.gc = std::mem::take(&mut self.gc).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.gpu_compile = std::mem::take(&mut self.gpu_compile).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+    }
+
+    /// GPU-process compile time of each run window (ms), 0 for a run that compiled nothing.
+    pub fn gpu_compile_per_run(&self, prefix: &str) -> BTreeMap<String, f64> {
+        self.windows
+            .iter()
+            .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
+            .map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gpu_compile.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6)))
+            .collect()
     }
 
     /// Main-thread GC time of each run window (ms), 0 for a run without a collection.
@@ -197,7 +210,13 @@ select 'gc', w.k, s.ts, s.dur, null, null
   from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
   join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
   left join slice p on p.id = s.parent_id
-  where s.name glob 'V8.GC_*' and t.name = 'CrRendererMain' and (p.name is null or p.name not glob 'V8.GC_*');
+  where s.name glob 'V8.GC_*' and t.name = 'CrRendererMain' and (p.name is null or p.name not glob 'V8.GC_*')
+union all
+select 'gpuc', w.k, s.ts, s.dur, null, null
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) join process pr using(upid)
+  join _w w on s.ts >= w.t0 and s.ts < w.t1
+  where pr.name glob 'GPU*' and s.category glob '*gpu.dawn*' and (s.name glob '*Compile*' or s.name glob '*APICreate*Pipeline*')
+    and not exists (select 1 from ancestor_slice(s.id) a where a.name glob '*Compile*' or a.name glob '*APICreate*Pipeline*');
 "#
     );
     let table = engine::query(trace, &sql)?;
@@ -216,6 +235,7 @@ select 'gc', w.k, s.ts, s.dur, null, null
             "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),
             "shift" => data.shifts.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))),
             "gc" => data.gc.entry(key).or_default().push(num(&row[3])),
+            "gpuc" => data.gpu_compile.entry(key).or_default().push(num(&row[3])),
             _ => {}
         }
     }

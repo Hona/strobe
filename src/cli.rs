@@ -103,7 +103,7 @@ Use
         [--bisect good..bad]           (the commit that moved the primary; one series)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
-                                  views: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql
+                                  views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report

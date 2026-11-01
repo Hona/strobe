@@ -395,7 +395,7 @@ The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`.
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
 `net.bytes` with an optional `{<url glob>}` (§8.1), and `launch.<milestone>` (§9.6). Metrics a
 series declares beyond the defaults may switch on what measures them: `count.*` installs the page
-counter, `canvas.*` the canvas frame hook (§8.4), `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
+counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Dawn categories, `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
 `disabled-by-default-v8.gc` category. Only that series' blocks pay for it, base and head alike.
 
 ### 7.2 Frames
@@ -521,6 +521,14 @@ A counter is an exact metric per run, `count.<name>`. Two sources add to it:
 
 A counter the page never touched reads 0. Compare builds that both count: a base without the
 counter reads 0, not "unknown".
+
+**GPU compiles** (`gpu.compile`): the time the browser's GPU process spends creating pipelines
+(`DeviceBase::APICreate*Pipeline*`) and compiling shaders (`*Compile*`), per run, on any of its
+threads, outermost slices only so a compile inside a pipeline counts once. It reads the Dawn trace
+category, on only for a series that declares it. A pipeline whose shaders come from the cache
+still costs its creation. The page's own threads never show this: a game's first frame once froze
+4.4 s here while its main thread was idle. `strobe query <rec> gpu` lists the GPU process's work by
+name from attribution traces (which carry the Dawn category).
 
 **Canvas frames** (`canvas.frames`, `canvas.interval.p50|p95|p99|max`): the page's own frames, at its own
 frame rate. Presented frames count compositor vsyncs, so a game drawing 60 frames a second on a

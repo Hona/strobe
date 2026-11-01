@@ -49,6 +49,7 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
+        "gpu" => gpu(&trace, top),
         "hotspots" | "alloc" => {
             let by = args.get("by").unwrap_or("function");
             if !matches!(by, "function" | "file" | "package") {
@@ -73,7 +74,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             memory(&dir, by, top, args.get("at"))
         }
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql"))),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql"))),
     }
 }
 
@@ -620,6 +621,20 @@ fn frames(trace: &Path, meta: &Value, top: usize) -> Result<Output> {
         text,
         json!({ "presented": ms.len(), "dropped_pct": dropped, "latency": { "p50": q(0.5), "p95": q(0.95), "p99": q(0.99) }, "values": values, "worst": worst, "phases": phase_json }),
     ))
+}
+
+/// The GPU process's work by name: its named tasks below the task loop on every thread (WebGPU command
+/// decoding, shader and pipeline compiles from attribution traces, compositing), heaviest first. A shader
+/// compile that froze a game's first frame for seconds showed here and nowhere in the page's own threads.
+fn gpu(trace: &Path, top: usize) -> Result<Output> {
+    let sql = format!(
+        "select t.name as thread, s.name, count(*) as n, round(sum(s.dur) / 1e6, 1) as total_ms, round(max(s.dur) / 1e6, 1) as max_ms
+         from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) join process p using(upid)
+         where p.name glob 'GPU*' and s.dur > 0 and s.depth between 1 and 4
+           and s.name not in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask', 'SequenceManager::DoIdleWork')
+         group by 1, 2 order by total_ms desc limit {top}"
+    );
+    sql_view(trace, &sql, top)
 }
 
 fn threads(trace: &Path, top: usize) -> Result<Output> {

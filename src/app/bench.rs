@@ -1084,6 +1084,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     let nets: Vec<String> = declared.iter().filter(|m| m.starts_with("net.")).map(|m| m.to_string()).collect();
     let shift = declared.iter().any(|m| *m == "layout.shift");
     let gc = declared.iter().any(|m| *m == "main.gc");
+    let gpu_compile = declared.iter().any(|m| *m == "gpu.compile");
     let canvas = declared.iter().any(|m| m.starts_with("canvas."));
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
@@ -1261,7 +1262,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
-        let extra_categories: Vec<&str> = [(shift, "loading"), (gc, "disabled-by-default-v8.gc")].into_iter().filter(|c| c.0).map(|c| c.1).collect();
+        let extra_categories: Vec<&str> = [(shift, "loading"), (gc, "disabled-by-default-v8.gc"), (gpu_compile, "gpu.dawn"), (gpu_compile, "disabled-by-default-gpu.dawn")]
+            .into_iter()
+            .filter(|c| c.0)
+            .map(|c| c.1)
+            .collect();
         let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         let mut census: Vec<Value> = Vec::new();
@@ -1531,6 +1536,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         if gc && set != Set::Memory {
             extra.insert("main.gc".to_string(), data.gc_per_run("run"));
+        }
+        if gpu_compile && set != Set::Memory {
+            extra.insert("gpu.compile".to_string(), data.gpu_compile_per_run("run"));
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);

@@ -23,7 +23,9 @@ pub fn categories(set: Set) -> Vec<&'static str> {
         // Only what attribution views read: JS stacks on layout and style events (`query layout`) and GC
         // phases (`query gc`). Invalidation tracking, `blink` and `v8.execute` recorded a million slices
         // nothing read and raised a profiled run's main-thread work by 40–50% against its timed pairs.
-        Set::Attribution => c.extend(["disabled-by-default-devtools.timeline.stack", "disabled-by-default-v8.gc"]),
+        // `gpu.dawn`: the GPU process's WebGPU work (`query gpu`): shader and pipeline compiles, command
+        // decoding.
+        Set::Attribution => c.extend(["disabled-by-default-devtools.timeline.stack", "disabled-by-default-v8.gc", "gpu.dawn"]),
         Set::Memory => c.extend(["disabled-by-default-memory-infra", "disabled-by-default-v8.gc"]),
     }
     c

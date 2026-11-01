@@ -95,13 +95,14 @@ Use
   status                          environment, validity preflight, recent recordings and experiments
   record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>]
                                   record a target; prints a handle (rec_…)
-  bench <file.bench.ts> --head <variant> [--base <variant> | --aa] [--filter <case>] [--pairs auto|N]
+  bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
+        [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--bisect good..bad]           (the commit that moved the primary; one series)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
-                                  views: summary frames threads hotspots alloc layout gc heap leaks memory insights sql
+                                  views: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report

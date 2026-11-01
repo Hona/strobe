@@ -35,7 +35,9 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     const found = [...root.querySelectorAll(first)]
     return rest.length ? found.flatMap((host) => (host.shadowRoot ? query(host.shadowRoot, rest) : [])) : found
   }
-  s.find = (sel, text) => query(document, sel.split(">>>").map((part) => part.trim())).find((el) => visible(el) && (text == null || (el.textContent ?? "").includes(text))) ?? null
+  // `text` matches a substring of the element's text, or all of it (trimmed) when `exact`.
+  const has = (el, text, exact) => text == null || (exact ? (el.textContent ?? "").trim() === text : (el.textContent ?? "").includes(text))
+  s.find = (sel, text, exact) => query(document, sel.split(">>>").map((part) => part.trim())).find((el) => visible(el) && has(el, text, exact)) ?? null
   s.focused = (sel) => { const el = s.find(sel); return !!el && el.contains(document.activeElement) }
   s.box = (sel) => {
     const el = s.find(sel)
@@ -44,10 +46,16 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) { el.scrollIntoView({ block: "nearest", inline: "nearest" }); r = el.getBoundingClientRect() }
     return { x: r.left + Math.min(r.width, innerWidth) / 2, y: r.top + Math.min(r.height, innerHeight) / 2, w: r.width, h: r.height }
   }
-  s.waitFor = (sel, timeout, text) => new Promise((resolve, reject) => {
-    if (s.find(sel, text)) return resolve(true)
-    const stop = observe(() => { if (s.find(sel, text)) { stop(); clearTimeout(t); resolve(true) } }, { subtree: true, childList: true, attributes: true, characterData: text != null })
-    const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : " containing " + JSON.stringify(text)))) }, timeout)
+  // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
+  // `:focus` selector would otherwise never resolve.
+  s.waitFor = (sel, timeout, text, exact) => new Promise((resolve, reject) => {
+    if (s.find(sel, text, exact)) return resolve(true)
+    const check = () => { if (s.find(sel, text, exact)) { stop(); clearTimeout(t); resolve(true) } }
+    const unwatch = observe(check, { subtree: true, childList: true, attributes: true, characterData: text != null })
+    document.addEventListener("focusin", check, true)
+    document.addEventListener("focusout", check, true)
+    const stop = () => { unwatch(); document.removeEventListener("focusin", check, true); document.removeEventListener("focusout", check, true) }
+    const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : (exact ? " with exactly " : " containing ") + JSON.stringify(text)))) }, timeout)
   })
   s.idle = (quiet, timeout) => new Promise((resolve, reject) => {
     let timer, po
@@ -148,6 +156,17 @@ impl Driver {
                 self.press(&s(0))?;
                 self.until(&opts(1))
             }
+            // The pointer over an element, without a click: reveals hover-only controls, or parks the pointer.
+            "hover" => {
+                let (x, y) = self.locate(&s(0), &opts(1))?;
+                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))?;
+                self.until(&opts(1))
+            }
+            "move" => {
+                let at = |i: usize| args.get(i).and_then(Value::as_f64).unwrap_or(0.0);
+                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": at(0), "y": at(1) }))?;
+                self.until(&opts(2))
+            }
             "scroll" => {
                 let o = opts(1);
                 let (x, y) = self.locate(&s(0), &opts(2))?;
@@ -162,7 +181,8 @@ impl Driver {
                 let o = opts(1);
                 let t = self.timeout(&o);
                 let text = o.get("text").cloned().unwrap_or(Value::Null);
-                self.wait(&format!("__strobe.waitFor({}, {}, {text})", json!(s(0)), t.as_millis()), t)?;
+                let exact = o.get("exact").and_then(Value::as_bool).unwrap_or(false);
+                self.wait(&format!("__strobe.waitFor({}, {}, {text}, {exact})", json!(s(0)), t.as_millis()), t)?;
                 Ok(Value::Bool(true))
             }
             "idle" => {
@@ -200,8 +220,15 @@ impl Driver {
     }
 
     fn until(&self, opts: &Value) -> Result<Value> {
-        let Some(until) = opts.get("until").and_then(Value::as_str) else { return Ok(Value::Bool(true)) };
         let t = self.timeout(opts);
+        // `{ selector, text?, exact? }`: a selector whose element holds that text.
+        if let Some(u) = opts.get("until").filter(|u| u.is_object()) {
+            let text = u.get("text").cloned().unwrap_or(Value::Null);
+            let exact = u.get("exact").and_then(Value::as_bool).unwrap_or(false);
+            let sel = json!(u["selector"].as_str().unwrap_or(""));
+            return self.wait(&format!("__strobe.waitFor({sel}, {}, {text}, {exact})", t.as_millis()), t);
+        }
+        let Some(until) = opts.get("until").and_then(Value::as_str) else { return Ok(Value::Bool(true)) };
         match until {
             "idle" => self.wait(&format!("__strobe.idle(300, {})", t.as_millis()), t),
             "frame" => self.call("__strobe.frame()"),

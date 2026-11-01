@@ -1,11 +1,29 @@
 {
   "name": "@strobe/bench",
   "version": "0.1.0",
-  "description": "Write strobe benchmarks as small TypeScript files",
+  "description": "Types and helpers for strobe bench files: measure web pages, Electron apps and scripts with paired, valid statistics",
   "type": "module",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./runner": "./src/runner.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
   },
-  "license": "MIT"
+  "files": ["dist", "README.md"],
+  "sideEffects": false,
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json",
+    "prepublishOnly": "bun run build"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.0"
+  },
+  "keywords": ["benchmark", "performance", "strobe", "playwright", "electron", "chromium"],
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  }
 }

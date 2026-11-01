@@ -1,6 +1,6 @@
 //! Paired statistics (SPEC §9.3): Wilcoxon signed-rank, Hodges–Lehmann, Holm, verdicts, mValue.
 
-use crate::model::{Better, MetricDef};
+use crate::model::{Better, Kind, MetricDef};
 use serde::Serialize;
 
 /// Signed-rank null distribution: counts of rank sums for n pairs (exact as f64 up to n = 50).
@@ -208,15 +208,45 @@ pub struct Comparison {
     pub verdict: String,
     pub decided: bool,
     pub needed_pairs: Option<usize>,
+    /// A counter that held one value on each side in every block: compared exactly (SPEC §10.1).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub exact: bool,
 }
 
-/// Compares paired block values. `pairs` holds (base, head) per pair.
-pub fn compare(def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f64) -> Comparison {
+/// Compares paired block values of metric `name` (`def` is its definition, or its family's).
+/// `pairs` holds (base, head) per pair.
+pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f64) -> Comparison {
     let finite: Vec<(f64, f64)> = pairs.iter().copied().filter(|(a, b)| a.is_finite() && b.is_finite()).collect();
-    let relative = def.unit != "count" && finite.iter().all(|(a, b)| *a > 0.0 && *b > 0.0);
+    // Counts compare by difference: a zero on either side (no fetches, no shift) has no ratio.
+    let relative = def.kind != Kind::Exact && def.unit != "count" && def.unit != "score" && finite.iter().all(|(a, b)| *a > 0.0 && *b > 0.0);
     let d: Vec<f64> = finite.iter().map(|(a, b)| if relative { (b / a).ln() } else { b - a }).collect();
     let base = crate::metrics::median(&finite.iter().map(|p| p.0).collect::<Vec<_>>());
     let head = crate::metrics::median(&finite.iter().map(|p| p.1).collect::<Vec<_>>());
+    // An exact counter that is stable on both sides (every block the same, from 2 pairs) has no noise
+    // to test: its difference is the answer. One that varies is compared like a timed metric.
+    if def.kind == Kind::Exact && finite.len() >= 2 && finite.iter().all(|p| p.0 == finite[0].0 && p.1 == finite[0].1) {
+        let diff = head - base;
+        let improved = (diff < 0.0) == (def.better == Better::Lower);
+        let verdict = if diff == 0.0 { "same (exact)".to_string() } else { format!("{} (exact)", if improved { def.words.0 } else { def.words.1 }) };
+        let p = if diff == 0.0 { 1.0 } else { 0.0 };
+        return Comparison {
+            metric: name.to_string(),
+            n: finite.len(),
+            base,
+            head,
+            estimate: diff,
+            lo: diff,
+            hi: diff,
+            relative: false,
+            confidence: 1.0,
+            p,
+            bound: 0.0,
+            verdict,
+            decided: true,
+            needed_pairs: None,
+            exact: true,
+        };
+    }
     let (est, lo, hi, achieved) = hodges_lehmann(&d, confidence);
     let p = wilcoxon_p(&d);
     let (est, lo, hi) = if relative { (est.exp() - 1.0, lo.exp() - 1.0, hi.exp() - 1.0) } else { (est, lo, hi) };
@@ -245,7 +275,7 @@ pub fn compare(def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f6
         let estimate = if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize };
         estimate.max(min_pairs(confidence))
     });
-    Comparison { metric: def.name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs }
+    Comparison { metric: name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs, exact: false }
 }
 
 /// Pairs a verdict needs, projected from a robust spread of the differences so far (1.4826·MAD,

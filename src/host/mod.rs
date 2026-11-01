@@ -326,6 +326,20 @@ pub fn system_busy(ms: u64) -> f64 {
 }
 
 /// Raises the visible windows of a process tree to topmost without activating them; returns how many.
+/// The largest visible window of these processes, shrunk to a 16×16 grid of averaged BGRA pixels read
+/// from the screen: what a person sees of it, for "painted" and "settled" (Windows only).
+pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
+    #[cfg(windows)]
+    {
+        win::window_pixels(pids)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pids;
+        None
+    }
+}
+
 pub fn raise_windows(root: u32) -> usize {
     #[cfg(windows)]
     {

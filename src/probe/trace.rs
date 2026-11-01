@@ -35,8 +35,15 @@ pub struct Tracing {
 }
 
 pub fn start(cdp: &Arc<Cdp>, set: Set) -> Result<Tracing> {
+    start_with(cdp, set, &[])
+}
+
+/// [`start`] plus `extra` categories a series asked for (`loading` for `layout.shift`).
+pub fn start_with(cdp: &Arc<Cdp>, set: Set, extra: &[&'static str]) -> Result<Tracing> {
+    let mut c = categories(set);
+    c.extend(extra.iter().filter(|e| !c.contains(e)).collect::<Vec<_>>());
     // Attribution traces of long runs (stacks, invalidations) overflowed the default buffer.
-    start_categories(cdp, &categories(set), if set == Set::Attribution || set == Set::Memory { 1_000_000 } else { 200_000 })
+    start_categories(cdp, &c, if set == Set::Attribution || set == Set::Memory { 1_000_000 } else { 200_000 })
 }
 
 /// A browser-wide trace of exactly `categories` into a buffer of `buffer_kb`.

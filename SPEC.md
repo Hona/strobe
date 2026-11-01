@@ -278,9 +278,9 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 
 ```
 strobe bench <file.bench.ts> --head <variant> [--base <variant>]
-             [--filter <case glob>] [--target <name>] [--params <k=v,...>]
+             [--filter <case glob>] [--target <name>] [--params <k=v,...|all>]
              [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
-             [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa]
+             [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power keep|high]
              [--require-verdict] [--json]
@@ -288,9 +288,13 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
 
 Every series in the file (case × target × params, narrowed by `--filter`, `--target` and
 `--params`) gets its own verdict. With `--base`: the A/B pipeline in §9. Without it: `--aa`
-runs `--head` against itself (§10.4), and `--probes memory --repeat <n>` is a leak run (§8.6).
-`--runs` is the measured runs per block (default 5). Variants are described in §9.5. `--bisect`
-walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
+runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak run (§8.6), and
+`--check` validates the file: one block per series on `--head`, one run per case, no warmup and
+no statistics. Each case passes, with its declared metrics' values from that run, or fails with
+the refusal, the page's URL and its screenshot; the next case still runs, and any failure exits 1.
+`--head` alone is an error that suggests `--base` or `--check`. `--runs` is the measured runs per
+block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
+described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
 
 Text output (a full example):
 
@@ -378,14 +382,19 @@ Each metric declares:
 
 | Property | Values |
 |---|---|
-| unit | `ms`, `bytes`, `count`, `%`, `Hz`, `W`, `MB/s` |
+| unit | `ms`, `bytes`, `count`, `score`, `%`, `Hz`, `W`, `MB/s` |
 | better | `lower` or `higher` |
-| kind | `timed` (wall or CPU time), `sampled` (statistical estimate), `exact` (a count that is stable in A/A, §10.4) |
-| scale | `ratio` (compare log ratios) or `absolute` (compare differences) |
+| kind | `timed` (wall or CPU time), `sampled` (statistical estimate), `exact` (a count, compared exactly when it is stable, §9.3) |
+| scale | `ratio` (compare log ratios) or `absolute` (compare differences); counts and scores are absolute, since 0 has no ratio |
 | minimum n | e.g. a percentile p needs `⌈10 / (1 − p)⌉` frames per block |
 | phase | which phases it covers; default the whole run |
 
-The catalog lives in `src/model/metrics.rs` and in `strobe query <h> summary --catalog`.
+The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`. Families resolve
+by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
+`net.bytes` with an optional `{<url glob>}` (§8.1), and `launch.<milestone>` (§9.6). Metrics a
+series declares beyond the defaults may switch on what measures them: `count.*` installs the page
+counter, `net.*` the Network domain, `layout.shift` the trace's `loading` category. Only that
+series' blocks pay for it, base and head alike.
 
 ### 7.2 Frames
 
@@ -424,7 +433,9 @@ phase.
 | `cpu` | JS stacks at 200 µs with line ticks | V8 profiler | attribution | med |
 | `alloc` | allocation sampling with stacks | HeapProfiler.startSampling | attribution | low–med |
 | `invalidation` | forced layouts and style invalidations with JS stacks | trace | attribution | med |
-| `counters` | `@strobe/web` counters, framework adapters | SDK | attribution | med |
+| `counters` | `count.<name>`: `ctx.count` in the bench file and the page's counter global (§8.4), per run | runner, page | timing, when declared | low |
+| `network` | `net.requests` and `net.bytes` per run, optionally by URL glob | Network domain | timing, when declared | low |
+| `shifts` | `layout.shift` per run; the largest shifts and the elements they moved | trace (`loading`), DOM | timing, when declared; names in attribution | low |
 | `coverage` | exact call and block counts | Profiler.startPreciseCoverage | attribution | high |
 | `census` | per-process memory account (§8.6) | bridge, CDP, OS, memory-infra | attribution | med |
 | `heap` | heap snapshots per runtime (§8.6) | bridge, CDP, inspector | attribution | high, pauses |
@@ -496,8 +507,31 @@ full. Displays may abbreviate; the record does not.
 
 ### 8.4 Counters
 
-`@strobe/web` counters cost nothing when strobe is not attached: the counter API checks a global
-that strobe installs with `Page.addScriptToEvaluateOnNewDocument` in attribution blocks only.
+A counter is an exact metric per run, `count.<name>`. Two sources add to it:
+
+- **Bench file:** `ctx.count(name, n = 1)` during `run`. Outside a run it counts nothing.
+- **Page:** `globalThis.__strobeCount?.(name, n)` in app code (what `@strobe/web`'s `count` calls).
+  When strobe is not attached it costs one optional call. strobe installs the global with
+  `Page.addScriptToEvaluateOnNewDocument` only in blocks of a series that declares a `count.*`
+  metric, resets the totals before each run's start mark, and reads them after its end mark, so
+  neither costs the run anything. A run that loads a page reads the departing document's totals
+  first, as for `main.work`.
+
+A counter the page never touched reads 0. Compare builds that both count: a base without the
+counter reads 0, not "unknown".
+
+**Network** (`net.requests`, `net.bytes`): the Network domain, enabled only for a series that
+declares a `net.*` metric. A request belongs to the run whose span it started in; its bytes on
+the wire (`loadingFinished.encodedDataLength`, else its chunks so far) may arrive after the run
+and still count for it. `data:` and `blob:` requests are not network requests. A glob without
+`://` matches the URL's path; `*` stays within a path segment, `**` crosses them, and the query
+string never takes part: `net.requests{/api/session/*/message}`.
+
+**Layout shift** (`layout.shift`): the sum of `LayoutShift` scores in the run's span, from the
+trace's `loading` category. Shifts right after input count: a run starts with its input, and a
+tab that jumps after a click is what the metric is for. Attribution blocks of such a series keep
+the five largest shifts with the elements they moved (named over `DOM.describeNode` while the
+page is open), shown by `query <rec> shifts` and in the bench's why lines.
 
 ### 8.5 OS and GPU sampling
 
@@ -671,8 +705,10 @@ flowchart LR
 - **Gate**: secondary metrics get verdict words only after the primary has a verdict
   (`faster`, `slower` or `same`), with Holm correction across secondaries. Otherwise they show
   intervals without verdicts.
-- **Exact metrics**: a counter that is stable in A/A (§10.4) is compared exactly; any
-  difference is real and printed as `exact`. Others are treated as timed.
+- **Exact metrics**: a counter (`kind: exact`) that holds one value on each side in every block,
+  from 2 pairs, is compared exactly: the difference is the answer, printed as `exact`, with
+  `same (exact)` or a direction word. It needs no test, so it skips Holm and the primary's gate. A
+  counter that varies between blocks is compared like a timed metric, by difference.
 - **Modes**: mValue per variant on run values (threshold 3.2, as BenchmarkDotNet). On a
   multimodal result strobe names the likely cause from recorded data (core residency, GC in the
   window, background load).
@@ -802,22 +838,40 @@ export default bench({
   is an Electron app by its profile in strobe.json `apps` (§13.2): `home` is a seed directory
   copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
   must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
-  (`app` borrows a profile) and `url(href)` also exist.
+  (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)` and `script(entry,
+  opts)` are below.
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
   its own server, so mock the API under `new URL(url).origin`. Playwright stays connected for the
   whole block, so routes and init scripts keep working. What `prepare` returns is
   `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
-- `params`: arrays of values; the cartesian product makes series.
+- `teardown(ctx)`: on a target (with `prepare`'s context) and on the file (with the run
+  context), when the block closes and while the browser is still open, for what `prepare` started.
+  A teardown that throws does not stop the others; it is reported once as a `Teardown` warning.
+- `params`: arrays of values; the cartesian product makes series. A parameter may be
+  `{ run: [...], more: [...] }`: `run` values make series by default, `more` values only with
+  `--params all` or when `--params k=v` names one, so a scaling sweep keeps a short default run.
 - `setup(ctx)`: once per block, after load, never measured.
-- `cases.<name>`: `primary` (metric name, required), `run(ctx)` (measured), `reset(ctx)`
-  (optional, between runs, never measured), `metrics` (optional extra secondaries), `probes`
-  (optional extra attribution probes).
+- `cases.<name>`: `primary` (metric name, required; `launch.ready` for a launch case), `run(ctx)`
+  (measured) or `launch` (a launch case, below), `reset(ctx)` (optional, between runs, never
+  measured), `metrics` (optional extra secondaries), `targets` (optional: the targets this case
+  runs on; default every target), `probes` (optional extra attribution probes).
 
-**`ctx`:** `page`, `phase(name, fn)`, `case` (the case the block runs, also in `prepare`, `setup` and a
-`url` function, so one file can give each case its own fixture), `params`, `target` (its name),
-`variant` (`base` or `head`, for logging only), `url`, `prepared`, `playwright` (in `prepare` only).
+**`ctx`:** `page`, `phase(name, fn)`, `count(name, n?)` (§8.4), `call(name, ...args)` (script
+targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
+file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
+`head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
+`playwright` and `mock(pattern, handler)`.
+
+**Mocks** (`ctx.mock(pattern, handler)` in `prepare`): answers requests whose URL matches
+`pattern` (`*` any run of characters, `?` one) through the Fetch domain with only those patterns
+paused. Playwright's `page.route` turns the HTTP cache off for the whole page, so a case that
+reloads in `reset` refetched every script, which no person does; with `mock` the scripts come from
+the cache. A handler gets `{ url, method, headers, body, json() }` and returns `{ status?, headers?,
+body? }` (text, bytes, or any other value as JSON) or `undefined` to let the request through.
+Patterns accumulate; the first that answers wins. Streams (an event source) are not mockable this
+way: serve them from a real local server and tear it down in `teardown`.
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
 checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
@@ -832,18 +886,75 @@ renders into one (a diff or code viewer) counts as a change.
 |---|---|
 | `goto(url, opts?)` | navigate and wait for load; a relative path resolves against the page |
 | `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre |
+| `hover(selector, opts?)` | the pointer moves to the element's centre, no click: reveals hover-only controls |
+| `move(x, y, opts?)` | the pointer moves to a viewport point: parks it away from anything that reacts to hover (an app that prefetches what the pointer rests on) |
 | `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
 | `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P` |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
-| `waitFor(selector, { text?, timeout? })` | resolves when a visible element matches (and contains `text`), through one in-page `MutationObserver` |
+| `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too |
 | `idle(opts?)` | the `"idle"` wait below, on its own |
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
 in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling), `"frame"`
-(two animation frames, the usual "after next paint"), or a selector. Every input call records its dispatch time on the trace clock, which the
-`interaction.*` metrics use (input → the presented frame that showed the change).
+(two animation frames, the usual "after next paint"), a selector, or `{ selector, text?, exact? }`
+(an element holding that text, as `waitFor`). Every input call records its dispatch time on the
+trace clock, which the `interaction.*` metrics use (input → the presented frame that showed the
+change).
+
+**Launch cases** (`launch: { until, milestones?, profile?, before?, inspect?, screen?, timeout? }`):
+a case that measures the launch itself, not work inside a launched app. Every block is one cold
+launch, timed from process spawn (from navigation for `web` and `url` targets) until `until` is
+visible in any of the target's windows: `launch.ready`. One launch per variant and series is
+discarded first, so the OS has read the build from disk before any timed launch. There are no runs,
+`reset` or `setup`.
+
+- **Seeing the end exactly:** strobe auto-attaches to every page of the launch browser-wide with
+  `waitForDebuggerOnStart`, so each page pauses until strobe's observer is in it, then runs. A page
+  that loaded before strobe could attach (a browser opens its first page at startup) gets the
+  observer late; that is still valid unless `until` already shows, which refuses the launch.
+- **Milestones** (`{ name: { match, in? } }`): the first line matching `match` (text, or a RegExp)
+  in `in`: `"output"` (stdout and stderr, colour codes removed; the default), `"page"` (the main
+  page's `performance.mark` names) or a glob of files under the launch's home (an app's log).
+  Each is a metric `launch.<name>` from spawn. Lines are read until 1 s after ready, up to 3 s
+  while one is missing; a milestone the case declares as a metric must appear, the rest are context.
+  `ready`, `painted`, `settled` and `node.*` are strobe's own names.
+- **Screen** (Windows, app targets, default on): the largest window's pixels, shrunk to 16×16 by
+  the GPU's halftone average, every 30 ms. `launch.painted` is the first sample that differs from
+  the window's first (a splash or a fade counts: it is what a person sees) and `launch.settled`
+  the last change up to 1 s after ready. The windows stay on top without focus for the whole
+  launch, raised asynchronously so a busy UI thread never blocks strobe.
+- **`inspect`** (app and exe targets): starts the main process with `--inspect` and reads Node's
+  own bootstrap timing after the launch: `launch.node.created`, `.start`, `.bootstrapped`. It adds
+  Node's inspector to every timed launch of both variants.
+- **`profile`**: `fresh` (default), a new home every launch, seeded from the target's `home`;
+  `warm`, one home per series and variant kept across its launches (the discarded launch fills
+  it), as a person's next launch. Homes are removed when the experiment ends.
+- **`before(ctx)`**: before every launch, never timed, with `root` (the variant's folder) and
+  `home` (the launch's home, `null` for web): delete caches for a cold dev start, seed state, start
+  or stop a service.
+- `cpu.work` is the CPU of the target's processes from spawn (or navigation) to ready, in cycles.
+- **Attribution:** a launch of its own, never timed. An app's main process starts paused under
+  `--inspect-brk` with its CPU profiler on (`cpu-main.cpuprofile`), and every page starts paused
+  until its profiler runs (`cpu-0.cpuprofile`), so both profiles cover the launch from the first
+  statement.
+
+**Command targets** (`command(run, { cwd?, env?, unset?, attach?, timeout?, build? })`): an app
+started by a command in the variant's folder, such as a dev server that builds and launches it.
+strobe reads the command's output and attaches at the first `ws://` after `attach` (default
+`DevTools listening on`). `{home}` (a fresh folder per launch) and `{port}` (a free port) are filled
+into `run` and `env`; `unset` removes variables (`PREFIX_*` for a family); `build` runs once per
+variant. The command's whole process tree ends with the block. Run cases and launch cases both
+work on it.
+
+**Script targets** (`script(entry, { runtime?, env?, build? })`): a Bun (default) or Node module of
+the variant, loaded by strobe's host in a fresh process per block, pinned like any target. Cases
+call its exports with `ctx.call(name, ...args)` (JSON in and out). Runs are timed by the host
+tree's CPU in cycles (`cpu.work`, the primary to use) and wall clock (`run.duration`); warmup and
+pairs work as for pages. Attribution blocks start the process with `--cpu-prof` (200 µs) and
+`--heap-prof`, whose profiles cover the whole process; their frames name the variant's own source
+files, so nothing needs a source map.
 
 **How it runs:**
 
@@ -972,6 +1083,7 @@ with at least 3 pairs shows zero spread.
 | `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` | rows with self and total time, sample counts, intervals, handles |
 | `alloc` | `--by function\|file\|package` | bytes allocated per row from sampled allocations (collected objects included), with complete locations and the three heaviest full stacks per function |
 | `layout` | | forced (synchronous) layouts and style recalculations by the JavaScript call site that forced them, with full stacks; per-run counts and time, forced and in the frame lifecycle |
+| `shifts` | | the five largest layout shifts of an attribution block (a series declaring `layout.shift`): score, run, time into it, and the elements that moved with their rects before and after |
 | `gc` | | per measured run: minor and major collections, main-thread GC time (pauses and incremental marking), helper-thread GC time, bytes freed |
 | `stack` | `<id>` | callers to the root, with source locations and packages |
 | `memory` | `--by process\|layer\|allocator` `--at <i>`; `a..b memory` | a census (default the last): per process OS private bytes, working set, Chromium allocators by effective size and the unexplained rest (an estimate); by layer across processes; by allocator; `a..b` by layer and process type. Readings of the snapshotted renderer after its first snapshot are starred (CensusContaminated) |
@@ -1166,6 +1278,9 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 - Bun: the inspector speaks WebKit's protocol; samples and heap through it are a phase 0 spike
   item (§21). An app's backend that exposes a V8-format heap dump is used through the bridge's
   `linked` processes.
+- Bench `script()` targets (§9.6) need neither: strobe's host (`host.mjs`, plain JavaScript that
+  Bun and Node both run) imports the module and answers calls over stdin and stdout, and the
+  runtime's own `--cpu-prof` and `--heap-prof` give attribution blocks their profiles.
 
 ### 13.6 Outside-in (any process)
 
@@ -1305,8 +1420,11 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
-- `@strobe/bench`: `bench`, `web`, `app`, `exe`, `url` for bench files, and the runner entry
-  strobe spawns (§9.6).
+- `@strobe/bench`: `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of
+  bench files (§9.6). strobe embeds the SDK, the runner and the script host and rewrites a bench
+  file's `@strobe/bench` import to its own copy, so bench files run without installing anything.
+  The npm package (built from `sdk/bench`: `dist/index.js` and `dist/index.d.ts`, version equal to
+  strobe's) gives editors and `tsc` the same types.
 - `@strobe/web`: `phase(name)`, `mark(name)`, `count(name, n)`; free when strobe is not
   attached (§8.4). `@strobe/web/solid`: computations per component through Solid's dev hooks,
   dev builds only.
@@ -1361,13 +1479,13 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
 | 0b | — | the bridge (`@strobe/electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
-| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`; validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
+| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@strobe/bench` on npm (types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
 | 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
 
-Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`, `gc`, `heap` (and
+Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
 `a..b heap`), `leaks`, `memory` (and `a..b memory`), `insights`, `sql`, `progress`. Not yet: `stack`,
 `gpu`, `cpu`, `timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
 `MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
@@ -1391,8 +1509,15 @@ and nothing else from them is emitted.
   it with the `strobe/quit` RPC. The engine runs one `trace_processor -q` per query (no `--httpd`).
 - Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
   are kept topmost without focus, since an occluded Chromium window stops rendering.
-- The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or a value
-  is at most 0 (then differences, with the bound max(bound × base, 0.5)). Default tested secondaries:
+- The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or
+  `score`, the kind is `exact`, or a value is at most 0 (then differences, with the bound
+  max(bound × base, 0.5)). Stable exact counters skip the test entirely (§9.3).
+- Launch cases and `script()` targets read CPU from per-process cycle counters over the time stamp
+  counter, not process times, which move in 15.6 ms ticks on Windows (a 2 ms call read 0 or
+  15.6 ms). The page counters, network and layout-shift probes switch on per series (§7.1).
+- `command()` targets and every strobe.json command go to `cmd /d /s /c "<line>"` verbatim on
+  Windows (`raw_arg`): Rust's argument quoting escaped a line's own quotes the way cmd does not read
+  them. Default tested secondaries:
   `frames.interval.p95`, `frames.dropped.pct`, `main.busy`, `interaction.p95`, `cpu.app.total`;
   everything else in the descriptive list gets an interval and no claim.
 - `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the

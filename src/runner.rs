@@ -12,12 +12,13 @@ use std::time::Duration;
 const INDEX: &str = include_str!("../sdk/bench/src/index.ts");
 const RUNNER: &str = include_str!("../sdk/bench/src/runner.ts");
 const PRELOAD: &str = include_str!("../sdk/bench/src/preload.ts");
+const HOST: &str = include_str!("../sdk/bench/src/host.mjs");
 
 /// Writes the embedded SDK under the state dir (once per strobe version) and returns its folder.
-fn sdk_dir() -> Result<PathBuf> {
+pub fn sdk_dir() -> Result<PathBuf> {
     let dir = paths::sdk().join(env!("CARGO_PKG_VERSION"));
     std::fs::create_dir_all(&dir)?;
-    for (name, body) in [("index.ts", INDEX), ("runner.ts", RUNNER), ("preload.ts", PRELOAD)] {
+    for (name, body) in [("index.ts", INDEX), ("runner.ts", RUNNER), ("preload.ts", PRELOAD), ("host.mjs", HOST)] {
         let p = dir.join(name);
         if std::fs::read_to_string(&p).ok().as_deref() != Some(body) {
             std::fs::write(&p, body)?;

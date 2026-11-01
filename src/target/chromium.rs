@@ -201,7 +201,7 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
     Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, exe: PathBuf::new(), version, window: Window::default() })
 }
 
-fn http_get(host: &str, path: &str) -> Result<String> {
+pub fn http_get(host: &str, path: &str) -> Result<String> {
     use std::io::{Read, Write};
     let mut s = std::net::TcpStream::connect(host).map_err(|e| Error::unreachable(format!("{host}: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();

@@ -31,6 +31,8 @@ base64 = "0.22"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Verifying downloaded engine archives against pinned hashes; pure Rust.
 sha2 = "0.10"
+# Launch milestones match the app's output and logs by regular expression; no Unicode tables.
+regex-lite = "0.1"
 
 [target.'cfg(windows)'.dependencies]
 # Win32: QPC clock, process CPU times, toolhelp snapshots, affinity, power plans, PDH, window state.

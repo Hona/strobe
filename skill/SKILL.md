@@ -11,11 +11,11 @@ strobe records a target on one timeline and answers with verdicts and handles (`
 
     strobe status [--calibrate]                    environment, validity preflight, recent handles
     strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
-    strobe bench <file.bench.ts> --head <variant> [--base <variant>] [--filter <case>] [--target <name>]
-                 [--params k=v] [--primary <metric>] [--aa] [--pairs auto|N] [--runs 5] [--power keep|high]
+    strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--target <name>]
+                 [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power keep|high]
                  [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
         variant: a directory, a git ref, app:<id>, exe:<path>
-    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout gc heap leaks memory insights sql
+    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql
         hotspots and alloc take --by function|file|package; memory takes --by process|layer|allocator and --at <i>;
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
     strobe report experiment|recording <handle> [--format html|md]    writes a file; show it in the Review pane
@@ -49,9 +49,17 @@ Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (i
       },
     })
 
-`page`: `goto` (relative paths resolve against the page) `click` `type` (one key event per character; `delay` ms between) `press` (`"ControlOrMeta+Shift+P"`) `scroll` `waitFor` (`{ text }` to wait for content) `idle` `wait`; input calls take `{ until: "idle" | "frame" | selector }`. `reset` puts state back between runs and is never measured. Playwright only in `prepare` on `web` targets; what `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working (routes, mocks) for the whole block. Never call `page.eval` in `run`.
+`page`: `goto` (relative paths resolve against the page) `click` `hover` `move(x, y)` `type` (one key event per character; `delay` ms between) `press` (`"ControlOrMeta+Shift+P"`) `scroll` `waitFor` (`{ text, exact }`; `:focus` works) `idle` `wait`; input calls take `{ until: "idle" | "frame" | selector | { selector, text, exact } }`. `reset` puts state back between runs and is never measured. Playwright only in `prepare` on `web` targets; what `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working for the whole block. Mock APIs with `ctx.mock(pattern, handler)` in `prepare`: Playwright's `page.route` turns the HTTP cache off, so reloads refetch every script. `teardown` (target or file) stops what `prepare` started. Never call `page.eval` in `run`.
 
-Primary metric: `main.busy` for scrolling and streaming on fast machines (frames rarely drop at normal speed), `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop. Fewer than 6 pairs never gets a verdict.
+More in a bench file:
+- `launch: { until, milestones?, profile?, before?, inspect? }` instead of `run`: one cold launch per block, timed from spawn to `until` (`launch.ready`); milestones `{ match: "text" | /re/, in: "output" | "page" | "<log glob under the home>" }` become `launch.<name>`; `launch.painted`/`launch.settled` from the window's pixels.
+- `command("bun run dev:desktop", { cwd, env: { X: "{home}" }, unset: ["APP_*"] })`: an app started by a dev command, attached where it prints `DevTools listening on ws://…`; `before(ctx)` deletes caches for a cold start.
+- `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
+- Exact counters: `ctx.count(name)` in `run`, `globalThis.__strobeCount?.(name)` in the app → `count.<name>`; `net.requests{/api/*/message}` and `net.bytes`; `layout.shift` (then `query <rec> shifts` names what moved). A stable count is compared exactly.
+- `params: { files: { run: [100, 10_000], more: [1, 1_000] } }`: `more` only with `--params all`. `targets: ["web"]` on a case limits where it runs.
+- `bun add -d @strobe/bench` gives editors and `tsc` the types; strobe runs its own copy either way.
+
+Primary metric: `main.work` for "does this cost less" (continuous; durations move in whole vsyncs), `main.busy` for scrolling and streaming, `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop, `launch.ready` for launches, `cpu.work` for scripts. Fewer than 6 pairs never gets a verdict. Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 
 Everything about the app under test lives in its repo's `strobe.json`: `build` and `serve` for web targets, and `apps` profiles for Electron apps (`exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`). Strobe itself knows no product. If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile.
 

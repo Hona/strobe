@@ -58,6 +58,11 @@ pub fn run(args: &Args) -> Result<Output> {
             if view == "alloc" { alloc(&dir, by, top) } else { hotspots(&dir, by, top) }
         }
         "layout" => layout(&dir, top),
+        "shifts" => {
+            let v =
+                store::read_json(&dir.join("shifts.json")).map_err(|_| Error::usage("no layout shifts in this recording: they come from attribution blocks of a series that declares layout.shift"))?;
+            Ok(Output::new(crate::probe::shifts::text(&v), v))
+        }
         "gc" => gc(&dir),
         "heap" => heap(&dir, top, args.has("reveal")),
         "leaks" => leaks(&dir, top, args.has("reveal")),
@@ -69,7 +74,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             memory(&dir, by, top, args.get("at"))
         }
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads hotspots alloc layout gc heap leaks memory insights sql"))),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads hotspots alloc layout shifts gc heap leaks memory insights sql"))),
     }
 }
 

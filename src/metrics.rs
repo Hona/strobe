@@ -104,6 +104,8 @@ pub struct BlockData {
     pub frames: BTreeMap<String, Vec<Frame>>,
     pub tasks: BTreeMap<String, Vec<(i64, i64)>>,
     pub latencies: BTreeMap<String, Vec<(i64, String)>>,
+    /// Layout shifts per window key: (ts, score). Only in traces with the `loading` category.
+    pub shifts: BTreeMap<String, Vec<(i64, f64)>>,
 }
 
 impl BlockData {
@@ -121,6 +123,16 @@ impl BlockData {
         self.frames = std::mem::take(&mut self.frames).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.tasks = std::mem::take(&mut self.tasks).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.latencies = std::mem::take(&mut self.latencies).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.shifts = std::mem::take(&mut self.shifts).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+    }
+
+    /// The summed layout-shift score of each run window, 0 for a run without shifts.
+    pub fn shift_per_run(&self, prefix: &str) -> BTreeMap<String, f64> {
+        self.windows
+            .iter()
+            .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
+            .map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.shifts.get(&w.key).map_or(0.0, |s| s.iter().map(|x| x.1).sum())))
+            .collect()
     }
 }
 
@@ -152,7 +164,13 @@ union all
 select 'lat', w.k, s.ts, s.dur, null, extract_arg(s.arg_set_id, 'event_latency.event_type')
   from slice s join track tr on s.track_id = tr.id
   join _w w on extract_arg(tr.dimension_arg_set_id, 'upid') = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where s.name = 'EventLatency';
+  where s.name = 'EventLatency'
+union all
+select 'shift', w.k, s.ts, null, null,
+  coalesce(extract_arg(s.arg_set_id, 'debug.data.weighted_score_delta'), extract_arg(s.arg_set_id, 'debug.data.score'))
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where s.name = 'LayoutShift';
 "#
     );
     let table = engine::query(trace, &sql)?;
@@ -169,6 +187,7 @@ select 'lat', w.k, s.ts, s.dur, null, extract_arg(s.arg_set_id, 'event_latency.e
             }
             "task" => data.tasks.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),
+            "shift" => data.shifts.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))),
             _ => {}
         }
     }

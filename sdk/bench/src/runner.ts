@@ -12,6 +12,8 @@ for (const level of ["log", "info", "warn", "error", "debug"] as const)
 const file = path.resolve(process.argv[2] ?? "")
 const spec = (await import(pathToFileURL(file).href)).default
 if (!spec || typeof spec !== "object" || !spec.cases) throw new Error(`${file} must default-export bench({ targets, cases })`)
+for (const [name, c] of Object.entries(spec.cases) as [string, any][])
+  if (typeof c.run !== "function" && !c.launch) throw new Error(`case ${name} needs run(ctx) or launch: { until }`)
 
 let seq = 0
 const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
@@ -26,6 +28,8 @@ const driver = (call: string, ...args: unknown[]) => request("driver", { call, a
 const page = {
   goto: (url: string, o = {}) => driver("goto", url, o),
   click: (selector: string, o = {}) => driver("click", selector, o),
+  hover: (selector: string, o = {}) => driver("hover", selector, o),
+  move: (x: number, y: number, o = {}) => driver("move", x, y, o),
   type: (selector: string, text: string, o = {}) => driver("type", selector, text, o),
   press: (key: string, o = {}) => driver("press", key, o),
   scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),
@@ -35,15 +39,19 @@ const page = {
   eval: (fn: Function, ...args: unknown[]) => driver("eval", fn.toString(), ...args),
 }
 
-const state: { case: string; params: Record<string, unknown>; target: string; variant: string; url: string; playwright: any; prepared: unknown } = {
-  case: "",
-  params: {},
-  target: "",
-  variant: "base",
-  url: "",
-  playwright: null,
-  prepared: undefined,
-}
+const state: {
+  case: string
+  params: Record<string, unknown>
+  target: string
+  variant: string
+  url: string
+  root: string
+  home: string | null
+  playwright: any
+  prepared: unknown
+  mocks: { pattern: string; test: RegExp; handler: Function }[]
+  session: any
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, playwright: null, prepared: undefined, mocks: [], session: null }
 
 const context = () => ({
   page,
@@ -52,6 +60,7 @@ const context = () => ({
   target: state.target,
   variant: state.variant,
   url: state.url,
+  root: state.root,
   prepared: state.prepared,
   async phase<T>(name: string, fn: () => T | Promise<T>) {
     await request("phase", { name, edge: "start" })
@@ -61,22 +70,60 @@ const context = () => ({
       await request("phase", { name, edge: "end" })
     }
   },
+  count(name: string, n = 1) {
+    void request("count", { name, n })
+  },
+  call: (name: string, ...args: unknown[]) => request("call", { name, args }),
 })
+
+const prepareContext = () => ({
+  case: state.case,
+  params: state.params,
+  target: state.target,
+  variant: state.variant,
+  url: state.url,
+  root: state.root,
+  playwright: state.playwright,
+  mock,
+})
+
+// The bench file's own options, as JSON: functions become flags, RegExps their source.
+function plain(value: any): any {
+  if (value instanceof RegExp) return { regex: { source: value.source, flags: value.flags } }
+  if (Array.isArray(value)) return value.map(plain)
+  if (value && typeof value === "object")
+    return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, typeof v === "function" ? true : plain(v)]))
+  return value
+}
 
 function describe() {
   const targets = Object.fromEntries(
     Object.entries(spec.targets ?? {}).map(([name, t]: [string, any]) => [
       name,
-      {
-        kind: t.kind, url: typeof t.url === "function" ? "/" : t.url, href: t.href, id: t.id, path: t.path, app: t.app, home: t.home,
-        viewport: t.viewport, scale: t.scale, prepare: !!t.prepare || typeof t.url === "function",
-      },
+      { ...plain(t), url: typeof t.url === "function" ? "/" : t.url, prepare: !!t.prepare || typeof t.url === "function", teardown: !!t.teardown },
     ]),
   )
   const cases = Object.fromEntries(
-    Object.entries(spec.cases).map(([name, c]: [string, any]) => [name, { primary: c.primary, metrics: c.metrics ?? [], reset: !!c.reset }]),
+    Object.entries(spec.cases).map(([name, c]: [string, any]) => [
+      name,
+      {
+        primary: c.primary ?? (c.launch ? "launch.ready" : undefined),
+        metrics: c.metrics ?? [],
+        reset: !!c.reset,
+        targets: c.targets,
+        launch: c.launch && {
+          ...plain(c.launch),
+          milestones: Object.fromEntries(
+            Object.entries(c.launch.milestones ?? {}).map(([m, d]: [string, any]) => [
+              m,
+              { in: d.in ?? "output", ...(d.match instanceof RegExp ? plain(d.match) : { match: d.match }) },
+            ]),
+          ),
+        },
+      },
+    ]),
   )
-  return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup }
+  return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup, teardown: !!spec.teardown }
 }
 
 async function playwright(endpoint: string, target: string) {
@@ -105,18 +152,80 @@ async function strobePage(context: any, target: string) {
   throw new Error(`Playwright did not attach to the page strobe opened (${target}) in 10 s`)
 }
 
+// Mocks through the Fetch domain on only the mocked patterns: unlike Playwright's routing, which turns
+// the HTTP cache off for the page, every other request loads as it would for a person.
+async function mock(pattern: string, handler: Function) {
+  if (!state.playwright) throw new Error("mock needs the block's browser: call it in prepare")
+  const test = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("?", ".").replaceAll("*", ".*") + "$")
+  state.mocks.push({ pattern, test, handler })
+  if (!state.session) {
+    state.session = await state.playwright.context.newCDPSession(state.playwright.page)
+    state.session.on("Fetch.requestPaused", (event: any) => void answer(state.session, event))
+  }
+  await state.session.send("Fetch.enable", { patterns: state.mocks.map((m) => ({ urlPattern: m.pattern, requestStage: "Request" })) })
+}
+
+async function answer(session: any, event: any) {
+  const { request: r, requestId } = event
+  const headers: Record<string, string> = r.headers ?? {}
+  const body: string | undefined = r.postData ?? (r.postDataEntries ? r.postDataEntries.map((e: any) => Buffer.from(e.bytes ?? "", "base64").toString()).join("") : undefined)
+  const req = { url: r.url, method: r.method, headers, body, json: () => JSON.parse(body ?? "null") }
+  try {
+    for (const m of state.mocks) {
+      if (!m.test.test(r.url)) continue
+      const res = await m.handler(req)
+      if (res === undefined) continue
+      const raw = res.body
+      const json = raw !== undefined && typeof raw !== "string" && !(raw instanceof Uint8Array)
+      const bytes = raw === undefined ? new Uint8Array() : raw instanceof Uint8Array ? raw : new TextEncoder().encode(json ? JSON.stringify(raw) : raw)
+      const out = { ...(json ? { "content-type": "application/json" } : {}), ...res.headers }
+      return await session.send("Fetch.fulfillRequest", {
+        requestId,
+        responseCode: res.status ?? 200,
+        responseHeaders: Object.entries(out).map(([name, value]) => ({ name, value: String(value) })),
+        body: Buffer.from(bytes).toString("base64"),
+      })
+    }
+    await session.send("Fetch.continueRequest", { requestId })
+  } catch (error) {
+    console.error(`mock ${r.method} ${r.url}: ${error instanceof Error ? error.stack : error}`)
+    await session.send("Fetch.failRequest", { requestId, errorReason: "Failed" }).catch(() => {})
+  }
+}
+
 async function handle(op: string, args: any) {
   switch (op) {
     case "describe":
       return describe()
     case "block":
-      Object.assign(state, { case: args.case ?? "", params: args.params ?? {}, target: args.target, variant: args.variant, url: args.url ?? "", prepared: undefined })
+      Object.assign(state, {
+        case: args.case ?? "",
+        params: args.params ?? {},
+        target: args.target,
+        variant: args.variant,
+        url: args.url ?? "",
+        root: args.root ?? "",
+        home: args.home ?? null,
+        prepared: undefined,
+        mocks: [],
+        session: null,
+      })
+      return true
+    case "before":
+      await spec.cases[args.case].launch.before?.({
+        case: state.case,
+        params: state.params,
+        target: state.target,
+        variant: state.variant,
+        root: state.root,
+        home: state.home,
+      })
       return true
     case "prepare": {
       const target = spec.targets[state.target]
       if (target?.prepare) {
         state.playwright = await playwright(args.endpoint, args.target)
-        state.prepared = await target.prepare({ case: state.case, params: state.params, target: state.target, variant: state.variant, url: state.url, playwright: state.playwright })
+        state.prepared = await target.prepare(prepareContext())
       }
       // A `url` function names the first page from what `prepare` returned, so the block loads one page.
       const url = typeof target?.url === "function" ? await target.url({ case: state.case, prepared: state.prepared, params: state.params }) : undefined
@@ -134,10 +243,17 @@ async function handle(op: string, args: any) {
       await c.reset(context())
       return true
     }
-    case "close":
+    case "close": {
+      // Teardown hooks run while the browser is still open; one that throws does not keep the rest.
+      const errors: unknown[] = []
+      await Promise.resolve(spec.teardown?.(context())).catch((e) => errors.push(e))
+      await Promise.resolve(spec.targets[state.target]?.teardown?.(prepareContext())).catch((e) => errors.push(e))
+      if (state.session) await state.session.detach().catch(() => {})
       if (state.playwright) await state.playwright.browser.close().catch(() => {})
-      state.playwright = null
+      Object.assign(state, { playwright: null, session: null, mocks: [] })
+      if (errors.length) throw new AggregateError(errors, `teardown failed: ${errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; ")}`)
       return true
+    }
     case "exit":
       setTimeout(() => process.exit(0), 10)
       return true

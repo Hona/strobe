@@ -12,6 +12,7 @@ use serde_json::{Value, json};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// One app to launch: an executable plus what its profile adds to the generic isolation.
@@ -196,9 +197,129 @@ fn copy_dir(from: &Path, to: &Path) -> Result<()> {
 
 /// Launches `app` in a fresh private home (seeded from `seed`) with a debugging port.
 pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>) -> Result<(Browser, Guard)> {
+    launch_with(app, seed, window, cpus, &Extra::default()).map(|(b, g, _)| (b, g))
+}
+
+/// What a timed launch adds: arguments (such as `--inspect`), the app's output line by line, and a
+/// home of the caller's (prepared by a hook, or kept warm across launches) instead of a new one.
+#[derive(Clone, Debug, Default)]
+pub struct Extra {
+    pub args: Vec<String>,
+    pub output: bool,
+    pub home: Option<PathBuf>,
+    /// Starts the main process paused (`--inspect-brk` on this port) and runs it once a CPU profile of
+    /// it is recording from its first statement: an attribution launch.
+    pub profile_main: Option<u16>,
+}
+
+/// A new private home folder; nothing is in it yet.
+pub fn new_home() -> PathBuf {
+    host::paths::run().join(format!("home-{}-{}", std::process::id(), host::now_ns()))
+}
+
+/// Ends what still runs from `home` (an app's detached service) and restores the URL schemes saved
+/// in it, without deleting it: a warm home is launched again.
+pub fn release_home(home: &Path) {
+    #[cfg(windows)]
+    for pid in host::win::running_under(home) {
+        kill_tree(pid);
+    }
+    restore_protocols(home);
+}
+
+/// When the process was spawned (Unix epoch, ms) and, when asked, its stdout and stderr lines with
+/// the time each arrived.
+pub struct Started {
+    pub epoch_ms: f64,
+    pub output: Option<std::sync::mpsc::Receiver<(f64, String)>>,
+    /// The main process's inspector, profiling, with `extra.profile_main`.
+    pub main: Option<Arc<Cdp>>,
+}
+
+/// Connects to a paused main process's inspector, starts its CPU profiler at 200 µs and lets it run.
+fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let ws = loop {
+        let found = super::chromium::http_get(&format!("127.0.0.1:{port}"), "/json/list")
+            .ok()
+            .and_then(|b| serde_json::from_str::<Value>(&b).ok())
+            .and_then(|v| v.as_array().and_then(|a| a.first()).and_then(|t| t["webSocketDebuggerUrl"].as_str().map(str::to_string)));
+        if let Some(ws) = found {
+            break ws;
+        }
+        if Instant::now() > deadline {
+            return Err(Error::msg("the app's main process opened no inspector in 30 s").hint("an Electron fuse (EnableNodeCliInspectArguments) may turn --inspect off in this build"));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let cdp = Cdp::connect(&ws)?;
+    cdp.send("Profiler.enable", json!({}), None)?;
+    cdp.send("Profiler.setSamplingInterval", json!({ "interval": 200 }), None)?;
+    cdp.send("Profiler.start", json!({}), None)?;
+    cdp.send("Runtime.runIfWaitingForDebugger", json!({}), None)?;
+    Ok(cdp)
+}
+
+/// Unix epoch time in ms, the clock pages report in (`performance.timeOrigin`).
+pub fn epoch_ms() -> f64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.0)
+}
+
+/// Lines of `child`'s stdout and stderr with their arrival time and terminal colour codes removed;
+/// the pipes are always drained, so a chatty app never blocks on a full pipe.
+pub fn lines(child: &mut std::process::Child) -> std::sync::mpsc::Receiver<(f64, String)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let readers: Vec<Box<dyn std::io::Read + Send>> =
+        [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten().collect();
+    for r in readers {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(r).lines().map_while(std::result::Result::ok) {
+                let _ = tx.send((epoch_ms(), strip_ansi(&line)));
+            }
+        });
+    }
+    rx
+}
+
+/// `text` without ANSI escape sequences (`ESC [ … letter`, `ESC ] … BEL`).
+pub fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('[') => {
+                for c in chars.by_ref() {
+                    if c.is_ascii_alphabetic() || c == '~' {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                while let Some(c) = chars.next() {
+                    if c == '\u{7}' || (c == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                        break;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
+pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
     let guard = Guard::take(&app.guards);
     live(app, &guard)?;
-    let home = host::paths::run().join(format!("home-{}-{}", std::process::id(), host::now_ns()));
+    let home = extra.home.clone().unwrap_or_else(new_home);
+    // A home launched before (a warm profile) keeps its state: the seed went in the first time.
+    let fresh = !home.join(".strobe-home").exists();
     let appdata = home.join("AppData").join("Roaming");
     let local = home.join("AppData").join("Local");
     let temp = local.join("Temp");
@@ -214,9 +335,10 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
     for d in &app.dirs {
         std::fs::create_dir_all(home.join(d))?;
     }
-    if let Some(s) = seed {
+    if let Some(s) = seed.filter(|_| fresh) {
         copy_dir(s, &home)?;
     }
+    std::fs::write(home.join(".strobe-home"), "")?;
     // A seed copied from a used profile may hold a stale port file.
     for stale in find(&home, "DevToolsActivePort", 6) {
         let _ = std::fs::remove_file(stale);
@@ -257,15 +379,28 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
     for a in &app.args {
         cmd.arg(fill(a));
     }
-    cmd.arg("--remote-debugging-port=0").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    for a in &extra.args {
+        cmd.arg(fill(a));
+    }
+    if let Some(port) = extra.profile_main {
+        cmd.arg(format!("--inspect-brk={port}"));
+    }
+    let piped = || if extra.output { Stdio::piped() } else { Stdio::null() };
+    cmd.arg("--remote-debugging-port=0").stdin(Stdio::null()).stdout(piped()).stderr(piped());
     let previous = cpus.and_then(host::set_affinity);
+    let epoch = epoch_ms();
     let spawned = cmd.spawn();
     if previous.is_some() {
         host::set_affinity(previous.unwrap_or(0));
     }
-    let child = spawned.map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
+    let mut child = spawned.map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
+    let output = extra.output.then(|| lines(&mut child));
     let pid = child.id();
     let mut launching = Launching { pid, home: Some(home.clone()) };
+    let main = match extra.profile_main {
+        Some(port) => Some(profile_from_start(port)?),
+        None => None,
+    };
     // Electron writes DevToolsActivePort into its userData folder, wherever the app names it.
     let deadline = Instant::now() + Duration::from_secs(60);
     let text = loop {
@@ -285,7 +420,7 @@ pub fn launch(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     launching.home = None;
     std::mem::forget(launching);
-    Ok((Browser { cdp, ws, child: Some(child), pid, profile: Some(home), exe: app.exe.clone(), version, window: window.clone() }, guard))
+    Ok((Browser { cdp, ws, child: Some(child), pid, profile: Some(home), exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
 }
 
 /// A JSON seed file with placeholders filled; a string that is exactly `{port}` becomes a number.
@@ -398,7 +533,9 @@ pub fn kill_tree(pid: u32) {
     if cfg!(windows) {
         let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     } else {
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        // A command target leads its own process group: end the group, then the process.
+        let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 }
 

@@ -367,7 +367,7 @@ pub fn broadcast_env_change() {
 pub fn raise_windows(pids: &[u32]) -> usize {
     use windows_sys::Win32::Foundation::{HWND, LPARAM};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
+        EnumWindows, GetWindowTextLengthW, GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos,
     };
     struct State<'a> {
         pids: &'a [u32],
@@ -385,11 +385,63 @@ pub fn raise_windows(pids: &[u32]) -> usize {
     let mut state = State { pids, found: Vec::new() };
     unsafe {
         EnumWindows(Some(each), &mut state as *mut State as LPARAM);
+        // Posted, not sent: a window of another process whose UI thread is busy would otherwise block
+        // the caller until that thread answers.
         for &h in &state.found {
-            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS);
         }
     }
     state.found.len()
+}
+
+/// See `host::window_pixels`: StretchBlt from the screen with HALFTONE averages each cell.
+pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, HALFTONE, ReleaseDC, SRCCOPY, SelectObject,
+        SetStretchBltMode, StretchBlt,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible};
+    struct State<'a> {
+        pids: &'a [u32],
+        best: Option<(i64, RECT)>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut State) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if state.pids.contains(&pid) && unsafe { IsWindowVisible(hwnd) } != 0 && unsafe { IsIconic(hwnd) } == 0 {
+            let mut r: RECT = unsafe { zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
+                let area = (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
+                if area > 10_000 && state.best.is_none_or(|(a, _)| area > a) {
+                    state.best = Some((area, r));
+                }
+            }
+        }
+        1
+    }
+    const N: i32 = 16;
+    let mut state = State { pids, best: None };
+    unsafe {
+        EnumWindows(Some(each), &mut state as *mut State as LPARAM);
+        let (_, r) = state.best?;
+        let screen = GetDC(std::ptr::null_mut());
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, N, N);
+        let old = SelectObject(mem, bmp);
+        SetStretchBltMode(mem, HALFTONE);
+        let ok = StretchBlt(mem, 0, 0, N, N, screen, r.left, r.top, r.right - r.left, r.bottom - r.top, SRCCOPY) != 0;
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: N, biHeight: -N, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB, ..zeroed() };
+        let mut px = vec![0u8; (N * N * 4) as usize];
+        let lines = GetDIBits(mem, bmp, 0, N as u32, px.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        (ok && lines == N).then_some(px)
+    }
 }
 
 pub fn refresh_at(x: i32, y: i32) -> Option<u32> {

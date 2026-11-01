@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod launch;
+mod script;
+
 /// Secondaries that get tested (Holm across these only). Fewer tests keep the correction reachable.
 const DEFAULT_SECONDARIES: &[&str] = &["frames.interval.p95", "frames.dropped.pct", "main.busy", "interaction.p95", "cpu.app.total"];
 
@@ -34,6 +37,10 @@ const WORK_PARTS: [(&str, &str, f64); 5] = [
     ("layout.count", "LayoutCount", 1.0),
     ("style.count", "RecalcStyleCount", 1.0),
 ];
+
+/// The page's side of `count.<name>` metrics (SPEC §8.4): `globalThis.__strobeCount?.(name, n)` in app
+/// code costs one optional call when strobe is not attached, and adds to this run's totals when it is.
+const COUNT_SCRIPT: &str = "globalThis.__strobeCount ??= (name, n = 1) => { const c = (globalThis.__strobeCounts ??= {}); c[name] = (c[name] ?? 0) + n }";
 
 /// A run with this much other work on the target's CPUs (% of one core) flags its block `Background`.
 const BACKGROUND_PCT: f64 = 25.0;
@@ -68,6 +75,8 @@ struct Series {
     primary: String,
     metrics: Vec<String>,
     reset: bool,
+    /// A launch case's `launch` spec (`until`, `milestones`, `before`, …); null for a run case.
+    launch: Value,
 }
 
 impl Series {
@@ -178,6 +187,12 @@ struct Ctx<'a> {
     awake: host::Awake,
     /// Time spent waiting for the screen to unlock (ms): not part of any series' run time.
     waited_ms: f64,
+    /// Series and variants that had their discarded first launch (launch cases).
+    launched: std::collections::BTreeSet<String>,
+    /// Warm launch homes per series and variant, removed when the experiment ends.
+    homes: BTreeMap<String, PathBuf>,
+    /// `--check`: one block per series on head, one run per case, no statistics.
+    check: bool,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -190,12 +205,18 @@ pub fn run(args: &Args) -> Result<Output> {
     let aa = args.has("aa");
     // `--probes memory`: a leak run per variant (SPEC §8.6); `--base` is optional there.
     let leak_run = args.get("probes") == Some("memory");
+    let check = args.has("check");
     let base_spec = match (args.get("base"), aa) {
+        _ if check && (aa || args.get("base").is_some()) => return Err(Error::usage("--check runs each case once on --head, with nothing to compare; drop --base and --aa")),
+        _ if check => None,
         (Some(b), false) => Some(b.to_string()),
         (None, true) => Some(head_spec.clone()),
         (Some(_), true) => return Err(Error::usage("--aa runs --head against itself; drop --base")),
         (None, false) if leak_run => None,
-        (None, false) => return Err(Error::usage("say what to compare: --base <variant> (or --aa for the same build on both sides)")),
+        (None, false) if args.get("head").is_some() => {
+            return Err(Error::usage("--head alone compares nothing: add --base <variant>, or --check to run each case once and see that it passes"));
+        }
+        (None, false) => return Err(Error::usage("say what to compare: --base <variant> (or --aa for the same build on both sides, or --check to validate the file)")),
     };
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
@@ -230,11 +251,20 @@ pub fn run(args: &Args) -> Result<Output> {
         baseline: validity::baseline(),
         keep_all: args.has("keep"),
         // A leak run's N: S0, N runs, S1, N runs, S2.
-        runs: if leak_run { args.num("repeat")?.unwrap_or(10.0).max(3.0) as usize } else { args.num("runs")?.unwrap_or(5.0).max(1.0) as usize },
+        runs: if check {
+            1
+        } else if leak_run {
+            args.num("repeat")?.unwrap_or(10.0).max(3.0) as usize
+        } else {
+            args.num("runs")?.unwrap_or(5.0).max(1.0) as usize
+        },
         warnings: Vec::new(),
         config: config.clone(),
         awake: host::Awake::start(),
         waited_ms: 0.0,
+        launched: Default::default(),
+        homes: BTreeMap::new(),
+        check,
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -272,11 +302,23 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut series_out = Vec::new();
     let mut all_decided = true;
     for s in &series {
-        let out = if leak_run { leak_series(&mut ctx, s, &mut variants, &config)? } else { run_series(&mut ctx, s, &mut variants, &config, aa, started, max_time)? };
+        let out = if check {
+            check_series(&mut ctx, s, &mut variants, &config)?
+        } else if leak_run {
+            leak_series(&mut ctx, s, &mut variants, &config)?
+        } else {
+            run_series(&mut ctx, s, &mut variants, &config, aa, started, max_time)?
+        };
         all_decided &= out["decided"].as_bool().unwrap_or(false);
         series_out.push(out);
     }
     ctx.runner.exit();
+    for home in std::mem::take(&mut ctx.homes).into_values() {
+        let _ = std::fs::remove_dir_all(home);
+    }
+    if check {
+        return check_output(&exp, &dir, &file, series_out, ctx.warnings);
+    }
     let refresh = host::refresh_at(ctx.window.x + 20, ctx.window.y + 20);
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
@@ -310,6 +352,56 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut out = Output::new(text, brief);
     if args.has("require-verdict") && !all_decided {
         out.code = 5;
+    }
+    Ok(out)
+}
+
+/// `--check`: one block on head with one run, no warmup and no statistics. A failing case is reported
+/// with what timed out and its screenshot, and the next case runs.
+fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
+    let target = ctx.describe["targets"][&s.target].clone();
+    for v in variants.iter_mut() {
+        prepare_variant(v, &target, config, false)?;
+    }
+    let started = Instant::now();
+    let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
+    let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    let (passed, error, values) = match r {
+        Ok(b) => (true, Value::Null, json!(b.values)),
+        Err(e) => (false, json!(e.message), Value::Null),
+    };
+    progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
+    let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
+    Ok(json!({
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
+        "passed": passed, "decided": passed, "error": error, "values": values, "elapsed_ms": elapsed_ms,
+    }))
+}
+
+fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>) -> Result<Output> {
+    let failed = series.iter().filter(|s| s["passed"] != true).count();
+    let mut text = String::new();
+    for s in &series {
+        // The declared metrics' values: one run's worth, enough to see that a counter counts.
+        let shown = |name: &str| s["values"][name].as_f64().map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit))));
+        let value = s["declared"].as_array().into_iter().flatten().filter_map(|m| m.as_str().and_then(shown)).collect::<Vec<_>>().join(" · ");
+        let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
+        if s["passed"] == true {
+            text += &format!("pass  {}  {value}  {secs:.1} s\n", s["label"].as_str().unwrap_or(""));
+        } else {
+            text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
+        }
+    }
+    text += &format!("\n{} of {} cases passed (one run each on head; nothing compared)\n", series.len() - failed, series.len());
+    for w in &warnings {
+        text += &format!("{} {:<24}{}\n", if w.level == "warn" { "!" } else { "i" }, w.id, w.text);
+    }
+    text += &format!("\n{exp}\n");
+    let result = json!({ "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "series": series, "warnings": warnings, "passed": failed == 0, "text": text });
+    store::write_json(&dir.join("result.json"), &result)?;
+    let mut out = Output::new(text, result);
+    if failed > 0 {
+        out.code = 1;
     }
     Ok(out)
 }
@@ -394,7 +486,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
         let n = pair + 1;
         let look = looks.contains(&n);
-        let cmp = stats::compare(def, &primary_pairs, bound, confidence);
+        let cmp = stats::compare(&s.primary, def, &primary_pairs, bound, confidence);
         let next = looks.iter().find(|&&l| l > n).copied();
         progress(format!(
             "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {}",
@@ -462,11 +554,14 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             continue;
         }
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
-        secondaries.push(tail_check(d, &blocks, stats::compare(d, &pp, bound, 0.95)));
+        secondaries.push(tail_check(d, &blocks, stats::compare(name, d, &pp, bound, 0.95)));
     }
-    let ps: Vec<f64> = secondaries.iter().map(|c| c.p).collect();
+    // An exact comparison (a stable counter) is a fact, not a test: it skips Holm and the primary's gate.
+    let tested: Vec<usize> = (0..secondaries.len()).filter(|&i| !secondaries[i].exact).collect();
+    let ps: Vec<f64> = tested.iter().map(|&i| secondaries[i].p).collect();
     let rejected = stats::holm(&ps, 0.05);
-    for (c, rej) in secondaries.iter_mut().zip(rejected) {
+    for (&i, rej) in tested.iter().zip(rejected) {
+        let c = &mut secondaries[i];
         if c.verdict.starts_with("refused") {
             continue;
         }
@@ -477,19 +572,22 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     }
     // Smallest n whose exact signed-rank test can clear Holm's first step across the tested set.
-    let tests = secondaries.len().max(1);
+    let tests = tested.len().max(1);
     let holm_pairs = (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests as f64).unwrap_or(60);
     let mut descriptive: Vec<Comparison> = Vec::new();
-    for name in DESCRIPTIVE {
-        if *name == s.primary || names.iter().any(|n| n == name) {
+    // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
+    let found: Vec<String> = blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work").cloned().collect()).unwrap_or_default();
+    for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
+        let name = name.as_str();
+        if name == s.primary || names.iter().any(|n| n == name) {
             continue;
         }
         let Some(d) = model::metric(name) else { continue };
-        if !blocks.iter().all(|b| b.values.get(*name).is_some_and(|v| v.is_finite())) {
+        if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
             continue;
         }
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
-        let mut c = tail_check(d, &blocks, stats::compare(d, &pp, bound, 0.95));
+        let mut c = tail_check(d, &blocks, stats::compare(name, d, &pp, bound, 0.95));
         if !c.verdict.starts_with("refused") {
             c.verdict = "·".into();
         }
@@ -515,11 +613,20 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if why {
         progress("  attribution blocks (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
         for v in variants.iter() {
-            match block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) {
+            // A launch's attribution is a launch of its own, profiled from the first statement.
+            let attributed = if s.launch.is_object() { launch::attribution(ctx, s, v) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+            match attributed {
                 Ok(b) => {
                     progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
+                    if let Some(line) =
+                        b.recording.as_deref().and_then(|r| store::resolve(r).ok()).and_then(|d| store::read_json(&d.join("shifts.json")).ok()).and_then(|v| probe::shifts::headline(&v))
+                    {
+                        progress(format!("  {} {line}", b.variant));
+                    }
                     // `Unresolved` (SPEC §10.2): script samples the stored source maps could not name.
-                    let hot = b.recording.as_deref().and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
+                    // A script target's profile names its own source files: nothing to map.
+                    let script = ctx.describe["targets"][&s.target]["kind"] == "script";
+                    let hot = b.recording.as_deref().filter(|_| !script).and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
                         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
                         if scripts > 0.0 && mapped / scripts < 0.95 {
@@ -537,7 +644,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
-        "label": s.label(), "case": s.case, "target": s.target, "params": s.params,
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
         "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
@@ -751,7 +858,13 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
-        let r = run_block(ctx, s, v, pair, set, keep);
+        let r = if s.launch.is_object() {
+            launch::block(ctx, s, v, pair)
+        } else if ctx.describe["targets"][&s.target]["kind"] == "script" {
+            script::block(ctx, s, v, pair, set, keep)
+        } else {
+            run_block(ctx, s, v, pair, set, keep)
+        };
         if !woken && r.as_ref().err().is_some_and(|e| e.message.contains("WindowHidden")) {
             progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
             woken = true;
@@ -770,7 +883,12 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
 fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
-    let app = kind == "app" || kind == "exe";
+    let app = kind == "app" || kind == "exe" || kind == "command";
+    // What the series declared beyond the default probes: counters, network counts, layout shift.
+    let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
+    let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
+    let nets: Vec<String> = declared.iter().filter(|m| m.starts_with("net.")).map(|m| m.to_string()).collect();
+    let shift = declared.iter().any(|m| *m == "layout.shift");
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -781,7 +899,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     ctx.used = Some(window.clone());
     let launched = Instant::now();
     let mut guard = None;
-    let browser = if app {
+    let browser = if kind == "command" {
+        let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
+        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &electron::new_home(), &window, ctx.pin)?.0
+    } else if app {
         let launch = variant_app(v, &target, &ctx.config)?;
         let seed = target["home"].as_str().map(|h| {
             let mut h = h.to_string();
@@ -817,6 +938,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         if !app && target.get("viewport").is_some_and(Value::is_object) {
             browser.fit_viewport(&page, window.width, window.height)?;
         }
+        // `count.<name>` metrics: the page counts through a global installed in every document it loads.
+        if !counted.is_empty() {
+            page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": COUNT_SCRIPT }))?;
+            page.eval(COUNT_SCRIPT)?;
+        }
         lap("attach");
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
@@ -835,6 +961,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         // A run that loads a page (`goto`) starts the counters again in the new document: what the
         // departing document did is read just before it goes and carried into the run's totals.
         let carried = RefCell::new([0.0f64; 6]);
+        // This run's `count.<name>` values: the bench file's `ctx.count` and the page's counter global.
+        let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
+        let page_counts =
+            || -> BTreeMap<String, f64> { page.eval("JSON.stringify(globalThis.__strobeCounts ?? {})").ok().and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok())).unwrap_or_default() };
+        let add_counts = |from: BTreeMap<String, f64>| {
+            let mut c = counts.borrow_mut();
+            for (k, n) in from {
+                *c.entry(k).or_default() += n;
+            }
+        };
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -846,8 +982,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                         for (sum, v) in c.iter_mut().zip(before) {
                             *sum += v;
                         }
+                        if !counted.is_empty() {
+                            add_counts(page_counts());
+                        }
                     }
                     driver.dispatch(call, &args)
+                }
+                "count" => {
+                    if !current.borrow().is_empty() {
+                        add_counts(BTreeMap::from([(a["name"].as_str().unwrap_or("").to_string(), a["n"].as_f64().unwrap_or(1.0))]));
+                    }
+                    Ok(Value::Bool(true))
                 }
                 "phase" => {
                     let name: String = a["name"].as_str().unwrap_or("phase").chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
@@ -862,7 +1007,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
         };
         let t = Duration::from_secs(120);
-        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url }), t, &serve)?;
+        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root }), t, &serve)?;
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {
@@ -891,7 +1036,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
-        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start(&browser.cdp, set)?) };
+        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, if shift { &["loading"] } else { &[] })?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         let mut census: Vec<Value> = Vec::new();
         // A leak run measures 2 × N runs: N to S1 and N more to S2.
@@ -901,6 +1046,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
         page.send("Performance.enable", json!({}))?;
+        // `net.*` metrics: requests and bytes per run from the Network domain, on only for such series.
+        let net = if nets.is_empty() {
+            None
+        } else {
+            let rx = browser.cdp.events();
+            page.send("Network.enable", json!({}))?;
+            Some(RefCell::new(Net::new(rx, page.session.clone())))
+        };
+        let run_counts: RefCell<Vec<BTreeMap<String, f64>>> = RefCell::new(Vec::new());
 
         let run_timeout = Duration::from_secs(60);
         let mut run_once = |key: &str| -> Result<Run> {
@@ -912,6 +1066,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let (cyc0, tsc0) = cycles();
             let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             *carried.borrow_mut() = [0.0; 6];
+            counts.borrow_mut().clear();
+            if !counted.is_empty() {
+                page.eval("globalThis.__strobeCounts = {}, true")?;
+            }
+            if let Some(n) = &net {
+                n.borrow_mut().drain(None);
+            }
             let c0 = counters();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
@@ -923,6 +1084,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
             let (cyc1, tsc1) = cycles();
+            if !counted.is_empty() {
+                add_counts(page_counts());
+            }
+            let index = run_counts.borrow().len();
+            run_counts.borrow_mut().push(counts.borrow().clone());
+            if let Some(n) = &net {
+                n.borrow_mut().drain(Some(index));
+            }
             let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
             if s.reset {
@@ -978,7 +1147,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 let (a, b) = (runs[i - 1].task, runs[i].task);
                 a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
             };
-            if steady || i >= MAX_WARMUP {
+            // `--check` measures the first run: it asks whether a case works, not what it costs.
+            if ctx.check {
+                first = Some(0);
+            } else if steady || i >= MAX_WARMUP {
                 unsteady = !steady;
                 first = Some(if set == Set::Attribution || set == Set::Memory || !steady { i + 1 } else { i - 1 });
                 if set == Set::Attribution {
@@ -1056,6 +1228,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             tracing.stop(&trace)?;
             lap("trace");
         }
+        // `layout.shift`'s explanation: the largest shifts and what moved, named while the page is open.
+        if set == Set::Attribution && shift {
+            match probe::shifts::largest(&trace, &token, &page, first, 5) {
+                Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
+                Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", v.role, e.message))),
+            }
+        }
         if set == Set::Attribution {
             // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
             let mut c = probe::census::take(&browser, &page);
@@ -1068,11 +1247,29 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
             lap("heap");
         }
-        let _ = ctx.runner.call("close", json!({}), t, &serve);
+        if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
+            && !ctx.warnings.iter().any(|w| w.id == "Teardown")
+        {
+            ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
+        }
         let mut data = if set == Set::Memory { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
         lap("analyse");
         let mut extra = BTreeMap::new();
+        let run_counts = run_counts.into_inner();
+        for name in &counted {
+            extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
+        }
+        if let Some(n) = net {
+            let mut n = n.into_inner();
+            n.settle();
+            for m in &nets {
+                extra.insert(m.clone(), (0..measured.len()).map(|j| (key(j), n.value(m, first + j))).collect());
+            }
+        }
+        if shift && set != Set::Memory {
+            extra.insert("layout.shift".to_string(), data.shift_per_run("run"));
+        }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
         if !gpu_3d.is_empty() {
@@ -1283,10 +1480,29 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
     let only_target = args.get("target");
     let fixed: BTreeMap<String, String> =
         args.get("params").map(|p| p.split(',').filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect()).unwrap_or_default();
+    // `--params all`: every value, the `more` ones too.
+    let all = args.get("params").is_some_and(|p| p.split(',').any(|x| x.trim() == "all"));
     let params = describe["params"].as_object().cloned().unwrap_or_default();
     let mut combos: Vec<BTreeMap<String, Value>> = vec![BTreeMap::new()];
     for (k, values) in &params {
-        let values: Vec<Value> = values.as_array().cloned().unwrap_or_default().into_iter().filter(|v| fixed.get(k).is_none_or(|f| value_text(v) == *f)).collect();
+        // `{ run, more }`: `run` by default; `more` with `--params all`, or when `--params k=v` names one.
+        let values: Vec<Value> = match values {
+            Value::Object(o) => {
+                let list = |key: &str| o.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+                let mut v = list("run");
+                if all || fixed.contains_key(k) {
+                    v.extend(list("more"));
+                }
+                v
+            }
+            v => v.as_array().cloned().unwrap_or_default(),
+        };
+        let values: Vec<Value> = values.into_iter().filter(|v| fixed.get(k).is_none_or(|f| value_text(v) == *f)).collect();
+        if values.is_empty()
+            && let Some(f) = fixed.get(k)
+        {
+            return Err(Error::usage(format!("--params {k}={f}: not one of {k}'s values")));
+        }
         combos = combos
             .into_iter()
             .flat_map(|c| {
@@ -1304,8 +1520,10 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
         if filter.is_some_and(|f| !glob(f, &case)) {
             continue;
         }
+        // A case may name the targets it runs on; by default it runs on every target.
+        let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
         for target in targets.keys() {
-            if only_target.is_some_and(|t| t != target) {
+            if only_target.is_some_and(|t| t != target) || on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) {
                 continue;
             }
             for p in &combos {
@@ -1316,11 +1534,102 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
                     primary: args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string()),
                     metrics: c["metrics"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default(),
                     reset: c["reset"].as_bool().unwrap_or(false),
+                    launch: c["launch"].clone(),
                 });
             }
         }
     }
     Ok(out)
+}
+
+/// Requests a page started per run and the bytes they received, from Network domain events read at run
+/// boundaries. A request belongs to the run it started in; its bytes may arrive after that run ends.
+struct Net {
+    rx: std::sync::mpsc::Receiver<Value>,
+    session: String,
+    /// Per run: (request id, URL) of every request it started, redirects included.
+    runs: Vec<Vec<(String, String)>>,
+    owner: BTreeMap<String, usize>,
+    /// Bytes on the wire per request: its finished total, else the chunks so far.
+    finished: BTreeMap<String, f64>,
+    chunks: BTreeMap<String, f64>,
+}
+
+impl Net {
+    fn new(rx: std::sync::mpsc::Receiver<Value>, session: String) -> Net {
+        Net { rx, session, runs: Vec::new(), owner: BTreeMap::new(), finished: BTreeMap::new(), chunks: BTreeMap::new() }
+    }
+
+    /// Reads the events so far; requests started now belong to run `current` (none between runs).
+    fn drain(&mut self, current: Option<usize>) {
+        while let Ok(ev) = self.rx.try_recv() {
+            self.take(&ev, current);
+        }
+    }
+
+    /// The last bytes of requests that were still loading when the runs ended: up to 300 ms of quiet.
+    fn settle(&mut self) {
+        while let Ok(ev) = self.rx.recv_timeout(Duration::from_millis(300)) {
+            self.take(&ev, None);
+        }
+    }
+
+    fn take(&mut self, ev: &Value, current: Option<usize>) {
+        if ev["sessionId"].as_str() != Some(self.session.as_str()) {
+            return;
+        }
+        let p = &ev["params"];
+        let id = p["requestId"].as_str().unwrap_or("").to_string();
+        match ev["method"].as_str().unwrap_or("") {
+            "Network.requestWillBeSent" => {
+                let url = p["request"]["url"].as_str().unwrap_or("");
+                if let Some(i) = current
+                    && (url.starts_with("http") || url.starts_with("ws"))
+                {
+                    if self.runs.len() <= i {
+                        self.runs.resize(i + 1, Vec::new());
+                    }
+                    self.runs[i].push((id.clone(), url.to_string()));
+                    self.owner.insert(id, i);
+                }
+            }
+            "Network.dataReceived" if self.owner.contains_key(&id) => *self.chunks.entry(id).or_default() += p["encodedDataLength"].as_f64().unwrap_or(0.0),
+            "Network.loadingFinished" if self.owner.contains_key(&id) => {
+                self.finished.insert(id, p["encodedDataLength"].as_f64().unwrap_or(0.0));
+            }
+            _ => {}
+        }
+    }
+
+    /// `net.requests` or `net.bytes` of run `i`, optionally `{<url glob>}`.
+    fn value(&self, metric: &str, i: usize) -> f64 {
+        let (base, pattern) = metric.split_once('{').map_or((metric, None), |(b, p)| (b, Some(p.trim_end_matches('}'))));
+        let requests = self.runs.get(i).map(Vec::as_slice).unwrap_or_default().iter().filter(|(_, url)| pattern.is_none_or(|p| url_glob(p, url)));
+        match base {
+            "net.bytes" => {
+                // A redirected request repeats its id: its bytes count once.
+                let ids: std::collections::BTreeSet<&String> = requests.map(|(id, _)| id).collect();
+                ids.into_iter().map(|id| self.finished.get(id).or(self.chunks.get(id)).copied().unwrap_or(0.0)).sum()
+            }
+            _ => requests.count() as f64,
+        }
+    }
+}
+
+/// A URL against a pattern: `*` within one path segment, `**` across them. A pattern without `://`
+/// matches the path; the query string is never part of the match.
+fn url_glob(pattern: &str, url: &str) -> bool {
+    let url = url.split(['?', '#']).next().unwrap_or(url);
+    let subject = if pattern.contains("://") { url } else { url.find("://").and_then(|i| url[i + 3..].find('/').map(|j| &url[i + 3 + j..])).unwrap_or("/") };
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match p.split_first() {
+            None => s.is_empty(),
+            Some((b'*', rest)) if rest.first() == Some(&b'*') => (0..=s.len()).any(|k| go(&rest[1..], &s[k..])),
+            Some((b'*', rest)) => (0..=s.len()).take_while(|k| *k == 0 || s[k - 1] != b'/').any(|k| go(rest, &s[k..])),
+            Some((c, rest)) => s.first() == Some(c) && go(rest, &s[1..]),
+        }
+    }
+    go(pattern.as_bytes(), subject.as_bytes())
 }
 
 fn value_text(v: &Value) -> String {
@@ -1379,6 +1688,19 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
 
 /// Builds and serves a variant for `web` targets (once per experiment).
 fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) -> Result<()> {
+    // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
+    // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
+    if matches!(target["kind"].as_str(), Some("command") | Some("script")) {
+        if let Kind::Git(r) = &v.kind
+            && v.root.is_none()
+        {
+            v.root = Some(worktree(r)?);
+        }
+        if let (Some(root), Some(cmd)) = (v.root.clone(), target["build"].as_str()) {
+            build_variant(v.role, &root, &json!({ "command": cmd }))?;
+        }
+        return Ok(());
+    }
     if target["kind"].as_str() != Some("web") || v.base_url.is_some() || matches!(v.kind, Kind::Url(_)) {
         return Ok(());
     }
@@ -1467,15 +1789,7 @@ fn worktree(r: &str) -> Result<PathBuf> {
 }
 
 fn shell(cmd: &str) -> Command {
-    if cfg!(windows) {
-        let mut c = Command::new("cmd");
-        c.args(["/d", "/s", "/c", cmd]);
-        c
-    } else {
-        let mut c = Command::new("sh");
-        c.args(["-c", cmd]);
-        c
-    }
+    crate::target::command::shell(cmd)
 }
 
 fn free_port() -> Result<u16> {
@@ -1586,13 +1900,12 @@ fn render(r: &Value) -> String {
         let refresh = r["refresh_hz"].as_u64().map(|h| format!(" · display {h} Hz")).unwrap_or_default();
         out += &format!("       {} · {} · window {}×{}{}\n", r["browser"].as_str().unwrap_or(""), gpu, r["window"]["width"], r["window"]["height"], refresh);
         out += &format!("plan   {} · power plan {} · visible, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
-        out += &format!(
-            "blocks {} pairs ({} fresh launches) · warmup until steady · {} runs per block · stopped: {}\n",
-            s["pairs"],
-            s["launches"],
-            r["plan"]["runs_per_block"],
-            s["stopped"].as_str().unwrap_or("")
-        );
+        let per_block = if s["kind"] == "launch" {
+            "one timed launch per block · first launch of each variant discarded".to_string()
+        } else {
+            format!("warmup until steady · {} runs per block", r["plan"]["runs_per_block"])
+        };
+        out += &format!("blocks {} pairs ({} fresh launches) · {per_block} · stopped: {}\n", s["pairs"], s["launches"], s["stopped"].as_str().unwrap_or(""));
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
         out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
@@ -1614,7 +1927,13 @@ fn render(r: &Value) -> String {
             // A percentage compared as a difference is in percentage points.
             let abs_unit = if unit == "%" { "pp" } else { unit };
             let delta = if rel { fmt::pct(est) } else { fmt::signed(est, abs_unit) };
-            let ci = if rel { format!("{} … {}", fmt::pct(lo), fmt::pct(hi)) } else { format!("{} … {}", fmt::signed(lo, abs_unit), fmt::signed(hi, abs_unit)) };
+            let ci = if c["exact"] == true {
+                "exact".to_string()
+            } else if rel {
+                format!("{} … {}", fmt::pct(lo), fmt::pct(hi))
+            } else {
+                format!("{} … {}", fmt::signed(lo, abs_unit), fmt::signed(hi, abs_unit))
+            };
             out += &format!(
                 "{}{}{}{}{}{}\n",
                 fmt::pad(&format!("{} {name}", if primary { "★" } else { " " }), 28),

@@ -6,6 +6,7 @@ pub mod cpu;
 pub mod gpu;
 pub mod heap;
 pub mod os;
+pub mod shifts;
 pub mod symbols;
 pub mod trace;
 

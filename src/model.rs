@@ -169,8 +169,89 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         about: "memory retained by objects allocated in a memory recording's first half and still alive at its end",
     },
+    MetricDef {
+        name: "cpu.work",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        about: "CPU time of the target's processes per run (all threads): a script target's main.work, a launch's total",
+    },
+    MetricDef {
+        name: "layout.shift",
+        unit: "score",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: ("steadier", "jumpier"),
+        min_n: 0,
+        about: "summed layout-shift score per run, shifts right after the run's input included",
+    },
+    MetricDef {
+        name: "net.requests",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Exact,
+        words: COUNT,
+        min_n: 0,
+        about: "requests the page started per run; `net.requests{<url glob>}` counts the matching ones",
+    },
+    MetricDef {
+        name: "net.bytes",
+        unit: "bytes",
+        better: Better::Lower,
+        kind: Kind::Exact,
+        words: AMOUNT,
+        min_n: 0,
+        about: "bytes received over the network per run (as encoded on the wire); `net.bytes{<url glob>}` for matching requests",
+    },
+    MetricDef {
+        name: "count",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Exact,
+        words: COUNT,
+        min_n: 0,
+        about: "`count.<name>`: what the bench file (`ctx.count`) or the page (`strobe.count`) counted per run",
+    },
+    MetricDef { name: "launch.ready", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "a launch case: from process spawn until its `until` selector is visible" },
+    MetricDef {
+        name: "launch.painted",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        about: "a launch case: from process spawn until the window's pixels first differ from its first frame (Windows)",
+    },
+    MetricDef {
+        name: "launch.settled",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        about: "a launch case: from process spawn until the window's pixels last changed before ready (Windows)",
+    },
+    MetricDef {
+        name: "launch.milestone",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        about: "`launch.<name>`: from process spawn until a milestone (a log line, Node bootstrap)",
+    },
 ];
 
+/// A metric's definition. Families resolve by their base: `net.requests{<glob>}` → `net.requests`,
+/// `count.<name>` → `count`, `launch.<milestone>` → `launch.milestone`.
 pub fn metric(name: &str) -> Option<&'static MetricDef> {
-    METRICS.iter().find(|m| m.name == name)
+    let base = name.split_once('{').map_or(name, |(b, _)| b);
+    let find = |n: &str| METRICS.iter().find(|m| m.name == n);
+    find(base).or_else(|| match base.split_once('.') {
+        Some(("count", rest)) if !rest.is_empty() => find("count"),
+        Some(("launch", rest)) if !rest.is_empty() => find("launch.milestone"),
+        _ => None,
+    })
 }

@@ -1,0 +1,599 @@
+//! Launch cases (SPEC §9.6): a block launches the target once, cold, and times it from process spawn
+//! (or, for a web target, from navigation) until the case's `until` selector is visible, with
+//! milestones on the way: lines in the app's output, its log files or its page marks, Node's own
+//! bootstrap timing, and when the window's pixels first and last changed.
+
+use super::*;
+use crate::target::cdp::Cdp;
+use crate::target::command;
+use crate::target::electron::{Extra, Started, epoch_ms};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, channel};
+use std::sync::{Arc, Mutex};
+
+/// One milestone: the first line matching `pattern` from `source`: `output` (stdout and stderr),
+/// `page` (the page's `performance.mark` names) or a glob of files under the launch's home.
+struct Milestone {
+    name: String,
+    pattern: regex_lite::Regex,
+    source: String,
+}
+
+/// A line seen during a launch: when (epoch ms), its text, and where it came from.
+type Line = (f64, String, String);
+
+pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Result<Block> {
+    let key = format!("{}\n{}", s.label(), v.role);
+    // The first launch of a build pays for its files being read from disk and scanned: one launch per
+    // variant and series is discarded before any is measured. A warm profile fills its home in it.
+    if !ctx.check && ctx.launched.insert(key.clone()) {
+        progress(format!("  {} warm-up launch (discarded)", v.role));
+        once(ctx, s, v, pair, &key, false)?;
+    }
+    once(ctx, s, v, pair, &key, false)
+}
+
+/// An attribution launch: never timed. The main process starts paused under `--inspect-brk` with its
+/// CPU profiler on (app and exe targets), and every page starts paused until its own profiler runs,
+/// so both profiles cover the launch from the first statement.
+pub(super) fn attribution(ctx: &mut Ctx, s: &Series, v: &Variant) -> Result<Block> {
+    let key = format!("{}\n{}", s.label(), v.role);
+    once(ctx, s, v, usize::MAX, &key, true)
+}
+
+fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile: bool) -> Result<Block> {
+    let spec = s.launch.clone();
+    let target = ctx.describe["targets"][&s.target].clone();
+    let kind = target["kind"].as_str().unwrap_or("").to_string();
+    let web = kind == "web" || kind == "url";
+    let milestones = milestones(&spec)?;
+    let t = Duration::from_secs(120);
+    let mut steps: Vec<(String, f64)> = Vec::new();
+    let mut lapped = Instant::now();
+    let mut lap = |name: &str, steps: &mut Vec<(String, f64)>| {
+        steps.push((name.to_string(), lapped.elapsed().as_secs_f64() * 1e3));
+        lapped = Instant::now();
+    };
+    if spec["inspect"] == true && kind != "app" && kind != "exe" {
+        return Err(Error::usage(format!("{}: launch.inspect reads Node's timing from an app or exe target's main process", s.case)));
+    }
+    // `fresh`: a new home per launch. `warm`: one home per series and variant, kept across its launches,
+    // so caches and state from the discarded first launch are there, as for a person's second launch.
+    let warm = match spec["profile"].as_str().unwrap_or("fresh") {
+        "fresh" => false,
+        "warm" => true,
+        other => return Err(Error::usage(format!("{}: launch.profile is fresh or warm, not {other}", s.case))),
+    };
+    let home = (!web).then(|| if warm { ctx.homes.entry(key.to_string()).or_insert_with(electron::new_home).clone() } else { electron::new_home() });
+    if let Some(h) = &home {
+        std::fs::create_dir_all(h)?;
+    }
+    let root = v.root.as_ref().map(|r| r.display().to_string());
+    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root, "home": home }), t, &no_page)?;
+    if spec["before"] == true {
+        ctx.runner
+            .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
+            .map_err(|e| Error::refused("RunIncomplete", format!("{} before: {}", s.case, e.message), "fix the launch's before hook"))?;
+    }
+    lap("before", &mut steps);
+    let mut window = ctx.window.clone();
+    if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
+        window.width = vp["width"].as_u64().unwrap_or(1400) as u32;
+        window.height = vp["height"].as_u64().unwrap_or(900) as u32;
+    }
+    ctx.used = Some(window.clone());
+    let screen = cfg!(windows) && !web && spec["screen"] != false && !profile;
+    let inspect_port = if spec["inspect"] == true && !profile { Some(free_port()?) } else { None };
+    let mut guard = None;
+    // The time stamp counter's rate, from two readings around the launch: cycles to ms.
+    let clock = (host::tsc(), Instant::now());
+    let (mut browser, started) = match kind.as_str() {
+        "app" | "exe" => {
+            let app = variant_app(v, &target, &ctx.config)?;
+            let seed = target["home"].as_str().map(|h| {
+                let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
+                Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
+            });
+            let extra = Extra {
+                args: inspect_port.map(|p| vec![format!("--inspect={p}")]).unwrap_or_default(),
+                output: true,
+                home: home.clone(),
+                profile_main: if profile { Some(free_port()?) } else { None },
+            };
+            let (b, g, st) = electron::launch_with(&app, seed.as_deref(), &window, ctx.pin, &extra)?;
+            guard = Some(g);
+            (b, st)
+        }
+        "command" => {
+            let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
+            command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), &window, ctx.pin)?
+        }
+        _ if web => (chromium::launch(&window, false, ctx.pin, &[])?, Started { epoch_ms: 0.0, output: None, main: None }),
+        other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
+    };
+    let result = (|| -> Result<Block> {
+        let watch = Watch::start(&browser.cdp, observer(&spec["until"]), profile)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let pid = browser.pid;
+        // An app's windows stay on top without focus (an occluded window never paints); `screen` also
+        // captures their pixels.
+        let sampler = (!web).then(|| {
+            let stop = stop.clone();
+            std::thread::spawn(move || sample_screen(pid, screen, &stop))
+        });
+        let tails = {
+            let globs: Vec<String> = milestones.iter().filter(|m| m.source != "output" && m.source != "page").map(|m| m.source.clone()).collect();
+            let stop = stop.clone();
+            let home = home.clone();
+            home.filter(|_| !globs.is_empty()).map(|home| std::thread::spawn(move || tail(&home, &globs, &stop)))
+        };
+        // CPU of the target's processes in cycles (exact; process times move in 15.6 ms ticks), from
+        // spawn, or from navigation for a web target whose browser was already up.
+        let cpu_now = || -> (u64, u64) { browser.processes().iter().fold((0, 0), |(c, n), p| (c + p.cycles, n + p.cpu_ns)) };
+        let mut cpu0 = (0, 0);
+        let started_ms = if web {
+            let page = browser.page()?;
+            let first = if target["prepare"].as_bool() == Some(true) {
+                let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &no_page)?;
+                let base = variant_url(v, &target)?;
+                r.get("url").and_then(Value::as_str).map(|u| join_url(origin(&base), u)).unwrap_or(base)
+            } else {
+                variant_url(v, &target)?
+            };
+            // An attribution launch's page profiler started when the page was attached, before this.
+            cpu0 = cpu_now();
+            let at = epoch_ms();
+            page.send("Page.navigate", json!({ "url": first }))?;
+            at
+        } else {
+            started.epoch_ms
+        };
+        let timeout = Duration::from_millis(spec["timeout"].as_u64().unwrap_or(120_000));
+        let (ready_at, page) = match watch.ready(timeout) {
+            Ok(found) => found,
+            Err(e) => {
+                let shot = watch.any_page().map(|p| snapshot(&p, &ctx.exp, "launch")).unwrap_or_default();
+                return Err(Error::refused("RunIncomplete", format!("{} launch: {}{shot}", s.case, e.message), "the until selector never showed"));
+            }
+        };
+        let cpu1 = cpu_now();
+        let cpu_ms = match (clock.0, host::tsc()) {
+            (Some(a), Some(b)) if b > a && cpu1.0 > 0 => cpu1.0.saturating_sub(cpu0.0) as f64 / ((b - a) as f64 / (clock.1.elapsed().as_secs_f64() * 1e3)),
+            _ => cpu1.1.saturating_sub(cpu0.1) as f64 / 1e6,
+        };
+        lap("ready", &mut steps);
+        if watch.late.load(Ordering::Relaxed) {
+            return Err(Error::refused(
+                "RunIncomplete",
+                format!("{} launch: the window showed its until selector before strobe could attach, so the launch has no valid end", s.case),
+                "a target strobe reaches only after its first page loads cannot be timed to a selector",
+            ));
+        }
+        validity::window_visible(&page)?;
+        if !ctx.gpu_checked {
+            ctx.gpu = serde_json::to_value(validity::software_gpu(&browser)?)?;
+            ctx.browser_version = browser.version.clone();
+            ctx.gpu_checked = true;
+        }
+        // Milestones may land after ready (a service that comes up behind the window), and the screen
+        // settles after it: lines are collected for 1 s, and up to 3 s while a milestone is missing.
+        let mut lines: Vec<Line> = Vec::new();
+        let settle = Instant::now() + Duration::from_secs(1);
+        let grace = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Some(rx) = &started.output {
+                lines.extend(rx.try_iter().map(|(at, l)| (at, l, "output".to_string())));
+            }
+            let now = Instant::now();
+            if now >= grace || (now >= settle && found_all(&milestones, &lines, |m| m.source == "output")) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        if milestones.iter().any(|m| m.source == "page") {
+            lines.extend(page_marks(&page));
+        }
+        stop.store(true, Ordering::Relaxed);
+        watch.stop();
+        if let Some(h) = tails {
+            lines.extend(joined(h));
+        }
+        let pixels = sampler.map(joined).unwrap_or_default();
+        lap("milestones", &mut steps);
+        let mut values = BTreeMap::new();
+        let ready_ms = ready_at - started_ms;
+        values.insert("launch.ready".to_string(), ready_ms);
+        values.insert("cpu.work".to_string(), cpu_ms);
+        for m in &milestones {
+            let first = lines.iter().filter(|(_, l, src)| *src == m.source && m.pattern.is_match(l)).map(|(at, _, _)| *at).min_by(f64::total_cmp);
+            match first {
+                Some(at) => {
+                    values.insert(format!("launch.{}", m.name), at - started_ms);
+                }
+                None if s.primary == format!("launch.{}", m.name) || s.metrics.iter().any(|x| *x == format!("launch.{}", m.name)) => {
+                    return Err(Error::refused("RunIncomplete", format!("{} launch: milestone {} never matched in {}", s.case, m.name, m.source), "check the milestone's match and where it looks"));
+                }
+                None => {}
+            }
+        }
+        if let Some((painted, settled)) = screen_times(&pixels) {
+            values.insert("launch.painted".into(), painted - started_ms);
+            values.insert("launch.settled".into(), settled - started_ms);
+        }
+        if let Some(port) = inspect_port {
+            for (name, at) in node_timing(port)? {
+                values.insert(format!("launch.node.{name}"), at - started_ms);
+            }
+            lap("node", &mut steps);
+        }
+        let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
+        let _ = ctx.runner.call("close", json!({}), t, &no_page);
+        Ok(Block {
+            variant: v.role.to_string(),
+            pair,
+            values,
+            run_ms: vec![ready_ms],
+            warmup: 0,
+            speed_ratio: None,
+            nodes: Vec::new(),
+            recording,
+            phases: BTreeMap::new(),
+            frames: Vec::new(),
+            intervals: Vec::new(),
+            steps: steps.clone(),
+            background: Vec::new(),
+            leak: None,
+        })
+    })();
+    // A warm home outlives the launch; whatever still runs from it ends with the launch.
+    let kept = if warm { browser.profile.take() } else { None };
+    browser.close();
+    if let Some(h) = kept {
+        electron::release_home(&h);
+    }
+    if let Some(g) = &guard {
+        g.check("after a launch")?;
+    }
+    result
+}
+
+fn no_page(_: &str, _: &Value) -> Result<Value> {
+    Err(Error::msg("a launch case's hooks have no page driver: a launch is timed from outside the app"))
+}
+
+fn milestones(spec: &Value) -> Result<Vec<Milestone>> {
+    spec["milestones"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(name, d)| {
+            let pattern = match (&d["match"], &d["regex"]) {
+                (Value::String(text), _) => regex_lite::escape(text),
+                (_, r) if r.is_object() => format!("{}{}", if r["flags"].as_str().unwrap_or("").contains('i') { "(?i)" } else { "" }, r["source"].as_str().unwrap_or("")),
+                _ => return Err(Error::usage(format!("launch milestone {name}: `match` is a string or a RegExp"))),
+            };
+            if ["ready", "painted", "settled"].contains(&name.as_str()) || name.starts_with("node.") {
+                return Err(Error::usage(format!("launch milestone {name}: launch.{name} is strobe's own; name it something else")));
+            }
+            let pattern = regex_lite::Regex::new(&pattern).map_err(|e| Error::usage(format!("launch milestone {name}: {e}")))?;
+            Ok(Milestone { name: name.clone(), pattern, source: d["in"].as_str().unwrap_or("output").to_string() })
+        })
+        .collect()
+}
+
+fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
+    milestones.iter().filter(|m| which(m)).all(|m| lines.iter().any(|(_, l, src)| *src == m.source && m.pattern.is_match(l)))
+}
+
+/// The init script that resolves `window.__strobeLaunch` with the epoch time `until` first showed, and
+/// returns whether it already shows (a late install).
+fn observer(until: &Value) -> String {
+    let (selector, text, exact) = match until {
+        Value::String(s) => (s.clone(), Value::Null, false),
+        o => (o["selector"].as_str().unwrap_or("").to_string(), o.get("text").cloned().unwrap_or(Value::Null), o["exact"] == true),
+    };
+    format!(
+        r#"(() => {{
+  if (window.__strobeLaunch) return false
+  const sel = {sel}, text = {text}, exact = {exact}
+  const visible = (el) => {{ const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (el.checkVisibility?.({{ checkOpacity: true, checkVisibilityCSS: true }}) ?? true) }}
+  const has = (el) => text == null || (exact ? (el.textContent ?? "").trim() === text : (el.textContent ?? "").includes(text))
+  let done
+  window.__strobeLaunch = new Promise((resolve) => (done = resolve))
+  const shows = () => [...document.querySelectorAll(sel)].some((el) => visible(el) && has(el))
+  const already = document.documentElement != null && shows()
+  const mo = new MutationObserver(() => {{ if (shows()) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }} }})
+  mo.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }})
+  if (already) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }}
+  return already
+}})()"#,
+        sel = json!(selector),
+    )
+}
+
+/// Every page of the launch, from its first script: browser-wide auto-attach pauses each new page
+/// until the observer (and, for attribution, its CPU profiler) is in, then lets it run. A page that
+/// already ran when strobe attached gets the observer late; if `until` already shows there, the
+/// launch has no valid end (`late`).
+struct Watch {
+    cdp: Arc<Cdp>,
+    found: Receiver<(f64, String, String)>,
+    stop: Arc<AtomicBool>,
+    late: Arc<AtomicBool>,
+    /// (session, target) of every page seen.
+    pages: Arc<Mutex<Vec<(String, String)>>>,
+}
+
+impl Watch {
+    fn start(cdp: &Arc<Cdp>, observer: String, profile: bool) -> Result<Watch> {
+        let events = cdp.events();
+        let (tx, found) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let late = Arc::new(AtomicBool::new(false));
+        let pages = Arc::new(Mutex::new(Vec::new()));
+        cdp.send("Target.setAutoAttach", json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }), None)?;
+        // Pages that already ran when strobe connected (a browser opens its first page at startup).
+        let running = cdp.send("Target.getTargets", json!({}), None)?;
+        for t in running["targetInfos"].as_array().into_iter().flatten().filter(|t| is_page(t)) {
+            let _ = cdp.send("Target.attachToTarget", json!({ "targetId": t["targetId"], "flatten": true }), None);
+        }
+        let watch = Watch { cdp: cdp.clone(), found, stop: stop.clone(), late: late.clone(), pages: pages.clone() };
+        let (cdp, stop2, late2, pages2) = (cdp.clone(), stop, late, pages);
+        std::thread::spawn(move || {
+            let mut seen = std::collections::BTreeSet::new();
+            while !stop2.load(Ordering::Relaxed) {
+                let Ok(ev) = events.recv_timeout(Duration::from_millis(100)) else { continue };
+                if ev["method"] != "Target.attachedToTarget" {
+                    continue;
+                }
+                let p = &ev["params"];
+                let session = p["sessionId"].as_str().unwrap_or("").to_string();
+                let info = &p["targetInfo"];
+                let waiting = p["waitingForDebugger"] == true;
+                let send = |method: &str, params: Value| cdp.send_timeout(method, params, Some(&session), Duration::from_secs(10));
+                let target = info["targetId"].as_str().unwrap_or("").to_string();
+                if is_page(info) && seen.insert(target.clone()) {
+                    let _ = send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": observer }));
+                    if profile {
+                        let _ = send("Profiler.enable", json!({}));
+                        let _ = send("Profiler.setSamplingInterval", json!({ "interval": probe::cpu::INTERVAL_US }));
+                        let _ = send("Profiler.start", json!({}));
+                    }
+                    pages2.lock().unwrap().push((session.clone(), target.clone()));
+                    let (cdp, tx, stop, late, observer) = (cdp.clone(), tx.clone(), stop2.clone(), late2.clone(), observer.clone());
+                    let session = session.clone();
+                    std::thread::spawn(move || {
+                        let eval = |expr: &str, wait: bool| {
+                            cdp.send_timeout("Runtime.evaluate", json!({ "expression": expr, "awaitPromise": wait, "returnByValue": true }), Some(&session), Duration::from_secs(10))
+                        };
+                        while !stop.load(Ordering::Relaxed) {
+                            match eval("window.__strobeLaunch", true) {
+                                Ok(r) if r["result"]["value"].is_number() => {
+                                    let _ = tx.send((r["result"]["value"].as_f64().unwrap_or(0.0), session, target));
+                                    return;
+                                }
+                                // A document that loaded before the init script was in: the observer goes in
+                                // now. Its time is valid unless `until` already shows.
+                                Ok(r) if r["result"]["type"] == "undefined" => {
+                                    if eval(&observer, false).is_ok_and(|r| r["result"]["value"] == true) {
+                                        late.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                                // The page closed: nothing more to wait for here.
+                                Err(e) if e.message.contains("ession") && e.message.contains("not found") => return,
+                                // A document between navigations.
+                                _ => std::thread::sleep(Duration::from_millis(20)),
+                            }
+                        }
+                    });
+                }
+                if waiting {
+                    let _ = send("Runtime.runIfWaitingForDebugger", json!({}));
+                }
+            }
+        });
+        Ok(watch)
+    }
+
+    /// The epoch time `until` first showed and the page it showed in.
+    fn ready(&self, timeout: Duration) -> Result<(f64, chromium::Page)> {
+        let (at, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error { code: 124, message: format!("not visible in {} s", timeout.as_secs()), hint: None })?;
+        Ok((at, chromium::Page { cdp: self.cdp.clone(), session, target }))
+    }
+
+    fn any_page(&self) -> Option<chromium::Page> {
+        self.pages.lock().unwrap().first().map(|(session, target)| chromium::Page { cdp: self.cdp.clone(), session: session.clone(), target: target.clone() })
+    }
+
+    fn stop(&self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
+/// A helper thread's result, or nothing if it does not finish within 5 s: a block never waits on a
+/// stuck OS call (a window that stopped answering), it goes without that thread's readings.
+fn joined<T: Default>(h: std::thread::JoinHandle<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !h.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if h.is_finished() { h.join().unwrap_or_default() } else { T::default() }
+}
+
+fn is_page(info: &Value) -> bool {
+    info["type"] == "page" && !info["url"].as_str().unwrap_or("").starts_with("devtools://")
+}
+
+/// Keeps the app's windows on top without focus, re-reading its process tree every 300 ms, and with
+/// `capture` reads the window's 16×16 average pixels every 30 ms (epoch ms).
+fn sample_screen(pid: u32, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut pids = Vec::new();
+    let mut read = Instant::now() - Duration::from_secs(1);
+    while !stop.load(Ordering::Relaxed) {
+        if read.elapsed() > Duration::from_millis(300) {
+            pids = host::tree_pids(pid);
+            host::raise_windows(pid);
+            read = Instant::now();
+        }
+        if let Some(px) = host::window_pixels(&pids).filter(|_| capture) {
+            out.push((epoch_ms(), px));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    out
+}
+
+/// When the window's pixels first differed from its first sample, and when they last changed while
+/// sampled (epoch ms). A splash or a fade counts as painted: it is what a person sees.
+fn screen_times(samples: &[(f64, Vec<u8>)]) -> Option<(f64, f64)> {
+    let (first_at, first) = samples.first()?;
+    // About 3 levels per channel on average over the window: more than compression noise.
+    let differs = |a: &[u8], b: &[u8]| a.iter().zip(b).map(|(x, y)| x.abs_diff(*y) as u32).sum::<u32>() > 16 * 16 * 12;
+    let painted = samples.iter().find(|(_, px)| differs(px, first)).map_or(*first_at, |(at, _)| *at);
+    let settled = samples.windows(2).rev().find(|w| differs(&w[0].1, &w[1].1)).map_or(painted, |w| w[1].0).max(painted);
+    Some((painted, settled))
+}
+
+/// The page's `performance.mark` names with their epoch time.
+fn page_marks(page: &chromium::Page) -> Vec<Line> {
+    let expr = r#"JSON.stringify(performance.getEntriesByType("mark").map((m) => [m.name, performance.timeOrigin + m.startTime]))"#;
+    page.eval(expr)
+        .ok()
+        .and_then(|v| v.as_str().and_then(|s| serde_json::from_str::<Vec<(String, f64)>>(s).ok()))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(name, at)| (at, name, "page".to_string()))
+        .collect()
+}
+
+/// Lines appended to files matching `globs` under `home`, each with the time strobe read it, until `stop`.
+fn tail(home: &Path, globs: &[String], stop: &AtomicBool) -> Vec<Line> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut offsets: BTreeMap<PathBuf, (u64, String)> = BTreeMap::new();
+    let mut out = Vec::new();
+    let mut listed = Instant::now() - Duration::from_secs(1);
+    let mut files: Vec<(PathBuf, String)> = Vec::new();
+    loop {
+        let stopping = stop.load(Ordering::Relaxed);
+        if listed.elapsed() > Duration::from_millis(200) || stopping {
+            files = globs.iter().flat_map(|g| matching(home, g).into_iter().map(move |p| (p, g.clone()))).collect();
+            listed = Instant::now();
+        }
+        for (path, glob) in &files {
+            let Ok(meta) = std::fs::metadata(path) else { continue };
+            let entry = offsets.entry(path.clone()).or_insert((0, String::new()));
+            if meta.len() <= entry.0 {
+                continue;
+            }
+            let Ok(mut f) = std::fs::File::open(path) else { continue };
+            let mut buf = Vec::new();
+            if f.seek(SeekFrom::Start(entry.0)).is_err() || f.read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            entry.0 += buf.len() as u64;
+            entry.1.push_str(&String::from_utf8_lossy(&buf));
+            let at = epoch_ms();
+            while let Some(i) = entry.1.find('\n') {
+                let line = electron::strip_ansi(entry.1[..i].trim_end_matches('\r'));
+                entry.1.drain(..=i);
+                out.push((at, line, glob.clone()));
+            }
+        }
+        if stopping {
+            return out;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Files under `root` whose path relative to it matches `glob` (`*` within a segment, `**` across).
+fn matching(root: &Path, glob: &str) -> Vec<PathBuf> {
+    let parts: Vec<&str> = glob.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
+    let mut out = Vec::new();
+    walk(root, &parts, &mut out, 0);
+    out
+}
+
+fn walk(dir: &Path, parts: &[&str], out: &mut Vec<PathBuf>, depth: usize) {
+    let Some((first, rest)) = parts.split_first() else { return };
+    if depth > 12 {
+        return;
+    }
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir).into_iter().flatten().flatten().collect();
+    if *first == "**" {
+        walk(dir, rest, out, depth + 1);
+        for e in entries.iter().filter(|e| e.path().is_dir()) {
+            walk(&e.path(), parts, out, depth + 1);
+        }
+        return;
+    }
+    for e in entries.iter().filter(|e| super::glob(first, &e.file_name().to_string_lossy())) {
+        let p = e.path();
+        if rest.is_empty() && p.is_file() {
+            out.push(p);
+        } else if !rest.is_empty() && p.is_dir() {
+            walk(&p, rest, out, depth + 1);
+        }
+    }
+}
+
+/// Node's own bootstrap milestones in the main process, read over `--inspect` after the launch (nothing
+/// attaches while it starts): when the process was created, when Node started and when it finished
+/// bootstrapping, as epoch ms.
+fn node_timing(port: u16) -> Result<Vec<(String, f64)>> {
+    let body = chromium::http_get(&format!("127.0.0.1:{port}"), "/json/list")
+        .map_err(|_| Error::msg("the main process opened no inspector").hint("an Electron fuse (EnableNodeCliInspectArguments) may turn --inspect off in this build"))?;
+    let list: Value = serde_json::from_str(&body)?;
+    let ws = list.as_array().and_then(|a| a.first()).and_then(|t| t["webSocketDebuggerUrl"].as_str()).ok_or_else(|| Error::msg("the main process has no inspector target"))?.to_string();
+    let cdp = Cdp::connect(&ws)?;
+    let r = cdp.send(
+        "Runtime.evaluate",
+        json!({ "expression": "JSON.stringify({ origin: performance.timeOrigin, timing: performance.nodeTiming.toJSON(), created: process.getCreationTime?.() ?? null })", "returnByValue": true }),
+        None,
+    )?;
+    let v: Value = serde_json::from_str(r["result"]["value"].as_str().unwrap_or("{}"))?;
+    let origin = v["origin"].as_f64().unwrap_or(0.0);
+    let mut out = Vec::new();
+    if let Some(c) = v["created"].as_f64() {
+        out.push(("created".to_string(), c));
+    }
+    for (name, field) in [("start", "nodeStart"), ("bootstrapped", "bootstrapComplete")] {
+        if let Some(ms) = v["timing"][field].as_f64().filter(|m| *m > 0.0) {
+            out.push((name.to_string(), origin + ms));
+        }
+    }
+    Ok(out)
+}
+
+/// The attribution launch's profiles as a recording: the page's (`cpu-0`) and the main process's
+/// (`cpu-main`), both from their first statement.
+fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, started: &Started, values: &BTreeMap<String, f64>) -> Result<String> {
+    let id = store::new_id("rec");
+    let dir = store::recording_dir(&id)?;
+    let renderer = probe::cpu::stop(page)?;
+    store::write_json(&dir.join("cpu-0.cpuprofile"), &renderer)?;
+    let mut scripts = std::collections::BTreeSet::new();
+    probe::symbols::urls(&renderer, &mut scripts);
+    if let Some(main) = &started.main {
+        let r = main.send("Profiler.stop", json!({}), None)?;
+        store::write_json(&dir.join("cpu-main.cpuprofile"), &r["profile"])?;
+    }
+    let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
+    probe::symbols::store_maps(page, &scripts, &dir, served.as_deref())?;
+    store::write_json(
+        &dir.join("meta.json"),
+        &json!({
+            "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+            "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
+            "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
+        }),
+    )?;
+    Ok(id)
+}

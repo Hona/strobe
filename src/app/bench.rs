@@ -816,6 +816,86 @@ fn pixels_series(ctx: &mut Ctx, s: &Series, variants: &[Variant]) -> Result<Valu
     Ok(Value::Array(out))
 }
 
+/// A comparison's cells as the tables show them: base, head, change, interval.
+fn cells(c: &Value) -> (String, String, String, String) {
+    let name = c["metric"].as_str().unwrap_or("");
+    let unit = model::metric(name).map(|m| m.unit).unwrap_or("");
+    let rel = c["relative"].as_bool().unwrap_or(false);
+    let est = c["estimate"].as_f64().unwrap_or(f64::NAN);
+    let (lo, hi) = (c["lo"].as_f64().unwrap_or(f64::NAN), c["hi"].as_f64().unwrap_or(f64::NAN));
+    let abs_unit = if unit == "%" { "pp" } else { unit };
+    let delta = if rel { fmt::pct(est) } else { fmt::signed(est, abs_unit) };
+    let ci = if c["exact"] == true {
+        "exact".to_string()
+    } else if rel {
+        format!("{} … {}", fmt::pct(lo), fmt::pct(hi))
+    } else {
+        format!("{} … {}", fmt::signed(lo, abs_unit), fmt::signed(hi, abs_unit))
+    };
+    (fmt::value(c["base"].as_f64().unwrap_or(f64::NAN), unit), fmt::value(c["head"].as_f64().unwrap_or(f64::NAN), unit), delta, ci)
+}
+
+/// `report experiment <id> --format pr`: the experiment as Markdown for a pull request body. Per series a table
+/// of the primary and the tested metrics with their intervals and verdicts, the context metrics folded away,
+/// pixels and warnings, then the setup and the command that reruns it.
+pub fn pr_markdown(r: &Value) -> String {
+    let variant = |role: &str| r["variants"].as_array().into_iter().flatten().find(|v| v["role"] == role).cloned().unwrap_or(Value::Null);
+    let (base, head) = (variant("base"), variant("head"));
+    let mut out = String::new();
+    for s in r["series"].as_array().into_iter().flatten() {
+        out += &format!("**{}**, {} pairs of fresh launches", s["label"].as_str().unwrap_or(""), s["pairs"]);
+        if s["kind"] == "launch" {
+            out += " (one timed launch each)";
+        }
+        out += ":\n\n| Metric | base | head | Change [interval] | Verdict |\n|---|---|---|---|---|\n";
+        let mut rows = vec![(true, s["primary"].clone())];
+        rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));
+        for (primary, c) in &rows {
+            let (b, h, d, ci) = cells(c);
+            let name = c["metric"].as_str().unwrap_or("");
+            let verdict = c["verdict"].as_str().unwrap_or("");
+            out += &format!("| `{name}`{} | {b} | {h} | {d} [{ci}] | {} |\n", if *primary { " (primary)" } else { "" }, if verdict == "·" { "" } else { verdict });
+        }
+        let descriptive = s["descriptive"].as_array().cloned().unwrap_or_default();
+        if !descriptive.is_empty() {
+            out += "\n<details><summary>Context metrics (not tested)</summary>\n\n| Metric | base | head | Change [interval] |\n|---|---|---|---|\n";
+            for c in &descriptive {
+                let (b, h, d, ci) = cells(c);
+                out += &format!("| `{}` | {b} | {h} | {d} [{ci}] |\n", c["metric"].as_str().unwrap_or(""));
+            }
+            out += "\n</details>\n";
+        }
+        if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {
+            let same = shots.iter().filter(|p| p["state"] == "same").count();
+            out += &format!("\n- **Pixels:** {same} of {} snapshots the same within launch noise.\n", shots.len());
+            for p in shots.iter().filter(|p| p["state"] != "same") {
+                out += &format!("  - `{}`: {}", p["name"].as_str().unwrap_or(""), pixel_line(p).trim().trim_start_matches("differ").trim());
+                out.push('\n');
+            }
+        }
+        let warns: Vec<&Value> = s["warnings"].as_array().into_iter().flatten().filter(|w| w["level"] == "warn").collect();
+        for w in warns {
+            out += &format!("\n- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
+        }
+        out += "\n";
+    }
+    let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
+    out += &format!(
+        "`{}` against `{}`, alternating fresh launches: {} · {} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
+        base["label"].as_str().unwrap_or("base"),
+        head["label"].as_str().unwrap_or("head"),
+        r["env"]["os"].as_str().unwrap_or(""),
+        r["env"]["cpu"].as_str().unwrap_or(""),
+        r["browser"].as_str().unwrap_or(""),
+        r["window"]["width"],
+        r["window"]["height"],
+        r["refresh_hz"].as_f64().map(|h| format!("{h:.0}")).unwrap_or_else(|| "?".into())
+    );
+    let file = r["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\").replace('\\', "/");
+    out += &format!("```sh\nstrobe bench {file} --base {} --head {}\n```\n", base["spec"].as_str().unwrap_or("<base>"), head["spec"].as_str().unwrap_or("."));
+    out
+}
+
 /// One snapshot's line: `same`, `differ` with how many pixels moved beyond the launch noise, or only one side.
 fn pixel_line(p: &Value) -> String {
     let name = p["name"].as_str().unwrap_or("");
@@ -2317,25 +2397,13 @@ fn render(r: &Value) -> String {
                 out.push('\n');
             }
             let name = c["metric"].as_str().unwrap_or("");
-            let unit = model::metric(name).map(|m| m.unit).unwrap_or("");
-            let rel = c["relative"].as_bool().unwrap_or(false);
-            let est = c["estimate"].as_f64().unwrap_or(f64::NAN);
-            let (lo, hi) = (c["lo"].as_f64().unwrap_or(f64::NAN), c["hi"].as_f64().unwrap_or(f64::NAN));
-            // A percentage compared as a difference is in percentage points.
-            let abs_unit = if unit == "%" { "pp" } else { unit };
-            let delta = if rel { fmt::pct(est) } else { fmt::signed(est, abs_unit) };
-            let ci = if c["exact"] == true {
-                "exact".to_string()
-            } else if rel {
-                format!("{} … {}", fmt::pct(lo), fmt::pct(hi))
-            } else {
-                format!("{} … {}", fmt::signed(lo, abs_unit), fmt::signed(hi, abs_unit))
-            };
+            // A percentage compared as a difference is in percentage points (`cells`).
+            let (b, h, delta, ci) = cells(&c);
             out += &format!(
                 "{}{}{}{}{}{}\n",
                 fmt::pad(&format!("{} {name}", if primary { "★" } else { " " }), 28),
-                fmt::pad(&fmt::value(c["base"].as_f64().unwrap_or(f64::NAN), unit), 11),
-                fmt::pad(&fmt::value(c["head"].as_f64().unwrap_or(f64::NAN), unit), 11),
+                fmt::pad(&b, 11),
+                fmt::pad(&h, 11),
                 fmt::pad(&delta, 9),
                 fmt::pad(&ci, 18),
                 c["verdict"].as_str().unwrap_or("")

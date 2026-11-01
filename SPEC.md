@@ -339,7 +339,7 @@ still running (`progress`).
 ### 5.8 `strobe report`
 
 ```
-strobe report <view> <handle | exp_…>… [--format md|html] [--out <path>] [--open] [--json]
+strobe report <view> <handle | exp_…>… [--format md|html|pr] [--out <path>] [--open] [--json]
 ```
 
 Writes a self-contained artifact from a view in the catalog (§11.2) and prints its path.
@@ -1196,7 +1196,10 @@ hotspots by function `(name, location)` and by file, allocation sites, forced la
 heap and its base/head diff, and attribution run counts, default cap 2 MB: a report keeps three full
 stacks for its top 15 rows and the heaviest below them, frames once per side in a `frame_table`
 that stacks index, while recordings and `query` keep all);
-markdown is GitHub-flavoured.
+markdown is GitHub-flavoured. `--format pr` writes an experiment for a pull request body: per
+series a table of the primary and tested metrics (base, head, change [interval], verdict), the
+context metrics in a folded `<details>`, pixels and warnings, then one line of setup (variants,
+OS, CPU, GPU, browser, window, display) and the `strobe bench` command that reruns it.
 
 ### 11.3 Insights
 

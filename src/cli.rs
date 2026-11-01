@@ -107,8 +107,8 @@ Use
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
                                   views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
-  report experiment|recording <handle> [--format html|md] [--out <path>] [--open]
-                                  write a self-contained HTML (or markdown) report
+  report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
+                                  write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
 
 Setup

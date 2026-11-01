@@ -47,12 +47,16 @@ pub fn run(args: &Args) -> Result<Output> {
         }
     }
     let format = args.get("format").unwrap_or("html");
+    if format == "pr" && !experiment {
+        return Err(Error::usage("--format pr writes an experiment's results for a pull request: give an exp_… handle"));
+    }
     let out = match args.get("out") {
         Some(p) => std::path::PathBuf::from(p),
-        None => dir.join(format!("report-{view}.{format}")),
+        None => dir.join(format!("report-{view}{}", if format == "pr" { ".pr.md".to_string() } else { format!(".{format}") })),
     };
     let body = match format {
         "md" => markdown(&data),
+        "pr" => super::bench::pr_markdown(&data),
         _ => html(view, &data),
     };
     std::fs::write(&out, &body)?;

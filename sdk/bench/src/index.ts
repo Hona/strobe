@@ -1,4 +1,4 @@
-// @strobe/bench: write benchmarks as small TypeScript files (SPEC §9.6).
+// @hona/strobe-bench: write benchmarks as small TypeScript files (SPEC §9.6).
 
 /** A visible element: a selector, or one whose text contains `text` (or is exactly it, trimmed). */
 export type Selector = string | { selector: string; text?: string; exact?: boolean }

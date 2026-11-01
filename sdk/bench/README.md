@@ -1,4 +1,4 @@
-# @strobe/bench
+# @hona/strobe-bench
 
 Types and helpers for [strobe](https://github.com/Hona/strobe) bench files.
 
@@ -7,11 +7,11 @@ anything. Install the package for your editor and `tsc`: the types catch a renam
 long run.
 
 ```sh
-bun add -d @strobe/bench
+bun add -d @hona/strobe-bench
 ```
 
 ```ts
-import { bench, web } from "@strobe/bench"
+import { bench, web } from "@hona/strobe-bench"
 
 export default bench({
   targets: { app: web({ url: "/" }) },

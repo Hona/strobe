@@ -1,13 +1,19 @@
 // The bench runner strobe spawns: imports a bench file and calls its functions on request (SPEC §9.6).
-// Protocol: newline-delimited JSON on stdin/stdout. console.* goes to stderr.
+// Protocol: newline-delimited JSON over a loopback socket to strobe (STROBE_RUNNER_PORT). The runner's
+// own stdio belongs to the bench file: stdin is empty, and stdout and stderr are the experiment's
+// runner.log, so a process a hook spawns (Bun's `$` passes stdin on) never sees or blocks the protocol.
 import path from "node:path"
+import { connect } from "node:net"
 import { pathToFileURL } from "node:url"
 import { createInterface } from "node:readline"
 
-const write = (message: object) => process.stdout.write(JSON.stringify(message) + "\n")
-for (const level of ["log", "info", "warn", "error", "debug"] as const)
-  console[level] = (...parts: unknown[]) =>
-    void process.stderr.write(parts.map((p) => (typeof p === "string" ? p : Bun.inspect(p))).join(" ") + "\n")
+const socket = connect(Number(process.env.STROBE_RUNNER_PORT), "127.0.0.1")
+await new Promise((resolve, reject) => {
+  socket.once("connect", resolve)
+  socket.once("error", reject)
+})
+socket.setNoDelay(true)
+const write = (message: object) => void socket.write(JSON.stringify(message) + "\n")
 
 const file = path.resolve(process.argv[2] ?? "")
 const spec = (await import(pathToFileURL(file).href)).default
@@ -268,7 +274,10 @@ async function handle(op: string, args: any) {
   throw new Error(`unknown op ${op}`)
 }
 
-createInterface({ input: process.stdin }).on("line", (line) => {
+// strobe going away ends the runner.
+socket.on("close", () => process.exit(0))
+
+createInterface({ input: socket }).on("line", (line) => {
   if (!line.trim()) return
   const message = JSON.parse(line)
   const waiting = pending.get(message.id)

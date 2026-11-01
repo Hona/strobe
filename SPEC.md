@@ -95,7 +95,7 @@ locations, not only PATH.
 | validator | A check that refuses a run (§10.1) |
 | analyser | A check that warns in the result (§10.2) |
 | census | A consistent per-process memory account at one moment (§8.6) |
-| bridge | `@strobe/electron` inside an app's main process (§13.2) |
+| bridge | `@hona/strobe-electron` inside an app's main process (§13.2) |
 | calibration | The known-cost page every probe must recover (§10.3) |
 | A/A | An experiment with the same build on both sides (§10.4) |
 
@@ -108,7 +108,7 @@ Cargo.toml  build.rs
 src/            one package: lib + bins strobe, strobew (Windows windowless); §4.3
 viewer/         self-contained HTML report viewer (`viewer/report.html`), embedded
 calibration/    the known-cost page (static), embedded
-sdk/            TypeScript: @strobe/bench, @strobe/web, @strobe/electron, @strobe/playwright
+sdk/            TypeScript: @hona/strobe-bench, @hona/strobe-web, @hona/strobe-electron, @hona/strobe-playwright
                 (one Bun workspace)
 skill/SKILL.md  the built-in skill, embedded (include_str!)
 schema/         strobe.v1.json (project config), result.v1.json, bridge.v1.json
@@ -414,7 +414,7 @@ series' blocks pay for it, base and head alike.
 
 ### 7.3 Phases
 
-Bench files (`phase(name, fn)`, §9.6) and `@strobe/web` (`phase(name)`) emit phase marks.
+Bench files (`phase(name, fn)`, §9.6) and `@hona/strobe-web` (`phase(name)`) emit phase marks.
 Run and phase boundaries are `performance.mark` calls in the page (`strobe:<block>:<kind>:…`),
 one `Runtime.evaluate` per boundary, placed before the first input and after `until` resolves.
 They land on the trace clock, so windows need no clock mapping. Every metric can be sliced by
@@ -510,7 +510,7 @@ full. Displays may abbreviate; the record does not.
 A counter is an exact metric per run, `count.<name>`. Two sources add to it:
 
 - **Bench file:** `ctx.count(name, n = 1)` during `run`. Outside a run it counts nothing.
-- **Page:** `globalThis.__strobeCount?.(name, n)` in app code (what `@strobe/web`'s `count` calls).
+- **Page:** `globalThis.__strobeCount?.(name, n)` in app code (what `@hona/strobe-web`'s `count` calls).
   When strobe is not attached it costs one optional call. strobe installs the global with
   `Page.addScriptToEvaluateOnNewDocument` only in blocks of a series that declares a `count.*`
   metric, resets the totals before each run's start mark, and reads them after its end mark, so
@@ -775,7 +775,7 @@ A benchmark is a small TypeScript file, in the spirit of BenchmarkDotNet:
 
 ```ts
 // packages/web/perf/feed.bench.ts (in the consumer's repo)
-import { bench, web, app } from "@strobe/bench"
+import { bench, web, app } from "@hona/strobe-bench"
 import { mockFeed } from "../e2e/mocks"
 
 export default bench({
@@ -987,7 +987,7 @@ experiment's `script.log`.
 
 ```mermaid
 sequenceDiagram
-  participant R as runner (bun, @strobe/bench)
+  participant R as runner (bun, @hona/strobe-bench)
   participant D as strobe
   participant T as target
   D->>R: spawn with the bench file; R reports targets, params, cases
@@ -1003,21 +1003,24 @@ sequenceDiagram
   D->>D: verdicts (§9.3)
 ```
 
-- The runner is a `bun` process running `@strobe/bench`'s entry. It imports the bench file and
+- The runner is a `bun` process running `@hona/strobe-bench`'s entry. It imports the bench file and
   calls its functions when told to. It is pinned to the CPUs the target is not pinned to, and
   its CPU time is a track in the recording. strobe itself (the driver relay, samplers, CDP) moves to
   the same CPUs for the bench, so the variant servers it spawns start there too; its previous mask
   comes back afterwards (the daemon runs benches in-process).
-- Runner protocol: newline-delimited JSON over the runner's stdin and stdout
-  (`{ "id", "op", "args" }` → `{ "id", "ok" | "error" }`). The runner sends `console.*` to
-  stderr, which strobe keeps as the block's log.
+- Runner protocol: newline-delimited JSON over a loopback socket strobe listens on
+  (`STROBE_RUNNER_PORT`; `{ "id", "op", "args" }` → `{ "id", "ok" | "error" }`). The runner's own
+  stdio belongs to the bench file: stdin is empty, and stdout and stderr are the experiment's
+  `runner.log`. A process a hook spawns therefore never touches the protocol (Bun's `$` passes stdin
+  on to its children and stalled on a protocol pipe that never closes). The script host works the
+  same way (`STROBE_HOST_PORT`, `script.log`).
 - A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
   The refusal names the page's URL and saves a screenshot of the page next to the experiment
   (`failed-<step>-….png`), so an agent can see what the app showed instead of guessing.
 - At every run start strobe reads the DOM node count; a count that drifts across runs means
   `reset` is missing (`StateDrift`).
 
-`@strobe/playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
+`@hona/strobe-playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
 `strobe.record(page, fn)` records one block. Those recordings support every view, but not
 `bench`'s verdicts.
 
@@ -1251,12 +1254,12 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   `--app <id>` on `record`) launches another build of the same app, such as a source build packed
   with the app's own build flags.
 
-**The bridge** (`@strobe/electron`, schema `bridge.v1.json`), for apps that never open a debug
+**The bridge** (`@hona/strobe-electron`, schema `bridge.v1.json`), for apps that never open a debug
 port in production:
 
 ```mermaid
 sequenceDiagram
-  participant App as App main process (@strobe/electron)
+  participant App as App main process (@hona/strobe-electron)
   participant D as strobe daemon
   Note over App: user turns strobe on for this session
   App->>D: connect to the user-only socket, hello {app, version, pid, electron, channel}
@@ -1306,7 +1309,7 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
   item (§21). An app's backend that exposes a V8-format heap dump is used through the bridge's
   `linked` processes.
 - Bench `script()` targets (§9.6) need neither: strobe's host (`host.mjs`, plain JavaScript that
-  Bun and Node both run) imports the module and answers calls over stdin and stdout, and the
+  Bun and Node both run) imports the module and answers calls over a loopback socket, and the
   runtime's own `--cpu-prof` and `--heap-prof` give attribution blocks their profiles.
 
 ### 13.6 Outside-in (any process)
@@ -1447,16 +1450,16 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
-- `@strobe/bench`: `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of
+- `@hona/strobe-bench`: `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of
   bench files (§9.6). strobe embeds the SDK, the runner and the script host and rewrites a bench
-  file's `@strobe/bench` import to its own copy, so bench files run without installing anything.
+  file's `@hona/strobe-bench` import to its own copy, so bench files run without installing anything.
   The npm package (built from `sdk/bench`: `dist/index.js` and `dist/index.d.ts`, version equal to
   strobe's) gives editors and `tsc` the same types.
-- `@strobe/web`: `phase(name)`, `mark(name)`, `count(name, n)`; free when strobe is not
-  attached (§8.4). `@strobe/web/solid`: computations per component through Solid's dev hooks,
+- `@hona/strobe-web`: `phase(name)`, `mark(name)`, `count(name, n)`; free when strobe is not
+  attached (§8.4). `@hona/strobe-web/solid`: computations per component through Solid's dev hooks,
   dev builds only.
-- `@strobe/electron`: the bridge in §13.2.
-- `@strobe/playwright`: `strobe.record(page, fn)` inside existing Playwright tests (§9.6).
+- `@hona/strobe-electron`: the bridge in §13.2.
+- `@hona/strobe-playwright`: `strobe.record(page, fn)` inside existing Playwright tests (§9.6).
 
 ## 21. Open items (verify in spikes)
 
@@ -1468,7 +1471,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - V8 code events in ETW for JS frames inside native stacks, on Electron.
 - Bun's WebKit inspector: sampling profiler and heap through it.
 - The self-hosted Perfetto UI against a local trace_processor on a port other than its default.
-- Solid's dev hook names for `@strobe/web/solid`.
+- Solid's dev hook names for `@hona/strobe-web/solid`.
 - macOS per-process GPU (IOReport); Linux refresh rate under Wayland.
 - Each embedding app's product decisions for the bridge: where the toggle lives, who can turn it
   on, the indicator.
@@ -1480,7 +1483,7 @@ Phase 0 runs two tracks in parallel.
 | Phase | Deliverable | Manual check |
 |---|---|---|
 | 0a | Spike: CDP proto trace + strobe counter packets → trace_processor; presented frames by SQL | `strobe record https://… --for 5s`, then `strobe query rec_… sql "…"` returns frames and a strobe counter |
-| 0b | Bridge spike: `@strobe/electron` in a dev build of a consumer's Electron app; `windows`, `cdp.send`, `memory.census` and `heap.snapshot` through the app's existing heap-capture code | `strobe record app:<id> --probes memory` writes a census and per-process snapshots |
+| 0b | Bridge spike: `@hona/strobe-electron` in a dev build of a consumer's Electron app; `windows`, `cdp.send`, `memory.census` and `heap.snapshot` through the app's existing heap-capture code | `strobe record app:<id> --probes memory` writes a census and per-process snapshots |
 | 1 | Daemon, MCP, skill, `up`/`leave`, `status` with validity preflight, calibration page | agent on adais calls `status`; calibration passes |
 | 2 | `bench`: bench files, runner, `page` driver, variants, blocks and pairs, statistics, verdicts, validators, A/A | A/A on a consumer's bench stays at the nominal rate; claims of merged perf PRs are re-checked |
 | 3 | A production Electron app through the bridge (an opt-in in the app), census and leaks | `strobe bench … --target app:<id>` on a production build |
@@ -1504,9 +1507,9 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | Phase | Built | Not yet |
 |---|---|---|
 | 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
-| 0b | — | the bridge (`@strobe/electron`) |
+| 0b | — | the bridge (`@hona/strobe-electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
-| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@strobe/bench` on npm (types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
+| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe-bench` on npm (types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |

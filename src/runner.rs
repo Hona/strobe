@@ -4,8 +4,9 @@ use crate::host::{self, paths};
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -35,7 +36,7 @@ pub fn find_bun() -> Option<PathBuf> {
 
 pub struct Runner {
     child: Child,
-    stdin: ChildStdin,
+    conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
     pub log: PathBuf,
@@ -49,6 +50,12 @@ impl Runner {
     pub fn spawn(file: &Path, log: PathBuf, cpus: Option<u64>) -> Result<Runner> {
         let bun = find_bun().ok_or_else(|| Error::msg("bench files need Bun").hint("install it from https://bun.sh"))?;
         let sdk = sdk_dir()?;
+        // The protocol runs over a loopback socket, never the runner's stdio: a bench file's hooks spawn
+        // processes, and Bun's `$` hands stdin on to them, which stalled on a protocol pipe that never
+        // closes. stdin is empty; stdout and stderr are the experiment's runner.log.
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let out = std::fs::File::create(&log)?;
+        let err = out.try_clone()?;
         let previous = cpus.and_then(host::set_affinity);
         let spawned = Command::new(bun)
             .arg("--preload")
@@ -56,26 +63,44 @@ impl Runner {
             .arg(sdk.join("runner.ts"))
             .arg(file)
             .env("STROBE_SDK_INDEX", sdk.join("index.ts"))
+            .env("STROBE_RUNNER_PORT", listener.local_addr()?.port().to_string())
             .current_dir(file.parent().unwrap_or(Path::new(".")))
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::from(std::fs::File::create(&log)?))
+            .stdin(Stdio::null())
+            .stdout(out)
+            .stderr(err)
             .spawn();
         if previous.is_some() {
             host::set_affinity(previous.unwrap_or(0));
         }
         let mut child = spawned.map_err(|e| Error::msg(format!("spawn bun: {e}")))?;
-        let stdin = child.stdin.take().ok_or_else(|| Error::msg("runner stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::msg("runner stdout"))?;
+        listener.set_nonblocking(true)?;
+        let deadline = std::time::Instant::now() + Duration::from_secs(120);
+        let conn = loop {
+            match listener.accept() {
+                Ok((conn, _)) => break conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(Error::msg(format!("runner connection: {e}"))),
+            }
+            if std::time::Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
+                let _ = child.kill();
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let tail: Vec<&str> = text.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+                return Err(Error::msg(format!("the bench runner did not start\n{}", tail.join("\n"))));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        conn.set_nonblocking(false)?;
+        conn.set_nodelay(true)?;
+        let reader = conn.try_clone()?;
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            for line in BufReader::new(reader).lines().map_while(std::result::Result::ok) {
                 if tx.send(line).is_err() {
                     break;
                 }
             }
         });
-        let mut runner = Runner { child, stdin, lines: rx, next: 1, log };
+        let mut runner = Runner { child, conn, lines: rx, next: 1, log };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -97,8 +122,8 @@ impl Runner {
     }
 
     fn write(&mut self, v: &Value) -> Result<()> {
-        writeln!(self.stdin, "{v}").map_err(|e| Error::msg(format!("runner: {e}")))?;
-        self.stdin.flush().ok();
+        writeln!(self.conn, "{v}").map_err(|e| Error::msg(format!("runner: {e}")))?;
+        self.conn.flush().ok();
         Ok(())
     }
 

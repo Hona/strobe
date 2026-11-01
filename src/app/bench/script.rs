@@ -5,13 +5,13 @@
 
 use super::*;
 use std::io::{BufRead, BufReader, Write};
-use std::process::ChildStdin;
+use std::net::TcpStream;
 use std::sync::mpsc::Receiver;
 
-/// The host process and its line protocol.
+/// The host process and its line protocol, over a loopback connection.
 struct Host {
     child: Child,
-    stdin: ChildStdin,
+    conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
 }
@@ -65,31 +65,52 @@ impl Host {
         for (k, v) in target["env"].as_object().into_iter().flatten() {
             cmd.env(k, v.as_str().unwrap_or(""));
         }
-        // The module's console output and errors, per experiment, next to the runner's log.
-        let err = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+        // Requests go over a loopback socket, never the host's stdio: the module and the children it
+        // spawns own that (Bun's `$` hands stdin on, and stalled on a protocol pipe that never closes).
+        // stdin is empty; stdout and stderr go to the experiment's script.log.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        cmd.env("STROBE_HOST_PORT", listener.local_addr()?.port().to_string());
+        let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
+        let err = out.try_clone()?;
         let previous = cpus.and_then(host::set_affinity);
-        let spawned = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err).spawn();
+        let spawned = cmd.stdin(Stdio::null()).stdout(out).stderr(err).spawn();
         if previous.is_some() {
             host::set_affinity(previous.unwrap_or(0));
         }
-        let mut child = spawned.map_err(|e| Error::msg(format!("start the process host: {e}")))?;
-        let stdin = child.stdin.take().ok_or_else(|| Error::msg("host stdin"))?;
-        let stdout = child.stdout.take().ok_or_else(|| Error::msg("host stdout"))?;
+        let mut child = spawned.map_err(|e| Error::msg(format!("start the script host: {e}")))?;
+        let failed = |log: &Path| {
+            let tail: Vec<String> = std::fs::read_to_string(log).unwrap_or_default().lines().rev().take(12).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect();
+            Error::msg(format!("the script host did not load {}:\n{}", entry.display(), tail.join("\n")))
+        };
+        // The host connects once its runtime is up; a module that fails to import ends it first.
+        listener.set_nonblocking(true)?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let conn = loop {
+            match listener.accept() {
+                Ok((conn, _)) => break conn,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(e) => return Err(Error::msg(format!("script host connection: {e}"))),
+            }
+            if Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
+                electron::kill_tree(child.id());
+                return Err(failed(log));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        conn.set_nonblocking(false)?;
+        conn.set_nodelay(true)?;
+        let reader = conn.try_clone()?;
         let (tx, lines) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            for line in BufReader::new(stdout).lines().map_while(std::result::Result::ok) {
+            for line in BufReader::new(reader).lines().map_while(std::result::Result::ok) {
                 if tx.send(line).is_err() {
                     break;
                 }
             }
         });
-        let host = Host { child, stdin, lines, next: 1 };
+        let host = Host { child, conn, lines, next: 1 };
         loop {
-            // A module that fails to import ends the process: its error is the log's last lines.
-            let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| {
-                let tail: Vec<String> = std::fs::read_to_string(log).unwrap_or_default().lines().rev().take(12).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect();
-                Error::msg(format!("the script host did not load {}:\n{}", entry.display(), tail.join("\n")))
-            })?;
+            let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| failed(log))?;
             if serde_json::from_str::<Value>(&line).ok().is_some_and(|v| v["ready"] == true) {
                 return Ok(host);
             }
@@ -101,8 +122,8 @@ impl Host {
         self.next += 1;
         let mut m = message;
         m["id"] = json!(id);
-        writeln!(self.stdin, "{m}").map_err(|e| Error::msg(format!("process host: {e}")))?;
-        self.stdin.flush().ok();
+        writeln!(self.conn, "{m}").map_err(|e| Error::msg(format!("script host: {e}")))?;
+        self.conn.flush().ok();
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());

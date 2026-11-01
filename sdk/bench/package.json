@@ -1,6 +1,6 @@
 {
-  "name": "@strobe/bench",
-  "version": "0.1.0",
+  "name": "@hona/strobe-bench",
+  "version": "0.1.1",
   "description": "Types and helpers for strobe bench files: measure web pages, Electron apps and scripts with paired, valid statistics",
   "type": "module",
   "types": "./dist/index.d.ts",

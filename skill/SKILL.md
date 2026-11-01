@@ -30,7 +30,7 @@ Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (i
 
 ## A bench file
 
-    import { bench, web, app } from "@strobe/bench"
+    import { bench, web, app } from "@hona/strobe-bench"
     import { mockFeed } from "../e2e/mocks"
     export default bench({
       targets: {
@@ -57,7 +57,7 @@ More in a bench file:
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
 - Exact counters: `ctx.count(name)` in `run`, `globalThis.__strobeCount?.(name)` in the app → `count.<name>`; `net.requests{/api/*/message}` and `net.bytes`; `layout.shift` (then `query <rec> shifts` names what moved). A stable count is compared exactly.
 - `params: { files: { run: [100, 10_000], more: [1, 1_000] } }`: `more` only with `--params all`. `targets: ["web"]` on a case limits where it runs.
-- `bun add -d @strobe/bench` gives editors and `tsc` the types; strobe runs its own copy either way.
+- `bun add -d @hona/strobe-bench` gives editors and `tsc` the types; strobe runs its own copy either way.
 
 Primary metric: `main.work` for "does this cost less" (continuous; durations move in whole vsyncs), `main.busy` for scrolling and streaming, `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop, `launch.ready` for launches, `cpu.work` for scripts. Fewer than 6 pairs never gets a verdict. Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 

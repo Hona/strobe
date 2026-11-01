@@ -17,7 +17,7 @@ strobe top                                                       # per-core, per
 A benchmark is a small TypeScript file, like BenchmarkDotNet:
 
 ```ts
-import { bench, web } from "@strobe/bench"
+import { bench, web } from "@hona/strobe-bench"
 
 export default bench({
   targets: { web: web({ url: "/" }) },

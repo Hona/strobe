@@ -97,6 +97,23 @@ Where does the GPU process spend time (a frozen first frame, a slow canvas)? `qu
 Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread, the module each started in, and whose: app, driver such as `nvwgf2umx.dll`, or os) and `query <rec> insights`. `cpu.wakes` is context switches/s (waits and preemptions, driver threads included); the insight counts the app's own threads apart.
 Writing the PR? `report experiment <exp> --format pr` gives the tables and the command that reruns them.
 
+## Every performance claim in a PR comes from strobe
+
+When a PR claims a performance change (faster, less CPU, fewer wakeups, less memory, smoother), its
+body carries strobe's evidence, and nothing else stands in for it:
+
+1. **Discovery**: the strobe command and recording id that pointed at the problem, and what it showed.
+2. **The change**: what the code does differently.
+3. **Results**: the output of `report experiment <exp> --format pr`, pasted verbatim. Don't retype
+   numbers, round them, drop rows, drop the context line or warnings (locked session, power plan,
+   cross-adapter, refused metrics), or rewrite verdicts. If a metric was refused or `unclear`, the PR
+   says so.
+4. **The bench**: the case's code, or a link to the bench file and case when it already exists. A new
+   bench case ships in the same PR as the first change it measures.
+
+Never put hand-measured timings, single recordings or `--check` smoke numbers in a results table:
+label them as noisy discovery evidence, or leave them out.
+
 ## Notes
 
 - Timing and attribution are separate blocks; never read timing from a `mixed` recording.

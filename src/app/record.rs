@@ -216,18 +216,16 @@ pub fn run(args: &Args) -> Result<Output> {
 
 /// A native app for `for_ms` (SPEC §13.7): launched isolated, left to settle for 3 s, then one run
 /// measured from outside: its processes' CPU in cycles, its threads' wakes (named in `threads.json`), IO,
-/// GPU and memory. An attribution recording is the same until native stacks exist (the deep helper).
+/// GPU, memory, the UI thread's CPU and what reached the screen; attribution adds native stacks (the deep helper).
 fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) -> Result<Output> {
     use crate::probe::wakes;
     use crate::target::native as nt;
     if set == Set::Memory {
         return Err(Error::usage("--probes memory follows a JS heap; a native app has none"));
     }
-    use crate::target::native_bridge::{self as nb, Listener};
     let home = isolate::prepare_home(app, args.get("home").map(std::path::Path::new), None)?;
     progress(format!("launching {} in an isolated home", app.exe.display()));
-    let listener = Listener::open()?;
-    let (mut n, guard) = match nt::launch(app, &home, &listener.env(), false, None) {
+    let (mut n, guard) = match nt::launch(app, &home, &[], false, None) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home.dir);
@@ -252,17 +250,6 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 return Err(validity::locked());
             }
         }
-        // An app whose toolkit has the bridge has connected by now: its run record covers the recording.
-        let bridge = listener.try_accept()?;
-        if let Some(b) = &bridge
-            && (b.hello.clock != nb::CLOCK || b.hello.now_ns < n.at_ns || b.hello.now_ns > host::now_ns())
-        {
-            return Err(Error::refused(
-                "ClockUnsynced",
-                format!("the app's bridge reports clock \"{}\" at {} ns, outside its launch on strobe's clock", b.hello.clock, b.hello.now_ns),
-                "the toolkit's bridge must stamp times with the OS monotonic clock strobe uses",
-            ));
-        }
         let awake = host::Awake::start();
         let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
         let dir = store::recording_dir(&id)?;
@@ -271,10 +258,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let presents = (set != Set::Attribution && !windowless).then(crate::etw::PresentCapture::start);
         let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
-        progress(format!("recording {id} for {}{}", fmt::ms_duration(for_ms), if bridge.is_some() { " (with the app's bridge)" } else { "" }));
-        if let Some(b) = &bridge {
-            b.request("run.begin", Value::Null, Duration::from_secs(10))?;
-        }
+        progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
         let snap0 = wakes::Snapshot::take(&n.pids());
         let c0 = cycles();
         let t0 = host::now_ns();
@@ -282,10 +266,6 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let t1 = host::now_ns();
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
-        let run = match &bridge {
-            Some(b) => b.request("run.end", Value::Null, Duration::from_secs(30))?,
-            None => Value::Null,
-        };
         let os = sampler.stop().window(t0, t1);
         let presents = presents.map(|r| r.and_then(|c| c.stop()));
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
@@ -297,19 +277,14 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         if !windowless {
             n.check_visible()?;
         }
-        let mut run = run;
         let mut frame_values = BTreeMap::new();
         let os_frames = match &presents {
             Some(Ok(p)) => {
-                let mut wins = [crate::etw::frames::RunWindow { t0, t1, rows: run.is_object().then(|| crate::etw::frames::rows_from_record(&run)), inputs: Vec::new() }];
                 let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
-                let f = crate::etw::frames::native_values(p, &n.pids(), &mut wins, display.as_ref());
+                let f = crate::etw::frames::native_values(p, &n.pids(), &[(t0, t1)], display.as_ref());
                 frame_values = f.values;
-                if let Some(rows) = &wins[0].rows {
-                    crate::etw::frames::fill_record(&mut run, rows);
-                }
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "inputs_refused": f.inputs_refused, "display": display })
+                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "display": display })
             }
             Some(Err(e)) => json!({ "refused": e.message }),
             None => Value::Null,
@@ -347,44 +322,33 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             values.insert("gpu.shared", v);
         }
         values.insert("memory.app.private", n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
-        if run.is_object() {
-            for (metric, field) in
-                [("ui.work", "wall_ms"), ("ui.cpu", "cpu_ms"), ("ui.view", "view_ms"), ("ui.layout", "layout_ms"), ("ui.text", "text_ms"), ("ui.paint", "paint_ms"), ("ui.encode", "encode_ms")]
-            {
-                if let Some(x) = run["work"][field].as_f64() {
-                    values.insert(metric, x);
-                }
+        // The UI thread: the main window's, from its own cycle counter and context switches.
+        let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
+        if let Some(t) = ui_tid.and_then(|tid| span.threads.iter().find(|t| t.tid == tid)) {
+            if let Some(c) = t.cpu_ms {
+                values.insert("ui.cpu", c);
             }
-            values.insert("ui.frames", run["frames"].as_array().map_or(0, Vec::len) as f64);
-            store::write_json(&dir.join("frames.json"), &json!({ "columns": run["frame_columns"], "runs": { "run:0": run["frames"] }, "marks": { "run:0": run["marks"] } }))?;
+            values.insert("ui.wakes", t.switches as f64 / (ms / 1e3));
         }
         let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
         let spans = std::slice::from_ref(&span);
         store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(spans, &names, &wakes::modules(spans))))?;
-        let mut bridged = run.clone();
-        if let Some(o) = bridged.as_object_mut() {
-            o.remove("frames");
-            o.remove("frame_columns");
-        }
         store::write_json(
             &dir.join("runs.json"),
-            &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write, "bridge": bridged }]),
+            &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]),
         )?;
-        let hello = bridge.as_ref().map(|b| &b.hello);
+        let debug = host::debug_runtime(&app.exe);
         let mut meta = json!({
             "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "os": os,
-            "window": n.window, "created": now_iso(), "valid": true, "hello": hello, "os_frames": os_frames, "session_locked": session_locked,
+            "window": n.window, "ui_thread": ui_tid, "created": now_iso(), "valid": true, "os_frames": os_frames, "session_locked": session_locked,
             // A debug build's times describe no build people run (`DevBuild`).
-            "timing": if hello.is_some_and(|h| h.debug_build) { "debug build" } else { "clean" },
-            "note": if set == Set::Attribution { format!("native attribution: run records and OS samples; {stacks_note}") } else { String::new() },
+            "timing": if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
+            "note": if set == Set::Attribution { format!("native attribution: OS samples; {stacks_note}") } else { String::new() },
         });
         for (k, x) in frame_values {
             meta["values"][k] = json!(x);
         }
         store::write_json(&dir.join("meta.json"), &meta)?;
-        if let Some(b) = &bridge {
-            b.quit();
-        }
         Ok(meta)
     })();
     n.close(true);
@@ -533,7 +497,7 @@ pub fn summary_text(meta: &Value) -> String {
     s
 }
 
-/// A native recording or block: what the OS saw, and with the app's bridge what its UI did.
+/// A native recording or block: what the OS saw of the app.
 fn native_summary(meta: &Value) -> String {
     let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
@@ -556,13 +520,15 @@ fn native_summary(meta: &Value) -> String {
             fmt::value(get("memory.app.private"), "MB")
         );
     }
-    if get("ui.work").is_finite() {
+    if get("ui.cpu").is_finite() {
+        s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
+    }
+    if get("frames.n").is_finite() {
         s += &format!(
-            "ui       work {} · cpu {} · {} frames submitted · interval p95 {}\n",
-            fmt::value(get("ui.work"), "ms"),
-            fmt::value(get("ui.cpu"), "ms"),
-            fmt::value(get("ui.frames"), "count"),
-            fmt::value(get("ui.interval.p95"), "ms")
+            "frames   {} on screen · interval p95 {} · {} dropped (OS present events)\n",
+            fmt::value(get("frames.n"), "count"),
+            fmt::value(get("frames.interval.p95"), "ms"),
+            fmt::value(get("frames.dropped"), "count")
         );
     }
     if meta["timing"] == "perturbed" {

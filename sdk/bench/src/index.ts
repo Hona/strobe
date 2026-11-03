@@ -10,16 +10,15 @@ export interface Options {
   until?: Until
   /** Milliseconds before the call fails the block. Default 30000. */
   timeout?: number
-  /** Native targets: the surface (window or overlay) by its key; default the app's main window. */
+  /** Native targets: the window (a top-level window or overlay of the app) by its title, or part of it; default the main window first, then the app's other windows. */
   window?: string
 }
 
 /**
- * Drives the target. On a native target the app's bridge does it (its UI toolkit built with strobe support):
- * `click`, `hover`, `move`, `type`, `press`, `scroll`, `wheel`, `waitFor`, `idle`, `wait`, `window` and `snapshot`
- * work there, with selectors as the toolkit's element keys (`"nav-history"`, `"slider/knob"`), `role=button`,
- * `text=General`, and a `:focus` suffix. `goto`, `eval`, `down` and `up` are page-only. Without the bridge a native
- * target takes `wait` only.
+ * Drives the target. On a native target strobe drives the app through the OS's accessibility tree and the app's
+ * own message loop (posted input; the app never takes focus): selectors are accessibility ids (an element key,
+ * `"nav-history"`, or a key path, `"slider/knob"`), `role=button`, `text=General`, with a `:focus` suffix.
+ * `goto` and `eval` are page-only; `act` and `query` are native-only.
  */
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
@@ -31,8 +30,8 @@ export interface Page {
   move(x: number, y: number, opts?: Options): Promise<void>
   /** Focuses `selector` (clicking it if focus is elsewhere), then sends one key event per character. */
   type(selector: string, text: string, opts?: Options & { delay?: number }): Promise<void>
-  /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. */
-  press(key: string, opts?: Options): Promise<void>
+  /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. Native targets: `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
+  press(key: string, opts?: Options & { selector?: string }): Promise<void>
   /** Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys). */
   down(key: string, opts?: Options): Promise<void>
   /** Lets go of a key `down` pressed. */
@@ -46,8 +45,16 @@ export interface Page {
   scroll(selector: string, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
   /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`. */
   wheel(selector: string, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
-  /** Native targets: shows, hides, focuses or closes a window (`opts.window`, default the main one), through the app's own path. */
-  window(action: "show" | "hide" | "focus" | "close", opts?: Options): Promise<void>
+  /** Native targets: shows, hides, minimizes, focuses or closes a window (`opts.window`, default the main one). `close` is the title bar's close (the app's own close path). */
+  window(action: "show" | "hide" | "minimize" | "focus" | "close", opts?: Options): Promise<void>
+  /**
+   * Native targets: an accessibility action on an element (UI Automation's patterns): `invoke`, `toggle`, `setValue`
+   * (`opts.value`), `expand`, `collapse`, `select`, `scrollIntoView`, `focus`. It skips hit testing and pointer
+   * handling, so it is never an input latency (`interaction.*` refuses a run that only acted).
+   */
+  act(selector: string, action: string, opts?: Options & { value?: string }): Promise<void>
+  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels), focused, enabled. */
+  query(selector: string, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean }[]>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
   waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */
@@ -154,7 +161,7 @@ export interface MilestoneUntil {
 }
 
 export interface Launch<P> {
-  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target without its bridge times to a window condition instead. */
+  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target: the screen time of the frame that first showed the element in its accessibility tree (OS present events), or a window condition. */
   until: Selector | WindowUntil | MilestoneUntil
   /** Named points on the way, each a metric `launch.<name>`. One a case declares must appear in every launch. */
   milestones?: Record<string, Milestone>
@@ -214,7 +221,6 @@ export type Target<P> =
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
   | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
-  | ({ kind: "headless"; app?: string; path?: string } & HeadlessOptions)
 
 export interface Viewport {
   width: number
@@ -262,11 +268,7 @@ export interface NativeOptions {
   args?: string[]
   /** Extra environment after the profile's; `{home}` and `{port}` are filled in. */
   env?: Record<string, string>
-  /**
-   * The app's bridge (`STROBE_BRIDGE`): by default strobe offers it and uses it once a page call, a `ui.*` or frame
-   * metric, or `--pixels` needs it. `true` requires it in every block; `false` measures the app from outside only.
-   */
-  bridge?: boolean
+
   /**
    * `false`: the app shows no window (a tray app). strobe neither waits for one nor places or checks it, launches end
    * on a milestone (`until: { milestone }`), and cases whose metrics are all CPU, memory, IO, counters and milestones
@@ -274,8 +276,6 @@ export interface NativeOptions {
    */
   window?: false
 }
-
-export type HeadlessOptions = Omit<NativeOptions, "viewport" | "bridge" | "window">
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
 export type ParamValues = readonly unknown[] | { readonly run: readonly unknown[]; readonly more?: readonly unknown[] }
@@ -334,22 +334,13 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
 /**
  * A native app (no browser engine): by its profile in strobe.json `apps` (`kind: "native"`), or an executable path.
  * Each block launches it in a fresh isolated home and measures it from outside: CPU in cycles, thread wakes
- * (`cpu.wakes`), IO, GPU, memory, and for launch cases its window. A directory or git-ref variant runs strobe.json's
- * `build` and launches its `output`.
+ * (`cpu.wakes`), the UI thread (`ui.cpu`), IO, GPU, memory, what reached the screen (`frames.*`, `interaction.*`), and
+ * for launch cases its window. `page` drives it through its accessibility tree. A directory or git-ref variant runs
+ * strobe.json's `build` and launches its `output`.
  */
 export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Target<P> {
   const path = /[\\/]|\.exe$/i.test(appOrPath)
   return { kind: "native", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
-}
-
-/**
- * The same native app in its toolkit's headless mode: offscreen, on a virtual clock, driven through its bridge. The
- * app profile's `headless` object holds the `args` and `env` that select it. Only `ui.*`, `count.*`, `cpu.*` and
- * `--pixels` are measured there: no display, no presentation, no launch.
- */
-export function headless<P = any>(appOrPath: string, opts: HeadlessOptions = {}): Target<P> {
-  const path = /[\\/]|\.exe$/i.test(appOrPath)
-  return { kind: "headless", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
 }
 
 export function bench<const Params extends Record<string, ParamValues> = {}>(spec: Bench<Params>): Bench<Params> {

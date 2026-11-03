@@ -41,7 +41,7 @@ impl Capture {
             set_interval(old_interval.unwrap_or(10_000)).ok();
             return Err(Error::msg(format!("process {root} is not running")));
         }
-        let cfg = session::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512) };
+        let cfg = session::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512), flush_ms: 0 };
         let t0 = crate::host::now_ns();
         let setup = |h: CONTROLTRACE_HANDLE| -> Result<()> {
             let ids = [CLASSIC_EVENT_ID { EventGuid: session::guid(PERFINFO), Type: SAMPLED_PROFILE, Reserved: [0; 7] }];

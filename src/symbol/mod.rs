@@ -54,12 +54,16 @@ type Named = (u32, u64, String, String, u32);
 type Resolved = Vec<(String, String, u32, String, bool)>;
 
 /// Symbolizes a recording's native samples (cached beside them in `deep-symbols.json.gz`).
-/// `thread`: keep only threads whose name contains it (or whose id it is).
-pub fn native(dir: &Path, thread: Option<&str>) -> Result<Option<Native>> {
+/// `thread`: keep only threads whose name contains it (or whose id it is); `spans`: only samples
+/// inside one of these host-clock spans (a phase).
+pub fn native(dir: &Path, thread: Option<&str>, spans: Option<&[(u64, u64)]>) -> Result<Option<Native>> {
     let Some(deep) = read_deep(dir)? else { return Ok(None) };
     let resolved = resolve_all(dir, &deep)?;
     let mut by_stack: HashMap<(u32, u32), u64> = HashMap::new();
     for s in &deep.samples {
+        if spans.is_some_and(|sp| !sp.iter().any(|(a, b)| s.0 >= *a && s.0 <= *b)) {
+            continue;
+        }
         if let Some(t) = thread {
             let name = deep.threads.get(&s.2).map(String::as_str).unwrap_or("");
             if !name.contains(t) && t != s.2.to_string() {

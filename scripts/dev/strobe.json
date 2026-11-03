@@ -6,8 +6,7 @@
   "apps": {
     "fake": {
       "kind": "native",
-      "exe": "fake-app.exe",
-      "headless": { "env": { "FAKE_MODE": "headless" } }
+      "exe": "fake-app.exe"
     }
   }
 }

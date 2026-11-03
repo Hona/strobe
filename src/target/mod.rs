@@ -1,9 +1,9 @@
 //! Finding and driving targets (SPEC §13).
 
+pub mod a11y;
 pub mod cdp;
 pub mod chromium;
 pub mod command;
 pub mod electron;
 pub mod isolate;
 pub mod native;
-pub mod native_bridge;

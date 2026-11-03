@@ -10,6 +10,8 @@ use windows_sys::core::GUID;
 
 const REAL_TIME: u32 = 0x100;
 const SYSTEM_LOGGER: u32 = 0x0200_0000;
+/// EVENT_TRACE_USE_MS_FLUSH_TIMER: `FlushTimer` in milliseconds.
+const USE_MS_FLUSH_TIMER: u32 = 0x10;
 const TRACED_GUID: u32 = 0x0002_0000;
 const PROCESS_REAL_TIME: u32 = 0x100;
 const PROCESS_RAW_TIMESTAMP: u32 = 0x1000;
@@ -146,6 +148,8 @@ pub struct Config {
     pub providers: Vec<Provider>,
     pub buffer_kb: u32,
     pub buffers: (u32, u32),
+    /// How often buffers reach the consumer, in ms; 0 for once a second.
+    pub flush_ms: u32,
 }
 
 impl<O: Send + 'static> Running<O> {
@@ -165,12 +169,12 @@ impl<O: Send + 'static> Running<O> {
         unsafe {
             (*p).Wnode.ClientContext = 1; // QPC
             (*p).Wnode.Flags = TRACED_GUID;
-            (*p).LogFileMode = REAL_TIME | if cfg.kernel != 0 { SYSTEM_LOGGER } else { 0 };
+            (*p).LogFileMode = REAL_TIME | if cfg.kernel != 0 { SYSTEM_LOGGER } else { 0 } | if cfg.flush_ms > 0 { USE_MS_FLUSH_TIMER } else { 0 };
             (*p).EnableFlags = cfg.kernel;
             (*p).BufferSize = cfg.buffer_kb;
             (*p).MinimumBuffers = cfg.buffers.0;
             (*p).MaximumBuffers = cfg.buffers.1;
-            (*p).FlushTimer = 1;
+            (*p).FlushTimer = if cfg.flush_ms > 0 { cfg.flush_ms } else { 1 };
         }
         let mut handle = CONTROLTRACE_HANDLE { Value: 0 };
         let mut rc = unsafe { StartTraceW(&mut handle, name.as_ptr(), p) };
@@ -181,12 +185,12 @@ impl<O: Send + 'static> Running<O> {
             unsafe {
                 (*p).Wnode.ClientContext = 1;
                 (*p).Wnode.Flags = TRACED_GUID;
-                (*p).LogFileMode = REAL_TIME | if cfg.kernel != 0 { SYSTEM_LOGGER } else { 0 };
+                (*p).LogFileMode = REAL_TIME | if cfg.kernel != 0 { SYSTEM_LOGGER } else { 0 } | if cfg.flush_ms > 0 { USE_MS_FLUSH_TIMER } else { 0 };
                 (*p).EnableFlags = cfg.kernel;
                 (*p).BufferSize = cfg.buffer_kb;
                 (*p).MinimumBuffers = cfg.buffers.0;
                 (*p).MaximumBuffers = cfg.buffers.1;
-                (*p).FlushTimer = 1;
+                (*p).FlushTimer = if cfg.flush_ms > 0 { cfg.flush_ms } else { 1 };
             }
             rc = unsafe { StartTraceW(&mut handle, name.as_ptr(), p) };
         }

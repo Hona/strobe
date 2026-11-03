@@ -44,6 +44,8 @@ const page = {
   scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),
   wheel: (selector: string, delta: object, o = {}) => driver("wheel", selector, delta, o),
   window: (action: string, o = {}) => driver("window", action, o),
+  act: (selector: string, action: string, o = {}) => driver("act", selector, action, o),
+  query: (selector: string, o = {}) => driver("query", selector, o),
   waitFor: (selector: string, o = {}) => driver("waitFor", selector, o),
   idle: (o = {}) => driver("idle", o),
   wait: (ms: number) => driver("wait", ms),

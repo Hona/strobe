@@ -62,9 +62,9 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         let d = cap.stop()?;
         crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
         progress("symbolizing (PDBs: local, then symbol servers)");
-        let native = crate::symbol::native(&dir, None)?;
+        let native = crate::symbol::native(&dir, None, None)?;
         let facts = native.as_ref().map(crate::symbol::summary).unwrap_or(Value::Null);
-        let top = super::query::native_hotspots(&dir, "function", 8, None).map(|o| o.text).unwrap_or_default();
+        let top = super::query::native_hotspots(&dir, "function", 8, None, None).map(|o| o.text).unwrap_or_default();
         let meta = json!({
             "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "deep", "token": "", "duration_ms": for_ms,
             "env": host::env(), "values": {}, "native": facts, "samples": d.samples.len(), "events_lost": d.events_lost, "pids": d.pids,

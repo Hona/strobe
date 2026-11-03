@@ -117,19 +117,24 @@ type Tracked = (Vec<Present>, Vec<(u64, u32)>);
 pub struct Capture {
     running: Running<Tracked>,
     t0: u64,
+    /// Presents as they complete, for waits while the session runs.
+    pub live: std::sync::Arc<super::Live>,
 }
 
 impl Capture {
-    /// Starts tracking presents in this process (needs admin or Performance Log Users).
+    /// Starts tracking presents in this process (needs admin or Performance Log Users). Buffers
+    /// flush every 10 ms, so a wait on the next frame hears of it within a frame or two.
     pub fn start() -> Result<Capture> {
-        let cfg = session::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256) };
+        let cfg = session::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256), flush_ms: 10 };
         let t0 = crate::host::now_ns();
         let armed = Arc::new(AtomicU64::new(0));
         let tracker_armed = armed.clone();
-        let running = Running::start(cfg, |_| Ok(()), move || Tracker::with_armed(tracker_armed))?;
+        let live = std::sync::Arc::new(super::Live::default());
+        let l = live.clone();
+        let running = Running::start(cfg, |_| Ok(()), move || Tracker::with_armed(tracker_armed, Some(l)))?;
         // Every provider runs from here: presents that start later are seen whole.
         armed.store(session::qpc_now(), Ordering::Release);
-        Ok(Capture { running, t0 })
+        Ok(Capture { running, t0, live })
     }
 
     pub fn stop(self) -> Result<Presents> {
@@ -273,6 +278,7 @@ pub struct Tracker {
     done: Vec<Ptr>,
     out: Vec<Present>,
     vsyncs: Vec<(u64, u32)>,
+    live: Option<std::sync::Arc<super::Live>>,
 }
 
 impl Handler for Tracker {
@@ -307,11 +313,12 @@ fn hdr(e: &EVENT_RECORD) -> (u64, u32, u32) {
 
 impl Tracker {
     pub fn new() -> Tracker {
-        Tracker::with_armed(Arc::new(AtomicU64::new(0)))
+        Tracker::with_armed(Arc::new(AtomicU64::new(0)), None)
     }
 
-    /// A tracker for a session whose providers all run from the raw QPC `armed` holds once set.
-    pub fn with_armed(armed: Arc<AtomicU64>) -> Tracker {
+    /// A tracker for a session whose providers all run from the raw QPC `armed` holds once set;
+    /// `live` hears of each present as it completes.
+    pub fn with_armed(armed: Arc<AtomicU64>, live: Option<std::sync::Arc<super::Live>>) -> Tracker {
         Tracker {
             armed,
             schema: Schema::default(),
@@ -333,6 +340,7 @@ impl Tracker {
             done: Vec::new(),
             out: Vec::new(),
             vsyncs: Vec::new(),
+            live,
         }
     }
 
@@ -607,6 +615,11 @@ impl Tracker {
             }
         }
         self.stop_tracking(p);
+        if let Some(l) = &self.live {
+            let b = p.borrow();
+            let screen = if b.state == Final::Presented && b.screen != 0 && !b.lost { session::ns(b.screen, self.freq) } else { 0 };
+            l.push(b.pid, session::ns(b.start, self.freq), screen);
+        }
         self.done.push(p.clone());
     }
 

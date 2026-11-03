@@ -108,6 +108,50 @@ pub fn access() -> Access {
     }
 }
 
+/// Presents as a running session completes them, for waits while it runs (`until: "frame"`, idle):
+/// (pid, start, screen time or 0 when it never reached the screen), the newest 65,536.
+#[derive(Default)]
+pub struct Live {
+    presents: std::sync::Mutex<std::collections::VecDeque<(u32, u64, u64)>>,
+    cv: std::sync::Condvar,
+}
+
+/// What `Live` says about some processes: the first present that reached the screen after a time
+/// (0 when none yet), and the start of their latest present of any fate (0 when none).
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
+pub struct LiveView {
+    pub next_start_ns: u64,
+    pub next_screen_ns: u64,
+    pub last_start_ns: u64,
+}
+
+impl Live {
+    pub fn push(&self, pid: u32, start: u64, screen: u64) {
+        let mut q = self.presents.lock().unwrap_or_else(|e| e.into_inner());
+        q.push_back((pid, start, screen));
+        if q.len() > 65_536 {
+            q.pop_front();
+        }
+        self.cv.notify_all();
+    }
+
+    /// Waits up to `wait` for a present of `pids` that started after `after` and reached the screen.
+    pub fn view(&self, pids: &[u32], after: u64, wait: std::time::Duration) -> LiveView {
+        let deadline = std::time::Instant::now() + wait;
+        let mut q = self.presents.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            let mine = || q.iter().filter(|p| pids.contains(&p.0));
+            let next = mine().filter(|p| p.1 > after && p.2 > 0).min_by_key(|p| p.1);
+            let last = mine().map(|p| p.1).max().unwrap_or(0);
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if next.is_some() || left.is_zero() {
+                return LiveView { next_start_ns: next.map_or(0, |p| p.1), next_screen_ns: next.map_or(0, |p| p.2), last_start_ns: last };
+            }
+            q = self.cv.wait_timeout(q, left).unwrap_or_else(|e| e.into_inner()).0;
+        }
+    }
+}
+
 /// A present session: in this process when its token may, else in the helper.
 pub enum PresentCapture {
     #[cfg(windows)]
@@ -152,6 +196,21 @@ impl PresentCapture {
             PresentCapture::Helper(_) => "helper",
             #[cfg(not(windows))]
             PresentCapture::None => "",
+        }
+    }
+
+    /// While the session runs: `Live::view` of `pids` after `after`, waiting up to `wait`.
+    pub fn live(&mut self, pids: &[u32], after: u64, wait: std::time::Duration) -> crate::model::Result<LiveView> {
+        match self {
+            #[cfg(windows)]
+            PresentCapture::Local(c) => Ok(c.live.view(pids, after, wait)),
+            #[cfg(windows)]
+            PresentCapture::Helper(c) => Ok(serde_json::from_value(c.call(serde_json::json!({ "op": "presents.live", "pids": pids, "after_ns": after, "wait_ms": wait.as_millis() as u64 }))?)?),
+            #[cfg(not(windows))]
+            PresentCapture::None => {
+                let _ = (pids, after, wait);
+                Ok(LiveView::default())
+            }
         }
     }
 

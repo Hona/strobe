@@ -23,7 +23,7 @@ pub struct Native {
     pub window: Option<TopWindow>,
 }
 
-/// Starts `app` in `home` with `env` added (such as the bridge's address); `output` keeps its stdout
+/// Starts `app` in `home` with `env` added; `output` keeps its stdout
 /// and stderr lines for milestones.
 pub fn launch(app: &App, home: &Home, env: &[(String, String)], output: bool, cpus: Option<u64>) -> Result<(Native, Guard)> {
     let mut guard = Guard::take(app);

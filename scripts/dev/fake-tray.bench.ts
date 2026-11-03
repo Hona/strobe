@@ -3,7 +3,7 @@
 import { bench, native } from "@hona/strobe"
 
 export default bench({
-  targets: { tray: native("fake", { args: [import.meta.dir + "/fake-bridge.ts"], env: { FAKE_NOWINDOW: "1" }, window: false }) },
+  targets: { tray: native("fake", { args: [import.meta.dir + "/fake-tray.ts"], window: false }) },
   cases: {
     idle: { primary: "cpu.wakes", metrics: ["cpu.work", "memory.app.private", "gpu.process.3d"], run: ({ page }) => page.wait(1000) },
     launch: { primary: "launch.ready", metrics: ["cpu.work"], launch: { until: { milestone: "up" }, milestones: { up: { match: "fake ready" } } } },

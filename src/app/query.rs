@@ -59,8 +59,8 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             if view == "alloc" {
                 alloc(&dir, by, top)
-            } else if args.has("native") || args.has("thread") {
-                native_hotspots(&dir, by, top, args.get("thread"))
+            } else if args.has("native") || args.has("thread") || args.has("phase") {
+                native_hotspots(&dir, by, top, args.get("thread"), args.get("phase"))
             } else {
                 hotspots(&dir, by, top)
             }
@@ -707,75 +707,82 @@ fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     }
     let sum = |o: &str| all.iter().filter(|r| r["origin"] == o).map(|r| r["wakes_per_s"].as_f64().unwrap_or(0.0)).sum::<f64>();
     if all.iter().any(|r| r["origin"].is_string()) {
-        text += &format!(
-            "by whose threads: app {} · driver {} · os {} (wakes/s)\n",
-            fmt::value(sum("app"), "count"),
-            fmt::value(sum("driver"), "count"),
-            fmt::value(sum("os"), "count")
-        );
+        text += &format!("by whose threads: app {} · driver {} · os {} (wakes/s)\n", fmt::value(sum("app"), "count"), fmt::value(sum("driver"), "count"), fmt::value(sum("os"), "count"));
     }
     text += "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks). A thread that exited during a run is not listed\n";
     Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>() })))
 }
 
-/// A native recording's frames (from the app's bridge): what each run submitted per surface, the gaps
-/// between submissions, and when the toolkit knows them, presentation times.
+/// A native recording's frames: per measured run, what reached the screen (OS present events), the
+/// inputs strobe gave the app, and each input's latency to the frame that showed it (SPEC §7.4).
 fn native_frames(dir: &Path, top: usize) -> Result<Output> {
-    let f = store::read_json(&dir.join("frames.json")).map_err(|_| Error::usage("this native recording has no frames: they come from the app's bridge (its toolkit built with strobe support)"))?;
-    let cols: Vec<String> = f["columns"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
-    let col = |name: &str| cols.iter().position(|c| c == name);
-    let (seq, surface, begin, cpu_end, submit, present, input) = (col("seq"), col("surface"), col("begin_ns"), col("cpu_end_ns"), col("submit_ns"), col("present_ns"), col("input_ns"));
-    let num = |row: &Value, i: Option<usize>| i.and_then(|i| row[i].as_f64()).unwrap_or(0.0);
+    let f = store::read_json(&dir.join("frames.json")).map_err(|_| Error::usage("this native recording has no frames: they come from bench blocks of a native target (--keep, or attribution)"))?;
+    let presents: crate::etw::Presents = {
+        let path = dir.join("presents.json.gz");
+        let mut text = String::new();
+        std::io::Read::read_to_string(
+            &mut flate2::read::GzDecoder::new(std::fs::File::open(&path).map_err(|_| Error::usage("this recording has no OS present events (no access, or a block without a window)"))?),
+            &mut text,
+        )?;
+        serde_json::from_str(&text)?
+    };
+    let pids: Vec<u32> = f["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).collect();
+    let refresh = crate::etw::frames::refresh_ms(&presents.vsyncs, presents.t0_ns, presents.t1_ns, None);
+    let quiet = crate::etw::frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
     let mut text = String::new();
     let mut runs_json = Vec::new();
-    let mut worst: Vec<(f64, String, f64)> = Vec::new();
-    for (run, rows) in f["runs"].as_object().into_iter().flatten() {
-        let rows = rows.as_array().cloned().unwrap_or_default();
-        let mut work: Vec<f64> = rows.iter().map(|r| (num(r, cpu_end) - num(r, begin)) / 1e6).filter(|x| *x >= 0.0).collect();
-        work.sort_by(f64::total_cmp);
-        let mut gaps: Vec<f64> = Vec::new();
-        let mut last: BTreeMap<i64, f64> = BTreeMap::new();
-        for r in &rows {
-            let s = num(r, surface) as i64;
-            let at = num(r, submit);
-            if let Some(prev) = last.insert(s, at)
-                && at > prev
-            {
-                gaps.push((at - prev) / 1e6);
-            }
-            let w = (num(r, cpu_end) - num(r, begin)) / 1e6;
-            worst.push((w, run.clone(), num(r, seq)));
-        }
+    let mut slow: Vec<(f64, String, &'static str)> = Vec::new();
+    for (run, r) in f["runs"].as_object().into_iter().flatten() {
+        let (t0, t1) = (r["t0_ns"].as_u64().unwrap_or(0), r["t1_ns"].as_u64().unwrap_or(0));
+        let shown = crate::etw::frames::from_presents(&presents.presents, &pids, t0, t1);
+        let mut screens: Vec<u64> = shown.shown.iter().map(|s| s.screen_ns).collect();
+        screens.sort_unstable();
+        let mut gaps: Vec<f64> = screens.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
         gaps.sort_by(f64::total_cmp);
-        let presented: Vec<f64> = rows.iter().filter(|r| num(r, present) > 0.0).map(|r| (num(r, present) - num(r, begin)) / 1e6).collect();
-        let inputs = rows.iter().filter(|r| num(r, input) > 0.0).count();
+        let inputs = r["inputs"].as_array().cloned().unwrap_or_default();
+        let kind = |k: &str| inputs.iter().filter(|i| i["kind"] == k).count();
+        let sent: Vec<crate::etw::frames::Sent> = inputs
+            .iter()
+            .filter(|i| i["kind"] == "discrete" || (i["kind"] == "scroll" && i["first"] == true))
+            .map(|i| crate::etw::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll" })
+            .collect();
+        let changes: Vec<u64> = r["changes"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+        let got = crate::etw::frames::reactions(&sent, &changes, &presents.presents, &pids, quiet);
+        slow.extend(got.interaction.iter().map(|ms| (*ms, run.clone(), "input")));
+        slow.extend(got.scroll.iter().map(|ms| (*ms, run.clone(), "scroll")));
         text += &format!(
-            "{run:<8} {:>5} frames · work p50 {} · p95 {} · interval p50 {} · p95 {} · max {}{}{}\n",
-            rows.len(),
-            fmt::value(metrics::percentile(&work, 0.5), "ms"),
-            fmt::value(metrics::percentile(&work, 0.95), "ms"),
+            "{run:<8} {:>5} frames on screen · {} discarded · interval p50 {} · p95 {} · inputs {} ({} pointer, {} action) · latency p50 {}{}\n",
+            shown.shown.len(),
+            shown.discarded,
             fmt::value(metrics::percentile(&gaps, 0.5), "ms"),
             fmt::value(metrics::percentile(&gaps, 0.95), "ms"),
-            fmt::value(gaps.last().copied().unwrap_or(f64::NAN), "ms"),
-            if presented.is_empty() { String::new() } else { format!(" · {} presented", presented.len()) },
-            if inputs > 0 { format!(" · {inputs} after input") } else { String::new() },
+            kind("discrete") + kind("scroll"),
+            kind("pointer"),
+            kind("pattern"),
+            fmt::value(
+                {
+                    let mut v = got.interaction.clone();
+                    v.sort_by(f64::total_cmp);
+                    metrics::percentile(&v, 0.5)
+                },
+                "ms"
+            ),
+            if got.unchanged + got.busy.0 + got.unshown.0 > 0 {
+                format!(" · not counted: {} changed no tree, {} came mid-drawing, {} showed no frame", got.unchanged, got.busy.0, got.unshown.0)
+            } else {
+                String::new()
+            },
         );
-        runs_json.push(
-            json!({ "run": run, "frames": rows.len(), "work_p95": metrics::percentile(&work, 0.95), "interval_p95": metrics::percentile(&gaps, 0.95), "presented": presented.len(), "inputs": inputs }),
-        );
+        runs_json.push(json!({ "run": run, "frames": shown.shown.len(), "discarded": shown.discarded, "interval_p95": metrics::percentile(&gaps, 0.95), "latencies_ms": got.interaction, "scroll_latencies_ms": got.scroll, "unchanged": got.unchanged, "busy": got.busy, "unshown": got.unshown }));
     }
-    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
-    text += "heaviest frames (begin to work done)\n";
-    for (w, run, s) in worst.iter().take(top.min(10)) {
-        text += &format!("  {:>9}  {run} frame {s}\n", fmt::value(*w, "ms"));
+    slow.sort_by(|a, b| b.0.total_cmp(&a.0));
+    text += "slowest inputs (posted to the screen time of the frame that showed them)\n";
+    for (ms, run, k) in slow.iter().take(top.min(10)) {
+        text += &format!("  {:>9}  {run} {k}\n", fmt::value(*ms, "ms"));
     }
-    text += "frames are what the app submitted; presented times come only from the toolkit or OS present events\n";
-    if let Some(marks) = f["marks"].as_object().filter(|m| !m.is_empty()) {
-        text += &format!("marks    {}\n", marks.values().map(|m| m.as_array().map_or(0, Vec::len)).sum::<usize>());
-    }
-    Ok(Output::new(text, json!({ "runs": runs_json, "columns": cols })))
+    text += "an input counts when the app changed its accessibility tree after it and was not drawing already (SPEC §7.4)\n";
+    Ok(Output::new(text, json!({ "runs": runs_json, "refresh_ms": refresh })))
 }
-
 fn threads(trace: &Path, top: usize) -> Result<Output> {
     let sql = format!(
         "select p.name as process, p.pid, t.name as thread, count(*) as tasks, round(sum(s.dur) / 1e6, 1) as busy_ms, round(max(s.dur) / 1e6, 1) as max_ms
@@ -789,7 +796,7 @@ fn threads(trace: &Path, top: usize) -> Result<Output> {
 pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     let profiles: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "cpuprofile")).collect();
     if profiles.is_empty() && dir.join("deep.json.gz").is_file() {
-        return native_hotspots(dir, by, top, None);
+        return native_hotspots(dir, by, top, None, None);
     }
     if profiles.is_empty() {
         return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
@@ -831,8 +838,10 @@ pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
 
 /// Self time per function, file or package from the recording's native samples (the kernel's
 /// sampled profile, symbolized from PDBs), in the shape of `hotspots`. `thread`: a thread name or id.
-pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>) -> Result<Output> {
-    let n = crate::symbol::native(dir, thread)?.ok_or_else(|| Error::usage("this recording has no native samples; record with --probes deep"))?;
+/// `phase`: only samples inside that phase of each measured run (`phase(name, fn)` in the bench file).
+pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>, phase: Option<&str>) -> Result<Output> {
+    let spans = phase.map(|p| phase_spans(dir, p)).transpose()?;
+    let n = crate::symbol::native(dir, thread, spans.as_deref())?.ok_or_else(|| Error::usage("this recording has no native samples; record with --probes deep"))?;
     let share = if n.samples > 0 { 100.0 * n.resolved as f64 / n.samples as f64 } else { 0.0 };
     let header = format!("native hotspots by {by} · self time · {{samples}} samples at {} µs · {share:.1}% resolved{{mapped}}", n.interval_us);
     let interval = n.interval_us;
@@ -850,6 +859,23 @@ pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>) -
     if share < 95.0 {
         let missing: Vec<String> = facts["unsymbolized"].as_array().into_iter().flatten().take(3).map(|m| format!("{} ({})", m["module"].as_str().unwrap_or(""), m["samples"])).collect();
         out.text += &format!("! Unresolved: {:.1}% of samples have no symbol (no PDB found): {}\n", 100.0 - share, missing.join(", "));
+    }
+    Ok(out)
+}
+
+/// The host-clock spans of a phase in a native recording's measured runs, from its marks.
+fn phase_spans(dir: &Path, phase: &str) -> Result<Vec<(u64, u64)>> {
+    let f = store::read_json(&dir.join("frames.json")).map_err(|_| Error::usage("--phase needs a native block's recording (its frames.json holds the phase marks)"))?;
+    let mut out = Vec::new();
+    for r in f["runs"].as_object().into_iter().flatten().map(|(_, r)| r) {
+        let marks: Vec<(String, u64)> = r["marks"].as_array().into_iter().flatten().filter_map(|m| Some((m[0].as_str()?.to_string(), m[1].as_u64()?))).collect();
+        let at = |edge: &str| marks.iter().find(|(n, _)| n.ends_with(&format!(":phase:{phase}:{edge}"))).map(|m| m.1);
+        if let (Some(a), Some(b)) = (at("start"), at("end")) {
+            out.push((a, b));
+        }
+    }
+    if out.is_empty() {
+        return Err(Error::usage(format!("no phase {phase:?} in this recording's runs")));
     }
     Ok(out)
 }

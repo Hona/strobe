@@ -29,7 +29,7 @@ fn tools() -> Value {
         { "name": "record", "description": "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), cdp:<port>, file:<path> (import).",
           "inputSchema": { "type": "object", "required": ["target"], "properties": {
             "target": s("https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, or file:<path>"), "for": s("duration, e.g. 10s (default 10s)"),
-            "native": b("exe:<path> is a native app (no browser engine): recorded from outside (CPU, thread wakes, IO, GPU, memory), and through its bridge if its toolkit has one"),
+            "native": b("exe:<path> is a native app (no browser engine): recorded from outside: CPU, thread wakes, IO, GPU, memory, the UI thread's CPU and what reached the screen"),
             "app": s("exe:<path>: the strobe.json app profile it borrows"),
             "probes": s("timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot)"), "headless": b("draw off screen: attribution data stays meaningful, frame metrics do not"), "served": s("folder the target's http origin serves, to resolve source-mapped frames to files on disk"), "timeout": n("seconds before returning while it keeps running (default 600)") } } },
         { "name": "bench", "description": "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress.",

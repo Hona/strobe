@@ -1,181 +1,31 @@
-//! Frame metrics from what the OS put on the screen (SPEC §7.2): OS presents alone (any process,
-//! outside-in), or a toolkit's frame rows joined to them (begin, input and screen times).
+//! Frame metrics from what the OS put on the screen (SPEC §7.2): the presents of a process tree,
+//! and the latency of the inputs strobe sent it to the presents that showed them (§7.4).
 //!
-//! A frame is pending from its begin (a toolkit row's `begin_ns`; outside-in, the present call's
-//! start) until its screen time. Between two consecutive frames of one surface (or swapchain) shown
-//! at `a` and `b`, the refreshes in between were missed when the later frame was pending early
-//! enough to make the refresh after `a` (pending before `a` + half a refresh): an animation that
-//! fell behind. A later start is the app resting (or, outside-in, a frame the app itself started
-//! late: only a toolkit's begin times can tell those apart), so the gap is neither an interval nor
-//! a drop, as Chromium's `STATE_NO_UPDATE_DESIRED` resets intervals.
+//! A frame is pending from its present call's start until its screen time. Between two consecutive
+//! frames of one swapchain shown at `a` and `b`, the refreshes in between were missed when the later
+//! frame was pending early enough to make the refresh after `a` (pending before `a` + half a
+//! refresh): an animation that fell behind. A later start is the app resting (or a frame the app
+//! itself started late: only a toolkit's own begin times could tell those apart), so the gap is
+//! neither an interval nor a drop, as Chromium's `STATE_NO_UPDATE_DESIRED` resets intervals.
 
 use super::{Present, Presents};
-use serde_json::Value;
 use std::collections::BTreeMap;
-
-/// One toolkit frame row (native bridge v1 `frame_columns`).
-#[derive(Clone, Copy, Debug, Default)]
-pub struct Row {
-    pub seq: u64,
-    pub surface: u32,
-    pub tid: u32,
-    pub begin_ns: u64,
-    pub cpu_end_ns: u64,
-    pub submit_ns: u64,
-    pub present_ns: u64,
-    pub input_ns: u64,
-}
-
-/// A run record's frame rows (`frame_columns`, `frames`), by column name.
-pub fn rows_from_record(rec: &Value) -> Vec<Row> {
-    let cols: Vec<&str> = rec["frame_columns"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-    let col = |name: &str| cols.iter().position(|c| *c == name);
-    let idx = [col("seq"), col("surface"), col("tid"), col("begin_ns"), col("cpu_end_ns"), col("submit_ns"), col("present_ns"), col("input_ns")];
-    rec["frames"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|row| {
-            let v = |i: usize| idx[i].and_then(|c| row[c].as_u64()).unwrap_or(0);
-            Row { seq: v(0), surface: v(1) as u32, tid: v(2) as u32, begin_ns: v(3), cpu_end_ns: v(4), submit_ns: v(5), present_ns: v(6), input_ns: v(7) }
-        })
-        .collect()
-}
-
-/// Writes rows' `present_ns` back into a run record's `frames`.
-pub fn fill_record(rec: &mut Value, rows: &[Row]) {
-    let Some(at) = rec["frame_columns"].as_array().and_then(|c| c.iter().position(|x| x == "present_ns")) else { return };
-    for (row, r) in rec["frames"].as_array_mut().into_iter().flatten().zip(rows) {
-        if let Some(cell) = row.get_mut(at)
-            && r.present_ns > 0
-        {
-            *cell = Value::from(r.present_ns);
-        }
-    }
-}
 
 /// A frame that reached the screen.
 #[derive(Clone, Copy, Debug)]
 pub struct Shown {
-    /// One surface (toolkit rows) or swapchain (presents): gaps are taken within it.
+    /// The swapchain: gaps are taken within it.
     pub stream: u64,
     pub pending_ns: u64,
     pub screen_ns: u64,
-    /// The frame's begin (toolkit rows only), for `frames.presented.*`.
-    pub begin_ns: Option<u64>,
-    pub input_ns: u64,
 }
 
-/// Slack around a row's present call when matching it to an OS present: the runtime logs the
-/// present's start on the presenting thread inside the call, on the same QPC clock as the row, so
-/// a few µs cover rounding. Wider would reach the next surface's or frame's present call.
-const JOIN_SLACK_NS: u64 = 10_000;
-
-/// Rows (or inputs) that matched no present beyond this share, with no events lost, refuse the
-/// frame metrics: a join that misses that much is not following the app's presents.
+/// Inputs that showed no frame beyond this share, with no events lost, refuse their latency: the
+/// session is not following the app's presents.
 const UNMATCHED_MAX: f64 = 0.05;
 
 fn stream(p: &Present) -> u64 {
     (p.pid as u64) << 48 ^ p.swapchain
-}
-
-/// What a join saw: rows (or inputs) it tried, those that matched no present, and those with more
-/// than one present that fit.
-#[derive(Clone, Copy, Debug, Default)]
-pub struct JoinStats {
-    pub tried: usize,
-    pub unmatched: usize,
-    pub ambiguous: usize,
-}
-
-impl JoinStats {
-    /// Why the joined frames cannot be defended, if they cannot: `AmbiguousPresent` when rows fit
-    /// several presents, `PresentsUnmatched` when over 5% matched none while the session lost no
-    /// events (with lost events, `PresentsLost` already says frame counts may be short).
-    pub fn refusal(&self, events_lost: u64) -> Option<String> {
-        if self.tried == 0 {
-            return None;
-        }
-        let share = |n: usize| n as f64 / self.tried as f64;
-        if share(self.ambiguous) > UNMATCHED_MAX {
-            return Some(format!(
-                "AmbiguousPresent: {} of {} frames fit more than one OS present (several surfaces presenting from one thread at once), so which reached the screen when is unknown",
-                self.ambiguous, self.tried
-            ));
-        }
-        if events_lost == 0 && share(self.unmatched) > UNMATCHED_MAX {
-            return Some(format!(
-                "PresentsUnmatched: {} of {} frames matched no OS present with no events lost: the present session is not following this app's presents",
-                self.unmatched, self.tried
-            ));
-        }
-        None
-    }
-}
-
-/// The OS present of each toolkit row: one of `pids`, started inside the row's present call
-/// (`cpu_end_ns`..`submit_ns`, within `JOIN_SLACK_NS`) on the row's own thread, the one nearest the
-/// call's start. Each surface keeps to the swapchain it first matched, and a swapchain to its
-/// surface. Another thread's present counts only when the rows have a single surface (a driver
-/// that presents from its own thread). Fills `present_ns` with the screen time of displayed ones
-/// and returns, per row, the matched present.
-pub fn join<'a>(rows: &mut [Row], presents: &'a [Present], pids: &[u32]) -> (Vec<Option<&'a Present>>, JoinStats) {
-    let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid)).collect();
-    let mut used = vec![false; mine.len()];
-    let mut out = vec![None; rows.len()];
-    let mut stats = JoinStats::default();
-    let single = rows.iter().map(|r| r.surface).collect::<std::collections::BTreeSet<_>>().len() <= 1;
-    let mut chain_of: BTreeMap<u32, u64> = BTreeMap::new();
-    let mut surface_of: BTreeMap<u64, u32> = BTreeMap::new();
-    let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by_key(|&i| rows[i].cpu_end_ns.min(rows[i].submit_ns));
-    for i in order {
-        let r = rows[i];
-        if r.submit_ns == 0 {
-            continue;
-        }
-        stats.tried += 1;
-        let start = r.cpu_end_ns.min(r.submit_ns);
-        let lo = start.saturating_sub(JOIN_SLACK_NS);
-        let hi = r.submit_ns + JOIN_SLACK_NS;
-        // Presents are sorted by start: only those inside the window are looked at.
-        let from = mine.partition_point(|p| p.start_ns < lo);
-        let fits = |same_thread: bool| -> Vec<usize> {
-            mine[from..]
-                .iter()
-                .enumerate()
-                .take_while(|(_, p)| p.start_ns <= hi)
-                .filter(|(j, p)| {
-                    !used[from + j]
-                        && (!same_thread || p.tid == r.tid)
-                        && chain_of.get(&r.surface).is_none_or(|c| *c == stream(p))
-                        && surface_of.get(&stream(p)).is_none_or(|s| *s == r.surface)
-                })
-                .map(|(j, _)| from + j)
-                .collect()
-        };
-        let mut found = fits(true);
-        if found.is_empty() && single {
-            found = fits(false);
-        }
-        // Nearest to the call's start: a present started later belongs to a later call.
-        let Some(&j) = found.iter().min_by_key(|&&j| mine[j].start_ns.abs_diff(start)) else {
-            stats.unmatched += 1;
-            continue;
-        };
-        if found.len() > 1 && !chain_of.contains_key(&r.surface) {
-            stats.ambiguous += 1;
-            continue;
-        }
-        used[j] = true;
-        chain_of.insert(r.surface, stream(mine[j]));
-        surface_of.insert(stream(mine[j]), r.surface);
-        out[i] = Some(mine[j]);
-        if mine[j].state == "displayed" && rows[i].present_ns == 0 {
-            rows[i].present_ns = mine[j].screen_ns;
-        }
-    }
-    (out, stats)
 }
 
 /// How long a target must have presented nothing before an input for its next present to be the
@@ -183,36 +33,6 @@ pub fn join<'a>(rows: &mut [Row], presents: &'a [Present], pids: &[u32]) -> (Vec
 pub fn quiet_ns(refresh_ms: f64) -> u64 {
     (2.0 * refresh_ms * 1e6) as u64
 }
-
-/// The longest an input waits for its frame: past this its present is something else's.
-const INPUT_HORIZON_NS: u64 = 1_000_000_000;
-
-/// The frame that showed each input (an input strobe sent, at `input_ns` on the host clock): the
-/// first present of `pids` started after it that reached the screen, when the target presented
-/// nothing for `quiet_ns` before it (at rest, so that present is the input's). An input the target
-/// was busy drawing through gets `None` and is not counted; one with no present within a second
-/// counts as unmatched (it changed nothing on screen, or its present was missed).
-pub fn join_inputs<'a>(inputs: &[u64], presents: &'a [Present], pids: &[u32], quiet_ns: u64) -> (Vec<Option<&'a Present>>, JoinStats) {
-    let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid)).collect();
-    let mut stats = JoinStats::default();
-    let out = inputs
-        .iter()
-        .map(|&t| {
-            let at = mine.partition_point(|p| p.start_ns < t);
-            if at > 0 && mine[at - 1].start_ns + quiet_ns > t {
-                return None;
-            }
-            stats.tried += 1;
-            let shown = mine[at..].iter().take_while(|p| p.start_ns <= t + INPUT_HORIZON_NS).find(|p| p.state == "displayed").copied();
-            if shown.is_none() {
-                stats.unmatched += 1;
-            }
-            shown
-        })
-        .collect();
-    (out, stats)
-}
-
 /// The refresh period (ms) of the display the target shows on (`display`, its window's display
 /// path): the median spacing of that path's vertical blanks in `[t0, t1]`, or its nominal refresh
 /// when it has too few blanks or they disagree with it by over 10% (another adapter's path of
@@ -247,20 +67,19 @@ pub fn refresh_ms(vsyncs: &[(u64, u32)], t0: u64, t1: u64, display: Option<&crat
     periods.values().all(|p| (p - first).abs() <= first * 0.02).then_some(first)
 }
 
-/// Per run window: displayed frames, discarded presents, and input-to-screen latencies (ms).
+/// Per run window: displayed frames and discarded presents.
 #[derive(Default)]
 pub struct RunFrames {
     pub shown: Vec<Shown>,
     pub discarded: usize,
-    pub latencies: Vec<f64>,
 }
 
-/// Outside-in: the displayed and discarded presents of `pids` started in `[t0, t1)`.
+/// The displayed and discarded presents of `pids` started in `[t0, t1)`.
 pub fn from_presents(presents: &[Present], pids: &[u32], t0: u64, t1: u64) -> RunFrames {
     let mut out = RunFrames::default();
     for p in presents.iter().filter(|p| pids.contains(&p.pid) && p.start_ns >= t0 && p.start_ns < t1) {
         match p.state.as_str() {
-            "displayed" => out.shown.push(Shown { stream: stream(p), pending_ns: p.start_ns, screen_ns: p.screen_ns, begin_ns: None, input_ns: 0 }),
+            "displayed" => out.shown.push(Shown { stream: stream(p), pending_ns: p.start_ns, screen_ns: p.screen_ns }),
             "discarded" => out.discarded += 1,
             _ => {}
         }
@@ -268,90 +87,26 @@ pub fn from_presents(presents: &[Present], pids: &[u32], t0: u64, t1: u64) -> Ru
     out
 }
 
-/// From toolkit rows joined to presents (`join`): displayed rows and rows whose present was discarded.
-pub fn from_rows(rows: &[Row], matched: &[Option<&Present>]) -> RunFrames {
-    let mut out = RunFrames::default();
-    for (r, m) in rows.iter().zip(matched) {
-        if r.present_ns > 0 {
-            out.shown.push(Shown { stream: r.surface as u64, pending_ns: r.begin_ns, screen_ns: r.present_ns, begin_ns: Some(r.begin_ns), input_ns: r.input_ns });
-            if r.input_ns > 0 && r.input_ns <= r.present_ns {
-                out.latencies.push((r.present_ns - r.input_ns) as f64 / 1e6);
-            }
-        } else if m.is_some_and(|p| p.state == "discarded") {
-            out.discarded += 1;
-        }
-    }
-    out
-}
-
-/// One measured run of a native app: its span on the host clock, its toolkit's frame rows when it
-/// reports them (their `present_ns` filled from the OS presents), and the times strobe sent it
-/// inputs (host clock), which the OS presents after each show on screen.
-#[derive(Default)]
-pub struct RunWindow {
-    pub t0: u64,
-    pub t1: u64,
-    pub rows: Option<Vec<Row>>,
-    pub inputs: Vec<u64>,
-}
-
-/// A native app's frame metrics from OS presents, and why some are refused.
+/// A native app's frame metrics from OS presents, and why they are refused when they are.
 #[derive(Default)]
 pub struct NativeFrames {
     pub values: BTreeMap<String, f64>,
-    /// Every frame metric: the join of rows to presents cannot be defended.
     pub refused: Option<String>,
-    /// `interaction.*`: strobe's inputs mostly matched no present.
-    pub inputs_refused: Option<String>,
 }
 
-/// Frame metrics of a native app's runs from OS presents: its toolkit's rows joined to them when
-/// it reports frames, else its processes' presents alone; `interaction.*` from strobe's own inputs
-/// to the first present that showed each (`join_inputs`) when the runs have inputs, else from the
-/// rows' input times. `display` is the target window's display path, for the refresh period.
-pub fn native_values(p: &Presents, pids: &[u32], runs: &mut [RunWindow], display: Option<&crate::host::DisplayPath>) -> NativeFrames {
-    let (t0, t1) = (runs.first().map_or(0, |r| r.t0), runs.last().map_or(0, |r| r.t1));
+/// Frame metrics of a native app's measured runs (their spans on the host clock) from its
+/// processes' presents. `display` is the target window's display path, for the refresh period.
+pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: Option<&crate::host::DisplayPath>) -> NativeFrames {
+    let (t0, t1) = (runs.first().map_or(0, |r| r.0), runs.last().map_or(0, |r| r.1));
     let refresh = refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000, display);
-    let quiet = quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
-    let (mut rows_stats, mut input_stats) = (JoinStats::default(), JoinStats::default());
-    let frames: Vec<RunFrames> = runs
-        .iter_mut()
-        .map(|r| {
-            let mut f = match r.rows.as_mut().filter(|rows| !rows.is_empty()) {
-                Some(rows) => {
-                    let (matched, s) = join(rows, &p.presents, pids);
-                    rows_stats.tried += s.tried;
-                    rows_stats.unmatched += s.unmatched;
-                    rows_stats.ambiguous += s.ambiguous;
-                    from_rows(rows, &matched)
-                }
-                None => from_presents(&p.presents, pids, r.t0, r.t1),
-            };
-            if !r.inputs.is_empty() {
-                let (shown, s) = join_inputs(&r.inputs, &p.presents, pids, quiet);
-                input_stats.tried += s.tried;
-                input_stats.unmatched += s.unmatched;
-                f.latencies = r.inputs.iter().zip(shown).filter_map(|(t, p)| p.map(|p| p.screen_ns.saturating_sub(*t) as f64 / 1e6)).collect();
-            }
-            f
-        })
-        .collect();
-    let mut out = NativeFrames { values: values(&frames, refresh), refused: rows_stats.refusal(p.events_lost), inputs_refused: None };
+    let frames: Vec<RunFrames> = runs.iter().map(|r| from_presents(&p.presents, pids, r.0, r.1)).collect();
+    let mut out = NativeFrames { values: values(&frames, refresh), refused: None };
     if refresh.is_none() && !p.vsyncs.is_empty() && display.is_none() {
         out.refused = Some("NoPresentSource: several displays run at different refresh rates and the target's window is unknown, so its refresh period is too".into());
-    }
-    if input_stats.tried > 0 && p.events_lost == 0 && input_stats.unmatched as f64 / input_stats.tried as f64 > UNMATCHED_MAX {
-        out.inputs_refused = Some(format!(
-            "PresentsUnmatched: {} of {} inputs showed no frame within a second: they changed nothing on screen, or the app presents in a way the session does not follow",
-            input_stats.unmatched, input_stats.tried
-        ));
-    }
-    if out.refused.is_some() {
         out.values.clear();
     }
     out
 }
-
 /// Missed refreshes and the intervals between frames shown while the target kept drawing.
 fn gaps(shown: &[Shown], refresh_ns: f64) -> (usize, Vec<f64>) {
     let mut by: BTreeMap<u64, Vec<&Shown>> = BTreeMap::new();
@@ -378,47 +133,31 @@ fn pct(sorted: &[f64], p: f64) -> f64 {
     crate::metrics::percentile(sorted, p)
 }
 
-/// Frame metrics over measured runs: interval and cost percentiles pool every run's frames, counts
+/// Frame metrics over measured runs: interval percentiles pool every run's frames, counts
 /// are the median per run (as `metrics::block_values` does for Chromium's frames). Nothing without
 /// a refresh period (no vertical blanks: no display).
 pub fn values(runs: &[RunFrames], refresh_ms: Option<f64>) -> BTreeMap<String, f64> {
     let mut out = BTreeMap::new();
     let Some(r) = refresh_ms else { return out };
     let refresh_ns = r * 1e6;
-    let (mut intervals, mut costs, mut inputs) = (Vec::new(), Vec::new(), Vec::new());
+    let mut intervals = Vec::new();
     let (mut counts, mut dropped, mut discarded) = (Vec::new(), Vec::new(), Vec::new());
     let (mut shown_all, mut dropped_all) = (0usize, 0usize);
     for run in runs {
         let (missed, iv) = gaps(&run.shown, refresh_ns);
         intervals.extend(iv);
-        costs.extend(run.shown.iter().filter_map(|s| s.begin_ns.filter(|b| *b > 0 && *b <= s.screen_ns).map(|b| (s.screen_ns - b) as f64 / 1e6)));
-        inputs.extend(run.latencies.iter().copied());
         counts.push(run.shown.len() as f64);
         dropped.push((missed + run.discarded) as f64);
         discarded.push(run.discarded as f64);
         shown_all += run.shown.len();
         dropped_all += missed + run.discarded;
     }
-    let sort = |v: &mut Vec<f64>| v.sort_by(|a, b| a.total_cmp(b));
-    sort(&mut intervals);
-    sort(&mut costs);
-    sort(&mut inputs);
+    intervals.sort_by(|a, b| a.total_cmp(b));
     if !intervals.is_empty() {
         for (name, p) in [("p50", 0.5), ("p95", 0.95), ("p99", 0.99)] {
             out.insert(format!("frames.interval.{name}"), pct(&intervals, p));
         }
         out.insert("frames.interval.max".into(), *intervals.last().unwrap_or(&0.0));
-    }
-    if !costs.is_empty() {
-        for (name, p) in [("p50", 0.5), ("p90", 0.9), ("p95", 0.95), ("p99", 0.99)] {
-            out.insert(format!("frames.presented.{name}"), pct(&costs, p));
-        }
-        out.insert("frames.presented.max".into(), *costs.last().unwrap_or(&0.0));
-    }
-    if !inputs.is_empty() {
-        out.insert("interaction.n".into(), inputs.len() as f64);
-        out.insert("interaction.p50".into(), pct(&inputs, 0.5));
-        out.insert("interaction.p95".into(), pct(&inputs, 0.95));
     }
     out.insert("frames.n".into(), shown_all as f64);
     out.insert("frames.presented.count".into(), crate::metrics::median(&counts));
@@ -429,4 +168,121 @@ pub fn values(runs: &[RunFrames], refresh_ms: Option<f64>) -> BTreeMap<String, f
     }
     out.insert("display.hz".into(), 1000.0 / r);
     out
+}
+
+/// An input strobe gave a native app: when it was posted (host clock), and whether it is a
+/// discrete one (a click's release, a key press) or the first wheel step of a scroll.
+#[derive(Clone, Copy, Debug)]
+pub struct Sent {
+    pub t_ns: u64,
+    pub scroll: bool,
+}
+
+/// Input latencies from outside the app (SPEC §7.4), in ms: discrete inputs for `interaction.*`,
+/// gesture-starting wheel steps for `scroll.latency.*`. An input counts when the app changed its
+/// accessibility tree within a second after it (`changes`, host clock: a press highlight or a caret
+/// blink changes none, so such an input never claims an unrelated later frame), and the app was at
+/// rest when it came (no present started in the `quiet` before it); its latency is then to the
+/// screen time of the first present of `pids` that started after it and reached the screen, within
+/// a second. Nothing carries over between inputs.
+#[derive(Clone, Debug, Default)]
+pub struct Reactions {
+    pub interaction: Vec<f64>,
+    pub scroll: Vec<f64>,
+    /// Inputs that changed the tree, per kind: (discrete, scroll).
+    pub tried: (usize, usize),
+    /// Of those, the app was already drawing when they came.
+    pub busy: (usize, usize),
+    /// Of those, no present reached the screen within a second.
+    pub unshown: (usize, usize),
+    /// Inputs after which the tree did not change.
+    pub unchanged: usize,
+}
+
+/// The longest an input waits for its frame: past this its present is something else's.
+const HORIZON_NS: u64 = 1_000_000_000;
+
+pub fn reactions(sent: &[Sent], changes: &[u64], presents: &[Present], pids: &[u32], quiet_ns: u64) -> Reactions {
+    let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid) && p.state != "lost" && p.state != "failed").collect();
+    let mut out = Reactions::default();
+    for s in sent {
+        let changed = changes.iter().any(|&c| c > s.t_ns && c <= s.t_ns + HORIZON_NS);
+        if !changed {
+            out.unchanged += 1;
+            continue;
+        }
+        let k = usize::from(s.scroll);
+        let bump = |t: &mut (usize, usize)| if k == 1 { t.1 += 1 } else { t.0 += 1 };
+        bump(&mut out.tried);
+        let at = mine.partition_point(|p| p.start_ns <= s.t_ns);
+        if at > 0 && mine[at - 1].start_ns + quiet_ns > s.t_ns {
+            bump(&mut out.busy);
+            continue;
+        }
+        match mine[at..].iter().take_while(|p| p.start_ns <= s.t_ns + HORIZON_NS).find(|p| p.state == "displayed" && p.screen_ns > s.t_ns) {
+            Some(p) => {
+                let ms = (p.screen_ns - s.t_ns) as f64 / 1e6;
+                if s.scroll { out.scroll.push(ms) } else { out.interaction.push(ms) }
+            }
+            None => bump(&mut out.unshown),
+        }
+    }
+    out
+}
+
+impl Reactions {
+    /// Values pooled over a block's runs, and why a kind is refused when it is: more than half of
+    /// its inputs came while the app was drawing (`AmbiguousInteraction`), over 5% showed no frame
+    /// while the session lost no events (`PresentsUnmatched`), or none reached a frame.
+    pub fn values(&self, events_lost: u64, out: &mut BTreeMap<String, f64>, refused: &mut BTreeMap<String, String>) {
+        for (prefix, count, v, tried, busy, unshown) in
+            [("interaction", "interaction.n", &self.interaction, self.tried.0, self.busy.0, self.unshown.0), ("scroll.latency", "scroll.n", &self.scroll, self.tried.1, self.busy.1, self.unshown.1)]
+        {
+            let why = if tried == 0 {
+                Some(if self.unchanged > 0 {
+                    format!("NoPresentSource: {prefix}.*: none of the {} inputs changed the app's accessibility tree, so no frame can be shown to be their reaction", self.unchanged)
+                } else {
+                    format!("NoPresentSource: {prefix}.*: the runs sent no input of this kind")
+                })
+            } else if busy * 2 > tried {
+                Some(format!("AmbiguousInteraction: {prefix}.*: the app was already drawing when {busy} of {tried} inputs came (an animation or a caret), so the next frame may not be their reaction"))
+            } else if events_lost == 0 && unshown as f64 > UNMATCHED_MAX * (tried - busy) as f64 {
+                Some(format!(
+                    "PresentsUnmatched: {prefix}.*: {unshown} of {} inputs that changed the app's tree showed no frame within a second: the app presents in a way the session does not follow, or reacted only in its tree",
+                    tried - busy
+                ))
+            } else if v.is_empty() {
+                Some(format!("NoPresentSource: {prefix}.*: no frame reached the screen within a second of {unshown} inputs"))
+            } else {
+                None
+            };
+            match why {
+                Some(w) => {
+                    for k in [format!("{prefix}.p50"), format!("{prefix}.p95"), count.to_string()] {
+                        refused.entry(k).or_insert_with(|| w.clone());
+                    }
+                }
+                None => {
+                    let mut v = v.clone();
+                    v.sort_by(f64::total_cmp);
+                    out.insert(count.to_string(), v.len() as f64);
+                    out.insert(format!("{prefix}.p50"), pct(&v, 0.5));
+                    out.insert(format!("{prefix}.p95"), pct(&v, 0.95));
+                }
+            }
+        }
+    }
+}
+
+/// Runs in which the app presented faster than the display refreshes (more presents started than
+/// refreshes plus ten): a toolkit spinning unpaced, whose frames describe no person's screen.
+pub fn unpaced(presents: &[Present], pids: &[u32], runs: &[(u64, u64)], refresh_ms: f64) -> Option<String> {
+    for &(t0, t1) in runs {
+        let n = presents.iter().filter(|p| pids.contains(&p.pid) && p.start_ns >= t0 && p.start_ns < t1).count();
+        let refreshes = (t1.saturating_sub(t0) as f64 / 1e6 / refresh_ms).ceil() as usize;
+        if n > refreshes + 10 {
+            return Some(format!("UnpacedSpin: the app presented {n} frames in a run of {refreshes} refreshes: it draws without waiting for the display"));
+        }
+    }
+    None
 }

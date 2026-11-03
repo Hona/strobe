@@ -1,23 +1,22 @@
 //! Native targets (SPEC §9.6, §13.7): an app with no browser engine, launched in an isolated home per
 //! block. From outside strobe measures its processes' CPU in cycles, its threads' wakes, IO, GPU and
-//! memory, and for launches its window's pixels. When the app's UI toolkit has the bridge, strobe also
-//! drives it (the bench file's `page`) and reads its run records: UI-thread work by phase, frames it
-//! submitted, exact counters.
+//! memory, what reached the screen (OS present events), and for launches its window's pixels. The
+//! bench file's `page` drives it through the OS's accessibility tree and its own message loop
+//! (`driver::native`), and input latency comes from those inputs to the presents that showed them.
 
 use super::launch::{Line, found_all, joined, milestones, no_page, screen_times, tail};
 use super::*;
-use crate::driver::native::NativeDriver;
-use crate::etw::frames;
+use crate::driver::native::{Log, Session};
+use crate::etw::{PresentCapture, frames};
 use crate::probe::wakes::{self, Snapshot, Span};
 use crate::target::native::{self as nt, Native};
-use crate::target::native_bridge::{self as nb, Bridge, Listener};
 use std::cell::OnceCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// What a native target launches for a variant: its app profile (`native(appId)`) or a bare
 /// executable (`native(path)`), with the variant's own build or `exe:` in place of the profile's
-/// executable, the target's `args` and `env` added, and for a headless target the profile's headless mode.
+/// executable, and the target's `args` and `env` added.
 pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
     let base = match (&v.kind, target["app"].as_str()) {
         (Kind::App(id), _) => isolate::app(id, config)?,
@@ -36,80 +35,43 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
     };
     let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
     let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
-    let app = base.with_extra(&args, &env);
-    if target["kind"] == "headless" { app.headless() } else { Ok(app) }
+    Ok(base.with_extra(&args, &env))
 }
 
-/// The app's bridge for one launch: connected when something first needs it (a page call, run
-/// records, a selector) and admitted once its hello fits the target.
-struct Link {
-    listener: Option<Listener>,
-    bridge: OnceCell<Bridge>,
+/// The driving session for one launch, opened when a page call first needs it: the app has then
+/// shown its window.
+struct Drive {
+    session: OnceCell<Session>,
     pid: u32,
-    /// When the app was spawned (host clock): its hello must come after it.
-    spawned_ns: u64,
-    headless: bool,
-    /// A timing block: a debug build is refused there.
-    timed: bool,
+    home: PathBuf,
+    /// The main window once found (0: none, a windowless app).
+    main: Cell<isize>,
 }
 
-impl Link {
-    fn new(target: &Value, n: &Native, timed: bool, listener: Option<Listener>) -> Link {
-        Link { listener, bridge: OnceCell::new(), pid: n.pid, spawned_ns: n.at_ns, headless: target["kind"] == "headless", timed }
+impl Drive {
+    fn pids(&self) -> Vec<u32> {
+        host::process_set(self.pid, Some(&self.home)).iter().map(|p| p.pid).collect()
     }
 
-    /// The bridge, waiting up to `wait` for the app to connect.
-    fn get(&self, wait: Duration) -> Result<&Bridge> {
-        if let Some(b) = self.bridge.get() {
-            return Ok(b);
+    fn get(&self) -> Result<&Session> {
+        if let Some(s) = self.session.get() {
+            return Ok(s);
         }
-        let l = self.listener.as_ref().ok_or_else(|| Error::usage("this target's bridge is off (native(…, { bridge: false })): it is measured from outside only"))?;
-        let pid = self.pid;
-        let b = l.accept(wait, &|| isolate::alive(pid))?;
-        self.admit(&b)?;
-        Ok(self.bridge.get_or_init(|| b))
+        if self.main.get() == 0 {
+            return Err(Error::usage("the app shows no window to drive (window: false)"));
+        }
+        let s = Session::open(&self.pids(), self.main.get())?;
+        let _ = self.session.set(s);
+        self.session.get().ok_or_else(|| Error::msg("internal: the driving session"))
     }
 
-    /// The bridge if the app has connected by now.
-    fn now(&self) -> Result<Option<&Bridge>> {
-        if let Some(b) = self.bridge.get() {
-            return Ok(Some(b));
-        }
-        let Some(b) = self.listener.as_ref().map(Listener::try_accept).transpose()?.flatten() else { return Ok(None) };
-        self.admit(&b)?;
-        Ok(Some(self.bridge.get_or_init(|| b)))
-    }
-
-    /// The hello's validators (SPEC §10.1): the clock strobe reads, the mode the target asks for, and
-    /// no debug build in a timing block.
-    fn admit(&self, b: &Bridge) -> Result<()> {
-        let h = &b.hello;
-        // Its hello's time must fall between the spawn and now on strobe's own clock.
-        if h.clock != nb::CLOCK || h.now_ns < self.spawned_ns || h.now_ns > host::now_ns() + 1_000_000 {
-            return Err(Error::refused(
-                "ClockUnsynced",
-                format!("the app's bridge reports clock \"{}\" at {} ns, outside its launch ({} ns) to now on strobe's \"{}\" clock", h.clock, h.now_ns, self.spawned_ns, nb::CLOCK),
-                "the toolkit's bridge must stamp times with the OS monotonic clock strobe uses, in ns",
-            ));
-        }
-        match (self.headless, h.mode.as_str()) {
-            (true, "headless") | (false, "window") => {}
-            (true, other) => return Err(Error::usage(format!("a headless() target's app says it runs in {other} mode: its profile's headless args or env did not select headless"))),
-            (false, other) => return Err(Error::usage(format!("a native() target's app says it runs in {other} mode; use headless() for that"))),
-        }
-        if h.debug_build && self.timed {
-            return Err(Error::refused(
-                "DevBuild",
-                format!("the app is a debug build ({} {}): its timings describe no build people run", h.toolkit, h.toolkit_version),
-                "build the app optimized (strobe.json build: a release or profiling profile)",
-            ));
-        }
-        Ok(())
-    }
-
-    fn quit(&self) {
-        if let Some(b) = self.bridge.get() {
-            b.quit();
+    /// The app may replace its main window (a splash, then the app): the session follows it.
+    fn follow(&self, n: &Native) {
+        if let Some(w) = &n.window {
+            self.main.set(w.hwnd);
+            if let Some(s) = self.session.get() {
+                s.set_main(w.hwnd);
+            }
         }
     }
 }
@@ -133,38 +95,20 @@ struct Run {
     cpu: f64,
     span: Span,
     counts: BTreeMap<String, f64>,
-    /// The bridge's run record (`run.end`), when the run used the bridge.
-    record: Option<Value>,
+    /// What the page calls did in the run: inputs and phase marks (host clock).
+    log: Log,
+    /// When the app announced accessibility changes, from the run's start to a second after its end.
+    changes: Vec<u64>,
+    /// Elements in the app's windows at the run's end, when strobe drives it (`StateDrift`).
+    elements: Option<usize>,
     t0: u64,
     t1: u64,
     total: f64,
-    /// When strobe sent the app each input of the run (host clock), for `interaction.*` from the
-    /// OS presents that showed them.
-    inputs: Vec<u64>,
 }
 
-impl Run {
-    /// What warmup compares: the UI thread's work with the bridge, else the processes' CPU.
-    fn work(&self) -> f64 {
-        self.record.as_ref().and_then(|r| r["work"]["wall_ms"].as_f64()).unwrap_or(self.cpu)
-    }
-}
-
-/// Metrics a headless target can defend: work on the UI thread, exact counts and CPU (SPEC §13.7).
-fn headless_allowed(metric: &str) -> bool {
-    metric.starts_with("ui.") || metric.starts_with("count.") || metric.starts_with("cpu.")
-}
-
-/// Metrics read from frames: refused together when a surface skipped work or spun.
+/// Metrics read from frames: refused together when the app spun unpaced.
 fn frame_metric(metric: &str) -> bool {
-    ["ui.frames", "ui.interval.", "frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
-}
-
-/// Does the series need the app's bridge before its runs: the target says so, a headless target, a
-/// `ui.*` metric, or a pixels block's snapshots. Presented-frame metrics wait for nothing: without the
-/// bridge (or its present times) they are refused.
-fn needs_bridge(ctx: &Ctx, s: &Series, target: &Value) -> bool {
-    target["bridge"] == true || target["kind"] == "headless" || ctx.pixels_dir.is_some() || std::iter::once(&s.primary).chain(&s.metrics).any(|m| m.starts_with("ui."))
+    ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
 }
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
@@ -172,24 +116,22 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         return Err(Error::usage("a leak run (--probes memory) follows a JS heap; a native target has none"));
     }
     let target = ctx.describe["targets"][&s.target].clone();
-    if target["kind"] == "headless"
-        && let Some(m) = std::iter::once(&s.primary).chain(&s.metrics).find(|m| !headless_allowed(m))
-    {
+    let app = app(v, &target, &ctx.config)?;
+    // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
+    let timed = set != Set::Attribution && ctx.pixels_dir.is_none();
+    if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
         return Err(Error::refused(
-            "NoDisplayForBudget",
-            format!("{m}: a headless app draws off screen on a virtual clock, so it has no display, presentation or GPU of its own to measure"),
-            "measure ui.*, count.* and cpu.* there, or use native() for the rest",
+            "DevBuild",
+            format!("{} imports {crt}, a debug C runtime: its timings describe no build people run", app.exe.display()),
+            "build the app optimized (strobe.json build: a release or profiling profile)",
         ));
     }
-    let app = app(v, &target, &ctx.config)?;
     // `Throttled`: there is no page to run the speed check in, so strobe runs a fixed workload of its
     // own on the target's CPUs before the launch, once the last block's app has left them quiet.
     let ratio = validity::native_speed_checked(ctx.pin)?;
     let home = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), None)?;
-    let listener = if target["bridge"] == false { None } else { Some(Listener::open()?) };
-    let env = listener.as_ref().map(Listener::env).unwrap_or_default();
     let launched = Instant::now();
-    let (mut n, guard) = match nt::launch(&app, &home, &env, false, ctx.pin) {
+    let (mut n, guard) = match nt::launch(&app, &home, &[], false, ctx.pin) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home.dir);
@@ -197,13 +139,14 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             return Err(e);
         }
     };
-    // Timing blocks refuse a debug build; pixels and attribution blocks are not timed.
-    let timed = set != Set::Attribution && ctx.pixels_dir.is_none();
-    let link = Link::new(&target, &n, timed, listener);
+    let drive = Drive { session: OnceCell::new(), pid: n.pid, home: home.dir.clone(), main: Cell::new(0) };
     let mut steps = vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)];
-    let result = runs(ctx, s, v, pair, set, keep, &target, &app, &home, &mut n, &guard, &link, &mut steps, ratio);
+    let result = runs(ctx, s, v, pair, set, keep, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
     let closing = Instant::now();
-    link.quit();
+    if let Some(s) = drive.session.get() {
+        s.release_all();
+    }
+    drop(drive);
     n.close(true);
     guard.check("after a block")?;
     result.map(|mut b| {
@@ -213,37 +156,20 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     })
 }
 
-/// The bridge's `info` (GPU and surfaces), checked once per block: `SoftwareGpu`, and `VariantMismatch`
-/// when base and head drew with different GPU backends, adapters or scales.
-fn admit_info(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Bridge) -> Result<Value> {
-    let info = b.request("info", Value::Null, Duration::from_secs(10))?;
-    let gpu = &info["gpu"];
-    let name = gpu["name"].as_str().unwrap_or("");
-    if gpu["device_type"].as_str().is_some_and(|t| t.eq_ignore_ascii_case("cpu")) || software_adapter(name) {
-        return Err(Error::refused(
-            "SoftwareGpu",
-            format!("the app renders on a software adapter ({name}, {})", gpu["backend"].as_str().unwrap_or("?")),
-            "run on a machine with a GPU; GPU and frame numbers from software rendering describe no real device",
-        ));
-    }
-    let scale = info["surfaces"].as_array().and_then(|a| a.first()).and_then(|s| s["scale"].as_f64());
-    let setup = format!("{} on {name} at scale {}", gpu["backend"].as_str().unwrap_or("?"), scale.map_or("?".into(), |s| s.to_string()));
-    // Per target: a headless target's offscreen surface may differ from the window target's.
+/// `VariantMismatch` when base and head drew on different adapters or at different scales: a
+/// difference there is not the change.
+fn admit_setup(ctx: &mut Ctx, s: &Series, v: &Variant, adapter: Option<&str>, scale: Option<f64>) -> Result<()> {
+    let setup = format!("{} at scale {}", adapter.unwrap_or("no GPU work"), scale.map_or("?".into(), |s| s.to_string()));
     let mine = format!("{}\n{}", s.target, v.role);
     if let Some((key, other)) = ctx.native_setup.iter().find(|(k, o)| k.split('\n').next() == Some(s.target.as_str()) && **k != mine && **o != setup) {
         return Err(Error::refused(
             "VariantMismatch",
-            format!("{} drew with {other}, {} with {setup}", key.split('\n').nth(1).unwrap_or(""), v.role),
-            "compare builds on the same GPU backend, adapter and scale; a difference there is not the change",
+            format!("{} drew on {other}, {} on {setup}", key.split('\n').nth(1).unwrap_or(""), v.role),
+            "compare builds on the same adapter and scale; a difference there is not the change",
         ));
     }
     ctx.native_setup.insert(mine, setup);
-    if !ctx.gpu_checked {
-        ctx.gpu = json!({ "devices": [name], "backend": gpu["backend"], "driver": gpu["driver"] });
-        ctx.browser_version = format!("{} {}", b.hello.toolkit, b.hello.toolkit_version).trim().to_string();
-        ctx.gpu_checked = true;
-    }
-    Ok(info)
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -259,7 +185,7 @@ fn runs(
     home: &isolate::Home,
     n: &mut Native,
     guard: &isolate::Guard,
-    link: &Link,
+    drive: &Drive,
     steps: &mut Vec<(String, f64)>,
     ratio: Option<f64>,
 ) -> Result<Block> {
@@ -268,16 +194,9 @@ fn runs(
         steps.push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));
         lapped.set(Instant::now());
     };
-    let headless = link.headless;
     // A windowless app (a tray app, `window: false`) has no window to wait for, place or check.
-    let windowless = headless || target["window"] == false || app.windowless;
-    if headless {
-        link.get(Duration::from_secs(60))?;
-    } else if windowless {
-        if needs_bridge(ctx, s, target) {
-            link.get(Duration::from_secs(60))?;
-        }
-    } else {
+    let windowless = target["window"] == false || app.windowless;
+    if !windowless {
         n.wait_window(Duration::from_secs(60), guard)?;
         let viewport = target.get("viewport").filter(|v| v.is_object());
         let mut at = ctx.window.clone();
@@ -289,28 +208,39 @@ fn runs(
             let scale = w.scale();
             ctx.used = Some(Window { x: w.rect.0, y: w.rect.1, width: (w.client.0 as f64 / scale).round() as u32, height: (w.client.1 as f64 / scale).round() as u32, scale: Some(scale) });
         }
-        if needs_bridge(ctx, s, target) {
-            link.get(Duration::from_secs(60))?;
-        }
     }
+    drive.follow(n);
     guard.check("after the app opened its window")?;
     lap("attach", steps);
+    // What reached the screen, from the OS's present events, for the whole block: page waits
+    // (`until: "frame"`, idle) read it live, and frame metrics read the measured runs. Native stacks
+    // in attribution blocks, through the helper.
+    let presents: RefCell<Option<PresentCapture>> = RefCell::new(None);
+    let mut presents_err: Option<String> = None;
+    if !windowless && set != Set::Attribution {
+        match PresentCapture::start() {
+            Ok(c) => *presents.borrow_mut() = Some(c),
+            Err(e) => presents_err = Some(e.message),
+        }
+    }
+    let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
     let current = RefCell::new(String::new());
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
+    let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
     let pixels = ctx.pixels_dir.clone();
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "driver" => {
                 let call = a["call"].as_str().unwrap_or("");
                 let args = a["args"].as_array().cloned().unwrap_or_default();
-                // A plain wait needs nothing from the app; every other call goes over its bridge.
+                // A plain wait needs nothing from the app.
                 if call == "wait" || (call == "snapshot" && pixels.is_none()) {
                     let ms = if call == "wait" { args.first().and_then(Value::as_f64).unwrap_or(0.0).max(0.0) } else { 0.0 };
                     std::thread::sleep(Duration::from_millis(ms as u64));
                     return Ok(Value::Bool(call == "wait"));
                 }
-                let bridge = link.get(Duration::from_secs(30)).map_err(|e| Error::usage(format!("page.{call}(): {}", e.message)).hint(e.hint.unwrap_or_default()))?;
-                NativeDriver { bridge, op_timeout: Duration::from_secs(30), pixels: pixels.clone() }.dispatch(call, &args)
+                let session = drive.get().map_err(|e| Error { message: format!("page.{call}(): {}", e.message), ..e })?;
+                session.dispatch(call, &args, &presents, pixels.as_deref())
             }
             "count" => {
                 if !current.borrow().is_empty() {
@@ -320,9 +250,9 @@ fn runs(
             }
             "phase" => {
                 let key = current.borrow().clone();
-                if let (false, Some(b)) = (key.is_empty(), link.now()?) {
+                if !key.is_empty() {
                     let name: String = a["name"].as_str().unwrap_or("phase").chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-                    b.request("mark", json!({ "name": format!("{key}:phase:{name}:{}", a["edge"].as_str().unwrap_or("start")) }), Duration::from_secs(10))?;
+                    marks.borrow_mut().push((format!("{key}:phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
                 }
                 Ok(Value::Bool(true))
             }
@@ -339,23 +269,15 @@ fn runs(
     )?;
     if !windowless {
         n.check_visible()?;
+        drive.follow(n);
     }
     lap("checks", steps);
     ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}", e.message), "fix the bench file's setup"))?;
     lap("setup", steps);
-    // Runs use the bridge when the app has connected by now (a page call in setup connects it).
-    let bridged = link.now()?;
-    let info = match bridged {
-        Some(b) => Some(admit_info(ctx, s, v, b)?),
-        None => None,
-    };
     let procs0 = (host::now_ns(), host::all_processes());
-    // What reached the screen, from the OS's present events: only for a series that declares a frame
-    // metric (§7.1), as a canvas hook is; native stacks in attribution blocks, through the helper.
-    let wants_frames = !headless && set != Set::Attribution && std::iter::once(&s.primary).chain(&s.metrics).any(|m| frame_metric(m) && !m.starts_with("ui."));
-    let presents = wants_frames.then(crate::etw::PresentCapture::start);
-    let stacks = (set == Set::Attribution && !headless && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
     let sampler = probe::os::Sampler::start(n.pid);
+    // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
+    let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
     let run_timeout = Duration::from_secs(60);
     let mut runs: Vec<Run> = Vec::new();
     let mut first: Option<usize> = None;
@@ -367,8 +289,10 @@ fn runs(
             n.raise();
         }
         counts.borrow_mut().clear();
-        if let Some(b) = bridged {
-            b.request("run.begin", Value::Null, Duration::from_secs(10))?;
+        marks.borrow_mut().clear();
+        if let Some(se) = drive.session.get() {
+            se.set_pids(&n.pids());
+            se.take_log();
         }
         *current.borrow_mut() = format!("run:{i}");
         let snap0 = Snapshot::take(&n.pids());
@@ -381,12 +305,11 @@ fn runs(
         let c1 = cycles(n);
         let snap1 = Snapshot::take(&n.pids());
         current.borrow_mut().clear();
-        let record = match bridged {
-            Some(b) => Some(b.request("run.end", Value::Null, Duration::from_secs(30))?),
-            None => None,
-        };
+        let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
+        log.marks.extend(marks.borrow_mut().drain(..));
+        let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), record, t0, t1, total: 0.0, inputs: Vec::new() });
+        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), log, changes: Vec::new(), elements, t0, t1, total: 0.0 });
         if s.reset {
             ctx.runner
                 .call("reset", json!({ "case": s.case }), run_timeout, &serve)
@@ -398,7 +321,7 @@ fn runs(
         } else if first.is_none() {
             // Steady once two runs do the same work, within 5% or 1 ms, as for pages (SPEC §9.1).
             let steady = i >= 1 && {
-                let (a, b) = (runs[i - 1].work(), runs[i].work());
+                let (a, b) = (runs[i - 1].cpu, runs[i].cpu);
                 a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
             };
             if steady || i >= MAX_WARMUP {
@@ -412,8 +335,13 @@ fn runs(
     steps.push(("warmup".into(), warm_ms));
     steps.push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
     lapped.set(Instant::now());
+    // Accessibility changes a second past each run still count for its last inputs.
+    let changes = drive.session.get().map(Session::changes).unwrap_or_default();
+    for r in &mut runs {
+        r.changes = changes.iter().copied().filter(|&c| c >= r.t0 && c <= r.t1 + 1_000_000_000).collect();
+    }
     let samples = sampler.stop();
-    let presents = presents.map(|r| r.and_then(|c| c.stop()));
+    let presents = presents.borrow_mut().take().map(|c| c.stop());
     let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
     let procs1 = (host::now_ns(), host::all_processes());
     if !windowless {
@@ -468,6 +396,9 @@ fn runs(
             ));
         }
     }
+    if !windowless {
+        admit_setup(ctx, s, v, adapter.as_deref(), n.window.as_ref().map(|w| w.scale()))?;
+    }
     let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     extra.insert("run.duration".into(), per_run(&|r| r.ms));
     extra.insert("cpu.work".into(), per_run(&|r| r.cpu));
@@ -477,21 +408,22 @@ fn runs(
         extra.insert("io.read".into(), per_run(&|r| r.span.io_read as f64));
         extra.insert("io.write".into(), per_run(&|r| r.span.io_write as f64));
     }
+    // The UI thread (the main window's), from its own cycle counter and context switches.
+    if let Some(tid) = ui_tid {
+        let ui = |r: &Run| r.span.threads.iter().find(|t| t.tid == tid).cloned();
+        extra.insert("ui.cpu".into(), per_run(&|r| ui(r).and_then(|t| t.cpu_ms).unwrap_or(f64::NAN)));
+        extra.insert("ui.wakes".into(), per_run(&|r| ui(r).map_or(f64::NAN, |t| if r.span.ms > 0.0 { t.switches as f64 / (r.span.ms / 1e3) } else { f64::NAN })));
+    }
     let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().enumerate().filter_map(|(j, g)| Some((key(j), g.gpu_3d_pct?))).collect();
     if !gpu_3d.is_empty() {
         extra.insert("gpu.process.3d".into(), gpu_3d);
     }
-    // The bench file's `ctx.count` and, with the bridge, the app's own exact counters.
-    let mut counters: std::collections::BTreeSet<String> = std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
-    for r in measured {
-        counters.extend(r.record.as_ref().and_then(|x| x["counts"].as_object()).into_iter().flatten().map(|(k, _)| k.clone()));
-    }
+    // The bench file's `ctx.count`.
+    let counters: std::collections::BTreeSet<String> = std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
     for name in &counters {
-        let count = |r: &Run| r.counts.get(name).copied().unwrap_or(0.0) + r.record.as_ref().and_then(|x| x["counts"][name.as_str()].as_f64()).unwrap_or(0.0);
-        extra.insert(format!("count.{name}"), per_run(&count));
+        extra.insert(format!("count.{name}"), per_run(&|r: &Run| r.counts.get(name).copied().unwrap_or(0.0)));
     }
     let mut refused = BTreeMap::new();
-    let ui = bridged.map(|_| ui_values(measured, &key, &mut extra, &mut refused));
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
     let foreign: Vec<f64> = gpu_runs
@@ -505,68 +437,83 @@ fn runs(
         })
         .collect();
     let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
-    if let Some(u) = &ui {
-        values.extend(u.pooled.clone());
-    }
-    // Presented frames from the OS: the toolkit's rows joined to its presents, else the presents alone.
-    let mut filled: BTreeMap<String, Value> = BTreeMap::new();
+    // Presented frames from the OS, and input latency from strobe's own inputs to them.
+    let pids = n.pids();
+    let mut reactions = frames::Reactions::default();
     match &presents {
         Some(Ok(p)) => {
-            let pids = n.pids();
-            let mut wins: Vec<frames::RunWindow> =
-                measured.iter().map(|r| frames::RunWindow { t0: r.t0, t1: r.t1, rows: r.record.as_ref().map(frames::rows_from_record), inputs: r.inputs.clone() }).collect();
-            let f = frames::native_values(p, &pids, &mut wins, display.as_ref());
+            let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
+            let f = frames::native_values(p, &pids, &spans, display.as_ref());
+            let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
+            let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
+            for r in measured {
+                let sent: Vec<frames::Sent> =
+                    r.log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| frames::Sent { t_ns: i.t_ns, scroll: i.kind == "scroll" }).collect();
+                let got = frames::reactions(&sent, &r.changes, &p.presents, &pids, quiet);
+                reactions.interaction.extend(got.interaction);
+                reactions.scroll.extend(got.scroll);
+                reactions.tried = (reactions.tried.0 + got.tried.0, reactions.tried.1 + got.tried.1);
+                reactions.busy = (reactions.busy.0 + got.busy.0, reactions.busy.1 + got.busy.1);
+                reactions.unshown = (reactions.unshown.0 + got.unshown.0, reactions.unshown.1 + got.unshown.1);
+                reactions.unchanged += got.unchanged;
+            }
             // SPEC §19: the present session's consumer may use 0.5% of a core; past 2% it competes
             // with the app it measures, and its frames describe a disturbed run.
             let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
             let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
-            let frames_refused = match overhead {
-                Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
-                _ => f.refused.clone(),
-            };
             if let Some(o) = overhead.filter(|o| *o > 0.5)
                 && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
             {
                 ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: the OS present session's consumer used {o:.2}% of a core, over its 0.5% budget (SPEC §19)", v.role)));
             }
-            match &frames_refused {
+            let spun = refresh.and_then(|ms| frames::unpaced(&p.presents, &pids, &spans, ms));
+            let frames_refused = match overhead {
+                Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
+                _ => f.refused.clone().or(spun),
+            };
+            match frames_refused {
                 Some(why) => {
-                    values.retain(|k, _| !frame_metric(k) || k.starts_with("ui."));
-                    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m) && !m.starts_with("ui.")) {
-                        refused.entry(m.clone()).or_insert_with(|| why.clone());
+                    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
+                        refused.insert(m.clone(), why.clone());
                     }
                 }
                 None => {
                     for (k, x) in f.values {
-                        if refused.contains_key(&k) || (k.starts_with("interaction.") && f.inputs_refused.is_some()) {
-                            continue;
-                        }
                         values.entry(k).or_insert(x);
                     }
-                    if let Some(why) = &f.inputs_refused {
-                        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.")) {
-                            refused.entry(m.clone()).or_insert_with(|| why.clone());
+                    // Only what the series declares is listed refused; the rest has no value.
+                    let mut why = BTreeMap::new();
+                    reactions.values(p.events_lost, &mut values, &mut why);
+                    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+                        if let Some(w) = why.get(m) {
+                            refused.entry(m.clone()).or_insert_with(|| w.clone());
                         }
                     }
-                }
-            }
-            for (j, (w, r)) in wins.iter().zip(measured).enumerate() {
-                if let (Some(rows), Some(rec)) = (&w.rows, &r.record) {
-                    let mut rec = rec.clone();
-                    frames::fill_record(&mut rec, rows);
-                    filled.insert(key(j), rec["frames"].clone());
                 }
             }
             if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
                 ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", v.role, p.events_lost)));
             }
         }
-        Some(Err(e)) => {
-            for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m) && !m.starts_with("ui.") && !values.contains_key(*m)) {
-                refused.entry(m.clone()).or_insert_with(|| format!("NoPresentSource: {m}: OS present events: {}", e.message));
-            }
-        }
+        Some(Err(e)) => presents_err = Some(e.message.clone()),
         None => {}
+    }
+    if let Some(why) = &presents_err {
+        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
+            refused.entry(m.clone()).or_insert_with(|| format!("NoPresentSource: {m}: OS present events: {why}"));
+        }
+    }
+    // Inputs given through accessibility actions skip hit testing and pointer handling: they are
+    // never an interaction, and a series that only gave such inputs says so.
+    let patterns = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "pattern").count();
+    let real = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "discrete" || i.kind == "scroll").count();
+    if patterns > 0 && real == 0 {
+        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
+            refused.insert(
+                m.clone(),
+                format!("PatternInput: {m}: the runs acted through accessibility actions (page.act), which skip hit testing and pointer handling; click, type or press for input latency"),
+            );
+        }
     }
     let private_mb = n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
     if private_mb > 0.0 {
@@ -590,16 +537,22 @@ fn runs(
         if values.contains_key(m) || refused.contains_key(m) {
             continue;
         }
-        if let Some(why) = missing(m, bridged.is_some(), headless) {
+        if let Some(why) = missing(m, ui_tid.is_some()) {
             refused.insert(m.clone(), why);
         }
     }
-    if headless {
-        values.retain(|k, _| headless_allowed(k) || k.ends_with(".n") || k.starts_with("cpu.foreign") || k == "warmup.unsteady");
+    for m in refused.keys() {
+        values.remove(m);
     }
     if let Some(why) = refused.get(&s.primary) {
         let (id, text) = why.split_once(": ").unwrap_or((why.as_str(), ""));
         return Err(Error::refused(id, format!("{}: {text}", s.primary), "pick a primary this target can measure"));
+    }
+    if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
+        ctx.warnings.push(validity::warn(
+            "CursorNotParked",
+            format!("{} block: the OS cursor could not be moved onto the pointer's points (a locked session?), so the app's hover tracking saw the cursor elsewhere", v.role),
+        ));
     }
     let background = busiest_others(&procs0, &procs1);
     let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
@@ -612,23 +565,12 @@ fn runs(
         let run_rows: Vec<Value> = measured
             .iter()
             .enumerate()
-            .map(|(j, r)| {
-                let mut rec = r.record.clone().unwrap_or(Value::Null);
-                if let Some(o) = rec.as_object_mut() {
-                    o.remove("frames");
-                    o.remove("frame_columns");
-                }
-                json!({ "run": key(j), "ms": r.ms, "cpu_ms": r.cpu, "switches": r.span.switches, "wakes_per_s": r.span.wakes_per_s(), "io_read": r.span.io_read, "io_write": r.span.io_write, "counts": r.counts, "bridge": rec })
-            })
+            .map(|(j, r)| json!({ "run": key(j), "ms": r.ms, "cpu_ms": r.cpu, "switches": r.span.switches, "wakes_per_s": r.span.wakes_per_s(), "io_read": r.span.io_read, "io_write": r.span.io_write, "counts": r.counts, "elements": r.elements }))
             .collect();
         store::write_json(&dir.join("runs.json"), &json!(run_rows))?;
-        if bridged.is_some() {
-            let columns = measured.iter().find_map(|r| r.record.as_ref().map(|x| x["frame_columns"].clone())).unwrap_or(Value::Null);
-            let frames: serde_json::Map<String, Value> =
-                measured.iter().enumerate().map(|(j, r)| (key(j), filled.get(&key(j)).cloned().unwrap_or_else(|| r.record.as_ref().map_or(Value::Null, |x| x["frames"].clone())))).collect();
-            let marks: serde_json::Map<String, Value> = measured.iter().enumerate().map(|(j, r)| (key(j), r.record.as_ref().map_or(Value::Null, |x| x["marks"].clone()))).collect();
-            store::write_json(&dir.join("frames.json"), &json!({ "columns": columns, "runs": frames, "marks": marks }))?;
-        }
+        let per: serde_json::Map<String, Value> =
+            measured.iter().enumerate().map(|(j, r)| (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
+        store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "runs": per }))?;
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }
@@ -650,10 +592,9 @@ fn runs(
             &json!({
                 "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
                 "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": refused, "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
-                "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background,
-                "hello": bridged.map(|b| &b.hello), "info": info,
+                "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
                 "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
-                "note": if set == Set::Attribution { format!("a native block's attribution: run records and OS samples, not timed; {stacks_note}") } else { String::new() },
+                "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
             }),
         )?;
         Some(id)
@@ -673,8 +614,8 @@ fn runs(
         run_ms: measured.iter().map(|r| r.ms).collect(),
         warmup: first,
         speed_ratio: ratio,
-        // `StateDrift`: the app's element count at each run's end, as a page's DOM nodes.
-        nodes: measured.iter().filter_map(|r| r.record.as_ref()?["counts"]["elements"].as_u64()).collect(),
+        // `StateDrift`: the app's accessibility element count at each run's end, as a page's DOM nodes.
+        nodes: measured.iter().filter_map(|r| r.elements.map(|e| e as u64)).collect(),
         recording,
         background,
         refused,
@@ -682,120 +623,18 @@ fn runs(
     })
 }
 
-/// What the bridge's run records add, pooled over the measured runs.
-struct Ui {
-    pooled: BTreeMap<String, f64>,
-}
-
-/// Per run: `ui.work`, `ui.cpu` and the phases, `ui.frames`. Pooled: `ui.interval.*` from each surface's
-/// submission gaps, and when the toolkit reports presentation times, `frames.presented.*`,
-/// `frames.interval.*` and `interaction.*`. Frame metrics are refused when a surface skipped work
-/// (occluded) or spun unpaced in a run.
-fn ui_values(measured: &[Run], key: &dyn Fn(usize) -> String, extra: &mut BTreeMap<String, BTreeMap<String, f64>>, refused: &mut BTreeMap<String, String>) -> Ui {
-    for (metric, field) in
-        [("ui.work", "wall_ms"), ("ui.cpu", "cpu_ms"), ("ui.view", "view_ms"), ("ui.layout", "layout_ms"), ("ui.text", "text_ms"), ("ui.paint", "paint_ms"), ("ui.encode", "encode_ms")]
-    {
-        let v: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.record.as_ref()?["work"][field].as_f64()?))).collect();
-        if v.len() == measured.len() {
-            extra.insert(metric.into(), v);
-        }
-    }
-    extra.insert("ui.frames".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.record.as_ref().and_then(|x| x["frames"].as_array()).map_or(0, Vec::len) as f64)).collect());
-    let mut gaps: Vec<f64> = Vec::new();
-    let mut presented: Vec<f64> = Vec::new();
-    let mut present_gaps: Vec<f64> = Vec::new();
-    let mut inputs: Vec<f64> = Vec::new();
-    let mut skipped: Option<String> = None;
-    let mut spun: Option<String> = None;
-    for r in measured {
-        let Some(rec) = &r.record else { continue };
-        let cols: Vec<&str> = rec["frame_columns"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
-        let col = |name: &str| cols.iter().position(|c| *c == name);
-        let (surface, begin, submit, present, input) = (col("surface"), col("begin_ns"), col("submit_ns"), col("present_ns"), col("input_ns"));
-        let num = |row: &Value, i: Option<usize>| i.and_then(|i| row[i].as_f64()).unwrap_or(0.0);
-        let mut last: BTreeMap<i64, (f64, f64)> = BTreeMap::new();
-        for row in rec["frames"].as_array().into_iter().flatten() {
-            let (sf, sub, pre) = (num(row, surface) as i64, num(row, submit), num(row, present));
-            let prev = last.insert(sf, (sub, pre));
-            if let Some((ps, pp)) = prev {
-                if sub > ps {
-                    gaps.push((sub - ps) / 1e6);
-                }
-                if pre > 0.0 && pp > 0.0 && pre > pp {
-                    present_gaps.push((pre - pp) / 1e6);
-                }
-            }
-            if pre > 0.0 {
-                presented.push((pre - num(row, begin)) / 1e6);
-                if num(row, input) > 0.0 {
-                    inputs.push((pre - num(row, input)) / 1e6);
-                }
-            }
-        }
-        for (name, sf) in rec["surfaces"].as_object().into_iter().flatten() {
-            let n = |k: &str| sf[k].as_u64().unwrap_or(0);
-            if n("occluded") + n("skipped") > 0 && skipped.is_none() {
-                skipped = Some(format!("WindowHidden: surface {name} skipped {} frames (occluded {}) in a measured run, so frames describe less work than a person sees", n("skipped"), n("occluded")));
-            }
-            if n("unpaced") > 10 && spun.is_none() {
-                spun = Some(format!("UnpacedSpin: surface {name} drew {} frames without waiting for the display in a measured run", n("unpaced")));
-            }
-        }
-    }
-    let mut pooled = BTreeMap::new();
-    let pct = |v: &mut Vec<f64>, prefix: &str, out: &mut BTreeMap<String, f64>| {
-        v.sort_by(f64::total_cmp);
-        if v.is_empty() {
-            return;
-        }
-        for (name, p) in [("p50", 0.5), ("p90", 0.9), ("p95", 0.95), ("p99", 0.99)] {
-            out.insert(format!("{prefix}.{name}"), metrics::percentile(v, p));
-        }
-        out.insert(format!("{prefix}.max"), *v.last().unwrap_or(&0.0));
-    };
-    pooled.insert("ui.n".into(), gaps.len() as f64);
-    pct(&mut gaps, "ui.interval", &mut pooled);
-    if !presented.is_empty() {
-        pooled.insert("frames.n".into(), presented.len() as f64);
-        pct(&mut presented, "frames.presented", &mut pooled);
-        pct(&mut present_gaps, "frames.interval", &mut pooled);
-        if !inputs.is_empty() {
-            inputs.sort_by(f64::total_cmp);
-            pooled.insert("interaction.n".into(), inputs.len() as f64);
-            pooled.insert("interaction.p50".into(), metrics::percentile(&inputs, 0.5));
-            pooled.insert("interaction.p95".into(), metrics::percentile(&inputs, 0.95));
-        }
-    }
-    if let Some(why) = skipped.or(spun) {
-        extra.retain(|k, _| !frame_metric(k));
-        let names: Vec<String> = pooled.keys().filter(|k| frame_metric(k)).cloned().chain(["ui.frames".to_string()]).collect();
-        for k in names {
-            pooled.remove(&k);
-            refused.insert(k, why.clone());
-        }
-        for k in ["ui.interval.p50", "ui.interval.p95", "ui.interval.max", "frames.presented.p95", "interaction.p95"] {
-            refused.entry(k.to_string()).or_insert_with(|| why.clone());
-        }
-    }
-    Ui { pooled }
-}
-
 /// Why a declared metric has no value on a native target.
-fn missing(metric: &str, bridged: bool, headless: bool) -> Option<String> {
+fn missing(metric: &str, ui_thread: bool) -> Option<String> {
     let area = metric.split('.').next().unwrap_or("");
-    if headless && !headless_allowed(metric) {
-        return Some(format!("NoDisplayForBudget: {metric} needs a display; a headless app has none"));
-    }
     match area {
-        "frames" | "interaction" | "scroll" | "display" if bridged => Some(format!(
-            "NoPresentSource: {metric} needs when frames reached the screen; this toolkit reports only when it submitted them (ui.frames, ui.interval.*), and OS present events gave none in the runs"
+        "frames" if metric.starts_with("frames.presented.") && metric != "frames.presented.count" => Some(format!(
+            "NoPresentSource: {metric} is a frame's begin to its screen time; from outside strobe sees when a frame reached the screen, not when the app began it (frames.interval.*, frames.dropped and interaction.* it does see)"
         )),
-        "frames" | "interaction" | "scroll" | "display" | "ui" => {
-            Some(format!("NoPresentSource: {metric} comes from inside the app; without its bridge strobe sees its processes, threads, GPU and window only"))
-        }
-        "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" | "gpu" if area != "gpu" || metric == "gpu.compile" => {
-            Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none"))
-        }
+        "frames" | "interaction" | "scroll" | "display" => Some(format!("NoPresentSource: {metric}: the runs gave no OS present events for it (no window, or no frames in the runs)")),
+        "ui" if !ui_thread => Some(format!("NoPresentSource: {metric} is the UI thread's (the main window's); this target has no window")),
+        "ui" => Some(format!("NoPresentSource: {metric} is not measured: native apps have ui.cpu and ui.wakes, from outside")),
+        "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
+        "gpu" if metric == "gpu.compile" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
         _ => None,
     }
 }
@@ -814,7 +653,7 @@ enum Until {
     Painted,
     /// The window's pixels last changed, once they stayed the same for a second.
     Settled,
-    /// An element shows, as the app's bridge sees it.
+    /// An element shows in the app's accessibility tree, timed to the frame that showed it.
     Selector(Value),
     /// One of the launch's milestones (an output or log line).
     Milestone(String),
@@ -875,9 +714,6 @@ pub(super) fn launch(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Res
 pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, profile: bool) -> Result<Block> {
     let spec = s.launch.clone();
     let target = ctx.describe["targets"][&s.target].clone();
-    if target["kind"] == "headless" {
-        return Err(Error::refused("NoDisplayForBudget", format!("{}: a launch is timed to what a person sees; a headless app shows nothing", s.case), "time launches on a native() target"));
-    }
     let key = format!("{}\n{}", s.label(), v.role);
     let milestones = milestones(&spec)?;
     if milestones.iter().any(|m| m.source == "page") {
@@ -899,9 +735,6 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         Some("painted") => Until::Painted,
         Some("settled") => Until::Settled,
         Some(other) => return Err(Error::usage(format!("{}: launch.until.window is visible, painted or settled, not {other}", s.case))),
-        None if target["bridge"] == false => {
-            return Err(Error::usage(format!("{}: launch.until a selector needs the app's bridge, which this target turns off; use {{ window: \"settled\" }}", s.case)));
-        }
         None => Until::Selector(spec["until"].clone()),
     };
     let capture = spec["screen"] != false && !windowless;
@@ -933,10 +766,19 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             .map_err(|e| Error::refused("RunIncomplete", format!("{} before: {}", s.case, e.message), "fix the launch's before hook"))?;
     }
     lap("before", &mut steps);
-    let listener = if target["bridge"] == false { None } else { Some(Listener::open()?) };
-    let bridge_env = listener.as_ref().map(Listener::env).unwrap_or_default();
+    // A launch timed to an element ends on the frame that showed it: OS present events say when.
+    let mut presents = match &until {
+        Until::Selector(_) => Some(PresentCapture::start().map_err(|e| {
+            Error::refused(
+                "NoPresentSource",
+                format!("{}: a launch timed to an element ends when the frame that showed it reached the screen: {}", s.case, e.message),
+                "run strobe up for present events, or time the launch to { window: \"settled\" }",
+            )
+        })?),
+        _ => None,
+    };
     let clock = (host::tsc(), Instant::now());
-    let (mut n, guard) = match nt::launch(&app, &prepared, &bridge_env, true, ctx.pin) {
+    let (mut n, guard) = match nt::launch(&app, &prepared, &[], true, ctx.pin) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home);
@@ -946,7 +788,6 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             return Err(e);
         }
     };
-    let link = Link::new(&target, &n, !profile, listener);
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
     let mut stacks = (profile && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
@@ -1000,29 +841,58 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 std::thread::sleep(Duration::from_millis(20));
             }
         } else if let Until::Selector(sel) = &until {
-            // The toolkit stamps the commit that first showed the element on strobe's clock. A launch
-            // whose element already showed in an earlier frame when strobe asked has no valid end.
-            let b = link.get(timeout)?;
-            let r = b
-                .request("wait", json!({ "until": sel, "timeout_ms": deadline.saturating_duration_since(Instant::now()).as_millis() as u64 }), timeout + Duration::from_secs(10))
+            // The element shows in the app's accessibility tree between the last read that lacked it
+            // and the first that had it; the frame that showed it is the first present to reach the
+            // screen that started in or after that span.
+            let main = loop {
+                if let Some(w) = host::main_window(&n.pids()) {
+                    break w;
+                }
+                if n.exited().is_some() && host::process_tree(n.pid).is_empty() {
+                    return Err(Error::refused("RunIncomplete", format!("{} launch: the app exited before it showed a window", s.case), "check that the app opens a window"));
+                }
+                guard.check("while the app started")?;
+                if Instant::now() > deadline {
+                    return Err(Error::refused("RunIncomplete", format!("{} launch: no window in {} s", s.case, timeout.as_secs()), "check that the app opens a window"));
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let session = Session::open(&n.pids(), main.hwnd)?;
+            let (lo, hi) = session
+                .appeared(sel, deadline.saturating_duration_since(Instant::now()))
                 .map_err(|e| Error::refused("RunIncomplete", format!("{} launch: {}", s.case, e.message), "the until selector never showed"))?;
             let cycles = n.processes().iter().map(|p| p.cycles).sum();
-            if !r["already"].is_boolean() {
+            let Some(lo) = lo else {
                 return Err(Error::refused(
                     "RunIncomplete",
-                    format!("{} launch: the app's bridge does not say whether the element showed before strobe asked (wait's already), so its time may be late", s.case),
-                    "update the toolkit's bridge to native-bridge-v1's wait reply, or time the launch to { window: \"settled\" }",
+                    format!("{} launch: the until selector already showed when strobe first read the app's accessibility tree, so the frame that showed it is unknown", s.case),
+                    "time the launch to an element that appears later, or to { window: \"settled\" }",
                 ));
-            }
-            if r["already"] == true && r["frame_seq"].as_u64().is_some_and(|f| f > 1) {
+            };
+            let p = presents.as_mut().ok_or_else(|| Error::msg("internal: the launch's present session"))?;
+            let pids = n.pids();
+            let early = p.live(&pids, lo, Duration::from_secs(2))?;
+            let late = p.live(&pids, hi, Duration::from_secs(2))?;
+            if late.next_screen_ns == 0 {
                 return Err(Error::refused(
                     "RunIncomplete",
-                    format!("{} launch: the until selector already showed in frame {} when strobe asked, so the launch has no valid end", s.case, r["frame_seq"]),
-                    "the toolkit's bridge must connect before its first frame commits",
+                    format!("{} launch: no frame reached the screen after the element showed", s.case),
+                    "a window that never presents cannot be timed to an element; use a milestone",
                 ));
             }
-            let at_ns = r["at_ns"].as_u64().ok_or_else(|| Error::msg("bridge wait: no at_ns in its reply"))?;
-            (n.epoch_ms + (at_ns as f64 - n.at_ns as f64) / 1e6, cycles)
+            let refresh_ns = host::refresh_at(main.rect.0, main.rect.1).map_or(16_666_667, |hz| 1_000_000_000 / hz.max(1) as u64);
+            if early.next_start_ns != late.next_start_ns && late.next_screen_ns.saturating_sub(early.next_screen_ns) > refresh_ns {
+                return Err(Error::refused(
+                    "RunIncomplete",
+                    format!(
+                        "{} launch: the app showed {:.1} ms of frames while strobe read its tree, so which frame showed the element is unknown",
+                        s.case,
+                        (late.next_screen_ns - early.next_screen_ns) as f64 / 1e6
+                    ),
+                    "time the launch to an element that appears after the app stops animating, or to { window: \"settled\" }",
+                ));
+            }
+            (n.epoch_ms + (late.next_screen_ns as f64 - n.at_ns as f64) / 1e6, cycles)
         } else {
             let mut first_px: Option<Vec<u8>> = None;
             let mut prev_px: Option<Vec<u8>> = None;
@@ -1132,7 +1002,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 &json!({
                     "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
                     "target": app.exe, "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
-                    "hello": link.bridge.get().map(|b| &b.hello), "timing": "perturbed",
+                    "timing": "perturbed",
                     "note": format!("a native launch's attribution: its values and output, not timed; {stacks_note}"),
                 }),
             )?;
@@ -1146,7 +1016,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if let Some(Ok(c)) = stacks.take() {
         let _ = c.stop();
     }
-    link.quit();
+    if let Some(p) = presents {
+        let _ = p.stop();
+    }
     n.close(!warm);
     let closed = ctx.runner.call("close", json!({}), t, &no_page);
     guard.check("after a launch")?;

@@ -27,8 +27,6 @@ pub struct App {
     guards: Vec<GuardSpec>,
     protocols: Vec<String>,
     args: Vec<String>,
-    /// The profile's `headless` object: the `args`, `env` and `unset` that select the app's headless mode.
-    headless: Value,
     /// The profile says `window: false`: the app opens no window (a tray app, a service).
     pub windowless: bool,
 }
@@ -57,20 +55,6 @@ impl App {
         self.args.extend(args.iter().cloned());
         self.env.extend(env.iter().cloned());
         self
-    }
-
-    /// The profile in its headless mode: its `headless` object's `args`, `env` and `unset` added. An
-    /// error when the profile has none, since strobe cannot know how an app selects headless.
-    pub fn headless(mut self) -> Result<App> {
-        let h = self.headless.clone();
-        if !h.is_object() {
-            return Err(Error::usage(format!("app profile \"{}\" has no headless object: add the args or env that start the app headless (\"headless\": {{ \"args\": [...] }})", self.id)));
-        }
-        let strings = |k: &str| h[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
-        self.args.extend(strings("args"));
-        self.unset.extend(strings("unset"));
-        self.env.extend(h["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())));
-        Ok(self)
     }
 
     fn unsets(&self, key: &str) -> bool {
@@ -137,7 +121,6 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         guards,
         protocols: strings("protocols"),
         args: strings("args"),
-        headless: p["headless"].clone(),
         windowless: p["window"] == false,
     })
 }

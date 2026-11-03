@@ -56,6 +56,18 @@ x11rb = { version = "0.13", default-features = false }
 framehop = { version = "0.16", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
+# UI Automation (COM): finding a native app's elements, their bounds and states, and waiting on its
+# accessibility events. 0.58 shares windows-targets 0.52 with windows-sys; pure Rust.
+windows = { version = "0.58", features = [
+  "implement",
+  "Win32_Foundation",
+  "Win32_System_Com",
+  "Win32_System_Ole",
+  "Win32_System_Variant",
+  "Win32_UI_Accessibility",
+] }
+# The `implement` macro's paths for strobe's UIA event handlers.
+windows-core = "0.58"
 # Win32: QPC clock, process CPU times, toolhelp snapshots, affinity, power plans, PDH, window state.
 windows-sys = { version = "0.59", features = [
   "Win32_Foundation",
@@ -92,6 +104,8 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_IO",
   "Win32_UI_Shell",
   "Win32_NetworkManagement_NetManagement",
+  # Native app snapshots: a window's own rendering of itself (PrintWindow).
+  "Win32_Storage_Xps",
 ] }
 
 [profile.release]

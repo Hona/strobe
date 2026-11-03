@@ -96,7 +96,7 @@ locations, not only PATH.
 | analyser | A check that warns in the result (§10.2) |
 | census | A consistent per-process memory account at one moment (§8.6) |
 | bridge | `@hona/strobe-electron` inside an app's main process (§13.2) |
-| native bridge | a native app's UI toolkit's link to strobe: it drives the app and reports its UI work (§13.7) |
+| accessibility tree | what an app exposes to the OS's assistive technology (UI Automation on Windows): strobe finds and waits on a native app's elements through it (§13.7) |
 | calibration | The known-cost page every probe must recover (§10.3) |
 | A/A | An experiment with the same build on both sides (§10.4) |
 
@@ -149,9 +149,10 @@ cli/            argument parsing, help, text + JSON rendering
 app/            commands (up, status, record, bench, query, report, top, update, leave, daemon)
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
 target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
-                process.rs, isolate.rs (isolated launches), electron.rs, native.rs and
-                native_bridge.rs (native apps, §13.7)
-driver/         the bench file's `page`: over CDP, or over a native app's bridge (native.rs)
+                process.rs, isolate.rs (isolated launches), electron.rs, native.rs (native apps,
+                §13.7), a11y/ (the OS accessibility client: uia.rs; posted input: input.rs)
+driver/         the bench file's `page`: over CDP, or a native app's accessibility tree and
+                message loop (native.rs)
 probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
                 census.rs, coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
                 helper.rs
@@ -281,8 +282,8 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
 - A native app (`app:<id>` with a native profile, or `exe:<path> --native`) records one run from
-  outside after a 3 s settle: CPU, thread wakes, IO, GPU and memory, and with its bridge connected
-  the app's run record (§13.7). `--probes attribution` records the same until native stacks exist.
+  outside after a 3 s settle: CPU, thread wakes, IO, GPU, memory, the UI thread (`ui.cpu`,
+  `ui.wakes`) and OS present events (§13.7). `--probes attribution` adds native stacks (§13.4).
 
 ### 5.6 `strobe bench`
 
@@ -425,20 +426,16 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
   per surface per composed frame" keys each present by its window, else (a composition swapchain,
   which has no window) its composition surface, else its process and swapchain; never window 0.
   At the session's first completed present, only presents that started before every provider ran
-  are dropped as partial. A toolkit's frame rows (native bridge: `begin_ns`, `cpu_end_ns`,
-  `submit_ns`, `input_ns`) join them on the row's own thread, the present's start inside the row's
-  present call (`cpu_end_ns`..`submit_ns`, ±10 µs: one clock, one thread), nearest the call's start;
-  each surface keeps to the swapchain it first matched. Another thread's present counts only when
-  the rows have one surface. Over 5% of rows fitting several presents refuses (`AmbiguousPresent`);
-  over 5% matching none with no events lost refuses (`PresentsUnmatched`). The join fills each
-  row's `present_ns`. Then `frames.presented.*` is `present_ns − begin_ns`.
+  are dropped as partial. The app's processes' presents are its frames; from outside there is no
+  frame begin, so `frames.presented.*` (begin to screen) is refused.
 - **Inputs to the screen** (the generic path, for any native app strobe drives): strobe stamps each
   input it sends (host clock); its frame is the first present of the app's processes that started
   after it and reached the screen (a discarded one is passed over: a later one shows it). An input
   counts only when the app presented nothing for two refreshes before it: at rest, the next present
   is the input's; an app already drawing may present a frame begun before the input, so that input
-  is not counted. An input with no displayed present within a second is unmatched; over 5% of them
-  refuses `interaction.*` (`PresentsUnmatched`). `interaction.*` is screen time − input time.
+  is not counted, and neither is one after which the app's accessibility tree did not change (§7.4).
+  An input with no displayed present within a second is unmatched; over 5% of them with no events
+  lost refuses `interaction.*` (`PresentsUnmatched`). `interaction.*` is screen time − input time.
 - **Refresh**: `display.hz` and the refresh period are the target window's display path's
   (`MonitorFromWindow` → `QueryDisplayConfig`: its `VidPnTargetId` and nominal rate): the median
   spacing of that path's vertical blanks (`VSyncDPC` and, on multi-plane drivers,
@@ -463,8 +460,9 @@ Bench files (`phase(name, fn)`, §9.6) and `@hona/strobe-web` (`phase(name)`) em
 Run and phase boundaries are `performance.mark` calls in the page (`strobe:<block>:<kind>:…`),
 one `Runtime.evaluate` per boundary, placed before the first input and after `until` resolves.
 They land on the trace clock, so windows need no clock mapping. Every metric can be sliced by
-phase. A native app's phases are `mark` requests over its bridge, stamped on the host clock in its
-run record (§13.7).
+phase. A native app's phase marks are strobe's own, stamped on the host clock (the clock of its
+inputs, OS present events and native samples) and kept in the recording's `frames.json`;
+`query <rec> hotspots --phase <name>` ranks the native samples inside that phase (§13.7).
 
 ### 7.4 Native apps
 
@@ -486,22 +484,44 @@ What strobe reads from a native app (§13.7), per run:
   folder: its thread pool and services) (`query <rec> threads`). The `wakes-while-idle` insight
   counts the app's own threads and names driver and OS threads apart. Every adapter the app used is
   recorded (`ctx.gpu.devices`), each with its own engine use.
-- **With the app's bridge:** `ui.work` (wall time of the UI thread's turns that did frame work or
-  handled input; the primary for "does this UI change cost less"), `ui.cpu` (that thread's CPU), and
-  descriptive parts `ui.view`, `ui.layout`, `ui.text`, `ui.paint`, `ui.encode`; `ui.frames` (frames the
-  UI thread submitted) and `ui.interval.p50|p95|max` (gaps between a surface's submissions, pooled over
-  the measured runs, minimum n as `canvas.interval`); `count.<name>` for every exact counter the
-  toolkit reports. Submission is not presentation: these are never called presented frames.
-- **Presented frames** (`frames.presented.*`, `frames.interval.*`, `frames.dropped*`,
-  `frames.discarded`, `display.hz`, `interaction.*`) where the toolkit reports when a frame reached
-  the screen (`present_ns`; macOS Metal's presented time), or on Windows from the OS's present
-  events (§7.2): a series that declares one gets a present session in its timing blocks; with the
-  bridge the toolkit's rows are joined to the presents (filling `present_ns` in `frames.json`),
-  without it the app's processes' presents count alone (no `frames.presented.*` then: there is no
-  begin). `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects, or,
-  for inputs strobe sent, the inputs-to-screen join (§7.2).
-  Without either source they are refused (`NoPresentSource`, with the reason: no access, or no
-  presents in the runs).
+- **The UI thread, from outside:** the thread that owns the main window is the app's UI thread.
+  `ui.cpu` is its CPU per run from its cycle counter (the primary for "does this UI change cost
+  less" from outside: continuous, not quantized to frames) and `ui.wakes` its context switches per
+  second. The bridge's split of UI work into view, layout, text, paint and encode is gone: where the
+  UI thread's time goes comes from native stacks in attribution blocks (§13.4), by function, file or
+  package, per phase (`query <rec> hotspots --thread <name> --phase <name>`).
+- **Presented frames** (`frames.interval.*`, `frames.dropped*`, `frames.discarded`,
+  `frames.presented.count`, `display.hz`) on Windows from the OS's present events (§7.2) of the
+  app's processes. Every native block with a window runs a present session when access allows (page
+  waits read it live). `frames.presented.p*` (a frame's begin to its screen time) is refused: only a
+  toolkit knows when it began a frame. A run in which the app presented more frames than the display
+  refreshed, plus ten, refuses the frame metrics (`UnpacedSpin`).
+- **Interaction latency** (`interaction.p50|p95`, `interaction.n`; `scroll.latency.p50|p95`,
+  `scroll.n`), from strobe's own inputs (§13.7) to the presents that showed them:
+  - Inputs: a click's release (its press shows a pressed look at most; the release does the click),
+    each key press of `type`, `press` and `down`, and for `scroll.latency.*` the first wheel step of
+    each `scroll` or `wheel`. Moves, hovers, presses and releases of keys are never samples, and
+    inputs given through accessibility actions (`page.act`) skip hit testing and pointer handling:
+    they are never samples, and a series whose runs only acted refuses `interaction.*`
+    (`PatternInput`).
+  - An input reacts when the app changed its accessibility tree (a structure, property or focus event
+    from its windows) within 1 s after strobe posted it. An input that changes no tree (a press
+    highlight, a hover, a key the app ignores) is not a sample, so no later frame of something else
+    (a caret blink, a timer) is ever attributed to it. Reactions that change only pixels are not
+    measured; an app with no accessibility tree has no `interaction.*`.
+  - Its latency is from the post time (host clock) to the screen time of the first present of the
+    app's processes that started after it and reached the screen, within 1 s. Each input is resolved
+    on its own after the run: nothing pending carries over between inputs, runs or a reset, and a
+    present after several inputs is the reaction of each (latency from each).
+  - Refused when ambiguous: an input that came while the app was drawing (a present started in the 2
+    refreshes before it) is not a sample, since the next frame may be its animation's; more than half
+    of a block's inputs like that refuses `interaction.*` (`AmbiguousInteraction`). No reacting input
+    or no shown frame refuses it (`NoPresentSource`, with the reason), as does a block without
+    present events.
+  - It is testable: `etw::frames::reactions` takes the posted inputs, the change times and the
+    presents, all on the host clock, and `query <rec> frames` shows per run which inputs counted and
+    why the others did not.
+- Every metric a native target cannot measure is listed refused with its reason, never dropped.
 
 ## 8. Probes
 
@@ -985,10 +1005,9 @@ export default bench({
   copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
   must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
   (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)` and `script(entry,
-  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, bridge? })` and
-  `headless(appIdOrPath, { home?, args?, env? })` are native apps (§13.7): `viewport` sizes the main
-  window's client area in device-independent pixels where the app allows; `bridge: true` requires
-  the app's bridge in every block and `false` turns it off.
+  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, window? })` is a
+  native app (§13.7): `viewport` sizes the main window's client area in device-independent pixels
+  where the app allows; `window: false` is an app with no window (a tray app).
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
@@ -1041,7 +1060,7 @@ renders into one (a diff or code viewer) counts as a change.
 | `hover(selector, opts?)` | the pointer moves to the element's centre, no click: reveals hover-only controls |
 | `move(x, y, opts?)` | the pointer moves to a viewport point: parks it away from anything that reacts to hover (an app that prefetches what the pointer rests on) |
 | `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
-| `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P` |
+| `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P`; native apps: `opts.selector` sends it to that element (clicked into focus first, as `type` does) |
 | `down(key, opts?)`, `up(key, opts?)` | one key held across other calls until its `up` (a game's `w`); a held `Shift`, `Control`, `Alt` or `Meta` marks the key events sent while it is down. No auto-repeat: Chromium's input sends none |
 | `snapshot(name)` | the page's pixels as `name`, for `--pixels` (§9.9); nothing outside a pixels block, so timed runs never pay for it |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
@@ -1050,13 +1069,20 @@ renders into one (a diff or code viewer) counts as a change.
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
 | `wheel(selector, { dx?, dy? }, opts?)` | one mouse-wheel event over the element (the viewport's centre with `""`) |
-| `window(action, opts?)` | native apps: `show`, `hide`, `focus` or `close` a window (`opts.window`, default the main one) through the app's own path |
+| `window(action, opts?)` | native apps: `show`, `hide`, `minimize`, `focus` or `close` a window (`opts.window`: a title, or part of one; default the main window) |
+| `act(selector, action, opts?)` | native apps: an accessibility action (`invoke`, `toggle`, `setValue` with `opts.value`, `expand`, `collapse`, `select`, `scrollIntoView`, `focus`); never an input latency |
+| `query(selector, opts?)` | native apps: the visible elements it matches now, with key path, role, name, value, screen rect, focus and enabled |
 
-On a native target the app's bridge does the driving (§13.7): `click`, `hover`, `move`, `type`,
-`press`, `scroll`, `wheel`, `waitFor`, `idle`, `wait`, `window` and `snapshot` map onto its ops, with
-the same `until` and `timeout` options plus `window` (which surface). Selectors are the toolkit's:
-element keys or key-path suffixes, `role=…`, `text=…`, a `:focus` suffix. `goto`, `eval`, `down` and
-`up` fail with their name. Without the bridge only `wait` works.
+On a native target strobe drives the app through the OS's accessibility tree and its message loop
+(§13.7), for any app with an accessibility tree: every call above but `goto` and `eval`, with the same
+`until` and `timeout` options plus `window`. Selectors are accessibility ids: an element key
+(AutomationId) or key path (`"slider/knob"`: earlier segments are the ids of the element's nearest
+ancestors that have one), `role=<role>` (control type; ARIA's names: `button`, `textbox`, `checkbox`,
+`switch`, `heading`, `dialog`, …), `text=<text>` (the name or a text field's value, substring unless
+`exact`), each with a `:focus` suffix. Only visible elements match (bounds inside their clipping
+ancestors, not offscreen); the first in tree order wins, searching the main window, then the app's
+other windows. `until: "idle"` is no present of the app and no accessibility change for 300 ms;
+`"frame"` is the next present of the app that reached the screen.
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
 in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling), `"frame"`
@@ -1111,10 +1137,14 @@ discarded first, so the OS has read the build from disk before any timed launch.
 - `cpu.work` is the CPU of the target's processes from spawn (or navigation) to ready, in cycles.
 - **Native apps** (§13.7): `until` is a window condition, `{ window: "visible" }` (its main window
   shows), `"painted"` (its pixels first change from its first frame) or `"settled"` (their last
-  change, once they held for a second), sampled every 30 ms with the tree's CPU cycles; or, with the
-  app's bridge, a selector, timed to the commit of the frame that first showed it on the host clock.
-  A selector that already showed in an earlier frame when strobe asked refuses the launch, as a late
-  page observer does. Milestones read output and log files (a native app has no page marks).
+  change, once they held for a second), sampled every 30 ms with the tree's CPU cycles; or a
+  selector, timed to the screen time of the frame that showed it: it appeared in the accessibility
+  tree between the last read that lacked it and the first that had it (strobe reads the tree when
+  the window appears and on each change it announces), and its frame is the first present to reach
+  the screen that started after that span began. Refused when the first read already had it, when
+  frames that reached the screen more than one refresh apart could each have shown it (an animation
+  during launch), and without OS present events. Milestones read output and log files (a native
+  app has no page marks).
 - **Attribution:** a launch of its own, never timed. An app's main process starts paused under
   `--inspect-brk` with its CPU profiler on (`cpu-main.cpuprofile`), and every page starts paused
   until its profiler runs (`cpu-0.cpuprofile`), so both profiles cover the launch from the first
@@ -1182,8 +1212,8 @@ sequenceDiagram
 - A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
   The refusal names the page's URL and saves a screenshot of the page next to the experiment
   (`failed-<step>-….png`), so an agent can see what the app showed instead of guessing.
-- At every run start strobe reads the DOM node count (a native app's bridge reports its element
-  count at each run's end); a count that drifts across runs means
+- At every run start strobe reads the DOM node count (a native app's: the elements in its
+  accessibility tree at each run's end, when strobe drives it); a count that drifts across runs means
   `reset` is missing (`StateDrift`).
 
 `@hona/strobe-playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
@@ -1236,31 +1266,32 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 
 | ID | Refuses when |
 |---|---|
-| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP, llvmpipe) and a frame or GPU metric is requested; a native app: its bridge's adapter is a CPU device, or its GPU work ran on such an adapter |
-| `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`; a native app whose bridge says `debug_build`) |
+| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP, llvmpipe) and a frame or GPU metric is requested; a native app: its GPU work ran on such an adapter |
+| `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`; a native app whose executable imports a debug C runtime, such as `ucrtbased.dll`) |
 | `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
-| `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs. A native surface that skipped frames (occluded) in a measured run refuses that block's frame metrics only |
-| `UnpacedSpin` | a native surface drew more than 10 frames in a run without waiting for the display: its frame metrics are refused |
-| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times (refuses that metric) |
+| `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs, or another window over the point strobe would click (the OS hit-tests elsewhere) |
+| `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
+| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric) |
+| `AmbiguousInteraction` | over half of a block's inputs came while the native app was drawing, so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
+| `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest |
-| `AmbiguousPresent` | over 5% of a toolkit's frames fit more than one OS present (refuses the frame metrics) |
-| `PresentsUnmatched` | over 5% of a toolkit's frames matched no OS present while the present session lost no events (refuses the frame metrics); over 5% of strobe's inputs showed no frame within a second (refuses `interaction.*`) |
+| `PresentsUnmatched` | over 5% of the inputs strobe sent a native app (those after which its accessibility tree changed) showed no frame within a second while the present session lost no events (refuses `interaction.*`, §7.4) |
 | `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
-| `NoDisplayForBudget` | a budget metric is requested without a real display; any metric of a headless native app beyond `ui.*`, `count.*` and `cpu.*`, and its launches |
+| `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
-| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6); a native bridge whose clock is not the host's, or whose hello is stamped outside its launch |
+| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
 
 ### 10.2 Analysers (warn in the result)
 
 `MultimodalDistribution` · `HighVariance` · `Underpowered` · `StateDrift` · `Background` ·
 `Throttling` · `Drift` (trend across pairs) · `CounterUnstable` · `ProbeOverhead` ·
 `Unresolved` (samples without a symbol above 5%) · `PowerPlan` (the user's plan was kept: `--power
-keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine`
+keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine` · `CursorNotParked` (a native block's OS cursor could not be moved onto the pointer's points, so hover tracking saw it elsewhere)
 · `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed) · `DisplayOff`
 (pairs ran with the console display off, §10.5) · `CrossAdapterScanout` (a native app draws on one GPU
 while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`
@@ -1306,16 +1337,22 @@ with at least 3 pairs shows zero spread.
 A machine left locked for days still benches what needs no presenting window. A series runs through a
 lock when nothing it measures reaches a screen:
 
-- `script()` and `headless()` targets, and leak runs (`--probes memory`; a headed page's hidden state
+- `script()` targets, and leak runs (`--probes memory`; a headed page's hidden state
   is not refused there);
-- a native target with `window: false` (a tray app) whose declared metrics are all `cpu.*`,
+- a native target with `window: false` (a tray app), or any native target under `--check` (it
+  validates a bench file and gives no verdict), whose declared metrics are all `cpu.*`, `ui.*`,
   `memory.*`, `io.*`, `count.*`, `run.duration` and launch milestones (a launch ends on
   `until: { milestone }`). `gpu.*` may be a secondary: on a locked screen the compositor draws
   nothing, so it is refused in locked blocks (and as a primary the series waits for an unlock).
 
 Everything else waits for an unlock as before: presented frames, `interaction.*`, `scroll.*`,
-`display.*`, `launch.painted|settled`, `ui.*` from a window, headed Chromium and Electron pages, and
-native apps with a window.
+`display.*`, `launch.painted|settled`, headed Chromium and Electron pages, and native apps with a
+window outside `--check`.
+
+What drives a native app on a locked session (checked on adais, locked): its accessibility tree reads
+and waits on its events, accessibility actions (`page.act`), and posted keys to its focused element.
+Pointer input does not: the OS hit-tests every point to the lock screen, so strobe cannot aim a click
+and refuses it (`SessionLocked`), and it cannot park the cursor. Nothing presents.
 
 Every block records its lock state (`locked`), checked at its start and end and by the 500 ms poll
 in between; a block whose state changed runs again. Base and head of a pair share one state, or the
@@ -1699,46 +1736,88 @@ and its launches end on one of their milestones (`until: { milestone: "<name>" }
 it arrives or a log line, read every 20 ms). Such series can run on a locked session (§10.5). An app that hands its window to another process and exits (a launcher, an app
 already running in single-instance mode) cannot be measured this way and says so.
 
-**The native bridge** (protocol `native-bridge-v1`), which a UI toolkit implements once for every app
-on it, off unless built in:
+**Driving, through the OS's accessibility tree** (no change to the app; any toolkit that exposes
+one: Win32 controls, WinUI, AccessKit, …). Strobe used to need a bridge a toolkit implemented; it
+drives every app through what the OS gives assistive technology instead, so it never names or links a
+toolkit (rule 15).
 
-- strobe listens on `127.0.0.1:<port>` per launch and starts the app with `STROBE_BRIDGE` and
-  `STROBE_BRIDGE_TOKEN` (32 hex characters). The app connects out once its runtime can answer
-  (before its first frame commits) and sends one hello line: `hello`, `token`, `pid`, `toolkit`,
-  `toolkit_version`, `mode` (`window` or `headless`), `debug_build`, `clock` (`qpc`, `mach` or
-  `monotonic`: the host clock in ns, §6) and `now_ns`. A wrong token closes the connection. Then
-  newline-delimited JSON: `{ id, op, args }` → `{ id, ok }` or `{ id, err: { code, message } }` (codes
-  `bad-request`, `not-found`, `timeout`, `unsupported`, `no-window`, `internal`), and rare events
-  (`{ event }`). The bridge's reader thread never touches UI state; requests run on the UI thread.
-- Ops: `info` (GPU name, backend, device type; surfaces with scale and present mode), `query`,
-  `wait` (`until`: a selector, `"frame"` or `"idle"`; replies `at_ns`, `frame_seq`, `already`),
-  input (`click`, `move`, `down`, `up`, `hover`, `wheel`, `scroll`, `type`, `press`: through the
-  toolkit's own input path, never OS input or focus, each stamped `input_ns` when it enters the
-  runtime), `window`, `mark`, `run.begin`, `run.end`, `snapshot` (PNG), `step` (headless) and `quit`.
-- `run.end` returns the run record: `work` (`wall_ms`, `cpu_ms` from the UI thread's cycle counter,
-  exclusive phases `view_ms`, `layout_ms`, `text_ms`, `paint_ms`, `encode_ms`, `other_ms`), `counts`
-  (exact, `elements` among them), `surfaces` (per surface `redraws`, `presents`, `unpaced`,
-  `skipped`, `occluded`, …), `frame_columns` and `frames` (one row per frame built: `seq`, `surface`,
-  `tid`, `begin_ns`, `cpu_end_ns`, `submit_ns`, `present_ns` or 0, `input_ns` or 0) and `marks`.
+- **The client** (`target/a11y`, one `Accessibility` trait; Windows UI Automation through COM, on one
+  MTA thread that owns the client, the last snapshot's elements and the event handlers). A snapshot
+  reads every window of the app (the main one first, then its other visible top-level windows:
+  popups, overlays) in one cached request per window (raw view: AutomationId, name, control type,
+  bounds, focus, enabled, offscreen, value, toggle state, heading level, dialog, available patterns),
+  in physical screen pixels (the thread is per-monitor DPI aware). The app's structure, property and
+  focus events wake waiters: a wait re-reads the tree on each change the app announces, never on a
+  timer, except while a window has not answered for its tree yet (re-read every 50 ms). A provider
+  that answers first with a placeholder root and builds its tree a turn later (lazy providers, such
+  as AccessKit's) raises a structure change then; strobe registers for events again when a window's
+  root element changes. macOS (AX) and Linux (AT-SPI) refuse with a reason: neither could be checked
+  (the macOS device grants no Accessibility permission to a remote shell, the Linux one has no
+  display).
+- **Input** (`target/a11y/input.rs`): window messages posted to the app's own message loop on a
+  thread of strobe's, each stamped on the host clock just before it is posted; never `SendInput`,
+  so the app never takes focus or activates.
+  - Pointer: aimed at the centre of the element's visible part, checked against what UI Automation
+    hit-tests there (the element, a descendant, or an ancestor when the provider hit-tests no finer;
+    anything else is covering it: `WindowHidden`). Posted to the window the OS hit-tests at that point
+    (`WindowFromPhysicalPoint`, which must be the app's), in its client coordinates at its own DPI
+    awareness: `WM_MOUSEMOVE` before every button message (a toolkit takes a button's position from
+    the last move), `WM_[LRM]BUTTONDOWN`/`UP` with the button and modifier flags, `…DBLCLK` for a
+    second press when the window class asks for it. A click's press is held at least 60 ms and until
+    the app rests (no present for two refreshes, at most 300 ms), as a person holds a click, so the
+    release that does the click comes at rest; the first key of `type` and the first wheel step wait
+    for rest the same way after the move or click before them.
+    `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL` carry screen coordinates and 120 units per 100 px (Chromium's
+    scroll per notch; what an app scrolls per notch is its own); `scroll` posts one step per refresh
+    at its speed. Strobe parks the OS cursor on the point (`SetCursorPos`: no click, no focus), since
+    hover tracking reads the real cursor (`TrackMouseEvent` posts a leave at once when it is
+    elsewhere, and a winit app then forgets the pointer and drops the next click); a cursor it could
+    not park warns `CursorNotParked`.
+  - Keys: to the focus window of the app's UI thread (`GetGUIThreadInfo`), `WM_KEYDOWN`/`UP` (or
+    `WM_SYSKEY*` while Alt is down without Control, and for F10) with the layout's scan code, the
+    extended bit, the context bit and previous-state and transition bits; characters as their keys on
+    the app's keyboard layout (`VkKeyScanEx`; a capital letter is Shift and its key, AltGr is Control
+    and Alt), so the app's own `TranslateMessage` makes the text. A character with no key on the
+    layout is refused (an input method's text is not built). Posting does not change the key state
+    a toolkit reads for modifiers and `TranslateMessage` reads for text (winit 0.30 reads
+    `GetKeyboardState` for every key event and its modifiers), so for any key with modifiers strobe
+    attaches its thread to the app's UI thread (`AttachThreadInput`: they share key state), sets it
+    (`SetKeyboardState`), posts the modifiers' downs and the key, waits until the app's loop has
+    taken them (sent `WM_NULL`s come back only as it looks at its queue: 2n + 2 of them), posts the
+    modifiers' ups and puts the state back. `page.down` keeps a key in that state until `page.up`.
+    `GetAsyncKeyState` still reads the physical keyboard.
+  - Without focus, not reachable: hover in an app that checks the cursor when the OS cursor cannot be
+    parked (a locked session), input methods, and anything that reads `GetAsyncKeyState`, raw input
+    or pointer messages (`WM_POINTER*`: an app that takes only those, such as one on a UWP input
+    stack, gets no posted mouse input). Pointer input on a locked session is refused
+    (`SessionLocked`): the OS hit-tests every point to the lock screen.
+  - Accessibility actions (`page.act`: Invoke, Toggle, Value, ExpandCollapse, SelectionItem,
+    ScrollItem, focus) are a labelled alternative: the app's handler runs, but no hit test and no
+    pointer handling, so they are never an input latency (§7.4).
+- **Window actions**: `close` posts `WM_SYSCOMMAND SC_CLOSE` (the title bar's close: the app's own
+  path), `minimize` `SC_MINIMIZE`, `show` `SC_RESTORE` or `ShowWindowAsync(SW_SHOWNOACTIVATE)`,
+  `hide` `ShowWindowAsync(SW_HIDE)`, `focus` `SetForegroundWindow` (refused when Windows keeps
+  another window in front).
+- **Pixels**: `snapshot` is the window's own rendering of its client area (`PrintWindow` with full
+  content, which composition and flip-model windows answer), as a PNG.
+- **Marks and runs**: strobe stamps runs, phases and inputs itself on the host clock; `frames.json`
+  keeps per measured run its inputs, marks and the accessibility change times, beside the OS presents.
+- **What it costs the app**: once a client is connected, an app keeps its accessibility tree current
+  and raises the events strobe listens to (a lazy provider such as AccessKit builds nothing until a
+  client asks), so a driven app runs as it does for a person with assistive technology on: base and
+  head both pay it, and a series that never calls `page` (an idle case) connects nothing. Every snapshot asks the app's accessibility provider for its tree (for
+  classic Win32 controls the proxies send messages to its UI thread), and a chord's settle sends a
+  few `WM_NULL`s. Strobe reads the tree to find what to act on before it posts and then waits on
+  events, but `until: <selector>` re-reads after each change, so put `until` on work whose cost is
+  not the question, or measure with `ui.cpu` and `cpu.work`, which include it.
 
-A block uses the bridge when the app has connected by the time `setup` finished (any page call
-connects it, waiting up to 30 s), and waits for it first when the target says `bridge: true`, the
-target is headless, the series declares a `ui.*` or frame metric, or the block takes `--pixels`
-snapshots. Each measured run is then wrapped in `run.begin` and `run.end`, outside its span; phases are
-`mark`s. strobe asks the app to `quit` before it kills the tree. The hello and `info` are checked once
-per block: `ClockUnsynced` (another clock, or a hello stamped outside the launch), `DevBuild` in timing
-blocks, `SoftwareGpu`, and `VariantMismatch` across base and head (backend, adapter, scale).
+**No headless target**: the bridge's `headless()` ran an app in its toolkit's offscreen mode on a
+virtual clock. From outside that needs a toolkit's own command line and offers no OS presentation or
+accessibility to read, so it would be one toolkit's feature inside strobe (rule 15); it was removed
+with the bridge. A tray app is `native(…, { window: false })`.
 
-**Headless** (`headless(appIdOrPath)`): the same app in its toolkit's headless mode, offscreen on a
-virtual clock, started with the profile's `headless` object (`args`, `env`, `unset`); its hello must
-say `mode: "headless"`. It has no window, display, presentation or GPU of its own to measure and no
-launch: only `ui.*`, `count.*`, `cpu.*` and `--pixels` snapshots, everything else `NoDisplayForBudget`.
-What it leaves out is everything between submitting a frame and a person seeing it (the compositor,
-vsync, occlusion, the window manager), and real time: an animation's work per frame is measured, its
-pacing is not. It never waits for an unlocked screen.
-
-**Attribution** (`--why`, `record --probes attribution`): the same blocks with their run records and
-OS samples kept, not timed, plus native stacks of the app's process tree when the deep helper is
+**Attribution** (`--why`, `record --probes attribution`): the same blocks with their OS samples and
+inputs kept, not timed, plus native stacks of the app's process tree when the deep helper is
 installed (§13.4): `deep.json.gz` holds the samples inside the measured runs only (not warmup runs,
 and not the `reset()` between runs), and `query <rec> hotspots` ranks them by function, file or
 package from the variant's own PDB (§12.2). An attribution launch samples from just after the spawn
@@ -1759,8 +1838,8 @@ recordings/rec_3f9a1c/
   deep.json.gz          native samples from the helper (modules, unique stacks, samples), symbolized on read
   deep-symbols.json.gz  their symbols, cached on first read
   presents.json.gz      OS present events: every present (start, screen time or discarded) and vertical blank
-  runs.json             native apps: per measured run, wall and CPU time, wakes, IO, and the bridge's run record without frames
-  frames.json           native apps with a bridge: `columns`, frame rows per run and marks per run
+  runs.json             native apps: per measured run, wall and CPU time, wakes, IO, counts, accessibility elements
+  frames.json           native apps: the app's pids, and per measured run its span, strobe's inputs, phase marks and accessibility change times
   threads.json          native apps: per thread wakes per second, CPU per run, name
 ```
 
@@ -1883,7 +1962,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
     linux-x64 and linux-arm64 (Linux builds are static musl binaries, for glibc and musl alike).
     `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
     install folder (§5.3), so the daemon never runs from a project's `node_modules`.
-  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native`, `headless` and the types of bench
+  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native` and the types of bench
     files (§9.6), built from `sdk/bench` (`dist/index.js`, `dist/index.d.ts`). strobe embeds the
     SDK, the runner and the script host and rewrites a bench file's `@hona/strobe` import (or the old
     `@hona/strobe-bench`) to its own copy, so a bench file runs with the SDK of the binary running it,
@@ -1956,7 +2035,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
-| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled`; OS present events joined to the toolkit's frames, native stacks in attribution blocks (phase 6 row) | `scroll.latency.*` for native apps (rows carry no input kind); accessibility drivers on Linux and macOS |
+| native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | macOS (AX) and Linux (AT-SPI) driving; `frames.presented.*` from outside |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
 | 7 | — | CI budgets, history, mesh |
 
@@ -1997,14 +2076,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `pid:`/`proc:` record only (`--probes timing|deep`). Variants also take `url:<href>` (an already
   running origin).
 - Native targets: `cpu.work` with `cpu.app.total` tested by default, as for scripts; `cpu.wakes`,
-  `io.*` and `ui.*` descriptive unless declared. Warmup compares `ui.work` with the bridge, else the
-  tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
+  `io.*` and `ui.*` descriptive unless declared. Warmup compares the tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
   the calibration. Declared metrics a native target cannot give are listed refused with their reason,
   never dropped; a refused primary refuses the block (exit 4). A metric-level refusal shows as
   `refused (<validator>): …` in the series, as `TailTooShort` does. `native(path)` is a fixed
   executable: a build never replaces it. `{cache}` keeps the platform's separators (cmd's own
   commands read `/` as a switch).
-- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread`, `status --fast`,
+- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread --phase`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
   removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a
@@ -2054,6 +2132,21 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   (including the first measured frame of an app idle until its first input); the toolkit join took
   presents within 500 µs of the call's return from any thread, so a frame whose present blocked on
   the swapchain could take the next frame's present.
+- Native apps are driven through the OS accessibility tree (§13.7), not a toolkit bridge; the
+  bridge server, its protocol, `headless()` and the `ui.*` work split are gone. Checked on adais
+  with the session locked (no presenting window), by `scripts/dev/a11y.bench.ts --check` on Character
+  Map (a classic Win32 app; noisy smoke runs on a busy machine, values not compared): its tree reads
+  in one cached request per window (27 elements; key paths such as `204/UpButton` resolve), event
+  waits resolve on its value changes, `page.act` sets a value, and posted keys type `Ab+1 x` exactly
+  (Shift for the capital and `+` through the shared key state) and `Shift+Home`, `Backspace` clear
+  it. On the locked session the OS hit-tests every point to the lock screen, so clicks refuse
+  (`SessionLocked`) and the cursor cannot be parked; the Windows 11 `notepad.exe` opened no window of
+  its own process in the isolated home (it hands off), so it cannot be a target. Not yet run on an
+  unlocked session: clicks, hover and wheel on a real window, `until: "frame"` and idle against live
+  presents, `interaction.*` and `scroll.latency.*`, a launch timed to a selector, `snapshot`, window
+  actions, and a winit app (Rune with AccessKit): its lazy tree, key paths, chords and clicks.
+  Driving costs the app: each tree read through classic controls' proxies sends messages to its UI
+  thread (`ui.wakes` read 6,000 to 7,500 per second in a typing case that waits on its text).
 - Storage: `cpu-0.cpuprofile` and `alloc-0.heapprofile` (plain JSON), `maps/` (source maps and
   function ranges), `heap-0.heapsnapshot.gz` (and `heap-s0`, `heap-s1` for memory recordings),
   `leaks.json`, census in `meta.json`, one `runner.log` and `progress.log` per experiment.
@@ -2069,7 +2162,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   orders: composed flips through DWM, independent flips, a runtime without DXGI events (Vulkan),
   a present replaced in its refresh (discarded), a frame composed a refresh late (one missed
   refresh, a 12.1 ms interval at 165 Hz) and a rest between bursts (neither); every screen time
-  landed on its vblank, and toolkit rows joined their presents. The consumer costs 0.25 µs per
+  landed on its vblank. The consumer costs 0.25 µs per
   event. The sampler's merge of kernel and user stack parts, its process filter and image paths,
   and PDB symbolization were checked with real stacks of a planted-hot MSVC binary sampled in
   process: the planted function ranked first at 94% with its loop's line, 100% resolved.

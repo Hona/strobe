@@ -489,6 +489,116 @@ pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
     }
 }
 
+/// The visible top-level windows of these processes, front to back: handle, title, and whether
+/// pointer input passes through it (`WS_EX_TRANSPARENT`).
+pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GWL_EXSTYLE, GetWindowLongW, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible, WS_EX_TRANSPARENT};
+    struct State<'a> {
+        pids: &'a [u32],
+        out: Vec<(isize, String, bool)>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut State) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if state.pids.contains(&pid) && unsafe { IsWindowVisible(hwnd) } != 0 {
+            let mut t = [0u16; 256];
+            let n = unsafe { GetWindowTextW(hwnd, t.as_mut_ptr(), t.len() as i32) }.max(0) as usize;
+            let through = unsafe { GetWindowLongW(hwnd, GWL_EXSTYLE) } as u32 & WS_EX_TRANSPARENT != 0;
+            state.out.push((hwnd as isize, String::from_utf16_lossy(&t[..n]), through));
+        }
+        1
+    }
+    let mut state = State { pids, out: Vec::new() };
+    unsafe { EnumWindows(Some(each), &mut state as *mut State as LPARAM) };
+    state.out
+}
+
+/// What a window draws now, its client area at its own pixels, through the window's own rendering
+/// (`PrintWindow` with full content, which composition and flip-model windows answer), as RGBA.
+pub fn window_image(hwnd: isize) -> Option<crate::png::Image> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits, ReleaseDC, SelectObject,
+    };
+    use windows_sys::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClientRect;
+    // PW_CLIENTONLY | PW_RENDERFULLCONTENT
+    const FLAGS: PRINT_WINDOW_FLAGS = 1 | 2;
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        let mut r: RECT = zeroed();
+        GetClientRect(h, &mut r);
+        let (w, ht) = (r.right - r.left, r.bottom - r.top);
+        if w <= 0 || ht <= 0 {
+            return None;
+        }
+        let screen = GetDC(std::ptr::null_mut());
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, ht);
+        let old = SelectObject(mem, bmp);
+        let ok = PrintWindow(h, mem, FLAGS) != 0;
+        let mut info: BITMAPINFO = zeroed();
+        info.bmiHeader = BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -ht, biPlanes: 1, biBitCount: 32, biCompression: BI_RGB, ..zeroed() };
+        let mut px = vec![0u8; (w * ht * 4) as usize];
+        let lines = GetDIBits(mem, bmp, 0, ht as u32, px.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
+        SelectObject(mem, old);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if !ok || lines != ht {
+            return None;
+        }
+        // BGRA to RGBA, opaque.
+        for p in px.chunks_mut(4) {
+            p.swap(0, 2);
+            p[3] = 255;
+        }
+        Some(crate::png::Image { width: w as usize, height: ht as usize, rgba: px })
+    }
+}
+
+/// A debug C runtime the executable imports (`ucrtbased.dll`, `vcruntime140d.dll`, …): a debug build
+/// of a C or C++ app, or of one that links such code. None when it imports none or is unreadable.
+pub fn debug_runtime(exe: &std::path::Path) -> Option<String> {
+    let b = std::fs::read(exe).ok()?;
+    let u16_at = |o: usize| b.get(o..o + 2).map(|s| u16::from_le_bytes([s[0], s[1]]));
+    let u32_at = |o: usize| b.get(o..o + 4).map(|s| u32::from_le_bytes([s[0], s[1], s[2], s[3]]));
+    let pe = u32_at(0x3c)? as usize;
+    if b.get(pe..pe + 4)? != b"PE\0\0" {
+        return None;
+    }
+    let sections = u16_at(pe + 6)? as usize;
+    let opt = pe + 24;
+    let opt_size = u16_at(pe + 20)? as usize;
+    // The import directory: data directory 1, after the PE32 or PE32+ fixed fields.
+    let dirs = opt + if u16_at(opt)? == 0x20b { 112 } else { 96 };
+    let import_rva = u32_at(dirs + 8)? as usize;
+    let rva = |r: usize| -> Option<usize> {
+        (0..sections).find_map(|i| {
+            let s = opt + opt_size + i * 40;
+            let (va, size, raw) = (u32_at(s + 12)? as usize, u32_at(s + 8)?.max(u32_at(s + 16)?) as usize, u32_at(s + 20)? as usize);
+            (r >= va && r < va + size).then_some(raw + r - va)
+        })
+    };
+    let mut at = rva(import_rva)?;
+    for _ in 0..4096 {
+        let name_rva = u32_at(at + 12)? as usize;
+        if name_rva == 0 {
+            break;
+        }
+        let o = rva(name_rva)?;
+        let end = b[o..].iter().position(|c| *c == 0)? + o;
+        let name = String::from_utf8_lossy(&b[o..end]).to_ascii_lowercase();
+        if name == "ucrtbased.dll" || (name.starts_with("vcruntime") || name.starts_with("msvcp") || name.starts_with("msvcr")) && name.ends_with("d.dll") {
+            return Some(name);
+        }
+        at += 20;
+    }
+    None
+}
+
 /// The largest visible top-level window of these processes that is not minimized (over 100×100).
 pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};

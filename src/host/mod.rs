@@ -249,6 +249,59 @@ pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     }
 }
 
+/// The visible top-level windows of `pids`, front to back: handle, title, click-through.
+pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
+    #[cfg(windows)]
+    {
+        win::top_windows(pids)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pids;
+        Vec::new()
+    }
+}
+
+/// The thread that owns a window (its UI thread), while the window exists.
+pub fn window_thread(hwnd: isize) -> Option<u32> {
+    #[cfg(windows)]
+    {
+        let tid = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd as _, std::ptr::null_mut()) };
+        (tid != 0).then_some(tid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        None
+    }
+}
+
+/// A window's client area as it draws it now (Windows only).
+pub fn window_image(hwnd: isize) -> Option<crate::png::Image> {
+    #[cfg(windows)]
+    {
+        win::window_image(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        None
+    }
+}
+
+/// A debug C runtime the executable imports, when it imports one (Windows executables).
+pub fn debug_runtime(exe: &Path) -> Option<String> {
+    #[cfg(windows)]
+    {
+        win::debug_runtime(exe)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = exe;
+        None
+    }
+}
+
 /// A window's state now; None once it is gone.
 pub fn window_state(hwnd: isize) -> Option<TopWindow> {
     #[cfg(windows)]

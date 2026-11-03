@@ -90,15 +90,8 @@ const DESCRIPTIVE: &[&str] = &[
     "cpu.wakes",
     "io.read",
     "io.write",
-    "ui.work",
     "ui.cpu",
-    "ui.view",
-    "ui.layout",
-    "ui.text",
-    "ui.paint",
-    "ui.encode",
-    "ui.frames",
-    "ui.interval.p95",
+    "ui.wakes",
     "js.heap.used",
     "dom.nodes",
 ];
@@ -255,7 +248,7 @@ struct Ctx<'a> {
     check: bool,
     /// A pixels block's snapshot folder (`--pixels`); `None` in every timed block.
     pixels_dir: Option<PathBuf>,
-    /// A native target's GPU backend, adapter and scale per variant, from its bridge (`VariantMismatch`).
+    /// A native target's GPU adapter and window scale per variant (`VariantMismatch`).
     native_setup: BTreeMap<String, String>,
     /// The bench's harness, overlaid on every variant's folder (`overlay_harness`).
     harness: Harness,
@@ -1032,7 +1025,6 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
-        Some("ui") => ("ui.n", "frame submission gaps"),
         _ => ("frames.n", "frames"),
     };
     if def.min_n > 1 {
@@ -1047,12 +1039,12 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
 
 /// What an attribution block records for this target.
 fn why_text(target: &Value) -> &'static str {
-    if is_native(target) { "run records, OS samples and native stacks (through the deep helper)" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
+    if is_native(target) { "OS samples and native stacks (through the deep helper)" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
 }
 
 /// The view that explains an attribution recording of a target of this kind.
 fn why_view(kind: &Value) -> &'static str {
-    if matches!(kind.as_str(), Some("native") | Some("headless")) { "hotspots --by package · threads · frames" } else { "hotspots --by package" }
+    if kind == "native" { "hotspots --by package · threads · frames" } else { "hotspots --by package" }
 }
 
 /// A metric a block refused: `why` is "<validator>: <reason>".
@@ -1319,17 +1311,21 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
 }
 
 /// Whether a series can run while the session is locked (SPEC §10.1 `SessionLocked`): nothing it
-/// measures needs a presenting window. Script and headless targets; leak runs; and a native target
-/// with `window: false` (a tray app) whose metrics are all CPU, memory, IO, counters, its run time, GPU
-/// use as a secondary (refused while locked) and launch milestones (not pixels).
+/// measures needs a presenting window. Script targets; leak runs; and a native target with
+/// `window: false` (a tray app), or any native target under `--check` (no verdict: it validates the
+/// file), whose metrics are all CPU (`ui.*` too), memory, IO, counters, its run time, GPU use as a
+/// secondary (refused while locked) and launch milestones (not pixels).
 fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
     let t = &ctx.describe["targets"][&s.target];
-    let offscreen =
-        |m: &str| ["cpu.", "memory.", "io.", "count.", "gpu."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled");
+    let offscreen = |m: &str| {
+        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
+    };
     match t["kind"].as_str().unwrap_or("") {
-        "script" | "headless" => true,
+        "script" => true,
         _ if set == Set::Memory => true,
-        "native" if t["window"] == false || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m)),
+        "native" if t["window"] == false || ctx.check || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => {
+            !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
+        }
         _ => false,
     }
 }
@@ -1988,9 +1984,9 @@ fn seed_dir(ctx: &Ctx, s: &Series, target: &Value) -> Option<PathBuf> {
     })
 }
 
-/// Native and headless targets (`native.rs`).
+/// Native targets (`native.rs`).
 fn is_native(target: &Value) -> bool {
-    matches!(target["kind"].as_str(), Some("native") | Some("headless"))
+    target["kind"] == "native"
 }
 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is

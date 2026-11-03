@@ -401,6 +401,12 @@ impl Conn {
                 }
                 Ok(json!({ "ok": {} }))
             }
+            "presents.live" => {
+                let c = self.presents.as_ref().ok_or_else(|| Error::msg("no present session"))?;
+                let pids: Vec<u32> = req["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).collect();
+                let wait = Duration::from_millis(req["wait_ms"].as_u64().unwrap_or(0).min(60_000));
+                Ok(json!({ "ok": c.live.view(&pids, req["after_ns"].as_u64().unwrap_or(0), wait) }))
+            }
             "presents.stop" => {
                 let c = self.presents.take().ok_or_else(|| Error::msg("no present session"))?;
                 Ok(json!({ "ok": c.stop()? }))

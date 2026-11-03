@@ -226,6 +226,7 @@ impl Driver {
                 self.until(&opts(2))
             }
             "window" => Err(Error::usage("page.window() shows, hides, focuses or closes a native app's windows; a page has none of its own")),
+            "act" | "query" => Err(Error::usage(format!("page.{call}() reads a native app's accessibility tree; on a page use eval or Playwright in prepare"))),
             "waitFor" => {
                 let o = opts(1);
                 let t = self.timeout(&o);

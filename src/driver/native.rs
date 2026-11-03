@@ -1,133 +1,566 @@
-//! The `page` driver for native targets (SPEC §9.6, §13.7): the bench file's page calls mapped onto the
-//! app's bridge ops, so one bench file drives a page and a native app alike. What the bridge does not
-//! do fails with the call's name.
+//! The `page` driver for native targets (SPEC §9.6, §13.7): the bench file's page calls on any native
+//! app, through the OS's accessibility tree (finding elements, their bounds and states, waiting on
+//! their changes) and the app's own message loop (posted pointer and key input), timed against the
+//! OS's present events. The app needs no strobe support; it needs an accessibility tree for
+//! selectors, and the session's present events for `until: "frame"` and frame metrics.
 
 use crate::model::{Error, Result};
-use crate::target::native_bridge::Bridge;
-use serde_json::{Map, Value, json};
+use serde::Serialize;
+use serde_json::Value;
+#[cfg(windows)]
+use serde_json::json;
+use std::cell::RefCell;
 use std::time::Duration;
 
-pub struct NativeDriver<'a> {
-    pub bridge: &'a Bridge,
-    pub op_timeout: Duration,
-    /// A pixels block's folder: `snapshot(name)` writes `<name>.png` there. Elsewhere a snapshot does nothing.
-    pub pixels: Option<std::path::PathBuf>,
+/// One input strobe gave the app, on the host clock at the moment it was posted.
+#[derive(Clone, Copy, Debug, Serialize)]
+pub struct Input {
+    pub t_ns: u64,
+    /// `discrete` (a click's release, a key press), `scroll` (a wheel step), `pointer` (a move, a
+    /// hover, a click's press, a key release) or `pattern` (an accessibility action: no hit test, no
+    /// pointer handling). Only `discrete` and `scroll` are interactions (SPEC §7.4).
+    pub kind: &'static str,
+    /// A scroll step that starts a gesture (the first of a `scroll` or a lone `wheel`).
+    pub first: bool,
 }
 
-impl NativeDriver<'_> {
-    /// One page call from the runner: `{ call, args }`.
-    pub fn dispatch(&self, call: &str, args: &[Value]) -> Result<Value> {
-        let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
-        let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
-        match call {
-            "click" | "hover" => self.op(call, json!({ "selector": s(0) }), &opts(1), 0.0),
-            "move" => {
-                let at = |i: usize| args.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-                self.op("move", json!({ "x": at(0), "y": at(1) }), &opts(2), 0.0)
+/// What a run's page calls did: inputs and phase marks, both on the host clock.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct Log {
+    pub inputs: Vec<Input>,
+    pub marks: Vec<(String, u64)>,
+}
+
+#[cfg(windows)]
+pub use win::Session;
+
+#[cfg(not(windows))]
+pub struct Session(std::convert::Infallible);
+
+#[cfg(not(windows))]
+impl Session {
+    pub fn open(_pids: &[u32], _main: isize) -> Result<Session> {
+        match crate::target::a11y::open(&[]) {
+            Err(e) => Err(e),
+            Ok(_) => Err(Error::msg("no native driver on this OS")),
+        }
+    }
+    pub fn dispatch(&self, _: &str, _: &[Value], _: &RefCell<Option<crate::etw::PresentCapture>>, _: Option<&std::path::Path>) -> Result<Value> {
+        match self.0 {}
+    }
+    pub fn set_pids(&self, _: &[u32]) {
+        match self.0 {}
+    }
+    pub fn set_main(&self, _: isize) {
+        match self.0 {}
+    }
+    pub fn take_log(&self) -> Log {
+        match self.0 {}
+    }
+    pub fn mark(&self, _: &str) {
+        match self.0 {}
+    }
+    pub fn elements(&self) -> Option<usize> {
+        match self.0 {}
+    }
+    pub fn release_all(&self) {
+        match self.0 {}
+    }
+    pub fn appeared(&self, _: &Value, _: Duration) -> Result<(Option<u64>, u64)> {
+        match self.0 {}
+    }
+    pub fn count_elements(&self) -> Result<usize> {
+        match self.0 {}
+    }
+    pub fn changes(&self) -> Vec<u64> {
+        match self.0 {}
+    }
+    pub fn parked(&self) -> Option<bool> {
+        match self.0 {}
+    }
+}
+
+#[cfg(windows)]
+mod win {
+    use super::*;
+    use crate::etw::PresentCapture;
+    use crate::host;
+    use crate::target::a11y::input::{self, Button, Key, Mods, Poster, Target};
+    use crate::target::a11y::{self, Accessibility, Action, Selector, Tree};
+    use std::cell::Cell;
+    use std::time::Instant;
+
+    /// Quiet that counts as idle: no present and no accessibility change for this long.
+    const IDLE_NS: u64 = 300_000_000;
+
+    pub struct Session {
+        a11y: Box<dyn Accessibility>,
+        poster: Poster,
+        pids: RefCell<Vec<u32>>,
+        main: Cell<isize>,
+        log: RefCell<Log>,
+        /// Change counts at the start of the run, for the per-run list of change times.
+        last_input: Cell<u64>,
+        /// The tree's size at the last snapshot (`StateDrift` reads it at each run's end).
+        size: Cell<Option<usize>>,
+        /// Whether the OS cursor could be parked on the pointer's point (false on a locked session).
+        parked: Cell<Option<bool>>,
+    }
+
+    impl Session {
+        pub fn open(pids: &[u32], main: isize) -> Result<Session> {
+            Ok(Session {
+                a11y: a11y::open(pids)?,
+                poster: Poster::start()?,
+                pids: RefCell::new(pids.to_vec()),
+                main: Cell::new(main),
+                log: RefCell::new(Log::default()),
+                last_input: Cell::new(0),
+                size: Cell::new(None),
+                parked: Cell::new(None),
+            })
+        }
+
+        pub fn set_pids(&self, pids: &[u32]) {
+            self.a11y.set_pids(pids);
+            *self.pids.borrow_mut() = pids.to_vec();
+        }
+
+        pub fn set_main(&self, hwnd: isize) {
+            self.main.set(hwnd);
+        }
+
+        pub fn take_log(&self) -> Log {
+            std::mem::take(&mut *self.log.borrow_mut())
+        }
+
+        pub fn mark(&self, name: &str) {
+            self.log.borrow_mut().marks.push((name.to_string(), host::now_ns()));
+        }
+
+        /// Elements in the app's windows at the last snapshot.
+        pub fn elements(&self) -> Option<usize> {
+            self.size.get()
+        }
+
+        pub fn release_all(&self) {
+            self.poster.release_all(self.main.get());
+        }
+
+        /// Times of the accessibility changes heard so far (the newest 65,536).
+        pub fn changes(&self) -> Vec<u64> {
+            self.a11y.change_times()
+        }
+
+        /// Whether the OS cursor could be parked on the pointer's points (hover tracking agrees).
+        pub fn parked(&self) -> Option<bool> {
+            self.parked.get()
+        }
+
+        fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
+            self.last_input.set(t_ns);
+            self.log.borrow_mut().inputs.push(Input { t_ns, kind, first });
+        }
+
+        /// The app's windows to search, main first: `window` (a title, or part of one) picks one.
+        fn windows(&self, window: Option<&str>) -> Result<Vec<isize>> {
+            let all = host::top_windows(&self.pids.borrow());
+            let main = self.main.get();
+            if let Some(w) = window.filter(|w| *w != "main") {
+                return all
+                    .iter()
+                    .find(|x| x.1.contains(w))
+                    .map(|x| vec![x.0])
+                    .ok_or_else(|| Error::usage(format!("window {w:?}: the app's visible windows are {}", all.iter().map(|x| format!("{:?}", x.1)).collect::<Vec<_>>().join(", "))));
             }
-            "type" => {
-                let o = opts(2);
-                let delay = o.get("delay").and_then(Value::as_f64).unwrap_or(0.0);
-                let text = s(1);
-                let mut a = json!({ "selector": s(0), "text": text });
-                if delay > 0.0 {
-                    a["delay_ms"] = json!(delay);
+            let mut v = vec![main];
+            v.extend(all.iter().map(|x| x.0).filter(|h| *h != main));
+            Ok(v)
+        }
+
+        fn snapshot(&self, window: Option<&str>) -> Result<Tree> {
+            let t = self.a11y.snapshot(&self.windows(window)?)?;
+            self.size.set(Some(t.nodes.len()));
+            Ok(t)
+        }
+
+        /// The first visible element `sel` matches, waiting up to `timeout` for the app's tree to show
+        /// it (re-read on each change it announces, never on a timer). An app with no tree at all
+        /// says so.
+        fn find(&self, sel: &Selector, window: Option<&str>, timeout: Duration) -> Result<(Tree, usize)> {
+            let deadline = Instant::now() + timeout;
+            loop {
+                let seen = self.a11y.changes().count;
+                let tree = self.snapshot(window)?;
+                if let Some(&i) = tree.find(sel).first() {
+                    return Ok((tree, i));
                 }
-                self.op("type", a, &o, delay * text.chars().count() as f64 / 1e3)
-            }
-            "press" => self.op("press", json!({ "chord": s(0) }), &opts(1), 0.0),
-            "scroll" => {
-                let d = opts(1);
-                if d.get("byX").and_then(Value::as_f64).is_some_and(|x| x != 0.0) {
-                    return Err(Error::usage("page.scroll() with byX: a native app's bridge scrolls vertically; use page.wheel() for a horizontal delta"));
+                if Instant::now() >= deadline {
+                    let why = if tree.nodes.len() <= tree.windows.len() {
+                        format!(
+                            "the app's windows expose no accessibility tree ({} element{}): strobe finds elements through it, so this app can be measured from outside only",
+                            tree.nodes.len(),
+                            if tree.nodes.len() == 1 { "" } else { "s" }
+                        )
+                    } else {
+                        format!("nothing visible matched in {} s ({} elements in its windows)", timeout.as_secs(), tree.nodes.len())
+                    };
+                    return Err(Error {
+                        code: 124,
+                        message: format!("selector {:?}: {why}", sel.source),
+                        hint: Some("check the key with page.query(\"role=button\") or an accessibility inspector".into()),
+                    });
                 }
-                let by = d.get("by").and_then(Value::as_f64).unwrap_or(0.0);
-                let speed = d.get("speed").and_then(Value::as_f64).unwrap_or(3000.0);
-                self.op("scroll", json!({ "selector": s(0), "by": by, "speed": speed }), &opts(2), by.abs() / speed.max(1.0))
+                self.a11y.wait_change(seen, settle(&tree, deadline));
             }
-            "wheel" => {
-                let d = opts(1);
-                let mut a = json!({ "dx": d.get("dx").and_then(Value::as_f64).unwrap_or(0.0), "dy": d.get("dy").and_then(Value::as_f64).unwrap_or(0.0) });
-                if !s(0).is_empty() {
-                    a["selector"] = json!(s(0));
+        }
+
+        /// The centre of the element's visible part, checked against what the OS hit-tests there
+        /// (an element under another one is not clickable), and the window that point posts to.
+        fn aim(&self, tree: &Tree, i: usize) -> Result<(f64, f64, Target)> {
+            let r = tree.visible_rect(i).ok_or_else(|| Error::msg("the element is not visible"))?;
+            let (x, y) = (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+            if let Err(what) = self.a11y.hit(i, x, y)? {
+                if host::session_locked() {
+                    return Err(Error::refused(
+                        "SessionLocked",
+                        format!("pointer input at {:?}: the session is locked, so the OS hit-tests every point to the lock screen ({what}) and a click cannot be aimed", tree.key_path(i)),
+                        "run pointer cases on an unlocked session; keys reach a focused element while locked (page.act(sel, \"focus\"), then type or press)",
+                    ));
                 }
-                self.op("wheel", a, &opts(2), 0.0)
+                return Err(Error::refused(
+                    "WindowHidden",
+                    format!("{:?} at ({x:.0}, {y:.0}) is under {what}: a click there reaches that, not the element", tree.key_path(i)),
+                    "wait until the element is uncovered (until: a selector), or close what covers it",
+                ));
             }
-            "waitFor" => {
-                let o = opts(1);
-                let mut until = json!({ "selector": s(0) });
-                for k in ["text", "exact"] {
-                    if let Some(v) = o.get(k) {
-                        until[k] = v.clone();
+            let t = self.poster.target(&self.pids.borrow(), x, y)?;
+            Ok((x, y, t))
+        }
+
+        /// Parks the OS cursor on the point so hover tracking agrees with the posted input.
+        fn park(&self, x: f64, y: f64) -> Result<()> {
+            let ok = self.poster.park(x, y)?;
+            self.parked.set(Some(ok));
+            Ok(())
+        }
+
+        fn frame_ms(&self, x: f64, y: f64) -> u64 {
+            host::refresh_at(x as i32, y as i32).map_or(16, |hz| (1000 / hz.max(1)).max(4) as u64)
+        }
+
+        /// Resolves after an input: a selector shows, the next frame reached the screen, or idle.
+        fn until(&self, opts: &Value, after: u64, presents: &RefCell<Option<PresentCapture>>) -> Result<()> {
+            let Some(u) = opts.get("until").filter(|u| !u.is_null()) else { return Ok(()) };
+            let t = timeout(opts);
+            match u.as_str() {
+                Some("idle") => self.idle(after, t, presents).map(|_| ()),
+                Some("frame") => self.frame(after, t, presents).map(|_| ()),
+                _ => self.find(&Selector::parse(u)?, opts["window"].as_str(), t).map(|_| ()),
+            }
+        }
+
+        /// The first present of the app that started after `after` and reached the screen.
+        fn frame(&self, after: u64, t: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<u64> {
+            let mut p = presents.borrow_mut();
+            let p = p.as_mut().ok_or_else(|| {
+                Error::refused(
+                    "NoPresentSource",
+                    "until: \"frame\" waits for the app's next frame on screen, from OS present events, which this block has none of",
+                    "run strobe up for present events, or wait for a selector",
+                )
+            })?;
+            let v = p.live(&self.pids.borrow(), after, t)?;
+            if v.next_screen_ns == 0 {
+                return Err(Error { code: 124, message: format!("until frame: the app showed no frame in {} s", t.as_secs()), hint: None });
+            }
+            Ok(v.next_screen_ns)
+        }
+
+        /// Waits until the app presented nothing and announced no accessibility change for 300 ms
+        /// after `after`; returns when the quiet began.
+        pub fn idle(&self, after: u64, t: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<u64> {
+            let deadline = Instant::now() + t;
+            loop {
+                let c = self.a11y.changes();
+                let mut last = after.max(c.last_ns).max(self.last_input.get());
+                if let Some(p) = presents.borrow_mut().as_mut() {
+                    last = last.max(p.live(&self.pids.borrow(), u64::MAX, Duration::ZERO)?.last_start_ns);
+                }
+                // Present events reach strobe within a flush (10 ms): allow for it before calling it quiet.
+                let quiet_at = last + IDLE_NS + 30_000_000;
+                let now = host::now_ns();
+                if now >= quiet_at {
+                    return Ok(last);
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error { code: 124, message: format!("idle: the app kept drawing or changing for {} s", t.as_secs()), hint: None });
+                }
+                let wake = Instant::now() + Duration::from_nanos(quiet_at - now);
+                self.a11y.wait_change(c.count, wake.min(deadline));
+            }
+        }
+
+        /// A launch's `until` selector: when strobe began the last read of the app's tree that lacked
+        /// it (None when the first read had it) and when it finished the first that had it.
+        pub fn appeared(&self, sel: &Value, t: Duration) -> Result<(Option<u64>, u64)> {
+            let sel = Selector::parse(sel)?;
+            let deadline = Instant::now() + t;
+            let mut lacked = None;
+            loop {
+                let seen = self.a11y.changes().count;
+                let tree = self.snapshot(None)?;
+                let done = host::now_ns();
+                if !tree.find(&sel).is_empty() {
+                    return Ok((lacked, done));
+                }
+                lacked = Some(tree.at_ns);
+                if Instant::now() >= deadline {
+                    return Err(Error { code: 124, message: format!("selector {:?}: nothing visible matched in {} s", sel.source, t.as_secs()), hint: None });
+                }
+                self.a11y.wait_change(seen, settle(&tree, deadline));
+            }
+        }
+
+        /// Elements in the app's windows now (`StateDrift`).
+        pub fn count_elements(&self) -> Result<usize> {
+            Ok(self.snapshot(None)?.nodes.len())
+        }
+
+        /// Before an input that is measured: at least `min`, then until the app has presented
+        /// nothing for two refreshes (at most 300 ms), so a frame of what came before (a hover, a
+        /// click's pressed look) is not taken for the input's (SPEC §7.4). Reads only strobe's own
+        /// copy of the present events.
+        fn rest(&self, min: Duration, refresh: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<()> {
+            std::thread::sleep(min);
+            let quiet = (refresh * 2).as_nanos() as u64;
+            let until = Instant::now() + Duration::from_millis(300);
+            while let Some(p) = presents.borrow_mut().as_mut() {
+                let last = p.live(&self.pids.borrow(), u64::MAX, Duration::ZERO)?.last_start_ns;
+                let now = host::now_ns();
+                if last + quiet <= now || Instant::now() >= until {
+                    break;
+                }
+                std::thread::sleep(Duration::from_nanos(last + quiet - now).min(Duration::from_millis(20)));
+            }
+            Ok(())
+        }
+
+        /// Where keys for `sel` go: its window, and the element's own window when it is one (a
+        /// classic control takes its keys there, as it does once it has focus); without a selector,
+        /// the main window's UI thread's focus window. An element without focus is clicked first, as
+        /// a person clicks into a field (that click is no keystroke), except a control with its own
+        /// window on a locked session, where no click can be aimed.
+        fn key_target(&self, sel: &str, o: &Value, presents: &RefCell<Option<PresentCapture>>) -> Result<(isize, Option<isize>)> {
+            if sel.is_empty() {
+                return Ok((self.main.get(), None));
+            }
+            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, o["window"].as_str(), timeout(o))?;
+            let top = tree.windows[tree.nodes[i].window];
+            let own = tree.nodes[i].hwnd;
+            let to = (own != 0 && own != top).then_some(own);
+            if !tree.focus_within(i) && !(to.is_some() && host::session_locked()) {
+                self.click(sel, &json!({ "window": o["window"] }), presents, "pointer")?;
+            }
+            Ok((top, to))
+        }
+
+        fn click(&self, sel: &str, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
+            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, opts["window"].as_str(), timeout(opts))?;
+            let (x, y, t) = self.aim(&tree, i)?;
+            let b = Button::parse(opts["button"].as_str())?;
+            let mods = Mods::parse_list(&opts["modifiers"])?;
+            let count = opts["count"].as_u64().unwrap_or(1).clamp(1, 3);
+            self.park(x, y)?;
+            let top = tree.windows[tree.nodes[i].window];
+            let gap = Duration::from_millis(self.frame_ms(x, y));
+            self.input(self.poster.move_to(t, 0)?, "pointer", false);
+            let mut last = 0;
+            for k in 0..count {
+                // The press shows a pressed look at most; the release is the click's action, held
+                // as a person holds a click (a double click's second press follows at once).
+                self.input(self.poster.button(t, b, true, k > 0, mods, top)?, "pointer", false);
+                if count > 1 {
+                    std::thread::sleep(gap);
+                } else {
+                    self.rest(Duration::from_millis(60), gap, presents)?;
+                }
+                last = self.poster.button(t, b, false, false, mods, top)?;
+                self.input(last, kind, false);
+            }
+            self.until(opts, last, presents)
+        }
+    }
+
+    /// How long to wait for the next change: until the deadline, except while a window has not
+    /// answered for its tree yet (no events can come from it then), when the tree is read again in 50 ms.
+    fn settle(tree: &Tree, deadline: Instant) -> Instant {
+        if tree.nodes.is_empty() { deadline.min(Instant::now() + Duration::from_millis(50)) } else { deadline }
+    }
+
+    fn timeout(opts: &Value) -> Duration {
+        opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::from_secs(30))
+    }
+
+    impl Session {
+        /// One page call from the runner. `pixels`: a pixels block's folder for `snapshot`.
+        pub fn dispatch(&self, call: &str, args: &[Value], presents: &RefCell<Option<PresentCapture>>, pixels: Option<&std::path::Path>) -> Result<Value> {
+            let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
+            let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
+            let main = self.main.get();
+            match call {
+                "click" => self.click(&s(0), &opts(1), presents, "discrete")?,
+                "hover" => {
+                    let o = opts(1);
+                    let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let (x, y, t) = self.aim(&tree, i)?;
+                    self.park(x, y)?;
+                    let at = self.poster.move_to(t, 0)?;
+                    self.input(at, "pointer", false);
+                    self.until(&o, at, presents)?;
+                }
+                "move" => {
+                    let at = |i: usize| args.get(i).and_then(Value::as_f64).unwrap_or(0.0);
+                    let o = opts(2);
+                    let (x, y) = self.poster.client_point(main, at(0), at(1))?;
+                    let t = self.poster.target(&self.pids.borrow(), x, y)?;
+                    self.park(x, y)?;
+                    let at = self.poster.move_to(t, 0)?;
+                    self.input(at, "pointer", false);
+                    self.until(&o, at, presents)?;
+                }
+                "type" => {
+                    let o = opts(2);
+                    let delay = Duration::from_millis(o["delay"].as_f64().unwrap_or(0.0).max(0.0) as u64);
+                    let (top, to) = self.key_target(&s(0), &o, presents)?;
+                    self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
+                    let mut last = 0;
+                    for (k, c) in s(1).chars().enumerate() {
+                        if k > 0 && !delay.is_zero() {
+                            std::thread::sleep(delay);
+                        }
+                        let key = if c == '\n' { Key::Vk(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN) } else { Key::Char(c) };
+                        last = self.poster.press(top, to, Mods::default(), key)?;
+                        self.input(last, "discrete", false);
                     }
+                    self.until(&o, last, presents)?;
                 }
-                self.wait(until, &o)
-            }
-            "idle" => self.wait(json!("idle"), &opts(0)),
-            "frame" => self.wait(json!("frame"), &opts(0)),
-            "wait" => {
-                let ms = args.first().and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-                std::thread::sleep(Duration::from_millis(ms as u64));
-                Ok(Value::Bool(true))
-            }
-            "window" => {
-                let o = opts(1);
-                let mut a = json!({ "action": s(0) });
-                if let Some(w) = o.get("window") {
-                    a["window"] = w.clone();
+                "press" => {
+                    let (mods, key) = input::parse_chord(&s(0))?;
+                    let o = opts(1);
+                    let (top, to) = self.key_target(o["selector"].as_str().unwrap_or(""), &o, presents)?;
+                    let at = self.poster.press(top, to, mods, key)?;
+                    self.input(at, "discrete", false);
+                    self.until(&opts(1), at, presents)?;
                 }
-                self.bridge.request("window", a, self.timeout(&o) + Duration::from_secs(10))?;
-                Ok(Value::Bool(true))
-            }
-            "snapshot" => {
-                let Some(dir) = &self.pixels else { return Ok(Value::Bool(false)) };
-                let name: String = s(0).chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-                std::fs::create_dir_all(dir)?;
-                let mut a = json!({ "path": dir.join(format!("{name}.png")) });
-                if let Some(w) = opts(1).get("window") {
-                    a["window"] = w.clone();
+                "down" | "up" => {
+                    let (mods, key) = input::parse_chord(&s(0))?;
+                    if mods.any() {
+                        return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
+                    }
+                    let at = if call == "down" { self.poster.hold(main, key)? } else { self.poster.release(main, key)? };
+                    self.input(at, if call == "down" { "discrete" } else { "pointer" }, false);
+                    self.until(&opts(1), at, presents)?;
                 }
-                self.bridge.request("snapshot", a, Duration::from_secs(60))?;
-                Ok(Value::Bool(true))
+                "scroll" => {
+                    let d = opts(1);
+                    let o = opts(2);
+                    let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let (x, y, t) = self.aim(&tree, i)?;
+                    self.park(x, y)?;
+                    self.input(self.poster.move_to(t, 0)?, "pointer", false);
+                    self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(x, y)), presents)?;
+                    let (by_y, by_x) = (d["by"].as_f64().unwrap_or(0.0), d["byX"].as_f64().unwrap_or(0.0));
+                    let speed = d["speed"].as_f64().unwrap_or(3000.0).max(1.0);
+                    // One wheel step per refresh at that speed, as a trackpad sends them.
+                    let frame = Duration::from_millis(self.frame_ms(x, y));
+                    let steps = ((by_y.abs().max(by_x.abs()) / speed) / frame.as_secs_f64()).ceil().max(1.0) as usize;
+                    let start = Instant::now();
+                    let mut last = 0;
+                    for k in 0..steps {
+                        let due = start + frame * k as u32;
+                        if let Some(w) = due.checked_duration_since(Instant::now()) {
+                            std::thread::sleep(w);
+                        }
+                        last = self.poster.wheel(t, by_x / steps as f64, by_y / steps as f64)?;
+                        self.input(last, "scroll", k == 0);
+                    }
+                    self.until(&o, last, presents)?;
+                }
+                "wheel" => {
+                    let d = opts(1);
+                    let o = opts(2);
+                    let (x, y, t) = if s(0).is_empty() {
+                        let w = host::window_state(main).ok_or_else(|| Error::msg("the app's window closed"))?;
+                        let (x, y) = self.poster.client_point(main, w.client.0 as f64 / w.scale() / 2.0, w.client.1 as f64 / w.scale() / 2.0)?;
+                        (x, y, self.poster.target(&self.pids.borrow(), x, y)?)
+                    } else {
+                        let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                        self.aim(&tree, i)?
+                    };
+                    self.park(x, y)?;
+                    self.input(self.poster.move_to(t, 0)?, "pointer", false);
+                    self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(x, y)), presents)?;
+                    let at = self.poster.wheel(t, d["dx"].as_f64().unwrap_or(0.0), d["dy"].as_f64().unwrap_or(0.0))?;
+                    self.input(at, "scroll", true);
+                    self.until(&o, at, presents)?;
+                }
+                "act" => {
+                    let o = opts(2);
+                    let (_, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let action = Action::parse(&s(1), o["value"].as_str())?;
+                    let at = self.a11y.act(i, &action)?;
+                    self.input(at, "pattern", false);
+                    self.until(&o, at, presents)?;
+                }
+                "query" => {
+                    let o = opts(1);
+                    let tree = self.snapshot(o["window"].as_str())?;
+                    let sel = Selector::parse(&Value::String(s(0)))?;
+                    let found: Vec<Value> = tree.find(&sel).into_iter().map(|i| tree.describe(i)).collect();
+                    return Ok(Value::Array(found));
+                }
+                "waitFor" => {
+                    let o = opts(1);
+                    let mut sel = json!({ "selector": s(0) });
+                    for k in ["text", "exact"] {
+                        if let Some(v) = o.get(k) {
+                            sel[k] = v.clone();
+                        }
+                    }
+                    self.find(&Selector::parse(&sel)?, o["window"].as_str(), timeout(&o))?;
+                }
+                "idle" => {
+                    self.idle(host::now_ns(), timeout(&opts(0)), presents)?;
+                }
+                "frame" => {
+                    self.frame(host::now_ns(), timeout(&opts(0)), presents)?;
+                }
+                "wait" => {
+                    let ms = args.first().and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
+                    std::thread::sleep(Duration::from_millis(ms as u64));
+                }
+                "window" => {
+                    let o = opts(1);
+                    let w = self.windows(o["window"].as_str())?[0];
+                    self.poster.window(w, &s(0))?;
+                }
+                "snapshot" => {
+                    let Some(dir) = pixels else { return Ok(Value::Bool(false)) };
+                    let name: String = s(0).chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
+                    let w = self.windows(opts(1)["window"].as_str())?[0];
+                    let img = host::window_image(w).ok_or_else(|| Error::msg(format!("snapshot {name}: the window did not draw itself (PrintWindow)")))?;
+                    std::fs::create_dir_all(dir)?;
+                    std::fs::write(dir.join(format!("{name}.png")), crate::png::write(&img)?)?;
+                }
+                "goto" | "eval" => {
+                    return Err(Error::usage(format!(
+                        "page.{call}() is a page's: a native app is driven through its accessibility tree and its message loop (click, hover, move, type, press, down, up, scroll, wheel, act, query, waitFor, idle, frame, wait, window, snapshot)"
+                    )));
+                }
+                other => return Err(Error::msg(format!("unknown page call {other}"))),
             }
-            "goto" | "eval" | "down" | "up" => Err(Error::usage(format!(
-                "page.{call}() is not available on a native target: its bridge drives elements, the pointer, keys, the wheel and windows (click, hover, move, type, press, scroll, wheel, waitFor, idle, wait, window, snapshot)"
-            ))),
-            other => Err(Error::msg(format!("unknown page call {other}"))),
-        }
-    }
-
-    fn timeout(&self, opts: &Value) -> Duration {
-        opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(self.op_timeout)
-    }
-
-    /// An input op with the call's options: `until`, `timeout` (as `timeout_ms`), `window`, and the
-    /// pointer's `button`, `count` and `modifiers`. `busy_s` is how long the input itself takes.
-    fn op(&self, op: &str, mut args: Value, opts: &Value, busy_s: f64) -> Result<Value> {
-        let t = self.timeout(opts);
-        if let (Some(a), Some(o)) = (args.as_object_mut(), opts.as_object()) {
-            copy(o, a, &["until", "window", "button", "count", "modifiers"]);
-            a.insert("timeout_ms".into(), json!(t.as_millis() as u64));
-        }
-        self.bridge.request(op, args, t + Duration::from_secs_f64(busy_s) + Duration::from_secs(10))
-    }
-
-    /// `wait` until a selector, `"idle"` or `"frame"`.
-    fn wait(&self, until: Value, opts: &Value) -> Result<Value> {
-        let t = self.timeout(opts);
-        let mut a = json!({ "until": until, "timeout_ms": t.as_millis() as u64 });
-        if let Some(w) = opts.get("window") {
-            a["window"] = w.clone();
-        }
-        self.bridge.request("wait", a, t + Duration::from_secs(10))?;
-        Ok(Value::Bool(true))
-    }
-}
-
-fn copy(from: &Map<String, Value>, to: &mut Map<String, Value>, keys: &[&str]) {
-    for k in keys {
-        if let Some(v) = from.get(*k).filter(|v| !v.is_null()) {
-            to.insert(k.to_string(), v.clone());
+            Ok(Value::Bool(true))
         }
     }
 }

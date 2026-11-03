@@ -47,6 +47,8 @@ pub fn run(args: &Args) -> Result<Output> {
             let sql = args.pos.get(2).ok_or_else(|| Error::usage("query <h> sql \"select …\""))?;
             sql_view(&trace, sql, top.max(50))
         }
+        "frames" if dir.join("frames.json").exists() || meta["native"] == true => native_frames(&dir, top),
+        "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
         "gpu" => gpu(&trace, top),
@@ -635,6 +637,87 @@ fn gpu(trace: &Path, top: usize) -> Result<Output> {
          group by 1, 2 order by total_ms desc limit {top}"
     );
     sql_view(trace, &sql, top)
+}
+
+/// A native recording's threads, busiest waker first: context switches per second over the measured
+/// runs, CPU per run from each thread's cycle counter, and its name.
+fn native_threads(dir: &Path, top: usize) -> Result<Output> {
+    let rows = store::read_json(&dir.join("threads.json"))?;
+    let all = rows.as_array().cloned().unwrap_or_default();
+    let mut text = format!("{:>10}  {:>12}  {:>7}  {:>7}  thread\n", "wakes/s", "cpu ms/run", "pid", "tid");
+    for r in all.iter().take(top) {
+        text += &format!(
+            "{:>10}  {:>12}  {:>7}  {:>7}  {}\n",
+            fmt::value(r["wakes_per_s"].as_f64().unwrap_or(f64::NAN), "count"),
+            fmt::value(r["cpu_ms_per_run"].as_f64().unwrap_or(f64::NAN), "count"),
+            r["pid"],
+            r["tid"],
+            r["name"].as_str().unwrap_or("(unnamed)")
+        );
+    }
+    if all.len() > top {
+        text += &format!("… {} more (--top)\n", all.len() - top);
+    }
+    text += "wakes: context switches of the thread (each a switch in to run); a thread that exited during a run is not listed\n";
+    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>() })))
+}
+
+/// A native recording's frames (from the app's bridge): what each run submitted per surface, the gaps
+/// between submissions, and when the toolkit knows them, presentation times.
+fn native_frames(dir: &Path, top: usize) -> Result<Output> {
+    let f = store::read_json(&dir.join("frames.json")).map_err(|_| Error::usage("this native recording has no frames: they come from the app's bridge (its toolkit built with strobe support)"))?;
+    let cols: Vec<String> = f["columns"].as_array().into_iter().flatten().filter_map(|c| c.as_str().map(str::to_string)).collect();
+    let col = |name: &str| cols.iter().position(|c| c == name);
+    let (seq, surface, begin, cpu_end, submit, present, input) = (col("seq"), col("surface"), col("begin_ns"), col("cpu_end_ns"), col("submit_ns"), col("present_ns"), col("input_ns"));
+    let num = |row: &Value, i: Option<usize>| i.and_then(|i| row[i].as_f64()).unwrap_or(0.0);
+    let mut text = String::new();
+    let mut runs_json = Vec::new();
+    let mut worst: Vec<(f64, String, f64)> = Vec::new();
+    for (run, rows) in f["runs"].as_object().into_iter().flatten() {
+        let rows = rows.as_array().cloned().unwrap_or_default();
+        let mut work: Vec<f64> = rows.iter().map(|r| (num(r, cpu_end) - num(r, begin)) / 1e6).filter(|x| *x >= 0.0).collect();
+        work.sort_by(f64::total_cmp);
+        let mut gaps: Vec<f64> = Vec::new();
+        let mut last: BTreeMap<i64, f64> = BTreeMap::new();
+        for r in &rows {
+            let s = num(r, surface) as i64;
+            let at = num(r, submit);
+            if let Some(prev) = last.insert(s, at)
+                && at > prev
+            {
+                gaps.push((at - prev) / 1e6);
+            }
+            let w = (num(r, cpu_end) - num(r, begin)) / 1e6;
+            worst.push((w, run.clone(), num(r, seq)));
+        }
+        gaps.sort_by(f64::total_cmp);
+        let presented: Vec<f64> = rows.iter().filter(|r| num(r, present) > 0.0).map(|r| (num(r, present) - num(r, begin)) / 1e6).collect();
+        let inputs = rows.iter().filter(|r| num(r, input) > 0.0).count();
+        text += &format!(
+            "{run:<8} {:>5} frames · work p50 {} · p95 {} · interval p50 {} · p95 {} · max {}{}{}\n",
+            rows.len(),
+            fmt::value(metrics::percentile(&work, 0.5), "ms"),
+            fmt::value(metrics::percentile(&work, 0.95), "ms"),
+            fmt::value(metrics::percentile(&gaps, 0.5), "ms"),
+            fmt::value(metrics::percentile(&gaps, 0.95), "ms"),
+            fmt::value(gaps.last().copied().unwrap_or(f64::NAN), "ms"),
+            if presented.is_empty() { String::new() } else { format!(" · {} presented", presented.len()) },
+            if inputs > 0 { format!(" · {inputs} after input") } else { String::new() },
+        );
+        runs_json.push(
+            json!({ "run": run, "frames": rows.len(), "work_p95": metrics::percentile(&work, 0.95), "interval_p95": metrics::percentile(&gaps, 0.95), "presented": presented.len(), "inputs": inputs }),
+        );
+    }
+    worst.sort_by(|a, b| b.0.total_cmp(&a.0));
+    text += "heaviest frames (begin to work done)\n";
+    for (w, run, s) in worst.iter().take(top.min(10)) {
+        text += &format!("  {:>9}  {run} frame {s}\n", fmt::value(*w, "ms"));
+    }
+    text += "frames are what the app submitted; presented times come only from the toolkit or OS present events\n";
+    if let Some(marks) = f["marks"].as_object().filter(|m| !m.is_empty()) {
+        text += &format!("marks    {}\n", marks.values().map(|m| m.as_array().map_or(0, Vec::len)).sum::<usize>());
+    }
+    Ok(Output::new(text, json!({ "runs": runs_json, "columns": cols })))
 }
 
 fn threads(trace: &Path, top: usize) -> Result<Output> {

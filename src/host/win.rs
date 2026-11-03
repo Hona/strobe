@@ -149,6 +149,13 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
     }
 }
 
+pub fn set_thread_affinity(mask: u64) {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+    unsafe {
+        SetThreadAffinityMask(GetCurrentThread(), mask as usize);
+    }
+}
+
 fn reg_string(key: &str, value: &str) -> Option<String> {
     let (k, v) = (wide(key), wide(value));
     let mut buf = vec![0u16; 512];
@@ -444,6 +451,85 @@ pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
     }
 }
 
+/// The largest visible top-level window of these processes that is not minimized (over 100×100).
+pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible};
+    struct State<'a> {
+        pids: &'a [u32],
+        best: Option<(i64, HWND, u32)>,
+    }
+    unsafe extern "system" fn each(hwnd: HWND, lparam: LPARAM) -> i32 {
+        let state = unsafe { &mut *(lparam as *mut State) };
+        let mut pid = 0u32;
+        unsafe { GetWindowThreadProcessId(hwnd, &mut pid) };
+        if state.pids.contains(&pid) && unsafe { IsWindowVisible(hwnd) } != 0 && unsafe { IsIconic(hwnd) } == 0 {
+            let mut r: RECT = unsafe { zeroed() };
+            if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
+                let area = (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
+                if area > 10_000 && state.best.is_none_or(|(a, _, _)| area > a) {
+                    state.best = Some((area, hwnd, pid));
+                }
+            }
+        }
+        1
+    }
+    let mut state = State { pids, best: None };
+    unsafe { EnumWindows(Some(each), &mut state as *mut State as LPARAM) };
+    let (_, hwnd, pid) = state.best?;
+    window_state(hwnd as isize).map(|mut w| {
+        w.pid = pid;
+        w
+    })
+}
+
+/// A window's place and state now; None once it no longer exists.
+pub fn window_state(hwnd: isize) -> Option<super::TopWindow> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible};
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    unsafe {
+        if IsWindow(h) == 0 {
+            return None;
+        }
+        let (mut r, mut c): (RECT, RECT) = (zeroed(), zeroed());
+        GetWindowRect(h, &mut r);
+        GetClientRect(h, &mut c);
+        let mut cloaked = 0u32;
+        DwmGetWindowAttribute(h, DWMWA_CLOAKED as u32, &mut cloaked as *mut u32 as *mut _, 4);
+        let mut pid = 0u32;
+        GetWindowThreadProcessId(h, &mut pid);
+        Some(super::TopWindow {
+            hwnd,
+            pid,
+            rect: (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            client: (c.right - c.left, c.bottom - c.top),
+            visible: IsWindowVisible(h) != 0,
+            iconic: IsIconic(h) != 0,
+            cloaked: cloaked != 0,
+            dpi: GetDpiForWindow(h).max(96),
+        })
+    }
+}
+
+/// Moves a window to `(x, y)` and, with `client`, sizes it so its client area is that many
+/// device-independent pixels at the window's DPI; keeps it topmost without activating it. Posted, so
+/// a busy UI thread never blocks strobe.
+pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u32)>) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{HWND_TOPMOST, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOSIZE, SWP_SHOWWINDOW, SetWindowPos};
+    let border = (w.rect.2 - w.client.0, w.rect.3 - w.client.1);
+    let scale = |v: u32| (v as f64 * w.dpi as f64 / 96.0).round() as i32;
+    let (cx, cy, size) = match client {
+        Some((cw, ch)) => (scale(cw) + border.0, scale(ch) + border.1, 0),
+        None => (0, 0, SWP_NOSIZE),
+    };
+    unsafe {
+        SetWindowPos(w.hwnd as _, HWND_TOPMOST, x, y, cx, cy, SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_ASYNCWINDOWPOS | size);
+    }
+}
+
 pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     unsafe {
         let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);
@@ -499,9 +585,39 @@ struct SysProcRaw {
     peak_nonpaged: usize,
     nonpaged: usize,
     pagefile: usize,
+    peak_pagefile: usize,
+    private_pages: usize,
+    read_ops: i64,
+    write_ops: i64,
+    other_ops: i64,
+    read_bytes: i64,
+    write_bytes: i64,
+    other_bytes: i64,
 }
 
-fn system_processes(names: bool) -> Vec<SysProc> {
+/// SYSTEM_THREAD_INFORMATION (x64): `threads` of them follow each process record.
+#[repr(C)]
+#[allow(dead_code)]
+struct SysThreadRaw {
+    kernel: i64,
+    user: i64,
+    create: i64,
+    wait_time: u32,
+    start: usize,
+    process: usize,
+    thread: usize,
+    priority: i32,
+    base_priority: i32,
+    switches: u32,
+    state: u32,
+    wait_reason: u32,
+}
+
+const _: () = assert!(size_of::<SysProcRaw>() == 0x100 && size_of::<SysThreadRaw>() == 0x50);
+
+/// Calls `f` with every process record of one `NtQuerySystemInformation(SystemProcessInformation)`
+/// snapshot and its thread records.
+fn each_process(mut f: impl FnMut(&SysProcRaw, &[SysThreadRaw])) -> bool {
     use std::cell::RefCell;
     use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessInformation};
     thread_local! {
@@ -516,45 +632,111 @@ fn system_processes(names: bool) -> Vec<SysProc> {
                 continue;
             }
             if rc < 0 {
-                return Vec::new();
+                return false;
             }
             break;
         }
-        let mut out = Vec::with_capacity(512);
         let base = buf.as_ptr() as *const u8;
         let mut off = 0usize;
         loop {
             let p = &*(base.add(off) as *const SysProcRaw);
-            let name = match (names, p.name.is_null()) {
-                (false, _) => String::new(),
-                (true, true) => {
-                    if p.pid == 0 {
-                        "Idle".to_string()
-                    } else {
-                        String::new()
-                    }
-                }
-                (true, false) => String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2)),
-            };
-            out.push(SysProc {
-                info: super::ProcInfo {
-                    pid: p.pid as u32,
-                    parent: p.parent as u32,
-                    name,
-                    cpu_ns: (p.user as u64 + p.kernel as u64) * 100,
-                    cycles: p.cycles,
-                    private_bytes: p.pagefile as u64,
-                    threads: p.threads,
-                },
-                create: p.create,
-            });
+            let threads = std::slice::from_raw_parts(base.add(off + size_of::<SysProcRaw>()) as *const SysThreadRaw, p.threads as usize);
+            f(p, threads);
             if p.next == 0 {
                 break;
             }
             off += p.next as usize;
         }
-        out
+        true
     })
+}
+
+/// Every thread of `pids` (sorted) from one system snapshot: context switches so far, and each
+/// process's IO bytes so far (read, written).
+pub fn threads(pids: &[u32]) -> (Vec<super::ThreadInfo>, Vec<(u32, u64, u64)>) {
+    let (mut out, mut io) = (Vec::new(), Vec::new());
+    each_process(|p, threads| {
+        let pid = p.pid as u32;
+        if pids.binary_search(&pid).is_err() {
+            return;
+        }
+        io.push((pid, p.read_bytes.max(0) as u64, p.write_bytes.max(0) as u64));
+        for t in threads {
+            out.push(super::ThreadInfo { pid, tid: t.thread as u32, switches: t.switches, cpu_ns: (t.kernel.max(0) as u64 + t.user.max(0) as u64) * 100 });
+        }
+    });
+    (out, io)
+}
+
+/// CPU cycles charged to one thread so far (TSC units), None when it cannot be opened.
+pub fn thread_cycles_of(tid: u32) -> Option<u64> {
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+    unsafe {
+        let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+        if h.is_null() {
+            return None;
+        }
+        let mut c = 0u64;
+        let ok = QueryThreadCycleTime(h, &mut c) != 0;
+        CloseHandle(h);
+        ok.then_some(c)
+    }
+}
+
+/// A thread's name (`SetThreadDescription`, which Rust's `thread::Builder::name` and most runtimes
+/// set), None when it has none or cannot be opened.
+pub fn thread_name(tid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{GetThreadDescription, OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
+    unsafe {
+        let h = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, 0, tid);
+        if h.is_null() {
+            return None;
+        }
+        let mut name: *mut u16 = std::ptr::null_mut();
+        let ok = GetThreadDescription(h, &mut name) >= 0 && !name.is_null();
+        CloseHandle(h);
+        if !ok {
+            return None;
+        }
+        let mut n = 0usize;
+        while *name.add(n) != 0 {
+            n += 1;
+        }
+        let s = String::from_utf16_lossy(std::slice::from_raw_parts(name, n));
+        LocalFree(name as _);
+        (!s.is_empty()).then_some(s)
+    }
+}
+
+fn system_processes(names: bool) -> Vec<SysProc> {
+    let mut out = Vec::with_capacity(512);
+    each_process(|p, _| {
+        let name = match (names, p.name.is_null()) {
+            (false, _) => String::new(),
+            (true, true) => {
+                if p.pid == 0 {
+                    "Idle".to_string()
+                } else {
+                    String::new()
+                }
+            }
+            (true, false) => unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2)) },
+        };
+        out.push(SysProc {
+            info: super::ProcInfo {
+                pid: p.pid as u32,
+                parent: p.parent as u32,
+                name,
+                cpu_ns: (p.user as u64 + p.kernel as u64) * 100,
+                cycles: p.cycles,
+                private_bytes: p.pagefile as u64,
+                threads: p.threads,
+            },
+            create: p.create,
+        });
+    });
+    out
 }
 
 pub fn all_processes() -> Vec<super::ProcInfo> {

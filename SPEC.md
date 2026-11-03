@@ -96,6 +96,7 @@ locations, not only PATH.
 | analyser | A check that warns in the result (§10.2) |
 | census | A consistent per-process memory account at one moment (§8.6) |
 | bridge | `@hona/strobe-electron` inside an app's main process (§13.2) |
+| native bridge | a native app's UI toolkit's link to strobe: it drives the app and reports its UI work (§13.7) |
 | calibration | The known-cost page every probe must recover (§10.3) |
 | A/A | An experiment with the same build on both sides (§10.4) |
 
@@ -148,7 +149,9 @@ cli/            argument parsing, help, text + JSON rendering
 app/            commands (up, status, record, bench, query, report, top, update, leave, daemon)
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
 target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
-                process.rs, launch.rs (isolated launches)
+                process.rs, isolate.rs (isolated launches), electron.rs, native.rs and
+                native_bridge.rs (native apps, §13.7)
+driver/         the bench file's `page`: over CDP, or over a native app's bridge (native.rs)
 probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
                 census.rs, coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
                 helper.rs
@@ -189,8 +192,8 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 |---|---|
 | `https://…`, `http://…` | a page in a strobe-launched Chromium: isolated profile, real GPU, fixed window (§13.1) |
 | `cdp:<port>`, `cdp:ws://…` | a running CDP endpoint (Playwright's, a dev Electron's) |
-| `app:<id>` | an Electron app by its profile in strobe.json `apps` (§13.2): launched in an isolated home, or attached through its bridge (§13.3) |
-| `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app |
+| `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7) |
+| `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
 | `node:<port>`, `bun:<port>` | an inspector endpoint (§13.5) |
 | `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, deep (§13.6) |
 | `file:<path>` | import an existing capture: a Chrome trace, `.cpuprofile`, `.heapsnapshot`, or a folder of them with a `manifest.json` (§8.7) |
@@ -275,6 +278,9 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
+- A native app (`app:<id>` with a native profile, or `exe:<path> --native`) records one run from
+  outside after a 3 s settle: CPU, thread wakes, IO, GPU and memory, and with its bridge connected
+  the app's run record (§13.7). `--probes attribution` records the same until native stacks exist.
 
 ### 5.6 `strobe bench`
 
@@ -422,7 +428,30 @@ Bench files (`phase(name, fn)`, §9.6) and `@hona/strobe-web` (`phase(name)`) em
 Run and phase boundaries are `performance.mark` calls in the page (`strobe:<block>:<kind>:…`),
 one `Runtime.evaluate` per boundary, placed before the first input and after `until` resolves.
 They land on the trace clock, so windows need no clock mapping. Every metric can be sliced by
-phase.
+phase. A native app's phases are `mark` requests over its bridge, stamped on the host clock in its
+run record (§13.7).
+
+### 7.4 Native apps
+
+What strobe reads from a native app (§13.7), per run:
+
+- **From outside, always:** `cpu.work` and `cpu.app.total` (the process tree's cycles), `cpu.wakes`
+  (context switches of the tree's threads per second: how often they wake to run; from two
+  `NtQuerySystemInformation(SystemProcessInformation)` snapshots around the run, a thread or process
+  born in the run counting from zero; one that exits in the run takes its last wakes with it, so the
+  count is a lower bound then), `io.read` and `io.write` (bytes, the same snapshots), `gpu.process.3d`,
+  `gpu.vram`, `memory.app.private`, `run.duration`. Per thread: wakes per second and CPU per run from
+  the thread's cycle counter, named by `GetThreadDescription` (`query <rec> threads`).
+- **With the app's bridge:** `ui.work` (wall time of the UI thread's turns that did frame work or
+  handled input; the primary for "does this UI change cost less"), `ui.cpu` (that thread's CPU), and
+  descriptive parts `ui.view`, `ui.layout`, `ui.text`, `ui.paint`, `ui.encode`; `ui.frames` (frames the
+  UI thread submitted) and `ui.interval.p50|p95|max` (gaps between a surface's submissions, pooled over
+  the measured runs, minimum n as `canvas.interval`); `count.<name>` for every exact counter the
+  toolkit reports. Submission is not presentation: these are never called presented frames.
+- **Presented frames** (`frames.presented.*`, `frames.interval.*`, `interaction.*`) only where the
+  toolkit reports when a frame reached the screen (`present_ns`; macOS Metal's presented time).
+  `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects. Elsewhere they
+  are refused (`NoPresentSource`) until OS present events are read.
 
 ## 8. Probes
 
@@ -794,7 +823,15 @@ it, for app profiles they use from anywhere; `apps` merge per app.
   env (`VariantMismatch`).
 - `app:<id>` and `exe:<path>` need no build.
 - `build` and `serve` are what a `web()` target runs for each variant; `serve` gets a free port
-  per variant.
+  per variant. A `native(appId)` target from a directory or git ref runs `build` and launches its
+  `output`, the executable (§13.7).
+- **`{cache}`** in `build.command`, `build.output` and `build.env` is a folder that outlives builds
+  and is shared by every worktree of the repository (`<state>/builds/cache/<repo>`), so base and head
+  reuse each other's dependency builds: `"CARGO_TARGET_DIR": "{cache}/cargo-target"`. Since both
+  variants then build into one place, a native target's output (and a `.pdb` beside it, Cargo's
+  `my_app.pdb` for `my-app.exe` included) is copied into strobe's folder for that variant
+  (`<state>/builds/out/<variant>`) right after its build, and a variant whose copy is missing builds
+  again even when its key is unchanged.
 - **Harness:** the bench file's folder, the `strobe.json` in use and the paths in its `harness`
   list (repository-relative), all from the checkout that holds the bench file. Before a variant
   builds and serves, strobe copies the harness into its folder, so a base from before the bench
@@ -880,7 +917,10 @@ export default bench({
   copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
   must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
   (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)` and `script(entry,
-  opts)` are below.
+  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, bridge? })` and
+  `headless(appIdOrPath, { home?, args?, env? })` are native apps (§13.7): `viewport` sizes the main
+  window's client area in device-independent pixels where the app allows; `bridge: true` requires
+  the app's bridge in every block and `false` turns it off.
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
@@ -941,6 +981,14 @@ renders into one (a diff or code viewer) counts as a change.
 | `idle(opts?)` | the `"idle"` wait below, on its own |
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
+| `wheel(selector, { dx?, dy? }, opts?)` | one mouse-wheel event over the element (the viewport's centre with `""`) |
+| `window(action, opts?)` | native apps: `show`, `hide`, `focus` or `close` a window (`opts.window`, default the main one) through the app's own path |
+
+On a native target the app's bridge does the driving (§13.7): `click`, `hover`, `move`, `type`,
+`press`, `scroll`, `wheel`, `waitFor`, `idle`, `wait`, `window` and `snapshot` map onto its ops, with
+the same `until` and `timeout` options plus `window` (which surface). Selectors are the toolkit's:
+element keys or key-path suffixes, `role=…`, `text=…`, a `:focus` suffix. `goto`, `eval`, `down` and
+`up` fail with their name. Without the bridge only `wait` works.
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
 in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling), `"frame"`
@@ -993,6 +1041,12 @@ discarded first, so the OS has read the build from disk before any timed launch.
   service is still found; what a hook starts is the bench file's to stop (`teardown`, or a process
   exit handler for one kept across launches).
 - `cpu.work` is the CPU of the target's processes from spawn (or navigation) to ready, in cycles.
+- **Native apps** (§13.7): `until` is a window condition, `{ window: "visible" }` (its main window
+  shows), `"painted"` (its pixels first change from its first frame) or `"settled"` (their last
+  change, once they held for a second), sampled every 30 ms with the tree's CPU cycles; or, with the
+  app's bridge, a selector, timed to the commit of the frame that first showed it on the host clock.
+  A selector that already showed in an earlier frame when strobe asked refuses the launch, as a late
+  page observer does. Milestones read output and log files (a native app has no page marks).
 - **Attribution:** a launch of its own, never timed. An app's main process starts paused under
   `--inspect-brk` with its CPU profiler on (`cpu-main.cpuprofile`), and every page starts paused
   until its profiler runs (`cpu-0.cpuprofile`), so both profiles cover the launch from the first
@@ -1060,7 +1114,8 @@ sequenceDiagram
 - A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
   The refusal names the page's URL and saves a screenshot of the page next to the experiment
   (`failed-<step>-….png`), so an agent can see what the app showed instead of guessing.
-- At every run start strobe reads the DOM node count; a count that drifts across runs means
+- At every run start strobe reads the DOM node count (a native app's bridge reports its element
+  count at each run's end); a count that drifts across runs means
   `reset` is missing (`StateDrift`).
 
 `@hona/strobe-playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
@@ -1113,18 +1168,20 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 
 | ID | Refuses when |
 |---|---|
-| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP, llvmpipe) and a frame or GPU metric is requested |
-| `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`) |
+| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP, llvmpipe) and a frame or GPU metric is requested; a native app: its bridge's adapter is a CPU device, or its GPU work ran on such an adapter |
+| `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`; a native app whose bridge says `debug_build`) |
 | `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
-| `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible` |
+| `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs. A native surface that skipped frames (occluded) in a measured run refuses that block's frame metrics only |
+| `UnpacedSpin` | a native surface drew more than 10 frames in a run without waiting for the display: its frame metrics are refused |
+| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times (refuses that metric) |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: it waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run |
 | `ConcurrentBench` | another bench runs on this device |
-| `VariantMismatch` | variants differ in build command, env, flags or window setup |
+| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
-| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode |
-| `NoDisplayForBudget` | a budget metric is requested without a real display |
+| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch and compares it with the fastest this device has run it (`<state>/native-speed.json`) |
+| `NoDisplayForBudget` | a budget metric is requested without a real display; any metric of a headless native app beyond `ui.*`, `count.*` and `cpu.*`, and its launches |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
-| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
+| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6); a native bridge whose clock is not the host's, or whose hello is stamped outside its launch |
 
 ### 10.2 Analysers (warn in the result)
 
@@ -1389,7 +1446,7 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 | Signal | Windows | Linux | macOS |
 |---|---|---|---|
 | process CPU, memory | `QueryProcessCycleTime` over the TSC for `cpu.app.total` per run (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between); `NtQuerySystemInformation`, PDH Process | `/proc/<pid>/stat`, `smaps_rollup` | `proc_pid_rusage`, `task_info` |
-| threads | `NtQuerySystemInformation` | `/proc/<pid>/task/*` | `proc_pidinfo` |
+| threads | `NtQuerySystemInformation`: context switches per thread (`cpu.wakes`); names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/*` | `proc_pidinfo` |
 | per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | `/proc/stat`, cpufreq | `host_processor_info` |
 | topology | `GetLogicalProcessorInformationEx` (L3 per CCD) | sysfs cache | `sysctl hw.perflevel*` |
 | GPU engines per process | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM fdinfo | IOReport (spike) |
@@ -1397,7 +1454,66 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 | device clocks, power, PCIe | NVML, ADLX | NVML, sysfs | IOReport (spike) |
 | displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow` | DRM / XRandR (spike) | CGDisplay |
 | adapter per window | D3DKMT + DXGI | — | Metal |
-| IO | `GetProcessIoCounters` | `/proc/<pid>/io` | `proc_pid_rusage` |
+| IO | `NtQuerySystemInformation` transfer counts (the snapshot threads come from) | `/proc/<pid>/io` | `proc_pid_rusage` |
+| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | — | — |
+
+### 13.7 Native apps
+
+An app with no browser engine (a Rust app on its own UI toolkit, any Win32 app) is a native target:
+`native(appIdOrPath)` in a bench file, `app:<id>` with a profile of `kind: "native"`, or
+`exe:<path> --native` for `record`. strobe launches it exactly as an Electron app (§13.2): a fresh
+private home with its environment redirects, the profile's `env` (with `{home}` and `{port}`),
+`unset`, `dirs`, `files`, `args`, `guard` and `protocols`, `LiveChannel`, and on close the whole tree
+and everything running from the home killed and the home deleted. There is no debugging port.
+
+**From outside** (no change to the app): the metrics in §7.4. The main window is the tree's largest
+visible top-level window. Each block moves it to the block's place, sizes its client area to the
+target's `viewport` (device-independent pixels) where the app allows it, and keeps it topmost without
+focus; it must be shown (visible, not minimized, not cloaked) at the start and end of the runs
+(`WindowHidden`). An app that hands its window to another process and exits (a launcher, an app
+already running in single-instance mode) cannot be measured this way and says so.
+
+**The native bridge** (protocol `native-bridge-v1`), which a UI toolkit implements once for every app
+on it, off unless built in:
+
+- strobe listens on `127.0.0.1:<port>` per launch and starts the app with `STROBE_BRIDGE` and
+  `STROBE_BRIDGE_TOKEN` (32 hex characters). The app connects out once its runtime can answer
+  (before its first frame commits) and sends one hello line: `hello`, `token`, `pid`, `toolkit`,
+  `toolkit_version`, `mode` (`window` or `headless`), `debug_build`, `clock` (`qpc`, `mach` or
+  `monotonic`: the host clock in ns, §6) and `now_ns`. A wrong token closes the connection. Then
+  newline-delimited JSON: `{ id, op, args }` → `{ id, ok }` or `{ id, err: { code, message } }` (codes
+  `bad-request`, `not-found`, `timeout`, `unsupported`, `no-window`, `internal`), and rare events
+  (`{ event }`). The bridge's reader thread never touches UI state; requests run on the UI thread.
+- Ops: `info` (GPU name, backend, device type; surfaces with scale and present mode), `query`,
+  `wait` (`until`: a selector, `"frame"` or `"idle"`; replies `at_ns`, `frame_seq`, `already`),
+  input (`click`, `move`, `down`, `up`, `hover`, `wheel`, `scroll`, `type`, `press`: through the
+  toolkit's own input path, never OS input or focus, each stamped `input_ns` when it enters the
+  runtime), `window`, `mark`, `run.begin`, `run.end`, `snapshot` (PNG), `step` (headless) and `quit`.
+- `run.end` returns the run record: `work` (`wall_ms`, `cpu_ms` from the UI thread's cycle counter,
+  exclusive phases `view_ms`, `layout_ms`, `text_ms`, `paint_ms`, `encode_ms`, `other_ms`), `counts`
+  (exact, `elements` among them), `surfaces` (per surface `redraws`, `presents`, `unpaced`,
+  `skipped`, `occluded`, …), `frame_columns` and `frames` (one row per frame built: `seq`, `surface`,
+  `tid`, `begin_ns`, `cpu_end_ns`, `submit_ns`, `present_ns` or 0, `input_ns` or 0) and `marks`.
+
+A block uses the bridge when the app has connected by the time `setup` finished (any page call
+connects it, waiting up to 30 s), and waits for it first when the target says `bridge: true`, the
+target is headless, the series declares a `ui.*` or frame metric, or the block takes `--pixels`
+snapshots. Each measured run is then wrapped in `run.begin` and `run.end`, outside its span; phases are
+`mark`s. strobe asks the app to `quit` before it kills the tree. The hello and `info` are checked once
+per block: `ClockUnsynced` (another clock, or a hello stamped outside the launch), `DevBuild` in timing
+blocks, `SoftwareGpu`, and `VariantMismatch` across base and head (backend, adapter, scale).
+
+**Headless** (`headless(appIdOrPath)`): the same app in its toolkit's headless mode, offscreen on a
+virtual clock, started with the profile's `headless` object (`args`, `env`, `unset`); its hello must
+say `mode: "headless"`. It has no window, display, presentation or GPU of its own to measure and no
+launch: only `ui.*`, `count.*`, `cpu.*` and `--pixels` snapshots, everything else `NoDisplayForBudget`.
+What it leaves out is everything between submitting a frame and a person seeing it (the compositor,
+vsync, occlusion, the window manager), and real time: an animation's work per frame is measured, its
+pacing is not. It never waits for an unlocked screen.
+
+**Attribution** (`--why`, `record --probes attribution`): for now the same blocks with their run
+records and OS samples kept, not timed. Native stacks need the deep helper (§13.4); the recording
+layout leaves room for them (§14.1).
 
 ## 14. Storage
 
@@ -1412,7 +1528,13 @@ recordings/rec_3f9a1c/
   heap/<process>-<n>.heapsnapshot.gz
   census-<n>.json
   deep.bin              helper samples (addresses, module loads), symbolized on read
+  runs.json             native apps: per measured run, wall and CPU time, wakes, IO, and the bridge's run record without frames
+  frames.json           native apps with a bridge: `columns`, frame rows per run and marks per run
+  threads.json          native apps: per thread wakes per second, CPU per run, name
 ```
+
+A native recording's stacks, once the deep helper exists, go to `deep.bin` beside these, against the
+variant's executable and `.pdb` that §9.5 copies.
 
 - Handles: `rec_` + 6 hex; any unique prefix works.
 - Retention: default cap 20 GB; oldest unpinned first. `--pin` keeps a recording.
@@ -1528,7 +1650,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
     optional dependency, so each machine installs only its own (win32-x64 so far).
     `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
     install folder (§5.3), so the daemon never runs from a project's `node_modules`.
-  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script` and the types of bench
+  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native`, `headless` and the types of bench
     files (§9.6), built from `sdk/bench` (`dist/index.js`, `dist/index.d.ts`). strobe embeds the
     SDK, the runner and the script host and rewrites a bench file's `@hona/strobe` import (or the old
     `@hona/strobe-bench`) to its own copy, so a bench file runs with the SDK of the binary running it,
@@ -1579,7 +1701,7 @@ Phase 0 runs two tracks in parallel.
 Uploading or sharing recordings · hosted dashboards · Firefox and Safari · mobile · GPU frame
 capture (RenderDoc or PIX level) · macOS deep mode · any automated tests.
 
-## 24. As built (2026-10-31)
+## 24. As built (2026-11-04)
 
 What exists today, against §1–§23. The design above stays the target; this section says where the
 code is and where it chose differently, so nobody reads a promise as a feature.
@@ -1595,9 +1717,11 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
+| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled` | OS present events (presented frames and input latency on Windows), native stacks; Linux and macOS windows and threads |
 | 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
 
-Query views built: `summary`, `frames`, `threads`, `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
+Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;
+its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
 `a..b heap`), `leaks`, `memory` (and `a..b memory`), `insights`, `sql`, `progress`. Not yet: `stack`,
 `gpu`, `cpu`, `timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
 `MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
@@ -1612,7 +1736,15 @@ and nothing else from them is emitted.
 
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:`, `pid:`, `proc:` and `@device`
   are not built. Variants also take `url:<href>` (an already running origin).
-- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id`, `status --fast`,
+- Native targets: `cpu.work` with `cpu.app.total` tested by default, as for scripts; `cpu.wakes`,
+  `io.*` and `ui.*` descriptive unless declared. Warmup compares `ui.work` with the bridge, else the
+  tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
+  the calibration. Declared metrics a native target cannot give are listed refused with their reason,
+  never dropped; a refused primary refuses the block (exit 4). A metric-level refusal shows as
+  `refused (<validator>): …` in the series, as `TailTooShort` does. `native(path)` is a fixed
+  executable: a build never replaces it. `{cache}` keeps the platform's separators (cmd's own
+  commands read `/` as a switch).
+- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
   removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a

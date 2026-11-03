@@ -147,7 +147,9 @@ impl BlockData {
         self.windows
             .iter()
             .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
-            .map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gpu_compile.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6)))
+            .map(|w| {
+                (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gpu_compile.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6))
+            })
             .collect()
     }
 

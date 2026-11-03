@@ -36,7 +36,8 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     let mut text = String::new();
     for r in &recordings {
         let rec = r["recording"].as_str().unwrap_or("");
-        text += &format!("{rec} · {} · attribution\nnext     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n", r["case"].as_str().unwrap_or(""));
+        text +=
+            &format!("{rec} · {} · attribution\nnext     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n", r["case"].as_str().unwrap_or(""));
     }
     Ok(Output::new(text, json!({ "recordings": recordings })))
 }
@@ -66,6 +67,11 @@ pub fn run(args: &Args) -> Result<Output> {
         (_, Some(path), None) => Some(isolate::App::bare(std::path::Path::new(path))),
         _ => None,
     };
+    // A native app (a profile of kind native, or `exe:<path> --native`): measured from outside.
+    if let Some(mut a) = app.clone().filter(|a| a.kind == "native" || args.has("native")) {
+        a.kind = "native".into();
+        return native(args, &a, &target, set, for_ms);
+    }
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, app:<id>, exe:<path>, cdp:<port> or file:<path>")));
     }
@@ -186,6 +192,138 @@ pub fn run(args: &Args) -> Result<Output> {
     Ok(Output::new(summary_text(&meta), meta))
 }
 
+/// A native app for `for_ms` (SPEC §13.7): launched isolated, left to settle for 3 s, then one run
+/// measured from outside: its processes' CPU in cycles, its threads' wakes (named in `threads.json`), IO,
+/// GPU and memory. An attribution recording is the same until native stacks exist (the deep helper).
+fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) -> Result<Output> {
+    use crate::probe::wakes;
+    use crate::target::native as nt;
+    if set == Set::Memory {
+        return Err(Error::usage("--probes memory follows a JS heap; a native app has none"));
+    }
+    use crate::target::native_bridge::{self as nb, Listener};
+    let home = isolate::prepare_home(app, args.get("home").map(std::path::Path::new), None)?;
+    progress(format!("launching {} in an isolated home", app.exe.display()));
+    let listener = Listener::open()?;
+    let (mut n, guard) = match nt::launch(app, &home, &listener.env(), false, None) {
+        Ok(x) => x,
+        Err(e) => {
+            isolate::release_home(&home.dir);
+            isolate::remove_home(&home.dir);
+            return Err(e);
+        }
+    };
+    let result = (|| -> Result<Value> {
+        n.wait_window(Duration::from_secs(60), &guard)?;
+        n.place(&Window::default(), false);
+        guard.check("after the app opened its window")?;
+        // The app loads itself; give it time to settle before recording.
+        std::thread::sleep(Duration::from_secs(3));
+        n.check_visible()?;
+        if host::session_locked() {
+            return Err(validity::locked());
+        }
+        // An app whose toolkit has the bridge has connected by now: its run record covers the recording.
+        let bridge = listener.try_accept()?;
+        if let Some(b) = &bridge
+            && (b.hello.clock != nb::CLOCK || b.hello.now_ns < n.at_ns || b.hello.now_ns > host::now_ns())
+        {
+            return Err(Error::refused(
+                "ClockUnsynced",
+                format!("the app's bridge reports clock \"{}\" at {} ns, outside its launch on strobe's clock", b.hello.clock, b.hello.now_ns),
+                "the toolkit's bridge must stamp times with the OS monotonic clock strobe uses",
+            ));
+        }
+        let awake = host::Awake::start();
+        let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
+        let dir = store::recording_dir(&id)?;
+        let sampler = probe::os::Sampler::start(n.pid);
+        let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+        progress(format!("recording {id} for {}{}", fmt::ms_duration(for_ms), if bridge.is_some() { " (with the app's bridge)" } else { "" }));
+        if let Some(b) = &bridge {
+            b.request("run.begin", Value::Null, Duration::from_secs(10))?;
+        }
+        let snap0 = wakes::Snapshot::take(&n.pids());
+        let c0 = cycles();
+        let t0 = host::now_ns();
+        std::thread::sleep(Duration::from_millis(for_ms));
+        let t1 = host::now_ns();
+        let c1 = cycles();
+        let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
+        let run = match &bridge {
+            Some(b) => b.request("run.end", Value::Null, Duration::from_secs(30))?,
+            None => Value::Null,
+        };
+        let os = sampler.stop().window(t0, t1);
+        if awake.locks() > 0 || host::session_locked() {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(validity::locked());
+        }
+        n.check_visible()?;
+        let ms = (t1 - t0) as f64 / 1e6;
+        let mut values: BTreeMap<&str, f64> = BTreeMap::new();
+        values.insert("run.duration", ms);
+        if let (Some(a), Some(b)) = (c0.1, c1.1)
+            && c1.0 > 0
+        {
+            let cpu = c1.0.saturating_sub(c0.0) as f64 / b.saturating_sub(a).max(1) as f64 * ms;
+            values.insert("cpu.work", cpu);
+            values.insert("cpu.app.total", 100.0 * cpu / ms);
+        }
+        if !span.threads.is_empty() {
+            values.insert("cpu.wakes", span.wakes_per_s());
+            values.insert("io.read", span.io_read as f64);
+            values.insert("io.write", span.io_write as f64);
+        }
+        if let Some(p) = os.gpu_3d_pct {
+            values.insert("gpu.process.3d", p);
+        }
+        if let Some(v) = os.vram_dedicated_mb {
+            values.insert("gpu.vram", v);
+        }
+        values.insert("memory.app.private", n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
+        if run.is_object() {
+            for (metric, field) in
+                [("ui.work", "wall_ms"), ("ui.cpu", "cpu_ms"), ("ui.view", "view_ms"), ("ui.layout", "layout_ms"), ("ui.text", "text_ms"), ("ui.paint", "paint_ms"), ("ui.encode", "encode_ms")]
+            {
+                if let Some(x) = run["work"][field].as_f64() {
+                    values.insert(metric, x);
+                }
+            }
+            values.insert("ui.frames", run["frames"].as_array().map_or(0, Vec::len) as f64);
+            store::write_json(&dir.join("frames.json"), &json!({ "columns": run["frame_columns"], "runs": { "run:0": run["frames"] }, "marks": { "run:0": run["marks"] } }))?;
+        }
+        let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
+        store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(std::slice::from_ref(&span), &names)))?;
+        let mut bridged = run.clone();
+        if let Some(o) = bridged.as_object_mut() {
+            o.remove("frames");
+            o.remove("frame_columns");
+        }
+        store::write_json(
+            &dir.join("runs.json"),
+            &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write, "bridge": bridged }]),
+        )?;
+        let hello = bridge.as_ref().map(|b| &b.hello);
+        let meta = json!({
+            "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "os": os,
+            "window": n.window, "created": now_iso(), "valid": true, "hello": hello,
+            // A debug build's times describe no build people run (`DevBuild`).
+            "timing": if hello.is_some_and(|h| h.debug_build) { "debug build" } else { "clean" },
+            "note": if set == Set::Attribution { "native attribution: run records and OS samples; native stacks need the deep helper (SPEC §13.4)" } else { "" },
+        });
+        store::write_json(&dir.join("meta.json"), &meta)?;
+        if let Some(b) = &bridge {
+            b.quit();
+        }
+        Ok(meta)
+    })();
+    n.close(true);
+    guard.check("after the app closed")?;
+    let meta = result?;
+    Ok(Output::new(summary_text(&meta), meta))
+}
+
 /// `--probes memory`: does the target keep what it allocates? A census and a heap snapshot at the
 /// start, the middle and the end (S0, S1, S2), no trace (SPEC §8.6). Objects allocated between S0 and
 /// S1 that are still alive in S2 are the leak suspects. Each census comes before its snapshot, which
@@ -257,6 +395,9 @@ pub fn summary_text(meta: &Value) -> String {
             fmt::bytes(l["retained_size"].as_f64().unwrap_or(0.0)),
         );
     }
+    if meta["native"] == true {
+        return native_summary(meta);
+    }
     let mut s = format!(
         "{} · {} · {} · {}\n",
         meta["id"].as_str().unwrap_or(""),
@@ -293,6 +434,39 @@ pub fn summary_text(meta: &Value) -> String {
         s += "timing   perturbed: profilers ran during this recording, so its times are not the target's; take times with --probes timing\n";
     }
     s += &format!("next     strobe query {} frames · strobe report recording {} --open\n", meta["id"].as_str().unwrap_or(""), meta["id"].as_str().unwrap_or(""));
+    s
+}
+
+/// A native recording or block: what the OS saw, and with the app's bridge what its UI did.
+fn native_summary(meta: &Value) -> String {
+    let v = &meta["values"];
+    let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let id = meta["id"].as_str().unwrap_or("");
+    let target = meta["target"].as_str().map(str::to_string).unwrap_or_else(|| meta["target"].to_string());
+    let mut s = format!("{id} · {target} · {} · {} · native\n", fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)), meta["probes"].as_str().unwrap_or(""));
+    s += &format!("cpu      {} of one core · {} in the run, all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
+    if get("cpu.wakes").is_finite() {
+        s += &format!("wakes    {} context switches of its threads\n", fmt::value(get("cpu.wakes"), "/s"));
+    }
+    if get("io.read").is_finite() {
+        s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
+    }
+    if get("memory.app.private").is_finite() {
+        s += &format!("gpu      3D {} · VRAM {} · memory {} private\n", fmt::value(get("gpu.process.3d"), "%"), fmt::value(get("gpu.vram"), "MB"), fmt::value(get("memory.app.private"), "MB"));
+    }
+    if get("ui.work").is_finite() {
+        s += &format!(
+            "ui       work {} · cpu {} · {} frames submitted · interval p95 {}\n",
+            fmt::value(get("ui.work"), "ms"),
+            fmt::value(get("ui.cpu"), "ms"),
+            fmt::value(get("ui.frames"), "count"),
+            fmt::value(get("ui.interval.p95"), "ms")
+        );
+    }
+    if meta["timing"] == "perturbed" {
+        s += "timing   perturbed: take times with --probes timing\n";
+    }
+    s += &format!("next     strobe query {id} threads · strobe query {id} frames\n");
     s
 }
 

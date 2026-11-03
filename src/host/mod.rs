@@ -129,6 +129,115 @@ pub struct ProcInfo {
     pub threads: u32,
 }
 
+/// One thread from a system snapshot.
+#[derive(Clone, Debug, Default)]
+pub struct ThreadInfo {
+    pub pid: u32,
+    pub tid: u32,
+    /// Context switches so far: each time the thread was switched in to run (it wraps at 2^32).
+    pub switches: u32,
+    /// Kernel + user time, in ns, in clock ticks.
+    pub cpu_ns: u64,
+}
+
+/// The threads of `pids` (sorted) and each process's IO bytes so far (pid, read, written), from one
+/// system snapshot.
+pub fn threads(pids: &[u32]) -> (Vec<ThreadInfo>, Vec<(u32, u64, u64)>) {
+    #[cfg(windows)]
+    {
+        win::threads(pids)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pids;
+        (Vec::new(), Vec::new())
+    }
+}
+
+/// CPU cycles charged to a thread so far (TSC units), or its name, when it can be opened.
+pub fn thread_cycles_of(tid: u32) -> Option<u64> {
+    #[cfg(windows)]
+    {
+        win::thread_cycles_of(tid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tid;
+        None
+    }
+}
+
+pub fn thread_name(tid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        win::thread_name(tid)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = tid;
+        None
+    }
+}
+
+/// A top-level window: its screen rect (x, y, width, height) and client size in physical pixels, its
+/// DPI, and whether a person could see it (visible, not minimized, not cloaked by the compositor).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct TopWindow {
+    pub hwnd: isize,
+    pub pid: u32,
+    pub rect: (i32, i32, i32, i32),
+    pub client: (i32, i32),
+    pub visible: bool,
+    pub iconic: bool,
+    pub cloaked: bool,
+    pub dpi: u32,
+}
+
+impl TopWindow {
+    pub fn shown(&self) -> bool {
+        self.visible && !self.iconic && !self.cloaked
+    }
+
+    pub fn scale(&self) -> f64 {
+        self.dpi as f64 / 96.0
+    }
+}
+
+/// The largest visible, unminimized top-level window of `pids` (Windows only).
+pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
+    #[cfg(windows)]
+    {
+        win::main_window(pids)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pids;
+        None
+    }
+}
+
+/// A window's state now; None once it is gone.
+pub fn window_state(hwnd: isize) -> Option<TopWindow> {
+    #[cfg(windows)]
+    {
+        win::window_state(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
+        None
+    }
+}
+
+/// Moves a window (and with `client`, sizes its client area in device-independent pixels), topmost
+/// without focus.
+pub fn place_window(w: &TopWindow, x: i32, y: i32, client: Option<(u32, u32)>) {
+    #[cfg(windows)]
+    win::place_window(w, x, y, client);
+    #[cfg(not(windows))]
+    let _ = (w, x, y, client);
+}
+
 /// Every process on the machine, from one system snapshot (no process is opened, so protected
 /// processes are included).
 pub fn all_processes() -> Vec<ProcInfo> {
@@ -284,6 +393,14 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
         let _ = mask;
         None
     }
+}
+
+/// Restricts the calling thread to `mask`.
+pub fn set_thread_affinity(mask: u64) {
+    #[cfg(windows)]
+    win::set_thread_affinity(mask);
+    #[cfg(not(windows))]
+    let _ = mask;
 }
 
 #[derive(Clone, Debug, Default, Serialize)]

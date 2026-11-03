@@ -24,6 +24,7 @@ pub fn value(v: f64, unit: &str) -> String {
         "bytes" => bytes(v),
         "pp" => format!("{v:.digits$} pp"),
         "MB" => format!("{v:.0} MB"),
+        "/s" => format!("{v:.digits$}/s"),
         _ => format!("{v:.digits$} {unit}"),
     }
 }

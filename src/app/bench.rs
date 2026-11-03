@@ -24,6 +24,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod launch;
+mod native;
 mod script;
 
 /// Secondaries that get tested (Holm across these only). Fewer tests keep the correction reachable.
@@ -85,6 +86,18 @@ const DESCRIPTIVE: &[&str] = &[
     "gpu.process.3d",
     "gpu.vram",
     "memory.app.private",
+    "cpu.wakes",
+    "io.read",
+    "io.write",
+    "ui.work",
+    "ui.cpu",
+    "ui.view",
+    "ui.layout",
+    "ui.text",
+    "ui.paint",
+    "ui.encode",
+    "ui.frames",
+    "ui.interval.p95",
     "js.heap.used",
     "dom.nodes",
 ];
@@ -128,6 +141,8 @@ struct Variant {
     root: Option<PathBuf>,
     base_url: Option<String>,
     server: Option<Child>,
+    /// A native target's executable built for this variant (strobe.json `build`), copied out of the build.
+    exe: Option<PathBuf>,
 }
 
 impl Drop for Variant {
@@ -175,15 +190,10 @@ const PROCESS_ROLES: [(&str, &str); 3] = [("renderer", "cpu.renderer"), ("GPU", 
 /// Each Chromium process's index in `PROCESS_ROLES`, by pid; empty where the browser does not say.
 fn process_roles(browser: &chromium::Browser) -> BTreeMap<u32, usize> {
     let info = browser.cdp.send("SystemInfo.getProcessInfo", json!({}), None).unwrap_or(Value::Null);
-    info["processInfo"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|p| Some((p["id"].as_u64()? as u32, PROCESS_ROLES.iter().position(|(t, _)| p["type"].as_str() == Some(*t))?)))
-        .collect()
+    info["processInfo"].as_array().into_iter().flatten().filter_map(|p| Some((p["id"].as_u64()? as u32, PROCESS_ROLES.iter().position(|(t, _)| p["type"].as_str() == Some(*t))?))).collect()
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 struct Block {
     variant: String,
     pair: usize,
@@ -203,6 +213,10 @@ struct Block {
     /// A leak run's growth verdicts and suspects (memory blocks only).
     #[serde(skip_serializing_if = "Option::is_none")]
     leak: Option<Value>,
+    /// Metrics this block cannot defend, with the validator and why ("WindowHidden: …"): they get no
+    /// value, and a series that declares one shows it refused.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    refused: BTreeMap<String, String>,
 }
 
 struct Ctx<'a> {
@@ -233,6 +247,8 @@ struct Ctx<'a> {
     check: bool,
     /// A pixels block's snapshot folder (`--pixels`); `None` in every timed block.
     pixels_dir: Option<PathBuf>,
+    /// A native target's GPU backend, adapter and scale per variant, from its bridge (`VariantMismatch`).
+    native_setup: BTreeMap<String, String>,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -306,6 +322,7 @@ pub fn run(args: &Args) -> Result<Output> {
         homes: BTreeMap::new(),
         check,
         pixels_dir: None,
+        native_setup: BTreeMap::new(),
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -436,16 +453,16 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let started = Instant::now();
     let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (passed, error, values) = match r {
-        Ok(b) => (true, Value::Null, json!(b.values)),
-        Err(e) => (false, json!(e.message), Value::Null),
+    let (passed, error, values, refused) = match r {
+        Ok(b) => (true, Value::Null, json!(b.values), json!(b.refused)),
+        Err(e) => (false, json!(e.message), Value::Null, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
     let mut attribution = Value::Null;
     if passed && ctx.args.get("why") == Some("always") {
-        progress("  attribution block (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
+        progress(format!("  attribution block ({}; not timed)", why_text(&target)));
         let v = &variants[0];
         // Warmed and run as in a bench: `--check`'s single cold run would start no profiler.
         ctx.check = false;
@@ -462,7 +479,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "values": values, "elapsed_ms": elapsed_ms, "attribution": attribution,
+        "passed": passed, "decided": passed, "error": error, "values": values, "refused": refused, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
     }))
 }
 
@@ -471,13 +488,18 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     let mut text = String::new();
     for s in &series {
         // The declared metrics' values: one run's worth, enough to see that a counter counts.
-        let shown = |name: &str| s["values"][name].as_f64().map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit))));
+        let shown = |name: &str| {
+            s["values"][name]
+                .as_f64()
+                .map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit))))
+                .or_else(|| s["refused"][name].as_str().map(|why| format!("{name} refused ({why})")))
+        };
         let value = s["declared"].as_array().into_iter().flatten().filter_map(|m| m.as_str().and_then(shown)).collect::<Vec<_>>().join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!("pass  {}  {value}  {secs:.1} s\n", s["label"].as_str().unwrap_or(""));
             if let Some(rec) = s["attribution"].as_str() {
-                text += &format!("      why  {rec} · strobe query {rec} hotspots --by package\n");
+                text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
             }
         } else {
             text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
@@ -633,7 +655,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let primary = tail_check(def, &blocks, primary);
     // Secondaries: gated on the primary, Holm-corrected. A script's CPU per run is its main.work, so it
     // is tested like main.busy is for a page.
-    let script = target["kind"] == "script";
+    let script = target["kind"] == "script" || is_native(&target);
     // `cpu.app.total` is CPU over run time: once runs get shorter or longer, its move says nothing about
     // the CPU they spent (a run 84% shorter for 80% less CPU reads +28%), so it is then context.
     let rate_context = !same(&blocks, &pairs, "run.duration", bound);
@@ -648,6 +670,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     for name in &names {
         let Some(d) = model::metric(name) else { continue };
         if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
+            // A metric the series declared that a block refused shows as refused, not as missing.
+            if let Some(why) = blocks.iter().find_map(|b| b.refused.get(name)) {
+                secondaries.push(refused(name, d, why));
+            }
             continue;
         }
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
@@ -709,7 +735,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress("  no attribution blocks: nothing to explain (--why always runs them anyway)");
     }
     if why {
-        progress("  attribution blocks (CPU and allocation stacks, forced layouts, GC, a heap snapshot; not timed)");
+        progress(format!("  attribution blocks ({}; not timed)", why_text(&target)));
         for v in variants.iter() {
             // A launch's attribution is a launch of its own, profiled from the first statement.
             let attributed = if s.launch.is_object() { launch::attribution(ctx, s, v) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
@@ -785,7 +811,8 @@ fn pixels_series(ctx: &mut Ctx, s: &Series, variants: &[Variant]) -> Result<Valu
         return Err(e);
     }
     let shots = |role: &str| -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(root.join(role)).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".png").map(str::to_string)).collect();
+        let mut names: Vec<String> =
+            std::fs::read_dir(root.join(role)).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_string_lossy().strip_suffix(".png").map(str::to_string)).collect();
         names.sort();
         names
     };
@@ -925,6 +952,7 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
+        Some("ui") => ("ui.n", "frame submission gaps"),
         _ => ("frames.n", "frames"),
     };
     if def.min_n > 1 {
@@ -934,6 +962,25 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
             c.decided = false;
         }
     }
+    c
+}
+
+/// What an attribution block records for this target.
+fn why_text(target: &Value) -> &'static str {
+    if is_native(target) { "run records and OS samples; native stacks need the deep helper" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
+}
+
+/// The view that explains an attribution recording of a target of this kind.
+fn why_view(kind: &Value) -> &'static str {
+    if matches!(kind.as_str(), Some("native") | Some("headless")) { "threads · frames" } else { "hotspots --by package" }
+}
+
+/// A metric a block refused: `why` is "<validator>: <reason>".
+fn refused(name: &str, def: &MetricDef, why: &str) -> Comparison {
+    let mut c = stats::compare(name, def, &[], 0.0, 0.95);
+    let (id, text) = why.split_once(": ").unwrap_or((why, ""));
+    c.verdict = format!("refused ({id}): {text}");
+    c.decided = false;
     c
 }
 
@@ -1118,6 +1165,10 @@ fn subject(v: &Variant) -> Option<String> {
 /// describe nothing), and wakes a display that went dark on idle, once, before a block refuses
 /// `WindowHidden`. The block's own checks still refuse anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+    // A headless app draws off screen: the lock screen covers nothing it draws.
+    if ctx.describe["targets"][&s.target]["kind"] == "headless" {
+        return native::block(ctx, s, v, pair, set, keep);
+    }
     let mut woken = false;
     loop {
         host::wake_display();
@@ -1136,8 +1187,13 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
-        let r = if s.launch.is_object() {
+        let native = is_native(&ctx.describe["targets"][&s.target]);
+        let r = if s.launch.is_object() && native {
+            native::launch(ctx, s, v, pair)
+        } else if s.launch.is_object() {
             launch::block(ctx, s, v, pair)
+        } else if native {
+            native::block(ctx, s, v, pair, set, keep)
         } else if ctx.describe["targets"][&s.target]["kind"] == "script" {
             script::block(ctx, s, v, pair, set, keep)
         } else {
@@ -1185,14 +1241,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), &window, ctx.pin)?.0
     } else if app {
         let launch = variant_app(v, &target, &ctx.config)?;
-        let seed = target["home"].as_str().map(|h| {
-            let mut h = h.to_string();
-            for (k, val) in &s.params {
-                h = h.replace(&format!("{{{k}}}"), &value_text(val));
-            }
-            let base = Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).to_path_buf();
-            base.join(h)
-        });
+        let seed = seed_dir(ctx, s, &target);
         let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
         guard = Some(g);
         b
@@ -1263,7 +1312,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let canvas_docs: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
         let take_canvas = || {
             if canvas {
-                let times: Vec<f64> = page.eval("JSON.stringify(globalThis.__strobeCanvas?.splice(0) ?? [])").ok().and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok())).unwrap_or_default();
+                let times: Vec<f64> =
+                    page.eval("JSON.stringify(globalThis.__strobeCanvas?.splice(0) ?? [])").ok().and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok())).unwrap_or_default();
                 canvas_docs.borrow_mut().push(times);
             }
         };
@@ -1346,11 +1396,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
-        let extra_categories: Vec<&str> = [(shift, "loading"), (gc, "disabled-by-default-v8.gc"), (gpu_compile, "gpu.dawn"), (gpu_compile, "disabled-by-default-gpu.dawn")]
-            .into_iter()
-            .filter(|c| c.0)
-            .map(|c| c.1)
-            .collect();
+        let extra_categories: Vec<&str> =
+            [(shift, "loading"), (gc, "disabled-by-default-v8.gc"), (gpu_compile, "gpu.dawn"), (gpu_compile, "disabled-by-default-gpu.dawn")].into_iter().filter(|c| c.0).map(|c| c.1).collect();
         let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         let mut census: Vec<Value> = Vec::new();
@@ -1731,6 +1778,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             steps: steps.borrow().clone(),
             background,
             leak,
+            refused: BTreeMap::new(),
         })
     })();
     lapped.set(Instant::now());
@@ -1801,6 +1849,19 @@ fn snapshot(page: &Page, exp: &str, step: &str) -> String {
         (Some(png), Some(path)) if std::fs::write(&path, &png).is_ok() => format!("\n  page: {url}\n  screenshot: {}", path.display()),
         _ => format!("\n  page: {url}"),
     }
+}
+
+/// The target's `home` seed folder for this series (`{param}` filled in), relative to the bench file.
+fn seed_dir(ctx: &Ctx, s: &Series, target: &Value) -> Option<PathBuf> {
+    target["home"].as_str().map(|h| {
+        let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
+        Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
+    })
+}
+
+/// Native and headless targets (`native.rs`).
+fn is_native(target: &Value) -> bool {
+    matches!(target["kind"].as_str(), Some("native") | Some("headless"))
 }
 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
@@ -2058,7 +2119,7 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
             (Kind::Git(spec.to_string()), spec.to_string(), None)
         }
     };
-    let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None };
+    let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None, exe: None };
     if let Kind::Git(r) = &v.kind {
         let sha = host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", "--short=10", r]))
             .ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
@@ -2167,8 +2228,31 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
             overlay_harness(v, &root)?;
         }
         if let (Some(root), Some(cmd)) = (v.root.clone(), target["build"].as_str()) {
-            build_variant(v.role, &root, &json!({ "command": cmd }))?;
+            build_variant(v.role, &root, &json!({ "command": cmd }), None)?;
         }
+        return Ok(());
+    }
+    // A native target from a directory or a git ref is built with strobe.json's `build`, and its output
+    // (the executable) copied into strobe's own folder for the variant, so base and head coexist even
+    // when the build writes to one shared place (`{cache}`). Without a `build`, both run the profile's
+    // or the target's executable.
+    if is_native(target) {
+        // `native(path)` names a fixed executable: no build replaces it.
+        if !matches!(v.kind, Kind::Dir | Kind::Git(_)) || v.exe.is_some() || target["path"].is_string() {
+            return Ok(());
+        }
+        let Some(build) = config.get("build").filter(|b| b.is_object() && b["command"].is_string()) else { return Ok(()) };
+        if let Kind::Git(r) = &v.kind {
+            v.root = Some(worktree(r)?);
+        }
+        let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
+        overlay_harness(v, &root)?;
+        let output = build["output"].as_str().ok_or_else(|| Error::usage("a native target's build in strobe.json needs output: the executable it builds"))?;
+        let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
+        let built = root.join(cache_fill(output, &root));
+        let exe = dest.join(built.file_name().ok_or_else(|| Error::usage(format!("build output {output} is not a file")))?);
+        build_variant(v.role, &root, build, Some((&built, &exe)))?;
+        v.exe = Some(exe);
         return Ok(());
     }
     if target["kind"].as_str() != Some("web") || v.base_url.is_some() || matches!(v.kind, Kind::Url(_)) {
@@ -2181,7 +2265,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
     overlay_harness(v, &root)?;
     let _ = aa;
     if let Some(build) = config.get("build").filter(|b| b.is_object()) {
-        build_variant(v.role, &root, build)?;
+        build_variant(v.role, &root, build, None)?;
     }
     let serve = config.get("serve").filter(|s| s.is_object()).ok_or_else(|| Error::usage("web targets need \"serve\" in strobe.json (a command with {port})"))?;
     let port = free_port()?;
@@ -2202,16 +2286,38 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
     Ok(())
 }
 
-fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
-    let cmd = build["command"].as_str().unwrap_or("");
+/// `{cache}` in a build's command, output or env: a folder that lasts across builds and is shared by
+/// every worktree of the repository (`<state>/builds/cache/<repo>`), such as a compiler's target folder,
+/// so base and head reuse each other's dependency builds.
+fn cache_fill(s: &str, root: &Path) -> String {
+    if !s.contains("{cache}") {
+        return s.to_string();
+    }
+    let common = host::output(Command::new("git").arg("-C").arg(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+        .and_then(|d| std::fs::canonicalize(d).ok())
+        .unwrap_or_else(|| root.to_path_buf());
+    let dir = host::paths::sub("builds").join("cache").join(hash_str(&common.to_string_lossy().to_lowercase()));
+    let _ = std::fs::create_dir_all(&dir);
+    s.replace("{cache}", &dir.display().to_string())
+}
+
+/// Runs `build` in `root` unless its key is unchanged. With `copy`, the built file (and a `.pdb` beside
+/// it) goes to the second path: a build that writes to a shared place (`{cache}`) leaves the other
+/// variant's output there, so a missing copy always rebuilds.
+fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &Path)>) -> Result<()> {
+    let cmd = cache_fill(build["command"].as_str().unwrap_or(""), root);
     if cmd.is_empty() {
         return Ok(());
     }
     let cwd = root.join(build["cwd"].as_str().unwrap_or("."));
     let key = build_key(root, build);
     let marker = host::paths::sub("builds").join(format!("{}.key", hash_str(&root.to_string_lossy())));
-    let output = build["output"].as_str().map(|o| root.join(o));
-    if std::fs::read_to_string(&marker).ok().as_deref() == Some(key.as_str()) && output.as_ref().is_none_or(|o| o.exists()) {
+    let output = build["output"].as_str().map(|o| root.join(cache_fill(o, root)));
+    let ready = match copy {
+        Some((_, dest)) => dest.exists(),
+        None => output.as_ref().is_none_or(|o| o.exists()),
+    };
+    if std::fs::read_to_string(&marker).ok().as_deref() == Some(key.as_str()) && ready {
         progress(format!("  build {role}: unchanged, reusing"));
         return Ok(());
     }
@@ -2222,7 +2328,7 @@ fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
         Command::new(crate::runner::find_bun().unwrap_or_else(|| "bun".into())).args(["install", "--frozen-lockfile"]).current_dir(&cwd).stdout(Stdio::null()).status()?;
     }
     progress(format!("  build {role}: {cmd}"));
-    let mut c = shell(cmd);
+    let mut c = shell(&cmd);
     c.current_dir(&cwd);
     // Source maps for attribution without changing what ships: a bundler config that reads this (Vite:
     // `build: { sourcemap: process.env.STROBE_SOURCEMAP }`) writes each map beside its script without the
@@ -2230,13 +2336,33 @@ fn build_variant(role: &str, root: &Path, build: &Value) -> Result<()> {
     c.env("STROBE_SOURCEMAP", "hidden");
     if let Some(env) = build["env"].as_object() {
         for (k, v) in env {
-            c.env(k, v.as_str().unwrap_or(""));
+            c.env(k, cache_fill(v.as_str().unwrap_or(""), root));
         }
     }
     let out = c.stdin(Stdio::null()).output()?;
     if !out.status.success() {
-        let tail = String::from_utf8_lossy(&out.stderr).lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        // A command that reports its failure on stdout (cmd's own commands do) shows that instead.
+        let text = if out.stderr.iter().all(u8::is_ascii_whitespace) { &out.stdout } else { &out.stderr };
+        let tail = String::from_utf8_lossy(text).lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
         return Err(Error::msg(format!("build {role} failed:\n{tail}")));
+    }
+    if let Some((built, dest)) = copy {
+        if !built.is_file() {
+            return Err(Error::msg(format!("build {role}: the build succeeded but wrote no {}", built.display())).hint("set build.output in strobe.json to the executable the command writes"));
+        }
+        if let Some(d) = dest.parent() {
+            std::fs::create_dir_all(d)?;
+        }
+        std::fs::copy(built, dest)?;
+        // Debug symbols beside the executable, for native stacks (Cargo names a `my-app` binary's `my_app.pdb`).
+        let stem = built.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+        for name in [stem.clone(), stem.replace('-', "_")] {
+            let pdb = built.with_file_name(format!("{name}.pdb"));
+            if pdb.is_file() {
+                std::fs::copy(&pdb, dest.with_file_name(format!("{name}.pdb")))?;
+                break;
+            }
+        }
     }
     std::fs::write(marker, key)?;
     Ok(())
@@ -2438,10 +2564,11 @@ fn render(r: &Value) -> String {
         let attr = &s["attribution"];
         if attr.get("base").is_some() || attr.get("head").is_some() {
             out += &format!(
-                "\nwhy    attribution blocks: base {} · head {}\n       strobe query {} hotspots --by package\n",
+                "\nwhy    attribution blocks: base {} · head {}\n       strobe query {} {}\n",
                 attr["base"].as_str().unwrap_or("—"),
                 attr["head"].as_str().unwrap_or("—"),
-                attr["head"].as_str().unwrap_or("rec_…")
+                attr["head"].as_str().unwrap_or("rec_…"),
+                why_view(&s["target_kind"])
             );
         }
         if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {

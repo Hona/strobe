@@ -213,7 +213,7 @@ impl Guard {
     }
 }
 
-fn alive(pid: u32) -> bool {
+pub fn alive(pid: u32) -> bool {
     #[cfg(windows)]
     return host::win::exe_of(pid).is_some();
     #[cfg(not(windows))]

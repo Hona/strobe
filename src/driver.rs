@@ -1,5 +1,7 @@
 //! The `page` driver (SPEC §9.6): inputs over CDP, event-driven waits, run and phase marks.
 
+pub mod native;
+
 use crate::model::{Error, Result};
 use crate::target::chromium::Page;
 use serde_json::{Value, json};
@@ -210,6 +212,20 @@ impl Driver {
                     .send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
                 self.until(&opts(2))
             }
+            // One wheel event at the element's centre (the viewport's without a selector), as a mouse wheel sends.
+            "wheel" => {
+                let d = opts(1);
+                let (x, y) = if s(0).is_empty() {
+                    let c = self.page.eval("[innerWidth / 2, innerHeight / 2]")?;
+                    (c[0].as_f64().unwrap_or(0.0), c[1].as_f64().unwrap_or(0.0))
+                } else {
+                    self.locate(&s(0), &opts(2))?
+                };
+                let delta = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
+                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy") }))?;
+                self.until(&opts(2))
+            }
+            "window" => Err(Error::usage("page.window() shows, hides, focuses or closes a native app's windows; a page has none of its own")),
             "waitFor" => {
                 let o = opts(1);
                 let t = self.timeout(&o);
@@ -242,8 +258,7 @@ impl Driver {
                 let Some(dir) = &self.pixels else { return Ok(Value::Bool(false)) };
                 let name: String = s(0).chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
                 let shot = self.page.send_long("Page.captureScreenshot", json!({ "format": "png" }))?;
-                let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap_or(""))
-                    .map_err(|e| Error::msg(format!("snapshot {name}: {e}")))?;
+                let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap_or("")).map_err(|e| Error::msg(format!("snapshot {name}: {e}")))?;
                 std::fs::create_dir_all(dir)?;
                 std::fs::write(dir.join(format!("{name}.png")), png)?;
                 Ok(Value::Bool(true))

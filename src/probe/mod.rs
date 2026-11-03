@@ -9,6 +9,7 @@ pub mod os;
 pub mod shifts;
 pub mod symbols;
 pub mod trace;
+pub mod wakes;
 
 /// Named probe sets (SPEC §8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]

@@ -42,6 +42,8 @@ const page = {
   up: (key: string, o = {}) => driver("up", key, o),
   snapshot: (name: string) => driver("snapshot", name),
   scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),
+  wheel: (selector: string, delta: object, o = {}) => driver("wheel", selector, delta, o),
+  window: (action: string, o = {}) => driver("window", action, o),
   waitFor: (selector: string, o = {}) => driver("waitFor", selector, o),
   idle: (o = {}) => driver("idle", o),
   wait: (ms: number) => driver("wait", ms),

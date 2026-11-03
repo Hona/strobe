@@ -283,6 +283,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
+            refused: BTreeMap::new(),
         })
     })();
     host.into_inner().exit();

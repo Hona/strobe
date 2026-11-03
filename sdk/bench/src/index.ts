@@ -10,8 +10,17 @@ export interface Options {
   until?: Until
   /** Milliseconds before the call fails the block. Default 30000. */
   timeout?: number
+  /** Native targets: the surface (window or overlay) by its key; default the app's main window. */
+  window?: string
 }
 
+/**
+ * Drives the target. On a native target the app's bridge does it (its UI toolkit built with strobe support):
+ * `click`, `hover`, `move`, `type`, `press`, `scroll`, `wheel`, `waitFor`, `idle`, `wait`, `window` and `snapshot`
+ * work there, with selectors as the toolkit's element keys (`"nav-history"`, `"slider/knob"`), `role=button`,
+ * `text=General`, and a `:focus` suffix. `goto`, `eval`, `down` and `up` are page-only. Without the bridge a native
+ * target takes `wait` only.
+ */
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
   goto(url: string, opts?: Options): Promise<void>
@@ -35,6 +44,10 @@ export interface Page {
    */
   snapshot(name: string): Promise<void>
   scroll(selector: string, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
+  /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`. */
+  wheel(selector: string, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
+  /** Native targets: shows, hides, focuses or closes a window (`opts.window`, default the main one), through the app's own path. */
+  window(action: "show" | "hide" | "focus" | "close", opts?: Options): Promise<void>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
   waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */
@@ -130,9 +143,14 @@ export interface Milestone {
   in?: "output" | "page" | (string & {})
 }
 
+/** A native app's launch ends on its main window: `visible`, its pixels first `painted` (changed from its first frame), or `settled` (their last change, once they hold for a second). */
+export interface WindowUntil {
+  window: "visible" | "painted" | "settled"
+}
+
 export interface Launch<P> {
-  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. */
-  until: Selector
+  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target without its bridge times to a window condition instead. */
+  until: Selector | WindowUntil
   /** Named points on the way, each a metric `launch.<name>`. One a case declares must appear in every launch. */
   milestones?: Record<string, Milestone>
   /** `fresh` (default): a new home every launch. `warm`: one home per series and variant, kept across its launches, so caches and state from earlier launches are there. */
@@ -190,6 +208,8 @@ export type Target<P> =
   | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport }
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
+  | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
+  | ({ kind: "headless"; app?: string; path?: string } & HeadlessOptions)
 
 export interface Viewport {
   width: number
@@ -227,6 +247,24 @@ export interface ScriptOptions {
   /** Run once per variant before its first block, in its folder. */
   build?: string
 }
+
+export interface NativeOptions {
+  /** A seed folder copied into each launch's fresh private home (`{param}` placeholders allowed), relative to the bench file. */
+  home?: string
+  /** The main window's client area in device-independent pixels, where the app lets strobe size it. */
+  viewport?: Viewport
+  /** Extra arguments after the profile's; `{home}` and `{port}` are filled in. */
+  args?: string[]
+  /** Extra environment after the profile's; `{home}` and `{port}` are filled in. */
+  env?: Record<string, string>
+  /**
+   * The app's bridge (`STROBE_BRIDGE`): by default strobe offers it and uses it once a page call, a `ui.*` or frame
+   * metric, or `--pixels` needs it. `true` requires it in every block; `false` measures the app from outside only.
+   */
+  bridge?: boolean
+}
+
+export type HeadlessOptions = Omit<NativeOptions, "viewport" | "bridge">
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
 export type ParamValues = readonly unknown[] | { readonly run: readonly unknown[]; readonly more?: readonly unknown[] }
@@ -280,6 +318,27 @@ export function command<P = any>(run: string, opts: Omit<CommandOptions, "run"> 
 /** A Bun or Node module of the variant, loaded in a fresh process per block; cases call its exports with `ctx.call`. */
 export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"> = {}): Target<P> {
   return { kind: "script", entry, ...opts }
+}
+
+/**
+ * A native app (no browser engine): by its profile in strobe.json `apps` (`kind: "native"`), or an executable path.
+ * Each block launches it in a fresh isolated home and measures it from outside: CPU in cycles, thread wakes
+ * (`cpu.wakes`), IO, GPU, memory, and for launch cases its window. A directory or git-ref variant runs strobe.json's
+ * `build` and launches its `output`.
+ */
+export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Target<P> {
+  const path = /[\\/]|\.exe$/i.test(appOrPath)
+  return { kind: "native", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
+}
+
+/**
+ * The same native app in its toolkit's headless mode: offscreen, on a virtual clock, driven through its bridge. The
+ * app profile's `headless` object holds the `args` and `env` that select it. Only `ui.*`, `count.*`, `cpu.*` and
+ * `--pixels` are measured there: no display, no presentation, no launch.
+ */
+export function headless<P = any>(appOrPath: string, opts: HeadlessOptions = {}): Target<P> {
+  const path = /[\\/]|\.exe$/i.test(appOrPath)
+  return { kind: "headless", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
 }
 
 export function bench<const Params extends Record<string, ParamValues> = {}>(spec: Bench<Params>): Bench<Params> {

@@ -4,7 +4,28 @@ use crate::model::{Error, Result};
 use std::collections::HashMap;
 
 /// Flags that take no value.
-const SWITCHES: &[&str] = &["json", "quiet", "verbose", "help", "version", "aa", "reveal", "require-verdict", "check", "yes", "open", "calibrate", "pin-runner", "headless", "keep", "fast", "once", "pixels", "pixels-only"];
+const SWITCHES: &[&str] = &[
+    "json",
+    "quiet",
+    "verbose",
+    "help",
+    "version",
+    "aa",
+    "reveal",
+    "require-verdict",
+    "check",
+    "yes",
+    "open",
+    "calibrate",
+    "pin-runner",
+    "headless",
+    "keep",
+    "fast",
+    "once",
+    "pixels",
+    "pixels-only",
+    "native",
+];
 
 #[derive(Clone)]
 pub struct Args {
@@ -94,7 +115,7 @@ Usage: strobe <command> [flags]
 Use
   status                          environment, validity preflight, recent recordings and experiments
   record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>]
-                                  record a target; prints a handle (rec_…)
+                                  record a target; prints a handle (rec_…); exe:<path> --native for a native app
   record --bench <file.bench.ts>#<case> [--head <variant>]
                                   record one bench case (it drives the page: clicks, keys) with the attribution probes
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
@@ -115,7 +136,7 @@ Setup
   up [--skip daemon,mcp,calibrate]  install, download the engine, start the daemon, register MCP and the skill
   leave [--yes]                   undo up (--yes also deletes recordings and experiments)
 
-Targets   https://… · app:<id> (a strobe.json profile) · exe:<path> [--app <id>] · cdp:<port> · cdp:ws://… · file:<path>
+Targets   https://… · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native] · cdp:<port> · cdp:ws://… · file:<path>
 Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
 Global    --json  -q  -h  -V
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable

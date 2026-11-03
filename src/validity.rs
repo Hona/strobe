@@ -83,6 +83,54 @@ pub fn throttled(ms: f64, baseline: Option<f64>) -> Result<Option<f64>> {
     Ok(Some(ratio))
 }
 
+/// The native speed check (`Throttled` for targets with no page to run the JS check in): a fixed
+/// integer workload on a strobe thread moved onto `cpus` (the target's CPUs), median of 3, in ms.
+pub fn native_speed(cpus: Option<u64>) -> f64 {
+    std::thread::spawn(move || {
+        if let Some(m) = cpus {
+            host::set_thread_affinity(m);
+        }
+        let mut t: Vec<f64> = (0..3)
+            .map(|_| {
+                let mut a = vec![0f64; 1 << 16];
+                let started = std::time::Instant::now();
+                let mut x = 0u64;
+                for i in 0..24_000_000u64 {
+                    let j = (i.wrapping_mul(2_654_435_761) & 65535) as usize;
+                    a[j] += i as f64;
+                    x ^= a[(j + 7) & 65535] as u64;
+                }
+                std::hint::black_box(x);
+                started.elapsed().as_secs_f64() * 1e3
+            })
+            .collect();
+        t.sort_by(f64::total_cmp);
+        t[1]
+    })
+    .join()
+    .unwrap_or(f64::NAN)
+}
+
+/// `Throttled` for the native speed check, against the fastest this device has run it (kept in
+/// `<state>/native-speed.json`; the first check sets it). Returns the ratio.
+pub fn native_throttled(ms: f64) -> Result<Option<f64>> {
+    let path = host::paths::state_dir().join("native-speed.json");
+    let best = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["ms"].as_f64()).filter(|b| *b > 0.0);
+    if ms.is_finite() && best.is_none_or(|b| ms < b) {
+        let _ = std::fs::write(&path, serde_json::json!({ "ms": ms }).to_string());
+    }
+    let Some(base) = best else { return Ok(None) };
+    let ratio = ms / base;
+    if ratio > 1.5 {
+        return Err(Error::refused(
+            "Throttled",
+            format!("the native speed check ran {ratio:.2}× slower than the fastest on this device ({ms:.1} ms vs {base:.1} ms)"),
+            "plug in power, leave power saving, let the machine cool down",
+        ));
+    }
+    Ok(Some(ratio))
+}
+
 /// Holds the per-device bench lock while alive.
 pub struct Lock(PathBuf);
 
@@ -97,7 +145,8 @@ pub fn lock() -> Result<Lock> {
     if let Ok(text) = std::fs::read_to_string(&path)
         && let Ok(pid) = text.trim().parse::<u32>()
         && pid != std::process::id()
-        && !host::process_tree(pid).is_empty()
+        // A lock a killed bench left behind can name a pid the OS gave to something else since.
+        && host::process_tree(pid).first().is_some_and(|p| p.name.to_lowercase().starts_with("strobe"))
     {
         return Err(Error::refused("ConcurrentBench", format!("another bench (pid {pid}) is running on this device"), "wait for it to finish; two benches on one device disturb each other"));
     }

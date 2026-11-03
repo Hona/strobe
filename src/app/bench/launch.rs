@@ -14,14 +14,14 @@ use std::sync::{Arc, Mutex};
 
 /// One milestone: the first line matching `pattern` from `source`: `output` (stdout and stderr),
 /// `page` (the page's `performance.mark` names) or a glob of files under the launch's home.
-struct Milestone {
-    name: String,
-    pattern: regex_lite::Regex,
-    source: String,
+pub(super) struct Milestone {
+    pub(super) name: String,
+    pub(super) pattern: regex_lite::Regex,
+    pub(super) source: String,
 }
 
 /// A line seen during a launch: when (epoch ms), its text, and where it came from.
-type Line = (f64, String, String);
+pub(super) type Line = (f64, String, String);
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Result<Block> {
     let key = format!("{}\n{}", s.label(), v.role);
@@ -38,6 +38,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Resu
 /// CPU profiler on (app and exe targets), and every page starts paused until its own profiler runs,
 /// so both profiles cover the launch from the first statement.
 pub(super) fn attribution(ctx: &mut Ctx, s: &Series, v: &Variant) -> Result<Block> {
+    if is_native(&ctx.describe["targets"][&s.target]) {
+        return super::native::launch_once(ctx, s, v, usize::MAX, true);
+    }
     let key = format!("{}\n{}", s.label(), v.role);
     once(ctx, s, v, usize::MAX, &key, true)
 }
@@ -268,6 +271,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
+            refused: BTreeMap::new(),
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may
@@ -297,11 +301,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     result
 }
 
-fn no_page(_: &str, _: &Value) -> Result<Value> {
+pub(super) fn no_page(_: &str, _: &Value) -> Result<Value> {
     Err(Error::msg("a launch case's hooks have no page driver: a launch is timed from outside the app"))
 }
 
-fn milestones(spec: &Value) -> Result<Vec<Milestone>> {
+pub(super) fn milestones(spec: &Value) -> Result<Vec<Milestone>> {
     spec["milestones"]
         .as_object()
         .into_iter()
@@ -321,7 +325,7 @@ fn milestones(spec: &Value) -> Result<Vec<Milestone>> {
         .collect()
 }
 
-fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
+pub(super) fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
     milestones.iter().filter(|m| which(m)).all(|m| lines.iter().any(|(_, l, src)| *src == m.source && m.pattern.is_match(l)))
 }
 
@@ -458,7 +462,7 @@ impl Drop for Watch {
 
 /// A helper thread's result, or nothing if it does not finish within 5 s: a block never waits on a
 /// stuck OS call (a window that stopped answering), it goes without that thread's readings.
-fn joined<T: Default>(h: std::thread::JoinHandle<T>) -> T {
+pub(super) fn joined<T: Default>(h: std::thread::JoinHandle<T>) -> T {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !h.is_finished() && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(10));
@@ -492,7 +496,7 @@ fn sample_screen(pid: u32, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8
 
 /// When the window's pixels first differed from its first sample, and when they last changed while
 /// sampled (epoch ms). A splash or a fade counts as painted: it is what a person sees.
-fn screen_times(samples: &[(f64, Vec<u8>)]) -> Option<(f64, f64)> {
+pub(super) fn screen_times(samples: &[(f64, Vec<u8>)]) -> Option<(f64, f64)> {
     let (first_at, first) = samples.first()?;
     // A cell (a 16th of the window each way, averaged) moving by more than 8 levels in a colour
     // channel: a panel or a list filling in moves several cells by far more, a blinking caret moves
@@ -516,7 +520,7 @@ fn page_marks(page: &chromium::Page) -> Vec<Line> {
 }
 
 /// Lines appended to files matching `globs` under `home`, each with the time strobe read it, until `stop`.
-fn tail(home: &Path, globs: &[String], stop: &AtomicBool) -> Vec<Line> {
+pub(super) fn tail(home: &Path, globs: &[String], stop: &AtomicBool) -> Vec<Line> {
     use std::io::{Read, Seek, SeekFrom};
     let mut offsets: BTreeMap<PathBuf, (u64, String)> = BTreeMap::new();
     let mut out = Vec::new();

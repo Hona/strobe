@@ -210,7 +210,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
 
 /// The bridge's `info` (GPU and surfaces), checked once per block: `SoftwareGpu`, and `VariantMismatch`
 /// when base and head drew with different GPU backends, adapters or scales.
-fn admit_info(ctx: &mut Ctx, v: &Variant, b: &Bridge) -> Result<Value> {
+fn admit_info(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Bridge) -> Result<Value> {
     let info = b.request("info", Value::Null, Duration::from_secs(10))?;
     let gpu = &info["gpu"];
     let name = gpu["name"].as_str().unwrap_or("");
@@ -223,14 +223,16 @@ fn admit_info(ctx: &mut Ctx, v: &Variant, b: &Bridge) -> Result<Value> {
     }
     let scale = info["surfaces"].as_array().and_then(|a| a.first()).and_then(|s| s["scale"].as_f64());
     let setup = format!("{} on {name} at scale {}", gpu["backend"].as_str().unwrap_or("?"), scale.map_or("?".into(), |s| s.to_string()));
-    if let Some((role, other)) = ctx.native_setup.iter().find(|(r, s)| r.as_str() != v.role && **s != setup) {
+    // Per target: a headless target's offscreen surface may differ from the window target's.
+    let mine = format!("{}\n{}", s.target, v.role);
+    if let Some((key, other)) = ctx.native_setup.iter().find(|(k, o)| k.split('\n').next() == Some(s.target.as_str()) && **k != mine && **o != setup) {
         return Err(Error::refused(
             "VariantMismatch",
-            format!("{role} drew with {other}, {} with {setup}", v.role),
+            format!("{} drew with {other}, {} with {setup}", key.split('\n').nth(1).unwrap_or(""), v.role),
             "compare builds on the same GPU backend, adapter and scale; a difference there is not the change",
         ));
     }
-    ctx.native_setup.insert(v.role.to_string(), setup);
+    ctx.native_setup.insert(mine, setup);
     if !ctx.gpu_checked {
         ctx.gpu = json!({ "devices": [name], "backend": gpu["backend"], "driver": gpu["driver"] });
         ctx.browser_version = format!("{} {}", b.hello.toolkit, b.hello.toolkit_version).trim().to_string();
@@ -333,7 +335,7 @@ fn runs(
     // Runs use the bridge when the app has connected by now (a page call in setup connects it).
     let bridged = link.now()?;
     let info = match bridged {
-        Some(b) => Some(admit_info(ctx, v, b)?),
+        Some(b) => Some(admit_info(ctx, s, v, b)?),
         None => None,
     };
     let procs0 = (host::now_ns(), host::all_processes());

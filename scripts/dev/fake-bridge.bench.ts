@@ -17,6 +17,7 @@ export default bench({
       async run({ page, phase }) {
         await phase("open", () => page.click("nav-history", { until: "history-pane" }))
         await page.click("nav-general", { until: "general-pane" })
+        await page.snapshot("general")
       },
     },
     scroll: {

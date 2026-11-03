@@ -100,9 +100,13 @@ impl Native {
 
     /// `WindowHidden` (SPEC §10.1) unless the main window is still there, visible, unminimized and not
     /// cloaked by the compositor.
-    pub fn check_visible(&self) -> Result<()> {
+    pub fn check_visible(&mut self) -> Result<()> {
         let Some(w) = &self.window else { return Ok(()) };
-        let state = host::window_state(w.hwnd);
+        // An app may replace its main window (a splash, then the app): follow it to the new one.
+        let state = host::window_state(w.hwnd).or_else(|| host::main_window(&self.pids()));
+        if let Some(s) = &state {
+            self.window = Some(s.clone());
+        }
         let why = match &state {
             None => Some("its window closed"),
             Some(s) if !s.visible => Some("its window is hidden"),

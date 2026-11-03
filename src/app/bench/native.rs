@@ -157,9 +157,10 @@ fn frame_metric(metric: &str) -> bool {
 }
 
 /// Does the series need the app's bridge before its runs: the target says so, a headless target, a
-/// metric only the bridge has, or a pixels block's snapshots.
+/// `ui.*` metric, or a pixels block's snapshots. Presented-frame metrics wait for nothing: without the
+/// bridge (or its present times) they are refused.
 fn needs_bridge(ctx: &Ctx, s: &Series, target: &Value) -> bool {
-    target["bridge"] == true || target["kind"] == "headless" || ctx.pixels_dir.is_some() || std::iter::once(&s.primary).chain(&s.metrics).any(|m| m.starts_with("ui.") || frame_metric(m))
+    target["bridge"] == true || target["kind"] == "headless" || ctx.pixels_dir.is_some() || std::iter::once(&s.primary).chain(&s.metrics).any(|m| m.starts_with("ui."))
 }
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {

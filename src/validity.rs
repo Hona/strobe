@@ -84,9 +84,11 @@ pub fn throttled(ms: f64, baseline: Option<f64>) -> Result<Option<f64>> {
 }
 
 /// The native speed check (`Throttled` for targets with no page to run the JS check in): a fixed
-/// integer workload on a strobe thread moved onto `cpus` (the target's CPUs), median of 3, in ms.
+/// integer workload on a strobe thread on `cpus` (the target's CPUs), median of 3, in ms. strobe's own
+/// mask (the runner's CPUs) is widened to them for the check and comes back after it.
 pub fn native_speed(cpus: Option<u64>) -> f64 {
-    std::thread::spawn(move || {
+    let previous = cpus.and_then(host::set_affinity);
+    let ms = std::thread::spawn(move || {
         if let Some(m) = cpus {
             host::set_thread_affinity(m);
         }
@@ -108,7 +110,11 @@ pub fn native_speed(cpus: Option<u64>) -> f64 {
         t[1]
     })
     .join()
-    .unwrap_or(f64::NAN)
+    .unwrap_or(f64::NAN);
+    if let Some(p) = previous {
+        host::set_affinity(p);
+    }
+    ms
 }
 
 /// `Throttled` for the native speed check, against the fastest this device has run it (kept in

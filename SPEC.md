@@ -1174,7 +1174,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs. A native surface that skipped frames (occluded) in a measured run refuses that block's frame metrics only |
 | `UnpacedSpin` | a native surface drew more than 10 frames in a run without waiting for the display: its frame metrics are refused |
 | `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times (refuses that metric) |
-| `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: it waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run |
+| `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms: on Windows, whether the session's input desktop can be opened; WTS's lock flag and LogonUI.exe stayed "locked" after an unlock on Windows 11). `bench` never refuses for it: it waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run |
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |

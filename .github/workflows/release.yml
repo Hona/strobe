@@ -4,6 +4,9 @@ name: Release
 # @hona/strobe-<platform>-<arch> with the binaries, @hona/strobe (the `strobe` command and the bench SDK) and
 # the @hona/strobe-bench alias. Windows x64 only so far. npm trusts this workflow in the npm environment
 # (trusted publishing over OIDC), so a publish needs no npm token and every version gets provenance.
+# npm trusts a workflow only for a package that exists. For a new package, first stage a throwaway version
+# (`npm stage publish --tag init` at 0.0.0-init), then `npm trust github <name> --file release.yml
+# --repo Hona/strobe --env npm --allow-publish`, and `npm access set mfa=publish <name>`.
 on:
   push:
     tags: ["v*"]
@@ -52,8 +55,3 @@ jobs:
           [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; }
       - name: Publish
         run: bun scripts/release.ts --bin target/release --publish
-        env:
-          # npm can trust a workflow only for a package that exists, so a new package's first version takes
-          # a short-lived token in the npm environment. Remove the secret once the package trusts this workflow.
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          NPM_CONFIG_PROVENANCE: "true"

@@ -464,10 +464,15 @@ What strobe reads from a native app (§13.7), per run:
   UI thread submitted) and `ui.interval.p50|p95|max` (gaps between a surface's submissions, pooled over
   the measured runs, minimum n as `canvas.interval`); `count.<name>` for every exact counter the
   toolkit reports. Submission is not presentation: these are never called presented frames.
-- **Presented frames** (`frames.presented.*`, `frames.interval.*`, `interaction.*`) only where the
-  toolkit reports when a frame reached the screen (`present_ns`; macOS Metal's presented time).
-  `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects. Elsewhere they
-  are refused (`NoPresentSource`) until OS present events are read.
+- **Presented frames** (`frames.presented.*`, `frames.interval.*`, `frames.dropped*`,
+  `frames.discarded`, `display.hz`, `interaction.*`) where the toolkit reports when a frame reached
+  the screen (`present_ns`; macOS Metal's presented time), or on Windows from the OS's present
+  events (§7.2): a series that declares one gets a present session in its timing blocks; with the
+  bridge the toolkit's rows are joined to the presents (filling `present_ns` in `frames.json`),
+  without it the app's processes' presents count alone (no `frames.presented.*` then: there is no
+  begin). `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects.
+  Without either source they are refused (`NoPresentSource`, with the reason: no access, or no
+  presents in the runs).
 
 ## 8. Probes
 
@@ -1600,9 +1605,10 @@ What it leaves out is everything between submitting a frame and a person seeing 
 vsync, occlusion, the window manager), and real time: an animation's work per frame is measured, its
 pacing is not. It never waits for an unlocked screen.
 
-**Attribution** (`--why`, `record --probes attribution`): for now the same blocks with their run
-records and OS samples kept, not timed. Native stacks need the deep helper (§13.4); the recording
-layout leaves room for them (§14.1).
+**Attribution** (`--why`, `record --probes attribution`): the same blocks with their run records and
+OS samples kept, not timed, plus native stacks of the app's process tree when the deep helper is
+installed (§13.4): `deep.json.gz` holds the measured runs' samples, and `query <rec> hotspots`
+ranks them by function, file or package from the variant's own PDB (§12.2).
 
 ## 14. Storage
 
@@ -1616,14 +1622,16 @@ recordings/rec_3f9a1c/
   cpu-<n>.cpuprofile.gz
   heap/<process>-<n>.heapsnapshot.gz
   census-<n>.json
-  deep.bin              helper samples (addresses, module loads), symbolized on read
+  deep.json.gz          native samples from the helper (modules, unique stacks, samples), symbolized on read
+  deep-symbols.json.gz  their symbols, cached on first read
+  presents.json.gz      OS present events: every present (start, screen time or discarded) and vertical blank
   runs.json             native apps: per measured run, wall and CPU time, wakes, IO, and the bridge's run record without frames
   frames.json           native apps with a bridge: `columns`, frame rows per run and marks per run
   threads.json          native apps: per thread wakes per second, CPU per run, name
 ```
 
-A native recording's stacks, once the deep helper exists, go to `deep.bin` beside these, against the
-variant's executable and `.pdb` that §9.5 copies.
+A native recording's stacks go to `deep.json.gz` beside these, symbolized against the variant's
+executable and `.pdb` that §9.5 copies (the module's own CodeView path finds it).
 
 - Handles: `rec_` + 6 hex; any unique prefix works.
 - Retention: default cap 20 GB; oldest unpinned first. `--pin` keeps a recording.
@@ -1806,7 +1814,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
-| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled` | OS present events (presented frames and input latency on Windows), native stacks; Linux and macOS windows and threads |
+| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled`; OS present events joined to the toolkit's frames, native stacks in attribution blocks (phase 6 row) | `scroll.latency.*` for native apps (rows carry no input kind); Linux and macOS windows and threads |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, Linux perf, symbols.electronjs.org |
 | 7 | — | CI budgets, history, mesh |
 

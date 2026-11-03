@@ -133,7 +133,16 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef { name: "frames.interval.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1000, about: "99th percentile gap between presented frames" },
     MetricDef { name: "frames.interval.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1, about: "longest gap between presented frames" },
     MetricDef { name: "frames.dropped.pct", unit: "%", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 0, about: "share of vsyncs with pending work that presented nothing" },
-    MetricDef { name: "frames.dropped", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "vsyncs Chromium reported as dropped, per run" },
+    MetricDef {
+        name: "frames.dropped",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        about: "vsyncs Chromium reported as dropped, per run; native and outside-in: missed refreshes while drawing plus discarded presents (OS present events)",
+    },
+    MetricDef { name: "frames.discarded", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "presents the OS replaced before they reached the screen, per run" },
     MetricDef { name: "frames.partial", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "frames presented without all updates, per run" },
     MetricDef { name: "main.busy", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "renderer main thread busy share during runs" },
     MetricDef {

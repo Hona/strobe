@@ -1010,12 +1010,12 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
 
 /// What an attribution block records for this target.
 fn why_text(target: &Value) -> &'static str {
-    if is_native(target) { "run records and OS samples; native stacks need the deep helper" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
+    if is_native(target) { "run records, OS samples and native stacks (through the deep helper)" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
 }
 
 /// The view that explains an attribution recording of a target of this kind.
 fn why_view(kind: &Value) -> &'static str {
-    if matches!(kind.as_str(), Some("native") | Some("headless")) { "threads · frames" } else { "hotspots --by package" }
+    if matches!(kind.as_str(), Some("native") | Some("headless")) { "hotspots --by package · threads · frames" } else { "hotspots --by package" }
 }
 
 /// A metric a block refused: `why` is "<validator>: <reason>".

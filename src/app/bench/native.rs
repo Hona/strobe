@@ -7,6 +7,7 @@
 use super::launch::{Line, found_all, joined, milestones, no_page, screen_times, tail};
 use super::*;
 use crate::driver::native::NativeDriver;
+use crate::etw::frames;
 use crate::probe::wakes::{self, Snapshot, Span};
 use crate::target::native::{self as nt, Native};
 use crate::target::native_bridge::{self as nb, Bridge, Listener};
@@ -346,6 +347,11 @@ fn runs(
         None => None,
     };
     let procs0 = (host::now_ns(), host::all_processes());
+    // What reached the screen, from the OS's present events: only for a series that declares a frame
+    // metric (§7.1), as a canvas hook is; native stacks in attribution blocks, through the helper.
+    let wants_frames = !headless && set != Set::Attribution && std::iter::once(&s.primary).chain(&s.metrics).any(|m| frame_metric(m) && !m.starts_with("ui."));
+    let presents = wants_frames.then(crate::etw::PresentCapture::start);
+    let stacks = (set == Set::Attribution && !headless && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
     let sampler = probe::os::Sampler::start(n.pid);
     let run_timeout = Duration::from_secs(60);
     let mut runs: Vec<Run> = Vec::new();
@@ -404,6 +410,8 @@ fn runs(
     steps.push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
     lapped.set(Instant::now());
     let samples = sampler.stop();
+    let presents = presents.map(|r| r.and_then(|c| c.stop()));
+    let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
     let procs1 = (host::now_ns(), host::all_processes());
     if !windowless {
         n.check_visible()?;
@@ -465,6 +473,35 @@ fn runs(
     if let Some(u) = &ui {
         values.extend(u.pooled.clone());
     }
+    // Presented frames from the OS: the toolkit's rows joined to its presents, else the presents alone.
+    let mut filled: BTreeMap<String, Value> = BTreeMap::new();
+    match &presents {
+        Some(Ok(p)) => {
+            let pids = n.pids();
+            let mut wins: Vec<frames::RunWindow> = measured.iter().map(|r| frames::RunWindow { t0: r.t0, t1: r.t1, rows: r.record.as_ref().map(frames::rows_from_record) }).collect();
+            for (k, x) in frames::native_values(p, &pids, &mut wins) {
+                if !refused.contains_key(&k) {
+                    values.entry(k).or_insert(x);
+                }
+            }
+            for (j, (w, r)) in wins.iter().zip(measured).enumerate() {
+                if let (Some(rows), Some(rec)) = (&w.rows, &r.record) {
+                    let mut rec = rec.clone();
+                    frames::fill_record(&mut rec, rows);
+                    filled.insert(key(j), rec["frames"].clone());
+                }
+            }
+            if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
+                ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", v.role, p.events_lost)));
+            }
+        }
+        Some(Err(e)) => {
+            for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m) && !m.starts_with("ui.") && !values.contains_key(*m)) {
+                refused.entry(m.clone()).or_insert_with(|| format!("NoPresentSource: {m}: OS present events: {}", e.message));
+            }
+        }
+        None => {}
+    }
     let private_mb = n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
     if private_mb > 0.0 {
         values.insert("memory.app.private".into(), private_mb);
@@ -517,10 +554,27 @@ fn runs(
         store::write_json(&dir.join("runs.json"), &json!(run_rows))?;
         if bridged.is_some() {
             let columns = measured.iter().find_map(|r| r.record.as_ref().map(|x| x["frame_columns"].clone())).unwrap_or(Value::Null);
-            let frames: serde_json::Map<String, Value> = measured.iter().enumerate().map(|(j, r)| (key(j), r.record.as_ref().map_or(Value::Null, |x| x["frames"].clone()))).collect();
+            let frames: serde_json::Map<String, Value> =
+                measured.iter().enumerate().map(|(j, r)| (key(j), filled.get(&key(j)).cloned().unwrap_or_else(|| r.record.as_ref().map_or(Value::Null, |x| x["frames"].clone())))).collect();
             let marks: serde_json::Map<String, Value> = measured.iter().enumerate().map(|(j, r)| (key(j), r.record.as_ref().map_or(Value::Null, |x| x["marks"].clone()))).collect();
             store::write_json(&dir.join("frames.json"), &json!({ "columns": columns, "runs": frames, "marks": marks }))?;
         }
+        if let Some(Ok(p)) = &presents {
+            crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
+        }
+        // Native stacks of the measured runs only (warmup runs are sampled too: the session starts first).
+        let stacks_note = match &stacks {
+            Some(Ok(d)) => {
+                let (a, b) = (measured.first().map_or(0, |r| r.t0), measured.last().map_or(0, |r| r.t1));
+                let mut d = d.clone();
+                d.samples.retain(|x| x.0 >= a && x.0 <= b);
+                crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
+                format!("native stacks: {} samples (query hotspots)", d.samples.len())
+            }
+            Some(Err(e)) => format!("native stacks failed: {}", e.message),
+            None if set == Set::Attribution => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
+            None => String::new(),
+        };
         store::write_json(
             &dir.join("meta.json"),
             &json!({
@@ -529,7 +583,7 @@ fn runs(
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background,
                 "hello": bridged.map(|b| &b.hello), "info": info,
                 "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
-                "note": if set == Set::Attribution { "a native block's attribution: run records and OS samples, not timed; native stacks need the deep helper (SPEC §13.4)" } else { "" },
+                "note": if set == Set::Attribution { format!("a native block's attribution: run records and OS samples, not timed; {stacks_note}") } else { String::new() },
             }),
         )?;
         Some(id)
@@ -664,7 +718,7 @@ fn missing(metric: &str, bridged: bool, headless: bool) -> Option<String> {
     }
     match area {
         "frames" | "interaction" | "scroll" | "display" if bridged => Some(format!(
-            "NoPresentSource: {metric} needs when frames reached the screen; this toolkit reports only when it submitted them (ui.frames, ui.interval.*), and OS present events are not read yet"
+            "NoPresentSource: {metric} needs when frames reached the screen; this toolkit reports only when it submitted them (ui.frames, ui.interval.*), and OS present events gave none in the runs"
         )),
         "frames" | "interaction" | "scroll" | "display" | "ui" => {
             Some(format!("NoPresentSource: {metric} comes from inside the app; without its bridge strobe sees its processes, threads, GPU and window only"))

@@ -11,7 +11,7 @@ import { copyFileSync } from "node:fs"
 import { join } from "node:path"
 import { parseArgs } from "node:util"
 
-// --otp: npm's one-time password for an account with two-factor publishing (CI uses a token instead).
+// --otp: npm's one-time password for an account with two-factor publishing (CI uses trusted publishing instead).
 const { values } = parseArgs({ options: { bin: { type: "string" }, publish: { type: "boolean", default: false }, otp: { type: "string" } } })
 const root = join(import.meta.dir, "..")
 const cargo = await Bun.file(join(root, "Cargo.toml")).text()

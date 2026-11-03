@@ -12,6 +12,8 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe status [--calibrate]                    environment, validity preflight, recent handles
     strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
     strobe record --bench <file.bench.ts>#<case> [--head <variant>]   a bench case (clicks, keys) under the attribution probes
+    strobe record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]   any running process from outside: frames from
+        the OS's present events, CPU, GPU; deep: native stacks (kernel sampled profile, PDB symbols)
     strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--target <name>]
                  [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power keep|high]
                  [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
@@ -19,15 +21,18 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         variant: a directory, a git ref, app:<id>, exe:<path>; every variant builds and serves with head's harness
         (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works
     strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
-        hotspots and alloc take --by function|file|package; memory takes --by process|layer|allocator and --at <i>;
+        hotspots and alloc take --by function|file|package (hotspots: --native, --thread <name> for native samples);
+        memory takes --by process|layer|allocator and --at <i>;
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
     strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
 
-Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `apps`, Electron or native) · `exe:<path>` (`--native` for a native app) · `cdp:ws://…` · `file:<path>` (import a trace, .cpuprofile or .heapsnapshot)
+Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `apps`, Electron or native) · `exe:<path>` (`--native` for a native app) · `cdp:ws://…` · `file:<path>` (import a trace, .cpuprofile or .heapsnapshot) · `pid:<n>` · `proc:<name>` (a running process, from outside)
 
-Probe sets: `timing` (default) · `attribution` (CPU stacks, allocations, forced layouts, GC, a heap snapshot; its times are perturbed) · `memory` (three heap snapshots for leaks, no trace)
+Probe sets: `timing` (default) · `attribution` (CPU stacks, allocations, forced layouts, GC, a heap snapshot; its times are perturbed) · `memory` (three heap snapshots for leaks, no trace) · `deep` (native stacks of a process tree, Windows; perturbed)
+
+OS present events (what reached the screen, for any native or Chromium window) and native stacks need `strobe up`'s one UAC prompt (Performance Log Users and the deep-mode helper); without it, those metrics are refused and `status` says why. `record https://… --os-frames` puts them beside Chromium's own frames.
 
 Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (invalid; the reason is in the result) · `5` inconclusive · `124` timeout · `255` unreachable
 
@@ -83,6 +88,7 @@ Does a case leak? `bench <file> --filter <case> --head . --probes memory --repea
 Is an app leaking over time? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.
 Is the method sound here? `bench <file> --aa --head .`.
 Does it still look the same? Snapshot deterministic states with `page.snapshot(name)` (a still page, an app's own frame stepper), then `bench <file> --base … --head . --pixels-only`: each snapshot is `same` within the launch noise strobe measures (base run twice), or `differ` with a diff image.
+Is a native app smooth, and where does its CPU go? `record proc:<name> --for 10s` while it animates (frames, drops, intervals from OS presents), then `record proc:<name> --probes deep` and `query <rec> hotspots --by package` (crates, std, OS modules, GPU driver; `--thread <name>` for one thread).
 Where does the GPU process spend time (a frozen first frame, a slow canvas)? `query <rec> gpu` on an attribution recording, and `gpu.compile` as a bench metric.
 Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread) and `query <rec> insights`.
 Writing the PR? `report experiment <exp> --format pr` gives the tables and the command that reruns them.

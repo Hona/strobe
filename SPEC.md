@@ -195,7 +195,7 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 | `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7) |
 | `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
 | `node:<port>`, `bun:<port>` | an inspector endpoint (§13.5) |
-| `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, deep (§13.6) |
+| `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, OS present events, deep (§13.6). `proc:` takes the one process of that name whose parent is not of that name |
 | `file:<path>` | import an existing capture: a Chrome trace, `.cpuprofile`, `.heapsnapshot`, or a folder of them with a `manifest.json` (§8.7) |
 | `<target>@<device>` | run on a mesh device through `mesh exec`; results come back tagged with the device |
 
@@ -225,7 +225,9 @@ Steps (each checks first, prints ✓ / ! / ✗):
 1. **Preflight** — OS, CPU and topology (CCDs, V-Cache by L3 size, P/E cores), power plan,
    GPUs (adapters, NVML), displays and refresh rates, `opencode`, browsers, installed apps.
 2. **Engine** — download the pinned trace_processor (§15), verify sha256.
-3. **Helper** — deep mode (§13.4): one UAC or sudo. Skippable (`--skip helper`).
+3. **Helper** — deep mode (§13.4): one UAC or sudo. Skippable (`--skip deep`). On Windows the one
+   elevated step adds the user to Performance Log Users (present events in strobe's own process from
+   the next logon) and installs the helper (present events until then, and native stacks).
 4. **Daemon** — autostart registered, this build's daemon running (§16).
 5. **MCP** — register `strobe` in opencode's global config and make it live in every loaded
    location, exactly as mesh does (`opencode mcp add`, then `opencode api experimental.mcp.add`),
@@ -416,6 +418,20 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
 - **Budget**: the refresh interval of the display the window is on (§13.1). No display, no
   budget metrics (`NoDisplayForBudget`).
 - `requestAnimationFrame` gaps, when wanted, are a separate metric named `raf.gap.*`.
+- **Native windows and any process from outside** (Windows): a frame is a present the OS put on the
+  screen, from its present events (§8.1 `presents`): one record per present with its start, the
+  screen time of its scanout (`displayed`), or `discarded` (replaced before scanout). A toolkit's
+  frame rows (native bridge: `begin_ns`, `submit_ns`, `input_ns`) join them by process, thread and
+  the present call's span, which fills each row's `present_ns`. Then `frames.presented.*` is
+  `present_ns − begin_ns`, `interaction.*` is `present_ns − input_ns` of the first frame that
+  reflects an input, and `display.hz` comes from the vertical blanks the kernel logs.
+- **Drops and intervals from screen times**: a frame is pending from its begin (outside-in: its
+  present call's start). Between two frames shown at `a` and `b`, the refreshes in between were
+  missed when `b` was pending before `a` plus half a refresh (an animation that fell behind); a
+  later begin is the app at rest, so the gap is neither an interval nor a drop (as
+  `STATE_NO_UPDATE_DESIRED` resets Chromium's intervals). `frames.dropped` adds discarded presents.
+  Outside-in, a frame the app itself started late looks like rest: only a toolkit's begin times
+  tell them apart.
 - **Quantization**: anything that ends on a presented frame (`run.duration` with an `until`,
   `interaction.*`) moves in whole vsyncs (6.06 ms at 165 Hz): a tab switch measured 40 or 47 ms
   and nothing between. Such a metric is the user's truth but decides slowly; pick `main.work`
@@ -472,6 +488,7 @@ What strobe reads from a native app (§13.7), per run:
 | `coverage` | exact call and block counts | Profiler.startPreciseCoverage | attribution | high |
 | `census` | per-process memory account (§8.6) | bridge, CDP, OS, memory-infra | attribution | med |
 | `heap` | heap snapshots per runtime (§8.6) | bridge, CDP, inspector | attribution | high, pauses |
+| `presents` | presents to the screen: displayed (scanout time) or discarded, vertical blanks | ETW real-time session (§13.4) | timing | low |
 | `deep` | native stacks, context switches, core residency | helper (§13.4) | attribution | med |
 
 Sets: `timing` = frames, threads, os, gpu. `attribution` = cpu, alloc, invalidation,
@@ -1254,7 +1271,7 @@ comparable with an unlocked one.
 | `summary` | | validity, environment, headline metrics per phase |
 | `frames` | `--phase` | frame percentiles, dropped vsyncs, budget misses, worst frames with handles |
 | `threads` | `--phase` | busy share by thread and category, long tasks |
-| `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` | rows with self and total time, sample counts, intervals, handles |
+| `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` `--native` | rows with self and total time, sample counts, intervals, handles; native samples (`deep`) in the same shape, with the share that resolved (a recording without a JavaScript profile shows them by default) |
 | `alloc` | `--by function\|file\|package` | bytes allocated per row from sampled allocations (collected objects included), with complete locations and the three heaviest full stacks per function |
 | `layout` | | forced (synchronous) layouts and style recalculations by the JavaScript call site that forced them, with full stacks; per-run counts and time, forced and in the frame lifecycle |
 | `shifts` | | the five largest layout shifts of an attribution block (a series declaring `layout.shift`): score, run, time into it, and the elements that moved with their rects before and after |
@@ -1326,6 +1343,17 @@ name. Core migration needs the deep helper and is not built.
 - PDBs and debug files from symbol servers by the module's build ID: symbols.electronjs.org for
   Electron, the Microsoft symbol server for Windows, plus servers listed in `strobe.json`.
 - Cached under `symbols/`.
+- As built (Windows, pure Rust: `pdb-addr2line` over `pdb2`, `rustc-demangle`, `msvc-demangler`):
+  a module's CodeView record (GUID, age, PDB path) picks its PDB: the path the build wrote (a local
+  build's own PDB, checked by GUID), beside the module, the cache
+  (`symbols/<pdb>/<GUID><age>/<pdb>`), then the Microsoft server and `strobe.json`
+  `symbols.servers` through `curl`; a miss leaves a `missing` marker for a day. Inline frames are
+  expanded; a return address looks up its call (address − 1). Symbolization runs when a view first
+  reads the recording and is cached beside it (`deep-symbols.json.gz`).
+- Packages for native frames: the crate from Cargo's folders (`registry/src/*/<crate>-<version>`,
+  else the folder holding `src`), `std` for the Rust toolchain's library, else the module:
+  `<module> (windows)` under the system folder, `<module> (gpu driver)` from the driver store or a
+  GPU vendor's module.
 
 ### 12.3 `(program)`
 
@@ -1455,6 +1483,39 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 - Linux: one sudo installs a root-owned helper with `cap_perfmon` and `cap_sys_ptrace`.
 - macOS: no deep mode in v1.
 
+As built (Windows):
+
+- **Who runs which session.** Present events (DXGI, DxgKrnl, Win32k and Dwm-Core providers) need
+  an elevated admin token or Performance Log Users; strobe runs that session itself when its token
+  allows, else through the helper. The kernel's sampled profile needs SeSystemProfilePrivilege,
+  which only administrators hold (Performance Log Users does not), so native stacks always go
+  through the helper. `strobe up`'s one UAC prompt (`strobe helper install`, elevated through
+  `ShellExecuteEx runas`) adds the user to Performance Log Users (it counts from the next logon),
+  copies the windowless binary to `%ProgramFiles%\strobe\strobe-helper.exe` and registers the task
+  `\strobe\helper-<RID>` (the user's principal, highest privileges, interactive token, on demand
+  only). `status` reports which path each session takes; `leave` removes all three with one prompt.
+- **The helper** (`strobe helper serve`) starts when the user's strobe runs its task
+  (`schtasks /run`, no prompt), serves `\\.\pipe\strobe-helper-<SID>` (ACL: that user, SYSTEM and
+  administrators; medium integrity may write; first instance only; remote clients rejected), and
+  exits after two minutes without a client. The client refuses a pipe served by any other binary.
+  Operations, one JSON line each way: `presents.start`/`presents.stop` (every present and vertical
+  blank, as JSON) and `stacks.start {root}`/`stacks.stop` (only for a process tree running as the
+  same user). A client that disconnects stops its sessions.
+- **Native stacks**: a system logger session with the profile source at 200 µs (5 kHz, the
+  system-wide interval restored afterwards), a stack walk on every sample, image loads with the
+  rundown of loaded images, and process starts, so children of the target count from their first
+  sample. Samples of other processes are dropped as they arrive; kernel and user parts of a stack
+  merge by timestamp and thread. The user's strobe adds thread names (`GetThreadDescription`) and
+  module lists the rundown missed. Recordings keep `deep.json.gz` (modules, unique stacks,
+  samples), symbolized on read (§12.2).
+- **Why ETW, not suspending threads from outside**: a non-elevated sampler (SuspendThread,
+  GetThreadContext, unwinding with the target's unwind tables over ReadProcessMemory) would avoid
+  the prompt, but it stops each thread for tens of microseconds per sample (5 kHz across a dozen
+  threads perturbs the target far more than an interrupt-time stack walk), can only sample threads
+  it already knows to be running (biased toward threads that just ran), sees no kernel or driver
+  frames, and needs an unwinder strobe would own. One prompt at setup is the cheaper price
+  (rule 11).
+
 ### 13.5 Bun and Node
 
 - Node: the inspector protocol (`node:<port>`): CPU profile, heap, event loop delay.
@@ -1477,6 +1538,8 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 | VRAM per process | D3DKMT committed bytes in dedicated and shared segments (PDH `Dedicated Usage` also counts allocations opened from other processes) | DRM fdinfo | — |
 | device clocks, power, PCIe | NVML, ADLX | NVML, sysfs | IOReport (spike) |
 | displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow` | DRM / XRandR (spike) | CGDisplay |
+| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | — | — |
+| native stacks | ETW sampled profile through the helper (§13.4) | perf (planned) | — |
 | adapter per window | D3DKMT + DXGI | — | Metal |
 | IO | `NtQuerySystemInformation` transfer counts (the snapshot threads come from) | `/proc/<pid>/io` | `proc_pid_rusage` |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | — | — |
@@ -1744,7 +1807,8 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
 | native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled` | OS present events (presented frames and input latency on Windows), native stacks; Linux and macOS windows and threads |
-| 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
+| 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, Linux perf, symbols.electronjs.org |
+| 7 | — | CI budgets, history, mesh |
 
 Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;
 its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
@@ -1760,8 +1824,9 @@ and nothing else from them is emitted.
 
 ### 24.2 Where the code differs from the design
 
-- Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:`, `pid:`, `proc:` and `@device`
-  are not built. Variants also take `url:<href>` (an already running origin).
+- Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.
+  `pid:`/`proc:` record only (`--probes timing|deep`). Variants also take `url:<href>` (an already
+  running origin).
 - Native targets: `cpu.work` with `cpu.app.total` tested by default, as for scripts; `cpu.wakes`,
   `io.*` and `ui.*` descriptive unless declared. Warmup compares `ui.work` with the bridge, else the
   tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
@@ -1770,7 +1835,7 @@ and nothing else from them is emitted.
   `refused (<validator>): …` in the series, as `TailTooShort` does. `native(path)` is a fixed
   executable: a build never replaces it. `{cache}` keeps the platform's separators (cmd's own
   commands read `/` as a switch).
-- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native`, `status --fast`,
+- Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
   removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a

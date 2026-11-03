@@ -42,6 +42,16 @@ fn u32_at(b: &[u8], at: usize) -> Option<u32> {
     b.get(at..at + 4).map(|x| u32::from_le_bytes([x[0], x[1], x[2], x[3]]))
 }
 
+/// `SizeOfImage` of a PE file: how much address space it takes when loaded.
+pub fn image_size(path: &Path) -> Option<u32> {
+    let mut head = vec![0u8; 1024];
+    let n = std::fs::File::open(path).ok()?.read(&mut head).ok()?;
+    head.truncate(n);
+    let pe = u32_at(&head, 0x3c)? as usize;
+    (head.get(pe..pe + 4)? == b"PE\0\0").then_some(())?;
+    u32_at(&head, pe + 24 + 56)
+}
+
 /// The CodeView record of a PE file (EXE, DLL, SYS), read from its debug directory.
 pub fn codeview(path: &Path) -> Option<CodeView> {
     let mut f = std::fs::File::open(path).ok()?;

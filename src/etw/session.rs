@@ -326,6 +326,8 @@ pub fn win_error(rc: u32) -> String {
 #[derive(Default)]
 pub struct Schema {
     cache: HashMap<(u128, u16, u8), Option<Vec<Prop>>>,
+    /// (provider, id, version, call site, 64-bit) → field offsets, for fixed layouts.
+    fixed: HashMap<(u128, u16, u8, usize, bool), Vec<Field>>,
 }
 
 struct Prop {
@@ -399,14 +401,30 @@ impl Schema {
     }
 
     /// Finds `names` in the event's payload. Missing names (another version) stay `found: false`.
+    /// Where every field up to the last one asked for has a fixed size, the offsets are cached per
+    /// event and call site, so most events cost a hash lookup.
     pub fn fields<const N: usize>(&mut self, e: &EVENT_RECORD, names: [&str; N]) -> [Field; N] {
+        let h = &e.EventHeader;
+        let ptr64 = h.Flags as u32 & EVENT_HEADER_FLAG_64_BIT_HEADER != 0;
+        let site = (key(&h.ProviderId), h.EventDescriptor.Id, h.EventDescriptor.Version, names.first().map_or(0, |n| n.as_ptr() as usize), ptr64);
+        if let Some(f) = self.fixed.get(&site)
+            && let Ok(out) = <[Field; N]>::try_from(f.as_slice())
+        {
+            return out;
+        }
         let mut out = [Field::default(); N];
-        let ptr64 = e.EventHeader.Flags as u32 & EVENT_HEADER_FLAG_64_BIT_HEADER != 0;
-        let data = unsafe { std::slice::from_raw_parts(e.UserData as *const u8, e.UserDataLength as usize) };
+        let data = payload(e);
         let Some(props) = self.layout(e) else { return out };
         let mut off = 0usize;
         let mut values: Vec<u64> = Vec::with_capacity(props.len());
+        let (mut fixed, mut left) = (true, N);
         for p in props.iter().take_while(|p| !p.name.starts_with('\u{1}')) {
+            if left == 0 {
+                break;
+            }
+            fixed &= p.flags & (PropertyParamCount | PropertyParamLength | PropertyStruct) == 0
+                && !matches!(p.in_type as i32, TDH_INTYPE_UNICODESTRING | TDH_INTYPE_ANSISTRING | TDH_INTYPE_SID | TDH_INTYPE_WBEMSID)
+                && (p.length > 0 || matches!(p.in_type as i32, TDH_INTYPE_POINTER | TDH_INTYPE_SIZET));
             let (size, count) = prop_size(props, p, data, off, ptr64, &values);
             let value = match size {
                 1 => data.get(off).map(|b| *b as u64),
@@ -418,8 +436,12 @@ impl Schema {
             values.push(value.unwrap_or(0));
             if let Some(i) = names.iter().position(|n| *n == p.name) {
                 out[i] = Field { off, size, count, found: off + size * count.max(1) <= data.len() || count == 0 };
+                left -= 1;
             }
             off += size * count;
+        }
+        if fixed && out.iter().all(|f| f.found) {
+            self.fixed.insert(site, out.to_vec());
         }
         out
     }
@@ -480,7 +502,7 @@ pub fn uint_at(e: &EVENT_RECORD, f: &Field, i: usize) -> u64 {
     if !f.found {
         return 0;
     }
-    let data = unsafe { std::slice::from_raw_parts(e.UserData as *const u8, e.UserDataLength as usize) };
+    let data = payload(e);
     let at = f.off + i * f.size;
     match f.size {
         1 => data.get(at).map_or(0, |b| *b as u64),

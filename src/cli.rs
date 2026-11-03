@@ -119,6 +119,9 @@ Use
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
   record --bench <file.bench.ts>#<case> [--head <variant>]
                                   record one bench case (it drives the page: clicks, keys) with the attribution probes
+  record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]
+                                  any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
+                                  (--os-frames on a Chromium record adds the OS present events beside its trace)
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
@@ -126,7 +129,7 @@ Use
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--bisect good..bad]           (the commit that moved the primary; one series)
                                   run an experiment; a verdict per series
-  query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal]
+  query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
@@ -134,10 +137,12 @@ Use
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
 
 Setup
-  up [--skip daemon,mcp,calibrate]  install, download the engine, start the daemon, register MCP and the skill
+  up [--skip deep,daemon,mcp,calibrate]  install, download the engine, deep mode (one UAC prompt), start the daemon,
+                                  register MCP and the skill
   leave [--yes]                   undo up (--yes also deletes recordings and experiments)
 
 Targets   https://… · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native] · cdp:<port> · cdp:ws://… · file:<path>
+          · pid:<n> · proc:<name>
 Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
 Global    --json  -q  -h  -V
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable

@@ -208,11 +208,36 @@ impl Handler for Sampler {
             samples.push((session::ns(ts, self.freq), pid, tid, cpu, at));
         }
         let devices = dos_devices();
-        let modules = self.images.into_iter().map(|m| Module { path: dos_path(&m.path, &devices), ..m }).collect();
+        let mut modules: Vec<Module> = self.images.into_iter().map(|m| Module { path: dos_path(&m.path, &devices), ..m }).collect();
+        if !modules.iter().any(|m| m.pid == 0) {
+            modules.extend(drivers(&devices));
+        }
         let mut pids: Vec<u32> = self.pids.into_iter().collect();
         pids.sort_unstable();
         Deep { interval_us: INTERVAL_100NS as f64 / 10.0, modules, stacks, samples, pids, ..Deep::default() }
     }
+}
+
+/// The kernel's images when the session's rundown named none (pid 0), from the loaded driver list.
+fn drivers(devices: &[(String, String)]) -> Vec<Module> {
+    use windows_sys::Win32::System::ProcessStatus::{K32EnumDeviceDrivers, K32GetDeviceDriverFileNameW};
+    let mut bases = vec![std::ptr::null_mut(); 1024];
+    let mut need = 0u32;
+    if unsafe { K32EnumDeviceDrivers(bases.as_mut_ptr(), (bases.len() * 8) as u32, &mut need) } == 0 {
+        return Vec::new();
+    }
+    bases
+        .iter()
+        .take((need as usize / 8).min(bases.len()))
+        .filter(|b| !b.is_null())
+        .filter_map(|&b| {
+            let mut name = vec![0u16; 1024];
+            let n = unsafe { K32GetDeviceDriverFileNameW(b, name.as_mut_ptr(), name.len() as u32) };
+            let path = dos_path(&String::from_utf16_lossy(&name[..n as usize]), devices);
+            let size = crate::symbol::pdb::image_size(std::path::Path::new(&path))?;
+            Some(Module { pid: 0, base: b as u64, size: size as u64, path })
+        })
+        .collect()
 }
 
 /// `\Device\HarddiskVolume3` → `C:` for every drive letter.

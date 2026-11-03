@@ -277,7 +277,7 @@ fn task_xml(sid: &str, exe: &std::path::Path) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo><Description>strobe deep-mode helper: ETW sessions (present events, sampled stacks) for this user's strobe, on request over a user-only pipe. Removed by strobe leave.</Description></RegistrationInfo>
+  <RegistrationInfo><Description>strobe deep-mode helper: ETW sessions (present events, sampled stacks) for this user's strobe, on request over a user-only pipe. Removed by strobe leave.</Description><SecurityDescriptor>D:(A;;FA;;;BA)(A;;FA;;;SY)(A;;GRGX;;;{sid})</SecurityDescriptor></RegistrationInfo>
   <Principals><Principal id="Author"><UserId>{sid}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
   <Settings>
     <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>

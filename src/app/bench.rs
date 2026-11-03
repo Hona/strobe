@@ -13,7 +13,7 @@ use crate::runner::Runner;
 use crate::stats::{self, Comparison};
 use crate::store;
 use crate::target::chromium::{self, Page, Window};
-use crate::target::electron;
+use crate::target::{electron, isolate};
 use crate::validity::{self, Warning};
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -1182,7 +1182,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     let mut guard = None;
     let browser = if kind == "command" {
         let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
-        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &electron::new_home(), &window, ctx.pin)?.0
+        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), &window, ctx.pin)?.0
     } else if app {
         let launch = variant_app(v, &target, &ctx.config)?;
         let seed = target["home"].as_str().map(|h| {
@@ -1805,9 +1805,9 @@ fn snapshot(page: &Page, exp: &str, step: &str) -> String {
 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
 /// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
-fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<electron::App> {
+fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
     if let Kind::App(id) = &v.kind {
-        return electron::app(id, config);
+        return isolate::app(id, config);
     }
     let profile = match target["kind"].as_str() {
         Some("app") => target["id"].as_str(),
@@ -1815,8 +1815,8 @@ fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<electron::
         _ => return Err(Error::usage("not an app target")),
     };
     let base = match profile {
-        Some(id) => electron::app(id, config)?,
-        None => electron::App::bare(Path::new(target["path"].as_str().unwrap_or(""))),
+        Some(id) => isolate::app(id, config)?,
+        None => isolate::App::bare(Path::new(target["path"].as_str().unwrap_or(""))),
     };
     match &v.kind {
         Kind::Exe(p) => Ok(base.with_exe(p)),
@@ -2040,7 +2040,7 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
         (Kind::Url(href.to_string()), href.to_string(), None)
     } else if let Some(id) = spec.strip_prefix("app:") {
         // Fails early when the profile is missing or the app is not installed.
-        electron::app(id, config)?;
+        isolate::installed(&isolate::app(id, config)?)?;
         (Kind::App(id.to_string()), spec.to_string(), None)
     } else if let Some(p) = spec.strip_prefix("exe:") {
         (Kind::Exe(PathBuf::from(p)), p.to_string(), None)

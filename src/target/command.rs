@@ -3,7 +3,8 @@
 
 use super::cdp::Cdp;
 use super::chromium::{Browser, Window};
-use super::electron::{Started, epoch_ms, lines};
+use super::electron::Started;
+use super::isolate::{epoch_ms, lines};
 use crate::host;
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
@@ -108,12 +109,12 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                super::electron::kill_tree(pid);
+                super::isolate::kill_tree(pid);
                 return Err(Error::msg(format!("`{}` exited before it printed \"{} ws://…\"", spec.run, spec.attach)));
             }
         }
         if Instant::now() > deadline {
-            super::electron::kill_tree(pid);
+            super::isolate::kill_tree(pid);
             return Err(Error::unreachable(format!("`{}` printed no \"{} ws://…\" in {} s", spec.run, spec.attach, spec.timeout.as_secs())));
         }
     };

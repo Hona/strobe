@@ -114,14 +114,14 @@ pub fn reap_orphans() {
                 continue;
             }
             for pid in host::win::running_under(&e.path()) {
-                super::electron::kill_tree(pid);
+                super::isolate::kill_tree(pid);
             }
         }
         #[cfg(not(windows))]
         if std::process::Command::new("kill").args(["-0", &owner.to_string()]).status().is_ok_and(|s| s.success()) {
             continue;
         }
-        super::electron::restore_protocols(&e.path());
+        super::isolate::restore_protocols(&e.path());
         let _ = std::fs::remove_dir_all(e.path());
     }
 }
@@ -300,7 +300,7 @@ impl Browser {
                 std::thread::sleep(Duration::from_millis(50));
             }
             // The whole tree: an Electron app's own service and helpers go with it.
-            super::electron::kill_tree(self.pid);
+            super::isolate::kill_tree(self.pid);
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -309,9 +309,9 @@ impl Browser {
             // everything that runs from the private home.
             #[cfg(windows)]
             for pid in crate::host::win::running_under(&p) {
-                super::electron::kill_tree(pid);
+                super::isolate::kill_tree(pid);
             }
-            super::electron::restore_protocols(&p);
+            super::isolate::restore_protocols(&p);
             // Chromium may hold files for a moment after exit.
             for _ in 0..20 {
                 if std::fs::remove_dir_all(&p).is_ok() {

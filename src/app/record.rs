@@ -9,7 +9,7 @@ use crate::model::{Error, Result};
 use crate::probe::{self, Set};
 use crate::store;
 use crate::target::chromium::{self, Window};
-use crate::target::electron;
+use crate::target::{electron, isolate};
 use crate::validity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -61,9 +61,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
     // `exe:<path> --app <id>` borrows an app profile for another build of that app.
     let app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
-        (Some(id), _, _) => Some(electron::app(id, &config)?),
-        (_, Some(path), Some(id)) => Some(electron::app(id, &config)?.with_exe(std::path::Path::new(path))),
-        (_, Some(path), None) => Some(electron::App::bare(std::path::Path::new(path))),
+        (Some(id), _, _) => Some(isolate::app(id, &config)?),
+        (_, Some(path), Some(id)) => Some(isolate::app(id, &config)?.with_exe(std::path::Path::new(path))),
+        (_, Some(path), None) => Some(isolate::App::bare(std::path::Path::new(path))),
         _ => None,
     };
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {

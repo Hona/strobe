@@ -95,7 +95,7 @@ impl Host {
                 Err(e) => return Err(Error::msg(format!("script host connection: {e}"))),
             }
             if Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
-                electron::kill_tree(child.id());
+                isolate::kill_tree(child.id());
                 return Err(failed(log));
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -155,7 +155,7 @@ impl Host {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        electron::kill_tree(self.child.id());
+        isolate::kill_tree(self.child.id());
     }
 }
 

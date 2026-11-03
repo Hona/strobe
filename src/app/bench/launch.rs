@@ -6,7 +6,8 @@
 use super::*;
 use crate::target::cdp::Cdp;
 use crate::target::command;
-use crate::target::electron::{Extra, Started, epoch_ms};
+use crate::target::electron::{Extra, Started};
+use crate::target::isolate::epoch_ms;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
@@ -64,7 +65,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         "warm" => true,
         other => return Err(Error::usage(format!("{}: launch.profile is fresh or warm, not {other}", s.case))),
     };
-    let home = (!web).then(|| if warm { ctx.homes.entry(key.to_string()).or_insert_with(electron::new_home).clone() } else { electron::new_home() });
+    let home = (!web).then(|| if warm { ctx.homes.entry(key.to_string()).or_insert_with(isolate::new_home).clone() } else { isolate::new_home() });
     if let Some(h) = &home {
         std::fs::create_dir_all(h)?;
     }
@@ -77,7 +78,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
     });
     let prepared = match &app {
-        Some(a) => Some(electron::prepare_home(a, seed.as_deref(), home.clone())?),
+        Some(a) => Some(isolate::prepare_home(a, seed.as_deref(), home.clone())?),
         None => None,
     };
     let env = app.as_ref().zip(prepared.as_ref()).map(|(a, h)| h.environment(a));
@@ -274,7 +275,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let home = browser.profile.take();
     browser.close();
     if let Some(h) = &home {
-        electron::release_home(h);
+        isolate::release_home(h);
     }
     let closed = ctx.runner.call("close", json!({}), t, &no_page);
     if let Some(h) = home.filter(|_| !warm) {
@@ -542,7 +543,7 @@ fn tail(home: &Path, globs: &[String], stop: &AtomicBool) -> Vec<Line> {
             entry.1.push_str(&String::from_utf8_lossy(&buf));
             let at = epoch_ms();
             while let Some(i) = entry.1.find('\n') {
-                let line = electron::strip_ansi(entry.1[..i].trim_end_matches('\r'));
+                let line = isolate::strip_ansi(entry.1[..i].trim_end_matches('\r'));
                 entry.1.drain(..=i);
                 out.push((at, line, glob.clone()));
             }

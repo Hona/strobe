@@ -4,3 +4,4 @@ pub mod cdp;
 pub mod chromium;
 pub mod command;
 pub mod electron;
+pub mod isolate;

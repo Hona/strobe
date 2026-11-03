@@ -74,6 +74,10 @@ pub fn native(dir: &Path, thread: Option<&str>) -> Result<Option<Native>> {
                         *out.unsymbolized.entry(package.clone()).or_default() += n;
                     }
                 }
+                // Consecutive frames of one unsymbolized module are one frame to a reader.
+                if !*ok && frames.last().is_some_and(|f: &Frame| f.name == *name && f.file.is_empty()) {
+                    continue;
+                }
                 frames.push(Frame { name: name.clone(), file: file.clone(), line: *line as i64, column: 0, url: String::new(), mapped: false, name_from: None, package: Some(package.clone()) });
             }
         }
@@ -186,6 +190,12 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
                     .collect(),
                 None => vec![(module.clone(), String::new(), 0, fallback.clone(), false)],
             };
+            // The standard library inlined into a function (`wrapping_mul` in a loop) is that
+            // function's work: it folds into the frame it was inlined into, whose line is the call.
+            let mut r = r;
+            while r.len() > 1 && r[0].3 == "std" && r[1..].iter().any(|f| f.3 != "std") {
+                r.remove(0);
+            }
             out.insert(key, r);
         }
     }

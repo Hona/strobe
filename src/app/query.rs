@@ -1099,6 +1099,7 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
     let (mut total, mut mapped, mut scripts) = (0.0, 0u64, 0u64);
     let samples: u64 = weights.iter().map(|w| w.2).sum();
     let mut packages: BTreeMap<String, String> = BTreeMap::new();
+    let mut lines: BTreeMap<(String, String), BTreeMap<i64, f64>> = BTreeMap::new();
     for (stack, w, hits) in weights {
         let Some(f) = stack.last() else { continue };
         if f.mapped {
@@ -1118,7 +1119,17 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
             }
             _ => f.name.clone(),
         };
-        let detail = if by == "function" { f.location() } else { String::new() };
+        // A native frame is located at the sampled line: its function's row is the function in its
+        // file, and the lines it spent the time on are kept beside it.
+        let native = f.package.is_some() && f.line > 0;
+        let detail = match by {
+            "function" if native => f.file.clone(),
+            "function" => f.location(),
+            _ => String::new(),
+        };
+        if native && by == "function" {
+            *lines.entry((key.clone(), detail.clone())).or_default().entry(f.line).or_default() += w;
+        }
         let e = rows.entry((key, detail)).or_insert((0.0, 0, Stacks::new()));
         e.0 += w;
         e.1 += hits;
@@ -1139,6 +1150,11 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
         let share = if total > 0.0 { w / total } else { 0.0 };
         let ci = 1.96 * (share * (1.0 - share) / n).sqrt();
         text += &format!("  {:>9}  {:>5.1}% ±{:>4.2}  {}  {}\n", show(*w), share * 100.0, ci * 100.0, k, detail);
+        let mut hot: Vec<(i64, f64)> = lines.get(&(k.clone(), detail.clone())).map(|l| l.iter().map(|(a, b)| (*a, *b)).collect()).unwrap_or_default();
+        hot.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if !hot.is_empty() {
+            text += &format!("             lines {}\n", hot.iter().take(4).map(|(l, x)| format!(":{l} {:.0}%", 100.0 * x / w.max(1e-9))).collect::<Vec<_>>().join(" · "));
+        }
         let mut heavy: Vec<(&Vec<Frame>, &(f64, u64))> = row_stacks.iter().collect();
         heavy.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
         if let Some((stack, (sw, _))) = heavy.first().filter(|(s, _)| s.len() > 1) {
@@ -1148,7 +1164,12 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
             }
         }
         let stacks_json: Vec<Value> = heavy.iter().take(3).map(|(stack, (sw, sn))| json!({ "weight": sw, "samples": sn, "frames": stack.iter().map(Frame::json).collect::<Vec<_>>() })).collect();
-        json_rows.push(json!({ "name": k, "weight": w, "samples": hits, "share": share, "share_ci": ci, "where": detail, "stacks": stacks_json }));
+        let mut row = json!({ "name": k, "weight": w, "samples": hits, "share": share, "share_ci": ci, "where": detail, "stacks": stacks_json });
+        if !hot.is_empty() {
+            row["line"] = json!(hot[0].0);
+            row["lines"] = json!(hot.iter().take(10).map(|(l, x)| json!({ "line": l, "weight": x })).collect::<Vec<_>>());
+        }
+        json_rows.push(row);
     }
     Output::new(text, json!({ "by": by, "samples": samples, "script_samples": scripts, "mapped_samples": mapped, "total": total, "rows": json_rows }))
 }

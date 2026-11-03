@@ -1355,6 +1355,11 @@ name. Core migration needs the deep helper and is not built.
   `symbols.servers` through `curl`; a miss leaves a `missing` marker for a day. Inline frames are
   expanded; a return address looks up its call (address − 1). Symbolization runs when a view first
   reads the recording and is cached beside it (`deep-symbols.json.gz`).
+- The Rust standard library inlined into a function (`wrapping_mul` in a loop, an iterator
+  adapter) is that function's work: those inline frames fold into the frame they were inlined
+  into, at the line of the call. Without that, a hot loop reads as `std`. A function's hotspot row
+  is the function in its file; the lines its samples fell on are listed beside it (`lines`, the
+  hottest first), and its stacks keep every frame's line.
 - Packages for native frames: the crate from Cargo's folders (`registry/src/*/<crate>-<version>`,
   else the folder holding `src`), `std` for the Rust toolchain's library, else the module:
   `<module> (windows)` under the system folder, `<module> (gpu driver)` from the driver store or a
@@ -1735,6 +1740,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | daemon idle private memory | ≤ 8 MB |
 | daemon idle CPU | ≤ 0.1% of one core |
 | samplers while recording | ≤ 0.5% of one core |
+| OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`) |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
@@ -1890,3 +1896,16 @@ and nothing else from them is emitted.
 - Cross-checks on that case agree: trace layouts and style recalcs per run match the browser's
   `LayoutCount` and `RecalcStyleCount` within 0.2%, their time matches `LayoutDuration` +
   `RecalcStyleDuration` within 2.5%, sampled allocations match bytes freed by GC within 15%.
+- OS present events and native stacks (§13.4) were checked without a live session, on synthetic
+  events laid out by this machine's own registered manifests (TDH) in PresentMon's documented
+  orders: composed flips through DWM, independent flips, a runtime without DXGI events (Vulkan),
+  a present replaced in its refresh (discarded), a frame composed a refresh late (one missed
+  refresh, a 12.1 ms interval at 165 Hz) and a rest between bursts (neither); every screen time
+  landed on its vblank, and toolkit rows joined their presents. The consumer costs 0.25 µs per
+  event. The sampler's merge of kernel and user stack parts, its process filter and image paths,
+  and PDB symbolization were checked with real stacks of a planted-hot MSVC binary sampled in
+  process: the planted function ranked first at 94% with its loop's line, 100% resolved.
+  Not yet run against a live session (no unlocked display or elevation was available): presents
+  on a real display (counts and intervals against Chromium's own frames with `record --os-frames`,
+  a native flip-model window), the helper's install, task start and pipe, the kernel's sampled
+  profile and its rundown, and the session's CPU cost on a busy desktop.

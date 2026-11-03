@@ -113,7 +113,8 @@ pub fn enable_privilege(name: &str) -> Result<()> {
     Ok(())
 }
 
-struct Sampler {
+/// The session's consumer: keeps the samples of `pids` (and their children) and the images they use.
+pub struct Sampler {
     guids: [GUID; 3],
     pids: HashSet<u32>,
     /// (stack walk timestamp, thread) → sample index: a sample taken in kernel mode gets its user
@@ -128,7 +129,7 @@ struct Sampler {
 const KERNEL: u64 = 0xFFFF_8000_0000_0000;
 
 impl Sampler {
-    fn new(pids: HashSet<u32>) -> Sampler {
+    pub fn new(pids: HashSet<u32>) -> Sampler {
         Sampler {
             guids: [session::guid(STACKWALK), session::guid(IMAGE), session::guid(PROCESS)],
             pids,

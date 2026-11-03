@@ -117,24 +117,176 @@ pub fn native_speed(cpus: Option<u64>) -> f64 {
     ms
 }
 
-/// `Throttled` for the native speed check, against the fastest this device has run it (kept in
-/// `<state>/native-speed.json`; the first check sets it). Returns the ratio.
-pub fn native_throttled(ms: f64) -> Result<Option<f64>> {
-    let path = host::paths::state_dir().join("native-speed.json");
-    let best = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["ms"].as_f64()).filter(|b| *b > 0.0);
-    if ms.is_finite() && best.is_none_or(|b| ms < b) {
-        let _ = std::fs::write(&path, serde_json::json!({ "ms": ms }).to_string());
+/// Busy % of each of `cpus` (all when `None`) over `ms`, from idle cycles against the TSC.
+fn busy(cpus: Option<u64>, ms: u64) -> Option<Vec<f64>> {
+    let (mut a, mut b) = (Vec::new(), Vec::new());
+    let t0 = host::tsc()?;
+    host::idle_cycles(&mut a).then_some(())?;
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+    let t1 = host::tsc()?;
+    host::idle_cycles(&mut b).then_some(())?;
+    let span = t1.saturating_sub(t0) as f64;
+    (span > 0.0 && a.len() == b.len()).then_some(())?;
+    Some(
+        a.iter()
+            .zip(&b)
+            .enumerate()
+            .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
+            .map(|(_, (x, y))| (100.0 * (1.0 - y.saturating_sub(*x) as f64 / span)).clamp(0.0, 100.0))
+            .collect(),
+    )
+}
+
+/// Waits, up to `max`, until `cpus` are quiet: two 100 ms looks in a row with their mean busy under
+/// 5% and none over 25% (an app that just ended still frees its memory and GPU objects on them).
+/// Returns the last look's mean and busiest CPU, in %.
+pub fn wait_quiet(cpus: Option<u64>, max: std::time::Duration) -> (f64, f64) {
+    let deadline = std::time::Instant::now() + max;
+    let mut calm = 0;
+    loop {
+        let Some(b) = busy(cpus, 100) else { return (f64::NAN, f64::NAN) };
+        let mean = b.iter().sum::<f64>() / b.len().max(1) as f64;
+        let top = b.iter().copied().fold(0.0, f64::max);
+        calm = if mean < 5.0 && top < 25.0 { calm + 1 } else { 0 };
+        if calm >= 2 || std::time::Instant::now() > deadline {
+            return (mean, top);
+        }
     }
-    let Some(base) = best else { return Ok(None) };
-    let ratio = ms / base;
-    if ratio > 1.5 {
+}
+
+/// The speed check's reference for one CPU mask: the median of the last checks that passed there.
+const KEPT: usize = 20;
+
+/// Other work on the target's CPUs during a check (% of one core) past which a slow check is that
+/// work's doing, not the device's.
+const FOREIGN_PCT: f64 = 25.0;
+
+/// One speed check: its time, the other work on the target's CPUs meanwhile (their busy time less
+/// the check's own core), and the processes outside strobe that used the most CPU (any CPU).
+#[derive(Clone)]
+struct Try {
+    ms: f64,
+    foreign_pct: f64,
+    others: Vec<(String, f64)>,
+}
+
+fn timed_check(cpus: Option<u64>) -> Try {
+    let me = std::process::id();
+    let (p0, c0, t0) = (host::all_processes(), idle_now(), host::tsc());
+    let started = std::time::Instant::now();
+    let ms = native_speed(cpus);
+    let wall_ms = started.elapsed().as_secs_f64() * 1e3;
+    let (p1, c1, t1) = (host::all_processes(), idle_now(), host::tsc());
+    let foreign_pct = match (c0, c1, t0, t1) {
+        (Some(a), Some(b), Some(x), Some(y)) if y > x && a.len() == b.len() => {
+            let span = (y - x) as f64;
+            let busy: f64 = a
+                .iter()
+                .zip(&b)
+                .enumerate()
+                .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
+                .map(|(_, (i0, i1))| (100.0 * (1.0 - i1.saturating_sub(*i0) as f64 / span)).clamp(0.0, 100.0))
+                .sum();
+            (busy - 100.0).max(0.0)
+        }
+        _ => 0.0,
+    };
+    let before: std::collections::HashMap<u32, u64> = p0.iter().map(|p| (p.pid, p.cpu_ns)).collect();
+    let mut others: Vec<(String, f64)> = p1
+        .iter()
+        .filter(|p| p.pid != me && p.pid != 0)
+        .filter_map(|p| {
+            let d = p.cpu_ns.saturating_sub(*before.get(&p.pid)?) as f64 / 1e6;
+            let pct = 100.0 * d / wall_ms.max(1.0);
+            (pct >= 5.0).then(|| (format!("{} ({})", p.name, p.pid), pct))
+        })
+        .collect();
+    others.sort_by(|a, b| b.1.total_cmp(&a.1));
+    others.truncate(3);
+    Try { ms, foreign_pct, others }
+}
+
+fn idle_now() -> Option<Vec<u64>> {
+    let mut v = Vec::new();
+    host::idle_cycles(&mut v).then_some(v)
+}
+
+/// `Throttled` for targets with no page (SPEC §10.1): the native speed check on `cpus`, run once
+/// they are quiet, against this device's reference for that mask (`<state>/native-speed.json`:
+/// the median of its last 20 passing checks; the first check sets it). A slow check is retried
+/// twice after the CPUs settle again: throttling (power, heat, a power plan) lasts, while an app
+/// that just ended (freeing a large model) or a burst of other work passes. Returns the ratio.
+pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
+    let path = host::paths::state_dir().join("native-speed.json");
+    let mut saved: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    let key = cpus.map_or("all".to_string(), |m| format!("{m:#x}"));
+    let mut kept: Vec<f64> = saved[&key]["ms"].as_array().into_iter().flatten().filter_map(Value::as_f64).filter(|m| *m > 0.0).collect();
+    let reference = (!kept.is_empty()).then(|| {
+        let mut s = kept.clone();
+        s.sort_by(f64::total_cmp);
+        s[s.len() / 2]
+    });
+    // Up to 3 slow tries on quiet CPUs, and for as long as 2 minutes while other processes keep the
+    // target's CPUs busy during the check: that is their work, not this device's speed.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut best: Option<Try> = None;
+    let mut slow = 0;
+    let last = loop {
+        wait_quiet(cpus, std::time::Duration::from_secs(10));
+        let t = timed_check(cpus);
+        if t.ms.is_finite() && best.as_ref().is_none_or(|b| t.ms < b.ms) {
+            best = Some(t.clone());
+        }
+        if reference.is_none_or(|r| t.ms / r <= 1.5) {
+            break t;
+        }
+        if t.foreign_pct > FOREIGN_PCT && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            continue;
+        }
+        slow += 1;
+        if slow >= 3 || std::time::Instant::now() >= deadline {
+            break t;
+        }
+    };
+    let Some(best) = best else { return Ok(None) };
+    let ms = best.ms;
+    let ratio = reference.map(|r| ms / r);
+    if let (Some(ratio), Some(r)) = (ratio, reference)
+        && ratio > 1.5
+    {
+        let who = |t: &Try| if t.others.is_empty() { "nothing outside strobe".to_string() } else { t.others.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ") };
+        if last.foreign_pct > FOREIGN_PCT {
+            return Err(Error::refused(
+                "Background",
+                format!(
+                    "the native speed check on the target's CPUs ran {ratio:.2}× slower than this device's reference ({ms:.1} ms vs {r:.1} ms) while other work kept those CPUs {:.0}% of a core busy for 2 minutes; busiest processes (% of a core): {}",
+                    last.foreign_pct,
+                    who(&last)
+                ),
+                "let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs",
+            ));
+        }
         return Err(Error::refused(
             "Throttled",
-            format!("the native speed check ran {ratio:.2}× slower than the fastest on this device ({ms:.1} ms vs {base:.1} ms)"),
+            format!(
+                "the native speed check ran {ratio:.2}× slower than this device's reference on these CPUs ({ms:.1} ms vs {r:.1} ms, best of 3 tries on quiet CPUs; other work during the last: {:.0}% of a core there; busiest processes: {})",
+                last.foreign_pct,
+                who(&last)
+            ),
             "plug in power, leave power saving, let the machine cool down",
         ));
     }
-    Ok(Some(ratio))
+    kept.push(ms);
+    let drop = kept.len().saturating_sub(KEPT);
+    kept.drain(..drop);
+    if let Some(o) = saved.as_object_mut() {
+        // The single all-time best older versions kept, for every mask at once.
+        o.remove("ms");
+    }
+    saved[&key] = serde_json::json!({ "ms": kept });
+    let _ = std::fs::write(&path, saved.to_string());
+    Ok(ratio)
 }
 
 /// Holds the per-device bench lock while alive.

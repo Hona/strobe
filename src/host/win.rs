@@ -197,7 +197,11 @@ pub fn power_plan() -> String {
             "8c5e7fda-e8bf-4a96" => "High performance".into(),
             "a1841308-3541-4fab" => "Power saver".into(),
             "e9a42b02-d5df-448d" => "Ultimate performance".into(),
-            _ => format!("custom {text}"),
+            // A vendor's or the user's own scheme: its name as powercfg shows it.
+            _ => super::output(std::process::Command::new("powercfg").arg("/getactivescheme"))
+                .and_then(|t| t.split_once('(').and_then(|(_, r)| r.rsplit_once(')')).map(|(n, _)| n.trim().to_string()))
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| format!("custom {text}")),
         }
     }
 }
@@ -233,6 +237,40 @@ pub fn wake_display() {
     unsafe {
         SendInput(1, &input, size_of::<INPUT>() as i32);
     }
+}
+
+static DISPLAY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(u8::MAX);
+static DISPLAY_CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The console display's state as Windows reports it (`GUID_CONSOLE_DISPLAY_STATE`: 0 off, 1 on,
+/// 2 dimmed) and how often it changed, from a power-setting callback registered on first use (it
+/// reports the state at once). None when it cannot be registered.
+pub fn display_state() -> Option<(u8, u64)> {
+    use std::sync::atomic::Ordering;
+    use windows_sys::Win32::System::Power::{DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS, POWERBROADCAST_SETTING, PowerSettingRegisterNotification};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{DEVICE_NOTIFY_CALLBACK, PBT_POWERSETTINGCHANGE};
+    const CONSOLE_DISPLAY_STATE: windows_sys::core::GUID = windows_sys::core::GUID::from_u128(0x6fe69556_704a_47a0_8f24_c28d936fda47);
+    unsafe extern "system" fn changed(_: *const std::ffi::c_void, kind: u32, setting: *const std::ffi::c_void) -> u32 {
+        if kind == PBT_POWERSETTINGCHANGE && !setting.is_null() {
+            let s = unsafe { &*(setting as *const POWERBROADCAST_SETTING) };
+            if s.DataLength >= 1 {
+                let v = s.Data[0];
+                if DISPLAY.swap(v, Ordering::Relaxed) != v {
+                    DISPLAY_CHANGES.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        0
+    }
+    static REGISTERED: OnceLock<bool> = OnceLock::new();
+    let ok = *REGISTERED.get_or_init(|| unsafe {
+        // Lives for the process: the registration is never removed.
+        let params = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS { Callback: Some(changed), Context: std::ptr::null_mut() }));
+        let mut handle = std::ptr::null_mut();
+        PowerSettingRegisterNotification(&CONSOLE_DISPLAY_STATE, DEVICE_NOTIFY_CALLBACK, params as *mut _ as _, &mut handle) == 0
+    });
+    let v = DISPLAY.load(Ordering::Relaxed);
+    (ok && v != u8::MAX).then(|| (v, DISPLAY_CHANGES.load(Ordering::Relaxed)))
 }
 
 /// For as long as the calling thread lives (or until changed): keeps the machine awake when `system`,
@@ -547,6 +585,52 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     }
 }
 
+pub fn display_of(hwnd: isize) -> Option<super::DisplayPath> {
+    use windows_sys::Win32::Devices::Display::{
+        DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,
+        QDC_ONLY_ACTIVE_PATHS, QueryDisplayConfig,
+    };
+    use windows_sys::Win32::Graphics::Gdi::MonitorFromWindow;
+    let text = |w: &[u16]| String::from_utf16_lossy(&w[..w.iter().position(|c| *c == 0).unwrap_or(w.len())]);
+    unsafe {
+        let mon = MonitorFromWindow(hwnd as _, MONITOR_DEFAULTTONEAREST);
+        let mut info: MONITORINFOEXW = zeroed();
+        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+        if GetMonitorInfoW(mon, &mut info as *mut _ as *mut _) == 0 {
+            return None;
+        }
+        let device = text(&info.szDevice);
+        let (mut np, mut nm) = (0u32, 0u32);
+        if GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &mut np, &mut nm) != 0 {
+            return None;
+        }
+        let mut paths: Vec<DISPLAYCONFIG_PATH_INFO> = vec![zeroed(); np as usize];
+        let mut modes: Vec<DISPLAYCONFIG_MODE_INFO> = vec![zeroed(); nm as usize];
+        if QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &mut np, paths.as_mut_ptr(), &mut nm, modes.as_mut_ptr(), std::ptr::null_mut()) != 0 {
+            return None;
+        }
+        paths.truncate(np as usize);
+        paths.iter().find_map(|p| {
+            let mut name: DISPLAYCONFIG_SOURCE_DEVICE_NAME = zeroed();
+            name.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            name.header.size = size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32;
+            name.header.adapterId = p.sourceInfo.adapterId;
+            name.header.id = p.sourceInfo.id;
+            if DisplayConfigGetDeviceInfo(&mut name.header) != 0 || !text(&name.viewGdiDeviceName).eq_ignore_ascii_case(&device) {
+                return None;
+            }
+            let r = p.targetInfo.refreshRate;
+            let luid = p.targetInfo.adapterId;
+            Some(super::DisplayPath {
+                device: device.clone(),
+                target: p.targetInfo.id,
+                adapter_luid: (luid.HighPart as u32 as u64) << 32 | luid.LowPart as u64,
+                hz: if r.Denominator > 0 { r.Numerator as f64 / r.Denominator as f64 } else { 0.0 },
+            })
+        })
+    }
+}
+
 /// One process from `NtQuerySystemInformation(SystemProcessInformation)`.
 struct SysProc {
     info: super::ProcInfo,
@@ -682,6 +766,67 @@ pub fn thread_cycles_of(tid: u32) -> Option<u64> {
         CloseHandle(h);
         ok.then_some(c)
     }
+}
+
+/// The loaded modules of a process: (base, size, path).
+fn process_modules(pid: u32) -> Vec<(u64, u64, String)> {
+    use windows_sys::Win32::System::ProcessStatus::{K32EnumProcessModulesEx, K32GetModuleFileNameExW, K32GetModuleInformation, LIST_MODULES_ALL, MODULEINFO};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+    let mut out = Vec::new();
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if h.is_null() {
+            return out;
+        }
+        let mut mods = vec![std::ptr::null_mut(); 2048];
+        let mut need = 0u32;
+        if K32EnumProcessModulesEx(h, mods.as_mut_ptr(), (mods.len() * 8) as u32, &mut need, LIST_MODULES_ALL) != 0 {
+            for &m in mods.iter().take((need as usize / 8).min(mods.len())) {
+                let mut info: MODULEINFO = zeroed();
+                let mut name = vec![0u16; 1024];
+                let n = K32GetModuleFileNameExW(h, m, name.as_mut_ptr(), name.len() as u32);
+                if n > 0 && K32GetModuleInformation(h, m, &mut info, size_of::<MODULEINFO>() as u32) != 0 {
+                    out.push((info.lpBaseOfDll as u64, info.SizeOfImage as u64, String::from_utf16_lossy(&name[..n as usize])));
+                }
+            }
+        }
+        CloseHandle(h);
+    }
+    out
+}
+
+/// Where each thread started: the module holding its Win32 start address (`NtQueryInformationThread`
+/// `ThreadQuerySetWin32StartAddress`; the system snapshot's start address is `RtlUserThreadStart` for
+/// every user thread). Per tid: the module's path.
+pub fn thread_modules(threads: &[(u32, u32)]) -> HashMap<u32, String> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_INFORMATION};
+    type Query = unsafe extern "system" fn(windows_sys::Win32::Foundation::HANDLE, i32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
+    let mut out = HashMap::new();
+    let ntdll: Vec<u16> = "ntdll.dll\0".encode_utf16().collect();
+    let Some(query) = (unsafe { GetProcAddress(GetModuleHandleW(ntdll.as_ptr()), c"NtQueryInformationThread".as_ptr() as *const u8) }) else { return out };
+    let query: Query = unsafe { std::mem::transmute(query) };
+    let mut modules: HashMap<u32, Vec<(u64, u64, String)>> = HashMap::new();
+    for &(pid, tid) in threads {
+        let start = unsafe {
+            let h = OpenThread(THREAD_QUERY_INFORMATION, 0, tid);
+            if h.is_null() {
+                continue;
+            }
+            let mut start = 0usize;
+            let ok = query(h, 9, &mut start as *mut usize as *mut _, size_of::<usize>() as u32, std::ptr::null_mut()) >= 0;
+            CloseHandle(h);
+            if !ok || start == 0 {
+                continue;
+            }
+            start as u64
+        };
+        let list = modules.entry(pid).or_insert_with(|| process_modules(pid));
+        if let Some((_, _, path)) = list.iter().find(|(b, s, _)| start >= *b && start < b + s) {
+            out.insert(tid, path.clone());
+        }
+    }
+    out
 }
 
 /// A thread's name (`SetThreadDescription`, which Rust's `thread::Builder::name` and most runtimes

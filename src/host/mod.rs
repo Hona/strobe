@@ -2,6 +2,7 @@
 
 pub mod http;
 pub mod paths;
+pub mod power;
 #[cfg(windows)]
 pub mod win;
 
@@ -43,9 +44,25 @@ pub fn wake_display() {
     win::wake_display();
 }
 
+/// The console display's state (0 off, 1 on, 2 dimmed) and how many times it changed so far; None
+/// where it is not known.
+pub fn display_state() -> Option<(u8, u64)> {
+    #[cfg(windows)]
+    {
+        win::display_state()
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
 /// While alive, keeps the machine awake and, while the session is unlocked, the display on (an
-/// unattended bench must not let the display sleep under it; a locked screen may go dark while the
-/// bench waits), and counts how often it saw the session locked, every 500 ms.
+/// unattended bench must not let the display sleep under it), and counts how often it saw the session
+/// locked, every 500 ms. A locked session's display may go dark as Windows decides: that is how a
+/// locked machine runs for its users, and keeping a display lit for days of locked benches would be
+/// strobe changing the machine. Benches track the display state per block instead (`display_state`)
+/// and redo a pair whose blocks saw different states.
 pub struct Awake {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     locked: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -425,10 +442,39 @@ pub struct Env {
     pub strobe: String,
 }
 
+/// The active power plan's name, with Windows 11's power mode when one is set on it
+/// ("Balanced · Best performance").
+pub fn env_power_plan() -> String {
+    #[cfg(windows)]
+    {
+        let plan = win::power_plan();
+        match power::mode() {
+            Some(m) if plan == "Balanced" => format!("{plan} · {m}"),
+            _ => plan,
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        String::new()
+    }
+}
+
+/// A laptop running on its battery.
+pub fn on_battery() -> bool {
+    #[cfg(windows)]
+    {
+        win::on_battery()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 pub fn env() -> Env {
     let topo = topology();
     #[cfg(windows)]
-    let (os, cpu, power_plan, on_battery) = (win::os_name(), win::cpu_name(), win::power_plan(), win::on_battery());
+    let (os, cpu, power_plan, on_battery) = (win::os_name(), win::cpu_name(), env_power_plan(), win::on_battery());
     #[cfg(not(windows))]
     let (os, cpu, power_plan, on_battery) = (std::env::consts::OS.to_string(), String::new(), String::new(), false);
     #[cfg(windows)]
@@ -488,6 +534,42 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     #[cfg(not(windows))]
     {
         let _ = (x, y);
+        None
+    }
+}
+
+/// The module each thread started in (its path), per tid, for `(pid, tid)` pairs (Windows only).
+pub fn thread_modules(threads: &[(u32, u32)]) -> std::collections::HashMap<u32, String> {
+    #[cfg(windows)]
+    {
+        win::thread_modules(threads)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = threads;
+        Default::default()
+    }
+}
+
+/// The display path a window shows on: its display target (the `VidPnTargetId` vertical blanks
+/// carry), the adapter that scans it out (LUID), and its nominal refresh.
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct DisplayPath {
+    pub device: String,
+    pub target: u32,
+    pub adapter_luid: u64,
+    pub hz: f64,
+}
+
+/// The display path of the monitor a window is on (the nearest one).
+pub fn display_of(hwnd: isize) -> Option<DisplayPath> {
+    #[cfg(windows)]
+    {
+        win::display_of(hwnd)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = hwnd;
         None
     }
 }

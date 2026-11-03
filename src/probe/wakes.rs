@@ -90,9 +90,31 @@ pub fn span(a: &Snapshot, b: &Snapshot) -> Span {
     out
 }
 
+/// Who a thread belongs to, by the module it started in: `driver` (a device driver's user-mode part,
+/// from the driver store, such as a GPU driver's worker threads), `os` (the OS's own: its thread pool,
+/// audio, RPC; a pool thread may run the app's callbacks), else `app`. Unknown without a module.
+pub fn origin(module: &str) -> &'static str {
+    let m = module.to_lowercase().replace('/', "\\");
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()).to_lowercase();
+    if m.contains("\\driverstore\\") {
+        "driver"
+    } else if m.starts_with(&windows) {
+        "os"
+    } else {
+        "app"
+    }
+}
+
+/// The module each thread of `spans` started in, while its process still runs.
+pub fn modules(spans: &[Span]) -> BTreeMap<u32, String> {
+    let threads: Vec<(u32, u32)> = spans.iter().flat_map(|s| s.threads.iter().map(|t| (t.pid, t.tid))).collect::<std::collections::BTreeSet<_>>().into_iter().collect();
+    host::thread_modules(&threads).into_iter().collect()
+}
+
 /// Per thread over several spans (the measured runs): wakes per second and CPU ms per run, busiest
-/// waker first, with the thread's name when it has one.
-pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>) -> Vec<serde_json::Value> {
+/// waker first, with the thread's name when it has one, the module it started in and that module's
+/// `origin`.
+pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeMap<u32, String>) -> Vec<serde_json::Value> {
     let total_ms: f64 = spans.iter().map(|s| s.ms).sum();
     let mut acc: BTreeMap<(u32, u32), (u64, f64, bool)> = BTreeMap::new();
     for s in spans {
@@ -109,8 +131,10 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>) -> Vec<serde_jso
     let mut rows: Vec<serde_json::Value> = acc
         .into_iter()
         .map(|((pid, tid), (n, cpu, known))| {
+            let module = modules.get(&tid);
             serde_json::json!({
                 "pid": pid, "tid": tid, "name": names.get(&tid), "switches": n,
+                "module": module.map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m)), "origin": module.map(|m| origin(m)),
                 "wakes_per_s": if total_ms > 0.0 { n as f64 / (total_ms / 1e3) } else { f64::NAN },
                 "cpu_ms_per_run": if known { Some(cpu / runs) } else { None },
             })

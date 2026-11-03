@@ -58,6 +58,8 @@ windows-sys = { version = "0.59", features = [
   # Native app windows: cloaked by the compositor (minimized to a virtual desktop, hidden), and their DPI.
   "Win32_Graphics_Dwm",
   "Win32_UI_HiDpi",
+  # The display path a window shows on (its refresh and the adapter that scans it out).
+  "Win32_Devices_Display",
   # OS and GPU sampler: console (top), NVML loaded at runtime, D3DKMT adapter names, NtQuerySystemInformation.
   "Win32_System_Console",
   "Win32_System_LibraryLoader",

@@ -78,7 +78,7 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
         cmd.process_group(0);
     }
     for (k, _) in std::env::vars() {
-        if spec.unset.iter().any(|u| u.strip_suffix('*').map_or(*u == k, |prefix| k.starts_with(prefix))) {
+        if super::isolate::env_unset(&spec.unset, &k) {
             cmd.env_remove(&k);
         }
     }

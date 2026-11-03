@@ -343,7 +343,7 @@ pub struct Summary {
     pub cores: Vec<CoreAvg>,
     /// The adapter the tree used most (engine time, then dedicated memory).
     pub gpu_adapter: Option<String>,
-    /// `3D` engine time of the tree on `gpu_adapter`, summed over its processes, % of one engine.
+    /// `3D` engine time of the tree on every adapter, summed over its processes, % of one engine.
     pub gpu_3d_pct: Option<f64>,
     /// Engine type → % of one engine on `gpu_adapter`.
     pub gpu_engines: BTreeMap<String, f64>,
@@ -448,7 +448,9 @@ impl Samples {
         if self.gpu_available {
             s.gpu_adapter = primary.map(adapter_name);
             s.gpu_engines = primary.and_then(|p| by_adapter.get(&p)).map(|a| a.1.clone()).unwrap_or_default();
-            s.gpu_3d_pct = Some(s.gpu_engines.get("3D").copied().unwrap_or(0.0));
+            // Every adapter: a process that draws on one GPU and computes on another uses both, and
+            // which one is busiest in a window must not decide what is counted.
+            s.gpu_3d_pct = Some(by_adapter.values().map(|a| a.1.get("3D").copied().unwrap_or(0.0)).sum());
             s.gpu_adapters = by_adapter.into_iter().map(|(a, (_, m))| (adapter_name(a), m)).collect();
             s.vram_dedicated_mb = Some(last.vram.iter().map(|m| m.dedicated).sum::<u64>() as f64 / MB);
             s.vram_shared_mb = Some(last.vram.iter().map(|m| m.shared).sum::<u64>() as f64 / MB);

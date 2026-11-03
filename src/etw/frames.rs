@@ -66,73 +66,193 @@ pub struct Shown {
     pub input_ns: u64,
 }
 
-/// Slack around a row's present call when matching it to an OS present (the runtime logs its
-/// start inside the call, and QPC reads on two threads differ by a few µs).
-const JOIN_SLACK_NS: u64 = 500_000;
+/// Slack around a row's present call when matching it to an OS present: the runtime logs the
+/// present's start on the presenting thread inside the call, on the same QPC clock as the row, so
+/// a few µs cover rounding. Wider would reach the next surface's or frame's present call.
+const JOIN_SLACK_NS: u64 = 10_000;
+
+/// Rows (or inputs) that matched no present beyond this share, with no events lost, refuse the
+/// frame metrics: a join that misses that much is not following the app's presents.
+const UNMATCHED_MAX: f64 = 0.05;
+
+fn stream(p: &Present) -> u64 {
+    (p.pid as u64) << 48 ^ p.swapchain
+}
+
+/// What a join saw: rows (or inputs) it tried, those that matched no present, and those with more
+/// than one present that fit.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct JoinStats {
+    pub tried: usize,
+    pub unmatched: usize,
+    pub ambiguous: usize,
+}
+
+impl JoinStats {
+    /// Why the joined frames cannot be defended, if they cannot: `AmbiguousPresent` when rows fit
+    /// several presents, `PresentsUnmatched` when over 5% matched none while the session lost no
+    /// events (with lost events, `PresentsLost` already says frame counts may be short).
+    pub fn refusal(&self, events_lost: u64) -> Option<String> {
+        if self.tried == 0 {
+            return None;
+        }
+        let share = |n: usize| n as f64 / self.tried as f64;
+        if share(self.ambiguous) > UNMATCHED_MAX {
+            return Some(format!(
+                "AmbiguousPresent: {} of {} frames fit more than one OS present (several surfaces presenting from one thread at once), so which reached the screen when is unknown",
+                self.ambiguous, self.tried
+            ));
+        }
+        if events_lost == 0 && share(self.unmatched) > UNMATCHED_MAX {
+            return Some(format!(
+                "PresentsUnmatched: {} of {} frames matched no OS present with no events lost: the present session is not following this app's presents",
+                self.unmatched, self.tried
+            ));
+        }
+        None
+    }
+}
 
 /// The OS present of each toolkit row: one of `pids`, started inside the row's present call
-/// (`cpu_end_ns`..`submit_ns`), the presenting thread first. Fills `present_ns` with the screen
-/// time of displayed ones and returns, per row, the matched present.
-pub fn join<'a>(rows: &mut [Row], presents: &'a [Present], pids: &[u32]) -> Vec<Option<&'a Present>> {
+/// (`cpu_end_ns`..`submit_ns`, within `JOIN_SLACK_NS`) on the row's own thread, the one nearest the
+/// call's start. Each surface keeps to the swapchain it first matched, and a swapchain to its
+/// surface. Another thread's present counts only when the rows have a single surface (a driver
+/// that presents from its own thread). Fills `present_ns` with the screen time of displayed ones
+/// and returns, per row, the matched present.
+pub fn join<'a>(rows: &mut [Row], presents: &'a [Present], pids: &[u32]) -> (Vec<Option<&'a Present>>, JoinStats) {
     let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid)).collect();
     let mut used = vec![false; mine.len()];
     let mut out = vec![None; rows.len()];
+    let mut stats = JoinStats::default();
+    let single = rows.iter().map(|r| r.surface).collect::<std::collections::BTreeSet<_>>().len() <= 1;
+    let mut chain_of: BTreeMap<u32, u64> = BTreeMap::new();
+    let mut surface_of: BTreeMap<u64, u32> = BTreeMap::new();
     let mut order: Vec<usize> = (0..rows.len()).collect();
-    order.sort_by_key(|&i| rows[i].submit_ns);
+    order.sort_by_key(|&i| rows[i].cpu_end_ns.min(rows[i].submit_ns));
     for i in order {
         let r = rows[i];
         if r.submit_ns == 0 {
             continue;
         }
-        let lo = r.cpu_end_ns.min(r.submit_ns).saturating_sub(JOIN_SLACK_NS);
+        stats.tried += 1;
+        let start = r.cpu_end_ns.min(r.submit_ns);
+        let lo = start.saturating_sub(JOIN_SLACK_NS);
         let hi = r.submit_ns + JOIN_SLACK_NS;
         // Presents are sorted by start: only those inside the window are looked at.
         let from = mine.partition_point(|p| p.start_ns < lo);
-        let pick = |same_thread: bool| {
+        let fits = |same_thread: bool| -> Vec<usize> {
             mine[from..]
                 .iter()
                 .enumerate()
                 .take_while(|(_, p)| p.start_ns <= hi)
-                .filter(|(j, p)| !used[from + j] && (!same_thread || p.tid == r.tid))
-                .min_by_key(|(_, p)| p.start_ns.abs_diff(r.submit_ns))
+                .filter(|(j, p)| {
+                    !used[from + j]
+                        && (!same_thread || p.tid == r.tid)
+                        && chain_of.get(&r.surface).is_none_or(|c| *c == stream(p))
+                        && surface_of.get(&stream(p)).is_none_or(|s| *s == r.surface)
+                })
                 .map(|(j, _)| from + j)
+                .collect()
         };
-        if let Some(j) = pick(true).or_else(|| pick(false)) {
-            used[j] = true;
-            out[i] = Some(mine[j]);
-            if mine[j].state == "displayed" && rows[i].present_ns == 0 {
-                rows[i].present_ns = mine[j].screen_ns;
-            }
+        let mut found = fits(true);
+        if found.is_empty() && single {
+            found = fits(false);
+        }
+        // Nearest to the call's start: a present started later belongs to a later call.
+        let Some(&j) = found.iter().min_by_key(|&&j| mine[j].start_ns.abs_diff(start)) else {
+            stats.unmatched += 1;
+            continue;
+        };
+        if found.len() > 1 && !chain_of.contains_key(&r.surface) {
+            stats.ambiguous += 1;
+            continue;
+        }
+        used[j] = true;
+        chain_of.insert(r.surface, stream(mine[j]));
+        surface_of.insert(stream(mine[j]), r.surface);
+        out[i] = Some(mine[j]);
+        if mine[j].state == "displayed" && rows[i].present_ns == 0 {
+            rows[i].present_ns = mine[j].screen_ns;
         }
     }
-    out
+    (out, stats)
 }
 
-/// The refresh period (ms) from vertical blanks in `[t0, t1]`: the median spacing on the display
-/// path with the most of them.
-pub fn refresh_ms(vsyncs: &[(u64, u32)], t0: u64, t1: u64) -> Option<f64> {
+/// How long a target must have presented nothing before an input for its next present to be the
+/// input's: a frame already under way when the input came may not hold it.
+pub fn quiet_ns(refresh_ms: f64) -> u64 {
+    (2.0 * refresh_ms * 1e6) as u64
+}
+
+/// The longest an input waits for its frame: past this its present is something else's.
+const INPUT_HORIZON_NS: u64 = 1_000_000_000;
+
+/// The frame that showed each input (an input strobe sent, at `input_ns` on the host clock): the
+/// first present of `pids` started after it that reached the screen, when the target presented
+/// nothing for `quiet_ns` before it (at rest, so that present is the input's). An input the target
+/// was busy drawing through gets `None` and is not counted; one with no present within a second
+/// counts as unmatched (it changed nothing on screen, or its present was missed).
+pub fn join_inputs<'a>(inputs: &[u64], presents: &'a [Present], pids: &[u32], quiet_ns: u64) -> (Vec<Option<&'a Present>>, JoinStats) {
+    let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid)).collect();
+    let mut stats = JoinStats::default();
+    let out = inputs
+        .iter()
+        .map(|&t| {
+            let at = mine.partition_point(|p| p.start_ns < t);
+            if at > 0 && mine[at - 1].start_ns + quiet_ns > t {
+                return None;
+            }
+            stats.tried += 1;
+            let shown = mine[at..].iter().take_while(|p| p.start_ns <= t + INPUT_HORIZON_NS).find(|p| p.state == "displayed").copied();
+            if shown.is_none() {
+                stats.unmatched += 1;
+            }
+            shown
+        })
+        .collect();
+    (out, stats)
+}
+
+/// The refresh period (ms) of the display the target shows on (`display`, its window's display
+/// path): the median spacing of that path's vertical blanks in `[t0, t1]`, or its nominal refresh
+/// when it has too few blanks or they disagree with it by over 10% (another adapter's path of
+/// the same id). Without a display path, only when every path with blanks runs at one rate: the
+/// busiest of several displays is not the one the target is on.
+pub fn refresh_ms(vsyncs: &[(u64, u32)], t0: u64, t1: u64, display: Option<&crate::host::DisplayPath>) -> Option<f64> {
     let mut by: BTreeMap<u32, Vec<u64>> = BTreeMap::new();
     for &(t, target) in vsyncs.iter().filter(|v| v.0 >= t0 && v.0 <= t1) {
         by.entry(target).or_default().push(t);
     }
-    let ts = by.into_values().max_by_key(Vec::len)?;
-    let mut gaps: Vec<f64> = ts.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).filter(|g| *g > 0.5 && *g < 50.0).collect();
-    if gaps.len() < 10 {
-        return None;
+    let period = |ts: &mut Vec<u64>| -> Option<f64> {
+        // A driver may log one blank twice (`VSyncDPC` and its multi-plane event): gaps under
+        // 0.5 ms are not refreshes.
+        ts.sort_unstable();
+        let mut gaps: Vec<f64> = ts.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).filter(|g| *g > 0.5 && *g < 50.0).collect();
+        if gaps.len() < 10 {
+            return None;
+        }
+        gaps.sort_by(|a, b| a.total_cmp(b));
+        Some(gaps[gaps.len() / 2])
+    };
+    let periods: BTreeMap<u32, f64> = by.into_iter().filter_map(|(k, mut ts)| Some((k, period(&mut ts)?))).collect();
+    if let Some(d) = display {
+        let nominal = (d.hz > 1.0).then(|| 1000.0 / d.hz);
+        return match (periods.get(&d.target), nominal) {
+            (Some(&p), Some(n)) if (p - n).abs() > n * 0.1 => Some(n),
+            (Some(&p), _) => Some(p),
+            (None, n) => n,
+        };
     }
-    gaps.sort_by(|a, b| a.total_cmp(b));
-    Some(gaps[gaps.len() / 2])
+    let first = *periods.values().next()?;
+    periods.values().all(|p| (p - first).abs() <= first * 0.02).then_some(first)
 }
 
-/// Per run window: displayed frames, discarded presents.
+/// Per run window: displayed frames, discarded presents, and input-to-screen latencies (ms).
 #[derive(Default)]
 pub struct RunFrames {
     pub shown: Vec<Shown>,
     pub discarded: usize,
-}
-
-fn stream(p: &Present) -> u64 {
-    (p.pid as u64) << 48 ^ p.swapchain
+    pub latencies: Vec<f64>,
 }
 
 /// Outside-in: the displayed and discarded presents of `pids` started in `[t0, t1)`.
@@ -154,6 +274,9 @@ pub fn from_rows(rows: &[Row], matched: &[Option<&Present>]) -> RunFrames {
     for (r, m) in rows.iter().zip(matched) {
         if r.present_ns > 0 {
             out.shown.push(Shown { stream: r.surface as u64, pending_ns: r.begin_ns, screen_ns: r.present_ns, begin_ns: Some(r.begin_ns), input_ns: r.input_ns });
+            if r.input_ns > 0 && r.input_ns <= r.present_ns {
+                out.latencies.push((r.present_ns - r.input_ns) as f64 / 1e6);
+            }
         } else if m.is_some_and(|p| p.state == "discarded") {
             out.discarded += 1;
         }
@@ -161,29 +284,72 @@ pub fn from_rows(rows: &[Row], matched: &[Option<&Present>]) -> RunFrames {
     out
 }
 
-/// One measured run of a native app: its span on the host clock, and its toolkit's frame rows when
-/// it has a bridge (their `present_ns` filled from the OS presents).
+/// One measured run of a native app: its span on the host clock, its toolkit's frame rows when it
+/// reports them (their `present_ns` filled from the OS presents), and the times strobe sent it
+/// inputs (host clock), which the OS presents after each show on screen.
+#[derive(Default)]
 pub struct RunWindow {
     pub t0: u64,
     pub t1: u64,
     pub rows: Option<Vec<Row>>,
+    pub inputs: Vec<u64>,
+}
+
+/// A native app's frame metrics from OS presents, and why some are refused.
+#[derive(Default)]
+pub struct NativeFrames {
+    pub values: BTreeMap<String, f64>,
+    /// Every frame metric: the join of rows to presents cannot be defended.
+    pub refused: Option<String>,
+    /// `interaction.*`: strobe's inputs mostly matched no present.
+    pub inputs_refused: Option<String>,
 }
 
 /// Frame metrics of a native app's runs from OS presents: its toolkit's rows joined to them when
-/// it reports frames, else its processes' presents alone.
-pub fn native_values(p: &Presents, pids: &[u32], runs: &mut [RunWindow]) -> BTreeMap<String, f64> {
+/// it reports frames, else its processes' presents alone; `interaction.*` from strobe's own inputs
+/// to the first present that showed each (`join_inputs`) when the runs have inputs, else from the
+/// rows' input times. `display` is the target window's display path, for the refresh period.
+pub fn native_values(p: &Presents, pids: &[u32], runs: &mut [RunWindow], display: Option<&crate::host::DisplayPath>) -> NativeFrames {
     let (t0, t1) = (runs.first().map_or(0, |r| r.t0), runs.last().map_or(0, |r| r.t1));
+    let refresh = refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000, display);
+    let quiet = quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
+    let (mut rows_stats, mut input_stats) = (JoinStats::default(), JoinStats::default());
     let frames: Vec<RunFrames> = runs
         .iter_mut()
-        .map(|r| match r.rows.as_mut().filter(|rows| !rows.is_empty()) {
-            Some(rows) => {
-                let matched = join(rows, &p.presents, pids);
-                from_rows(rows, &matched)
+        .map(|r| {
+            let mut f = match r.rows.as_mut().filter(|rows| !rows.is_empty()) {
+                Some(rows) => {
+                    let (matched, s) = join(rows, &p.presents, pids);
+                    rows_stats.tried += s.tried;
+                    rows_stats.unmatched += s.unmatched;
+                    rows_stats.ambiguous += s.ambiguous;
+                    from_rows(rows, &matched)
+                }
+                None => from_presents(&p.presents, pids, r.t0, r.t1),
+            };
+            if !r.inputs.is_empty() {
+                let (shown, s) = join_inputs(&r.inputs, &p.presents, pids, quiet);
+                input_stats.tried += s.tried;
+                input_stats.unmatched += s.unmatched;
+                f.latencies = r.inputs.iter().zip(shown).filter_map(|(t, p)| p.map(|p| p.screen_ns.saturating_sub(*t) as f64 / 1e6)).collect();
             }
-            None => from_presents(&p.presents, pids, r.t0, r.t1),
+            f
         })
         .collect();
-    values(&frames, refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000))
+    let mut out = NativeFrames { values: values(&frames, refresh), refused: rows_stats.refusal(p.events_lost), inputs_refused: None };
+    if refresh.is_none() && !p.vsyncs.is_empty() && display.is_none() {
+        out.refused = Some("NoPresentSource: several displays run at different refresh rates and the target's window is unknown, so its refresh period is too".into());
+    }
+    if input_stats.tried > 0 && p.events_lost == 0 && input_stats.unmatched as f64 / input_stats.tried as f64 > UNMATCHED_MAX {
+        out.inputs_refused = Some(format!(
+            "PresentsUnmatched: {} of {} inputs showed no frame within a second: they changed nothing on screen, or the app presents in a way the session does not follow",
+            input_stats.unmatched, input_stats.tried
+        ));
+    }
+    if out.refused.is_some() {
+        out.values.clear();
+    }
+    out
 }
 
 /// Missed refreshes and the intervals between frames shown while the target kept drawing.
@@ -226,7 +392,7 @@ pub fn values(runs: &[RunFrames], refresh_ms: Option<f64>) -> BTreeMap<String, f
         let (missed, iv) = gaps(&run.shown, refresh_ns);
         intervals.extend(iv);
         costs.extend(run.shown.iter().filter_map(|s| s.begin_ns.filter(|b| *b > 0 && *b <= s.screen_ns).map(|b| (s.screen_ns - b) as f64 / 1e6)));
-        inputs.extend(run.shown.iter().filter(|s| s.input_ns > 0 && s.input_ns <= s.screen_ns).map(|s| (s.screen_ns - s.input_ns) as f64 / 1e6));
+        inputs.extend(run.latencies.iter().copied());
         counts.push(run.shown.len() as f64);
         dropped.push((missed + run.discarded) as f64);
         discarded.push(run.discarded as f64);

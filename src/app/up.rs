@@ -51,7 +51,7 @@ pub fn run(args: &Args) -> Result<Output> {
         topo.groups.iter().enumerate().map(|(i, g)| format!("CCD{i} {} MB L3{}", g.l3_mb, if topo.vcache().is_some_and(|v| v.mask == g.mask) { " (V-Cache)" } else { "" })).collect();
     s.line("✓", "cpu", format!("{} · {} logical{}", env.cpu, env.logical_cpus, if groups.is_empty() { String::new() } else { format!(" · {}", groups.join(", ")) }));
     let fast = env.power_plan.contains("performance");
-    s.line(if fast { "✓" } else { "i" }, "power", if fast { env.power_plan.clone() } else { format!("{} (kept; bench --power high switches it for the run)", env.power_plan) });
+    s.line(if fast { "✓" } else { "i" }, "power", if fast { env.power_plan.clone() } else { format!("{} (benches and timed recordings switch to High performance for the run, then back)", env.power_plan) });
     match chromium::find() {
         Some(p) => s.line("✓", "browser", p.display().to_string()),
         None => s.line("✗", "browser", "no Chromium: install Chrome or run bunx playwright install chromium"),

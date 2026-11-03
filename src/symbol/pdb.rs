@@ -1,7 +1,7 @@
 //! Native symbols from PDBs (SPEC §12.2), with pure-Rust crates (`pdb-addr2line` over `pdb2`).
 //!
-//! A module's PDB is the one its CodeView record names (GUID, age, path): first the path the build
-//! wrote (a local build's own PDB), then beside the module, then strobe's cache, then the symbol
+//! A module's PDB is the one its CodeView record names (GUID, age, path): first beside the module (a
+//! copied build's own PDB), then the path the build wrote, then strobe's cache, then the symbol
 //! servers (Microsoft's, then `strobe.json` `symbols.servers`) through `curl`, cached under
 //! `<state>/symbols/<pdb>/<GUID><age>/`. A server miss leaves a `missing` marker for a day.
 
@@ -108,24 +108,30 @@ pub fn codeview(path: &Path) -> Option<CodeView> {
     None
 }
 
-/// Whether a PDB file is the one `cv` names (its GUID).
+/// Whether a PDB file is the one `cv` names: its GUID and its age. An incremental link keeps the
+/// GUID and bumps the age, so a GUID alone can pair one build's module with a later build's PDB.
 fn matches(path: &Path, cv: &CodeView) -> bool {
     let Ok(f) = std::fs::File::open(path) else { return false };
     let Ok(mut pdb) = pdb_addr2line::pdb::PDB::open(f) else { return false };
     let Ok(info) = pdb.pdb_information() else { return false };
     let (d1, d2, d3, d4) = info.guid.as_fields();
     let g = &cv.guid;
-    d1 == u32::from_le_bytes([g[0], g[1], g[2], g[3]]) && d2 == u16::from_le_bytes([g[4], g[5]]) && d3 == u16::from_le_bytes([g[6], g[7]]) && d4[..] == g[8..]
+    let guid = d1 == u32::from_le_bytes([g[0], g[1], g[2], g[3]]) && d2 == u16::from_le_bytes([g[4], g[5]]) && d3 == u16::from_le_bytes([g[6], g[7]]) && d4[..] == g[8..];
+    // The debug information stream's age is the one the linker writes into the module.
+    let age = pdb.debug_information().ok().and_then(|d| d.age()).unwrap_or(info.age);
+    guid && age == cv.age
 }
 
 pub fn cache_dir() -> PathBuf {
     crate::host::paths::state_dir().join("symbols")
 }
 
-/// The matching PDB for a module: local first, then the symbol servers (downloaded once).
+/// The matching PDB for a module: local first, then the symbol servers (downloaded once). Beside the
+/// module comes before the path the build wrote: a build folder shared by several builds (base and
+/// head) holds only the last one's PDB there, while each copied build keeps its own beside it.
 pub fn find(module: &Path, cv: &CodeView, servers: &[String]) -> Option<PathBuf> {
     let name = cv.file_name();
-    let local = [PathBuf::from(&cv.pdb), module.with_file_name(&name)];
+    let local = [module.with_file_name(&name), PathBuf::from(&cv.pdb)];
     if let Some(p) = local.into_iter().find(|p| p.is_file() && matches(p, cv)) {
         return Some(p);
     }

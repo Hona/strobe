@@ -138,6 +138,9 @@ struct Run {
     t0: u64,
     t1: u64,
     total: f64,
+    /// When strobe sent the app each input of the run (host clock), for `interaction.*` from the
+    /// OS presents that showed them.
+    inputs: Vec<u64>,
 }
 
 impl Run {
@@ -180,8 +183,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     }
     let app = app(v, &target, &ctx.config)?;
     // `Throttled`: there is no page to run the speed check in, so strobe runs a fixed workload of its
-    // own on the target's CPUs before the launch.
-    let ratio = validity::native_throttled(validity::native_speed(ctx.pin))?;
+    // own on the target's CPUs before the launch, once the last block's app has left them quiet.
+    let ratio = validity::native_speed_checked(ctx.pin)?;
     let home = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), None)?;
     let listener = if target["bridge"] == false { None } else { Some(Listener::open()?) };
     let env = listener.as_ref().map(Listener::env).unwrap_or_default();
@@ -267,7 +270,7 @@ fn runs(
     };
     let headless = link.headless;
     // A windowless app (a tray app, `window: false`) has no window to wait for, place or check.
-    let windowless = headless || target["window"] == false;
+    let windowless = headless || target["window"] == false || app.windowless;
     if headless {
         link.get(Duration::from_secs(60))?;
     } else if windowless {
@@ -383,7 +386,7 @@ fn runs(
             None => None,
         };
         let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), record, t0, t1, total: 0.0 });
+        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), record, t0, t1, total: 0.0, inputs: Vec::new() });
         if s.reset {
             ctx.runner
                 .call("reset", json!({ "case": s.case }), run_timeout, &serve)
@@ -420,9 +423,21 @@ fn runs(
     let key = |j: usize| format!("run:{}", first + j);
     let per_run = |f: &dyn Fn(&Run) -> f64| -> BTreeMap<String, f64> { measured.iter().enumerate().map(|(j, r)| (key(j), f(r))).filter(|(_, x)| x.is_finite()).collect() };
     let gpu_runs: Vec<probe::os::Summary> = measured.iter().map(|r| samples.window(r.t0, r.t1)).collect();
-    // `SoftwareGpu` from outside: the adapter the app's GPU work ran on, when it used one.
-    let adapter = gpu_runs.iter().find_map(|g| g.gpu_adapter.clone());
-    if let Some(a) = adapter.as_deref().filter(|a| software_adapter(a)) {
+    // Every adapter the app's GPU work ran on in the measured runs, busiest first: a process may
+    // draw on one GPU and compute on another, and each is attributed on its own.
+    let mut by_adapter: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+    for g in &gpu_runs {
+        for (a, engines) in &g.gpu_adapters {
+            for (e, pct) in engines {
+                *by_adapter.entry(a.clone()).or_default().entry(e.clone()).or_default() += pct / gpu_runs.len().max(1) as f64;
+            }
+        }
+    }
+    let mut adapters: Vec<String> = by_adapter.keys().cloned().collect();
+    adapters.sort_by(|a, b| by_adapter[b].values().sum::<f64>().total_cmp(&by_adapter[a].values().sum::<f64>()));
+    let adapter = adapters.first().cloned().or_else(|| gpu_runs.iter().find_map(|g| g.gpu_adapter.clone()));
+    // `SoftwareGpu` from outside: an adapter the app's GPU work ran on is a software one.
+    if let Some(a) = adapters.iter().chain(adapter.iter()).find(|a| software_adapter(a)) {
         return Err(Error::refused(
             "SoftwareGpu",
             format!("the app renders on a software adapter ({a})"),
@@ -430,8 +445,28 @@ fn runs(
         ));
     }
     if !ctx.gpu_checked && adapter.is_some() {
-        ctx.gpu = json!({ "devices": adapter.iter().collect::<Vec<_>>() });
+        let devices = if adapters.is_empty() { adapter.iter().cloned().collect() } else { adapters.clone() };
+        ctx.gpu = json!({ "devices": devices });
         ctx.gpu_checked = true;
+    }
+    // The display path the window shows on, for the refresh period and `CrossAdapterScanout`: an app
+    // that draws on one adapter while another drives its monitor pays a copy across the bus per frame.
+    let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
+    if let Some(d) = &display {
+        let luid = |name: &str| samples.adapters.iter().find(|a| a.name == name).map(|a| a.luid);
+        let drawing: Vec<&String> = adapters.iter().filter(|a| by_adapter[*a].get("3D").copied().unwrap_or(0.0) > 0.0).collect();
+        if !drawing.is_empty() && !drawing.iter().any(|a| luid(a) == Some(d.adapter_luid)) && !ctx.warnings.iter().any(|w| w.id == "CrossAdapterScanout") {
+            let scanout = samples.adapters.iter().find(|a| a.luid == d.adapter_luid).map_or_else(|| format!("adapter 0x{:x}", d.adapter_luid), |a| a.name.clone());
+            ctx.warnings.push(validity::info(
+                "CrossAdapterScanout",
+                format!(
+                    "{} block: the app draws on {} while {scanout} drives its window's display ({}): each frame crosses between adapters, as it does for the app's users on this kind of machine",
+                    v.role,
+                    drawing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" and "),
+                    d.device
+                ),
+            ));
+        }
     }
     let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
     extra.insert("run.duration".into(), per_run(&|r| r.ms));
@@ -478,10 +513,41 @@ fn runs(
     match &presents {
         Some(Ok(p)) => {
             let pids = n.pids();
-            let mut wins: Vec<frames::RunWindow> = measured.iter().map(|r| frames::RunWindow { t0: r.t0, t1: r.t1, rows: r.record.as_ref().map(frames::rows_from_record) }).collect();
-            for (k, x) in frames::native_values(p, &pids, &mut wins) {
-                if !refused.contains_key(&k) {
-                    values.entry(k).or_insert(x);
+            let mut wins: Vec<frames::RunWindow> =
+                measured.iter().map(|r| frames::RunWindow { t0: r.t0, t1: r.t1, rows: r.record.as_ref().map(frames::rows_from_record), inputs: r.inputs.clone() }).collect();
+            let f = frames::native_values(p, &pids, &mut wins, display.as_ref());
+            // SPEC §19: the present session's consumer may use 0.5% of a core; past 2% it competes
+            // with the app it measures, and its frames describe a disturbed run.
+            let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
+            let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
+            let frames_refused = match overhead {
+                Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
+                _ => f.refused.clone(),
+            };
+            if let Some(o) = overhead.filter(|o| *o > 0.5)
+                && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
+            {
+                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: the OS present session's consumer used {o:.2}% of a core, over its 0.5% budget (SPEC §19)", v.role)));
+            }
+            match &frames_refused {
+                Some(why) => {
+                    values.retain(|k, _| !frame_metric(k) || k.starts_with("ui."));
+                    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m) && !m.starts_with("ui.")) {
+                        refused.entry(m.clone()).or_insert_with(|| why.clone());
+                    }
+                }
+                None => {
+                    for (k, x) in f.values {
+                        if refused.contains_key(&k) || (k.starts_with("interaction.") && f.inputs_refused.is_some()) {
+                            continue;
+                        }
+                        values.entry(k).or_insert(x);
+                    }
+                    if let Some(why) = &f.inputs_refused {
+                        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.")) {
+                            refused.entry(m.clone()).or_insert_with(|| why.clone());
+                        }
+                    }
                 }
             }
             for (j, (w, r)) in wins.iter().zip(measured).enumerate() {
@@ -508,6 +574,10 @@ fn runs(
     }
     if let Some(v) = gpu_runs.last().and_then(|g| g.vram_dedicated_mb) {
         values.insert("gpu.vram".into(), v);
+    }
+    // An integrated GPU has no dedicated memory: its allocations are all in system memory.
+    if let Some(v) = gpu_runs.last().and_then(|g| g.vram_shared_mb) {
+        values.insert("gpu.shared".into(), v);
     }
     if !foreign.is_empty() {
         values.insert("cpu.foreign".into(), metrics::median(&foreign));
@@ -538,7 +608,7 @@ fn runs(
         let dir = store::recording_dir(&id)?;
         let names: BTreeMap<u32, String> =
             spans.iter().flat_map(|s| s.threads.iter().map(|t| t.tid)).collect::<std::collections::BTreeSet<_>>().into_iter().filter_map(|t| Some((t, host::thread_name(t)?))).collect();
-        store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(&spans, &names)))?;
+        store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(&spans, &names, &wakes::modules(&spans))))?;
         let run_rows: Vec<Value> = measured
             .iter()
             .enumerate()
@@ -562,12 +632,12 @@ fn runs(
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }
-        // Native stacks of the measured runs only (warmup runs are sampled too: the session starts first).
+        // Native stacks of the measured runs only: warmup runs, and each run's reset between them,
+        // are sampled too (the session runs throughout) and are not the case.
         let stacks_note = match &stacks {
             Some(Ok(d)) => {
-                let (a, b) = (measured.first().map_or(0, |r| r.t0), measured.last().map_or(0, |r| r.t1));
                 let mut d = d.clone();
-                d.samples.retain(|x| x.0 >= a && x.0 <= b);
+                d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1));
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
                 format!("native stacks: {} samples (query hotspots)", d.samples.len())
             }
@@ -813,7 +883,8 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if milestones.iter().any(|m| m.source == "page") {
         return Err(Error::usage(format!("{}: a native app has no page marks; read milestones from its output or a log file", s.case)));
     }
-    let windowless = target["window"] == false;
+    let app = app(v, &target, &ctx.config)?;
+    let windowless = target["window"] == false || app.windowless;
     let until = match spec["until"].get("window").and_then(Value::as_str) {
         // A milestone of the app's own (an output or log line): the launch needs no window at all.
         _ if spec["until"]["milestone"].is_string() => {
@@ -852,7 +923,6 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         steps.push((name.to_string(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
     };
-    let app = app(v, &target, &ctx.config)?;
     let home = if warm { ctx.homes.entry(key).or_insert_with(isolate::new_home).clone() } else { isolate::new_home() };
     let prepared = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), Some(home.clone()))?;
     let env = prepared.environment(&app);
@@ -877,6 +947,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         }
     };
     let link = Link::new(&target, &n, !profile, listener);
+    // An attribution launch samples native stacks from right after the spawn (the session follows
+    // the new tree) until ready, through the helper when it is installed.
+    let mut stacks = (profile && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1043,13 +1116,24 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         let recording = if profile {
             let id = store::new_id("rec");
             let dir = store::recording_dir(&id)?;
+            // Stacks from the spawn until the launch was ready (its settling after is not the launch).
+            let ready_ns = n.at_ns + ((ready.0 - n.epoch_ms).max(0.0) * 1e6) as u64;
+            let stacks_note = match stacks.take().map(|r| r.and_then(|c| c.stop())) {
+                Some(Ok(mut d)) => {
+                    d.samples.retain(|x| x.0 >= n.at_ns && x.0 <= ready_ns);
+                    crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
+                    format!("native stacks from just after the spawn until ready: {} samples (query hotspots)", d.samples.len())
+                }
+                Some(Err(e)) => format!("native stacks failed: {}", e.message),
+                None => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
+            };
             store::write_json(
                 &dir.join("meta.json"),
                 &json!({
                     "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
                     "target": app.exe, "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
                     "hello": link.bridge.get().map(|b| &b.hello), "timing": "perturbed",
-                    "note": "a native launch's attribution: its values and output, not timed; native stacks need the deep helper (SPEC §13.4)",
+                    "note": format!("a native launch's attribution: its values and output, not timed; {stacks_note}"),
                 }),
             )?;
             Some(id)
@@ -1058,6 +1142,10 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         };
         Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), ..Block::default() })
     })();
+    // A launch that failed before its recording still ends the helper's session.
+    if let Some(Ok(c)) = stacks.take() {
+        let _ = c.stop();
+    }
     link.quit();
     n.close(!warm);
     let closed = ctx.runner.call("close", json!({}), t, &no_page);

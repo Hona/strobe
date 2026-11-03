@@ -165,19 +165,28 @@ pub fn insights(dir: &Path) -> Result<Output> {
     // a short timer) costs power and CPU all day; the threads that wake most are named.
     let wakes = v["cpu.wakes"].as_f64().unwrap_or(0.0);
     if meta["native"] == true && meta["kind"] == "record" && wakes >= 50.0 {
-        let top: Vec<String> = store::read_json(&dir.join("threads.json"))
-            .ok()
-            .and_then(|t| t.as_array().cloned())
-            .unwrap_or_default()
-            .iter()
-            .take(3)
-            .map(|t| format!("{} {}", t["name"].as_str().unwrap_or("(unnamed)"), fmt::value(t["wakes_per_s"].as_f64().unwrap_or(0.0), "/s")))
-            .collect();
+        let threads = store::read_json(&dir.join("threads.json")).ok().and_then(|t| t.as_array().cloned()).unwrap_or_default();
+        let line = |t: &Value| {
+            let module = t["module"].as_str().map(|m| format!(" ({m})")).unwrap_or_default();
+            format!("{}{module} {}", t["name"].as_str().unwrap_or("(unnamed)"), fmt::value(t["wakes_per_s"].as_f64().unwrap_or(0.0), "/s"))
+        };
+        // The app's own threads are what its code can change; a driver's or the OS's threads inside
+        // its processes wake for what the app asked of them (a GPU device, an audio stream), so they
+        // are named apart.
+        let mine = |t: &&Value| t["origin"] != "driver" && t["origin"] != "os";
+        let sum = |own: bool| threads.iter().filter(|t| mine(t) == own).map(|t| t["wakes_per_s"].as_f64().unwrap_or(0.0)).sum::<f64>();
+        let (app, other) = (sum(true), sum(false));
+        let top: Vec<String> = threads.iter().filter(mine).take(3).map(line).collect();
+        let theirs: Vec<String> = threads.iter().filter(|t| !mine(t)).take(3).map(line).collect();
+        let mut title = format!("the app's threads woke {} with nothing to do; most: {}", fmt::value(app, "/s"), if top.is_empty() { "none".into() } else { top.join(", ") });
+        if other > 0.0 {
+            title += &format!("; driver and OS threads in its processes woke {} more: {}", fmt::value(other, "/s"), theirs.join(", "));
+        }
         hit(
             "wakes-while-idle",
-            if wakes >= 200.0 { "warn" } else { "info" },
-            format!("the app's threads woke {} with nothing to do; most: {}", fmt::value(wakes, "/s"), top.join(", ")),
-            json!({ "wakes_per_s": wakes, "top": top }),
+            if app >= 200.0 { "warn" } else { "info" },
+            title,
+            json!({ "wakes_per_s": wakes, "app_wakes_per_s": app, "driver_os_wakes_per_s": other, "top": top, "driver_os_top": theirs }),
             vec![q("threads")],
         );
     }
@@ -680,21 +689,32 @@ fn gpu(trace: &Path, top: usize) -> Result<Output> {
 fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     let rows = store::read_json(&dir.join("threads.json"))?;
     let all = rows.as_array().cloned().unwrap_or_default();
-    let mut text = format!("{:>10}  {:>12}  {:>7}  {:>7}  thread\n", "wakes/s", "cpu ms/run", "pid", "tid");
+    let mut text = format!("{:>10}  {:>12}  {:>7}  {:>7}  {:<6}  thread (started in)\n", "wakes/s", "cpu ms/run", "pid", "tid", "whose");
     for r in all.iter().take(top) {
+        let started = r["module"].as_str().map(|m| format!(" ({m})")).unwrap_or_default();
         text += &format!(
-            "{:>10}  {:>12}  {:>7}  {:>7}  {}\n",
+            "{:>10}  {:>12}  {:>7}  {:>7}  {:<6}  {}{started}\n",
             fmt::value(r["wakes_per_s"].as_f64().unwrap_or(f64::NAN), "count"),
             fmt::value(r["cpu_ms_per_run"].as_f64().unwrap_or(f64::NAN), "count"),
             r["pid"],
             r["tid"],
+            r["origin"].as_str().unwrap_or("?"),
             r["name"].as_str().unwrap_or("(unnamed)")
         );
     }
     if all.len() > top {
         text += &format!("… {} more (--top)\n", all.len() - top);
     }
-    text += "wakes: context switches of the thread (each a switch in to run); a thread that exited during a run is not listed\n";
+    let sum = |o: &str| all.iter().filter(|r| r["origin"] == o).map(|r| r["wakes_per_s"].as_f64().unwrap_or(0.0)).sum::<f64>();
+    if all.iter().any(|r| r["origin"].is_string()) {
+        text += &format!(
+            "by whose threads: app {} · driver {} · os {} (wakes/s)\n",
+            fmt::value(sum("app"), "count"),
+            fmt::value(sum("driver"), "count"),
+            fmt::value(sum("os"), "count")
+        );
+    }
+    text += "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks). A thread that exited during a run is not listed\n";
     Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>() })))
 }
 

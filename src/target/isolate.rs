@@ -29,6 +29,8 @@ pub struct App {
     args: Vec<String>,
     /// The profile's `headless` object: the `args`, `env` and `unset` that select the app's headless mode.
     headless: Value,
+    /// The profile says `window: false`: the app opens no window (a tray app, a service).
+    pub windowless: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,7 +74,7 @@ impl App {
     }
 
     fn unsets(&self, key: &str) -> bool {
-        self.unset.iter().any(|u| u.strip_suffix('*').map_or(u == key, |prefix| key.starts_with(prefix)))
+        env_unset(&self.unset, key)
     }
 }
 
@@ -111,13 +113,15 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         Value::Object(m) => m.get(os).and_then(Value::as_str).map(str::to_string),
         _ => None,
     }
-    .map(|s| expand(&s))
     .ok_or_else(|| Error::usage(format!("app profile \"{id}\" has no exe for {os}")))?;
+    let exe = expand(&exe).map_err(|e| Error::usage(format!("app profile \"{id}\" exe: {}", e.message)))?;
     let strings = |k: &str| p[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
-    let guards = p["guard"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|g| Some(GuardSpec { file: expand(g["file"].as_str()?), pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) })).collect())
-        .unwrap_or_default();
+    let mut guards = Vec::new();
+    for g in p["guard"].as_array().into_iter().flatten() {
+        let Some(file) = g["file"].as_str() else { continue };
+        let file = expand(file).map_err(|e| Error::usage(format!("app profile \"{id}\" guard: {}", e.message)))?;
+        guards.push(GuardSpec { file, pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) });
+    }
     let kind = p["kind"].as_str().unwrap_or("electron").to_string();
     if kind != "electron" && kind != "native" {
         return Err(Error::usage(format!("app profile \"{id}\": kind is electron or native, not {kind}")));
@@ -134,6 +138,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         protocols: strings("protocols"),
         args: strings("args"),
         headless: p["headless"].clone(),
+        windowless: p["window"] == false,
     })
 }
 
@@ -145,22 +150,62 @@ pub fn installed(app: &App) -> Result<()> {
     Ok(())
 }
 
+/// Whether environment variable `key` is `name`: in any case on Windows, which reads names that way
+/// (`%APPDATA%` is `AppData`), exactly elsewhere.
+pub fn env_name_is(key: &str, name: &str) -> bool {
+    if cfg!(windows) { key.eq_ignore_ascii_case(name) } else { key == name }
+}
+
+/// Whether `key` matches an `unset` pattern (`NAME`, or `PREFIX*`), cased as `env_name_is`.
+pub fn env_unset(patterns: &[String], key: &str) -> bool {
+    patterns.iter().any(|u| match u.strip_suffix('*') {
+        Some(prefix) => key.len() >= prefix.len() && key.is_char_boundary(prefix.len()) && env_name_is(&key[..prefix.len()], prefix),
+        None => env_name_is(key, u),
+    })
+}
+
 /// `~`, `%VAR%` and `${VAR}` from strobe's own environment: the real user's, never a launched copy's.
-fn expand(s: &str) -> PathBuf {
-    let mut out = match s.strip_prefix('~') {
+/// A variable that is not set is an error: a path left holding `%VAR%` names nothing, and a guard on
+/// it would protect nothing while passing every check.
+fn expand(s: &str) -> Result<PathBuf> {
+    let home = match s.strip_prefix('~') {
         Some(rest) => format!("{}{rest}", host::home().display()),
         None => s.to_string(),
     };
-    for (k, v) in std::env::vars() {
-        out = out.replace(&format!("%{k}%"), &v).replace(&format!("${{{k}}}"), &v);
+    let mut out = String::with_capacity(home.len());
+    let mut rest = home.as_str();
+    loop {
+        let (at, open, close) = match (rest.find('%'), rest.find("${")) {
+            (Some(p), Some(b)) if b < p => (b, 2, '}'),
+            (Some(p), _) => (p, 1, '%'),
+            (None, Some(b)) => (b, 2, '}'),
+            (None, None) => break,
+        };
+        out.push_str(&rest[..at]);
+        let after = &rest[at + open..];
+        let name = after.find(close).map(|end| &after[..end]).filter(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || "_()".contains(c)));
+        let Some(name) = name else {
+            out.push_str(&rest[at..at + open]);
+            rest = after;
+            continue;
+        };
+        let value = std::env::vars_os().find(|(k, _)| k.to_str().is_some_and(|k| env_name_is(k, name))).map(|(_, v)| v.to_string_lossy().to_string());
+        let Some(value) = value else {
+            return Err(Error::usage(format!("{s}: environment variable {name} is not set, so the path names nothing")));
+        };
+        out.push_str(&value);
+        rest = &after[name.len() + 1..];
     }
-    PathBuf::from(out)
+    out.push_str(rest);
+    Ok(PathBuf::from(out))
 }
 
 /// What the profile's guarded files held before launch: the user's own state, which must not change.
 #[derive(Clone, Debug, Default)]
 pub struct Guard {
     checks: Vec<Check>,
+    /// Seed files the home shares with other launches: none may change.
+    pub shared: Vec<Shared>,
 }
 
 #[derive(Clone, Debug)]
@@ -184,11 +229,20 @@ impl Guard {
                 Check { file: g.file.clone(), before, pid, addr }
             })
             .collect();
-        Guard { checks }
+        Guard { checks, shared: Vec::new() }
     }
 
-    /// Fails when a guarded file changed, or its process stopped running or answering.
+    /// Fails when a guarded file changed, or its process stopped running or answering, or the app
+    /// wrote to a seed file its home shares with other launches.
     pub fn check(&self, when: &str) -> Result<()> {
+        if let Some(s) = self.shared.iter().find(|s| stamp(&s.cache) != Some((s.len, s.modified))) {
+            return Err(Error::msg(format!(
+                "stopped {when}: the app changed {}, a large seed file strobe shares read-only between launches (as {}), so later launches would not start from the same seed",
+                s.link.display(),
+                s.cache.display()
+            ))
+            .hint("the next launch makes a fresh shared copy; an app that must write a seed file this large needs it below 64 MB or outside the seed"));
+        }
         for c in &self.checks {
             let changed = std::fs::read_to_string(&c.file).ok() != c.before;
             let stopped = c.pid.is_some_and(|p| !alive(p));
@@ -220,18 +274,109 @@ pub fn alive(pid: u32) -> bool {
     return Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
 }
 
-fn copy_dir(from: &Path, to: &Path) -> Result<()> {
+/// Seed files this large are shared, not copied into each home: a copy per launch writes the whole
+/// file again, an antivirus scans each new copy on every CPU while the bench measures, and deleting
+/// it after costs again.
+const SHARE_BYTES: u64 = 64 << 20;
+
+/// A large seed file shared into a home: one read-only copy per seed version in strobe's own
+/// `<state>/seeds`, hard-linked into each home, with its size and time when linked. The app reads it
+/// like any file of its home; it cannot write through to the seed (read-only), and a write that got
+/// through anyway shows in `Guard::check`.
+#[derive(Clone, Debug)]
+pub struct Shared {
+    pub link: PathBuf,
+    pub cache: PathBuf,
+    len: u64,
+    modified: Option<std::time::SystemTime>,
+}
+
+fn stamp(p: &Path) -> Option<(u64, Option<std::time::SystemTime>)> {
+    std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()))
+}
+
+/// The read-only cached copy of a large seed file (made once per seed version), linked to `dst`.
+/// None when it cannot be shared (another volume, no hard links): the caller copies it.
+fn share(seed: &Path, dst: &Path) -> Option<Shared> {
+    use sha2::Digest;
+    let (len, modified) = stamp(seed)?;
+    let id: String = sha2::Sha256::digest(format!("{}\n{len}\n{modified:?}", seed.display()).as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    let cache = host::paths::sub("seeds").join(id).join(seed.file_name()?);
+    // A cached copy that changed since it was made (a write that got through) is made again.
+    let fresh = stamp(&cache).is_some_and(|(l, _)| l == len) && std::fs::read_to_string(cache.with_extension("stamp")).ok() == Some(format!("{:?}", stamp(&cache)));
+    if !fresh {
+        if let Ok(m) = std::fs::metadata(&cache) {
+            let mut p = m.permissions();
+            #[allow(clippy::permissions_set_readonly_false)]
+            p.set_readonly(false);
+            let _ = std::fs::set_permissions(&cache, p);
+            let _ = std::fs::remove_file(&cache);
+        }
+        // Copies of seeds no bench linked for a week go (a regenerated seed is a new version).
+        let week = std::time::Duration::from_secs(7 * 86_400);
+        for e in std::fs::read_dir(host::paths::sub("seeds")).into_iter().flatten().flatten() {
+            let used = std::fs::read_dir(e.path()).into_iter().flatten().flatten().filter_map(|f| f.metadata().ok()?.accessed().ok()).max();
+            if used.and_then(|t| t.elapsed().ok()).is_some_and(|age| age > week) {
+                for f in std::fs::read_dir(e.path()).into_iter().flatten().flatten() {
+                    if let Ok(m) = f.metadata() {
+                        let mut p = m.permissions();
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        p.set_readonly(false);
+                        let _ = std::fs::set_permissions(f.path(), p);
+                    }
+                }
+                let _ = std::fs::remove_dir_all(e.path());
+            }
+        }
+        std::fs::create_dir_all(cache.parent()?).ok()?;
+        std::fs::copy(seed, &cache).ok()?;
+        let mut p = std::fs::metadata(&cache).ok()?.permissions();
+        p.set_readonly(true);
+        std::fs::set_permissions(&cache, p).ok()?;
+        std::fs::write(cache.with_extension("stamp"), format!("{:?}", stamp(&cache))).ok()?;
+    }
+    std::fs::hard_link(&cache, dst).ok()?;
+    let (len, modified) = stamp(&cache)?;
+    Some(Shared { link: dst.to_path_buf(), cache, len, modified })
+}
+
+fn copy_dir(from: &Path, to: &Path, shared: &mut Vec<Shared>) -> Result<()> {
     std::fs::create_dir_all(to)?;
     for e in std::fs::read_dir(from)?.flatten() {
         let p = e.path();
         let dst = to.join(e.file_name());
         if p.is_dir() {
-            copy_dir(&p, &dst)?;
+            copy_dir(&p, &dst, shared)?;
+        } else if let Some(s) = std::fs::metadata(&p).ok().filter(|m| m.len() >= SHARE_BYTES).and_then(|_| share(&p, &dst)) {
+            shared.push(s);
         } else {
             std::fs::copy(&p, &dst)?;
         }
     }
     Ok(())
+}
+
+/// Unlinks a home's shared seed files: a read-only file's link may need its attribute cleared first,
+/// which clears it on the cached copy too, so it is set again right after.
+fn unshare(home: &Path) {
+    let Ok(text) = std::fs::read_to_string(home.join(".strobe-shared")) else { return };
+    for line in text.lines() {
+        let Some((link, cache)) = line.split_once('\t') else { continue };
+        let link = Path::new(link);
+        if std::fs::remove_file(link).is_ok() || !link.exists() {
+            continue;
+        }
+        let set = |ro: bool| {
+            if let Ok(m) = std::fs::metadata(cache) {
+                let mut p = m.permissions();
+                p.set_readonly(ro);
+                let _ = std::fs::set_permissions(cache, p);
+            }
+        };
+        set(false);
+        let _ = std::fs::remove_file(link);
+        set(true);
+    }
 }
 
 /// A new private home folder; nothing is in it yet.
@@ -251,6 +396,7 @@ pub fn release_home(home: &Path) {
 
 /// Removes a home once nothing holds its files any more.
 pub fn remove_home(home: &Path) {
+    unshare(home);
     for _ in 0..20 {
         if std::fs::remove_dir_all(home).is_ok() || !home.exists() {
             break;
@@ -319,6 +465,8 @@ pub struct Home {
     pub dir: PathBuf,
     pub port: u16,
     pub env: Vec<(String, String)>,
+    /// Large seed files shared into the home rather than copied.
+    pub shared: Vec<Shared>,
 }
 
 impl Home {
@@ -326,6 +474,8 @@ impl Home {
     /// (a background service).
     pub fn environment(&self, app: &App) -> std::collections::BTreeMap<String, String> {
         let mut out: std::collections::BTreeMap<String, String> = std::env::vars().filter(|(k, _)| !app.unsets(k)).collect();
+        // One entry per name: the home's `APPDATA` replaces strobe's `AppData` on Windows.
+        out.retain(|k, _| !self.env.iter().any(|(e, _)| env_name_is(k, e)));
         out.extend(self.env.iter().cloned());
         out
     }
@@ -356,8 +506,18 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     for d in &app.dirs {
         std::fs::create_dir_all(home.join(d))?;
     }
+    let mut shared = Vec::new();
     if let Some(s) = seed.filter(|_| fresh) {
-        copy_dir(s, &home)?;
+        copy_dir(s, &home, &mut shared)?;
+        let list: String = shared.iter().map(|s| format!("{}\t{}\n", s.link.display(), s.cache.display())).collect();
+        std::fs::write(home.join(".strobe-shared"), list)?;
+    } else if let Ok(text) = std::fs::read_to_string(home.join(".strobe-shared")) {
+        // A warm home keeps its links: watch them for this launch too.
+        for (link, cache) in text.lines().filter_map(|l| l.split_once('\t')) {
+            if let Some((len, modified)) = stamp(Path::new(cache)) {
+                shared.push(Shared { link: link.into(), cache: cache.into(), len, modified });
+            }
+        }
     }
     std::fs::write(home.join(".strobe-home"), "")?;
     // A seed copied from a used profile may hold a stale port file.
@@ -400,7 +560,7 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     env.extend(app.env.iter().map(|(k, v)| (k.clone(), fill(v))));
-    Ok(Home { dir: home, port, env })
+    Ok(Home { dir: home, port, env, shared })
 }
 
 /// A spawned app: the child, when it was spawned (epoch ms and the host clock), and its output lines

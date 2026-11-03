@@ -22,6 +22,8 @@ use crate::model::Result;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::rc::Rc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use windows_sys::Win32::System::Diagnostics::Etw::EVENT_RECORD;
 use windows_sys::core::GUID;
 
@@ -122,7 +124,11 @@ impl Capture {
     pub fn start() -> Result<Capture> {
         let cfg = session::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256) };
         let t0 = crate::host::now_ns();
-        let running = Running::start(cfg, |_| Ok(()), Tracker::new)?;
+        let armed = Arc::new(AtomicU64::new(0));
+        let tracker_armed = armed.clone();
+        let running = Running::start(cfg, |_| Ok(()), move || Tracker::with_armed(tracker_armed))?;
+        // Every provider runs from here: presents that start later are seen whole.
+        armed.store(session::qpc_now(), Ordering::Release);
         Ok(Capture { running, t0 })
     }
 
@@ -182,6 +188,8 @@ struct P {
     sync_interval: i32,
     flags: u32,
     hwnd: u64,
+    /// Win32k's composition surface (its `CompositionSurfaceLuid`), kept after the token ends.
+    luid: u64,
     submit_seq: u32,
     w32k: (u64, u64, u64),
     dxgk_token: u64,
@@ -206,6 +214,28 @@ struct P {
 }
 
 type Ptr = Rc<RefCell<P>>;
+
+/// What one present updates on screen, for "one present per surface per composed frame". A window's
+/// handle when the present has one; a composition swapchain (DirectComposition, every one with
+/// handle 0) by its composition surface, else by process and swapchain. Never handle 0.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum Surface {
+    Window(u64),
+    Composition(u64),
+    Swapchain(u32, u64),
+}
+
+fn surface(b: &P) -> Option<Surface> {
+    if b.hwnd != 0 {
+        Some(Surface::Window(b.hwnd))
+    } else if b.luid != 0 {
+        Some(Surface::Composition(b.luid))
+    } else if b.swapchain != 0 {
+        Some(Surface::Swapchain(b.pid, b.swapchain))
+    } else {
+        None
+    }
+}
 
 const RING: usize = 2048;
 const DXGI_PRESENT_TEST: u32 = 1;
@@ -234,10 +264,12 @@ pub struct Tracker {
     by_w32k: HashMap<(u64, u64, u64), Ptr>,
     by_dxgk_token: HashMap<u64, Ptr>,
     by_dxgk_token_data: HashMap<u64, Ptr>,
-    last_by_window: HashMap<u64, Ptr>,
+    last_by_window: HashMap<Surface, Ptr>,
     waiting_for_dwm: VecDeque<Ptr>,
     dwm_tid: u32,
     has_completed: bool,
+    /// Raw QPC from which every provider runs (0 until the session is up).
+    armed: Arc<AtomicU64>,
     done: Vec<Ptr>,
     out: Vec<Present>,
     vsyncs: Vec<(u64, u32)>,
@@ -275,7 +307,13 @@ fn hdr(e: &EVENT_RECORD) -> (u64, u32, u32) {
 
 impl Tracker {
     pub fn new() -> Tracker {
+        Tracker::with_armed(Arc::new(AtomicU64::new(0)))
+    }
+
+    /// A tracker for a session whose providers all run from the raw QPC `armed` holds once set.
+    pub fn with_armed(armed: Arc<AtomicU64>) -> Tracker {
         Tracker {
+            armed,
             schema: Schema::default(),
             freq: session::qpc_freq(),
             guids: [session::guid(DXGI), session::guid(DXGKRNL), session::guid(WIN32K), session::guid(DWM)],
@@ -413,9 +451,9 @@ impl Tracker {
     }
 
     fn stop_tracking(&mut self, p: &Ptr) {
-        let (ring, waiting, tid, driver_tid, pid, start, serial, w32k, token, token_data, hwnd, in_dwm) = {
+        let (ring, waiting, tid, driver_tid, pid, start, serial, w32k, token, token_data, in_dwm) = {
             let b = p.borrow();
-            (b.ring, b.waiting_for_stop, b.tid, b.driver_tid, b.pid, b.start, b.serial, b.w32k, b.dxgk_token, b.dxgk_token_data, b.hwnd, b.in_dwm_waiting)
+            (b.ring, b.waiting_for_stop, b.tid, b.driver_tid, b.pid, b.start, b.serial, b.w32k, b.dxgk_token, b.dxgk_token_data, b.in_dwm_waiting)
         };
         if let Some(r) = ring {
             self.ring[r] = None;
@@ -444,9 +482,7 @@ impl Tracker {
         if token_data != 0 && self.by_dxgk_token_data.get(&token_data).is_some_and(|q| Rc::ptr_eq(q, p)) {
             self.by_dxgk_token_data.remove(&token_data);
         }
-        if hwnd != 0 && self.last_by_window.get(&hwnd).is_some_and(|q| Rc::ptr_eq(q, p)) {
-            self.last_by_window.remove(&hwnd);
-        }
+        self.last_by_window.retain(|_, q| !Rc::ptr_eq(q, p));
         if in_dwm {
             self.waiting_for_dwm.retain(|q| !Rc::ptr_eq(q, p));
         }
@@ -480,13 +516,17 @@ impl Tracker {
     }
 
     fn complete(&mut self, p: &Ptr) {
-        // The first completion means every provider runs: presents already in flight may have
-        // missed events, so they are dropped (PresentMon does the same).
+        // Presents that started before every provider ran may have missed events, so at the first
+        // completion they are dropped (PresentMon drops every present in flight then). Only those:
+        // a present that started after the session was up is whole, and dropping it would lose the
+        // first frame of an app that was idle until its first measured input.
         if !self.has_completed && !p.borrow().lost {
+            let armed = self.armed.load(Ordering::Acquire);
             let pids: Vec<u32> = self.by_process.keys().copied().collect();
             for pid in pids {
                 for _ in 0..100_000 {
-                    let Some(first) = self.by_process.get(&pid).and_then(|m| m.values().next().cloned()) else { break };
+                    let first = self.by_process.get(&pid).and_then(|m| m.values().next().cloned()).filter(|q| armed == 0 || q.borrow().start < armed);
+                    let Some(first) = first else { break };
                     self.remove_lost(&first);
                     if let Some(m) = self.by_process.get_mut(&pid) {
                         let (s, n) = (first.borrow().start, first.borrow().serial);
@@ -494,8 +534,15 @@ impl Tracker {
                     }
                 }
             }
+            // Before the session is up every present may still be partial: the next completion
+            // decides again.
+            if armed == 0 {
+                return;
+            }
             self.has_completed = true;
-            return;
+            if p.borrow().lost {
+                return;
+            }
         }
         if p.borrow().completed {
             return;
@@ -518,13 +565,15 @@ impl Tracker {
                     d.borrow_mut().lost = true;
                 }
             } else {
-                let mut hwnds = HashSet::new();
+                // One present per surface reaches the screen per composed frame: the newest.
+                let mut surfaces = HashSet::new();
                 for d in dependents.iter().rev() {
                     let mut b = d.borrow_mut();
                     if b.completed {
                         continue;
                     }
-                    if matches!(b.mode, Mode::ComposedFlip | Mode::ComposedCopyGpu | Mode::ComposedCopyCpu) && !hwnds.insert(b.hwnd) {
+                    let key = surface(&b);
+                    if matches!(b.mode, Mode::ComposedFlip | Mode::ComposedCopyGpu | Mode::ComposedCopyCpu) && key.is_some_and(|k| !surfaces.insert(k)) {
                         b.state = Final::Discarded;
                         b.screen = 0;
                     } else if b.state != Final::Discarded {
@@ -838,8 +887,14 @@ impl Tracker {
                 }
             }
             id::VSYNC_MPO | id::HSYNC_MPO => {
-                let addr_name = if e.EventHeader.EventDescriptor.Id == id::VSYNC_MPO && version >= 1 { "PresentIdOrPhysicalAddress" } else { "ScannedPhysicalAddress" };
-                let [planes, addrs, entries, seqs] = self.schema.fields(e, ["PlaneCount", addr_name, "FlipEntryCount", "FlipSubmitSequence"]);
+                let vsync = e.EventHeader.EventDescriptor.Id == id::VSYNC_MPO;
+                let addr_name = if vsync && version >= 1 { "PresentIdOrPhysicalAddress" } else { "ScannedPhysicalAddress" };
+                let [planes, addrs, entries, seqs, target] = self.schema.fields(e, ["PlaneCount", addr_name, "FlipEntryCount", "FlipSubmitSequence", "VidPnTargetId"]);
+                // Multi-plane drivers log their vertical blanks here instead of `VSyncDPC` (an HSync
+                // is an immediate flip, not a blank).
+                if vsync && target.found {
+                    self.vsyncs.push((session::ns(ts, self.freq), uint(e, &target) as u32));
+                }
                 let (planes, entries) = (uint(e, &planes) as usize, uint(e, &entries) as usize);
                 let active = (0..planes.min(addrs.count.max(1)).min(64)).filter(|i| uint_at(e, &addrs, *i) != 0).count();
                 for i in 0..entries.min(seqs.count.max(1)).min(64) {
@@ -882,17 +937,19 @@ impl Tracker {
                 let [token] = self.schema.fields(e, ["Token"]);
                 let token = uint(e, &token);
                 let Some(p) = self.by_dxgk_token.remove(&token) else { return };
-                let (mode, seen_w32k, hwnd) = {
+                let (mode, seen_w32k, key) = {
                     let mut b = p.borrow_mut();
                     b.ready = if b.ready == 0 { ts } else { b.ready.min(ts) };
-                    (b.mode, b.seen_win32k, b.hwnd)
+                    (b.mode, b.seen_win32k, surface(&b))
                 };
                 if mode == Mode::ComposedFlip && !seen_w32k && !p.borrow().in_dwm_waiting {
                     p.borrow_mut().in_dwm_waiting = true;
                     self.waiting_for_dwm.push_back(p.clone());
                 }
-                if mode == Mode::ComposedCopyGpu {
-                    self.last_by_window.insert(hwnd, p.clone());
+                if mode == Mode::ComposedCopyGpu
+                    && let Some(k) = key
+                {
+                    self.last_by_window.insert(k, p.clone());
                 }
             }
             id::BLIT => {
@@ -942,6 +999,7 @@ impl Tracker {
                     b.mode = Mode::ComposedFlip;
                     b.seen_win32k = true;
                     b.w32k = key;
+                    b.luid = key.0;
                 }
                 self.by_w32k.insert(key, p);
             }
@@ -951,23 +1009,23 @@ impl Tracker {
                 let Some(p) = self.by_w32k.get(&key).cloned() else { return };
                 match uint(e, &state) {
                     TOKEN_IN_FRAME => {
-                        let hwnd = {
+                        let key = {
                             let mut b = p.borrow_mut();
                             b.seen_in_frame = true;
                             if uint(e, &iflip) != 0 && b.mode == Mode::ComposedFlip {
                                 b.mode = Mode::IndependentFlip;
                             }
-                            b.hwnd
+                            surface(&b)
                         };
-                        // Composing a newer present of the window discards the one it last showed
+                        // Composing a newer present of the surface discards the one it last showed
                         // that never reached the screen.
-                        if hwnd != 0 {
-                            match self.last_by_window.get(&hwnd).cloned() {
+                        if let Some(key) = key {
+                            match self.last_by_window.get(&key).cloned() {
                                 None => {
-                                    self.last_by_window.insert(hwnd, p.clone());
+                                    self.last_by_window.insert(key, p.clone());
                                 }
                                 Some(prev) if !Rc::ptr_eq(&prev, &p) => {
-                                    self.last_by_window.insert(hwnd, p.clone());
+                                    self.last_by_window.insert(key, p.clone());
                                     if !prev.borrow().wait_for_sync_dpc {
                                         {
                                             let mut b = prev.borrow_mut();
@@ -983,18 +1041,18 @@ impl Tracker {
                         }
                     }
                     TOKEN_CONFIRMED => {
-                        let hwnd = {
+                        let key = {
                             let mut b = p.borrow_mut();
                             if b.state == Final::Unknown && b.flags & DXGI_PRESENT_DO_NOT_SEQUENCE != 0 {
                                 b.state = Final::Discarded;
                             }
-                            b.hwnd
+                            surface(&b)
                         };
                         if p.borrow().state == Final::Discarded {
                             self.remove_from_submit(&p);
                         }
-                        if hwnd != 0 {
-                            self.last_by_window.remove(&hwnd);
+                        if let Some(key) = key {
+                            self.last_by_window.remove(&key);
                         }
                     }
                     TOKEN_DISCARDED => {
@@ -1039,7 +1097,11 @@ impl Tracker {
                 let data = (uint(e, &chain) & 0xffff_ffff) << 32 | (uint(e, &serial) & 0xffff_ffff);
                 if let Some(p) = self.by_dxgk_token_data.remove(&data) {
                     p.borrow_mut().dxgk_token_data = 0;
-                    self.last_by_window.insert(uint(e, &hwnd), p);
+                    let hwnd = uint(e, &hwnd);
+                    let key = if hwnd != 0 { Some(Surface::Window(hwnd)) } else { surface(&p.borrow()) };
+                    if let Some(key) = key {
+                        self.last_by_window.insert(key, p);
+                    }
                 }
             }
             id::SCHEDULE_SURFACEUPDATE => {

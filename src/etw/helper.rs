@@ -24,6 +24,7 @@ use windows_sys::Win32::Security::{PSID, SECURITY_ATTRIBUTES};
 
 const PERF_LOG_USERS: &str = "S-1-5-32-559";
 const ADMINISTRATORS: &str = "S-1-5-32-544";
+const SYSTEM: &str = "S-1-5-18";
 const IDLE_EXIT: Duration = Duration::from_secs(120);
 
 fn wide(s: &str) -> Vec<u16> {
@@ -85,6 +86,31 @@ pub fn user_sid() -> Option<String> {
         let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
         LocalFree(text as _);
         Some(s)
+    }
+}
+
+/// The owner SID of a kernel object handle (opened with READ_CONTROL, as GENERIC_READ includes).
+fn pipe_owner(h: HANDLE) -> Option<String> {
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo, SE_KERNEL_OBJECT};
+    use windows_sys::Win32::Security::{OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
+    unsafe {
+        let mut owner: PSID = std::ptr::null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if GetSecurityInfo(h, SE_KERNEL_OBJECT, OWNER_SECURITY_INFORMATION, &mut owner, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), &mut sd) != 0 || owner.is_null() {
+            return None;
+        }
+        let mut text: *mut u16 = std::ptr::null_mut();
+        let out = (ConvertSidToStringSidW(owner, &mut text) != 0).then(|| {
+            let mut n = 0;
+            while *text.add(n) != 0 {
+                n += 1;
+            }
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            LocalFree(text as _);
+            s
+        });
+        LocalFree(sd as _);
+        out
     }
 }
 
@@ -538,15 +564,27 @@ impl Client {
         loop {
             let h = unsafe { CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, std::ptr::null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
             if h != INVALID_HANDLE_VALUE {
-                // Only the installed helper may answer: a pipe of this name from anything else is refused.
+                // Only the installed helper may answer: the server runs the installed image (a medium
+                // process may read an elevated one's image name), and the pipe belongs to this user or
+                // to administrators or SYSTEM (an elevated token's default owner). Another account that
+                // created a pipe of this name first owns it itself, even running a copy of the helper.
                 let mut pid = 0u32;
-                unsafe { GetNamedPipeServerProcessId(h, &mut pid) };
-                let exe = crate::host::win::exe_of(pid);
-                if exe.as_ref().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(&helper_exe().to_string_lossy())) || exe.is_none() {
+                let served = unsafe { GetNamedPipeServerProcessId(h, &mut pid) } != 0 && pid != 0;
+                let exe = served.then(|| crate::host::win::exe_of(pid)).flatten();
+                let image = exe.as_ref().is_some_and(|e| e.to_string_lossy().eq_ignore_ascii_case(&helper_exe().to_string_lossy()));
+                let owner = pipe_owner(h);
+                let owned = owner.as_deref().is_some_and(|o| o == sid || o == ADMINISTRATORS || o == SYSTEM);
+                if image && owned {
                     return Ok(Client(h));
                 }
                 unsafe { CloseHandle(h) };
-                return Err(Error::msg(format!("the helper pipe is served by {} instead of {}", exe.map(|e| e.display().to_string()).unwrap_or_default(), helper_exe().display())));
+                return Err(Error::msg(format!(
+                    "refused the helper pipe: served by {} (pid {pid}, owner {}), not the installed helper {} run by this user or an administrator",
+                    exe.map(|e| e.display().to_string()).unwrap_or_else(|| "an unreadable process".into()),
+                    owner.unwrap_or_else(|| "unreadable".into()),
+                    helper_exe().display()
+                ))
+                .hint("another account may have created the pipe first: sign it out, or run strobe up again"));
             }
             let rc = unsafe { GetLastError() };
             if rc == 231 {

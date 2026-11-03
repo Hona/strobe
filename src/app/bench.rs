@@ -85,6 +85,7 @@ const DESCRIPTIVE: &[&str] = &[
     "cpu.browser",
     "gpu.process.3d",
     "gpu.vram",
+    "gpu.shared",
     "memory.app.private",
     "cpu.wakes",
     "io.read",
@@ -219,6 +220,11 @@ struct Block {
     refused: BTreeMap<String, String>,
     /// The block ran on a locked screen (a series that needs no presenting window, `runs_locked`).
     locked: bool,
+    /// The console display's state through the block (0 off, 1 on, 2 dimmed), when known: a display
+    /// that sleeps under a locked series changes what the machine does (the compositor parks, the GPU
+    /// idles deeper), so both blocks of a pair share it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display: Option<u8>,
 }
 
 struct Ctx<'a> {
@@ -251,6 +257,10 @@ struct Ctx<'a> {
     pixels_dir: Option<PathBuf>,
     /// A native target's GPU backend, adapter and scale per variant, from its bridge (`VariantMismatch`).
     native_setup: BTreeMap<String, String>,
+    /// The bench's harness, overlaid on every variant's folder (`overlay_harness`).
+    harness: Harness,
+    /// The repository the bench file is in: git refs resolve and worktrees are made there.
+    project: PathBuf,
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -283,11 +293,7 @@ pub fn run(args: &Args) -> Result<Output> {
     chromium::reap_orphans();
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
     let config = config::load(&project);
-    let _power = match args.get("power").unwrap_or("keep") {
-        "keep" => None,
-        "high" => Some(PowerPlan::high()?),
-        other => return Err(Error::usage(format!("--power: keep or high, not {other}"))),
-    };
+    let power = power_for(args)?;
     let env = host::env();
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
@@ -325,6 +331,9 @@ pub fn run(args: &Args) -> Result<Output> {
         check,
         pixels_dir: None,
         native_setup: BTreeMap::new(),
+        // Per bench: a long-lived daemon runs benches of several repositories.
+        harness: harness(&file, &project, &config),
+        project: project.clone(),
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -334,8 +343,8 @@ pub fn run(args: &Args) -> Result<Output> {
     if busy > 0.10 {
         ctx.warnings.push(validity::warn("Background", format!("{:.0}% of all CPUs were busy before the run; close heavy apps for tighter intervals", busy * 100.0)));
     }
-    if !env.power_plan.is_empty() && !env.power_plan.contains("performance") {
-        ctx.warnings.push(validity::info("PowerPlan", format!("{} (kept; --power high switches it for the run)", env.power_plan)));
+    if let Some(why) = &power.kept {
+        ctx.warnings.push(validity::info("PowerPlan", why.clone()));
     }
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
@@ -357,7 +366,6 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
         None => vec![resolve_variant("head", &head_spec, &project, &config)?],
     };
-    let _ = HARNESS.set(harness(&file, &project, &config));
     let started = Instant::now();
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
@@ -372,14 +380,14 @@ pub fn run(args: &Args) -> Result<Output> {
         } else if pixels_only {
             let target = ctx.describe["targets"][&s.target].clone();
             for v in variants.iter_mut() {
-                prepare_variant(v, &target, &config, false)?;
+                prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
             }
             let pixels = pixels_series(&mut ctx, s, &variants)?;
             json!({ "label": s.label(), "case": s.case, "kind": "pixels", "pixels": pixels, "decided": pixels.as_array().is_some_and(|a| a.iter().all(|p| p["state"] == "same")) })
         } else if leak_run {
             leak_series(&mut ctx, s, &mut variants, &config)?
         } else {
-            run_series(&mut ctx, s, &mut variants, &config, aa, started, max_time)?
+            run_series(&mut ctx, s, &mut variants, &config, started, max_time)?
         };
         all_decided &= out["decided"].as_bool().unwrap_or(false);
         series_out.push(out);
@@ -450,7 +458,7 @@ pub fn run(args: &Args) -> Result<Output> {
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
     for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, false)?;
+        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
     let started = Instant::now();
     let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
@@ -526,7 +534,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
 fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
     for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, false)?;
+        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
     let n = ctx.runs;
     progress(format!("\n{}  leak run · warmup, then S0 · {n} runs · S1 · {n} runs · S2, a post-GC census after every run", s.label()));
@@ -553,12 +561,12 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     }))
 }
 
-fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, aa: bool, started: Instant, max_time: Option<Duration>) -> Result<Value> {
+fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, started: Instant, max_time: Option<Duration>) -> Result<Value> {
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
     for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, aa)?;
+        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
     let bound =
         ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
@@ -600,8 +608,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                 idx[v] = blocks.len();
                 blocks.push(b);
             }
-            // Base and head of a pair share one lock state, or the pair runs again.
-            if blocks[start].locked == blocks[start + 1].locked {
+            // Base and head of a pair share one lock state and one display state, or the pair runs again.
+            if blocks[start].locked == blocks[start + 1].locked && blocks[start].display == blocks[start + 1].display {
                 break;
             }
             for b in blocks.drain(start..) {
@@ -611,9 +619,13 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             }
             redone += 1;
             if redone >= 5 {
-                return Err(Error::refused("SessionLocked", "the session kept locking and unlocking between a pair's blocks", "bench while the session stays locked or stays unlocked"));
+                return Err(Error::refused(
+                    "SessionLocked",
+                    "the session kept locking and unlocking, or the display kept turning off and on, between a pair's blocks",
+                    "bench while the session stays locked or stays unlocked",
+                ));
             }
-            progress(format!("  pair {}: the session locked or unlocked between its blocks; the pair runs again", pair + 1));
+            progress(format!("  pair {}: the session locked or unlocked, or the display turned off or on, between its blocks; the pair runs again", pair + 1));
         }
         pairs.push((idx[0], idx[1]));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
@@ -762,6 +774,16 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         warnings.push(validity::warn("SessionLocked", format!("{locked_pairs} of {} pairs ran on a locked screen and the rest unlocked: nothing is decided; rerun in one state", pairs.len())));
     } else if session == "locked" {
         warnings.push(validity::info("SessionLocked", "every block ran on a locked screen (the series needs no presenting window): compare it only with runs that were locked too"));
+    }
+    // Each pair ran in one display state; pairs in different ones still compare within themselves.
+    let dark = pairs.iter().filter(|&&(a, _)| blocks[a].display == Some(0)).count();
+    if dark > 0 {
+        let text = if dark == pairs.len() {
+            "every block ran with the display off (a locked session's display sleeps): compare it only with runs whose display was off too".to_string()
+        } else {
+            format!("{dark} of {} pairs ran with the display off and the rest with it on; each pair ran in one state, so the comparison holds, but absolute values mix both", pairs.len())
+        };
+        warnings.push(validity::info("DisplayOff", text));
     }
     // Attribution: one block per variant with profilers, never timed. By default only when there is a
     // difference to explain; `--why always` keeps them for every series, `--why never` (or
@@ -912,6 +934,13 @@ fn cells(c: &Value) -> (String, String, String, String) {
 /// `report experiment <id> --format pr`: the experiment as Markdown for a pull request body. Per series a table
 /// of the primary and the tested metrics with their intervals and verdicts, the context metrics folded away,
 /// pixels and warnings, then the setup and the command that reruns it.
+/// Whether a note belongs in a PR table: every warning, and the context notes a reader needs to
+/// know what the numbers compare with (a locked session, a sleeping display, the power plan, a
+/// GPU that does not drive the display, a smoke run's few pairs).
+fn in_pr(w: &Value) -> bool {
+    w["level"] == "warn" || ["SessionLocked", "DisplayOff", "PowerPlan", "CrossAdapterScanout", "FewPairs", "StaleCalibration"].contains(&w["id"].as_str().unwrap_or(""))
+}
+
 pub fn pr_markdown(r: &Value) -> String {
     let variant = |role: &str| r["variants"].as_array().into_iter().flatten().find(|v| v["role"] == role).cloned().unwrap_or(Value::Null);
     let (base, head) = (variant("base"), variant("head"));
@@ -947,19 +976,27 @@ pub fn pr_markdown(r: &Value) -> String {
                 out.push('\n');
             }
         }
-        let warns: Vec<&Value> = s["warnings"].as_array().into_iter().flatten().filter(|w| w["level"] == "warn").collect();
-        for w in warns {
+        for w in s["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)) {
             out += &format!("\n- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
         }
         out += "\n";
     }
+    // The bench's own notes (power plan, lost present events, …), once.
+    let general: Vec<&Value> = r["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)).collect();
+    for w in &general {
+        out += &format!("- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
+    }
+    if !general.is_empty() {
+        out += "\n";
+    }
     let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
     out += &format!(
-        "`{}` against `{}`, alternating fresh launches: {} · {} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
+        "`{}` against `{}`, alternating fresh launches: {} · {} · power plan {} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
         base["label"].as_str().unwrap_or("base"),
         head["label"].as_str().unwrap_or("head"),
         r["env"]["os"].as_str().unwrap_or(""),
         r["env"]["cpu"].as_str().unwrap_or(""),
+        r["env"]["power_plan"].as_str().filter(|p| !p.is_empty()).unwrap_or("?"),
         r["browser"].as_str().unwrap_or(""),
         r["window"]["width"],
         r["window"]["height"],
@@ -1212,16 +1249,23 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
     if runs_locked(ctx, s, set) {
         loop {
             let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
+            let display = host::display_state();
             let r = any_block(ctx, s, v, pair, set, keep);
             let end = host::session_locked();
             let steady = start == end && if start { ctx.awake.unlocks() == unlocks } else { ctx.awake.locks() == locks };
-            if steady {
-                return r.map(|b| session_state(s, b, start));
+            // The display turned off (or on) during the block: it ran in two machine states.
+            let lit = display.is_none_or(|(_, n)| host::display_state().is_some_and(|(_, m)| m == n));
+            if steady && lit {
+                return r.map(|mut b| {
+                    b.display = display.map(|d| d.0);
+                    session_state(s, b, start)
+                });
             }
             if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            progress(format!("  the session locked or unlocked during a {} block: discarded, it runs again", v.role));
+            let what = if steady { "the display turned off or on" } else { "the session locked or unlocked" };
+            progress(format!("  {what} during a {} block: discarded, it runs again", v.role));
         }
     }
     let mut woken = false;
@@ -1285,7 +1329,7 @@ fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
     match t["kind"].as_str().unwrap_or("") {
         "script" | "headless" => true,
         _ if set == Set::Memory => true,
-        "native" if t["window"] == false => !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m)),
+        "native" if t["window"] == false || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m)),
         _ => false,
     }
 }
@@ -1875,6 +1919,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             leak,
             refused: BTreeMap::new(),
             locked: false,
+            display: None,
         })
     })();
     lapped.set(Instant::now());
@@ -1902,32 +1947,20 @@ impl Drop for OwnAffinity {
     }
 }
 
-/// `--power high`: the High performance plan for the run, then the previous plan again (also on error).
-/// Not the default: AMD X3D core parking relies on Balanced to keep work on the V-Cache CCD.
-struct PowerPlan {
-    previous: String,
-}
-
-impl PowerPlan {
-    fn high() -> Result<PowerPlan> {
-        if !cfg!(windows) {
-            return Err(Error::usage("--power high only switches Windows power plans"));
-        }
-        let active = host::output(Command::new("powercfg").arg("/getactivescheme")).unwrap_or_default();
-        let previous =
-            active.split_whitespace().find(|w| w.len() == 36 && w.matches('-').count() == 4).map(str::to_string).ok_or_else(|| Error::msg("powercfg: could not read the active power plan"))?;
-        if !Command::new("powercfg").args(["/setactive", "SCHEME_MIN"]).stdout(Stdio::null()).status()?.success() {
-            return Err(Error::msg("powercfg could not switch to High performance"));
-        }
-        progress("  power plan: High performance for this run");
-        Ok(PowerPlan { previous })
+/// The run's power plan (SPEC §9.4): `--power high` (the default) switches to the fastest plan the
+/// device offers and puts the user's back afterwards, even after a kill (`host::power`); `--power
+/// keep` keeps the user's. strobe pins the target to its CPUs itself, so it needs no core parking.
+pub(crate) fn power_for(args: &Args) -> Result<host::power::Power> {
+    let keep = match args.get("power").unwrap_or("high") {
+        "keep" => true,
+        "high" => false,
+        other => return Err(Error::usage(format!("--power: high or keep, not {other}"))),
+    };
+    let p = host::power::Power::for_run(keep);
+    if p.kept.is_none() {
+        progress(format!("  power plan: {} for this run", p.used));
     }
-}
-
-impl Drop for PowerPlan {
-    fn drop(&mut self) {
-        let _ = Command::new("powercfg").args(["/setactive", &self.previous]).stdout(Stdio::null()).status();
-    }
+    Ok(p)
 }
 
 /// What the page showed when a step failed: its URL and a screenshot saved with the experiment.
@@ -2231,8 +2264,6 @@ struct Harness {
     paths: Vec<PathBuf>,
 }
 
-static HARNESS: std::sync::OnceLock<Harness> = std::sync::OnceLock::new();
-
 fn harness(file: &Path, project: &Path, config: &Value) -> Harness {
     let dir = file.parent().unwrap_or(Path::new("."));
     let from = host::output(Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]))
@@ -2248,8 +2279,7 @@ fn harness(file: &Path, project: &Path, config: &Value) -> Harness {
 /// Copies the harness into a variant's folder, so a base from before the bench existed (its serve script, its
 /// strobe.json) builds and serves the way head does. A worktree strobe made is strobe's own: head's harness
 /// replaces whatever the ref had. A folder of the user's only gets the files it lacks.
-fn overlay_harness(v: &Variant, root: &Path) -> Result<()> {
-    let Some(h) = HARNESS.get() else { return Ok(()) };
+fn overlay_harness(v: &Variant, root: &Path, h: &Harness) -> Result<()> {
     let root = std::fs::canonicalize(root)?;
     if root == h.from {
         return Ok(());
@@ -2311,17 +2341,17 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Builds and serves a variant for `web` targets (once per experiment).
-fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) -> Result<()> {
+fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness, project: &Path) -> Result<()> {
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
     // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
     if matches!(target["kind"].as_str(), Some("command") | Some("script")) {
         if let Kind::Git(r) = &v.kind
             && v.root.is_none()
         {
-            v.root = Some(worktree(r)?);
+            v.root = Some(worktree(r, project)?);
         }
         if let Some(root) = v.root.clone() {
-            overlay_harness(v, &root)?;
+            overlay_harness(v, &root, h)?;
         }
         if let (Some(root), Some(cmd)) = (v.root.clone(), target["build"].as_str()) {
             build_variant(v.role, &root, &json!({ "command": cmd }), None)?;
@@ -2339,10 +2369,10 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
         }
         let Some(build) = config.get("build").filter(|b| b.is_object() && b["command"].is_string()) else { return Ok(()) };
         if let Kind::Git(r) = &v.kind {
-            v.root = Some(worktree(r)?);
+            v.root = Some(worktree(r, project)?);
         }
         let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
-        overlay_harness(v, &root)?;
+        overlay_harness(v, &root, h)?;
         let output = build["output"].as_str().ok_or_else(|| Error::usage("a native target's build in strobe.json needs output: the executable it builds"))?;
         let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
         let built = root.join(cache_fill(output, &root));
@@ -2355,11 +2385,10 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, aa: bool) ->
         return Ok(());
     }
     if let Kind::Git(r) = &v.kind {
-        v.root = Some(worktree(r)?);
+        v.root = Some(worktree(r, project)?);
     }
     let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
-    overlay_harness(v, &root)?;
-    let _ = aa;
+    overlay_harness(v, &root, h)?;
     if let Some(build) = config.get("build").filter(|b| b.is_object()) {
         build_variant(v.role, &root, build, None)?;
     }
@@ -2417,6 +2446,9 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
         progress(format!("  build {role}: unchanged, reusing"));
         return Ok(());
     }
+    // Builds run on every CPU: strobe itself is pinned to the runner's CPUs, and children inherit
+    // that. The pin comes back after it, and the machine settles before any timed block.
+    let _unpinned = Unpinned::start();
     // A package with its own lockfile below the repository root (a site in a Rust repo) gets its own install:
     // a fresh worktree has none.
     if (cwd.join("bun.lock").exists() || cwd.join("bun.lockb").exists()) && !cwd.join("node_modules").exists() {
@@ -2464,6 +2496,27 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
     Ok(())
 }
 
+/// While alive, strobe (and what it starts) may use every CPU; dropping it restores strobe's pin and
+/// waits up to 30 s for the CPUs to go quiet (a build's last processes, a scan of what it wrote).
+struct Unpinned(Option<u64>);
+
+impl Unpinned {
+    fn start() -> Unpinned {
+        let n = host::topology().logical.min(64);
+        let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        Unpinned(host::set_affinity(all))
+    }
+}
+
+impl Drop for Unpinned {
+    fn drop(&mut self) {
+        if let Some(mask) = self.0 {
+            host::set_affinity(mask);
+        }
+        validity::wait_quiet(None, Duration::from_secs(30));
+    }
+}
+
 fn build_key(root: &Path, build: &Value) -> String {
     let git = |a: &[&str]| host::output(Command::new("git").arg("-C").arg(root).args(a)).unwrap_or_default();
     // In a worktree strobe made for a git ref, untracked files are strobe's own (a script target's
@@ -2478,16 +2531,31 @@ fn hash_str(s: &str) -> String {
     sha2::Sha256::digest(s.as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
-fn worktree(r: &str) -> Result<PathBuf> {
-    let sha = host::output(Command::new("git").args(["rev-parse", r])).ok_or_else(|| Error::usage(format!("unknown git ref {r}")))?;
+/// A worktree of `project` at ref `r`, strobe's own (`<state>/builds/<sha12>`). One kept from an
+/// earlier bench is reset to the ref first: a harness overlaid then (or anything a build wrote
+/// into tracked files) must not carry into this bench. Ignored files (dependencies, build output)
+/// stay, so builds and installs are reused.
+fn worktree(r: &str, project: &Path) -> Result<PathBuf> {
+    let git = || {
+        let mut c = Command::new("git");
+        c.arg("-C").arg(project);
+        c
+    };
+    let sha = host::output(git().args(["rev-parse", r])).ok_or_else(|| Error::usage(format!("unknown git ref {r} in {}", project.display())))?;
     let dir = host::paths::sub("builds").join(&sha[..12.min(sha.len())]);
-    if !dir.join(".git").exists() {
+    if dir.join(".git").exists() {
+        let at = |a: &[&str]| Command::new("git").arg("-C").arg(&dir).args(a).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+        if !(at(&["checkout", "--force", "--detach", &sha]) && at(&["clean", "-fd"])) {
+            return Err(Error::msg(format!("could not reset the worktree for {r} at {}", dir.display())).hint("remove that folder; strobe makes it again"));
+        }
+    } else {
         progress(format!("  worktree {r} → {}", dir.display()));
-        let ok = Command::new("git").args(["worktree", "add", "--detach"]).arg(&dir).arg(&sha).stdout(Stdio::null()).status()?.success();
+        let ok = git().args(["worktree", "add", "--detach"]).arg(&dir).arg(&sha).stdout(Stdio::null()).status()?.success();
         if !ok {
             return Err(Error::msg(format!("git worktree add for {r} failed")));
         }
         if dir.join("bun.lock").exists() || dir.join("bun.lockb").exists() {
+            let _unpinned = Unpinned::start();
             progress("  bun install (worktree)");
             Command::new(crate::runner::find_bun().unwrap_or_else(|| "bun".into())).arg("install").current_dir(&dir).stdout(Stdio::null()).status()?;
         }

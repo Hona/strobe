@@ -123,7 +123,7 @@ Use
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
-        [--why auto|always|never] [--trace lean|full] [--power keep|high] [--pin auto|none|ccdN|<cpus>]
+        [--why auto|always|never] [--trace lean|full] [--power high|keep] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)

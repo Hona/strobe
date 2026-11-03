@@ -51,6 +51,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(path) = target.strip_prefix("file:") {
         return super::query::import(path);
     }
+    // A timed recording runs on the fastest power plan, as a bench does (SPEC §9.4); attribution,
+    // deep and memory recordings are not timed.
+    let _power = if args.get("probes").unwrap_or("timing") == "timing" { Some(super::bench::power_for(args)?) } else { None };
     if target.starts_with("pid:") || target.starts_with("proc:") {
         return super::outside::record(args, &target);
     }
@@ -191,7 +194,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let os_frames = match os_frames {
         Some(Ok(p)) => {
             let run = crate::etw::frames::from_presents(&p.presents, &tree, t0, t1);
-            let v = crate::etw::frames::values(&[run], crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1));
+            let display = host::main_window(&tree).and_then(|w| host::display_of(w.hwnd));
+            let v = crate::etw::frames::values(&[run], crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()));
             crate::symbol::write_gz(&dir.join("presents.json.gz"), &p)?;
             json!({ "values": v, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "pids": tree })
         }
@@ -231,15 +235,22 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             return Err(e);
         }
     };
+    // A profile with `window: false` (a tray app) has no window to wait for, place or check, and
+    // nothing of it reaches the display: a locked session changes none of what is recorded.
+    let windowless = app.windowless;
     let result = (|| -> Result<Value> {
-        n.wait_window(Duration::from_secs(60), &guard)?;
-        n.place(&Window::default(), false);
-        guard.check("after the app opened its window")?;
+        if !windowless {
+            n.wait_window(Duration::from_secs(60), &guard)?;
+            n.place(&Window::default(), false);
+            guard.check("after the app opened its window")?;
+        }
         // The app loads itself; give it time to settle before recording.
         std::thread::sleep(Duration::from_secs(3));
-        n.check_visible()?;
-        if host::session_locked() {
-            return Err(validity::locked());
+        if !windowless {
+            n.check_visible()?;
+            if host::session_locked() {
+                return Err(validity::locked());
+            }
         }
         // An app whose toolkit has the bridge has connected by now: its run record covers the recording.
         let bridge = listener.try_accept()?;
@@ -257,7 +268,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let dir = store::recording_dir(&id)?;
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
-        let presents = (set != Set::Attribution).then(crate::etw::PresentCapture::start);
+        let presents = (set != Set::Attribution && !windowless).then(crate::etw::PresentCapture::start);
         let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
         progress(format!("recording {id} for {}{}", fmt::ms_duration(for_ms), if bridge.is_some() { " (with the app's bridge)" } else { "" }));
@@ -278,22 +289,27 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let os = sampler.stop().window(t0, t1);
         let presents = presents.map(|r| r.and_then(|c| c.stop()));
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
-        if awake.locks() > 0 || host::session_locked() {
+        let session_locked = awake.locks() > 0 || host::session_locked();
+        if session_locked && !windowless {
             let _ = std::fs::remove_dir_all(&dir);
             return Err(validity::locked());
         }
-        n.check_visible()?;
+        if !windowless {
+            n.check_visible()?;
+        }
         let mut run = run;
         let mut frame_values = BTreeMap::new();
         let os_frames = match &presents {
             Some(Ok(p)) => {
-                let mut wins = [crate::etw::frames::RunWindow { t0, t1, rows: run.is_object().then(|| crate::etw::frames::rows_from_record(&run)) }];
-                frame_values = crate::etw::frames::native_values(p, &n.pids(), &mut wins);
+                let mut wins = [crate::etw::frames::RunWindow { t0, t1, rows: run.is_object().then(|| crate::etw::frames::rows_from_record(&run)), inputs: Vec::new() }];
+                let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
+                let f = crate::etw::frames::native_values(p, &n.pids(), &mut wins, display.as_ref());
+                frame_values = f.values;
                 if let Some(rows) = &wins[0].rows {
                     crate::etw::frames::fill_record(&mut run, rows);
                 }
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms })
+                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "inputs_refused": f.inputs_refused, "display": display })
             }
             Some(Err(e)) => json!({ "refused": e.message }),
             None => Value::Null,
@@ -327,6 +343,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         if let Some(v) = os.vram_dedicated_mb {
             values.insert("gpu.vram", v);
         }
+        if let Some(v) = os.vram_shared_mb {
+            values.insert("gpu.shared", v);
+        }
         values.insert("memory.app.private", n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
         if run.is_object() {
             for (metric, field) in
@@ -340,7 +359,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             store::write_json(&dir.join("frames.json"), &json!({ "columns": run["frame_columns"], "runs": { "run:0": run["frames"] }, "marks": { "run:0": run["marks"] } }))?;
         }
         let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
-        store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(std::slice::from_ref(&span), &names)))?;
+        let spans = std::slice::from_ref(&span);
+        store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(spans, &names, &wakes::modules(spans))))?;
         let mut bridged = run.clone();
         if let Some(o) = bridged.as_object_mut() {
             o.remove("frames");
@@ -353,7 +373,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let hello = bridge.as_ref().map(|b| &b.hello);
         let mut meta = json!({
             "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "os": os,
-            "window": n.window, "created": now_iso(), "valid": true, "hello": hello, "os_frames": os_frames,
+            "window": n.window, "created": now_iso(), "valid": true, "hello": hello, "os_frames": os_frames, "session_locked": session_locked,
             // A debug build's times describe no build people run (`DevBuild`).
             "timing": if hello.is_some_and(|h| h.debug_build) { "debug build" } else { "clean" },
             "note": if set == Set::Attribution { format!("native attribution: run records and OS samples; {stacks_note}") } else { String::new() },
@@ -528,7 +548,13 @@ fn native_summary(meta: &Value) -> String {
         s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
     }
     if get("memory.app.private").is_finite() {
-        s += &format!("gpu      3D {} · VRAM {} · memory {} private\n", fmt::value(get("gpu.process.3d"), "%"), fmt::value(get("gpu.vram"), "MB"), fmt::value(get("memory.app.private"), "MB"));
+        s += &format!(
+            "gpu      3D {} · VRAM {} · shared {} · memory {} private\n",
+            fmt::value(get("gpu.process.3d"), "%"),
+            fmt::value(get("gpu.vram"), "MB"),
+            fmt::value(get("gpu.shared"), "MB"),
+            fmt::value(get("memory.app.private"), "MB")
+        );
     }
     if get("ui.work").is_finite() {
         s += &format!(

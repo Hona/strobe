@@ -239,7 +239,7 @@ Steps (each checks first, prints ✓ / ! / ✗):
 $ strobe up
 strobe up · adais
   ✓ cpu        Ryzen 9 9950X3D · 16C/32T · CCD0 V-Cache (96 MB L3), CCD1 (32 MB L3)
-  ! power      Balanced (kept; bench --power high switches it for the run)
+  i power      Balanced (benches and timed recordings switch to High performance for the run, then back)
   ✓ gpu        RTX 5070 Ti · NVML ok · D3DKMT ok
   ✓ displays   2 · 144 Hz, 60 Hz
   ✓ targets    Chrome · 2 app profiles installed
@@ -292,7 +292,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
-             [--why auto|always|never] [--trace lean|full] [--power keep|high]
+             [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--require-verdict] [--json]
 ```
 
@@ -420,11 +420,29 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
 - `requestAnimationFrame` gaps, when wanted, are a separate metric named `raf.gap.*`.
 - **Native windows and any process from outside** (Windows): a frame is a present the OS put on the
   screen, from its present events (§8.1 `presents`): one record per present with its start, the
-  screen time of its scanout (`displayed`), or `discarded` (replaced before scanout). A toolkit's
-  frame rows (native bridge: `begin_ns`, `submit_ns`, `input_ns`) join them by process, thread and
-  the present call's span, which fills each row's `present_ns`. Then `frames.presented.*` is
-  `present_ns − begin_ns`, `interaction.*` is `present_ns − input_ns` of the first frame that
-  reflects an input, and `display.hz` comes from the vertical blanks the kernel logs.
+  screen time of its scanout (`displayed`), or `discarded` (replaced before scanout). "One present
+  per surface per composed frame" keys each present by its window, else (a composition swapchain,
+  which has no window) its composition surface, else its process and swapchain; never window 0.
+  At the session's first completed present, only presents that started before every provider ran
+  are dropped as partial. A toolkit's frame rows (native bridge: `begin_ns`, `cpu_end_ns`,
+  `submit_ns`, `input_ns`) join them on the row's own thread, the present's start inside the row's
+  present call (`cpu_end_ns`..`submit_ns`, ±10 µs: one clock, one thread), nearest the call's start;
+  each surface keeps to the swapchain it first matched. Another thread's present counts only when
+  the rows have one surface. Over 5% of rows fitting several presents refuses (`AmbiguousPresent`);
+  over 5% matching none with no events lost refuses (`PresentsUnmatched`). The join fills each
+  row's `present_ns`. Then `frames.presented.*` is `present_ns − begin_ns`.
+- **Inputs to the screen** (the generic path, for any native app strobe drives): strobe stamps each
+  input it sends (host clock); its frame is the first present of the app's processes that started
+  after it and reached the screen (a discarded one is passed over: a later one shows it). An input
+  counts only when the app presented nothing for two refreshes before it: at rest, the next present
+  is the input's; an app already drawing may present a frame begun before the input, so that input
+  is not counted. An input with no displayed present within a second is unmatched; over 5% of them
+  refuses `interaction.*` (`PresentsUnmatched`). `interaction.*` is screen time − input time.
+- **Refresh**: `display.hz` and the refresh period are the target window's display path's
+  (`MonitorFromWindow` → `QueryDisplayConfig`: its `VidPnTargetId` and nominal rate): the median
+  spacing of that path's vertical blanks (`VSyncDPC` and, on multi-plane drivers,
+  `VSyncDPCMultiPlane`), or its nominal rate when they are too few or disagree by over 10%. With no
+  window, only when every display runs at one rate (`NoPresentSource` otherwise).
 - **Drops and intervals from screen times**: a frame is pending from its begin (outside-in: its
   present call's start). Between two frames shown at `a` and `b`, the refreshes in between were
   missed when `b` was pending before `a` plus half a refresh (an animation that fell behind); a
@@ -452,12 +470,21 @@ run record (§13.7).
 What strobe reads from a native app (§13.7), per run:
 
 - **From outside, always:** `cpu.work` and `cpu.app.total` (the process tree's cycles), `cpu.wakes`
-  (context switches of the tree's threads per second: how often they wake to run; from two
-  `NtQuerySystemInformation(SystemProcessInformation)` snapshots around the run, a thread or process
-  born in the run counting from zero; one that exits in the run takes its last wakes with it, so the
-  count is a lower bound then), `io.read` and `io.write` (bytes, the same snapshots), `gpu.process.3d`,
-  `gpu.vram`, `memory.app.private`, `run.duration`. Per thread: wakes per second and CPU per run from
-  the thread's cycle counter, named by `GetThreadDescription` (`query <rec> threads`).
+  (context switches of the tree's threads per second: each a switch in to run, after a wait (a
+  timer, an event, IO) or a preemption; at rest nearly all are waits. Driver and OS pool threads
+  inside the app's processes count too, and a handoff between two of its threads counts twice. From
+  two `NtQuerySystemInformation(SystemProcessInformation)` snapshots around the run, a thread or
+  process born in the run counting from zero; one that exits in the run takes its last wakes with it,
+  so the count is a lower bound then), `io.read` and `io.write` (bytes, the same snapshots),
+  `gpu.process.3d` (3D engine time summed over every adapter the processes used: one that draws on
+  one GPU and computes on another uses both), `gpu.vram` (dedicated), `gpu.shared` (GPU memory in
+  system memory: all of an integrated GPU's), `memory.app.private`, `run.duration`. Per thread: wakes
+  per second and CPU per run from the thread's cycle counter, named by `GetThreadDescription`, with
+  the module it started in (its Win32 start address, `ThreadQuerySetWin32StartAddress`) and whose it
+  is: `app`, `driver` (from the driver store, such as a GPU driver's workers) or `os` (the Windows
+  folder: its thread pool and services) (`query <rec> threads`). The `wakes-while-idle` insight
+  counts the app's own threads and names driver and OS threads apart. Every adapter the app used is
+  recorded (`ctx.gpu.devices`), each with its own engine use.
 - **With the app's bridge:** `ui.work` (wall time of the UI thread's turns that did frame work or
   handled input; the primary for "does this UI change cost less"), `ui.cpu` (that thread's CPU), and
   descriptive parts `ui.view`, `ui.layout`, `ui.text`, `ui.paint`, `ui.encode`; `ui.frames` (frames the
@@ -470,7 +497,8 @@ What strobe reads from a native app (§13.7), per run:
   events (§7.2): a series that declares one gets a present session in its timing blocks; with the
   bridge the toolkit's rows are joined to the presents (filling `present_ns` in `frames.json`),
   without it the app's processes' presents count alone (no `frames.presented.*` then: there is no
-  begin). `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects.
+  begin). `interaction.*` is a frame's `present_ns` minus the earliest input it first reflects, or,
+  for inputs strobe sent, the inputs-to-screen join (§7.2).
   Without either source they are refused (`NoPresentSource`, with the reason: no access, or no
   presents in the runs).
 
@@ -799,11 +827,18 @@ flowchart LR
 | Control | Windows | Linux | macOS |
 |---|---|---|---|
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
-| power plan for the run with `--power high` (opt-in: AMD X3D core parking relies on Balanced), restored after, also after a crash | `PowerSetActiveScheme` | governor read only; analyser | read only |
+| power plan: the fastest the device offers for every bench and timed recording (`--power high`, the default), the user's own back after it, also after a crash or kill; `--power keep` opts out; on battery the plan is kept. Either way the context notes say so | the active vendor's High performance scheme (AMD Ryzen Balanced → AMD Ryzen High Performance), else Windows' High performance, else Ultimate performance, else on a Balanced-only device Windows 11's Best performance power mode (`powercfg /setactive`, powrprof `PowerSetActiveOverlayScheme`); the scheme and power mode to restore are journaled in `<state>/power.json` first, and any strobe that starts restores a journal whose strobe is gone | governor read only; analyser | read only |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
 | window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | `visibilityState` | `visibilityState` |
 | throttling | frequency below the expected range (PDH % of maximum frequency) | cpufreq | analyser only |
 | battery | `GetSystemPowerStatus` | `/sys/class/power_supply` | IOKit |
+
+strobe pins the target itself, so High performance's unparked cores cost it nothing: an X3D CCD's
+V-Cache preference holds through `--pin`. The plan used (with its power mode) is in every
+experiment's env line and `report --format pr` footer.
+
+Builds run unpinned (strobe's own pin, which a build inherits, is lifted for them), and after a build
+strobe waits up to 30 s for the CPUs to go quiet before any timed block.
 
 Provenance stored with every experiment and recording: CPU, topology, pinning, power plan, OS build, GPU and driver,
 displays and the adapter driving the window, window size and scale, browser or Electron and
@@ -839,8 +874,17 @@ it, for app profiles they use from anywhere; `apps` merge per app.
 
 - A variant is `git:<ref>`, `app:<id>`, `exe:<path>`, or a bare value: an existing directory,
   else a git ref.
-- A git ref becomes a detached worktree under `builds/`, never one of the user's worktrees.
-  Built with the project's command.
+- A git ref becomes a detached worktree under `builds/`, never one of the user's worktrees, made
+  from the bench file's repository (`git -C <project>`, wherever strobe runs from, the daemon
+  included). A worktree kept from an earlier bench is reset to its ref first (`checkout --force`,
+  `clean -fd`): a harness overlaid then must not carry over; ignored files (dependencies, build
+  output) stay. Built with the project's command.
+- **A build that works on any commit:** a `--base` from before a build profile or a feature existed
+  must build with the same command as `--head` (and `--bisect` walks such history). Prefer the
+  build tool's standard optimized profile with settings in `build.env` over a custom profile or
+  feature in the repository: for Cargo, `cargo build --release` with
+  `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, `CARGO_PROFILE_RELEASE_STRIP=false` (a PDB for
+  native stacks) and `CARGO_PROFILE_RELEASE_INCREMENTAL=false`.
 - Build cache key: tree hash + build command + env hash. Both variants must share command and
   env (`VariantMismatch`).
 - `app:<id>` and `exe:<path>` need no build.
@@ -859,7 +903,8 @@ it, for app profiles they use from anywhere; `apps` merge per app.
   builds and serves, strobe copies the harness into its folder, so a base from before the bench
   existed (no serve script, no `strobe.json`) runs the way head does. A worktree strobe made for a
   git ref is strobe's own: head's harness replaces the ref's. A directory of the user's only gets
-  the files it lacks, and strobe names any it kept.
+  the files it lacks, and strobe names any it kept. The harness is the bench's own (a daemon runs
+  benches of several repositories, each with its harness).
 - **Source maps:** every build strobe runs has `STROBE_SOURCEMAP=hidden` in its environment. A
   bundler config that reads it (Vite: `build: { sourcemap: process.env.STROBE_SOURCEMAP }`) writes
   each map beside its script without the `sourceMappingURL` comment, so the scripts served are
@@ -1200,7 +1245,11 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
-| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch and compares it with the fastest this device has run it (`<state>/native-speed.json`) |
+| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
+| `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest |
+| `AmbiguousPresent` | over 5% of a toolkit's frames fit more than one OS present (refuses the frame metrics) |
+| `PresentsUnmatched` | over 5% of a toolkit's frames matched no OS present while the present session lost no events (refuses the frame metrics); over 5% of strobe's inputs showed no frame within a second (refuses `interaction.*`) |
+| `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
 | `NoDisplayForBudget` | a budget metric is requested without a real display; any metric of a headless native app beyond `ui.*`, `count.*` and `cpu.*`, and its launches |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
 | `ClockUnsynced` | sources cannot be aligned within 1 ms (§6); a native bridge whose clock is not the host's, or whose hello is stamped outside its launch |
@@ -1209,8 +1258,15 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 
 `MultimodalDistribution` · `HighVariance` · `Underpowered` · `StateDrift` · `Background` ·
 `Throttling` · `Drift` (trend across pairs) · `CounterUnstable` · `ProbeOverhead` ·
-`Unresolved` (samples without a symbol above 5%) · `PowerPlan` · `Battery` · `VirtualMachine`
-· `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed).
+`Unresolved` (samples without a symbol above 5%) · `PowerPlan` (the user's plan was kept: `--power
+keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine`
+· `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed) · `DisplayOff`
+(pairs ran with the console display off, §10.5) · `CrossAdapterScanout` (a native app draws on one GPU
+while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`
+(the present session's consumer over 0.5% of a core) · `PresentsLost`.
+
+`report --format pr` prints every warning and the context notes that say what the numbers compare
+with: `SessionLocked`, `DisplayOff`, `PowerPlan`, `CrossAdapterScanout`, `FewPairs`, `StaleCalibration`.
 
 `Background` (built): per measured run, the busy time of the CPUs the target is pinned to (the OS
 sampler's per-CPU idle cycles) minus the target's own cycles is `cpu.foreign` (% of one core); a block
@@ -1266,6 +1322,19 @@ pair runs again (five times at most, then `SessionLocked` refuses). The series s
 when every pair ran locked, with an info line to compare it only with locked runs; pairs in both
 states refuse every metric of the series (`refused (SessionLocked)`), since a locked number is not
 comparable with an unlocked one.
+
+The console display's state (`GUID_CONSOLE_DISPLAY_STATE`: off, on, dimmed) is tracked the same way
+for series that run through a lock: a block during which it changed runs again, and base and head of
+a pair share one state or the pair runs again. When the display sleeps, the compositor parks and the
+GPU and CPUs idle deeper, so a pair across that change would compare two machine states. strobe keeps
+the display on (`ES_DISPLAY_REQUIRED`) only while the session is unlocked: a locked machine's display
+sleeps as Windows decides, which is how locked machines run for their users, and keeping a display lit
+through days of locked benches would be strobe changing the machine. Pairs in different display states
+still compare within themselves; `DisplayOff` notes it (every pair, or how many).
+
+`record pid:|proc:` on a locked session records CPU, GPU and stacks (`--probes deep`) and refuses only
+its frames; `record app:<id>` of a profile with `window: false` waits for no window and runs on a
+locked session.
 
 ## 11. Views and reports
 
@@ -1349,8 +1418,10 @@ name. Core migration needs the deep helper and is not built.
   Electron, the Microsoft symbol server for Windows, plus servers listed in `strobe.json`.
 - Cached under `symbols/`.
 - As built (Windows, pure Rust: `pdb-addr2line` over `pdb2`, `rustc-demangle`, `msvc-demangler`):
-  a module's CodeView record (GUID, age, PDB path) picks its PDB: the path the build wrote (a local
-  build's own PDB, checked by GUID), beside the module, the cache
+  a module's CodeView record (GUID, age, PDB path) picks its PDB: beside the module (a copied
+  variant build's own PDB), then the path the build wrote (a shared `{cache}` target folder holds
+  only the last build's there), each checked by GUID and age (an incremental link keeps the GUID and
+  bumps the age), then the cache
   (`symbols/<pdb>/<GUID><age>/<pdb>`), then the Microsoft server and `strobe.json`
   `symbols.servers` through `curl`; a miss leaves a `missing` marker for a day. Inline frames are
   expanded; a return address looks up its call (address − 1). Symbolization runs when a view first
@@ -1423,9 +1494,20 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
 }
 ```
 
-- `exe`: a path or one per OS; `~`, `%VAR%` and `${VAR}` expand from the real user's environment.
-- `env`, `unset` (exact names or `PREFIX*`), `dirs` and `files` (JSON or text; a string that is
-  exactly `{port}` becomes a number) shape the copy; `args` are extra command-line arguments.
+- `exe`: a path or one per OS; `~`, `%VAR%` and `${VAR}` expand from the real user's environment,
+  names in any case on Windows (`%APPDATA%` is `AppData`). A variable that is not set refuses the
+  profile (`exe` or `guard`): a path left holding `%VAR%` names nothing, and a guard on it would pass
+  every check while protecting nothing.
+- `env`, `unset` (exact names or `PREFIX*`, any case on Windows), `dirs` and `files` (JSON or text; a
+  string that is exactly `{port}` becomes a number) shape the copy; `args` are extra command-line
+  arguments. `window: false`: the app opens no window (a tray app); `record app:<id>` waits for none.
+- **Seeds** (`home` seed folders, copied into each fresh home): a file of 64 MB or more (a model) is
+  shared, not copied. strobe keeps one read-only copy per seed version in `<state>/seeds` and
+  hard-links it into each home, so a launch writes nothing that size again: a fresh copy per block
+  had an antivirus scan it on every CPU and the system flush and free it, around the speed check and
+  the measured runs. The app cannot write through the link (read-only), and `guard` checks that the
+  shared copy is unchanged after every block. Where a link cannot be made (another volume), the file
+  is copied as before. Shared copies no bench used for a week go.
 - **Background downloads are an isolation gap.** An isolated desktop app's stable channel downloaded its next
   release mid-run, which read as "the beta channel idles at 83% less CPU" until the updater log showed the
   download. Proxy env vars do not stop it (Electron's network stack ignores them on Windows), and
@@ -1507,7 +1589,11 @@ As built (Windows):
 - **The helper** (`strobe helper serve`) starts when the user's strobe runs its task
   (`schtasks /run`, no prompt), serves `\\.\pipe\strobe-helper-<SID>` (ACL: that user, SYSTEM and
   administrators; medium integrity may write; first instance only; remote clients rejected), and
-  exits after two minutes without a client. The client refuses a pipe served by any other binary.
+  exits after two minutes without a client. The client accepts the pipe only when its server
+  (`GetNamedPipeServerProcessId`) runs the installed helper's image and the pipe object belongs to
+  this user, administrators or SYSTEM (`GetSecurityInfo` owner: an elevated token's default owner is
+  administrators). Another account that created a pipe of that name first owns it itself, even when
+  it runs a copy of the helper; a server whose image cannot be read is refused too.
   Operations, one JSON line each way: `presents.start`/`presents.stop` (every present and vertical
   blank, as JSON) and `stacks.start {root}`/`stacks.stop` (only for a process tree running as the
   same user). A client that disconnects stops its sessions.
@@ -1612,8 +1698,10 @@ pacing is not. It never waits for an unlocked screen.
 
 **Attribution** (`--why`, `record --probes attribution`): the same blocks with their run records and
 OS samples kept, not timed, plus native stacks of the app's process tree when the deep helper is
-installed (§13.4): `deep.json.gz` holds the measured runs' samples, and `query <rec> hotspots`
-ranks them by function, file or package from the variant's own PDB (§12.2).
+installed (§13.4): `deep.json.gz` holds the samples inside the measured runs only (not warmup runs,
+and not the `reset()` between runs), and `query <rec> hotspots` ranks them by function, file or
+package from the variant's own PDB (§12.2). An attribution launch samples from just after the spawn
+until the launch was ready.
 
 ## 14. Storage
 
@@ -1740,7 +1828,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | daemon idle private memory | ≤ 8 MB |
 | daemon idle CPU | ≤ 0.1% of one core |
 | samplers while recording | ≤ 0.5% of one core |
-| OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`) |
+| OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
@@ -1884,8 +1972,21 @@ and nothing else from them is emitted.
   process, not the renderer).
 - `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the
   driver's dispatch times; `display.hz` comes from vsync spacing in the trace.
-- `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` switches plans
-  with `powercfg`.
+- `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` (the default)
+  switches plans with `powercfg` and power modes with powrprof (§9.4).
+- The native speed check's slow results on this machine came from the seed copy, not the CPU: a
+  listening bench that copied a 697 MB model into each fresh home refused `Throttled` (1.7–2.0×) at
+  pair 4 every time while a tray bench without it ran clean. Copying that file had the antivirus
+  (MsMpEng) at 80–140% of a core and System at 20–85% for seconds after each copy and delete. Large
+  seed files are now shared read-only (§13.2), the check waits for quiet CPUs, and a check slowed by
+  other processes names them (`Background`) instead of refusing `Throttled`.
+- Present tracking fixed after review (not yet run on a live session): composition swapchains (no
+  window) were all one window 0 in DWM's one-present-per-window rule, so one surface's presents could
+  discard another's; multi-plane drivers' vertical blanks were not recorded; the refresh came from
+  the busiest display, not the window's; the first completion dropped every present in flight
+  (including the first measured frame of an app idle until its first input); the toolkit join took
+  presents within 500 µs of the call's return from any thread, so a frame whose present blocked on
+  the swapchain could take the next frame's present.
 - Storage: `cpu-0.cpuprofile` and `alloc-0.heapprofile` (plain JSON), `maps/` (source maps and
   function ranges), `heap-0.heapsnapshot.gz` (and `heap-s0`, `heap-s1` for memory recordings),
   `leaks.json`, census in `meta.json`, one `runner.log` and `progress.log` per experiment.

@@ -9,7 +9,6 @@ use crate::host;
 use crate::model::{Error, Result};
 use crate::probe;
 use crate::store;
-use crate::validity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -50,13 +49,11 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         Some(d) => duration_ms(d)?,
         None => 10_000,
     };
-    // The lock screen covers every window: nothing reaches the display and presents stop.
-    if host::session_locked() {
-        return Err(validity::locked());
-    }
     let awake = host::Awake::start();
     let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
     let dir = store::recording_dir(&id)?;
+    // The lock screen covers every window: nothing reaches the display and presents stop. Stacks,
+    // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
     if deep {
         let cap = etw::StackCapture::start(root)?;
@@ -90,10 +87,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let (c1, tsc1, t1) = (cycles(), host::tsc(), host::now_ns());
     let os = sampler.stop().window(t0, t1);
     let presents = presents.and_then(|p| p.stop());
-    if locked(&awake) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(validity::locked());
-    }
+    let session_locked = locked(&awake);
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
     if let (Some(a), Some(b)) = (tsc0, tsc1)
         && b > a
@@ -106,21 +100,33 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     if let Some(v) = os.vram_dedicated_mb {
         values.insert("gpu.vram".into(), v);
     }
+    if let Some(v) = os.vram_shared_mb {
+        values.insert("gpu.shared".into(), v);
+    }
     let mut session = Value::Null;
     let refused = match &presents {
+        _ if session_locked => Some("SessionLocked: the session was locked while strobe recorded, so nothing reached the display".to_string()),
         Ok(p) => {
             let pids = host::tree_pids(root);
+            let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
             let run = frames::from_presents(&p.presents, &pids, t0, t1);
-            values.extend(frames::values(&[run], frames::refresh_ms(&p.vsyncs, t0, t1)));
-            crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-            session = json!({ "via": via, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "presents": p.presents.len(), "pids": pids });
-            None
+            match frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()) {
+                None if !p.vsyncs.is_empty() && display.is_none() => {
+                    Some("NoPresentSource: several displays run at different refresh rates and the process has no window to say which it is on".to_string())
+                }
+                refresh => {
+                    values.extend(frames::values(&[run], refresh));
+                    crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
+                    session = json!({ "via": via, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "presents": p.presents.len(), "pids": pids, "display": display });
+                    None
+                }
+            }
         }
         Err(e) => Some(e.message.clone()),
     };
     let meta = json!({
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
-        "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused,
+        "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked,
         "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true,
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -160,6 +166,9 @@ pub fn text(meta: &Value) -> String {
                 cpu.map(|c| format!("{c:.1} ms CPU ({:.3}% of a core)", 100.0 * c / dur)).unwrap_or_else(|| "?".into())
             );
         }
+    }
+    if meta["session_locked"] == true {
+        s += "session  locked: CPU and GPU numbers compare only with other locked recordings\n";
     }
     if get("cpu.app.total").is_finite() {
         s += &format!("cpu      {} of one core, process tree", fmt::value(get("cpu.app.total"), "%"));

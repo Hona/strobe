@@ -527,6 +527,13 @@ pub fn qpc_freq() -> u64 {
     f.max(1) as u64
 }
 
+/// The raw QPC count now, the clock of event time stamps (`ClientContext = 1`, raw time stamps).
+pub fn qpc_now() -> u64 {
+    let mut c = 0i64;
+    unsafe { windows_sys::Win32::System::Performance::QueryPerformanceCounter(&mut c) };
+    c.max(0) as u64
+}
+
 /// A raw QPC count in nanoseconds, the way `host::now_ns` converts it.
 pub fn ns(qpc: u64, freq: u64) -> u64 {
     ((qpc as u128) * 1_000_000_000 / freq as u128) as u64

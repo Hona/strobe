@@ -285,6 +285,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             leak: None,
             refused: BTreeMap::new(),
             locked: false,
+            display: None,
         })
     })();
     host.into_inner().exit();

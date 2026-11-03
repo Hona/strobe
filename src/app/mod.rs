@@ -64,6 +64,8 @@ pub fn dispatch(args: &Args) -> Result<Output> {
     if args.has("help") {
         return Ok(Output::new(HELP.to_string(), json!({ "help": HELP })));
     }
+    // A strobe killed mid-run left the user on its power plan: put theirs back first.
+    crate::host::power::restore_stale();
     match args.command.as_str() {
         "record" => record::run(args),
         "bench" => bench::run(args),

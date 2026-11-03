@@ -26,7 +26,8 @@ pub struct Native {
 /// Starts `app` in `home` with `env` added (such as the bridge's address); `output` keeps its stdout
 /// and stderr lines for milestones.
 pub fn launch(app: &App, home: &Home, env: &[(String, String)], output: bool, cpus: Option<u64>) -> Result<(Native, Guard)> {
-    let guard = Guard::take(app);
+    let mut guard = Guard::take(app);
+    guard.shared = home.shared.clone();
     isolate::live(app, &guard)?;
     let s = isolate::spawn(app, home, &[], env, output, cpus)?;
     Ok((Native { child: s.child, pid: s.pid, home: home.dir.clone(), exe: app.exe.clone(), epoch_ms: s.epoch_ms, at_ns: s.at_ns, output: s.output, window: None }, guard))

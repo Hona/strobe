@@ -1,0 +1,11 @@
+// Dev bench for a windowless (tray) native app while the session may be locked (not shipped). Run from the repo root:
+//   strobe bench scripts/dev/fake-tray.bench.ts --head . --check
+import { bench, native } from "@hona/strobe"
+
+export default bench({
+  targets: { tray: native("fake", { args: [import.meta.dir + "/fake-bridge.ts"], env: { FAKE_NOWINDOW: "1" }, window: false }) },
+  cases: {
+    idle: { primary: "cpu.wakes", metrics: ["cpu.work", "memory.app.private", "gpu.process.3d"], run: ({ page }) => page.wait(1000) },
+    launch: { primary: "launch.ready", metrics: ["cpu.work"], launch: { until: { milestone: "up" }, milestones: { up: { match: "fake ready" } } } },
+  },
+})

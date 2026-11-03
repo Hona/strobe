@@ -25,7 +25,9 @@ const now = () => {
 const env = process.env
 const mode = env.FAKE_MODE ?? "window"
 const frameMs = Number(env.FAKE_FRAME_MS ?? 2)
-if (mode === "window") spawn("C:/Windows/System32/charmap.exe", [], { stdio: "ignore" })
+// FAKE_NOWINDOW=1: a tray app, no window at all. It says when it is up on stdout (a launch milestone).
+if (mode === "window" && !env.FAKE_NOWINDOW) spawn("C:/Windows/System32/charmap.exe", [], { stdio: "ignore" })
+setTimeout(() => console.log("fake ready"), 80)
 
 const [host, port] = (env.STROBE_BRIDGE ?? "").split(":")
 if (!port) {

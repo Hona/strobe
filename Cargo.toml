@@ -46,8 +46,6 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_Power",
   "Win32_System_Registry",
   "Win32_System_RemoteDesktop",
-  # Lock screen: whether the session's input desktop can be opened.
-  "Win32_System_StationsAndDesktops",
   "Win32_UI_WindowsAndMessaging",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_Graphics_Gdi",

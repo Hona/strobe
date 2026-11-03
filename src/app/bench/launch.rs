@@ -272,6 +272,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             background: Vec::new(),
             leak: None,
             refused: BTreeMap::new(),
+            locked: false,
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may
@@ -560,7 +561,7 @@ pub(super) fn tail(home: &Path, globs: &[String], stop: &AtomicBool) -> Vec<Line
 }
 
 /// Files under `root` whose path relative to it matches `glob` (`*` within a segment, `**` across).
-fn matching(root: &Path, glob: &str) -> Vec<PathBuf> {
+pub(super) fn matching(root: &Path, glob: &str) -> Vec<PathBuf> {
     let parts: Vec<&str> = glob.split(['/', '\\']).filter(|p| !p.is_empty()).collect();
     let mut out = Vec::new();
     walk(root, &parts, &mut out, 0);

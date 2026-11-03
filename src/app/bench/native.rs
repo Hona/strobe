@@ -265,8 +265,14 @@ fn runs(
         lapped.set(Instant::now());
     };
     let headless = link.headless;
+    // A windowless app (a tray app, `window: false`) has no window to wait for, place or check.
+    let windowless = headless || target["window"] == false;
     if headless {
         link.get(Duration::from_secs(60))?;
+    } else if windowless {
+        if needs_bridge(ctx, s, target) {
+            link.get(Duration::from_secs(60))?;
+        }
     } else {
         n.wait_window(Duration::from_secs(60), guard)?;
         let viewport = target.get("viewport").filter(|v| v.is_object());
@@ -327,7 +333,7 @@ fn runs(
         t,
         &serve,
     )?;
-    if !headless {
+    if !windowless {
         n.check_visible()?;
     }
     lap("checks", steps);
@@ -348,7 +354,7 @@ fn runs(
     while first.is_none_or(|f| runs.len() < f + ctx.runs) {
         let i = runs.len();
         let began = Instant::now();
-        if !headless {
+        if !windowless {
             n.raise();
         }
         counts.borrow_mut().clear();
@@ -399,7 +405,7 @@ fn runs(
     lapped.set(Instant::now());
     let samples = sampler.stop();
     let procs1 = (host::now_ns(), host::all_processes());
-    if !headless {
+    if !windowless {
         n.check_visible()?;
     }
     let measured = &runs[first..];
@@ -686,6 +692,8 @@ enum Until {
     Settled,
     /// An element shows, as the app's bridge sees it.
     Selector(Value),
+    /// One of the launch's milestones (an output or log line).
+    Milestone(String),
 }
 
 /// One look at the launching app: when (epoch ms), whether its window shows, its pixels, and the tree's
@@ -751,7 +759,17 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if milestones.iter().any(|m| m.source == "page") {
         return Err(Error::usage(format!("{}: a native app has no page marks; read milestones from its output or a log file", s.case)));
     }
+    let windowless = target["window"] == false;
     let until = match spec["until"].get("window").and_then(Value::as_str) {
+        // A milestone of the app's own (an output or log line): the launch needs no window at all.
+        _ if spec["until"]["milestone"].is_string() => {
+            let name = spec["until"]["milestone"].as_str().unwrap_or("").to_string();
+            if !milestones.iter().any(|m| m.name == name) {
+                return Err(Error::usage(format!("{}: launch.until.milestone {name} is not one of its milestones", s.case)));
+            }
+            Until::Milestone(name)
+        }
+        _ if windowless => return Err(Error::usage(format!("{}: a target with window: false times its launch to a milestone: until: {{ milestone: \"<name>\" }}", s.case))),
         Some("visible") => Until::Visible,
         Some("painted") => Until::Painted,
         Some("settled") => Until::Settled,
@@ -761,7 +779,10 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         }
         None => Until::Selector(spec["until"].clone()),
     };
-    let capture = spec["screen"] != false;
+    let capture = spec["screen"] != false && !windowless;
+    if windowless && let Some(m) = std::iter::once(&s.primary).chain(&s.metrics).find(|m| *m == "launch.painted" || *m == "launch.settled") {
+        return Err(Error::usage(format!("{}: {m} reads the window's pixels; this target has window: false", s.case)));
+    }
     if !capture && matches!(until, Until::Painted | Until::Settled) {
         return Err(Error::usage(format!("{}: launch.until.window painted or settled reads the window's pixels; drop screen: false", s.case)));
     }
@@ -805,10 +826,12 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
-        let watcher = {
+        // A windowless app has no window to keep on top or sample.
+        let watcher = (!windowless).then(|| {
             let (stop, pid) = (stop.clone(), n.pid);
             std::thread::spawn(move || watch(pid, capture, &stop, tx))
-        };
+        });
+        let mut lines: Vec<Line> = Vec::new();
         let tails = {
             let globs: Vec<String> = milestones.iter().filter(|m| m.source != "output").map(|m| m.source.clone()).collect();
             let stop = stop.clone();
@@ -818,7 +841,38 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         let timeout = Duration::from_millis(spec["timeout"].as_u64().unwrap_or(120_000));
         let deadline = Instant::now() + timeout;
         // (epoch ms, cycles of the tree) when the launch was ready.
-        let ready: (f64, u64) = if let Until::Selector(sel) = &until {
+        let ready: (f64, u64) = if let Until::Milestone(name) = &until {
+            // The first line matching it, from the output as it arrives or the log files under the
+            // home (read every 20 ms); its time is when strobe read it, or the line's own `at`.
+            let m = milestones.iter().find(|m| &m.name == name).ok_or_else(|| Error::msg("internal: the until milestone"))?;
+            let when = |at: f64, l: &str| m.pattern.captures(l).map(|c| c.name("at").and_then(|v| v.as_str().parse::<f64>().ok()).filter(|v| *v > 1e12).unwrap_or(at));
+            loop {
+                if let Some(rx) = &n.output {
+                    lines.extend(rx.try_iter().map(|(at, l)| (at, l, "output".to_string())));
+                }
+                let mut found = lines.iter().filter(|(_, _, src)| *src == m.source).find_map(|(at, l, _)| when(*at, l));
+                if found.is_none() && m.source != "output" {
+                    let now = isolate::epoch_ms();
+                    found =
+                        super::launch::matching(&home, &m.source).iter().filter_map(|p| std::fs::read_to_string(p).ok()).find_map(|text| text.lines().find_map(|l| when(now, &isolate::strip_ansi(l))));
+                }
+                if let Some(at) = found {
+                    break (at, n.processes().iter().map(|p| p.cycles).sum());
+                }
+                if n.exited().is_some() && host::process_tree(n.pid).is_empty() {
+                    return Err(Error::refused("RunIncomplete", format!("{} launch: the app exited before milestone {name}", s.case), "check the milestone's match and where it looks"));
+                }
+                guard.check("while the app started")?;
+                if Instant::now() > deadline {
+                    return Err(Error::refused(
+                        "RunIncomplete",
+                        format!("{} launch: milestone {name} never matched in {} s", s.case, timeout.as_secs()),
+                        "check the milestone's match and where it looks",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        } else if let Until::Selector(sel) = &until {
             // The toolkit stamps the commit that first showed the element on strobe's clock. A launch
             // whose element already showed in an earlier frame when strobe asked has no valid end.
             let b = link.get(timeout)?;
@@ -888,7 +942,6 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             (Some(a), Some(b)) if b > a && ready.1 > 0 => ready.1 as f64 / ((b - a) as f64 / (clock.1.elapsed().as_secs_f64() * 1e3)),
             _ => f64::NAN,
         };
-        let mut lines: Vec<Line> = Vec::new();
         let settle = Instant::now() + Duration::from_secs(1);
         let grace = Instant::now() + Duration::from_secs(3);
         loop {
@@ -905,7 +958,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         if let Some(h) = tails {
             lines.extend(joined(h));
         }
-        let pixels = joined(watcher);
+        let pixels = watcher.map(joined).unwrap_or_default();
         lap("milestones", &mut steps);
         let mut values = BTreeMap::new();
         let ready_ms = ready.0 - n.epoch_ms;
@@ -969,5 +1022,6 @@ fn until_text(u: &Until) -> &'static str {
         Until::Painted => "painted",
         Until::Settled => "settled",
         Until::Selector(_) => "showed its until selector",
+        Until::Milestone(_) => "reached its milestone",
     }
 }

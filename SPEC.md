@@ -1174,7 +1174,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs. A native surface that skipped frames (occluded) in a measured run refuses that block's frame metrics only |
 | `UnpacedSpin` | a native surface drew more than 10 frames in a run without waiting for the display: its frame metrics are refused |
 | `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times (refuses that metric) |
-| `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms: on Windows, whether the session's input desktop can be opened; WTS's lock flag and LogonUI.exe stayed "locked" after an unlock on Windows 11). `bench` never refuses for it: it waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run |
+| `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | another bench runs on this device |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
@@ -1221,6 +1221,29 @@ against: the median time of the fixed speed-check workload on this device.
 the share of secondary metrics that claimed a change (must stay at or below the nominal rate)
 and which counters are stable. A counter is `exact` for a project and device only after an A/A
 with at least 3 pairs shows zero spread.
+
+### 10.5 Benches on a locked session
+
+A machine left locked for days still benches what needs no presenting window. A series runs through a
+lock when nothing it measures reaches a screen:
+
+- `script()` and `headless()` targets, and leak runs (`--probes memory`; a headed page's hidden state
+  is not refused there);
+- a native target with `window: false` (a tray app) whose declared metrics are all `cpu.*`,
+  `memory.*`, `io.*`, `count.*`, `run.duration` and launch milestones (a launch ends on
+  `until: { milestone }`). `gpu.*` may be a secondary: on a locked screen the compositor draws
+  nothing, so it is refused in locked blocks (and as a primary the series waits for an unlock).
+
+Everything else waits for an unlock as before: presented frames, `interaction.*`, `scroll.*`,
+`display.*`, `launch.painted|settled`, `ui.*` from a window, headed Chromium and Electron pages, and
+native apps with a window.
+
+Every block records its lock state (`locked`), checked at its start and end and by the 500 ms poll
+in between; a block whose state changed runs again. Base and head of a pair share one state, or the
+pair runs again (five times at most, then `SessionLocked` refuses). The series says `session: locked`
+when every pair ran locked, with an info line to compare it only with locked runs; pairs in both
+states refuse every metric of the series (`refused (SessionLocked)`), since a locked number is not
+comparable with an unlocked one.
 
 ## 11. Views and reports
 
@@ -1471,7 +1494,9 @@ and everything running from the home killed and the home deleted. There is no de
 visible top-level window. Each block moves it to the block's place, sizes its client area to the
 target's `viewport` (device-independent pixels) where the app allows it, and keeps it topmost without
 focus; it must be shown (visible, not minimized, not cloaked) at the start and end of the runs
-(`WindowHidden`). An app that hands its window to another process and exits (a launcher, an app
+(`WindowHidden`). A target with `window: false` (a tray app) has none: no wait, placement or check,
+and its launches end on one of their milestones (`until: { milestone: "<name>" }`, an output line as
+it arrives or a log line, read every 20 ms). Such series can run on a locked session (§10.5). An app that hands its window to another process and exits (a launcher, an app
 already running in single-instance mode) cannot be measured this way and says so.
 
 **The native bridge** (protocol `native-bridge-v1`), which a UI toolkit implements once for every app
@@ -1718,7 +1743,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
-| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled` | OS present events (presented frames and input latency on Windows), native stacks; Linux and macOS windows and threads |
+| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled` | OS present events (presented frames and input latency on Windows), native stacks; Linux and macOS windows and threads |
 | 6, 7 | — | deep helper, native symbols, CI budgets, history, mesh |
 
 Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;

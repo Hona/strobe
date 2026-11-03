@@ -148,9 +148,14 @@ export interface WindowUntil {
   window: "visible" | "painted" | "settled"
 }
 
+/** A native launch ends on one of its own milestones (an output or log line): no window needed. */
+export interface MilestoneUntil {
+  milestone: string
+}
+
 export interface Launch<P> {
   /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target without its bridge times to a window condition instead. */
-  until: Selector | WindowUntil
+  until: Selector | WindowUntil | MilestoneUntil
   /** Named points on the way, each a metric `launch.<name>`. One a case declares must appear in every launch. */
   milestones?: Record<string, Milestone>
   /** `fresh` (default): a new home every launch. `warm`: one home per series and variant, kept across its launches, so caches and state from earlier launches are there. */
@@ -262,9 +267,15 @@ export interface NativeOptions {
    * metric, or `--pixels` needs it. `true` requires it in every block; `false` measures the app from outside only.
    */
   bridge?: boolean
+  /**
+   * `false`: the app shows no window (a tray app). strobe neither waits for one nor places or checks it, launches end
+   * on a milestone (`until: { milestone }`), and cases whose metrics are all CPU, memory, IO, counters and milestones
+   * run while the session is locked.
+   */
+  window?: false
 }
 
-export type HeadlessOptions = Omit<NativeOptions, "viewport" | "bridge">
+export type HeadlessOptions = Omit<NativeOptions, "viewport" | "bridge" | "window">
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
 export type ParamValues = readonly unknown[] | { readonly run: readonly unknown[]; readonly more?: readonly unknown[] }

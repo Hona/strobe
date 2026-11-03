@@ -209,18 +209,19 @@ pub fn on_battery() -> bool {
     }
 }
 
-/// Whether this process's session shows the lock screen: its input desktop is then Winlogon's, which a
-/// user's process cannot open. WTS's session flags (and a running LogonUI.exe) can stay "locked" after
-/// an unlock on Windows 11, so neither is read.
+/// Whether this process's session shows the lock screen.
 pub fn session_locked() -> bool {
-    use windows_sys::Win32::System::StationsAndDesktops::{CloseDesktop, DESKTOP_SWITCHDESKTOP, OpenInputDesktop};
+    use windows_sys::Win32::System::RemoteDesktop::{WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTS_SESSIONSTATE_LOCK, WTSFreeMemory, WTSINFOEXW, WTSQuerySessionInformationW, WTSSessionInfoEx};
     unsafe {
-        let desk = OpenInputDesktop(0, 0, DESKTOP_SWITCHDESKTOP);
-        if desk.is_null() {
-            return true;
+        let mut buf: *mut u16 = std::ptr::null_mut();
+        let mut bytes = 0u32;
+        if WTSQuerySessionInformationW(WTS_CURRENT_SERVER_HANDLE, WTS_CURRENT_SESSION, WTSSessionInfoEx, &mut buf, &mut bytes) == 0 || buf.is_null() {
+            return false;
         }
-        CloseDesktop(desk);
-        false
+        let info = &*(buf as *const WTSINFOEXW);
+        let locked = info.Level == 1 && info.Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK as i32;
+        WTSFreeMemory(buf as _);
+        locked
     }
 }
 

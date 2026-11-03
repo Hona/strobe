@@ -217,6 +217,8 @@ struct Block {
     /// value, and a series that declares one shows it refused.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     refused: BTreeMap<String, String>,
+    /// The block ran on a locked screen (a series that needs no presenting window, `runs_locked`).
+    locked: bool,
 }
 
 struct Ctx<'a> {
@@ -453,9 +455,9 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let started = Instant::now();
     let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (passed, error, values, refused) = match r {
-        Ok(b) => (true, Value::Null, json!(b.values), json!(b.refused)),
-        Err(e) => (false, json!(e.message), Value::Null, Value::Null),
+    let (passed, error, values, refused, locked) = match r {
+        Ok(b) => (true, Value::Null, json!(b.values), json!(b.refused), b.locked),
+        Err(e) => (false, json!(e.message), Value::Null, Value::Null, false),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
@@ -479,7 +481,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "values": values, "refused": refused, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "passed": passed, "decided": passed, "error": error, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
     }))
 }
 
@@ -497,7 +499,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         let value = s["declared"].as_array().into_iter().flatten().filter_map(|m| m.as_str().and_then(shown)).collect::<Vec<_>>().join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
-            text += &format!("pass  {}  {value}  {secs:.1} s\n", s["label"].as_str().unwrap_or(""));
+            text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
             if let Some(rec) = s["attribution"].as_str() {
                 text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
             }
@@ -584,16 +586,34 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     for pair in 0..max_pairs {
         let order: [usize; 2] = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
         let mut idx = [0usize; 2];
-        for &v in &order {
-            let keep = ctx.keep_all || pair == 0;
-            // Timing blocks trace only what the metrics read; `--trace full` keeps every timeline category.
-            let set = if ctx.args.get("trace") == Some("full") { Set::Timing } else { Set::Lean };
-            let b = block_on_screen(ctx, s, &variants[v], pair, set, keep)?;
-            if pair == 0 {
-                progress(format!("  {} block  {}", b.variant, steps_text(&b.steps)));
+        let mut redone = 0;
+        loop {
+            let start = blocks.len();
+            for &v in &order {
+                let keep = ctx.keep_all || pair == 0;
+                // Timing blocks trace only what the metrics read; `--trace full` keeps every timeline category.
+                let set = if ctx.args.get("trace") == Some("full") { Set::Timing } else { Set::Lean };
+                let b = block_on_screen(ctx, s, &variants[v], pair, set, keep)?;
+                if pair == 0 {
+                    progress(format!("  {} block  {}{}", b.variant, steps_text(&b.steps), if b.locked { " · session locked" } else { "" }));
+                }
+                idx[v] = blocks.len();
+                blocks.push(b);
             }
-            idx[v] = blocks.len();
-            blocks.push(b);
+            // Base and head of a pair share one lock state, or the pair runs again.
+            if blocks[start].locked == blocks[start + 1].locked {
+                break;
+            }
+            for b in blocks.drain(start..) {
+                if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            redone += 1;
+            if redone >= 5 {
+                return Err(Error::refused("SessionLocked", "the session kept locking and unlocking between a pair's blocks", "bench while the session stays locked or stays unlocked"));
+            }
+            progress(format!("  pair {}: the session locked or unlocked between its blocks; the pair runs again", pair + 1));
         }
         pairs.push((idx[0], idx[1]));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
@@ -720,6 +740,29 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     let mut warnings: Vec<Warning> = Vec::new();
     analyse(s, def, &blocks, &pairs, &mut warnings);
+    // A number from a locked screen is not comparable with one from an unlocked screen: pairs that
+    // ran in both states decide nothing.
+    let locked_pairs = pairs.iter().filter(|&&(a, _)| blocks[a].locked).count();
+    let session = match locked_pairs {
+        0 => "unlocked",
+        n if n == pairs.len() => "locked",
+        _ => "mixed",
+    };
+    let mut primary = primary;
+    let mut primary_decided = primary_decided;
+    if session == "mixed" {
+        let why = format!("refused (SessionLocked): {locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len());
+        primary.verdict = why.clone();
+        primary.decided = false;
+        primary_decided = false;
+        for c in secondaries.iter_mut().chain(descriptive.iter_mut()) {
+            c.verdict = why.clone();
+            c.decided = false;
+        }
+        warnings.push(validity::warn("SessionLocked", format!("{locked_pairs} of {} pairs ran on a locked screen and the rest unlocked: nothing is decided; rerun in one state", pairs.len())));
+    } else if session == "locked" {
+        warnings.push(validity::info("SessionLocked", "every block ran on a locked screen (the series needs no presenting window): compare it only with runs that were locked too"));
+    }
     // Attribution: one block per variant with profilers, never timed. By default only when there is a
     // difference to explain; `--why always` keeps them for every series, `--why never` (or
     // `--probes timing`) skips them.
@@ -778,7 +821,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     Ok(json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
-        "primary": primary, "decided": primary_decided, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
+        "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
@@ -1165,9 +1208,21 @@ fn subject(v: &Variant) -> Option<String> {
 /// describe nothing), and wakes a display that went dark on idle, once, before a block refuses
 /// `WindowHidden`. The block's own checks still refuse anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
-    // A headless app draws off screen: the lock screen covers nothing it draws.
-    if ctx.describe["targets"][&s.target]["kind"] == "headless" {
-        return native::block(ctx, s, v, pair, set, keep);
+    // A series that needs no presenting window runs through a lock, in one lock state per block.
+    if runs_locked(ctx, s, set) {
+        loop {
+            let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
+            let r = any_block(ctx, s, v, pair, set, keep);
+            let end = host::session_locked();
+            let steady = start == end && if start { ctx.awake.unlocks() == unlocks } else { ctx.awake.locks() == locks };
+            if steady {
+                return r.map(|b| session_state(s, b, start));
+            }
+            if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            progress(format!("  the session locked or unlocked during a {} block: discarded, it runs again", v.role));
+        }
     }
     let mut woken = false;
     loop {
@@ -1187,18 +1242,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
-        let native = is_native(&ctx.describe["targets"][&s.target]);
-        let r = if s.launch.is_object() && native {
-            native::launch(ctx, s, v, pair)
-        } else if s.launch.is_object() {
-            launch::block(ctx, s, v, pair)
-        } else if native {
-            native::block(ctx, s, v, pair, set, keep)
-        } else if ctx.describe["targets"][&s.target]["kind"] == "script" {
-            script::block(ctx, s, v, pair, set, keep)
-        } else {
-            run_block(ctx, s, v, pair, set, keep)
-        };
+        let r = any_block(ctx, s, v, pair, set, keep);
         if !woken && r.as_ref().err().is_some_and(|e| e.message.contains("WindowHidden")) {
             progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
             woken = true;
@@ -1212,6 +1256,51 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
     }
+}
+
+/// One block of whatever kind the target and case are.
+fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+    let native = is_native(&ctx.describe["targets"][&s.target]);
+    if s.launch.is_object() && native {
+        native::launch(ctx, s, v, pair)
+    } else if s.launch.is_object() {
+        launch::block(ctx, s, v, pair)
+    } else if native {
+        native::block(ctx, s, v, pair, set, keep)
+    } else if ctx.describe["targets"][&s.target]["kind"] == "script" {
+        script::block(ctx, s, v, pair, set, keep)
+    } else {
+        run_block(ctx, s, v, pair, set, keep)
+    }
+}
+
+/// Whether a series can run while the session is locked (SPEC §10.1 `SessionLocked`): nothing it
+/// measures needs a presenting window. Script and headless targets; leak runs; and a native target
+/// with `window: false` (a tray app) whose metrics are all CPU, memory, IO, counters, its run time, GPU
+/// use as a secondary (refused while locked) and launch milestones (not pixels).
+fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
+    let t = &ctx.describe["targets"][&s.target];
+    let offscreen =
+        |m: &str| ["cpu.", "memory.", "io.", "count.", "gpu."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled");
+    match t["kind"].as_str().unwrap_or("") {
+        "script" | "headless" => true,
+        _ if set == Set::Memory => true,
+        "native" if t["window"] == false => !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m)),
+        _ => false,
+    }
+}
+
+/// Records a block's lock state. On a locked screen the compositor draws nothing, so GPU use there
+/// describes no person's screen: its values go, and a series that declares one shows it refused.
+fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
+    b.locked = locked;
+    if locked {
+        b.values.retain(|k, _| !k.starts_with("gpu."));
+        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("gpu.")) {
+            b.refused.insert(m.clone(), "SessionLocked: the session was locked, so the compositor drew nothing and GPU use describes no screen".into());
+        }
+    }
+    b
 }
 
 fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
@@ -1387,7 +1476,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         validity::dev_build(&page)?;
         let speed = validity::speed_check(&page)?;
         let ratio = validity::throttled(speed, ctx.baseline)?;
-        validity::window_visible(&page)?;
+        // A leak run reads heaps, not pixels: on a locked screen the hidden page is still measured.
+        let hidden_ok = set == Set::Memory && host::session_locked();
+        if !hidden_ok {
+            validity::window_visible(&page)?;
+        }
         lap("checks");
         ctx.runner
             .call("setup", json!({}), t, &serve)
@@ -1591,7 +1684,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
         let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
         // The window must have stayed visible for the whole block.
-        validity::window_visible(&page)?;
+        if !hidden_ok {
+            validity::window_visible(&page)?;
+        }
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
@@ -1779,6 +1874,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             background,
             leak,
             refused: BTreeMap::new(),
+            locked: false,
         })
     })();
     lapped.set(Instant::now());
@@ -2510,7 +2606,12 @@ fn render(r: &Value) -> String {
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
         let refresh = r["refresh_hz"].as_u64().map(|h| format!(" · display {h} Hz")).unwrap_or_default();
         out += &format!("       {} · {} · window {}×{}{}\n", r["browser"].as_str().unwrap_or(""), gpu, r["window"]["width"], r["window"]["height"], refresh);
-        out += &format!("plan   {} · power plan {} · visible, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
+        let screen = match s["session"].as_str() {
+            Some("locked") => "session locked (nothing measured needs a presenting window)",
+            Some("mixed") => "session locked in some pairs only: nothing decided",
+            _ => "visible",
+        };
+        out += &format!("plan   {} · power plan {} · {screen}, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
         let per_block = if s["kind"] == "launch" {
             "one timed launch per block · first launch of each variant discarded".to_string()
         } else {

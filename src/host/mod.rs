@@ -49,6 +49,7 @@ pub fn wake_display() {
 pub struct Awake {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     locked: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    unlocked: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Awake {
@@ -56,13 +57,16 @@ impl Awake {
         use std::sync::atomic::Ordering;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let locked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (s, l) = (stop.clone(), locked.clone());
+        let unlocked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (s, l, u) = (stop.clone(), locked.clone(), unlocked.clone());
         std::thread::spawn(move || {
             let mut was: Option<bool> = None;
             while !s.load(Ordering::Relaxed) {
                 let locked = session_locked();
                 if locked {
                     l.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    u.fetch_add(1, Ordering::Relaxed);
                 }
                 if was != Some(locked) {
                     #[cfg(windows)]
@@ -74,12 +78,17 @@ impl Awake {
             #[cfg(windows)]
             win::keep_awake(false, false);
         });
-        Awake { stop, locked }
+        Awake { stop, locked, unlocked }
     }
 
     /// Lock observations so far: a block during which this changed saw the lock screen.
     pub fn locks(&self) -> u64 {
         self.locked.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Unlocked observations so far: a block run on a locked screen during which this changed saw it unlocked.
+    pub fn unlocks(&self) -> u64 {
+        self.unlocked.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

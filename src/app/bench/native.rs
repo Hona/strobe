@@ -825,6 +825,13 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 .request("wait", json!({ "until": sel, "timeout_ms": deadline.saturating_duration_since(Instant::now()).as_millis() as u64 }), timeout + Duration::from_secs(10))
                 .map_err(|e| Error::refused("RunIncomplete", format!("{} launch: {}", s.case, e.message), "the until selector never showed"))?;
             let cycles = n.processes().iter().map(|p| p.cycles).sum();
+            if !r["already"].is_boolean() {
+                return Err(Error::refused(
+                    "RunIncomplete",
+                    format!("{} launch: the app's bridge does not say whether the element showed before strobe asked (wait's already), so its time may be late", s.case),
+                    "update the toolkit's bridge to native-bridge-v1's wait reply, or time the launch to { window: \"settled\" }",
+                ));
+            }
             if r["already"] == true && r["frame_seq"].as_u64().is_some_and(|f| f > 1) {
                 return Err(Error::refused(
                     "RunIncomplete",

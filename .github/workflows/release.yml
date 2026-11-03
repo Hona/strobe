@@ -23,10 +23,12 @@ jobs:
         run: |
           rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
           rustup default stable-x86_64-pc-windows-gnu
-          $sc = "$(rustc --print sysroot)\lib\rustlib\x86_64-pc-windows-gnu\bin\self-contained"
-          echo $sc | Out-File -FilePath $env:GITHUB_PATH -Append
+      # Rust's bundled MinGW linker and CRT, as on a machine with no gcc on PATH. A gcc on PATH, the runner's or
+      # the bundled one put there, makes rustc skip its CRT objects, and ld fails on crt2.o.
       - name: Build
         run: cargo build --release --locked
+        env:
+          RUSTFLAGS: -C link-self-contained=yes
       - uses: oven-sh/setup-bun@v2
       - uses: actions/setup-node@v5
         with:

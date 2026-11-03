@@ -2,8 +2,8 @@ name: Release
 
 # A version tag (v0.2.0) builds strobe and publishes its npm packages at Cargo.toml's version:
 # @hona/strobe-<platform>-<arch> with the binaries, @hona/strobe (the `strobe` command and the bench SDK) and
-# the @hona/strobe-bench alias. Windows x64 only so far. npm takes the NPM_TOKEN secret, or trusted publishing
-# configured for this workflow on npmjs.com.
+# the @hona/strobe-bench alias. Windows x64 only so far. npm trusts this workflow in the npm environment
+# (trusted publishing over OIDC), so a publish needs no npm token and every version gets provenance.
 on:
   push:
     tags: ["v*"]
@@ -11,13 +11,19 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   windows-x64:
     runs-on: windows-latest
+    # The npm environment takes deployments from v* tags only, and npm trusts only this environment.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Rust (windows-gnu, as strobe builds locally)
         shell: pwsh
         run: |
@@ -29,11 +35,15 @@ jobs:
         run: cargo build --release --locked
         env:
           RUSTFLAGS: -C link-self-contained=yes
-      - uses: oven-sh/setup-bun@v2
-      - uses: actions/setup-node@v5
+      # No caches in a release build: a poisoned cache would ship in the packages.
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          no-cache: true
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
+          package-manager-cache: false
       - name: Check the tag names Cargo.toml's version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash
@@ -43,4 +53,7 @@ jobs:
       - name: Publish
         run: bun scripts/release.ts --bin target/release --publish
         env:
+          # npm can trust a workflow only for a package that exists, so a new package's first version takes
+          # a short-lived token in the npm environment. Remove the secret once the package trusts this workflow.
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_CONFIG_PROVENANCE: "true"

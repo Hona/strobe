@@ -70,6 +70,12 @@ pub fn run(args: &Args) -> Result<Output> {
         Ok(p) => s.line("✓", "engine", format!("trace_processor {} · sha256 ok · {}", engine::VERSION, p.display())),
         Err(e) => s.line("✗", "engine", e.message),
     }
+    // Deep mode: present events and native stacks (one UAC prompt when something is missing).
+    #[cfg(windows)]
+    {
+        let (mark, detail) = super::helper::setup(skip.contains(&"deep") || skip.contains(&"helper"));
+        s.line(mark, "deep", detail);
+    }
     // Daemon: autostart and running.
     if !skip.contains(&"daemon") {
         daemon_up(&mut s, &installed, updated)?;
@@ -432,6 +438,17 @@ pub fn leave(args: &Args) -> Result<Output> {
     s.line("✓", "mcp", "removed");
     let _ = std::fs::remove_dir_all(skill_path().parent().unwrap_or(Path::new("")));
     s.line("✓", "skill", "removed");
+    // The deep-mode helper lives where only an elevated step writes: one UAC prompt removes it.
+    #[cfg(windows)]
+    if crate::etw::access().helper
+        && let Some(sid) = crate::etw::helper::user_sid()
+    {
+        match crate::etw::helper::elevated(&format!("helper uninstall --sid {sid}")) {
+            Ok(0) => s.line("✓", "deep", "removed the helper task, its copy and Performance Log Users membership"),
+            Ok(_) => s.line("!", "deep", "helper uninstall failed; run strobe leave again"),
+            Err(e) => s.line("!", "deep", format!("{}: the helper stays", e.message)),
+        }
+    }
     // The install folder `up` added to the user PATH (the binaries stay: this one is running).
     #[cfg(windows)]
     {

@@ -3,7 +3,9 @@
 pub mod bench;
 pub mod bisect;
 pub mod fmt;
+pub mod helper;
 pub mod mcp;
+pub mod outside;
 pub mod query;
 pub mod record;
 pub mod report;
@@ -71,6 +73,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "top" => top::run(args),
         "up" => up::run(args),
         "leave" => up::leave(args),
+        "helper" => helper::run(args),
         "mcp" => mcp::stdio().map(|_| Output::new(String::new(), Value::Null)),
         "daemon" => mcp::daemon(args).map(|_| Output::new(String::new(), Value::Null)),
         other => Err(Error::usage(format!("unknown command {other}; see strobe --help"))),

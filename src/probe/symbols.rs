@@ -133,12 +133,14 @@ pub struct Frame {
     pub mapped: bool,
     /// Where `name` came from: "map", "source" (the declaration on disk), or None (the profile's own).
     pub name_from: Option<String>,
+    /// Native frames know their package from symbols (a crate, `std`, an OS module, a GPU driver).
+    pub package: Option<String>,
 }
 
 impl Frame {
-    /// `file:line:column`, or `(native)` for frames without a script.
+    /// `file:line:column`, or `(native)` for frames without a script or a source file.
     pub fn location(&self) -> String {
-        if self.url.is_empty() {
+        if self.url.is_empty() && self.file.is_empty() {
             return "(native)".into();
         }
         match (self.line, self.column) {
@@ -149,7 +151,11 @@ impl Frame {
     }
 
     pub fn json(&self) -> Value {
-        json!({ "name": self.name, "name_from": self.name_from, "file": self.file, "line": self.line, "column": self.column, "url": self.url, "source_mapped": self.mapped })
+        let mut v = json!({ "name": self.name, "name_from": self.name_from, "file": self.file, "line": self.line, "column": self.column, "url": self.url, "source_mapped": self.mapped });
+        if let Some(p) = &self.package {
+            v["package"] = json!(p);
+        }
+        v
     }
 }
 
@@ -213,7 +219,7 @@ impl Symbolizer {
     /// A frame from a V8 call frame: `url`, 0-based `line` and `col`, and the profile's own name.
     pub fn frame(&self, url: &str, line0: i64, col0: i64, minified: &str) -> Frame {
         let minified = if minified.is_empty() { "(anonymous)" } else { minified };
-        let plain = Frame { name: minified.to_string(), file: url.to_string(), line: line0 + 1, column: col0 + 1, url: url.to_string(), mapped: false, name_from: None };
+        let plain = Frame { name: minified.to_string(), file: url.to_string(), line: line0 + 1, column: col0 + 1, url: url.to_string(), mapped: false, name_from: None, package: None };
         if url.is_empty() || line0 < 0 || col0 < 0 {
             return plain;
         }
@@ -243,7 +249,16 @@ impl Symbolizer {
             (_, Some(n)) => (n.clone(), Some("map")),
             _ => (minified.to_string(), None),
         };
-        Frame { name, file: file.map(|p| p.display().to_string()).unwrap_or(o.source), line: o.line + 1, column: o.column + 1, url: url.to_string(), mapped: true, name_from: from.map(str::to_string) }
+        Frame {
+            name,
+            file: file.map(|p| p.display().to_string()).unwrap_or(o.source),
+            line: o.line + 1,
+            column: o.column + 1,
+            url: url.to_string(),
+            mapped: true,
+            name_from: from.map(str::to_string),
+            package: None,
+        }
     }
 
     /// A frame from a V8 `callFrame` object.

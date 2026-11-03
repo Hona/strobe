@@ -33,6 +33,12 @@ flate2 = { version = "1", default-features = false, features = ["rust_backend"] 
 sha2 = "0.10"
 # Launch milestones match the app's output and logs by regular expression; no Unicode tables.
 regex-lite = "0.1"
+# Native stacks: functions, files, lines and inline frames from PDBs; pure Rust (pdb2 underneath).
+pdb-addr2line = "0.12"
+# Rust symbol names in PDB public symbols (legacy and v0 mangling); pure Rust.
+rustc-demangle = "0.1"
+# C++ symbol names in Microsoft's public PDBs (`?Present@CDXGISwapChain@@…`); pure Rust.
+msvc-demangler = "0.11"
 
 [target.'cfg(windows)'.dependencies]
 # Win32: QPC clock, process CPU times, toolhelp snapshots, affinity, power plans, PDH, window state.
@@ -58,6 +64,17 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_WindowsProgramming",
   "Wdk_Graphics_Direct3D",
   "Wdk_System_SystemInformation",
+  # ETW: OS present events, sampled stacks and image loads; the deep-mode helper's pipe, its ACL,
+  # the one elevation, and the Performance Log Users group.
+  "Win32_System_Diagnostics_Etw",
+  "Win32_System_Time",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_Pipes",
+  "Win32_System_IO",
+  "Win32_UI_Shell",
+  "Win32_NetworkManagement_NetManagement",
 ] }
 
 [profile.release]

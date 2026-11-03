@@ -25,6 +25,7 @@ const SWITCHES: &[&str] = &[
     "pixels",
     "pixels-only",
     "native",
+    "os-frames",
 ];
 
 #[derive(Clone)]

@@ -44,6 +44,14 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let daemon = super::mcp::running();
     let skill = super::up::skill_state();
+    let deep = crate::etw::access();
+    #[cfg(windows)]
+    let deep_text = super::helper::describe(&deep);
+    #[cfg(not(windows))]
+    let deep_text = "not on this OS".to_string();
+    if !deep.presents() {
+        problems.push("no OS present events (native frame metrics are refused): strobe up".into());
+    }
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
         problems.push("no calibration yet (strobe up)".into());
@@ -55,6 +63,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
         "session_locked": locked, "valid": problems.is_empty(), "problems": problems,
         "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill,
+        "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
     let mut t = String::new();
@@ -65,6 +74,7 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} screen     {}\n", mark(!locked), if locked { "locked: benches wait for an unlock" } else { "unlocked" });
     t += &format!("  {} browser    {}\n", mark(browser.is_some()), browser.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
+    t += &format!("  {} deep       {}\n", mark(deep.presents() && deep.helper), deep_text);
     t += &format!("  {} engine     trace_processor {}{}\n", mark(engine::installed()), engine::VERSION, if engine::installed() { "" } else { " (not downloaded)" });
     t += &format!(
         "  {} calibrate  {}\n",

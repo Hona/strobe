@@ -51,6 +51,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(path) = target.strip_prefix("file:") {
         return super::query::import(path);
     }
+    if target.starts_with("pid:") || target.starts_with("proc:") {
+        return super::outside::record(args, &target);
+    }
 
     let set = Set::parse(args.get("probes").unwrap_or("timing")).ok_or_else(|| Error::usage("--probes: timing, attribution or memory"))?;
     let for_ms = match args.get("for") {
@@ -130,6 +133,8 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     std::thread::sleep(Duration::from_millis(300));
     let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
+    // `--os-frames`: the OS's present events beside the trace's frames, a cross-check of both.
+    let os_frames = (args.has("os-frames") && !attach).then(crate::etw::PresentCapture::start);
     let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let t0 = host::now_ns();
     driver.mark("run:0:start")?;
@@ -139,6 +144,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let t1 = host::now_ns();
     let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let os = sampler.map(|s| s.stop().window(t0, t1));
+    let tree = host::tree_pids(browser.pid);
+    let os_frames = os_frames.map(|r| r.and_then(|c| c.stop()));
     if on_screen && (awake.locks() > 0 || host::session_locked()) {
         let _ = std::fs::remove_dir_all(&dir);
         return Err(validity::locked());
@@ -180,9 +187,20 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(v) = os.as_ref().and_then(|o| o.vram_dedicated_mb) {
         values.insert("gpu.vram".into(), v);
     }
+    // The trace's mark times are its own clock; the OS window is the same span on QPC (§6).
+    let os_frames = match os_frames {
+        Some(Ok(p)) => {
+            let run = crate::etw::frames::from_presents(&p.presents, &tree, t0, t1);
+            let v = crate::etw::frames::values(&[run], crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1));
+            crate::symbol::write_gz(&dir.join("presents.json.gz"), &p)?;
+            json!({ "values": v, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "pids": tree })
+        }
+        Some(Err(e)) => json!({ "refused": e.message }),
+        None => Value::Null,
+    };
     let meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
-        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os,
+        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os, "os_frames": os_frames,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
         // Rule 3: timing taken with profilers on describes the profiled target, not the target.
         "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
@@ -379,6 +397,18 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
 pub fn summary_text(meta: &Value) -> String {
     let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    if meta["pid"].is_u64() && meta["probes"] == "timing" {
+        return super::outside::text(meta);
+    }
+    if meta["probes"] == "deep" {
+        let id = meta["id"].as_str().unwrap_or("");
+        return format!(
+            "{id} · {} · deep · {} native samples · {:.1}% resolved\nnext     strobe query {id} hotspots · strobe query {id} hotspots --by package\n",
+            meta["target"].as_str().unwrap_or(""),
+            meta["samples"],
+            100.0 * meta["native"]["resolved_share"].as_f64().unwrap_or(0.0)
+        );
+    }
     if meta["probes"] == "memory" {
         let id = meta["id"].as_str().unwrap_or("");
         let l = &meta["leaks"];
@@ -429,6 +459,21 @@ pub fn summary_text(meta: &Value) -> String {
     }
     if get("interaction.p95").is_finite() {
         s += &format!("input    p95 {} input → presentation\n", fmt::value(get("interaction.p95"), "ms"));
+    }
+    let of = &meta["os_frames"];
+    if let Some(why) = of["refused"].as_str() {
+        s += &format!("os       refused: {why}\n");
+    } else if of["values"].is_object() {
+        let g = |k: &str| of["values"][k].as_f64().unwrap_or(f64::NAN);
+        s += &format!(
+            "os       {} displayed · interval p50 {} · p95 {} · {} dropped ({}) · display {:.1} Hz   (OS present events)\n",
+            fmt::value(g("frames.n"), "count"),
+            fmt::value(g("frames.interval.p50"), "ms"),
+            fmt::value(g("frames.interval.p95"), "ms"),
+            fmt::value(g("frames.dropped"), "count"),
+            fmt::value(g("frames.dropped.pct"), "%"),
+            g("display.hz")
+        );
     }
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: profilers ran during this recording, so its times are not the target's; take times with --probes timing\n";

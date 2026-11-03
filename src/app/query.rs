@@ -57,7 +57,13 @@ pub fn run(args: &Args) -> Result<Output> {
             if !matches!(by, "function" | "file" | "package") {
                 return Err(Error::usage(format!("--by: function, file or package, not {by}")));
             }
-            if view == "alloc" { alloc(&dir, by, top) } else { hotspots(&dir, by, top) }
+            if view == "alloc" {
+                alloc(&dir, by, top)
+            } else if args.has("native") || args.has("thread") {
+                native_hotspots(&dir, by, top, args.get("thread"))
+            } else {
+                hotspots(&dir, by, top)
+            }
         }
         "layout" => layout(&dir, top),
         "shifts" => {
@@ -248,6 +254,16 @@ select count(*), max(s.dur), (select s2.ts from slice s2 join thread_track tt2 o
     }
     // Unresolved time: script without source maps, and native time strobe cannot name without deep.
     if let Ok(h) = hotspots(dir, "function", 400).map(|o| o.json) {
+        if h["native"] == true && h["resolved_share"].as_f64().is_some_and(|s| s < 0.95) {
+            let share = h["resolved_share"].as_f64().unwrap_or(0.0);
+            hit(
+                "unresolved",
+                "info",
+                format!("unresolved native: {:.0}% of native samples have no symbol (no matching PDB), mostly in {}", 100.0 * (1.0 - share), h["unsymbolized"][0]["module"].as_str().unwrap_or("?")),
+                json!({ "resolved_share": share, "unsymbolized": h["unsymbolized"] }),
+                vec![q("hotspots --by package")],
+            );
+        }
         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
         if scripts > 0.0 && mapped / scripts < 0.95 {
             hit(
@@ -752,6 +768,9 @@ fn threads(trace: &Path, top: usize) -> Result<Output> {
 /// Self time per function, file or package from the recording's CPU profiles (attribution only).
 pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     let profiles: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "cpuprofile")).collect();
+    if profiles.is_empty() && dir.join("deep.json.gz").is_file() {
+        return native_hotspots(dir, by, top, None);
+    }
     if profiles.is_empty() {
         return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
     }
@@ -786,6 +805,31 @@ pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
+    }
+    Ok(out)
+}
+
+/// Self time per function, file or package from the recording's native samples (the kernel's
+/// sampled profile, symbolized from PDBs), in the shape of `hotspots`. `thread`: a thread name or id.
+pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>) -> Result<Output> {
+    let n = crate::symbol::native(dir, thread)?.ok_or_else(|| Error::usage("this recording has no native samples; record with --probes deep"))?;
+    let share = if n.samples > 0 { 100.0 * n.resolved as f64 / n.samples as f64 } else { 0.0 };
+    let header = format!("native hotspots by {by} · self time · {{samples}} samples at {} µs · {share:.1}% resolved{{mapped}}", n.interval_us);
+    let interval = n.interval_us;
+    let facts = crate::symbol::summary(&n);
+    let mut out = rank(n.weights, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
+    out.json["native"] = json!(true);
+    out.json["interval_us"] = json!(interval);
+    out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
+    out.json["resolved_samples"] = facts["resolved_samples"].clone();
+    out.json["resolved_share"] = facts["resolved_share"].clone();
+    out.json["unsymbolized"] = facts["unsymbolized"].clone();
+    for r in out.json["rows"].as_array_mut().into_iter().flatten() {
+        r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
+    }
+    if share < 95.0 {
+        let missing: Vec<String> = facts["unsymbolized"].as_array().into_iter().flatten().take(3).map(|m| format!("{} ({})", m["module"].as_str().unwrap_or(""), m["samples"])).collect();
+        out.text += &format!("! Unresolved: {:.1}% of samples have no symbol (no PDB found): {}\n", 100.0 - share, missing.join(", "));
     }
     Ok(out)
 }
@@ -1064,6 +1108,8 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
             scripts += hits;
         }
         let key = match by {
+            "package" if f.package.is_some() => f.package.clone().unwrap_or_default(),
+            "file" if f.url.is_empty() && !f.file.is_empty() => f.file.clone(),
             "file" | "package" if f.url.is_empty() => f.name.clone(),
             "file" => f.file.clone(),
             "package" => {

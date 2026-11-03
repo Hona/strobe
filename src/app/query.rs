@@ -155,6 +155,26 @@ pub fn insights(dir: &Path) -> Result<Output> {
             );
         }
     }
+    // Wakes while idle: a native app recorded with no input whose threads keep waking (a polling loop,
+    // a short timer) costs power and CPU all day; the threads that wake most are named.
+    let wakes = v["cpu.wakes"].as_f64().unwrap_or(0.0);
+    if meta["native"] == true && meta["kind"] == "record" && wakes >= 50.0 {
+        let top: Vec<String> = store::read_json(&dir.join("threads.json"))
+            .ok()
+            .and_then(|t| t.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .take(3)
+            .map(|t| format!("{} {}", t["name"].as_str().unwrap_or("(unnamed)"), fmt::value(t["wakes_per_s"].as_f64().unwrap_or(0.0), "/s")))
+            .collect();
+        hit(
+            "wakes-while-idle",
+            if wakes >= 200.0 { "warn" } else { "info" },
+            format!("the app's threads woke {} with nothing to do; most: {}", fmt::value(wakes, "/s"), top.join(", ")),
+            json!({ "wakes_per_s": wakes, "top": top }),
+            vec![q("threads")],
+        );
+    }
     // Long tasks: one task over 50 ms blocks input for that long.
     let trace = dir.join("trace.pftrace");
     if trace.is_file() && !meta["token"].as_str().unwrap_or("").is_empty() {

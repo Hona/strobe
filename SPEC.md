@@ -1278,6 +1278,7 @@ As built (`query <rec> insights`, `query <exp> insights`):
 | `long-tasks` | renderer main-thread tasks over 50 ms in the runs | count, the longest |
 | `work-while-idle` | a `record` with no input that presents ≥ 1 frame/s or keeps the main thread ≥ 5% busy | frames/s, busy share |
 | `detached-dom` | the heap snapshot holds detached DOM nodes | count, retained size, the largest's retainer path |
+| `wakes-while-idle` | a native app's `record` (no input) whose threads wake ≥ 50/s (warn from 200/s) | wakes per second, the three threads that wake most |
 | `background` | `cpu.foreign.max` ≥ 25% | the busiest processes outside strobe's tree |
 | `unresolved` / `native-time` | < 95% of script samples mapped / `(program)` ≥ 30% of busy samples | shares |
 | `leak` | a memory recording or leak run | its facts and verdict |

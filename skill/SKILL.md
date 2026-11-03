@@ -83,6 +83,7 @@ Is an app leaking over time? `record <target> --probes memory --for 60s` (do the
 Is the method sound here? `bench <file> --aa --head .`.
 Does it still look the same? Snapshot deterministic states with `page.snapshot(name)` (a still page, an app's own frame stepper), then `bench <file> --base … --head . --pixels-only`: each snapshot is `same` within the launch noise strobe measures (base run twice), or `differ` with a diff image.
 Where does the GPU process spend time (a frozen first frame, a slow canvas)? `query <rec> gpu` on an attribution recording, and `gpu.compile` as a bench metric.
+Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread) and `query <rec> insights`.
 Writing the PR? `report experiment <exp> --format pr` gives the tables and the command that reruns them.
 
 ## Notes

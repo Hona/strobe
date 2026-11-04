@@ -733,9 +733,10 @@ fn main_win(pids: &[u32]) -> Option<Win> {
         .max_by(|a, b| (a.onscreen, a.bounds.size.width * a.bounds.size.height).partial_cmp(&(b.onscreen, b.bounds.size.width * b.bounds.size.height)).unwrap_or(std::cmp::Ordering::Equal))
 }
 
-/// Seconds since the last keyboard, mouse or trackpad input in this login session.
+/// Seconds since the last keyboard, mouse or trackpad input from the hardware. The HID system's state, not
+/// the session's: the clicks strobe posts to the session count there, and must not read as a person.
 pub fn user_idle_s() -> f64 {
-    unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) }
+    unsafe { CGEventSourceSecondsSinceLastEventType(1, u32::MAX) }
 }
 
 /// How long nobody may have touched this Mac before strobe brings a covered app to the front.

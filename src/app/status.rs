@@ -52,14 +52,19 @@ pub fn run(args: &Args) -> Result<Output> {
     let deep_text = super::helper::describe(&deep);
     #[cfg(target_os = "linux")]
     let deep_text = match crate::probe::perf::access() {
-        (true, true) => "native stacks: perf events, kernel frames included · no OS present events on Linux".to_string(),
-        (true, false) => "native stacks: perf events, user frames (kernel frames need perf_event_paranoid 1 or CAP_PERFMON) · no OS present events on Linux".to_string(),
-        _ => format!("native stacks off: {} · no OS present events on Linux", crate::probe::perf::refusal().unwrap_or_default()),
+        (true, true) => "native stacks: perf events, kernel frames included".to_string(),
+        (true, false) => "native stacks: perf events, user frames (kernel frames need perf_event_paranoid 1 or CAP_PERFMON)".to_string(),
+        _ => format!("native stacks off: {}", crate::probe::perf::refusal().unwrap_or_default()),
     };
     #[cfg(target_os = "macos")]
-    let deep_text = "native stacks: /usr/bin/sample (every thread's stack each 1 ms, untimed) · no OS present events on macOS".to_string();
+    let deep_text = "native stacks: /usr/bin/sample (every thread's stack each 1 ms, untimed)".to_string();
     if !deep.presents() && cfg!(windows) {
         problems.push("no OS present events (native frame metrics are refused): strobe up".into());
+    }
+    let (native_ok, native_text) = native_drive();
+    // A headless Linux machine has no app to drive: only a Mac without its permissions is a problem.
+    if !native_ok && cfg!(target_os = "macos") {
+        problems.push(format!("native apps: {native_text}"));
     }
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
@@ -73,6 +78,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "session_locked": locked, "valid": problems.is_empty(), "problems": problems,
         "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill, "benches": benches,
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
+        "native": { "ready": native_ok, "detail": native_text },
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
     let mut t = String::new();
@@ -84,6 +90,7 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} browser    {}\n", mark(browser.is_some()), browser.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} deep       {}\n", mark(deep.presents() && deep.helper), deep_text);
+    t += &format!("  {} native     {}\n", mark(native_ok), native_text);
     t += &format!("  {} engine     trace_processor {}{}\n", mark(engine::installed()), engine::VERSION, if engine::installed() { "" } else { " (not downloaded)" });
     t += &format!(
         "  {} calibrate  {}\n",
@@ -126,6 +133,42 @@ pub fn run(args: &Args) -> Result<Output> {
         t += &format!("               {id}\n");
     }
     Ok(Output::new(t, json))
+}
+
+/// What drives native apps here and what shows their frames, and whether both work (SPEC §13.7).
+fn native_drive() -> (bool, String) {
+    #[cfg(windows)]
+    {
+        let p = crate::etw::access();
+        (true, format!("UI Automation, posted window messages · frames: {}", if p.presents() { "OS present events" } else { "none (strobe up)" }))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let app = host::macos::responsible_app();
+        let (ax, rec) = (host::macos::accessibility_trusted(), host::macos::screen_capture_allowed());
+        let text = format!(
+            "accessibility API, Quartz events to the app · Accessibility {} · frames: ScreenCaptureKit, Screen Recording {}{}",
+            if ax { "granted" } else { "missing" },
+            if rec { "granted" } else { "missing" },
+            if ax && rec { String::new() } else { format!(" (grant to {app}: System Settings › Privacy & Security)") }
+        );
+        (ax && rec, text)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let bus = host::dbus::Conn::session().ok().and_then(|mut s| s.call("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", &[]).ok()).is_some();
+        let x11 = std::env::var_os("DISPLAY").is_some();
+        let frames = match crate::etw::PresentCapture::start() {
+            Ok(_) => "X Present".to_string(),
+            Err(e) => format!("none ({})", e.message),
+        };
+        let text = format!(
+            "AT-SPI {} · XTest {} · frames: {frames}",
+            if bus { "(accessibility bus found)" } else { "missing (no accessibility bus: at-spi2-core)" },
+            if x11 { "on the X11 display" } else { "missing (no X11 display; Wayland windows take none)" }
+        );
+        (bus && x11, text)
+    }
 }
 
 fn dir_size(p: &std::path::Path) -> u64 {

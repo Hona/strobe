@@ -191,6 +191,63 @@ pub fn raise_windows(pids: &[u32]) -> usize {
     .unwrap_or(0)
 }
 
+/// A window's title: `_NET_WM_NAME` (UTF-8), else `WM_NAME`.
+fn title(x: &X, win: Window) -> String {
+    let utf8 = atom(x, "UTF8_STRING").unwrap_or(0);
+    for (name, kind) in [("_NET_WM_NAME", utf8), ("WM_NAME", AtomEnum::STRING.into())] {
+        let Some(a) = atom(x, name) else { continue };
+        if let Some(r) = x.conn.get_property(false, win, a, kind, 0, 1024).ok().and_then(|c| c.reply().ok()).filter(|r| !r.value.is_empty()) {
+            return String::from_utf8_lossy(&r.value).to_string();
+        }
+    }
+    String::new()
+}
+
+/// The viewable windows of `pids`, front to back: id, title, click-through (never, on X11).
+pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
+    with(|x| {
+        let mut v: Vec<(isize, String, bool)> =
+            clients(x).into_iter().filter_map(|w| info(x, w)).filter(|i| pids.contains(&i.pid) && i.viewable && !i.hidden).map(|i| (i.win as isize, title(x, i.win), false)).collect();
+        v.reverse();
+        Some(v)
+    })
+    .unwrap_or_default()
+}
+
+/// Where a window's client area starts on the root window.
+pub fn client_origin(win: isize) -> Option<(i32, i32)> {
+    with(|x| {
+        let at = x.conn.translate_coordinates(win as Window, x.root, 0, 0).ok()?.reply().ok()?;
+        Some((at.dst_x as i32, at.dst_y as i32))
+    })
+}
+
+/// The topmost viewable managed window at a root point: (window, pid, title).
+pub fn window_at(px: i32, py: i32) -> Option<(isize, u32, String)> {
+    with(|x| {
+        let stack = clients(x);
+        let hit = stack.iter().rev().filter_map(|&w| info(x, w)).find(|i| i.viewable && px >= i.rect.0 && py >= i.rect.1 && px < i.rect.0 + i.rect.2 && py < i.rect.1 + i.rect.3)?;
+        Some((hit.win as isize, hit.pid, title(x, hit.win)))
+    })
+}
+
+/// A window's client area as it is drawn now (`GetImage`, 32-bit pixels), for `snapshot`.
+pub fn window_image(win: isize) -> Option<crate::png::Image> {
+    with(|x| {
+        let g = x.conn.get_geometry(win as Window).ok()?.reply().ok()?;
+        let r = x.conn.get_image(ImageFormat::Z_PIXMAP, win as Window, 0, 0, g.width, g.height, !0).ok()?.reply().ok()?;
+        let (w, h) = (g.width as usize, g.height as usize);
+        if r.data.len() < w * h * 4 {
+            return None;
+        }
+        let mut rgba = Vec::with_capacity(w * h * 4);
+        for px in r.data[..w * h * 4].chunks(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+        Some(crate::png::Image { width: w, height: h, rgba })
+    })
+}
+
 /// The largest window of `pids` as 16×16 averaged BGRA cells, from its own pixels (`GetImage` of the
 /// one-pixel row through each cell row's middle, so a sample moves a few kilobytes, not the window).
 pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {

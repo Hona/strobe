@@ -8,20 +8,27 @@
 //!   blocks only. Needs SeSystemProfilePrivilege (administrators), so it runs in the helper.
 //! - `helper`: the elevated helper (§13.4): a scheduled task the user's strobe starts on demand,
 //!   reachable only over a pipe whose ACL names that user, doing a fixed set of operations.
-//! - `frames`: presents (and a toolkit's frame rows) into frame metrics; no Windows API.
+//! - `frames`: presents into frame metrics; no OS API.
+//! - `sck` (macOS) and `xpresent` (Linux X11): the same `Present` records from what those OSes show
+//!   another app of a window's frames: ScreenCaptureKit's frame times, X Present's completion events.
 //!
-//! Every timestamp is the QPC clock (`WNODE_HEADER.ClientContext = 1`) in nanoseconds, the clock of
-//! `host::now_ns`, so presents and stacks line up with marks and OS samples without mapping.
+//! Every timestamp is the host clock (`host::now_ns`: QPC on Windows, `WNODE_HEADER.ClientContext =
+//! 1`; Mach absolute time on macOS; CLOCK_MONOTONIC on Linux), so presents and stacks line up with
+//! marks and OS samples without mapping.
 
 pub mod frames;
 #[cfg(windows)]
 pub mod helper;
 #[cfg(windows)]
 pub mod present;
+#[cfg(target_os = "macos")]
+pub mod sck;
 #[cfg(windows)]
 pub mod session;
 #[cfg(windows)]
 pub mod stacks;
+#[cfg(target_os = "linux")]
+pub mod xpresent;
 
 use serde::{Deserialize, Serialize};
 
@@ -59,6 +66,15 @@ pub struct Presents {
     pub consumer_cpu_ms: Option<f64>,
     pub t0_ns: u64,
     pub t1_ns: u64,
+    /// The source sees when a frame reached the screen, not when the app handed it over (macOS
+    /// ScreenCaptureKit, X11 Present): each present's start is its screen time, so a gap between
+    /// frames cannot be told from rest and intervals and drops are refused.
+    #[serde(default)]
+    pub no_begin: bool,
+    /// The source sees frames that take one path only (X11: the Present extension): an app with
+    /// none of them may still draw another way, so no frames is not zero frames.
+    #[serde(default)]
+    pub only: Option<String>,
 }
 
 /// Whether this process may run the real-time present session itself, else why not.
@@ -152,14 +168,17 @@ impl Live {
     }
 }
 
-/// A present session: in this process when its token may, else in the helper.
+/// A present session: in this process when its token may, else in the helper (Windows); a window's
+/// frames through ScreenCaptureKit (macOS) or X Present (Linux X11).
 pub enum PresentCapture {
     #[cfg(windows)]
     Local(present::Capture),
     #[cfg(windows)]
     Helper(helper::Client),
-    #[cfg(not(windows))]
-    None,
+    #[cfg(target_os = "macos")]
+    Screen(sck::Capture),
+    #[cfg(target_os = "linux")]
+    X11(xpresent::Capture),
 }
 
 impl PresentCapture {
@@ -182,20 +201,37 @@ impl PresentCapture {
             Err(local_err.unwrap_or_else(|| crate::model::Error::msg(a.refusal().unwrap_or_default())))
         }
         #[cfg(target_os = "linux")]
-        return Err(crate::model::Error::msg("Linux gives no outside view of when another app's frames reach the screen (DRM page flips need root tracing and name no process; X11 Present and Wayland presentation-time report only to the app itself): presented frames need the toolkit's own present times"));
+        return Ok(PresentCapture::X11(xpresent::Capture::start()?));
         #[cfg(target_os = "macos")]
-        return Err(crate::model::Error::msg("macOS gives no unprivileged outside view of when another app's frames reach the screen (WindowServer's timing needs root tracing or Instruments): presented frames need the toolkit's own present times (Metal's presentedTime)"));
+        return Ok(PresentCapture::Screen(sck::Capture::start()?));
     }
 
-    /// `in-process` or `helper`.
+    /// `in-process`, `helper`, `screencapturekit` or `x11-present`.
     pub fn via(&self) -> &'static str {
         match self {
             #[cfg(windows)]
             PresentCapture::Local(_) => "in-process",
             #[cfg(windows)]
             PresentCapture::Helper(_) => "helper",
-            #[cfg(not(windows))]
-            PresentCapture::None => "",
+            #[cfg(target_os = "macos")]
+            PresentCapture::Screen(_) => "screencapturekit",
+            #[cfg(target_os = "linux")]
+            PresentCapture::X11(_) => "x11-present",
+        }
+    }
+
+    /// Follows the windows of `pids`: the OS session (Windows) sees every process already; a
+    /// window source (macOS, Linux) watches their windows from now on. Returns when it does.
+    pub fn track(&mut self, pids: &[u32]) {
+        match self {
+            #[cfg(windows)]
+            PresentCapture::Local(_) | PresentCapture::Helper(_) => {
+                let _ = pids;
+            }
+            #[cfg(target_os = "macos")]
+            PresentCapture::Screen(c) => c.track(pids),
+            #[cfg(target_os = "linux")]
+            PresentCapture::X11(c) => c.track(pids),
         }
     }
 
@@ -206,10 +242,15 @@ impl PresentCapture {
             PresentCapture::Local(c) => Ok(c.live.view(pids, after, wait)),
             #[cfg(windows)]
             PresentCapture::Helper(c) => Ok(serde_json::from_value(c.call(serde_json::json!({ "op": "presents.live", "pids": pids, "after_ns": after, "wait_ms": wait.as_millis() as u64 }))?)?),
-            #[cfg(not(windows))]
-            PresentCapture::None => {
-                let _ = (pids, after, wait);
-                Ok(LiveView::default())
+            #[cfg(target_os = "macos")]
+            PresentCapture::Screen(c) => {
+                c.track(pids);
+                Ok(c.live.view(pids, after, wait))
+            }
+            #[cfg(target_os = "linux")]
+            PresentCapture::X11(c) => {
+                c.track(pids);
+                Ok(c.live.view(pids, after, wait))
             }
         }
     }
@@ -220,8 +261,10 @@ impl PresentCapture {
             PresentCapture::Local(c) => c.stop(),
             #[cfg(windows)]
             PresentCapture::Helper(mut c) => Ok(serde_json::from_value(c.call(serde_json::json!({ "op": "presents.stop" }))?)?),
-            #[cfg(not(windows))]
-            PresentCapture::None => Ok(Presents::default()),
+            #[cfg(target_os = "macos")]
+            PresentCapture::Screen(c) => c.stop(),
+            #[cfg(target_os = "linux")]
+            PresentCapture::X11(c) => c.stop(),
         }
     }
 }

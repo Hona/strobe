@@ -103,13 +103,11 @@ impl Awake {
                 }
                 let hold = h.load(Ordering::Relaxed);
                 if was != Some((hold, locked)) {
-                    #[cfg(any(windows, target_os = "macos"))]
                     os::keep_awake(hold, hold && !locked);
                     was = Some((hold, locked));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            #[cfg(any(windows, target_os = "macos"))]
             os::keep_awake(false, false);
         });
         Awake { stop, held, locked, unlocked }
@@ -311,37 +309,48 @@ pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
     {
         win::top_windows(pids)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = pids;
-        Vec::new()
+        x11::top_windows(pids)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::top_windows(pids)
     }
 }
 
-/// The thread that owns a window (its UI thread), while the window exists.
+/// The thread that owns a window (its UI thread), while the window exists. On Linux and macOS no
+/// thread owns a window: the UI thread is the process's main thread, where AppKit must run and
+/// X11 toolkits do.
 pub fn window_thread(hwnd: isize) -> Option<u32> {
     #[cfg(windows)]
     {
         let tid = unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId(hwnd as _, std::ptr::null_mut()) };
         (tid != 0).then_some(tid)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = hwnd;
-        None
+        window_state(hwnd).map(|w| w.pid).filter(|&p| p != 0)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::main_thread(window_state(hwnd)?.pid)
     }
 }
 
-/// A window's client area as it draws it now (Windows only).
+/// A window's client area as it draws it now.
 pub fn window_image(hwnd: isize) -> Option<crate::png::Image> {
     #[cfg(windows)]
     {
         win::window_image(hwnd)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        let _ = hwnd;
-        None
+        x11::window_image(hwnd)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::window_image(hwnd)
     }
 }
 

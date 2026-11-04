@@ -1,14 +1,12 @@
 //! The `page` driver for native targets (SPEC §9.6, §13.7): the bench file's page calls on any native
 //! app, through the OS's accessibility tree (finding elements, their bounds and states, waiting on
-//! their changes) and the app's own message loop (posted pointer and key input), timed against the
-//! OS's present events. The app needs no strobe support; it needs an accessibility tree for
+//! their changes) and the OS's input (`a11y::input`: posted window messages on Windows, Quartz events
+//! posted to the app on macOS, XTest on Linux), timed against what reached the screen. The app needs no strobe support; it needs an accessibility tree for
 //! selectors, and the session's present events for `until: "frame"` and frame metrics.
 
 use crate::model::{Error, Result};
 use serde::Serialize;
-use serde_json::Value;
-#[cfg(windows)]
-use serde_json::json;
+use serde_json::{Value, json};
 use std::cell::RefCell;
 use std::time::Duration;
 
@@ -31,61 +29,13 @@ pub struct Log {
     pub marks: Vec<(String, u64)>,
 }
 
-#[cfg(windows)]
-pub use win::Session;
+pub use imp::Session;
 
-#[cfg(not(windows))]
-pub struct Session(std::convert::Infallible);
-
-#[cfg(not(windows))]
-impl Session {
-    pub fn open(_pids: &[u32], _main: isize) -> Result<Session> {
-        match crate::target::a11y::open(&[]) {
-            Err(e) => Err(e),
-            Ok(_) => Err(Error::msg("no native driver on this OS")),
-        }
-    }
-    pub fn dispatch(&self, _: &str, _: &[Value], _: &RefCell<Option<crate::etw::PresentCapture>>, _: Option<&std::path::Path>) -> Result<Value> {
-        match self.0 {}
-    }
-    pub fn set_pids(&self, _: &[u32]) {
-        match self.0 {}
-    }
-    pub fn set_main(&self, _: isize) {
-        match self.0 {}
-    }
-    pub fn take_log(&self) -> Log {
-        match self.0 {}
-    }
-    pub fn mark(&self, _: &str) {
-        match self.0 {}
-    }
-    pub fn elements(&self) -> Option<usize> {
-        match self.0 {}
-    }
-    pub fn release_all(&self) {
-        match self.0 {}
-    }
-    pub fn appeared(&self, _: &Value, _: Duration) -> Result<(Option<u64>, u64)> {
-        match self.0 {}
-    }
-    pub fn count_elements(&self) -> Result<usize> {
-        match self.0 {}
-    }
-    pub fn changes(&self) -> Vec<u64> {
-        match self.0 {}
-    }
-    pub fn parked(&self) -> Option<bool> {
-        match self.0 {}
-    }
-}
-
-#[cfg(windows)]
-mod win {
+mod imp {
     use super::*;
     use crate::etw::PresentCapture;
     use crate::host;
-    use crate::target::a11y::input::{self, Button, Key, Mods, Poster, Target};
+    use crate::target::a11y::input::{self, Button, Key, Mods, Named, Poster, Target};
     use crate::target::a11y::{self, Accessibility, Action, Selector, Tree};
     use std::cell::Cell;
     use std::time::Instant;
@@ -267,7 +217,13 @@ mod win {
                 Error::refused(
                     "NoPresentSource",
                     "until: \"frame\" waits for the app's next frame on screen, from OS present events, which this block has none of",
-                    "run strobe up for present events, or wait for a selector",
+                    if cfg!(windows) {
+                        "run strobe up for present events, or wait for a selector"
+                    } else if cfg!(target_os = "macos") {
+                        "grant Screen Recording (frames come from ScreenCaptureKit; strobe status says to which app), or wait for a selector"
+                    } else {
+                        "frames come from X Present on an X11 server with a real display and no compositing manager; wait for a selector instead"
+                    },
                 )
             })?;
             let v = p.live(&self.pids.borrow(), after, t)?;
@@ -398,6 +354,11 @@ mod win {
         if tree.nodes.is_empty() { deadline.min(Instant::now() + Duration::from_millis(50)) } else { deadline }
     }
 
+    /// A wheel movement too small for a wheel that moves in whole clicks (X11's XTest device).
+    fn no_click(px: f64) -> Error {
+        Error::usage(format!("a wheel movement of {px} px sends no wheel click: on X11 the wheel moves in clicks (strobe sends one per 100 px); move it at least 50 px"))
+    }
+
     fn timeout(opts: &Value) -> Duration {
         opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::from_secs(30))
     }
@@ -439,7 +400,7 @@ mod win {
                         if k > 0 && !delay.is_zero() {
                             std::thread::sleep(delay);
                         }
-                        let key = if c == '\n' { Key::Vk(windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_RETURN) } else { Key::Char(c) };
+                        let key = if c == '\n' { Key::Named(Named::Enter) } else { Key::Char(c) };
                         last = self.poster.press(top, to, Mods::default(), key)?;
                         self.input(last, "discrete", false);
                     }
@@ -482,8 +443,15 @@ mod win {
                         if let Some(w) = due.checked_duration_since(Instant::now()) {
                             std::thread::sleep(w);
                         }
-                        last = self.poster.wheel(t, by_x / steps as f64, by_y / steps as f64)?;
-                        self.input(last, "scroll", k == 0);
+                        // A wheel that moves in clicks (X11) sends a step only once the steps add up to one.
+                        let at = self.poster.wheel(t, by_x / steps as f64, by_y / steps as f64)?;
+                        if at != 0 {
+                            self.input(at, "scroll", last == 0);
+                            last = at;
+                        }
+                    }
+                    if last == 0 {
+                        return Err(no_click(by_x.abs().max(by_y.abs())));
                     }
                     self.until(&o, last, presents)?;
                 }
@@ -501,7 +469,11 @@ mod win {
                     self.park(x, y)?;
                     self.input(self.poster.move_to(t, 0)?, "pointer", false);
                     self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(x, y)), presents)?;
-                    let at = self.poster.wheel(t, d["dx"].as_f64().unwrap_or(0.0), d["dy"].as_f64().unwrap_or(0.0))?;
+                    let (dx, dy) = (d["dx"].as_f64().unwrap_or(0.0), d["dy"].as_f64().unwrap_or(0.0));
+                    let at = self.poster.wheel(t, dx, dy)?;
+                    if at == 0 {
+                        return Err(no_click(dx.abs().max(dy.abs())));
+                    }
                     self.input(at, "scroll", true);
                     self.until(&o, at, presents)?;
                 }

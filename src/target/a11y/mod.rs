@@ -1,30 +1,47 @@
 //! A native app's accessibility tree (SPEC §13.7): what any app with OS accessibility exposes, read
-//! by the OS's own client API (Windows UI Automation), so strobe finds elements by the selectors bench
-//! files use without the app knowing strobe.
+//! by the OS's own client API (Windows UI Automation, macOS's AX API, Linux AT-SPI), so strobe finds
+//! elements by the selectors bench files use without the app knowing strobe.
 //!
-//! Selectors: an element key or a key path (`"slider/knob"`: the last segment is the element's
-//! AutomationId, earlier ones the AutomationIds of its nearest ancestors that have one), `role=<x>`
-//! (control type), `text=<x>` (name, substring unless exact), each with an optional `:focus` suffix.
-//! Only elements a person could see match: non-empty bounds inside their clipping ancestors, not
-//! offscreen. The first match in tree order wins.
+//! Selectors: an element key or a key path (`"slider/knob"`: the last segment is the element's key,
+//! earlier ones the keys of its nearest ancestors that have one), `role=<x>`, `text=<x>` (name or
+//! value, substring unless exact), each with an optional `:focus` suffix. The key is the element's
+//! AutomationId (Windows), AXIdentifier (macOS) or AccessibleId (AT-SPI): where toolkits put an
+//! author's id. Roles are ARIA's names, mapped from each OS's own roles. Only elements a person could
+//! see match: non-empty bounds inside their clipping ancestors, not offscreen. The first match in tree
+//! order wins.
+
+pub mod keys;
 
 #[cfg(windows)]
 pub mod input;
 #[cfg(windows)]
 pub mod uia;
 
+#[cfg(target_os = "macos")]
+pub mod ax;
+#[cfg(target_os = "macos")]
+#[path = "cg_input.rs"]
+pub mod input;
+
+#[cfg(target_os = "linux")]
+pub mod atspi;
+#[cfg(target_os = "linux")]
+#[path = "xtest.rs"]
+pub mod input;
+
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::time::Instant;
 
-/// One element of a snapshot. Rects are screen physical pixels: x, y, width, height.
+/// One element of a snapshot. Rects are screen coordinates, x, y, width, height: physical pixels on
+/// Windows and X11, points on macOS (the unit of its window list and events).
 #[derive(Clone, Debug, Default)]
 pub struct Node {
     pub id: String,
     pub name: String,
-    /// The control type (UIA ControlType id).
+    /// The control type (UIA ControlType id; macOS and AT-SPI roles are mapped to the same ids).
     pub role: i32,
-    /// The OS's own role text for it (LocalizedControlType).
+    /// The OS's own role text for it (LocalizedControlType, the AX role, the AT-SPI role name).
     pub role_text: String,
     pub value: Option<String>,
     pub rect: [f64; 4],
@@ -332,7 +349,7 @@ impl Action {
     }
 }
 
-/// An OS accessibility client: Windows UI Automation now; macOS AX and Linux AT-SPI refuse.
+/// An OS accessibility client: Windows UI Automation, macOS AX, Linux AT-SPI.
 pub trait Accessibility {
     /// The trees of these top-level windows (main first). It registers for their change events once.
     fn snapshot(&self, windows: &[isize]) -> Result<Tree>;
@@ -351,19 +368,26 @@ pub trait Accessibility {
     fn set_pids(&self, pids: &[u32]);
 }
 
+/// Before a native app launches: makes sure the OS's accessibility service runs, so an app that
+/// looks for it once at start finds it (Linux: the session's accessibility bus, started on demand;
+/// an app started before it never registers). Nothing elsewhere.
+pub fn prepare() {
+    #[cfg(target_os = "linux")]
+    atspi::wake_bus();
+}
+
 /// The OS's accessibility client for an app's processes.
 pub fn open(pids: &[u32]) -> Result<Box<dyn Accessibility>> {
     #[cfg(windows)]
     {
         Ok(Box::new(uia::Uia::start(pids)?))
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
-        let _ = pids;
-        Err(Error::usage(if cfg!(target_os = "macos") {
-            "driving a native app through accessibility (AX) is not built on macOS yet: strobe measures it from outside only"
-        } else {
-            "driving a native app through accessibility (AT-SPI) is not built on Linux yet: strobe measures it from outside only"
-        }))
+        Ok(Box::new(ax::Ax::start(pids)?))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Ok(Box::new(atspi::Atspi::start(pids)?))
     }
 }

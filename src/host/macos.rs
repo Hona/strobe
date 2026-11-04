@@ -738,6 +738,26 @@ pub fn accessibility_trusted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+/// The app macOS asks permissions of for strobe: the ancestor launchd started (Terminal, an agent's
+/// app, a remote shell's daemon), as its bundle when it is in one. macOS attributes a process's
+/// Accessibility and Screen Recording to that responsible process, not to strobe itself.
+pub fn responsible_app() -> String {
+    let all = all_bsd();
+    let mut pid = std::process::id();
+    for _ in 0..64 {
+        let Some(p) = all.iter().find(|b| b.pid == pid) else { break };
+        if p.ppid <= 1 {
+            break;
+        }
+        pid = p.ppid;
+    }
+    let exe = exe_of(pid).map(|p| p.display().to_string()).unwrap_or_else(|| format!("process {pid}"));
+    match exe.find(".app/") {
+        Some(i) => exe[..i + 4].to_string(),
+        None => exe,
+    }
+}
+
 /// Screen Recording permission: needed to read another app's pixels.
 pub fn screen_capture_allowed() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() != 0 }
@@ -813,6 +833,71 @@ pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
     }
     let bytes = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(data.0), CFDataGetLength(data.0) as usize) };
     Some(super::grid16(bytes, width, height, stride))
+}
+
+/// The on-screen windows of `pids`, front to back: id, title (CoreGraphics gives titles only with
+/// Screen Recording), click-through (unknown here: false).
+pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
+    let Some(list) = Cf::new(unsafe { CGWindowListCopyWindowInfo(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0) }) else { return Vec::new() };
+    cf_array(list.0)
+        .into_iter()
+        .filter_map(|d| {
+            let pid = cf_i64(cf_get(d, "kCGWindowOwnerPID"))? as u32;
+            let layer = cf_i64(cf_get(d, "kCGWindowLayer")).unwrap_or(0);
+            (pids.contains(&pid) && (0..1000).contains(&layer) && cf_f64(cf_get(d, "kCGWindowAlpha")).unwrap_or(1.0) > 0.0)
+                .then(|| Some((cf_i64(cf_get(d, "kCGWindowNumber"))? as isize, cf_string(cf_get(d, "kCGWindowName")).unwrap_or_default(), false)))?
+        })
+        .collect()
+}
+
+/// The frontmost on-screen window of `pids` holding a point (points, global display space).
+pub fn window_at(pids: &[u32], x: f64, y: f64) -> Option<u32> {
+    windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0)
+        .into_iter()
+        .find(|w| pids.contains(&w.pid) && w.alpha > 0.0 && x >= w.bounds.origin.x && y >= w.bounds.origin.y && x < w.bounds.origin.x + w.bounds.size.width && y < w.bounds.origin.y + w.bounds.size.height)
+        .map(|w| w.id)
+}
+
+/// The process's main thread (the lowest thread id: ids only grow), where AppKit runs the UI.
+pub fn main_thread(pid: u32) -> Option<u32> {
+    let id = thread_ids(pid).into_iter().min()?;
+    THREADS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(id as u32, (pid, id));
+    Some(id as u32)
+}
+
+/// A window's pixels at the display's resolution (`CGWindowListCreateImage`, Screen Recording), as RGBA.
+pub fn window_image(id: isize) -> Option<crate::png::Image> {
+    type CreateImage = unsafe extern "C" fn(CGRect, u32, u32, u32) -> CFTypeRef;
+    if !screen_capture_allowed() {
+        return None;
+    }
+    let sym = CString::new("CGWindowListCreateImage").ok()?;
+    let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, sym.as_ptr()) };
+    if f.is_null() {
+        return None;
+    }
+    let create: CreateImage = unsafe { std::mem::transmute(f) };
+    let null = CGRect { origin: CGPoint { x: f64::INFINITY, y: f64::INFINITY }, size: CGSize::default() };
+    // This window only, its own bounds without the shadow, at the best resolution.
+    let img = unsafe { create(null, LIST_INCLUDING, id as u32, 1 | 8) };
+    if img.is_null() {
+        return None;
+    }
+    let (width, height, stride, bpp) = unsafe { (CGImageGetWidth(img), CGImageGetHeight(img), CGImageGetBytesPerRow(img), CGImageGetBitsPerPixel(img)) };
+    let data = Cf::new(unsafe { CGDataProviderCopyData(CGImageGetDataProvider(img)) });
+    unsafe { CGImageRelease(img) };
+    let data = data?;
+    if bpp != 32 {
+        return None;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(CFDataGetBytePtr(data.0), CFDataGetLength(data.0) as usize) };
+    let mut rgba = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        for px in bytes.get(y * stride..y * stride + width * 4)?.chunks(4) {
+            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+        }
+    }
+    Some(crate::png::Image { width, height, rgba })
 }
 
 /// macOS lets no app put another app's window on top without activating it (which takes focus): none.

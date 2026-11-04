@@ -87,12 +87,17 @@ pub fn from_presents(presents: &[Present], pids: &[u32], t0: u64, t1: u64) -> Ru
     out
 }
 
-/// A native app's frame metrics from OS presents, and why they are refused when they are.
+/// A native app's frame metrics from OS presents, and why they are refused when they are: all of
+/// them (`refused`) or some (`partial`, by metric).
 #[derive(Default)]
 pub struct NativeFrames {
     pub values: BTreeMap<String, f64>,
     pub refused: Option<String>,
+    pub partial: BTreeMap<String, String>,
 }
+
+/// Metrics that need when a frame was handed over, not only when it was shown.
+const NEED_BEGIN: &[&str] = &["frames.interval.p50", "frames.interval.p95", "frames.interval.p99", "frames.interval.max", "frames.dropped", "frames.dropped.pct"];
 
 /// Frame metrics of a native app's measured runs (their spans on the host clock) from its
 /// processes' presents. `display` is the target window's display path, for the refresh period.
@@ -100,10 +105,25 @@ pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: O
     let (t0, t1) = (runs.first().map_or(0, |r| r.0), runs.last().map_or(0, |r| r.1));
     let refresh = refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000, display);
     let frames: Vec<RunFrames> = runs.iter().map(|r| from_presents(&p.presents, pids, r.0, r.1)).collect();
-    let mut out = NativeFrames { values: values(&frames, refresh), refused: None };
+    let mut out = NativeFrames { values: values(&frames, refresh), ..NativeFrames::default() };
     if refresh.is_none() && !p.vsyncs.is_empty() && display.is_none() {
         out.refused = Some("NoPresentSource: several displays run at different refresh rates and the target's window is unknown, so its refresh period is too".into());
         out.values.clear();
+    }
+    if let Some(only) = &p.only
+        && !p.presents.iter().any(|x| pids.contains(&x.pid) && x.start_ns >= t0 && x.start_ns < t1)
+    {
+        out.refused = Some(format!("NoPresentSource: the app showed no frame through {only} in the runs: it may draw another way, which strobe does not see"));
+        out.values.clear();
+    }
+    if p.no_begin {
+        for m in NEED_BEGIN {
+            out.values.remove(*m);
+            out.partial.insert(
+                m.to_string(),
+                format!("NoPresentSource: {m}: this OS shows strobe when a frame reached the screen, not when the app handed it over, so a gap between frames cannot be told from the app resting"),
+            );
+        }
     }
     out
 }

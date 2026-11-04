@@ -78,7 +78,10 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         );
         return Ok(Output::new(text, meta));
     }
-    let presents = etw::PresentCapture::start();
+    let presents = etw::PresentCapture::start().map(|mut p| {
+        p.track(&host::tree_pids(root));
+        p
+    });
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
     let sampler = probe::os::Sampler::start(root);
     let cycles = || host::process_tree(root).iter().map(|p| p.cycles).sum::<u64>();
@@ -139,15 +142,16 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         Ok(p) => {
             let pids = host::tree_pids(root);
             let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
-            let run = frames::from_presents(&p.presents, &pids, t0, t1);
-            match frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()) {
-                None if !p.vsyncs.is_empty() && display.is_none() => {
+            let f = frames::native_values(p, &pids, &[(t0, t1)], display.as_ref());
+            match f.refused {
+                Some(why) if display.is_none() && why.contains("several displays") => {
                     Some("NoPresentSource: several displays run at different refresh rates and the process has no window to say which it is on".to_string())
                 }
-                refresh => {
-                    values.extend(frames::values(&[run], refresh));
+                Some(why) => Some(why),
+                None => {
+                    values.extend(f.values);
                     crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-                    session = json!({ "via": via, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "presents": p.presents.len(), "pids": pids, "display": display });
+                    session = json!({ "via": via, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "presents": p.presents.len(), "pids": pids, "display": display, "refused_metrics": f.partial });
                     None
                 }
             }

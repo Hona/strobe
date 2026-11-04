@@ -16,6 +16,7 @@
 //! - Activation. A real click on an inactive window activates it (`WM_MOUSEACTIVATE`); a posted one
 //!   does not, so the app stays in the background, as strobe needs.
 
+pub use super::keys::{Button, Key, Mods, Named, parse_chord};
 use crate::model::{Error, Result};
 use std::sync::mpsc::{Sender, channel};
 use std::time::Duration;
@@ -30,141 +31,45 @@ const MK_SHIFT: u32 = 0x04;
 const MK_CONTROL: u32 = 0x08;
 const MK_MBUTTON: u32 = 0x10;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Button {
-    Left,
-    Right,
-    Middle,
-}
-
-impl Button {
-    pub fn parse(s: Option<&str>) -> Result<Button> {
-        Ok(match s.unwrap_or("left") {
-            "left" => Button::Left,
-            "right" => Button::Right,
-            "middle" => Button::Middle,
-            other => return Err(Error::usage(format!("button: left, right or middle, not {other}"))),
-        })
-    }
-
-    fn messages(self) -> (u32, u32, u32, usize) {
-        match self {
-            Button::Left => (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON as usize),
-            Button::Right => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON as usize),
-            Button::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON as usize),
-        }
+fn button_messages(b: Button) -> (u32, u32, u32, usize) {
+    match b {
+        Button::Left => (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON as usize),
+        Button::Right => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON as usize),
+        Button::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON as usize),
     }
 }
 
-/// Modifier keys held for an input.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct Mods {
-    pub ctrl: bool,
-    pub shift: bool,
-    pub alt: bool,
-    pub meta: bool,
+fn vks(m: Mods) -> Vec<u16> {
+    m.keys().into_iter().map(named_vk).collect()
 }
 
-impl Mods {
-    pub fn any(self) -> bool {
-        self.ctrl || self.shift || self.alt || self.meta
+/// The virtual key of a named key.
+fn named_vk(n: Named) -> u16 {
+    match n {
+        Named::Enter => VK_RETURN,
+        Named::Tab => VK_TAB,
+        Named::Escape => VK_ESCAPE,
+        Named::Backspace => VK_BACK,
+        Named::Delete => VK_DELETE,
+        Named::Insert => VK_INSERT,
+        Named::Home => VK_HOME,
+        Named::End => VK_END,
+        Named::PageUp => VK_PRIOR,
+        Named::PageDown => VK_NEXT,
+        Named::ArrowUp => VK_UP,
+        Named::ArrowDown => VK_DOWN,
+        Named::ArrowLeft => VK_LEFT,
+        Named::ArrowRight => VK_RIGHT,
+        Named::Space => VK_SPACE,
+        Named::Shift => VK_SHIFT,
+        Named::Control => VK_CONTROL,
+        Named::Alt => VK_MENU,
+        Named::Meta => VK_LWIN,
+        Named::ContextMenu => VK_APPS,
+        Named::CapsLock => VK_CAPITAL,
+        Named::F(n) => VK_F1 + n as u16 - 1,
+        Named::Letter(c) | Named::Digit(c) => c as u16,
     }
-
-    /// `["ctrl", "shift", "alt", "meta"]`, as click options give them.
-    pub fn parse_list(v: &serde_json::Value) -> Result<Mods> {
-        let mut m = Mods::default();
-        for s in v.as_array().into_iter().flatten().filter_map(|x| x.as_str()) {
-            match s.to_ascii_lowercase().as_str() {
-                "ctrl" | "control" | "controlormeta" => m.ctrl = true,
-                "shift" => m.shift = true,
-                "alt" => m.alt = true,
-                "meta" | "win" | "super" => m.meta = true,
-                other => return Err(Error::usage(format!("modifier {other}: ctrl, shift, alt or meta"))),
-            }
-        }
-        Ok(m)
-    }
-
-    fn vks(self) -> Vec<u16> {
-        let mut v = Vec::new();
-        if self.ctrl {
-            v.push(VK_CONTROL);
-        }
-        if self.shift {
-            v.push(VK_SHIFT);
-        }
-        if self.alt {
-            v.push(VK_MENU);
-        }
-        if self.meta {
-            v.push(VK_LWIN);
-        }
-        v
-    }
-}
-
-/// A key: a virtual key, or a character the app's layout types.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Key {
-    Vk(u16),
-    Char(char),
-}
-
-/// `"Enter"`, `"a"`, `"Control+Shift+P"`, `"ControlOrMeta+a"` (Control on Windows), Playwright's names.
-pub fn parse_chord(s: &str) -> Result<(Mods, Key)> {
-    let parts: Vec<&str> = if s == "+" { vec!["+"] } else { s.split('+').collect() };
-    let (last, mods) = parts.split_last().ok_or_else(|| Error::usage("an empty key"))?;
-    let mut m = Mods::default();
-    for p in mods {
-        match p.to_ascii_lowercase().as_str() {
-            "control" | "ctrl" | "controlormeta" => m.ctrl = true,
-            "shift" => m.shift = true,
-            "alt" => m.alt = true,
-            "meta" | "win" => m.meta = true,
-            other => return Err(Error::usage(format!("key {s:?}: {other} is not a modifier (Control, Shift, Alt, Meta, ControlOrMeta)"))),
-        }
-    }
-    Ok((m, key_named(last).ok_or_else(|| Error::usage(format!("key {s:?}: unknown key {last:?}")))?))
-}
-
-pub fn key_named(name: &str) -> Option<Key> {
-    let vk = match name {
-        "Enter" => VK_RETURN,
-        "Tab" => VK_TAB,
-        "Escape" | "Esc" => VK_ESCAPE,
-        "Backspace" => VK_BACK,
-        "Delete" => VK_DELETE,
-        "Insert" => VK_INSERT,
-        "Home" => VK_HOME,
-        "End" => VK_END,
-        "PageUp" => VK_PRIOR,
-        "PageDown" => VK_NEXT,
-        "ArrowUp" => VK_UP,
-        "ArrowDown" => VK_DOWN,
-        "ArrowLeft" => VK_LEFT,
-        "ArrowRight" => VK_RIGHT,
-        "Space" | " " => VK_SPACE,
-        "Shift" => VK_SHIFT,
-        "Control" => VK_CONTROL,
-        "Alt" => VK_MENU,
-        "Meta" => VK_LWIN,
-        "ContextMenu" => VK_APPS,
-        "CapsLock" => VK_CAPITAL,
-        _ => {
-            if let Some(n) = name.strip_prefix('F').and_then(|n| n.parse::<u16>().ok()).filter(|n| (1..=24).contains(n)) {
-                VK_F1 + n - 1
-            } else if let Some(c) = name.strip_prefix("Key").filter(|c| c.len() == 1 && c.as_bytes()[0].is_ascii_uppercase()) {
-                c.as_bytes()[0] as u16
-            } else if let Some(c) = name.strip_prefix("Digit").filter(|c| c.len() == 1 && c.as_bytes()[0].is_ascii_digit()) {
-                c.as_bytes()[0] as u16
-            } else {
-                let mut chars = name.chars();
-                let c = chars.next()?;
-                return chars.next().is_none().then_some(Key::Char(c));
-            }
-        }
-    };
-    Some(Key::Vk(vk))
 }
 
 /// Keys whose scan code has the 0xE0 prefix (the lParam's extended bit).
@@ -201,7 +106,7 @@ pub fn wheel_wparam(delta: i32, keys: usize) -> usize {
 /// Wheel units for a delta in pixels: one notch (120) per 100 px, Chromium's scroll per notch.
 /// What a native app scrolls per notch is its own.
 pub fn wheel_delta(px: f64) -> i32 {
-    (px / 100.0 * 120.0).round() as i32
+    (super::keys::notches(px) * 120.0).round() as i32
 }
 
 /// One message to post.
@@ -323,7 +228,7 @@ impl Poster {
     /// around it. `dbl`: the second press of a double click. Returns when the button was posted.
     pub fn button(&self, t: Target, b: Button, down: bool, dbl: bool, mods: Mods, top: isize) -> Result<u64> {
         self.call(move |s| {
-            let (dn, up, dblclk, mk) = b.messages();
+            let (dn, up, dblclk, mk) = button_messages(b);
             let msg = match (down, dbl && class_dblclks(t.hwnd)) {
                 (true, true) => dblclk,
                 (true, false) => dn,
@@ -340,14 +245,14 @@ impl Poster {
             }
             let keys = keys_window(top);
             let at = s.with_state(top, mods, |s| {
-                let mut downs: Vec<Msg> = mods.vks().into_iter().filter(|vk| !s.held.contains(vk)).map(|vk| key_msg(keys, vk, false, mods)).collect();
+                let mut downs: Vec<Msg> = vks(mods).into_iter().filter(|vk| !s.held.contains(vk)).map(|vk| key_msg(keys, vk, false, mods)).collect();
                 let n = downs.len();
                 downs.extend(msgs);
                 let stamps = post(&downs)?;
                 settle(keys, downs.len())?;
                 Ok(stamps[n + 1])
             })?;
-            let ups: Vec<Msg> = mods.vks().into_iter().rev().filter(|vk| !s.held.contains(vk)).map(|vk| key_msg(keys, vk, true, Mods::default())).collect();
+            let ups: Vec<Msg> = vks(mods).into_iter().rev().filter(|vk| !s.held.contains(vk)).map(|vk| key_msg(keys, vk, true, Mods::default())).collect();
             post(&ups)?;
             settle(keys, ups.len())?;
             Ok(at)
@@ -387,7 +292,7 @@ impl Poster {
                 let v = post(&[key_msg(keys, vk, false, mods), up])?;
                 return Ok(v[0]);
             }
-            let fresh: Vec<u16> = mods.vks().into_iter().filter(|m| !s.held.contains(m)).collect();
+            let fresh: Vec<u16> = vks(mods).into_iter().filter(|m| !s.held.contains(m)).collect();
             let all = s.held_mods().or(mods);
             let at = s.with_state(top, mods, |_| {
                 let mut msgs: Vec<Msg> = fresh.iter().map(|m| key_msg(keys, *m, false, all)).collect();
@@ -524,12 +429,6 @@ impl State {
     }
 }
 
-impl Mods {
-    fn or(self, o: Mods) -> Mods {
-        Mods { ctrl: self.ctrl || o.ctrl, shift: self.shift || o.shift, alt: self.alt || o.alt, meta: self.meta || o.meta }
-    }
-}
-
 fn mods_mk(m: Mods) -> usize {
     (if m.ctrl { MK_CONTROL as usize } else { 0 }) | if m.shift { MK_SHIFT as usize } else { 0 }
 }
@@ -564,7 +463,7 @@ fn set_state(held: &[u16], mods: Mods) {
             _ => {}
         }
     };
-    for vk in held.iter().copied().chain(mods.vks()) {
+    for vk in held.iter().copied().chain(vks(mods)) {
         down(vk);
     }
     unsafe { SetKeyboardState(ks.as_ptr()) };
@@ -586,7 +485,7 @@ fn keys_window(top: isize) -> isize {
 /// is Shift and its key; AltGr characters are Control+Alt).
 fn resolve(top: isize, key: Key, mods: Mods) -> Result<(u16, Mods)> {
     match key {
-        Key::Vk(vk) => Ok((vk, mods)),
+        Key::Named(n) => Ok((named_vk(n), mods)),
         Key::Char(c) => {
             let mut units = [0u16; 2];
             if c.encode_utf16(&mut units).len() != 1 {

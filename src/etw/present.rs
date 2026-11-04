@@ -140,7 +140,7 @@ impl Capture {
     pub fn stop(self) -> Result<Presents> {
         let t1 = crate::host::now_ns();
         let ((presents, vsyncs), stats) = self.running.stop()?;
-        Ok(Presents { presents, vsyncs, events: stats.events, events_lost: stats.events_lost + stats.buffers_lost, consumer_cpu_ms: stats.consumer_cpu_ms, t0_ns: self.t0, t1_ns: t1 })
+        Ok(Presents { presents, vsyncs, events: stats.events, events_lost: stats.events_lost + stats.buffers_lost, consumer_cpu_ms: stats.consumer_cpu_ms, t0_ns: self.t0, t1_ns: t1, ..Presents::default() })
     }
 }
 

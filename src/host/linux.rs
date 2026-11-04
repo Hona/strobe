@@ -427,6 +427,37 @@ pub fn session_locked() -> bool {
     false
 }
 
+/// What `keep_awake` holds: logind's idle inhibitor (a file descriptor: closing it releases it) and
+/// the session's screen saver inhibition (a cookie, owned by the connection that took it).
+type Inhibitors = (Option<std::os::fd::OwnedFd>, Option<(super::dbus::Conn, u32)>);
+static AWAKE: std::sync::Mutex<Inhibitors> = std::sync::Mutex::new((None, None));
+
+/// Keeps the machine from going idle when `system` (logind's `idle` inhibitor in block mode: no idle
+/// suspend or idle action, while a person may still suspend it), and the display from blanking as
+/// well when `display` (`org.freedesktop.ScreenSaver.Inhibit` on the session bus, where the desktop
+/// has it). Released when false; a desktop without either keeps its own idle rules.
+pub fn keep_awake(system: bool, display: bool) {
+    use super::dbus::{Arg, Conn};
+    let mut held = AWAKE.lock().unwrap_or_else(|e| e.into_inner());
+    if system && held.0.is_none() {
+        held.0 = Conn::system_with_fds().ok().and_then(|mut c| {
+            let args = [Arg::Str("idle"), Arg::Str("strobe"), Arg::Str("a measurement is running"), Arg::Str("block")];
+            c.call_fds("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "Inhibit", &args).ok()?.1.into_iter().next()
+        });
+    } else if !system {
+        held.0 = None;
+    }
+    if display && held.1.is_none() {
+        held.1 = Conn::session().ok().and_then(|mut c| {
+            let r = c.call("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver", "Inhibit", &[Arg::Str("strobe"), Arg::Str("a measurement is running")]).ok()?;
+            let cookie = r.first()?.as_i64()? as u32;
+            Some((c, cookie))
+        });
+    } else if !display && let Some((mut c, cookie)) = held.1.take() {
+        let _ = c.call("org.freedesktop.ScreenSaver", "/org/freedesktop/ScreenSaver", "org.freedesktop.ScreenSaver", "UnInhibit", &[Arg::U32(cookie)]);
+    }
+}
+
 fn locked_hint(bus: &mut super::dbus::Conn) -> std::io::Result<bool> {
     use super::dbus::Value;
     let display = bus.get_property("org.freedesktop.login1", "/org/freedesktop/login1/user/self", "org.freedesktop.login1.User", "Display")?;

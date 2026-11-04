@@ -128,6 +128,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     // own on the target's CPUs before the launch, once the last block's app has left them quiet.
     let ratio = validity::native_speed_checked(ctx.pin)?;
     let home = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), None)?;
+    crate::target::a11y::prepare();
     let launched = Instant::now();
     let (mut n, guard) = match nt::launch(&app, &home, &[], false, ctx.pin) {
         Ok(x) => x,
@@ -217,7 +218,10 @@ fn runs(
     let mut presents_err: Option<String> = None;
     if !windowless && set != Set::Attribution && set != Set::Memory {
         match PresentCapture::start() {
-            Ok(c) => *presents.borrow_mut() = Some(c),
+            Ok(mut c) => {
+                c.track(&n.pids());
+                *presents.borrow_mut() = Some(c);
+            }
             Err(e) => presents_err = Some(e.message),
         }
     }
@@ -489,6 +493,11 @@ fn runs(
                 None => {
                     for (k, x) in f.values {
                         values.entry(k).or_insert(x);
+                    }
+                    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+                        if let Some(w) = f.partial.get(m) {
+                            refused.entry(m.clone()).or_insert_with(|| w.clone());
+                        }
                     }
                     // Only what the series declares is listed refused; the rest has no value.
                     let mut why = BTreeMap::new();
@@ -810,11 +819,12 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             Error::refused(
                 "NoPresentSource",
                 format!("{}: a launch timed to an element ends when the frame that showed it reached the screen: {}", s.case, e.message),
-                "run strobe up for present events, or time the launch to { window: \"settled\" }",
+                if cfg!(windows) { "run strobe up for present events, or time the launch to { window: \"settled\" }" } else { "time the launch to { window: \"settled\" }" },
             )
         })?),
         _ => None,
     };
+    crate::target::a11y::prepare();
     let clock = (host::tsc(), Instant::now());
     let (mut n, guard) = match nt::launch(&app, &prepared, &[], true, ctx.pin) {
         Ok(x) => x,
@@ -895,6 +905,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 }
                 std::thread::sleep(Duration::from_millis(10));
             };
+            if let Some(p) = presents.as_mut() {
+                p.track(&n.pids());
+            }
             let session = Session::open(&n.pids(), main.hwnd)?;
             let (lo, hi) = session
                 .appeared(sel, deadline.saturating_duration_since(Instant::now()))

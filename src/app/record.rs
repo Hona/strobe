@@ -278,7 +278,12 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let dir = store::recording_dir(&id)?;
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
-        let presents = (set != Set::Attribution && !windowless).then(crate::etw::PresentCapture::start);
+        let presents = (set != Set::Attribution && !windowless).then(|| {
+            crate::etw::PresentCapture::start().map(|mut c| {
+                c.track(&n.pids());
+                c
+            })
+        });
         let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
         progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
@@ -307,7 +312,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 let f = crate::etw::frames::native_values(p, &n.pids(), &[(t0, t1)], display.as_ref());
                 frame_values = f.values;
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "display": display })
+                json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "refused_metrics": f.partial, "display": display })
             }
             Some(Err(e)) => json!({ "refused": e.message }),
             None => Value::Null,

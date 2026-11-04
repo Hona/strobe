@@ -2720,6 +2720,25 @@ linted on all three OSes; not yet run against a live window (the session was loc
 pacing against the page's frames, and a native drag on each OS. Benches stop and resume (§5.6), retry
 launches that fail and pass, stop `saturated` primaries and run on to the pairs Holm needs (§9.1).
 
+Live on macOS (2026-11-05, M4 MacBook Air, macOS 27, Accessibility granted through the remote shell,
+no Screen Recording, `--check` smoke runs, values noisy and not compared):
+
+- `scripts/dev/ax.bench.ts` on the Cocoa app: `query`, `click`, `type`, `chord` (⌘A, Backspace),
+  `act(toggle)`, `scroll` and `wheel` pass; `frames` is refused (`NoPresentSource`). Found and fixed:
+  AppKit handled none of the mouse events posted to the app's process, from any event source, with or
+  without the window fields, active or not, so pointer input now goes through the session (§13.7);
+  whether a person is at the Mac reads the HID system's idle time, so strobe's own clicks do not count.
+- A Rune app (`examples/settings`, AccessKit): switches by click, `act(toggle)`, `act(invoke)` and
+  focus then Space; radios and segments by click and `act(select)`; the slider by
+  `act(setValue)`. Found and fixed: a radio is pressed for `select` (the adapter takes an AXSelected
+  write and does nothing); a range control gets a number even when its AXValue reads as text
+  ("1.00×"); `{ value: 0.2 }` reached every driver as "" (a number was dropped); the adapter names a
+  heading's role "Heading", which counts as a heading. The adapter maps a scroll view to AXUnknown.
+- A page drag on Edge: `drag`, a path function, `down`/`up` with all three buttons, waits and
+  snapshots pass; `page.idle()` on pages had been refused by the selector check (fixed).
+  `input.rate` 58.5/s at 60 Hz with `input.gap.p95` 70 to 75 ms, and the recording presented 2
+  frames over the drag (the window likely occluded): not diagnosed.
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).

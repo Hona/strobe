@@ -497,13 +497,14 @@ impl Builder {
 
     /// A native recording's runs, phases, marks, strobe's inputs and the accessibility tree's changes.
     fn native_runs(&mut self, dir: &Path) {
+        type Args = Vec<(String, Value)>;
         let runs_info: HashMap<String, Value> =
             store::read_json(&dir.join("runs.json")).ok().and_then(|v| v.as_array().cloned()).into_iter().flatten().filter_map(|r| Some((r["run"].as_str()?.to_string(), r))).collect();
         let mut runs: Vec<(String, Value)> = store::read_json(&dir.join("frames.json")).ok().and_then(|f| f["runs"].as_object().cloned()).into_iter().flatten().collect();
         runs.sort_by_key(|(_, r)| r["t0_ns"].as_u64().unwrap_or(0));
-        let mut spans: Vec<(String, u64, u64, Vec<(String, Value)>)> = Vec::new();
+        let mut spans: Vec<(String, u64, u64, Args)> = Vec::new();
         let mut marks: Vec<(String, u64)> = Vec::new();
-        let mut inputs: Vec<(String, u64, Vec<(String, Value)>)> = Vec::new();
+        let mut inputs: Vec<(String, u64, Args)> = Vec::new();
         let mut changes: Vec<u64> = Vec::new();
         for (name, r) in &runs {
             let (Some(a), Some(b)) = (r["t0_ns"].as_u64(), r["t1_ns"].as_u64()) else { continue };

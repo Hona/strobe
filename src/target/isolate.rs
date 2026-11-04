@@ -33,6 +33,11 @@ pub struct App {
     moved: Vec<PathBuf>,
     /// The profile says `window: false`: the app opens no window (a tray app, a service).
     pub windowless: bool,
+    /// The profile's `gpuCache` (`warm` or `cold`), when it names one.
+    pub gpu_cache_mode: Option<String>,
+    /// Where the GPU shader caches of this app's launches persist between them (`gpuCache: "warm"`):
+    /// lent into each home before the launch and taken back when the home goes (`lend_gpu_caches`).
+    pub gpu_cache: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -170,6 +175,8 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         args: strings("args"),
         moved,
         windowless: p["window"] == false,
+        gpu_cache_mode: p["gpuCache"].as_str().map(str::to_string),
+        gpu_cache: None,
     })
 }
 
@@ -444,8 +451,129 @@ pub fn release_home(home: &Path) {
     restore_protocols(home);
 }
 
+/// Where GPU drivers keep compiled shaders, relative to a home whose per-user folders the launch
+/// redirects: Windows resolves `%LOCALAPPDATA%` (and LocalLow, from `%USERPROFILE%`) under it, Mesa
+/// and NVIDIA's Linux driver use `$XDG_CACHE_HOME` (older NVIDIA drivers `~/.nv`). macOS keeps Metal's
+/// cache per app in the per-user cache folder the OS assigns (`getconf DARWIN_USER_CACHE_DIR`), which
+/// no environment variable moves: every launch there uses the user's own, warm.
+const DRIVER_CACHES: &[&str] = if cfg!(windows) {
+    &[
+        "AppData/Local/NVIDIA/DXCache",
+        "AppData/Local/NVIDIA/GLCache",
+        "AppData/Local/D3DSCache",
+        "AppData/Local/AMD/DxCache",
+        "AppData/Local/AMD/DxcCache",
+        "AppData/Local/AMD/VkCache",
+        "AppData/Local/AMD/OglCache",
+        "AppData/LocalLow/Intel/ShaderCache",
+    ]
+} else if cfg!(target_os = "linux") {
+    &[".cache/mesa_shader_cache", ".cache/mesa_shader_cache_db", ".cache/nvidia", ".cache/radv_builtin_shaders", ".nv"]
+} else {
+    &[]
+};
+
+/// Folders Chromium (and so an Electron app) keeps its own GPU caches in, wherever its profile is:
+/// program binaries, Skia's and Dawn's compiled shaders.
+const CHROMIUM_GPU_CACHES: &[&str] = &["GPUCache", "GrShaderCache", "GraphiteDawnCache", "DawnGraphiteCache", "DawnWebGPUCache", "ShaderCache"];
+
+/// Moves `from` to `to` (same volume: strobe's state folder), retrying while a just-closed app's
+/// files are still held.
+fn move_dir(from: &Path, to: &Path) -> bool {
+    if let Some(p) = to.parent() {
+        let _ = std::fs::create_dir_all(p);
+    }
+    for _ in 0..20 {
+        if std::fs::rename(from, to).is_ok() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
+
+/// Lends the GPU shader caches kept in `store` to `home` before a launch: moved in (no copy), so the
+/// app's driver and Chromium find what earlier launches of the same variant compiled, as on a
+/// person's machine. Never the user's own caches, and never another variant's (each has its store).
+/// What the home already holds (a seed's own) wins. True when the store held anything.
+pub fn lend_gpu_caches(home: &Path, store: &Path) -> bool {
+    let _ = std::fs::create_dir_all(store);
+    let _ = std::fs::write(home.join(".strobe-gpu-cache"), store.display().to_string());
+    let held = std::fs::read_to_string(store.join("paths")).unwrap_or_default();
+    let mut warm = false;
+    for rel in held.lines().filter(|l| !l.is_empty()) {
+        let (from, to) = (store.join("dirs").join(rel), home.join(rel));
+        if from.is_dir() && !to.exists() && move_dir(&from, &to) {
+            warm = true;
+        }
+    }
+    warm
+}
+
+/// Takes a home's GPU shader caches back into the store it borrowed them from (`lend_gpu_caches`),
+/// once nothing runs from it: the driver folders, and every Chromium GPU cache folder in it.
+pub fn keep_gpu_caches(home: &Path) {
+    let Ok(store) = std::fs::read_to_string(home.join(".strobe-gpu-cache")) else { return };
+    let store = PathBuf::from(store.trim());
+    let mut rels: Vec<String> = DRIVER_CACHES.iter().map(|r| r.to_string()).filter(|r| home.join(r).is_dir()).collect();
+    fn chromium(dir: &Path, home: &Path, depth: usize, out: &mut Vec<String>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            let rel = p.strip_prefix(home).map(|r| r.to_string_lossy().replace('\\', "/")).unwrap_or_default();
+            if !p.is_dir() || DRIVER_CACHES.iter().any(|d| rel == *d) {
+                continue;
+            }
+            if CHROMIUM_GPU_CACHES.iter().any(|n| e.file_name() == *n) {
+                out.push(rel);
+            } else if depth > 0 {
+                chromium(&p, home, depth - 1, out);
+            }
+        }
+    }
+    chromium(home, home, 6, &mut rels);
+    let mut kept: Vec<String> = std::fs::read_to_string(store.join("paths")).unwrap_or_default().lines().filter(|l| !l.is_empty()).map(str::to_string).collect();
+    for rel in rels {
+        let to = store.join("dirs").join(&rel);
+        if to.exists() {
+            let _ = std::fs::remove_dir_all(&to);
+        }
+        if move_dir(&home.join(&rel), &to) && !kept.contains(&rel) {
+            kept.push(rel);
+        }
+    }
+    let _ = std::fs::write(store.join("paths"), kept.join("\n"));
+}
+
+/// The GPU cache store of one executable, which recordings of it share (`record`, `record --bench`):
+/// a recording after the first finds what the earlier ones compiled.
+pub fn exe_gpu_store(exe: &Path) -> PathBuf {
+    use sha2::Digest;
+    let key: String = sha2::Sha256::digest(exe.display().to_string().as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect();
+    host::paths::sub("gpu-cache").join(format!("rec-{key}"))
+}
+
+/// Bytes a GPU cache store holds (its caches, while no launch has them lent).
+pub fn gpu_cache_bytes(store: &Path) -> u64 {
+    fn size(p: &Path) -> u64 {
+        std::fs::read_dir(p).into_iter().flatten().flatten().map(|e| if e.path().is_dir() { size(&e.path()) } else { e.metadata().map(|m| m.len()).unwrap_or(0) }).sum()
+    }
+    size(&store.join("dirs"))
+}
+
+/// Stores of GPU caches (`gpu-cache/<key>`) no launch used for a week go.
+pub fn prune_gpu_caches() {
+    let week = Duration::from_secs(7 * 86_400);
+    for e in std::fs::read_dir(host::paths::sub("gpu-cache")).into_iter().flatten().flatten() {
+        let used = std::fs::metadata(e.path().join("paths")).or_else(|_| e.metadata()).ok().and_then(|m| m.modified().ok());
+        if used.and_then(|t| t.elapsed().ok()).is_some_and(|age| age > week) {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
 /// Removes a home once nothing holds its files any more.
 pub fn remove_home(home: &Path) {
+    keep_gpu_caches(home);
     unshare(home);
     for _ in 0..20 {
         if std::fs::remove_dir_all(home).is_ok() || !home.exists() {
@@ -517,6 +645,8 @@ pub struct Home {
     pub env: Vec<(String, String)>,
     /// Large seed files shared into the home rather than copied.
     pub shared: Vec<Shared>,
+    /// With `App::gpu_cache`: whether the launch found GPU shader caches from earlier launches.
+    pub gpu_warm: Option<bool>,
 }
 
 impl Home {
@@ -612,7 +742,8 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     env.extend(app.env.iter().map(|(k, v)| (k.clone(), fill(v))));
-    Ok(Home { dir: home, port, env, shared })
+    let gpu_warm = app.gpu_cache.as_deref().map(|store| lend_gpu_caches(&home, store));
+    Ok(Home { dir: home, port, env, shared, gpu_warm })
 }
 
 /// A spawned app: the child, when it was spawned (epoch ms and the host clock), and its output lines
@@ -728,6 +859,7 @@ impl Drop for Launching {
         kill_tree(self.pid);
         if let Some(h) = self.home.take() {
             release_home(&h);
+            keep_gpu_caches(&h);
             let _ = std::fs::remove_dir_all(h);
         }
     }

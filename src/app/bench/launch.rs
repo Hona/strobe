@@ -75,7 +75,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
     // keeps), and the hook gets the environment and executable the app launches with, so it can start
     // what the app expects to find (a background service) the way the app would.
-    let app = if kind == "app" || kind == "exe" { Some(variant_app(v, &target, &ctx.config)?) } else { None };
+    let app = if kind == "app" || kind == "exe" { Some(with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?) } else { None };
     let seed = target["home"].as_str().map(|h| {
         let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
         Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
@@ -274,6 +274,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             refused: BTreeMap::new(),
             locked: false,
             display: None,
+            screen: None,
             reserve: None,
         })
     })();
@@ -640,7 +641,7 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
     store::write_json(
         &dir.join("meta.json"),
         &json!({
-            "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+            "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
             "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
             "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
         }),

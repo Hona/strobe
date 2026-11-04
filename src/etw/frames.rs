@@ -294,6 +294,23 @@ impl Reactions {
     }
 }
 
+/// The fastest rate (presents started per second) of `pids` in any of `runs`; None without presents.
+pub fn present_rate(presents: &[Present], pids: &[u32], runs: &[(u64, u64)]) -> Option<f64> {
+    runs.iter()
+        .filter(|(t0, t1)| t1 > t0)
+        .map(|&(t0, t1)| presents.iter().filter(|p| pids.contains(&p.pid) && p.start_ns >= t0 && p.start_ns < t1).count() as f64 / ((t1 - t0) as f64 / 1e9))
+        .filter(|r| *r > 0.0)
+        .max_by(f64::total_cmp)
+}
+
+/// `UnpacedSpin` as a warning: presents finishing far faster than the display refreshes (1.5 times
+/// its rate), whatever the toolkit believes (composited while the session is locked, a display
+/// asleep), with the rate and the refresh. `hz` from the vertical blanks, else the display's mode.
+pub fn spin(presents: &[Present], pids: &[u32], runs: &[(u64, u64)], hz: Option<f64>) -> Option<(f64, f64)> {
+    let hz = hz.filter(|hz| *hz > 0.0)?;
+    present_rate(presents, pids, runs).filter(|fps| *fps > 1.5 * hz).map(|fps| (fps, hz))
+}
+
 /// Runs in which the app presented faster than the display refreshes (more presents started than
 /// refreshes plus ten): a toolkit spinning unpaced, whose frames describe no person's screen.
 pub fn unpaced(presents: &[Present], pids: &[u32], runs: &[(u64, u64)], refresh_ms: f64) -> Option<String> {

@@ -115,7 +115,7 @@ fn frame_metric(metric: &str) -> bool {
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     let target = ctx.describe["targets"][&s.target].clone();
-    let app = app(v, &target, &ctx.config)?;
+    let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
     let timed = set != Set::Attribution && set != Set::Memory && ctx.pixels_dir.is_none();
     if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
@@ -141,8 +141,20 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     };
     let drive = Drive { session: OnceCell::new(), pid: n.pid, home: home.dir.clone(), main: Cell::new(0) };
     ctx.target_qos = host::background_qos(Some(n.pid));
+    // The per-thread timeline, from the launch to the last run's end, in untimed blocks (`--check`,
+    // attribution): its system snapshot each second costs strobe about 1% of a core.
+    let timeline = (ctx.check || set == Set::Attribution).then(|| {
+        let (root, dir) = (n.pid, home.dir.clone());
+        wakes::Timeline::start(move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect())
+    });
     let mut steps = vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)];
     let result = runs(ctx, s, v, pair, set, keep, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
+    if let (Some(t), Ok(b)) = (timeline, &result) {
+        let t = t.stop();
+        if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+            let _ = crate::symbol::write_gz(&dir.join("timeline.json.gz"), &t);
+        }
+    }
     let closing = Instant::now();
     if let Some(s) = drive.session.get() {
         s.release_all();
@@ -495,6 +507,26 @@ fn runs(
                 ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: the OS present session's consumer used {o:.2}% of a core, over its 0.5% budget (SPEC §19)", v.role)));
             }
             let spun = refresh.and_then(|ms| frames::unpaced(&p.presents, &pids, &spans, ms));
+            // A spin the toolkit cannot see (composited while locked, a display asleep): said for
+            // every series, declared frame metrics or not, with the display's own rate when no
+            // vertical blanks came.
+            if let Some((fps, hz)) = frames::spin(&p.presents, &pids, &spans, refresh.map(|ms| 1000.0 / ms).or_else(|| display.as_ref().map(|d| d.hz)))
+                && !ctx.warnings.iter().any(|w| w.id == "UnpacedSpin")
+            {
+                let state = screen_state(&procs0, &procs1);
+                ctx.warnings.push(validity::warn(
+                    "UnpacedSpin",
+                    format!(
+                        "{} block: the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display (pacing broken{}), so it draws as fast as it can and its CPU and GPU numbers describe that spin",
+                        v.role,
+                        match (state["session"].as_str(), state["display"].as_str()) {
+                            (Some("locked"), _) => ", composited while the session is locked".to_string(),
+                            (_, Some(d)) if d != "on" => format!(", the display {d}"),
+                            _ => String::new(),
+                        }
+                    ),
+                ));
+            }
             let frames_refused = match overhead {
                 Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
                 _ => f.refused.clone().or(spun),
@@ -601,6 +633,7 @@ fn runs(
         ));
     }
     let background = busiest_others(&procs0, &procs1);
+    let screen = screen_state(&procs0, &procs1);
     let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
     let recording = if keep || set == Set::Attribution {
         let id = store::new_id("rec");
@@ -637,9 +670,10 @@ fn runs(
         store::write_json(
             &dir.join("meta.json"),
             &json!({
-                "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+                "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": refused, "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
+                "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
                 // The OS and GPU samples over the measured runs, for `query gpu`.
                 "os": samples.window(measured[0].t0, measured[measured.len() - 1].t1), "leak": leak_result,
                 "timing": if set == Set::Timing || set == Set::Lean { "clean" } else { "perturbed" },
@@ -669,6 +703,7 @@ fn runs(
         background,
         refused,
         leak: leak_result,
+        screen: Some(screen),
         ..Block::default()
     })
 }
@@ -787,7 +822,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if milestones.iter().any(|m| m.source == "page") {
         return Err(Error::usage(format!("{}: a native app has no page marks; read milestones from its output or a log file", s.case)));
     }
-    let app = app(v, &target, &ctx.config)?;
+    let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     let windowless = target["window"] == false || app.windowless;
     let until = match spec["until"].get("window").and_then(Value::as_str) {
         // A milestone of the app's own (an output or log line): the launch needs no window at all.
@@ -1087,8 +1122,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             store::write_json(
                 &dir.join("meta.json"),
                 &json!({
-                    "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+                    "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                     "target": app.exe, "probes": "attribution", "runs": 1, "values": meta_values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
+                    "gpu_cache": prepared.gpu_warm.map(|w| if w { "warm" } else { "cold" }),
                     "timing": "perturbed",
                     "note": format!("a native launch's attribution: its values and output, not timed; {stacks_note}"),
                 }),

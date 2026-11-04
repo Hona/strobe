@@ -70,6 +70,10 @@ pub fn wake_display() {
     win::wake_display();
 }
 
+/// The processes that composite the screen, by executable name: Windows' desktop window manager,
+/// macOS's window server, X servers and the common Wayland and X11 compositors.
+pub const COMPOSITORS: &[&str] = &["dwm.exe", "WindowServer", "Xorg", "Xwayland", "gnome-shell", "kwin_wayland", "kwin_x11", "weston", "sway", "picom", "mutter"];
+
 /// The console display's state (0 off, 1 on, 2 dimmed) and how many times it changed so far; None
 /// where it is not known.
 pub fn display_state() -> Option<(u8, u64)> {

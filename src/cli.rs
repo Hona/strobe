@@ -28,6 +28,7 @@ const SWITCHES: &[&str] = &[
     "os-frames",
     "style",
     "force",
+    "timeline",
 ];
 
 #[derive(Clone)]
@@ -136,6 +137,7 @@ Use
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
   record --bench <file.bench.ts>#<case> [--head <variant>]
                                   record one bench case (it drives the page: clicks, keys) with the attribution probes
+                                  (a native app: --gpu-cache warm|cold, its GPU shader caches from earlier recordings of it)
   record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)
@@ -152,7 +154,8 @@ Use
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
-                                  (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
+                                  (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>;
+                                  threads --timeline: each thread's CPU per second from the launch, exited ones too)
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
                                   (md and pr print the markdown; the file's path goes to stderr)
@@ -173,6 +176,6 @@ Setup
 Targets   https://… · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native] · cdp:<port> · cdp:ws://… · file:<path>
           · pid:<n> · proc:<name>
 Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
-Global    --json  -q  -h  -V
+Global    --json  -q  -h  -V  --progress stderr|stdout|off (stdout for shells that count stderr lines as a failure)
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable
 ";

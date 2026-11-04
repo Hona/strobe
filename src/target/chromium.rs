@@ -309,6 +309,7 @@ impl Browser {
                 super::isolate::kill_tree(pid);
             }
             super::isolate::restore_protocols(&p);
+            super::isolate::keep_gpu_caches(&p);
             // Chromium may hold files for a moment after exit.
             for _ in 0..20 {
                 if std::fs::remove_dir_all(&p).is_ok() {

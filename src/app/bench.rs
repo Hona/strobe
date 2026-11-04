@@ -170,6 +170,13 @@ fn tree_state(root: &Path) -> Option<String> {
     Some(format!("{sha} {:x}", sha2::Sha256::digest(&diff.stdout)))
 }
 
+/// What a recording says about the variant it ran: the commit, uncommitted changes and their hash
+/// (what the build read), so a kept or `--check` recording still names its code later.
+fn variant_git(v: &Variant) -> Value {
+    let changes = v.state.as_deref().and_then(|s| s.split_once(' ')).map(|(_, h)| &h[..12.min(h.len())]).filter(|_| v.dirty);
+    json!({ "spec": v.spec, "commit": v.commit, "dirty": v.dirty, "changes": changes })
+}
+
 impl Drop for Variant {
     fn drop(&mut self) {
         if let Some(mut s) = self.server.take() {
@@ -294,6 +301,9 @@ struct Block {
     /// idles deeper), so both blocks of a pair share it.
     #[serde(skip_serializing_if = "Option::is_none")]
     display: Option<u8>,
+    /// The display, session and compositor over the block (`screen_state`), where strobe read them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen: Option<Value>,
     /// What `--reserve-cpus` did in this block: processes moved, started during it, not movable, and
     /// the sweep's own CPU (% of one core).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -324,6 +334,8 @@ struct Ctx<'a> {
     launched: std::collections::BTreeSet<String>,
     /// Warm launch homes per series and variant, removed when the experiment ends.
     homes: BTreeMap<String, PathBuf>,
+    /// Per target, how its launches found the GPU shader caches (`gpuCache`), for the plan.
+    gpu_cache: BTreeMap<String, String>,
     /// `--check`: one block per series on head, one run per case, no statistics.
     check: bool,
     /// A pixels block's snapshot folder (`--pixels`); `None` in every timed block.
@@ -505,6 +517,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let _own = OwnAffinity(runner_pin.and_then(host::set_affinity));
     progress(format!("strobe bench {} · {exp}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()));
     let busy = host::system_busy(1000);
+    isolate::prune_gpu_caches();
     let runner = Runner::spawn(&file, dir.join("runner.log"), runner_pin)?;
     let mut ctx = Ctx {
         args,
@@ -533,6 +546,7 @@ pub fn run(args: &Args) -> Result<Output> {
         waited_ms: 0.0,
         launched: Default::default(),
         homes: BTreeMap::new(),
+        gpu_cache: BTreeMap::new(),
         check,
         pixels_dir: None,
         native_setup: BTreeMap::new(),
@@ -691,6 +705,12 @@ pub fn run(args: &Args) -> Result<Output> {
     for home in std::mem::take(&mut ctx.homes).into_values() {
         let _ = std::fs::remove_dir_all(home);
     }
+    // The experiment's GPU cache stores go with it; a stopped one keeps them for `--resume`.
+    if halted.as_ref().is_none_or(|h| h.code != 130) && args.get("gpu-store") != Some("exe") {
+        for v in variants.iter() {
+            let _ = std::fs::remove_dir_all(gpu_store(&exp, v));
+        }
+    }
     if let Some(t) = &ctx.reserved {
         ctx.warnings.push(validity::info("ReservedCpus", t.text()));
     }
@@ -725,7 +745,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
         "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
         "plan": {
-            "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa, "reserve": ctx.reserved, "reserve_mode": ctx.reserve,
+            "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa, "reserve": ctx.reserved, "reserve_mode": ctx.reserve, "gpu_cache": ctx.gpu_cache,
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
         },
@@ -785,9 +805,9 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         .ok()
         .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
         .unwrap_or_default();
-    let (passed, error, hint, values, refused, locked, recording) = match r {
-        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked, json!(b.recording)),
-        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null),
+    let (passed, error, hint, values, refused, locked, recording, screen) = match r {
+        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked, json!(b.recording), b.screen.unwrap_or(Value::Null)),
+        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
@@ -816,7 +836,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
-        "recording": recording,
+        "recording": recording, "screen": screen,
         "log": log, "log_path": ctx.runner.log,
     }))
 }
@@ -841,6 +861,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
             if let Some(rec) = s["recording"].as_str() {
                 text += &format!("      rec  {rec} · strobe query {rec} {}\n", if s["target_kind"] == "native" { "threads" } else { "summary" });
+            }
+            if let Some(line) = screen_line(&s["screen"]) {
+                text += &format!("      screen  {line}\n");
             }
             if let Some(rec) = s["attribution"].as_str() {
                 text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
@@ -996,7 +1019,47 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut halted: Option<Error> = None;
     // The primary's verdict at the look that decided it, kept while pairs continue for the secondaries.
     let mut decided_at: Option<Comparison> = None;
-    'pairs: for pair in pairs.len()..max_pairs {
+    // Warm GPU caches (`gpuCache`): discarded blocks per variant fill its store first, so no measured
+    // block pays a driver compiling its shaders cold. A driver may compile in the background for
+    // longer than a block (NVIDIA's Vulkan cache took two 40 s launches to fill), so they repeat
+    // while the store still grew by 5% (at most 3). A launch case's discarded first launch warms too.
+    if pairs.is_empty() && gpu_warming(ctx, s, &target)? {
+        'warm: for v in variants.iter() {
+            if !ctx.launched.insert(format!("{}\n{}\ngpu", s.label(), v.role)) {
+                continue;
+            }
+            let store = gpu_store(&ctx.exp, v);
+            for round in 1..=3 {
+                let before = isolate::gpu_cache_bytes(&store);
+                progress(format!("  {} warm-up block {round} (discarded): fills its GPU shader caches", v.role));
+                match block_on_screen(ctx, s, v, 0, Set::Lean, false) {
+                    Ok(b) => {
+                        if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+                            let _ = std::fs::remove_dir_all(dir);
+                        }
+                    }
+                    Err(e) if e.code == 130 || stop_requested() => {
+                        halted = Some(stop_error());
+                        break 'warm;
+                    }
+                    Err(e) => return Err(e),
+                }
+                let after = isolate::gpu_cache_bytes(&store);
+                let grew = after.saturating_sub(before);
+                if grew < (after / 20).max(64 << 10) {
+                    break;
+                }
+                if round == 3 {
+                    ctx.warnings.push(validity::warn(
+                        "GpuCacheGrowing",
+                        format!("{}: {}'s GPU shader caches still grew by {} in its third warm-up block: its measured blocks may still compile shaders", s.label(), v.role, fmt::bytes(grew as f64)),
+                    ));
+                }
+            }
+        }
+    }
+    let from = if halted.is_some() { max_pairs } else { pairs.len() };
+    'pairs: for pair in from..max_pairs {
         if stop_requested() {
             halted = Some(stop_error());
             break;
@@ -1727,6 +1790,37 @@ fn busiest_others(a: &(u64, Vec<host::ProcInfo>), b: &(u64, Vec<host::ProcInfo>)
     out
 }
 
+/// What the screen was doing over a block or recording, for its meta and `query summary`: the
+/// display (on, off, dimmed), the session (locked or not) and the compositor's CPU between two
+/// process snapshots. A recording made with the display asleep or locked draws differently (a
+/// composited spin, a parked compositor), and its numbers only compare with recordings in that state.
+pub(crate) fn screen_state(a: &(u64, Vec<host::ProcInfo>), b: &(u64, Vec<host::ProcInfo>)) -> Value {
+    let before: BTreeMap<u32, u64> = a.1.iter().map(|p| (p.pid, p.cpu_ns)).collect();
+    let span = b.0.saturating_sub(a.0).max(1) as f64;
+    let compositor = b.1.iter().filter(|p| host::COMPOSITORS.iter().any(|c| p.name.eq_ignore_ascii_case(c))).fold(None, |acc: Option<(String, f64)>, p| {
+        let pct = 100.0 * p.cpu_ns.saturating_sub(before.get(&p.pid).copied().unwrap_or(p.cpu_ns)) as f64 / span;
+        Some(match acc {
+            Some((n, x)) => (n, x + pct),
+            None => (p.name.clone(), pct),
+        })
+    });
+    json!({
+        "display": host::display_state().map(|d| match d.0 { 0 => "off", 1 => "on", _ => "dimmed" }),
+        "session": if host::session_locked() { "locked" } else { "unlocked" },
+        "compositor": compositor.map(|(name, pct)| json!({ "name": name, "cpu_pct": pct })),
+    })
+}
+
+/// `display on · session locked · dwm.exe 3.1% of a core`, from `screen_state`.
+pub(crate) fn screen_line(s: &Value) -> Option<String> {
+    let session = s["session"].as_str()?;
+    let mut parts = vec![format!("display {}", s["display"].as_str().unwrap_or("?")), format!("session {session}")];
+    if let Some(c) = s["compositor"].as_object() {
+        parts.push(format!("{} {:.1}% of a core", c["name"].as_str().unwrap_or("compositor"), c["cpu_pct"].as_f64().unwrap_or(f64::NAN)));
+    }
+    Some(parts.join(" · "))
+}
+
 /// The commit subject of a git variant, so a report still says what was compared days later.
 fn subject(v: &Variant) -> Option<String> {
     let root = v.root.as_ref()?;
@@ -2100,7 +2194,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
         crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), &window, ctx.pin)?.0
     } else if app {
-        let launch = variant_app(v, &target, &ctx.config)?;
+        let launch = with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?;
         let seed = seed_dir(ctx, s, &target);
         let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
         guard = Some(g);
@@ -2466,6 +2560,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             })
             .collect();
         let background = busiest_others(&procs0, &procs1);
+        let screen = screen_state(&procs0, &procs1);
         let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
         let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
         // The window must have stayed visible for the whole block.
@@ -2642,9 +2737,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let intervals = metrics::run_intervals(&data);
         let recording = if keep || set == Set::Memory {
             let mut meta = json!({
-                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
-                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version, "background": background,
+                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version, "background": background, "screen": screen,
             });
             if !census.is_empty() {
                 meta["census"] = json!(census);
@@ -2678,6 +2773,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             refused: BTreeMap::new(),
             locked: false,
             display: None,
+            screen: Some(screen),
             reserve: None,
         })
     })();
@@ -2753,6 +2849,51 @@ fn seed_dir(ctx: &Ctx, s: &Series, target: &Value) -> Option<PathBuf> {
 /// Native targets (`native.rs`).
 fn is_native(target: &Value) -> bool {
     target["kind"] == "native"
+}
+
+/// Where a variant's launches keep their GPU shader caches during an experiment (`gpuCache: "warm"`).
+fn gpu_store(exp: &str, v: &Variant) -> PathBuf {
+    host::paths::sub("gpu-cache").join(format!("{exp}-{}", v.role))
+}
+
+/// The target's `gpuCache` (else its app profile's; default `warm`) set on `app`: `warm` lends each
+/// launch the GPU shader caches the variant's earlier launches compiled (its own store, never the
+/// other variant's or the user's), as a person's machine has them; `cold` starts every launch
+/// without any. `--check` has no discarded block: its first launch per variant is cold, the next
+/// (the next case, `--why always`'s attribution block) warm. Noted per target for the plan.
+fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut app: isolate::App) -> Result<isolate::App> {
+    let mode = target["gpuCache"].as_str().or(app.gpu_cache_mode.as_deref()).unwrap_or("warm").to_string();
+    let note = match mode.as_str() {
+        _ if cfg!(target_os = "macos") => "os: macOS keeps Metal's compiled shaders per app in the user's own cache folder, which a launch cannot move: warm, and shared by both variants",
+        "warm" if ctx.args.get("gpu-store") == Some("exe") => {
+            app.gpu_cache = Some(isolate::exe_gpu_store(&app.exe));
+            "warm: recordings of one executable share its GPU shader caches (the first recording's launches compile them)"
+        }
+        "warm" => {
+            app.gpu_cache = Some(gpu_store(&ctx.exp, v));
+            "warm: each variant keeps the driver's and Chromium's GPU shader caches across its own launches, from discarded first blocks"
+        }
+        "cold" => "cold: every launch compiles its shaders again (gpuCache: \"cold\")",
+        other => return Err(Error::usage(format!("{}: gpuCache is warm or cold, not {other}", s.target))),
+    };
+    ctx.gpu_cache.entry(s.target.clone()).or_insert_with(|| note.to_string());
+    Ok(app)
+}
+
+/// Whether a series' launches of `target` take warm GPU caches that its first block of each variant
+/// fills (the block before the pairs, discarded).
+fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
+    let kind = target["kind"].as_str().unwrap_or("");
+    if ctx.check || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe") {
+        return Ok(false);
+    }
+    let profile = match kind {
+        "native" => target["app"].as_str(),
+        "app" => target["id"].as_str(),
+        _ => target["app"].as_str(),
+    };
+    let from_profile = profile.and_then(|id| isolate::app(id, &ctx.config).ok()).and_then(|a| a.gpu_cache_mode);
+    Ok(target["gpuCache"].as_str().map(str::to_string).or(from_profile).as_deref().unwrap_or("warm") == "warm")
 }
 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is

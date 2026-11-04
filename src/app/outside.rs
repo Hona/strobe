@@ -87,10 +87,16 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let cycles = || host::process_tree(root).iter().map(|p| p.cycles).sum::<u64>();
     // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
     let snap0 = wakes::Snapshot::take(&host::tree_pids(root));
+    let timeline = wakes::Timeline::start(move || host::tree_pids(root));
+    let procs0 = (host::now_ns(), host::all_processes());
     let (c0, tsc0, t0) = (cycles(), host::tsc(), host::now_ns());
     progress(format!("recording {name} ({root}) for {}", fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     let (c1, tsc1, t1) = (cycles(), host::tsc(), host::now_ns());
+    let screen = super::bench::screen_state(&procs0, &(host::now_ns(), host::all_processes()));
+    let mut timeline = timeline.stop();
+    timeline.marks.push(("recording".into(), t0, t1));
+    crate::symbol::write_gz(&dir.join("timeline.json.gz"), &timeline)?;
     let tree = host::process_tree(root);
     let pids: Vec<u32> = tree.iter().map(|p| p.pid).collect();
     let span = wakes::span(&snap0, &wakes::Snapshot::take(&pids));
@@ -136,6 +142,13 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     if let Some(v) = os.vram_shared_mb {
         values.insert("gpu.shared".into(), v);
     }
+    // Presents far faster than the display refreshes, locked or not (`UnpacedSpin`).
+    let unpaced = presents.as_ref().ok().and_then(|p| {
+        let pids = host::tree_pids(root);
+        let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
+        let hz = frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
+        frames::spin(&p.presents, &pids, &[(t0, t1)], hz)
+    });
     let mut session = Value::Null;
     let refused = match &presents {
         _ if session_locked => Some("SessionLocked: the session was locked while strobe recorded, so nothing reached the display".to_string()),
@@ -161,10 +174,11 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let meta = json!({
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
         "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,
-        "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true,
+        "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true, "screen": screen,
+        "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })),
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
-    Ok(Output::new(text(&meta), meta))
+    Ok(Output::new(super::record::summary_text(&meta), meta))
 }
 
 pub fn text(meta: &Value) -> String {

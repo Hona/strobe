@@ -37,6 +37,9 @@ pub fn main() -> i32 {
         Ok(a) => a,
         Err(e) => return fail(&e, false),
     };
+    if let Err(e) = progress_mode(&args) {
+        return fail(&e, args.json());
+    }
     if args.has("version") {
         println!("strobe {}", env!("CARGO_PKG_VERSION"));
         return 0;
@@ -107,10 +110,32 @@ pub fn progress_to(path: Option<std::path::PathBuf>) {
     *PROGRESS_FILE.lock().unwrap() = path;
 }
 
-/// Progress lines for long commands go to stderr so stdout stays the result.
+/// Where progress lines go (`--progress`, else `STROBE_PROGRESS`): `stderr` (default), `stdout` or `off`.
+static PROGRESS: std::sync::OnceLock<&'static str> = std::sync::OnceLock::new();
+
+fn progress_mode(args: &Args) -> Result<()> {
+    let mode = match args.get("progress").map(str::to_string).or_else(|| std::env::var("STROBE_PROGRESS").ok()).as_deref() {
+        None | Some("stderr") => "stderr",
+        // Never into `--json` output: one document on stdout.
+        Some("stdout") if args.json() => "off",
+        Some("stdout") => "stdout",
+        Some("off") => "off",
+        Some(other) => return Err(Error::usage(format!("--progress is stderr, stdout or off, not {other}"))),
+    };
+    let _ = PROGRESS.set(mode);
+    Ok(())
+}
+
+/// Progress lines for long commands go to stderr so stdout stays the result; `--progress stdout`
+/// for shells that count any stderr line as a failure (Windows PowerShell 5.1 with `2>&1` or `*>`
+/// sets `$?` to false, and `powershell -Command` then exits 1, while strobe's own exit code,
+/// `$LASTEXITCODE`, is 0).
 pub fn progress(msg: impl AsRef<str>) {
-    if std::env::var_os("STROBE_QUIET").is_none() {
-        eprintln!("{}", msg.as_ref());
+    match *PROGRESS.get().unwrap_or(&"stderr") {
+        "off" => {}
+        _ if std::env::var_os("STROBE_QUIET").is_some() => {}
+        "stdout" => println!("{}", msg.as_ref()),
+        _ => eprintln!("{}", msg.as_ref()),
     }
     if let Some(p) = PROGRESS_FILE.lock().unwrap().as_ref()
         && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p)

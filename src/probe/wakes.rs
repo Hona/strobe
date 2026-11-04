@@ -95,6 +95,124 @@ pub fn span(a: &Snapshot, b: &Snapshot) -> Span {
     out
 }
 
+/// Every second: each thread's CPU and wakes over a whole launch, threads that exited included
+/// (`query <rec> threads --timeline`), so work that starts late and stops again (a driver compiling
+/// shaders 25 s after the launch) shows when it ran, not only as a per-run total.
+pub const TIMELINE_EVERY: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// One thread on a timeline: when it first and last showed, its name and the module it started in,
+/// read while it ran (a thread that exited has neither later).
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct TimelineThread {
+    pub pid: u32,
+    pub tid: u32,
+    pub name: Option<String>,
+    pub module: Option<String>,
+    pub first_ns: u64,
+    pub last_ns: u64,
+}
+
+/// What a timeline sampler saw. `cells` are (tick, thread, CPU ms, wakes) for the ticks a thread ran
+/// in, CPU from the thread's kernel and user times (Windows counts them in clock ticks of 15.6 ms:
+/// within a few percent over a second); tick `i` covers `(ticks[i - 1], ticks[i]]` (tick 0 from `t0_ns`). A thread's CPU between its
+/// last sighting and its exit is not in it (at most one interval).
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct TimelineData {
+    pub t0_ns: u64,
+    pub interval_ms: u64,
+    pub ticks: Vec<u64>,
+    pub threads: Vec<TimelineThread>,
+    pub cells: Vec<(u32, u32, f32, u32)>,
+    /// The sampler thread's own CPU (rule 2).
+    pub cpu_ms: Option<f64>,
+    /// Spans to show on it (name, start, end), when the recording keeps no runs of its own.
+    #[serde(default)]
+    pub marks: Vec<(String, u64, u64)>,
+}
+
+/// Samples a process set's threads on a background thread until `stop`.
+pub struct Timeline {
+    stop: std::sync::mpsc::Sender<()>,
+    thread: std::thread::JoinHandle<TimelineData>,
+}
+
+impl Timeline {
+    /// `pids` names the processes at each tick (a tree and what runs from its home).
+    pub fn start(pids: impl Fn() -> Vec<u32> + Send + 'static) -> Timeline {
+        let (stop, rx) = std::sync::mpsc::channel::<()>();
+        let thread = std::thread::Builder::new()
+            .name("strobe-timeline".into())
+            .spawn(move || {
+                let (k0, tsc0, ns0) = (host::thread_cycles(), host::tsc(), host::now_ns());
+                // One system snapshot a tick, its threads' context switches and CPU time (no handle per
+                // thread: the cycle counters cost more than the snapshot). Which processes: read again
+                // every few ticks (finding what runs from a home opens every process).
+                type Threads = BTreeMap<(u32, u32), (u32, u64)>;
+                let read = |set: &[u32]| -> (u64, Threads) {
+                    let mut sorted = set.to_vec();
+                    sorted.sort_unstable();
+                    sorted.dedup();
+                    let at = host::now_ns();
+                    (at, host::threads(&sorted).0.into_iter().map(|t| ((t.pid, t.tid), (t.switches, t.cpu_ns))).collect())
+                };
+                let mut set = pids();
+                let (t0, mut prev) = read(&set);
+                let mut out = TimelineData { t0_ns: t0, interval_ms: TIMELINE_EVERY.as_millis() as u64, ..TimelineData::default() };
+                let mut index: BTreeMap<(u32, u32), u32> = BTreeMap::new();
+                let mut seen = |out: &mut TimelineData, at: u64, threads: &Threads| {
+                    let mut new = Vec::new();
+                    for &(pid, tid) in threads.keys() {
+                        let i = *index.entry((pid, tid)).or_insert_with(|| {
+                            new.push((pid, tid));
+                            out.threads.push(TimelineThread { pid, tid, name: host::thread_name(tid), first_ns: at, ..TimelineThread::default() });
+                            out.threads.len() as u32 - 1
+                        });
+                        out.threads[i as usize].last_ns = at;
+                    }
+                    if !new.is_empty() {
+                        let modules = host::thread_modules(&new);
+                        for t in out.threads.iter_mut().filter(|t| t.module.is_none()) {
+                            t.module = modules.get(&t.tid).cloned();
+                        }
+                    }
+                    index.clone()
+                };
+                seen(&mut out, t0, &prev);
+                loop {
+                    if !matches!(rx.recv_timeout(TIMELINE_EVERY), Err(std::sync::mpsc::RecvTimeoutError::Timeout)) {
+                        break;
+                    }
+                    let tick = out.ticks.len() as u32;
+                    if tick % 5 == 4 {
+                        set = pids();
+                    }
+                    let (at, now) = read(&set);
+                    let index = seen(&mut out, at, &now);
+                    for (key, &(switches, cpu_ns)) in &now {
+                        // A thread born in the tick counts from zero.
+                        let (s0, c0) = prev.get(key).copied().unwrap_or((0, 0));
+                        let (wakes, cpu) = (switches.wrapping_sub(s0), cpu_ns.saturating_sub(c0) as f64 / 1e6);
+                        if wakes > 0 || cpu > 0.0 {
+                            out.cells.push((tick, index[key], cpu as f32, wakes));
+                        }
+                    }
+                    out.ticks.push(at);
+                    prev = now;
+                }
+                let hz = tsc0.zip(host::tsc()).map(|(a, b)| (b - a) as f64 / ((host::now_ns() - ns0) as f64 / 1e9)).filter(|&hz| hz > 0.0 && k0 > 0);
+                out.cpu_ms = hz.map(|hz| (host::thread_cycles() - k0) as f64 / hz * 1e3);
+                out
+            })
+            .expect("spawn the timeline thread");
+        Timeline { stop, thread }
+    }
+
+    pub fn stop(self) -> TimelineData {
+        let _ = self.stop.send(());
+        self.thread.join().unwrap_or_default()
+    }
+}
+
 /// Who a thread belongs to, by the module it started in: `driver` (a device driver's user-mode part,
 /// from the driver store, such as a GPU driver's worker threads), `os` (the OS's own: its thread pool,
 /// audio, RPC; a pool thread may run the app's callbacks), else `app`. Unknown without a module.

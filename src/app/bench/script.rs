@@ -300,6 +300,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             refused: BTreeMap::new(),
             locked: false,
             display: None,
+            screen: None,
             reserve: None,
         })
     })();
@@ -327,7 +328,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         store::write_json(
             &rec.join("meta.json"),
             &json!({
-                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
+                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": target["entry"], "probes": set, "runs": block.run_ms.len(), "values": block.values,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "script": true,
                 "note": "script profiles cover the whole host process: its start, setup, warmup and measured runs",

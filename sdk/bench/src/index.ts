@@ -243,11 +243,14 @@ interface Hooks<P> {
 export type Target<P> =
   | ({ kind: "web"; url: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P>)
   | ({ kind: "url"; href: string; viewport?: Viewport; scale?: number } & Hooks<P>)
-  | { kind: "app"; id: string; home?: string; viewport?: Viewport }
-  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport }
+  | { kind: "app"; id: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache }
+  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache }
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
   | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
+
+/** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
+export type GpuCache = "warm" | "cold"
 
 export interface Viewport {
   width: number
@@ -297,6 +300,12 @@ export interface NativeOptions {
   env?: Record<string, string>
   /** Variables the launch removes, after the profile's (`PREFIX_*` for a family): `["WAYLAND_DISPLAY"]` for an X11 run. */
   unset?: string[]
+  /**
+   * `"warm"` (default): each variant keeps the GPU driver's compiled shaders across its own launches (a discarded first
+   * block fills them), as a person's machine has them; never the other variant's or yours. `"cold"`: every launch
+   * starts without, so the driver compiles again (first launch after an install or a driver update).
+   */
+  gpuCache?: GpuCache
 
   /**
    * `false`: the app shows no window (a tray app). strobe neither waits for one nor places or checks it, launches end
@@ -341,12 +350,12 @@ export function url<P = any>(href: string, opts: { viewport?: Viewport; scale?: 
 }
 
 /** An installed Electron app, by its profile in strobe.json `apps`, in a fresh isolated home seeded from `home`. */
-export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport } = {}): Target<P> {
+export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport; gpuCache?: GpuCache } = {}): Target<P> {
   return { kind: "app", id, ...opts }
 }
 
 /** A packaged Electron app by path; `app` borrows a profile from strobe.json `apps` for it. */
-export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport } = {}): Target<P> {
+export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache } = {}): Target<P> {
   return { kind: "exe", path, ...opts }
 }
 

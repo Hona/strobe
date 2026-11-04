@@ -204,8 +204,16 @@ strobe <command> [flags]
 Setup      up · update · leave
 Use        status · record · bench · query · report · top
 Internal   daemon · mcp · helper (hidden)
-Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
+Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
+
+Progress lines of long commands go to stderr (stdout stays the result); `--progress stdout` (or
+`STROBE_PROGRESS=stdout`) puts them on stdout, `off` drops them; with `--json` stdout never gets
+them. Windows PowerShell 5.1 turns every stderr line of a native command it redirects (`2>&1`,
+`*>`) into an error record and sets `$?` to false, and `powershell -Command` then exits 1 although
+strobe exited 0: read strobe's own code from `$LASTEXITCODE`, or use `--progress stdout`. Checked on
+adais: a successful `record --bench` exits 0 (`$LASTEXITCODE`), and its shell reported 1 only with
+`2>&1`.
 
 ### 5.1 Targets
 
@@ -570,6 +578,18 @@ What strobe reads from a native app (§13.7), per run:
   folder: its thread pool and services) (`query <rec> threads`). The `wakes-while-idle` insight
   counts the app's own threads and names driver and OS threads apart. Every adapter the app used is
   recorded (`ctx.gpu.devices`), each with its own engine use.
+- **A thread timeline** (native `record`, `record pid:`, and native bench blocks that are not timed:
+  `--check` and attribution): a thread of strobe's takes the same system snapshot every second from
+  the launch (or the recording's start) to the last run's end, over the tree (and what runs from
+  its home, read every 5 s), and keeps each thread's CPU (its kernel and user times: Windows counts
+  them in 15.6 ms clock ticks, within a few percent over a second) and wakes per second, when it
+  first and last showed, its name and its start module, read while it ran (`timeline.json.gz`). `query <rec> threads --timeline` draws one column per second (coarser
+  past two minutes) per thread with the runs marked, so work that starts late and stops shows when
+  it ran ("a driver thread from 23 s to 52 s"), and threads that exited are listed (`query <rec>
+  threads` names them below the per-run list, with their CPU over the recording). A thread's CPU
+  between its last snapshot and its exit is missing (at most one interval). Its own CPU is in the
+  file: the system snapshot dominates (about 9 ms a second on adais with 350 processes and 8,000
+  threads), which is over the samplers' budget (§19), so timed blocks have none.
 - **The UI thread, from outside:** the thread that owns the main window is the app's UI thread (on
   macOS and Linux no thread owns a window: it is the process's main thread, where AppKit must run and
   X11 toolkits do).
@@ -1501,7 +1521,22 @@ and the CPU metrics kept say to compare them only at the same priority) · `Curs
 while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`
 (the present session's consumer over 0.5% of a core) · `PresentsLost` · `VariantChanged` (a folder
 variant's commit or uncommitted changes differ, when a series builds it, from when the bench started:
-later series measure what it holds then).
+later series measure what it holds then) · `UnpacedSpin` as a warning (a native block's presents ran
+1.5 times faster than the display refreshes, from the vertical blanks or else the display's mode:
+its pacing is broken, such as an app composited while the session is locked at about 545 frames a
+second on a 165 Hz display, so it draws as fast as it can and its CPU and GPU numbers describe that;
+said for every series, declared frame metrics or not, with the session and display state; native
+`record` and `record pid:` keep it as `unpaced` and `query summary` prints it) · `GpuCacheGrowing`
+(a variant's GPU shader caches still grew in its third warm-up block, §13.2).
+
+**Screen state.** Every native block and Chromium block, `record` of a native app and `record pid:`
+keep `screen` in their meta: the display (`on`, `off`, `dimmed`: `GUID_CONSOLE_DISPLAY_STATE` on
+Windows), the session (`locked` or not) and the compositor's CPU over the block (`dwm.exe` on
+Windows, `WindowServer` on macOS, the X server or Wayland compositor on Linux, from two process
+snapshots), so a recording made with the display asleep or the session locked says so. `--check`
+prints it under each case (`screen  display on · session locked · dwm.exe 3.1% of a core`) and
+`query <rec> summary` beside the variant's commit (`variant_git`: commit, uncommitted changes and
+their diff hash, kept in every block recording) and whether the launch found GPU shader caches.
 
 `report --format pr` prints every warning and the context notes that say what the numbers compare
 with: `SessionLocked`, `DisplayOff`, `PowerPlan`, `CrossAdapterScanout`, `FewPairs`, `StaleCalibration`.
@@ -1737,6 +1772,35 @@ Strobe launches any Electron app the same way, with no change to the app:
   asks for the script itself (shebang and `chmod +x`, or a launcher) as the executable.
 - On close, every process running from the home is killed (detached children outlive the tree),
   then the home is deleted.
+- **GPU shader caches** (`gpuCache`, a native or app target option, else the app profile's;
+  default `warm`). A GPU driver keeps the shaders it compiled under the per-user folders the home
+  redirects (NVIDIA `%LOCALAPPDATA%\NVIDIA\DXCache` and `GLCache`, `D3DSCache`, AMD `DxCache`,
+  `DxcCache`, `VkCache`, `OglCache`, Intel `LocalLow\Intel\ShaderCache`; Mesa
+  `$XDG_CACHE_HOME/mesa_shader_cache`, NVIDIA's Linux `$XDG_CACHE_HOME/nvidia` and `~/.nv`), and
+  Chromium keeps its own in the profile (`GPUCache`, `GrShaderCache`, `GraphiteDawnCache`,
+  `DawnGraphiteCache`, `DawnWebGPUCache`, `ShaderCache`). A person's are warm; a fresh home's are
+  empty, so every block compiled again: Hex's dictation spent 4.6 to 5.3 s of each 6 s run in
+  NVIDIA's compiler on a driver thread, from about 25 s after the launch, which drowned the app's
+  own CPU. With `warm`, each variant has its own store (`<state>/gpu-cache/<exp>-<role>`): before a
+  launch its folders are moved into the home (a rename, no copy; what a seed put there wins), and
+  when the home goes they are moved back. Base and head never share one, and neither touches the
+  user's own caches. Discarded warm-up blocks per series and variant fill the store before the
+  first pair, again while the store still grew by 5% (at most 3: NVIDIA's Vulkan cache took two
+  40 s launches to fill; `GpuCacheGrowing` warns after the third); a launch case's discarded first
+  launch warms it too. The experiment removes its stores when it ends (a stopped one keeps them
+  for `--resume`), and stores unused for a week go. `--check` has no warm-up block: its first launch
+  per variant is cold, the next warm. `record` and `record --bench` share one store per
+  executable (`gpu-cache/rec-<hash>`): the first recording of a build is cold, later ones warm
+  (`--gpu-cache cold` keeps a recording cold). `cold` starts every launch without: the first launch
+  after an install or a driver update. The plan (`plan.gpu_cache`) says which per target, and each
+  kept recording whether its launch found caches (`gpu_cache`). Killing the tree loses nothing:
+  the driver's cache files are written as it compiles (memory-mapped, flushed at the process's
+  end). macOS keeps Metal's compiled shaders per app in the per-user cache folder the OS assigns
+  (`getconf DARWIN_USER_CACHE_DIR`, `<bundle id>/com.apple.metal`), which no environment variable
+  moves: launches there use the user's own cache, warm and shared by both variants, and the plan
+  says so. Pages (`web`, `url`) run the installed browser with the user's driver caches (the
+  browser is the same binary for both variants) and a fresh profile's empty GPU caches, which the
+  block's warmup runs fill.
 
 What one app needs beyond that is its **app profile**, in the consumer's strobe.json (rule 15):
 
@@ -2260,6 +2324,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | daemon idle private memory | ≤ 8 MB |
 | daemon idle CPU | ≤ 0.1% of one core |
 | samplers while recording | ≤ 0.5% of one core |
+| thread timeline (`record`, `--check` and attribution blocks only, §7.4) | ≤ 1% of one core, in its own file (`cpu_ms`) |
 | OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block) |
@@ -2330,7 +2395,7 @@ Phase 0 runs two tracks in parallel.
 Uploading or sharing recordings · hosted dashboards · Firefox and Safari · mobile · GPU frame
 capture (RenderDoc or PIX level) · macOS deep mode · any automated tests.
 
-## 24. As built (2026-11-04)
+## 24. As built (2026-11-05)
 
 What exists today, against §1–§23. The design above stays the target; this section says where the
 code is and where it chose differently, so nobody reads a promise as a feature.
@@ -2457,6 +2522,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `refused (<validator>): …` in the series, as `TailTooShort` does. `native(path)` is a fixed
   executable: a build never replaces it. `{cache}` keeps the platform's separators (cmd's own
   commands read `/` as a switch).
+- GPU shader caches (§13.2), checked on adais (RTX 5070 Ti, Hex's dictation `recording` case, a
+  Vulkan model): NVIDIA's driver-thread CPU over a `record --bench` (a check launch, then an
+  attribution launch) went 5.2 s (cold, 23 s launch) then 26.5 s, 13.5 s and 0.55 s (80 to 115 s
+  launches) as the executable's store filled over three recordings; a warm check launch's driver
+  threads used 26 ms. By hand, a 40 s dictation in one home: 41.3 s of the process's CPU cold, 20.7 s
+  after one killed launch, 2.8 s after a second. The cache files grow when the process ends, killed
+  or not. Each variant's store is lent by renaming folders into the home and back.
 - Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread --phase`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`

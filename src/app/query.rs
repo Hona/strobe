@@ -73,6 +73,7 @@ pub fn run(args: &Args) -> Result<Output> {
             sql_view(&trace, sql, top.max(50))
         }
         "frames" if dir.join("frames.json").exists() || meta["native"] == true => native_frames(&dir, top),
+        "threads" if args.has("timeline") => thread_timeline(&dir, top),
         "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
@@ -841,8 +842,148 @@ fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     if gone.is_finite() && gone > (0.05 * total).max(5.0) {
         text += &format!("{} per run in threads no longer there at the run's end (they exited during it): the processes spent {} per run, the threads above {}\n", fmt::value(gone, "ms"), fmt::value(total, "ms"), fmt::value(listed, "ms"));
     }
-    text += "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks). A thread that exited during a run is not listed\n";
-    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>(), "cpu_ms_per_run": total, "exited_ms_per_run": gone.is_finite().then_some(gone.max(0.0)) })))
+    // Threads that exited before the end, from the timeline (sampled every half second from the launch).
+    let mut exited_json = Vec::new();
+    if let Some(t) = read_timeline(dir) {
+        let end = t.ticks.last().copied().unwrap_or(t.t0_ns);
+        let listed: std::collections::BTreeSet<u64> = all.iter().filter_map(|r| r["tid"].as_u64()).collect();
+        let mut gone: Vec<(&crate::probe::wakes::TimelineThread, f64)> = t
+            .threads
+            .iter()
+            .enumerate()
+            .filter(|(_, th)| th.last_ns < end && !listed.contains(&(th.tid as u64)))
+            .map(|(i, th)| (th, t.cells.iter().filter(|c| c.1 as usize == i).map(|c| c.2 as f64).sum::<f64>()))
+            .filter(|(_, cpu)| *cpu >= 1.0)
+            .collect();
+        gone.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if !gone.is_empty() {
+            text += "exited before the end (CPU over the whole recording):\n";
+        }
+        let s = |ns: u64| ns.saturating_sub(t.t0_ns) as f64 / 1e9;
+        for (th, cpu) in gone.iter().take(top) {
+            let module = th.module.as_deref().map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m));
+            text += &format!(
+                "  {:>10}  {:>7}  {:<6}  {}{}  ran {:.1}-{:.1} s\n",
+                fmt::value(*cpu, "ms"),
+                th.tid,
+                th.module.as_deref().map(crate::probe::wakes::origin).unwrap_or("?"),
+                th.name.as_deref().unwrap_or("(unnamed)"),
+                module.map(|m| format!(" ({m})")).unwrap_or_default(),
+                s(th.first_ns),
+                s(th.last_ns)
+            );
+            exited_json.push(json!({ "pid": th.pid, "tid": th.tid, "name": th.name, "module": module, "cpu_ms": cpu, "first_s": s(th.first_ns), "last_s": s(th.last_ns) }));
+        }
+    }
+    text += &format!(
+        "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks).{}\n",
+        if dir.join("timeline.json.gz").exists() { " When each ran: --timeline" } else { " A thread that exited during a run is not listed" }
+    );
+    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>(), "cpu_ms_per_run": total, "exited_ms_per_run": gone.is_finite().then_some(gone.max(0.0)), "exited": exited_json })))
+}
+
+fn read_timeline(dir: &Path) -> Option<crate::probe::wakes::TimelineData> {
+    let mut text = String::new();
+    std::io::Read::read_to_string(&mut flate2::read::GzDecoder::new(std::fs::File::open(dir.join("timeline.json.gz")).ok()?), &mut text).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// `query <rec> threads --timeline`: each thread's CPU per second (or coarser for long recordings)
+/// from the launch, threads that exited included, with the runs marked, so work that starts late
+/// and stops shows when it ran.
+fn thread_timeline(dir: &Path, top: usize) -> Result<Output> {
+    let t = read_timeline(dir).ok_or_else(|| Error::usage("this recording has no thread timeline: native recordings and kept native bench blocks have one (from this strobe on)"))?;
+    let end = t.ticks.last().copied().unwrap_or(t.t0_ns);
+    let span_s = end.saturating_sub(t.t0_ns) as f64 / 1e9;
+    // One column per second, coarser past 120 s.
+    let bin_s = (span_s / 120.0).ceil().max(1.0);
+    let cols = ((span_s / bin_s).ceil() as usize).max(1);
+    let col = |ns: u64| (((ns.saturating_sub(t.t0_ns)) as f64 / 1e9 / bin_s) as usize).min(cols - 1);
+    let tick_start = |i: usize| if i == 0 { t.t0_ns } else { t.ticks[i - 1] };
+    // Spans to mark: the measured runs (a bench block's frames.json) or the recording's own window.
+    let mut marks: Vec<(String, u64, u64)> = t.marks.clone();
+    if let Ok(f) = store::read_json(&dir.join("frames.json")) {
+        for (name, r) in f["runs"].as_object().into_iter().flatten() {
+            marks.push((name.clone(), r["t0_ns"].as_u64().unwrap_or(0), r["t1_ns"].as_u64().unwrap_or(0)));
+        }
+    }
+    let n = t.threads.len();
+    let mut cpu = vec![vec![0.0f64; cols]; n];
+    let mut wakes = vec![vec![0u64; cols]; n];
+    for &(tick, th, ms, w) in &t.cells {
+        let i = tick as usize;
+        let c = col(tick_start(i) / 2 + t.ticks[i] / 2);
+        cpu[th as usize][c] += ms as f64;
+        wakes[th as usize][c] += w as u64;
+    }
+    let total: Vec<f64> = cpu.iter().map(|r| r.iter().sum()).collect();
+    let mut order: Vec<usize> = (0..n).filter(|&i| total[i] > 0.0 || wakes[i].iter().sum::<u64>() > 0).collect();
+    order.sort_by(|&a, &b| total[b].total_cmp(&total[a]));
+    let ramp = |pct: f64| match pct {
+        p if p < 1.0 => ' ',
+        p if p < 5.0 => '.',
+        p if p < 15.0 => ':',
+        p if p < 30.0 => '-',
+        p if p < 50.0 => '=',
+        p if p < 75.0 => '+',
+        p if p < 95.0 => '*',
+        _ => '#',
+    };
+    let mut axis = vec![' '; cols];
+    for c in (0..cols).step_by(10) {
+        for (k, ch) in format!("{}s", (c as f64 * bin_s) as u64).chars().enumerate() {
+            if c + k < cols {
+                axis[c + k] = ch;
+            }
+        }
+    }
+    let mut runs = vec![' '; cols];
+    for (_, a, b) in &marks {
+        if *b > *a {
+            for c in runs.iter_mut().take(col(*b) + 1).skip(col(*a)) {
+                *c = '~';
+            }
+        }
+    }
+    let mut text = format!(
+        "threads over time · one column per {} from the launch (a process recorded from outside: from the start) · CPU of one core: ' ' <1%  . <5%  : <15%  - <30%  = <50%  + <75%  * <95%  # more\n",
+        if bin_s == 1.0 { "second".to_string() } else { format!("{bin_s:.0} s") }
+    );
+    text += &format!("|{}|\n|{}|  {}\n", axis.iter().collect::<String>(), runs.iter().collect::<String>(), if marks.is_empty() { "" } else { "~ runs" });
+    let s = |ns: u64| ns.saturating_sub(t.t0_ns) as f64 / 1e9;
+    let mut rows = Vec::new();
+    for &i in order.iter().take(top) {
+        let th = &t.threads[i];
+        let strip: String = cpu[i].iter().map(|ms| ramp(100.0 * ms / (bin_s * 1e3))).collect();
+        let exited = th.last_ns < end;
+        let module = th.module.as_deref().map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m));
+        let peak = wakes[i].iter().copied().max().unwrap_or(0) as f64 / bin_s;
+        text += &format!(
+            "|{strip}|  {:>9}  {:>6} wakes/s peak  {:.1}-{:.1} s{}  {:<6} {}{} {}\n",
+            fmt::value(total[i], "ms"),
+            fmt::value(peak, "count"),
+            s(th.first_ns),
+            s(th.last_ns),
+            if exited { " exited" } else { "" },
+            th.module.as_deref().map(crate::probe::wakes::origin).unwrap_or("?"),
+            th.name.as_deref().unwrap_or("(unnamed)"),
+            module.map(|m| format!(" ({m})")).unwrap_or_default(),
+            th.tid
+        );
+        rows.push(json!({
+            "pid": th.pid, "tid": th.tid, "name": th.name, "module": module, "first_s": s(th.first_ns), "last_s": s(th.last_ns), "exited": exited,
+            "cpu_ms": total[i], "cpu_ms_per_bin": cpu[i], "wakes_per_bin": wakes[i],
+        }));
+    }
+    if order.len() > top {
+        text += &format!("… {} more (--top)\n", order.len() - top);
+    }
+    text += &format!(
+        "sampled every {} ms ({} of strobe's own CPU); a thread's CPU between its last sample and its exit is missing\n",
+        t.interval_ms,
+        t.cpu_ms.map(|c| fmt::value(c, "ms")).unwrap_or_else(|| "?".into())
+    );
+    Ok(Output::new(text, json!({ "bin_s": bin_s, "span_s": span_s, "marks": marks.iter().map(|(n, a, b)| json!({ "name": n, "from_s": s(*a), "to_s": s(*b) })).collect::<Vec<_>>(), "threads": rows })))
 }
 
 /// A native recording's frames: per measured run, what reached the screen (OS present events), the

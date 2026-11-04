@@ -23,6 +23,8 @@ use std::time::Duration;
 fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
     b.set("filter", case);
+    // Recordings of one executable share its GPU caches, as `record` does.
+    b.set("gpu-store", "exe");
     for k in ["target", "params", "id", "pin", "power", "runs", "style"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
@@ -254,7 +256,21 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     // end at one (`--for` caps it then).
     let line = |k: &str| args.get(k).map(|r| regex_lite::Regex::new(r).map_err(|e| Error::usage(format!("--{k}: {e}")))).transpose();
     let (until, stop) = (line("until-line")?, line("stop-line")?);
+    // `--gpu-cache` (else the profile's `gpuCache`; default warm): one store of GPU shader caches per
+    // executable, so a recording after the first runs with them warm, as for a person.
+    let mut app = app.clone();
+    match args.get("gpu-cache").or(app.gpu_cache_mode.as_deref()).unwrap_or("warm") {
+        "warm" if !cfg!(target_os = "macos") => app.gpu_cache = Some(isolate::exe_gpu_store(&app.exe)),
+        "warm" | "cold" => {}
+        other => return Err(Error::usage(format!("--gpu-cache is warm or cold, not {other}"))),
+    }
+    let app = &app;
     let home = isolate::prepare_home(app, args.get("home").map(std::path::Path::new), None)?;
+    match home.gpu_warm {
+        Some(true) => progress("GPU shader caches: warm, from earlier recordings of this executable"),
+        Some(false) => progress("GPU shader caches: cold, the first recording of this executable (the next one is warm; --gpu-cache cold keeps them cold)"),
+        None => {}
+    }
     progress(format!("launching {} in an isolated home", app.exe.display()));
     let (mut n, guard) = match nt::launch(app, &home, &[], until.is_some() || stop.is_some(), None) {
         Ok(x) => x,
@@ -268,6 +284,11 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     // nothing of it reaches the display: a locked session changes none of what is recorded.
     let windowless = app.windowless;
     let qos = host::background_qos(None).or_else(|| host::background_qos(Some(n.pid)));
+    // Each thread's CPU and wakes from the launch on (`query <rec> threads --timeline`).
+    let timeline = std::cell::RefCell::new(Some({
+        let (root, dir) = (n.pid, home.dir.clone());
+        wakes::Timeline::start(move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect())
+    }));
     let result = (|| -> Result<Value> {
         if !windowless {
             n.wait_window(Duration::from_secs(60), &guard)?;
@@ -306,6 +327,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             None => format!("recording {id} for {}", fmt::ms_duration(for_ms)),
         });
         let snap0 = wakes::Snapshot::take(&n.pids());
+        let procs0 = (host::now_ns(), host::all_processes());
         let c0 = cycles();
         let t0 = host::now_ns();
         match &stop {
@@ -323,6 +345,12 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let for_ms = (t1 - t0) / 1_000_000;
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
+        let screen = super::bench::screen_state(&procs0, &(host::now_ns(), host::all_processes()));
+        if let Some(t) = timeline.borrow_mut().take() {
+            let mut t = t.stop();
+            t.marks.push(("recording".into(), t0, t1));
+            crate::symbol::write_gz(&dir.join("timeline.json.gz"), &t)?;
+        }
         let os = sampler.stop().window(t0, t1);
         let presents = presents.map(|r| r.and_then(|c| c.stop()));
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
@@ -335,6 +363,14 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             n.check_visible()?;
         }
         let mut frame_values = BTreeMap::new();
+        let unpaced = match &presents {
+            Some(Ok(p)) => {
+                let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
+                let hz = crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
+                crate::etw::frames::spin(&p.presents, &n.pids(), &[(t0, t1)], hz)
+            }
+            _ => None,
+        };
         let os_frames = match &presents {
             Some(Ok(p)) => {
                 let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
@@ -402,6 +438,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let mut meta = json!({
             "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "os": os,
             "window": n.window, "ui_thread": ui_tid, "created": now_iso(), "valid": true, "os_frames": os_frames, "session_locked": session_locked,
+            "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
+            "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })),
             // A debug build's times describe no build people run (`DevBuild`).
             "timing": if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
             "note": if set == Set::Attribution { format!("native attribution: OS samples; {stacks_note}") } else { String::new() },
@@ -505,6 +543,38 @@ fn background_line(meta: &Value) -> Option<String> {
 }
 
 pub fn summary_text(meta: &Value) -> String {
+    let mut s = summary_body(meta);
+    s += &context_lines(meta);
+    s
+}
+
+/// What a recording ran and in what state, where it kept them: the variant's commit, the screen
+/// (display, session, compositor), the GPU shader caches, and presents that never waited for the
+/// display.
+fn context_lines(meta: &Value) -> String {
+    let mut s = String::new();
+    let g = &meta["variant_git"];
+    if let Some(commit) = g["commit"].as_str() {
+        let changes = match (g["dirty"] == true, g["changes"].as_str()) {
+            (true, Some(h)) => format!(" with uncommitted changes (diff {h})"),
+            (true, None) => " with uncommitted changes".into(),
+            _ => String::new(),
+        };
+        s += &format!("variant  {} · {commit}{changes}\n", meta["variant"].as_str().unwrap_or(""));
+    }
+    if let Some(line) = super::bench::screen_line(&meta["screen"]) {
+        s += &format!("screen   {line}\n");
+    }
+    if let Some(c) = meta["gpu_cache"].as_str() {
+        s += &format!("gpu      shader caches {c} at the launch{}\n", if c == "cold" { " (the driver compiled them during it)" } else { "" });
+    }
+    if let (Some(fps), Some(hz)) = (meta["unpaced"]["fps"].as_f64(), meta["unpaced"]["hz"].as_f64()) {
+        s += &format!("! UnpacedSpin  the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display, so it draws as fast as it can\n");
+    }
+    s
+}
+
+fn summary_body(meta: &Value) -> String {
     let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     if meta["pid"].is_u64() && meta["probes"] == "timing" {

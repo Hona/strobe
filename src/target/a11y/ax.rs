@@ -385,7 +385,7 @@ fn role_id(role: &str, subrole: &str) -> i32 {
         ("AXSlider", _) => 50015,
         ("AXIncrementor" | "AXStepper", _) => 50016,
         ("AXTabGroup", _) => 50018,
-        ("AXStaticText" | "AXHeading", _) => 50020,
+        ("AXStaticText" | "AXHeading" | "Heading", _) => 50020,
         ("AXToolbar", _) => 50021,
         ("AXHelpTag", _) => 50022,
         ("AXGroup" | "AXRadioGroup" | "AXSection" | "AXLandmark", _) => 50026,
@@ -433,7 +433,8 @@ fn node(r: &Read, parent: Option<usize>, window: usize, hidden: bool) -> Node {
         focused: r.focused,
         enabled: r.enabled,
         offscreen: hidden || r.minimized,
-        heading: role == "AXHeading",
+        // A toolkit's macOS adapter may name the role "Heading", without the AX prefix.
+        heading: matches!(role, "AXHeading" | "Heading"),
         dialog: matches!(r.subrole.as_str(), "AXDialog" | "AXSystemDialog" | "AXFloatingWindow") || role == "AXSheet",
         patterns,
         toggled: toggle.then(|| r.number.unwrap_or(0.0) != 0.0),

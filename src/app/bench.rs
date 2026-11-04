@@ -950,6 +950,12 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
 /// (a run 84% shorter for 80% less CPU reads +28%), so it is then context.
 fn secondary_names(s: &Series, script: bool, rate_context: bool) -> Vec<String> {
     let mut names: Vec<String> = s.metrics.clone();
+    // A metric with a no-worse margin is declared: it is tested.
+    for m in s.noworse.keys() {
+        if *m != s.primary && !names.contains(m) {
+            names.push(m.clone());
+        }
+    }
     for m in DEFAULT_SECONDARIES.iter().copied().chain(script.then_some("cpu.work")) {
         let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context);
         if !skip {
@@ -1004,7 +1010,18 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     };
     let max_pairs = *looks.last().unwrap_or(&40);
     let min_pairs = looks[0];
-    progress(format!("\n{}  primary {}", s.label(), s.primary));
+    // Non-inferiority (SPEC §9.3): the same interval at the same looks, judged against the margin.
+    let margin = s.noworse.get(&s.primary).copied();
+    let compare_primary = |pp: &[(f64, f64)]| match margin {
+        Some(m) => stats::compare_noworse(&s.primary, def, pp, m, confidence),
+        None => stats::compare(&s.primary, def, pp, bound, confidence),
+    };
+    progress(format!(
+        "\n{}  primary {}{}",
+        s.label(),
+        s.primary,
+        margin.map(|m| format!(" · no worse than {}%?", (m * 1000.0).round() / 10.0)).unwrap_or_default()
+    ));
     let series_started = Instant::now();
     let waited_before = ctx.waited_ms;
     // A resumed experiment (`--resume`) starts from the pairs it had finished.
@@ -1022,6 +1039,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut halted: Option<Error> = None;
     // The primary's verdict at the look that decided it, kept while pairs continue for the secondaries.
     let mut decided_at: Option<Comparison> = None;
+    // Discarded warm-up blocks and their wall time, for `plan` (SPEC §9.1).
+    let (mut warmup_blocks, mut warmup_ms) = (0usize, 0.0f64);
     // Warm GPU caches (`gpuCache`): discarded blocks per variant fill its store first, so no measured
     // block pays a driver compiling its shaders cold. A driver may compile in the background for
     // longer than a block (NVIDIA's Vulkan cache took two 40 s launches to fill), so they repeat
@@ -1035,8 +1054,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             for round in 1..=3 {
                 let before = isolate::gpu_cache_bytes(&store);
                 progress(format!("  {} warm-up block {round} (discarded): fills its GPU shader caches", v.role));
+                let warm_started = Instant::now();
                 match block_on_screen(ctx, s, v, 0, Set::Lean, false) {
                     Ok(b) => {
+                        warmup_blocks += 1;
+                        warmup_ms += warm_started.elapsed().as_secs_f64() * 1e3;
                         if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
                             let _ = std::fs::remove_dir_all(dir);
                         }
@@ -1125,7 +1147,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             continue;
         }
         let look = looks.contains(&n);
-        let cmp = stats::compare(&s.primary, def, &primary_pairs, bound, confidence);
+        let cmp = compare_primary(&primary_pairs);
         let next = looks.iter().find(|&&l| l > n).copied();
         progress(format!(
             "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {}",
@@ -1147,7 +1169,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let d: Vec<f64> = primary_pairs.iter().map(|&(a, b)| if cmp.relative { (b / a).ln() } else { b - a }).collect();
         let mut cmp = cmp;
         if !cmp.decided {
-            cmp.needed_pairs = Some(stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence));
+            cmp.needed_pairs = Some(match cmp.noworse {
+                Some(m) => stats::pairs_needed_noworse(&d, stats::margin_shift(def, cmp.relative, m), confidence),
+                None => stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence),
+            });
         }
         let hopeless = look && n >= FUTILITY_FROM && cmp.needed_pairs.is_some_and(|need| need > max_pairs);
         // A share at its ceiling on both sides (91% vs 92% dropped frames at background priority) moves
@@ -1193,7 +1218,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // Pairs a resumed series had finished: the comparison at the last of them.
     if last.is_none() && !pairs.is_empty() {
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
-        last = Some(stats::compare(&s.primary, def, &pp, bound, confidence));
+        last = Some(compare_primary(&pp));
     }
     let primary = last.ok_or_else(|| Error::msg("no pairs completed"))?;
     let primary_decided = stopped == "primary decided" && pairs.len() >= min_pairs;
@@ -1209,7 +1234,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             s if s.starts_with("failed") => format!("unclear: {} pair{}, then the bench failed", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
             "more pairs cannot decide it" | "max pairs" | "max time" => match primary.needed_pairs {
                 Some(n) if n != usize::MAX && n > pairs.len() => format!("underpowered: ~{n} pairs needed"),
-                _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => format!("unclear after {} pairs, the last planned look: the difference sits on the equivalence bound", pairs.len()),
+                _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => {
+                    format!("unclear after {} pairs, the last planned look: the difference sits on the {}", pairs.len(), if margin.is_some() { "margin" } else { "equivalence bound" })
+                }
                 _ => "unclear".into(),
             },
             _ => "unclear".into(),
@@ -1231,7 +1258,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             continue;
         }
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
-        secondaries.push(tail_check(d, &blocks, stats::compare(name, d, &pp, bound, 0.95)));
+        let c = match s.noworse.get(name) {
+            Some(&m) => stats::compare_noworse(name, d, &pp, m, 0.95),
+            None => stats::compare(name, d, &pp, bound, 0.95),
+        };
+        secondaries.push(tail_check(d, &blocks, c));
     }
     // An exact comparison (a stable counter) is a fact, not a test: it skips Holm and the primary's gate.
     let tested: Vec<usize> = (0..secondaries.len()).filter(|&i| !secondaries[i].exact).collect();
@@ -1242,7 +1273,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         if c.verdict.starts_with("refused") {
             continue;
         }
-        let keep = primary_decided && ((rej && (c.lo > 0.0 || c.hi < 0.0)) || c.verdict.starts_with("same"));
+        // A non-inferiority secondary's test is against its margin: rejected, its interval clears it.
+        let directional = if c.noworse.is_some() { c.decided } else { c.lo > 0.0 || c.hi < 0.0 };
+        let keep = primary_decided && ((rej && directional) || c.verdict.starts_with("same"));
         if !keep {
             c.verdict = "—".into();
             c.decided = false;
@@ -1366,7 +1399,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
-        "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
+        "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
+        "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),

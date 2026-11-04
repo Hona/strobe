@@ -4,10 +4,21 @@
 //   swiftc -O scripts/dev/cocoa-app.swift -o /tmp/strobe-cocoa-app
 import AppKit
 
+/// A text field that selects all on ⌘A itself, without an Edit menu's key equivalent.
+final class Field: NSTextField {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool {
+        if event.modifierFlags.contains(.command), event.charactersIgnoringModifiers == "a", let editor = currentEditor() {
+            editor.selectAll(nil)
+            return true
+        }
+        return super.performKeyEquivalent(with: event)
+    }
+}
+
 final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTableViewDataSource {
     let window = NSWindow(contentRect: NSRect(x: 200, y: 200, width: 640, height: 480), styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
     let count = NSTextField(labelWithString: "rows: 0")
-    let field = NSTextField(string: "")
+    let field = Field(string: "")
     let echo = NSTextField(labelWithString: "echo: ")
     let table = NSTableView()
     var rows = (0..<60).map { "seed \($0)" }
@@ -19,14 +30,6 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTableVi
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
-        // ⌘A and the other editing keys reach a text field through the Edit menu's key equivalents.
-        let main = NSMenu()
-        let edit = NSMenuItem()
-        edit.submenu = NSMenu(title: "Edit")
-        edit.submenu!.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        main.addItem(NSMenuItem())
-        main.addItem(edit)
-        NSApp.mainMenu = main
         window.title = "strobe dev app"
         let add = keyed(NSButton(title: "Add", target: self, action: #selector(onAdd)), "add")
         let check = keyed(NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil), "check")

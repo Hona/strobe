@@ -13,6 +13,23 @@ use std::time::{Duration, Instant};
 /// Why a macOS window counts as hidden when other apps' windows cover it.
 pub const COVERED: &str = "window is covered by other apps' windows (strobe brings it to the front only after a minute without keyboard or mouse input, and with the Accessibility permission)";
 
+/// macOS: every block measures the app as the active one (`host::raise_windows`), so one that is
+/// not is a different state, not a measurement.
+pub const NOT_ACTIVE: &str = "app is not the active app (on macOS strobe measures every block with it active, and makes it so only after a minute without keyboard or mouse input, with the Accessibility permission)";
+
+/// Whether the app owning a window is not the active one, where strobe measures it active (macOS).
+fn inactive(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        !super::a11y::ax::is_front(pid)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 pub struct Native {
     pub child: Child,
     pub pid: u32,
@@ -132,6 +149,7 @@ impl Native {
             Some(s) if s.iconic => Some("window is minimized"),
             Some(s) if s.cloaked && cfg!(target_os = "macos") => Some(COVERED),
             Some(s) if s.cloaked => Some("window is cloaked (another virtual desktop, or hidden by the compositor)"),
+            Some(s) if inactive(s.pid) => Some(NOT_ACTIVE),
             _ => None,
         };
         match why {

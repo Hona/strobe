@@ -966,20 +966,21 @@ pub fn window_image(id: isize) -> Option<crate::png::Image> {
 }
 
 /// macOS lets no app put another app's window on top without activating it, which takes the keyboard
-/// focus. So strobe activates the app only when other apps' windows cover its main window and nobody
-/// has used this Mac for a minute (an idle laptop running a bench, its apps maximized): a person at the
-/// keyboard keeps their focus, and a covered window stays `WindowHidden`. Returns 1 when the window
-/// is in view.
+/// focus. So strobe makes the app the active one in every block (`check_visible` requires it), and
+/// only once nobody has used this Mac for a minute: a person at the keyboard keeps their focus, and
+/// the block waits for them. Activating every time, not only when other windows cover the app's,
+/// keeps every block in one state: an app's key window can cost several times an inactive one's
+/// (a Rune window at rest: 3× its CPU). Returns 1 when the app is active.
 pub fn raise_windows(pids: &[u32]) -> usize {
     let Some(w) = main_win(pids) else { return 0 };
     if !w.onscreen {
         return 0;
     }
-    if covered(&w) == 0.0 {
+    if crate::target::a11y::ax::is_front(w.pid) {
         return 1;
     }
     if user_idle_s() < IDLE_BEFORE_ACTIVATE_S || !accessibility_trusted() {
         return 0;
     }
-    usize::from(crate::target::a11y::ax::activate(w.pid).is_ok() && covered(&w) == 0.0)
+    usize::from(crate::target::a11y::ax::activate(w.pid).is_ok())
 }

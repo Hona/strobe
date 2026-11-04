@@ -304,6 +304,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             None => std::thread::sleep(Duration::from_secs(3)),
         }
         if !windowless {
+            n.raise();
             n.check_visible()?;
             if host::session_locked() {
                 return Err(validity::locked());

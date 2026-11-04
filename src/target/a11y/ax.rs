@@ -211,6 +211,11 @@ pub fn window_element(id: isize) -> Option<(Cf, u32)> {
     windows_of(pid).into_iter().find(|w| w.1 == Some(id as u32)).map(|w| (w.0, pid))
 }
 
+/// Whether the app is the active one (`AXFrontmost`).
+pub fn is_front(pid: u32) -> bool {
+    Cf::new(unsafe { AXUIElementCreateApplication(pid as i32) }).is_some_and(|app| copy(app.0, "AXFrontmost").and_then(|v| cf_i64(v.0)) == Some(1))
+}
+
 /// Brings the app to the front (`AXFrontmost`): macOS gives keys only to the active app's key
 /// window. Returns once it is in front, or why not.
 pub fn activate(pid: u32) -> Result<()> {

@@ -63,6 +63,8 @@ impl Args {
                 "-V" => Some("version".to_string()),
                 "-q" => Some("quiet".to_string()),
                 "-v" => Some("verbose".to_string()),
+                // As gh names a repository (`report … --update-pr 12 -R owner/repo`).
+                "-R" => Some("repo".to_string()),
                 a if a.starts_with("--") && a.len() > 2 => Some(a[2..].to_string()),
                 _ => None,
             };

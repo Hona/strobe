@@ -862,7 +862,7 @@ pub fn run(args: &Args) -> Result<Output> {
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
             "estimate": estimate,
         },
-        "identity": ident, "ledger": ledger,
+        "file_repo": super::pr::repo_relative(&file.display().to_string()), "identity": ident, "ledger": ledger,
         "variants": variants.iter().map(|v| json!({
             "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
             "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
@@ -1621,133 +1621,6 @@ fn cells(c: &Value) -> (String, String, String, String) {
         format!("{} … {}", fmt::signed(lo, abs_unit), fmt::signed(hi, abs_unit))
     };
     (fmt::value(c["base"].as_f64().unwrap_or(f64::NAN), unit), fmt::value(c["head"].as_f64().unwrap_or(f64::NAN), unit), delta, ci)
-}
-
-/// `report experiment <id> --format pr`: the experiment as Markdown for a pull request body. Per series a table
-/// of the primary and the tested metrics with their intervals and verdicts, the context metrics folded away,
-/// pixels and warnings, then the setup and the command that reruns it.
-/// Whether a note belongs in a PR table: every warning, and the context notes a reader needs to
-/// know what the numbers compare with (a locked session, a sleeping display, the power plan, a
-/// GPU that does not drive the display, a smoke run's few pairs, other processes kept off the target's CPUs).
-fn in_pr(w: &Value) -> bool {
-    w["level"] == "warn" || ["SessionLocked", "DisplayOff", "PowerPlan", "CrossAdapterScanout", "FewPairs", "StaleCalibration", "ReservedCpus"].contains(&w["id"].as_str().unwrap_or(""))
-}
-
-pub fn pr_markdown(r: &Value) -> String {
-    let variant = |role: &str| r["variants"].as_array().into_iter().flatten().find(|v| v["role"] == role).cloned().unwrap_or(Value::Null);
-    let (base, head) = (variant("base"), variant("head"));
-    let mut out = String::new();
-    for s in r["series"].as_array().into_iter().flatten() {
-        out += &format!("**{}**, {} pairs of fresh launches", s["label"].as_str().unwrap_or(""), s["pairs"]);
-        if s["kind"] == "launch" {
-            out += " (one timed launch each)";
-        }
-        out += ":\n\n| Metric | base | head | Change [interval] | Verdict |\n|---|---|---|---|---|\n";
-        let mut rows = vec![(true, s["primary"].clone())];
-        rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));
-        for (primary, c) in &rows {
-            let (b, h, d, ci) = cells(c);
-            let name = c["metric"].as_str().unwrap_or("");
-            let verdict = c["verdict"].as_str().unwrap_or("");
-            out += &format!("| `{name}`{} | {b} | {h} | {d} [{ci}] | {} |\n", if *primary { " (primary)" } else { "" }, if verdict == "·" { "" } else { verdict });
-        }
-        let descriptive = s["descriptive"].as_array().cloned().unwrap_or_default();
-        if !descriptive.is_empty() {
-            out += "\n<details><summary>Context metrics (not tested)</summary>\n\n| Metric | base | head | Change [interval] |\n|---|---|---|---|\n";
-            for c in &descriptive {
-                let (b, h, d, ci) = cells(c);
-                out += &format!("| `{}` | {b} | {h} | {d} [{ci}] |\n", c["metric"].as_str().unwrap_or(""));
-            }
-            out += "\n</details>\n";
-        }
-        if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {
-            let same = shots.iter().filter(|p| p["state"] == "same").count();
-            out += &format!("\n- **Pixels:** {same} of {} snapshots the same within launch noise.\n", shots.len());
-            for p in shots.iter().filter(|p| p["state"] != "same") {
-                out += &format!("  - `{}`: {}", p["name"].as_str().unwrap_or(""), pixel_line(p).trim().trim_start_matches("differ").trim());
-                out.push('\n');
-            }
-        }
-        for w in s["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)) {
-            out += &format!("\n- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
-        }
-        out += "\n";
-    }
-    if let Some(st) = r["stopped"].as_object() {
-        let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-        let what = if st.get("code").and_then(Value::as_i64) == Some(130) {
-            "stopped before it finished".to_string()
-        } else {
-            format!("failed before it finished ({})", st.get("why").and_then(Value::as_str).unwrap_or(""))
-        };
-        out += &format!(
-            "- **Incomplete:** the bench {what}; the tables hold the pairs it finished{}.\n\n",
-            if not_run.is_empty() { String::new() } else { format!(", and these series did not run: {}", not_run.join(", ")) }
-        );
-    }
-    // The bench's own notes (power plan, lost present events, …), once.
-    let general: Vec<&Value> = r["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)).collect();
-    for w in &general {
-        out += &format!("- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
-    }
-    if !general.is_empty() {
-        out += "\n";
-    }
-    // The rerun ledger (`store::ledger`): the other experiments on these variants and what they found.
-    if let Some(t) = store::ledger::line(r) {
-        out += &format!("- **Ledger:** {t}.\n\n");
-    }
-    let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
-    let context = fmt::fields([
-        r["env"]["os"].as_str().unwrap_or("").to_string(),
-        r["env"]["cpu"].as_str().unwrap_or("").to_string(),
-        r["env"]["power_plan"].as_str().filter(|p| !p.is_empty()).map(|p| format!("power plan {p}")).unwrap_or_default(),
-        r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!("other processes kept off CPUs {}", cpu_list(c))).unwrap_or_default(),
-        gpu.to_string(),
-        r["browser"].as_str().unwrap_or("").to_string(),
-        fmt::size(&r["window"]),
-        r["refresh_hz"].as_f64().map(|h| format!("{h:.0} Hz display")).unwrap_or_default(),
-    ]);
-    out += &format!(
-        "`{}` against `{}`, alternating fresh launches: {context}. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
-        variant_name(&base),
-        variant_name(&head),
-    );
-    out += &format!("```sh\n{}\n```\n", rerun_command(r, &base, &head));
-    if let Some(line) = super::open::pr_line(r) {
-        out += &format!("\n{line}");
-    }
-    out
-}
-
-/// The `strobe bench` line that reruns an experiment: its bench file, its variants by commit where it
-/// has one (a folder is a commit plus whatever is in it now), and every flag that chose what ran
-/// and how (filter, primary, pairs, runs, probes, …), not the handles.
-fn rerun_command(r: &Value, base: &Value, head: &Value) -> String {
-    let file = r["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\").replace('\\', "/");
-    let quote = |s: &str| if s.is_empty() || s.contains([' ', '"', '\'', '*', '&', '|', '<', '>', ';']) { format!("\"{}\"", s.replace('"', "\\\"")) } else { s.to_string() };
-    let spec = |v: &Value, fallback: &str| match (v["kind"].as_str(), v["commit"].as_str()) {
-        (Some("dir"), Some(c)) => c.to_string(),
-        _ => v["spec"].as_str().unwrap_or(fallback).to_string(),
-    };
-    let flags = r["args"]["flags"].as_object();
-    let mut line = format!("strobe bench {}", quote(&file));
-    if flags.is_some_and(|f| f.contains_key("aa")) {
-        line += &format!(" --aa --head {}", quote(&spec(head, ".")));
-    } else {
-        line += &format!(" --base {} --head {}", quote(&spec(base, "<base>")), quote(&spec(head, ".")));
-    }
-    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open"];
-    let mut rest: Vec<(&String, &Value)> = flags.into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).collect();
-    rest.sort_by(|a, b| a.0.cmp(b.0));
-    for (k, v) in rest {
-        match v.as_str() {
-            Some("true") => line += &format!(" --{k}"),
-            Some(x) => line += &format!(" --{k} {}", quote(x)),
-            None => {}
-        }
-    }
-    line
 }
 
 /// One snapshot's line: `same`, `differ` with how many pixels moved beyond the launch noise, or only one side.
@@ -3459,18 +3332,6 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
         v.commit = Some(sha);
     }
     Ok(v)
-}
-
-/// How a report names a variant: its commit (a ref that is not the commit itself in front, a
-/// directory's uncommitted changes after), else its label.
-fn variant_name(v: &Value) -> String {
-    let Some(commit) = v["commit"].as_str() else { return v["label"].as_str().unwrap_or("").to_string() };
-    let spec = v["spec"].as_str().unwrap_or("");
-    let mut name = if v["kind"] == "git" && !commit.starts_with(spec) && !spec.starts_with(commit) { format!("{spec} ({commit})") } else { commit.to_string() };
-    if v["dirty"] == true {
-        name += " with uncommitted changes";
-    }
-    name
 }
 
 /// The bench's harness: the bench file's folder, the strobe.json in use and strobe.json's `harness` paths, in

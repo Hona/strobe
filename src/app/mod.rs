@@ -8,6 +8,7 @@ pub mod history;
 pub mod mcp;
 pub mod open;
 pub mod outside;
+pub mod pr;
 pub mod query;
 pub mod record;
 pub mod report;

@@ -808,7 +808,7 @@ fn native_gpu(dir: &Path, meta: &Value) -> Result<Output> {
 
 /// A native recording's threads, busiest waker first: context switches per second over the measured
 /// runs, CPU per run from each thread's cycle counter, and its name.
-fn native_threads(dir: &Path, top: usize) -> Result<Output> {
+pub fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     let rows = store::read_json(&dir.join("threads.json"))?;
     let mut all = rows.as_array().cloned().unwrap_or_default();
     // Without per-thread wakes (macOS counts them per process), the busiest threads come first.

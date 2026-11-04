@@ -61,12 +61,22 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(p) => std::path::PathBuf::from(p),
         None => dir.join(format!("report-{view}{}", if format == "pr" { ".pr.md".to_string() } else { format!(".{format}") })),
     };
+    if args.get("update-pr").is_some() && format != "pr" {
+        return Err(Error::usage("--update-pr replaces an experiment's block in a pull request body: add --format pr"));
+    }
     let body = match format {
         "md" => markdown(&data),
-        "pr" => super::bench::pr_markdown(&data),
+        "pr" => super::pr::block(&data),
         _ => html(view, &data),
     };
     write_whole(&out, &body)?;
+    // The block between its markers in a pull request's body, the author's text around it untouched.
+    if let Some(n) = args.get("update-pr") {
+        let url = super::pr::update_pr(n, args.get("repo"), data["id"].as_str().unwrap_or(handle), &body, args.has("force"))?;
+        let path = out.display().to_string();
+        let text = format!("updated {url} with {} ({}); the report is also in {path}\n", data["id"].as_str().unwrap_or(handle), super::fmt::bytes(body.len() as f64));
+        return Ok(Output::new(text, json!({ "path": path, "bytes": body.len(), "pr": url })));
+    }
     if args.has("open") {
         open(&out.display().to_string());
     }
@@ -124,6 +134,14 @@ fn attach_hotspots(data: &mut Value) {
         if let Some(d) = diff {
             s["heap_diff"] = d.json;
         }
+        // A native app's two launches by what holds their memory (host, GPU mapped, private, …).
+        if let [(_, _, a), (_, _, b)] = recs.as_slice()
+            && a.join("memory.json").exists()
+            && b.join("memory.json").exists()
+            && let Ok(d) = super::query::memory_diff(a, b, 10)
+        {
+            s["memory_diff"] = d.json;
+        }
     }
 }
 
@@ -136,7 +154,16 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
         let gc = scope.spawn(|| super::query::gc(dir));
         let alloc = scope.spawn(|| (super::query::alloc(dir, "function", 25), super::query::alloc(dir, "file", 25)));
         let heap = scope.spawn(|| super::query::heap(dir, 15, false));
-        let mut h = super::query::hotspots(dir, "function", 50).ok()?.json;
+        // A native recording without native stacks still has its threads and memory.
+        let native = dir.join("threads.json").exists();
+        let mut h = match super::query::hotspots(dir, "function", 50) {
+            Ok(o) => o.json,
+            Err(_) if native => json!({ "rows": [] }),
+            Err(_) => return None,
+        };
+        if native && let Ok(o) = super::query::native_threads(dir, 15) {
+            h["threads"] = o.json;
+        }
         if let Ok(o) = super::query::hotspots(dir, "file", 25) {
             h["files"] = o.json["rows"].clone();
         }

@@ -427,6 +427,7 @@ still running (`progress`).
 
 ```
 strobe report <view> <handle | exp_…>… [--format md|html|pr] [--out <path>] [--open] [--json]
+strobe report experiment <exp_…> --format pr --update-pr <n> [-R owner/repo] [--force]
 ```
 
 Writes a self-contained artifact from a view in the catalog (§11.2) and prints its path.
@@ -1607,8 +1608,10 @@ prints it under each case (`screen  display on · session locked · dwm.exe 3.1%
 `query <rec> summary` beside the variant's commit (`variant_git`: commit, uncommitted changes and
 their diff hash, kept in every block recording) and whether the launch found GPU shader caches.
 
-`report --format pr` prints every warning and the context notes that say what the numbers compare
-with: `SessionLocked`, `DisplayOff`, `PowerPlan`, `CrossAdapterScanout`, `FewPairs`, `StaleCalibration`.
+`report --format pr` shows every warning: one alert above the series condenses them (a locked
+session and a sleeping display once for all series, `Background` as how many timed blocks were
+flagged and the peak), and its validity drawer keeps each note's text; the per-block foreign CPU is
+in the per-pair tables.
 
 `Background` (built): per measured run, the busy time of the CPUs the target is pinned to (the OS
 sampler's per-CPU idle cycles) minus the target's own cycles is `cpu.foreign` (% of one core); a block
@@ -1727,16 +1730,67 @@ hotspots by function `(name, location)` and by file, allocation sites, forced la
 heap and its base/head diff, and attribution run counts, default cap 2 MB: a report keeps three full
 stacks for its top 15 rows and the heaviest below them, frames once per side in a `frame_table`
 that stacks index, while recordings and `query` keep all);
-markdown is GitHub-flavoured. `--format pr` writes an experiment for a pull request body: per
-series a table of the primary and tested metrics (base, head, change [interval], verdict), the
-context metrics in a folded `<details>`, pixels and warnings, then one line of setup (variants,
-OS, CPU, GPU, browser, window, display; a field strobe does not have, such as a native app's
-browser, is left out rather than shown empty) and the `strobe bench` command that reruns it. The
-setup names each variant by its commit (`6c23f8032f`, `origin/dev (fe04656465)`, and "with uncommitted
-changes" for a folder that had them), not a folder, so the line means something in another repo's PR.
-The rerun command keeps every flag that chose what ran and how (`--filter`, `--primary`, `--pairs`,
-`--runs`, `--probes`, `--params`, `--aa`, …; the experiment stores its command line) and names a folder
-variant by its commit.
+markdown is GitHub-flavoured.
+
+`--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
+pull request body, pasted verbatim. It reads as the HTML report does, in three depths:
+
+- **Always visible:** the bottom line (one series: its primary's change, base → head, interval,
+  verdict and the pairs head won, plus the secondaries that moved; more series: a tally and a
+  scorecard with a row per series), one `<sub>` line of setup (variants, OS, CPU with pinning and
+  reserved CPUs, power plan, GPU, browser, window and display when frames were drawn, pairs, and
+  the session state the numbers compare with: `session locked, display off`), the rerun ledger
+  when other experiments compared the same variants, at most one alert (`[!CAUTION]` for a stopped
+  bench, a refused primary, an A/A false positive, `NotSteady`, `StateDrift` or
+  `BackgroundPriority`; `[!WARNING]` for any other warning; `[!NOTE]` for context notes only), and
+  the `strobe bench` command that reruns it.
+- **One click (series `<details>`, open for one or two series and for the first two that moved or
+  were refused of more):** the tested metrics, each with base → head, the change and its interval,
+  the verdict and a 21-cell interval ruler on a shared ±10/25/50/100% scale (`│` is 0, `┤━●━├` the
+  interval and estimate, `‹ ›` past the scale, `×` refused); a Mermaid `xychart-beta` of the
+  primary per pair (bars base, line head), or a `gantt` of a launch's milestones when they lie
+  apart; a frame-pacing line when the series drew frames.
+- **Two clicks:** context metrics, the per-pair table (order, values, change, max frame gap,
+  foreign CPU of each block and the busiest other processes, kept recordings), attribution
+  (native: thread wakes and CPU by owner and thread, memory by what holds it; web: main-thread
+  phases, GC, CPU and allocation movers, the live heap's diff and head's insights), and validity
+  (variants with subjects, rig, `ReservedCpus`, the method, every note in full, drill-down
+  commands, the Perfetto line).
+
+Rules: changes are coloured (`$\color{…}`, dollar-backtick math so `\%` survives) only for a decided
+move in a direction, by the metric's better direction; undecided, `same`, gated and descriptive rows
+stay plain. Verdicts keep strobe's words, and a blank secondary says why: `gated on primary`,
+`unconfirmed (Holm: needs N pairs)` or `unclear (~N pairs)`; `refused: <Id>` carries its reason;
+`no worse (≤X%)`, `worse (>X%)`, `underpowered`, `saturated` and `stopped` read as such. No Mermaid
+inside a closed `<details>` (it would draw at zero width), no alert inside one, no footnotes, no
+emoji. Variants are named by commit (`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), the bench file
+by its path in its repository, never a local folder. The output is deterministic and at most 24,000
+characters (UTF-16, as GitHub counts; its limit is 65,536): a long report sheds, in order, attribution
+rows past 3, context rows that read 0 on both sides, quiet pairs of series without a direction, the
+middle pairs of a series with more than 16, the context and attribution drawers, then per-pair tables
+and charts; never a series' verdict, its tested metrics, a refusal, the alert or the rerun command.
+
+The block is delimited so a reader and a tool can tell strobe's evidence from the author's text:
+
+```
+<!-- strobe:report exp_9b3b26 v1 begin sha256:78fbde6b6f53f8b4 -->
+<sub><b>strobe 0.6.0</b> · generated by <code>strobe report experiment exp_9b3b26 --format pr</code> · …</sub>
+---
+… the report …
+---
+<sub>end of strobe report <code>exp_9b3b26</code></sub>
+<!-- strobe:report exp_9b3b26 end -->
+```
+
+The hash is the first 16 hex digits of the SHA-256 of the content between the markers (trimmed,
+LF line ends). Authors write their summary, discovery and change outside the block; a PR may carry
+one block per experiment. `--update-pr <n>` (through `gh`, `-R owner/repo` for another repository)
+replaces that experiment's block in pull request `n`'s body, or appends it, and leaves the rest of
+the body as it was; a block whose content no longer matches its hash was edited by hand and is
+refused unless `--force`. A body over 65,536 characters is refused. The setup line and the rerun
+command keep every flag that chose what ran and how (`--filter`, `--primary`, `--pairs`, `--runs`,
+`--probes`, `--params`, `--aa`, …; the experiment stores its command line); a bench stores its file's
+path in its repository as `file_repo`.
 Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
 stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed
 over the target once flushed, so the file is whole when the command returns and a reader never

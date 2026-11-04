@@ -73,9 +73,9 @@ pub struct Access {
 }
 
 impl Access {
-    /// Present events in this process, or through the helper.
+    /// Present events in this process, or through the helper (Windows: Linux and macOS give none).
     pub fn presents(&self) -> bool {
-        self.token != "none" || self.helper
+        cfg!(windows) && (self.token != "none" || self.helper)
     }
 
     /// Why present metrics are refused, when they are.
@@ -96,9 +96,15 @@ pub fn access() -> Access {
     {
         helper::access()
     }
-    #[cfg(not(windows))]
+    // Off Windows `helper` means native stacks are available: perf events for this user (Linux),
+    // `/usr/bin/sample` (macOS).
+    #[cfg(target_os = "linux")]
     {
-        Access { token: "none", pending_sign_out: false, helper: false }
+        Access { token: "none", pending_sign_out: false, helper: crate::probe::perf::access().0 }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        Access { token: "none", pending_sign_out: false, helper: std::path::Path::new("/usr/bin/sample").is_file() }
     }
 }
 
@@ -131,8 +137,10 @@ impl PresentCapture {
             }
             Err(local_err.unwrap_or_else(|| crate::model::Error::msg(a.refusal().unwrap_or_default())))
         }
-        #[cfg(not(windows))]
-        Err(crate::model::Error::msg("OS present events are Windows only (ETW)"))
+        #[cfg(target_os = "linux")]
+        return Err(crate::model::Error::msg("Linux gives no outside view of when another app's frames reach the screen (DRM page flips need root tracing and name no process; X11 Present and Wayland presentation-time report only to the app itself): presented frames need the toolkit's own present times"));
+        #[cfg(target_os = "macos")]
+        return Err(crate::model::Error::msg("macOS gives no unprivileged outside view of when another app's frames reach the screen (WindowServer's timing needs root tracing or Instruments): presented frames need the toolkit's own present times (Metal's presentedTime)"));
     }
 
     /// `in-process` or `helper`.
@@ -163,6 +171,10 @@ impl PresentCapture {
 pub struct StackCapture {
     #[cfg(windows)]
     client: helper::Client,
+    #[cfg(target_os = "linux")]
+    perf: crate::probe::perf::Capture,
+    #[cfg(target_os = "macos")]
+    sample: crate::probe::sample::Capture,
 }
 
 impl StackCapture {
@@ -173,11 +185,10 @@ impl StackCapture {
             client.call(serde_json::json!({ "op": "stacks.start", "root": root }))?;
             Ok(StackCapture { client })
         }
-        #[cfg(not(windows))]
-        {
-            let _ = root;
-            Err(crate::model::Error::msg("native stacks are Windows only for now (ETW)"))
-        }
+        #[cfg(target_os = "linux")]
+        return Ok(StackCapture { perf: crate::probe::perf::Capture::start(root)? });
+        #[cfg(target_os = "macos")]
+        return Ok(StackCapture { sample: crate::probe::sample::Capture::start(root)? });
     }
 
     /// Stops sampling; thread names and missing module lists come from the live processes.
@@ -189,8 +200,10 @@ impl StackCapture {
             fill_from_processes(&mut deep);
             Ok(deep)
         }
-        #[cfg(not(windows))]
-        Ok(Deep::default())
+        #[cfg(target_os = "linux")]
+        return self.perf.stop();
+        #[cfg(target_os = "macos")]
+        return self.sample.stop();
     }
 }
 
@@ -265,6 +278,16 @@ pub struct Deep {
     pub threads: std::collections::BTreeMap<u32, String>,
     pub pids: Vec<u32>,
     pub events_lost: u64,
+    /// The samples carry no time (macOS `sample`): each is stamped with the capture's start, and
+    /// they cover the whole capture.
+    #[serde(default)]
+    pub untimed: bool,
+    /// Frames the sampling tool already named: (pid, address, function, file, line).
+    #[serde(default)]
+    pub located: Vec<(u32, u64, String, String, u32)>,
+    /// Samples left out of `stacks`, by why (macOS: a thread waiting or inside the kernel).
+    #[serde(default)]
+    pub dropped: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

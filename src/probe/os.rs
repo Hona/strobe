@@ -179,6 +179,10 @@ impl Cpus {
 
     /// Collects the PDH counters; the reading covers the `dt` since the last collection.
     fn freq(&mut self, dt: u64, nominal: &mut Option<f64>) -> Option<Freq> {
+        #[cfg(target_os = "linux")]
+        if self.pdh.is_none() {
+            return linux_freq(dt, nominal);
+        }
         let p = self.pdh.as_mut()?;
         p.q.collect();
         let mut f = Freq { dt_ns: dt, ..Freq::default() };
@@ -200,6 +204,22 @@ impl Cpus {
         });
         (dt > 0).then_some(f)
     }
+}
+
+/// Linux: each CPU's average frequency over the last interval the kernel measured
+/// (`cpuinfo_avg_freq`, from the APERF/MPERF counters, kernel 6.13+) against its base frequency. Older
+/// kernels only give an instantaneous `scaling_cur_freq`, which is not an average: no reading then.
+#[cfg(target_os = "linux")]
+fn linux_freq(dt: u64, nominal: &mut Option<f64>) -> Option<Freq> {
+    let read = |cpu: usize, f: &str| std::fs::read_to_string(format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/{f}")).ok().and_then(|s| s.trim().parse::<f64>().ok());
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let mut f = Freq { dt_ns: dt, ..Freq::default() };
+    for cpu in 0..n {
+        let (avg, base) = (read(cpu, "cpuinfo_avg_freq")?, read(cpu, "base_frequency").or_else(|| read(cpu, "cpuinfo_max_freq"))?);
+        *nominal = Some(base / 1000.0);
+        f.perf.push((100.0 * avg / base) as f32);
+    }
+    (dt > 0).then_some(f)
 }
 
 /// `0,12` → 12 (group * 64 + number); `_Total` and `0,_Total` → None.
@@ -452,8 +472,11 @@ impl Samples {
             // which one is busiest in a window must not decide what is counted.
             s.gpu_3d_pct = Some(by_adapter.values().map(|a| a.1.get("3D").copied().unwrap_or(0.0)).sum());
             s.gpu_adapters = by_adapter.into_iter().map(|(a, (_, m))| (adapter_name(a), m)).collect();
-            s.vram_dedicated_mb = Some(last.vram.iter().map(|m| m.dedicated).sum::<u64>() as f64 / MB);
-            s.vram_shared_mb = Some(last.vram.iter().map(|m| m.shared).sum::<u64>() as f64 / MB);
+            // Apple GPUs share system memory: no per-process VRAM to report (refused, never 0).
+            if cfg!(not(target_os = "macos")) {
+                s.vram_dedicated_mb = Some(last.vram.iter().map(|m| m.dedicated).sum::<u64>() as f64 / MB);
+                s.vram_shared_mb = Some(last.vram.iter().map(|m| m.shared).sum::<u64>() as f64 / MB);
+            }
             s.gpu_unreadable_pids = self.gpu_unreadable.clone();
         }
         let device = match primary {

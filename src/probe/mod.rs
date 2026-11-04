@@ -4,8 +4,16 @@ pub mod alloc;
 pub mod census;
 pub mod cpu;
 pub mod gpu;
+#[cfg(target_os = "linux")]
+pub mod gpu_linux;
+#[cfg(target_os = "macos")]
+pub mod gpu_macos;
 pub mod heap;
 pub mod os;
+#[cfg(target_os = "linux")]
+pub mod perf;
+#[cfg(target_os = "macos")]
+pub mod sample;
 pub mod shifts;
 pub mod symbols;
 pub mod trace;

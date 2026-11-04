@@ -102,13 +102,17 @@ pub fn adapters() -> Vec<Adapter> {
         }
         out
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
     {
-        Vec::new()
+        super::gpu_linux::adapters()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::gpu_macos::adapters()
     }
 }
 
-fn intern(names: &mut Vec<String>, name: &str) -> u16 {
+pub(super) fn intern(names: &mut Vec<String>, name: &str) -> u16 {
     match names.iter().position(|n| n == name) {
         Some(i) => i as u16,
         None => {
@@ -216,31 +220,10 @@ pub use kmt::Kmt;
 #[cfg(windows)]
 pub use nvml::Nvml;
 
-#[cfg(not(windows))]
-pub struct Kmt {
-    pub unreadable: Vec<u32>,
-}
-
-#[cfg(not(windows))]
-impl Kmt {
-    pub fn new(_adapters: &[Adapter], _names: &mut Vec<String>) -> Option<Kmt> {
-        None
-    }
-    pub fn read(&mut self, _pids: &[u32], _dt_ns: u64, _nodes: bool, _gpu: &mut Vec<EngineUse>, _vram: &mut Vec<VramUse>) {}
-}
-
-#[cfg(not(windows))]
-pub struct Nvml {
-    pub devices: Vec<Device>,
-}
-
-#[cfg(not(windows))]
-impl Nvml {
-    pub fn load(_adapters: &[Adapter]) -> Option<Nvml> {
-        None
-    }
-    pub fn sample(&mut self, _t_ns: u64, _pcie: bool, _out: &mut Vec<DeviceSample>) {}
-}
+#[cfg(target_os = "linux")]
+pub use super::gpu_linux::{Kmt, Nvml};
+#[cfg(target_os = "macos")]
+pub use super::gpu_macos::{Kmt, Nvml};
 
 #[cfg(windows)]
 mod kmt {

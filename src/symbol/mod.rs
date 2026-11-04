@@ -1,6 +1,8 @@
 //! Native symbols (SPEC §12.2): a recording's native samples (`deep.json.gz`) as located frames
 //! and packages, ready for the views that rank JavaScript samples (hotspots, insights, reports).
 
+#[cfg(unix)]
+pub mod dwarf;
 pub mod pdb;
 
 use crate::etw::Deep;
@@ -39,7 +41,14 @@ pub struct Native {
     pub resolved: u64,
     /// Modules with samples and no symbols (no PDB found), with their sample counts.
     pub unsymbolized: BTreeMap<String, u64>,
+    /// Samples the sampler left out of the stacks, by why (macOS: threads waiting or in the kernel).
+    pub dropped: BTreeMap<String, u64>,
+    /// The samples carry no time and cover the whole capture (macOS).
+    pub untimed: bool,
 }
+
+/// A frame a sampling tool named: (pid, address, function, file, line).
+type Named = (u32, u64, String, String, u32);
 
 /// One resolved address: its frames innermost first (inline frames expanded).
 type Resolved = Vec<(String, String, u32, String, bool)>;
@@ -59,7 +68,7 @@ pub fn native(dir: &Path, thread: Option<&str>) -> Result<Option<Native>> {
         }
         *by_stack.entry((s.4, s.1)).or_default() += 1;
     }
-    let mut out = Native { weights: Vec::new(), interval_us: deep.interval_us, samples: 0, resolved: 0, unsymbolized: BTreeMap::new() };
+    let mut out = Native { weights: Vec::new(), interval_us: deep.interval_us, samples: 0, resolved: 0, unsymbolized: BTreeMap::new(), dropped: deep.dropped.clone(), untimed: deep.untimed };
     for ((stack, pid), n) in by_stack {
         let Some(addrs) = deep.stacks.get(stack as usize) else { continue };
         let mut frames: Vec<Frame> = Vec::new();
@@ -120,7 +129,7 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
         (a < m.base + m.size.max(1)).then_some(m)
     };
     // Every distinct address, grouped by module file; a return address (not the leaf) looks up the call.
-    let mut wanted: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+    let mut wanted: BTreeMap<String, Vec<(String, u64)>> = BTreeMap::new();
     let mut out: HashMap<String, Resolved> = HashMap::new();
     let mut seen = std::collections::HashSet::new();
     for s in &deep.samples {
@@ -134,7 +143,7 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
             }
             match find(s.1, a) {
                 Some(m) => {
-                    let rva = (a - m.base).saturating_sub(u64::from(i > 0)) as u32;
+                    let rva = (a - m.base).saturating_sub(u64::from(i > 0));
                     wanted.entry(m.path.clone()).or_default().push((key.clone(), rva));
                     out.insert(key, Vec::new());
                 }
@@ -153,8 +162,8 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
         .collect();
     // Each module's PDB is its own read (and maybe download): several at once.
     // (address keys and module-relative addresses, module path, frames per address when its PDB was found)
-    type Job = (Vec<(String, u32)>, String, Option<Vec<Vec<pdb::Located>>>);
-    let jobs: Vec<(String, Vec<(String, u32)>)> = wanted.into_iter().collect();
+    type Job = (Vec<(String, u64)>, String, Option<Vec<Vec<pdb::Located>>>);
+    let jobs: Vec<(String, Vec<(String, u64)>)> = wanted.into_iter().collect();
     let results: Vec<Job> = std::thread::scope(|scope| {
         let handles: Vec<_> = jobs
             .chunks(jobs.len().div_ceil(8).max(1))
@@ -165,7 +174,14 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
                         .iter()
                         .map(|(path, items)| {
                             let p = Path::new(path);
-                            let located = pdb::codeview(p).and_then(|cv| pdb::find(p, &cv, servers)).and_then(|pdb| pdb::resolve(&pdb, &items.iter().map(|x| x.1).collect::<Vec<_>>()));
+                            // PE modules by their PDB; ELF and Mach-O by their DWARF.
+                            let located = match pdb::codeview(p) {
+                                Some(cv) => pdb::find(p, &cv, servers).and_then(|pdb| pdb::resolve(&pdb, &items.iter().map(|x| x.1 as u32).collect::<Vec<_>>())),
+                                #[cfg(unix)]
+                                None => dwarf::resolve(p, &items.iter().map(|x| x.1).collect::<Vec<_>>()),
+                                #[cfg(not(unix))]
+                                None => None,
+                            };
                             (items.clone(), path.clone(), located)
                         })
                         .collect::<Vec<_>>()
@@ -174,6 +190,9 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
             .collect();
         handles.into_iter().flat_map(|h| h.join().unwrap_or_default()).collect()
     });
+    // Names the sampling tool gave (macOS `sample`), for addresses no debug info named.
+    let named: HashMap<(u32, u64), &Named> = deep.located.iter().map(|l| ((l.0, l.1), l)).collect();
+    let addr_of: HashMap<String, (u32, u64)> = deep.samples.iter().flat_map(|s| deep.stacks.get(s.4 as usize).into_iter().flatten().enumerate().map(move |(i, &a)| (addr_key(s.1, a, i == 0), (s.1, a)))).collect();
     for (items, path, located) in results {
         let module = path.rsplit(['\\', '/']).next().unwrap_or(&path).to_string();
         let fallback = module_package(&path);
@@ -188,7 +207,10 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
                         (name, f.file.clone().unwrap_or_default(), f.line, package, f.function.is_some())
                     })
                     .collect(),
-                None => vec![(module.clone(), String::new(), 0, fallback.clone(), false)],
+                None => match addr_of.get(&key).and_then(|k| named.get(k)) {
+                    Some((_, _, name, file, line)) => vec![(demangle_any(name), file.clone(), *line, file_package(file).unwrap_or_else(|| fallback.clone()), true)],
+                    None => vec![(module.clone(), String::new(), 0, fallback.clone(), false)],
+                },
             };
             // The standard library inlined into a function (`wrapping_mul` in a loop) is that
             // function's work: it folds into the frame it was inlined into, whose line is the call.
@@ -201,6 +223,16 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
     }
     let _ = write_gz(&cache, &out);
     Ok(out)
+}
+
+/// A name a sampling tool printed: mangled Rust or C++ (`_R…`, `_ZN…`) made readable.
+fn demangle_any(name: &str) -> String {
+    pdb::demangle(name)
+}
+
+/// The package of a bare file name a sampling tool printed (`main.rs`): Rust's own sources as `std`.
+fn file_package(file: &str) -> Option<String> {
+    crate_of(file).or_else(|| matches!(file, "rt.rs" | "backtrace.rs" | "function.rs" | "thread.rs" | "panicking.rs" | "panic.rs").then(|| "std".to_string()))
 }
 
 /// The Rust crate (or `std`) a source path belongs to, from Cargo's folder layout.
@@ -227,6 +259,21 @@ pub fn crate_of(file: &str) -> Option<String> {
 
 /// A module without source paths: OS modules and GPU drivers say so; others go by file name.
 pub fn module_package(path: &str) -> String {
+    if path.starts_with('/') || path.starts_with('[') {
+        let module = path.rsplit('/').next().unwrap_or(path).to_string();
+        let gpu = ["libnvidia", "libcuda", "libvulkan_", "libGLX_", "libEGL_", "libgallium", "libdrm", "libMTL", "AGX", "libGPU", "libigdrcl"].iter().any(|p| module.starts_with(p)) || module.ends_with("_dri.so") || path.contains("/dri/") || path.contains("/Extensions/AGX");
+        return if path == "[kernel.kallsyms]" {
+            "(kernel)".into()
+        } else if gpu {
+            format!("{module} (gpu driver)")
+        } else if path.starts_with("/System/") || path.starts_with("/usr/lib/system/") || (cfg!(target_os = "macos") && path.starts_with("/usr/lib/")) {
+            format!("{module} (macos)")
+        } else if path.starts_with("/usr/lib") || path.starts_with("/lib") {
+            format!("{module} (system)")
+        } else {
+            module
+        };
+    }
     let lower = path.to_ascii_lowercase().replace('/', "\\");
     let module = lower.rsplit('\\').next().unwrap_or(&lower).to_string();
     let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()).to_ascii_lowercase();
@@ -247,5 +294,5 @@ pub fn summary(n: &Native) -> Value {
         v.sort_by(|a, b| b.1.cmp(a.1));
         v.into_iter().take(10).map(|(m, c)| json!({ "module": m, "samples": c })).collect()
     };
-    json!({ "samples": n.samples, "resolved_samples": n.resolved, "resolved_share": if n.samples > 0 { n.resolved as f64 / n.samples as f64 } else { 0.0 }, "unsymbolized": top })
+    json!({ "samples": n.samples, "resolved_samples": n.resolved, "resolved_share": if n.samples > 0 { n.resolved as f64 / n.samples as f64 } else { 0.0 }, "unsymbolized": top, "dropped": n.dropped, "untimed": n.untimed })
 }

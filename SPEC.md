@@ -1013,6 +1013,15 @@ it, for app profiles they use from anywhere; `apps` merge per app.
   `output`, the executable (§13.7). Like a profile's `exe`, `output` is one path or one per OS
   (`{ "windows": "{cache}/cargo-target/release/my-app.exe", "macos": "{cache}/cargo-target/release/my-app" }`):
   a Cargo build names `my-app.exe` only on Windows.
+- **Per OS:** `build.windows`, `build.macos` and `build.linux` are objects that overlay the rest
+  of `build` on that OS: their `env` merges key by key, any other key (`command`, `cwd`,
+  `output`) replaces. A repository pins what its build needs on one OS so no user sets it by hand:
+  `"windows": { "env": { "RUSTUP_TOOLCHAIN": "stable-x86_64-pc-windows-msvc" } }`. The overlay is
+  part of the build key.
+- **A failed build** shows the last 25 lines of its output (stderr, else stdout), writes all of it
+  to `<state>/builds/logs/<variant>.log`, and hints at `build.env` and the per-OS overlay, since a
+  build that works for its author and fails here is most often a toolchain or variable this
+  machine lacks.
 - **`{cache}`** in `build.command`, `build.output` and `build.env` is a folder that outlives builds
   and is shared by every worktree of the repository (`<state>/builds/cache/<repo>`), so base and head
   reuse each other's dependency builds: `"CARGO_TARGET_DIR": "{cache}/cargo-target"`. Since both

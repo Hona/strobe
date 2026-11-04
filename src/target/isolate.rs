@@ -86,6 +86,28 @@ pub fn per_os(v: &Value) -> Option<&str> {
     }
 }
 
+/// strobe.json's `build` for this OS: its `windows`, `macos` or `linux` object overlays the rest
+/// (`env` merged key by key, other keys replaced), so a repository pins what its build needs on
+/// one OS (a toolchain, a compiler) without every user setting it.
+pub fn build_for_os(build: &Value) -> Value {
+    let Some(base) = build.as_object() else { return build.clone() };
+    let mut out = base.clone();
+    for k in ["windows", "macos", "linux"] {
+        out.remove(k);
+    }
+    if let Some(overlay) = base.get(os()).and_then(Value::as_object) {
+        for (k, v) in overlay {
+            match (k.as_str(), out.get_mut(k)) {
+                ("env", Some(Value::Object(env))) if v.is_object() => env.extend(v.as_object().cloned().unwrap_or_default()),
+                _ => {
+                    out.insert(k.clone(), v.clone());
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
 /// The app profile `id` from `config["apps"]`, following `extends`.
 pub fn app(id: &str, config: &Value) -> Result<App> {
     let apps = config["apps"].as_object().cloned().unwrap_or_default();

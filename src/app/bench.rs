@@ -2008,7 +2008,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             // The page's source maps, kept with the recording while its server still runs, so any view
             // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
             // `build.output`) turns original sources into files on disk.
-            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&ctx.config["build"]["output"]))).map(|(r, d)| r.join(d));
+            let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
+            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
             let mut scripts = std::collections::BTreeSet::new();
             for (profile, allocs) in &segments {
                 probe::symbols::urls(profile, &mut scripts);
@@ -2654,7 +2655,11 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
         if !matches!(v.kind, Kind::Dir | Kind::Git(_)) || v.exe.is_some() || target["path"].is_string() {
             return Ok(());
         }
-        let Some(build) = config.get("build").filter(|b| b.is_object() && b["command"].is_string()) else { return Ok(()) };
+        let build = config.get("build").map(crate::target::isolate::build_for_os).unwrap_or(Value::Null);
+        let build = &build;
+        if !build["command"].is_string() {
+            return Ok(());
+        }
         if let Kind::Git(r) = &v.kind {
             v.root = Some(worktree(r, project)?);
         }
@@ -2677,7 +2682,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
     overlay_harness(v, &root, h)?;
     if let Some(build) = config.get("build").filter(|b| b.is_object()) {
-        build_variant(v.role, &root, build, None)?;
+        build_variant(v.role, &root, &crate::target::isolate::build_for_os(build), None)?;
     }
     let serve = config.get("serve").filter(|s| s.is_object()).ok_or_else(|| Error::usage("web targets need \"serve\" in strobe.json (a command with {port})"))?;
     let port = free_port()?;
@@ -2758,8 +2763,17 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
     if !out.status.success() {
         // A command that reports its failure on stdout (cmd's own commands do) shows that instead.
         let text = if out.stderr.iter().all(u8::is_ascii_whitespace) { &out.stdout } else { &out.stderr };
-        let tail = String::from_utf8_lossy(text).lines().rev().take(15).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
-        return Err(Error::msg(format!("build {role} failed:\n{tail}")));
+        let tail = String::from_utf8_lossy(text).lines().rev().take(25).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n");
+        let log = host::paths::sub("builds").join("logs").join(format!("{}.log", hash_str(&root.to_string_lossy())));
+        let saved = log.parent().is_some_and(|d| std::fs::create_dir_all(d).is_ok())
+            && std::fs::write(&log, [format!("$ {cmd}\n(in {})\n\n--- stdout\n", cwd.display()).as_bytes(), &out.stdout, b"\n--- stderr\n", &out.stderr].concat()).is_ok();
+        let code = out.status.code().map(|c| format!(" (exit {c})")).unwrap_or_default();
+        let whole = if saved { format!("; all of it: {}", log.display()) } else { String::new() };
+        return Err(Error::msg(format!("build {role} failed{code}: {cmd}\n{tail}")).hint(format!(
+            "it ran in {} with this machine's defaults{whole}. A toolchain or variable the build needs goes in strobe.json build.env, or build.{}.env for this OS only",
+            cwd.display(),
+            crate::target::isolate::os()
+        )));
     }
     if let Some((built, dest)) = copy {
         if !built.is_file() {

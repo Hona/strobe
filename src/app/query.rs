@@ -961,7 +961,8 @@ fn thread_timeline(dir: &Path, top: usize) -> Result<Output> {
         text += &format!(
             "|{strip}|  {:>9}  {:>6} wakes/s peak  {:.1}-{:.1} s{}  {:<6} {}{} {}\n",
             fmt::value(total[i], "ms"),
-            fmt::value(peak, "count"),
+            // macOS counts wakes per process, not per thread.
+            if cfg!(target_os = "macos") { "—".to_string() } else { fmt::value(peak, "count") },
             s(th.first_ns),
             s(th.last_ns),
             if exited { " exited" } else { "" },

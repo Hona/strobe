@@ -2559,7 +2559,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   untimed samples all carry the capture's start, before the warmup runs, and the block kept only
   samples inside its measured runs. Untimed samples are kept whole now, as §13.4 says, and `--phase`
   refuses them. `sample` itself works on air (macOS 27.0.1: 1,549 samples of a 2 s capture of a
-  same-user process, through `strobe run` in the bench slot).
+  same-user process, through `strobe run` in the bench slot), and a `record --bench` of Hex's dictation case on air now keeps 8,888 samples, 100% resolved.
 - Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread --phase`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`

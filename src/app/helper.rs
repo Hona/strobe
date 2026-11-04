@@ -84,5 +84,10 @@ pub fn describe(a: &crate::etw::Access) -> String {
         (_, false, true) => "present events through the helper",
         _ => "no present events (strobe up)",
     };
-    format!("{presents} · native stacks {}", if a.helper { "through the helper" } else { "off (strobe up)" })
+    let stacks = match (a.helper, cfg!(target_arch = "x86_64")) {
+        (true, _) => "through the helper",
+        (false, true) => "without the helper: strobe suspends threads itself (user frames only; strobe up for the kernel's sampler)",
+        (false, false) => "off (strobe up)",
+    };
+    format!("{presents} · native stacks {stacks}")
 }

@@ -3685,6 +3685,9 @@ fn render(r: &Value) -> String {
         let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!("others kept off CPUs {}", cpu_list(c))).unwrap_or_default();
         let power = format!("power plan {}", env["power_plan"].as_str().filter(|p| !p.is_empty()).unwrap_or("?"));
         out += &format!("plan   {}\n", fmt::fields([r["plan"]["pin"].as_str().unwrap_or(""), &reserved, &power, &format!("{screen}, unthrottled")]));
+        if let Some(gpu) = r["plan"]["gpu_cache"][s["target"].as_str().unwrap_or("")].as_str() {
+            out += &format!("gpu    shader caches {gpu}\n");
+        }
         let per_block = if s["kind"] == "launch" {
             "one timed launch per block · first launch of each variant discarded".to_string()
         } else {

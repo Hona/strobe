@@ -36,7 +36,8 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
     };
     let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
     let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
-    Ok(base.with_extra(&args, &env))
+    let unset: Vec<String> = target["unset"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
+    Ok(base.with_extra(&args, &env).with_unset(&unset))
 }
 
 /// The driving session for one launch, opened when a page call first needs it: the app has then

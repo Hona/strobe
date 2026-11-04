@@ -1192,7 +1192,7 @@ export default bench({
   copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
   must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
   (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)` and `script(entry,
-  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, window? })` is a
+  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, unset?, window? })` is a
   native app (§13.7): `viewport` sizes the main window's client area in device-independent pixels
   where the app allows; `window: false` is an app with no window (a tray app).
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright

@@ -295,6 +295,8 @@ export interface NativeOptions {
   args?: string[]
   /** Extra environment after the profile's; `{home}` and `{port}` are filled in. */
   env?: Record<string, string>
+  /** Variables the launch removes, after the profile's (`PREFIX_*` for a family): `["WAYLAND_DISPLAY"]` for an X11 run. */
+  unset?: string[]
 
   /**
    * `false`: the app shows no window (a tray app). strobe neither waits for one nor places or checks it, launches end

@@ -61,6 +61,12 @@ impl App {
         self
     }
 
+    /// Variables (or `PREFIX_*` families) the launch removes, after the profile's.
+    pub fn with_unset(mut self, unset: &[String]) -> App {
+        self.unset.extend(unset.iter().cloned());
+        self
+    }
+
     fn unsets(&self, key: &str) -> bool {
         env_unset(&self.unset, key)
     }

@@ -436,6 +436,10 @@ fn runs(
     for name in &counters {
         extra.insert(format!("count.{name}"), per_run(&|r: &Run| r.counts.get(name).copied().unwrap_or(0.0)));
     }
+    // `phase.<name>`: the run's phase spans, from strobe's own marks.
+    for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("phase.")) {
+        extra.insert(format!("phase.{name}"), per_run(&|r: &Run| super::phase_ms(&r.log.marks, name)));
+    }
     let mut refused = BTreeMap::new();
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
@@ -681,6 +685,7 @@ fn missing(metric: &str, ui_thread: bool) -> Option<String> {
         "ui" if !ui_thread => Some(format!("NoPresentSource: {metric} is the UI thread's (the main window's); this target has no window")),
         "ui" => Some(format!("NoPresentSource: {metric} is not measured: native apps have ui.cpu and ui.wakes, from outside")),
         "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
+        "phase" => Some(format!("NoPhase: {metric}: no measured run entered phase(\"{}\")", &metric[6..])),
         "gpu" if metric == "gpu.compile" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
         _ => None,
     }

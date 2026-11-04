@@ -69,7 +69,7 @@ export interface Context<P> {
   page: Page
   /** The case this block runs: a block always belongs to one case. */
   case: string
-  /** Marks a named span inside a run; every metric can be sliced by it. */
+  /** Marks a named span inside a run; every metric can be sliced by it, and `phase.<name>` is its wall time. */
   phase<T>(name: string, fn: () => T | Promise<T>): Promise<T>
   /** Adds `n` (default 1) to the `count.<name>` metric of the current run. Outside a run it counts nothing. */
   count(name: string, n?: number): void
@@ -187,7 +187,7 @@ export interface Launch<P> {
 interface CaseBase {
   /** The metric this case is about, declared before the run. */
   primary: string
-  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
+  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `phase.<name>`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
   metrics?: string[]
   /** The targets this case runs on. Default: every target. */
   targets?: string[]

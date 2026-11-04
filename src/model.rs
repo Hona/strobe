@@ -354,6 +354,15 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         about: "`count.<name>`: what the bench file (`ctx.count`) or the page (`strobe.count`) counted per run",
     },
+    MetricDef {
+        name: "phase",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        about: "`phase.<name>`: wall time of the run's `phase(name, fn)` spans, from strobe's own marks (summed when a run has several)",
+    },
     MetricDef { name: "launch.ready", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "a launch case: from process spawn until its `until` selector is visible" },
     MetricDef {
         name: "launch.painted",
@@ -385,12 +394,13 @@ pub const METRICS: &[MetricDef] = &[
 ];
 
 /// A metric's definition. Families resolve by their base: `net.requests{<glob>}` → `net.requests`,
-/// `count.<name>` → `count`, `launch.<milestone>` → `launch.milestone`.
+/// `count.<name>` → `count`, `phase.<name>` → `phase`, `launch.<milestone>` → `launch.milestone`.
 pub fn metric(name: &str) -> Option<&'static MetricDef> {
     let base = name.split_once('{').map_or(name, |(b, _)| b);
     let find = |n: &str| METRICS.iter().find(|m| m.name == n);
     find(base).or_else(|| match base.split_once('.') {
         Some(("count", rest)) if !rest.is_empty() => find("count"),
+        Some(("phase", rest)) if !rest.is_empty() => find("phase"),
         Some(("launch", rest)) if !rest.is_empty() => find("launch.milestone"),
         _ => None,
     })

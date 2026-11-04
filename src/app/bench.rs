@@ -1600,6 +1600,24 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
     }
 }
 
+/// `phase.<name>` for one run (ms): the summed spans between its `…:phase:<name>:start` and `:end`
+/// marks on one clock; NaN when the run never entered the phase.
+fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
+    let (start, end) = (format!(":phase:{name}:start"), format!(":phase:{name}:end"));
+    let mut open: Option<u64> = None;
+    let mut total: Option<u64> = None;
+    for (key, at) in marks {
+        if key.ends_with(&start) {
+            open = Some(*at);
+        } else if key.ends_with(&end)
+            && let Some(from) = open.take()
+        {
+            *total.get_or_insert(0) += at.saturating_sub(from);
+        }
+    }
+    total.map_or(f64::NAN, |ns| ns as f64 / 1e6)
+}
+
 /// Whether a series can run while the session is locked (SPEC §10.1 `SessionLocked`): nothing it
 /// measures needs a presenting window. Script targets; leak runs; and a native target with
 /// `window: false` (a tray app), or any native target under `--check` (no verdict: it validates the
@@ -1608,7 +1626,7 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
 fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
     let t = &ctx.describe["targets"][&s.target];
     let offscreen = |m: &str| {
-        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
+        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     match t["kind"].as_str().unwrap_or("") {
         "script" => true,
@@ -2088,6 +2106,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let run_counts = run_counts.into_inner();
         for name in &counted {
             extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
+        }
+        // `phase.<name>`: the run's phase windows from the trace's marks.
+        for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("phase.")) {
+            let per: BTreeMap<String, f64> = (0..measured.len())
+                .filter_map(|j| {
+                    let suffix = format!(":run:{}:phase:{name}", first + j);
+                    let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0) as f64 / 1e6).collect();
+                    (!spans.is_empty()).then(|| (key(j), spans.iter().sum()))
+                })
+                .collect();
+            extra.insert(format!("phase.{name}"), per);
         }
         if let Some(n) = net {
             let mut n = n.into_inner();
@@ -3114,4 +3143,20 @@ fn render(r: &Value) -> String {
     }
     out += &format!("{} · strobe report experiment {} --open\n", r["id"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""));
     out
+}
+
+#[cfg(test)]
+mod phase_tests {
+    use super::phase_ms;
+
+    #[test]
+    fn a_phase_sums_its_spans_and_is_unknown_when_never_entered() {
+        let marks: Vec<(String, u64)> = [("run:0:phase:finish:start", 1_000_000), ("run:0:phase:other:start", 1_500_000), ("run:0:phase:finish:end", 4_000_000), ("run:0:phase:finish:start", 10_000_000), ("run:0:phase:finish:end", 12_500_000)]
+            .into_iter()
+            .map(|(k, t)| (k.to_string(), t))
+            .collect();
+        assert_eq!(phase_ms(&marks, "finish"), 5.5);
+        assert!(phase_ms(&marks, "other").is_nan());
+        assert!(phase_ms(&marks, "start").is_nan());
+    }
 }

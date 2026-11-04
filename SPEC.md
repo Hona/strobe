@@ -483,6 +483,13 @@ phase. A native app's phase marks are strobe's own, stamped on the host clock (t
 inputs, OS present events and native samples) and kept in the recording's `frames.json`;
 `query <rec> hotspots --phase <name>` ranks the native samples inside that phase (§13.7).
 
+`phase.<name>` is a phase's own wall time per run (ms, timed, lower is better), summed when a run
+enters it more than once: from the trace marks on pages, from strobe's host-clock marks on native
+and script targets. strobe stamps both edges when the runner reports them, so a bench file can time
+a span inside a run (a command to its reply, a request to the state it waits for) without reporting
+a number of its own. A declared `phase.<name>` that no measured run entered is refused (`NoPhase`).
+On a locked session it is an offscreen metric, like `run.duration`.
+
 ### 7.4 Native apps
 
 What strobe reads from a native app (§13.7), per run:
@@ -1148,7 +1155,7 @@ export default bench({
   measured), `metrics` (optional extra secondaries), `targets` (optional: the targets this case
   runs on; default every target), `probes` (optional extra attribution probes).
 
-**`ctx`:** `page`, `phase(name, fn)`, `count(name, n?)` (§8.4), `call(name, ...args)` (script
+**`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
@@ -2248,7 +2255,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
 | 0b | — | the bridge (`@hona/strobe-electron`) |
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update --on` |
-| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe` on npm (CLI and types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
+| 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `phase.<name>` (pages, native, script), `net.*`, `layout.shift`; `@hona/strobe` on npm (CLI and types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |

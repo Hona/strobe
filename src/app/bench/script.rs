@@ -174,6 +174,9 @@ fn cpu_ms(a: (u64, Option<u64>, u64), b: (u64, Option<u64>, u64), wall_ms: f64) 
     }
 }
 
+/// One run: wall ms, CPU ms, its counters, the heap it retained (MB), and its phase marks.
+type ScriptRun = (f64, f64, BTreeMap<String, f64>, f64, Vec<(String, u64)>);
+
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     let target = ctx.describe["targets"][&s.target].clone();
     let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a script target runs in a variant's folder (a directory or a git ref)", v.role)))?;
@@ -194,6 +197,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     let pid = host.borrow().pid();
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
     let counting = std::cell::Cell::new(false);
+    let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "call" => host.borrow_mut().request(json!({ "name": a["name"], "args": a["args"] }), Duration::from_secs(600)),
@@ -203,7 +207,13 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
                 }
                 Ok(Value::Bool(true))
             }
-            "phase" => Ok(Value::Bool(true)),
+            "phase" => {
+                if counting.get() {
+                    let name = a["name"].as_str().unwrap_or("phase");
+                    marks.borrow_mut().push((format!("phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
+                }
+                Ok(Value::Bool(true))
+            }
             "driver" => Err(Error::msg("a script target has no page: call its exports with ctx.call(name, ...args)")),
             other => Err(Error::msg(format!("unknown runner request {other}"))),
         }
@@ -217,11 +227,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
         let measured_runs = ctx.runs;
-        let mut runs: Vec<(f64, f64, BTreeMap<String, f64>, f64)> = Vec::new();
+        let mut runs: Vec<ScriptRun> = Vec::new();
         let mut first: Option<usize> = None;
         while first.is_none_or(|f| runs.len() < f + measured_runs) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
             counts.borrow_mut().clear();
+            marks.borrow_mut().clear();
             counting.set(true);
             let (c0, t0) = (cpu(pid), Instant::now());
             ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out"))?;
@@ -229,7 +240,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             let used = cpu_ms(c0, cpu(pid), wall);
             counting.set(false);
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
-            runs.push((wall, used, counts.borrow().clone(), retained));
+            runs.push((wall, used, counts.borrow().clone(), retained, marks.borrow_mut().drain(..).collect()));
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
@@ -261,6 +272,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         for name in s.metrics.iter().chain(std::iter::once(&s.primary)).filter(|m| m.starts_with("count.")) {
             let counter = name.trim_start_matches("count.");
             extra.insert(name.clone(), measured.iter().enumerate().map(|(j, r)| (key(j), r.2.get(counter).copied().unwrap_or(0.0))).collect());
+        }
+        for name in s.metrics.iter().chain(std::iter::once(&s.primary)).filter_map(|m| m.strip_prefix("phase.")) {
+            extra.insert(format!("phase.{name}"), measured.iter().enumerate().map(|(j, r)| (key(j), super::phase_ms(&r.4, name))).filter(|(_, x)| x.is_finite()).collect());
         }
         let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
         let private_mb = host::process_tree(pid).iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);

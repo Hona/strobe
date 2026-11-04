@@ -1,6 +1,6 @@
 {
   "name": "@hona/strobe-linux-x64",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "The strobe binary for Linux x64 (static, glibc or musl); installed by @hona/strobe",
   "files": ["strobe"],
   "os": ["linux"],

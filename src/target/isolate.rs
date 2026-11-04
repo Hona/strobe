@@ -651,6 +651,18 @@ pub fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
 /// it. Isolation should make it safe, but the user's own app is never the thing to experiment on.
 pub fn live(app: &App, guard: &Guard) -> Result<()> {
     if !host::running(&app.exe).is_empty() {
+        // An interpreter runs every script of its kind: a running one says nothing about the app.
+        let stem = app.exe.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+        let interpreter = ["python", "pythonw", "py", "node", "bun", "deno", "ruby", "perl", "sh", "bash", "java", "javaw", "pwsh", "powershell"]
+            .iter()
+            .any(|i| stem == *i || stem.strip_prefix(i).is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.')));
+        if interpreter {
+            return Err(Error::refused(
+                "LiveChannel",
+                format!("{} is running, and it is an interpreter: strobe cannot tell your app's copy from any other script it runs", app.exe.display()),
+                "launch the script itself as the executable (a shebang line and chmod +x on Linux and macOS, or a small launcher), so the app has an executable of its own",
+            ));
+        }
         return Err(Error::refused("LiveChannel", format!("{} is running: that is your app", app.exe.display()), "measure another build or channel, or close it"));
     }
     // The install folder: a macOS app's bundle, else the executable's folder.

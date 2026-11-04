@@ -1638,7 +1638,9 @@ Strobe launches any Electron app the same way, with no change to the app:
   folder is inside the home (a stale one from a seed is removed first).
 - **`LiveChannel`**: refuses when the executable is already running, or when a guarded process
   (below) runs from the app's install folder or a data folder of the same name. The user's own
-  app is never the thing to experiment on.
+  app is never the thing to experiment on. An interpreter as the executable (python, node, bun,
+  a shell, …) runs any script, so a running one says nothing about the app: the refusal says so and
+  asks for the script itself (shebang and `chmod +x`, or a launcher) as the executable.
 - On close, every process running from the home is killed (detached children outlive the tree),
   then the home is deleted.
 

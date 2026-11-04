@@ -1123,18 +1123,20 @@ pub fn pr_markdown(r: &Value) -> String {
         out += "\n";
     }
     let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
-    let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!(" · other processes kept off CPUs {}", cpu_list(c))).unwrap_or_default();
+    let context = fmt::fields([
+        r["env"]["os"].as_str().unwrap_or("").to_string(),
+        r["env"]["cpu"].as_str().unwrap_or("").to_string(),
+        r["env"]["power_plan"].as_str().filter(|p| !p.is_empty()).map(|p| format!("power plan {p}")).unwrap_or_default(),
+        r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!("other processes kept off CPUs {}", cpu_list(c))).unwrap_or_default(),
+        gpu.to_string(),
+        r["browser"].as_str().unwrap_or("").to_string(),
+        fmt::size(&r["window"]),
+        r["refresh_hz"].as_f64().map(|h| format!("{h:.0} Hz display")).unwrap_or_default(),
+    ]);
     out += &format!(
-        "`{}` against `{}`, alternating fresh launches: {} · {} · power plan {}{reserved} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
+        "`{}` against `{}`, alternating fresh launches: {context}. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
         base["label"].as_str().unwrap_or("base"),
         head["label"].as_str().unwrap_or("head"),
-        r["env"]["os"].as_str().unwrap_or(""),
-        r["env"]["cpu"].as_str().unwrap_or(""),
-        r["env"]["power_plan"].as_str().filter(|p| !p.is_empty()).unwrap_or("?"),
-        r["browser"].as_str().unwrap_or(""),
-        r["window"]["width"],
-        r["window"]["height"],
-        r["refresh_hz"].as_f64().map(|h| format!("{h:.0}")).unwrap_or_else(|| "?".into())
     );
     let file = r["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\").replace('\\', "/");
     out += &format!("```sh\nstrobe bench {file} --base {} --head {}\n```\n", base["spec"].as_str().unwrap_or("<base>"), head["spec"].as_str().unwrap_or("."));
@@ -2943,17 +2945,23 @@ fn render(r: &Value) -> String {
             continue;
         }
         out += &format!("strobe bench {file} · {}   base {}   head {}\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
-        out += &format!("env    {} · {} · {} logical CPUs\n", env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), env["logical_cpus"]);
+        let cpus = env["logical_cpus"].as_u64().map(|n| format!("{n} logical CPUs")).unwrap_or_default();
+        out += &format!("env    {}\n", fmt::fields([env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), &cpus]));
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
-        let refresh = r["refresh_hz"].as_u64().map(|h| format!(" · display {h} Hz")).unwrap_or_default();
-        out += &format!("       {} · {} · window {}×{}{}\n", r["browser"].as_str().unwrap_or(""), gpu, r["window"]["width"], r["window"]["height"], refresh);
+        let window = Some(fmt::size(&r["window"])).filter(|s| !s.is_empty()).map(|s| format!("window {s}")).unwrap_or_default();
+        let refresh = r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default();
+        let display = fmt::fields([r["browser"].as_str().unwrap_or(""), gpu, &window, &refresh]);
+        if !display.is_empty() {
+            out += &format!("       {display}\n");
+        }
         let screen = match s["session"].as_str() {
             Some("locked") => "session locked (nothing measured needs a presenting window)",
             Some("mixed") => "session locked in some pairs only: nothing decided",
             _ => "visible",
         };
-        let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!(" · others kept off CPUs {}", cpu_list(c))).unwrap_or_default();
-        out += &format!("plan   {}{reserved} · power plan {} · {screen}, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
+        let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!("others kept off CPUs {}", cpu_list(c))).unwrap_or_default();
+        let power = format!("power plan {}", env["power_plan"].as_str().filter(|p| !p.is_empty()).unwrap_or("?"));
+        out += &format!("plan   {}\n", fmt::fields([r["plan"]["pin"].as_str().unwrap_or(""), &reserved, &power, &format!("{screen}, unthrottled")]));
         let per_block = if s["kind"] == "launch" {
             "one timed launch per block · first launch of each variant discarded".to_string()
         } else {

@@ -1520,7 +1520,12 @@ that stacks index, while recordings and `query` keep all);
 markdown is GitHub-flavoured. `--format pr` writes an experiment for a pull request body: per
 series a table of the primary and tested metrics (base, head, change [interval], verdict), the
 context metrics in a folded `<details>`, pixels and warnings, then one line of setup (variants,
-OS, CPU, GPU, browser, window, display) and the `strobe bench` command that reruns it.
+OS, CPU, GPU, browser, window, display; a field strobe does not have, such as a native app's
+browser, is left out rather than shown empty) and the `strobe bench` command that reruns it.
+Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
+stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed
+over the target once flushed, so the file is whole when the command returns and a reader never
+sees a part of it.
 
 ### 11.3 Insights
 

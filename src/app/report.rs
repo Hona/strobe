@@ -59,12 +59,32 @@ pub fn run(args: &Args) -> Result<Output> {
         "pr" => super::bench::pr_markdown(&data),
         _ => html(view, &data),
     };
-    std::fs::write(&out, &body)?;
+    write_whole(&out, &body)?;
     if args.has("open") {
         open(&out);
     }
     let path = out.display().to_string();
-    Ok(Output::new(format!("{path} · {}\n", super::fmt::bytes(body.len() as f64)), json!({ "path": path, "bytes": body.len() })))
+    let size = super::fmt::bytes(body.len() as f64);
+    // Markdown is for pasting: it goes to stdout, and the file's path to stderr.
+    if format == "pr" || format == "md" {
+        if !args.json() {
+            eprintln!("strobe: wrote {path} · {size}");
+        }
+        return Ok(Output::new(body.clone(), json!({ "path": path, "bytes": body.len(), "markdown": body })));
+    }
+    Ok(Output::new(format!("{path} · {size}\n"), json!({ "path": path, "bytes": body.len() })))
+}
+
+/// Writes beside the target and renames over it once flushed, so a reader never sees half a report.
+fn write_whole(path: &std::path::Path, body: &str) -> Result<()> {
+    use std::io::Write;
+    let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
+    let mut f = std::fs::File::create(&tmp)?;
+    f.write_all(body.as_bytes())?;
+    f.sync_all()?;
+    drop(f);
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// The "why": each series' attribution recordings (base and head) as the report shows them, plus how

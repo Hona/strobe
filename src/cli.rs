@@ -134,6 +134,7 @@ Use
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
+                                  (md and pr print the markdown; the file's path goes to stderr)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
 
 Setup

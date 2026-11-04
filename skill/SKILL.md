@@ -24,7 +24,8 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         hotspots and alloc take --by function|file|package (hotspots: --native, --thread <name> for native samples);
         memory takes --by process|layer|allocator and --at <i>;
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
-    strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body
+    strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body,
+        printed to stdout (the file's path on stderr)
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
@@ -99,7 +100,7 @@ Is a native app smooth, and where does its CPU go? `record proc:<name> --for 10s
 Where does the GPU process spend time (a frozen first frame, a slow canvas)? `query <rec> gpu` on an attribution recording, and `gpu.compile` as a bench metric. On a native or `pid:` recording, `query <rec> gpu` gives engine use and GPU memory per adapter from the OS.
 What does a launch do before it is ready? `record --bench <file>#<launch case>`: its milestones, and `query <rec> threads` for each thread's wakes and CPU from the spawn until ready (no trace needed).
 Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread, the module each started in, and whose: app, driver such as `nvwgf2umx.dll`, or os) and `query <rec> insights`. `cpu.wakes` is context switches/s (waits and preemptions, driver threads included); the insight counts the app's own threads apart.
-Writing the PR? `report experiment <exp> --format pr` gives the tables and the command that reruns them.
+Writing the PR? `report experiment <exp> --format pr` prints the tables and the command that reruns them (paste stdout).
 
 ## Every performance claim in a PR comes from strobe
 

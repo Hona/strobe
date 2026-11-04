@@ -77,6 +77,19 @@ pub fn pad(s: &str, w: usize) -> String {
     if n >= w { format!("{s} ") } else { format!("{s}{}", " ".repeat(w - n)) }
 }
 
+/// `a · b · c` without the fields that are empty (a native target has no browser, a tray app no window).
+pub fn fields<S: AsRef<str>>(parts: impl IntoIterator<Item = S>) -> String {
+    parts.into_iter().filter(|p| !p.as_ref().trim().is_empty()).map(|p| p.as_ref().trim().to_string()).collect::<Vec<_>>().join(" · ")
+}
+
+/// `1400×900`, or nothing without a window size.
+pub fn size(w: &serde_json::Value) -> String {
+    match (w["width"].as_f64(), w["height"].as_f64()) {
+        (Some(x), Some(y)) if x > 0.0 && y > 0.0 => format!("{x:.0}×{y:.0}"),
+        _ => String::new(),
+    }
+}
+
 pub fn ms_duration(ms: u64) -> String {
     if ms < 1000 {
         format!("{ms} ms")

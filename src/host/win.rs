@@ -1240,8 +1240,8 @@ pub fn on_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) {
     static TARGET: AtomicPtr<std::sync::atomic::AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
     unsafe extern "system" fn handler(kind: u32) -> i32 {
         let flag = TARGET.load(Ordering::SeqCst);
-        if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) && !flag.is_null() {
-            unsafe { (*flag).store(true, Ordering::SeqCst) };
+        // The first Ctrl+C asks strobe to stop; a second, while that one is still pending, ends it.
+        if (kind == CTRL_C_EVENT || kind == CTRL_BREAK_EVENT) && !flag.is_null() && !unsafe { (*flag).swap(true, Ordering::SeqCst) } {
             return 1;
         }
         0

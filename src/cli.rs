@@ -92,6 +92,15 @@ impl Args {
     pub fn json(&self) -> bool {
         self.has("json")
     }
+
+    /// The command line as JSON, kept with an experiment so `--resume` runs it again.
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({ "command": self.command, "pos": self.pos, "flags": self.flags })
+    }
+
+    pub fn from_json(v: &serde_json::Value) -> Option<Args> {
+        Some(Args { command: v["command"].as_str()?.to_string(), pos: serde_json::from_value(v["pos"].clone()).ok()?, flags: serde_json::from_value(v["flags"].clone()).ok()? })
+    }
 }
 
 /// Parses `10s`, `500ms`, `2m`, or plain seconds.

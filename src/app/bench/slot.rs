@@ -143,6 +143,10 @@ impl Registration {
                 super::progress(format!("  still waiting after {} ({ends})", super::super::fmt::ms_duration(started.elapsed().as_millis() as u64)));
                 reminded = Instant::now();
             }
+            if super::stop_requested() {
+                self.set("idle", "");
+                return Err(super::stop_error());
+            }
             std::thread::sleep(Duration::from_millis(200));
         }
         self.set("running", what);

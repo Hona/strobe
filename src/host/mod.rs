@@ -773,19 +773,27 @@ pub fn running_under(dir: &Path) -> Vec<u32> {
     os::running_under(dir)
 }
 
-/// SIGINT sets `flag` instead of ending strobe.
+/// SIGINT and SIGTERM set `flag` instead of ending strobe; a second one while the flag is still set
+/// ends it as the signal would.
 #[cfg(unix)]
 pub fn unix_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) {
     use std::sync::atomic::{AtomicPtr, Ordering};
     static TARGET: AtomicPtr<std::sync::atomic::AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
-    extern "C" fn handler(_: libc::c_int) {
+    extern "C" fn handler(sig: libc::c_int) {
         let flag = TARGET.load(Ordering::SeqCst);
-        if !flag.is_null() {
-            unsafe { (*flag).store(true, Ordering::SeqCst) };
+        if !flag.is_null() && !unsafe { (*flag).swap(true, Ordering::SeqCst) } {
+            return;
+        }
+        unsafe {
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
         }
     }
     if TARGET.swap(flag as *const _ as *mut _, Ordering::SeqCst).is_null() {
-        unsafe { libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t) };
+        unsafe {
+            libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t);
+            libc::signal(libc::SIGTERM, handler as *const () as libc::sighandler_t);
+        }
     }
 }
 

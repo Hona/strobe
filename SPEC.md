@@ -212,6 +212,7 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version
 | 4 | refused: a validator failed; the result names it and the fix |
 | 5 | inconclusive (`unclear` or `underpowered`), only with `--require-verdict` |
 | 124 | timeout |
+| 130 | `bench` stopped (Ctrl-C, SIGINT, SIGTERM or `--stop`): what finished is written, `--resume` goes on |
 | 255 | target or device unreachable |
 
 ### 5.3 `strobe up`
@@ -296,7 +297,29 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--require-verdict] [--json]
+strobe bench --stop <exp>
+strobe bench --resume <exp>
 ```
+
+**Stopping and resuming.** Ctrl-C (SIGINT), SIGTERM or `strobe bench --stop <exp>` (from any shell,
+or for a bench the daemon runs) stops a bench once its current block ends; waits (a locked session,
+the bench slot, busy CPUs) end at once. A second Ctrl-C ends strobe at once. On Windows and in a
+terminal the runner and the browser get the same Ctrl-C and end with it, so the block in flight is
+dropped. What finished stays: the half pair goes, the finished pairs of the running series get
+their comparison (no verdict unless a planned look had decided it), finished series keep theirs,
+and the rest are listed as not run. The result (`result.json`, `report`, `--format pr`, which marks
+it incomplete) is written and strobe exits 130. A failure after some pairs (a refused block, a
+launch that kept failing) ends the same way, with that error's exit code. After every pair a bench
+saves its command line and each series' finished blocks and pairs, or its result once done, in the
+experiment's `state.json`; `--resume <exp>` runs the same command line again (the bench file and
+directory variants as full paths, so from any folder) from there: finished series are kept, the
+running one goes on from its next pair, and variants build again (unchanged ones from the cache).
+
+**Launches that fail and pass.** A block whose launch failed for a reason that passes (the browser
+did not open its debugging port, a DevTools call such as `Target.attachToTarget` got no reply, the
+connection dropped) runs again, after 30 s and a wait for quiet CPUs, holding nothing meanwhile, up
+to 3 times per block; a run that failed, or a validator, still ends it. Two such failures under load
+(load average 35–70 on a shared Mac) once lost a 40-minute experiment with its finished pairs.
 
 Every series in the file (case × target × params, narrowed by `--filter`, `--target` and
 `--params`) gets its own verdict. `--filter` takes case names separated by commas; each is exact
@@ -862,7 +885,14 @@ flowchart LR
   differences (1.4826·MAD), not the interval width: early intervals are [min, max] of few Walsh
   averages, and one odd pair once stopped a series (a tab switch, "~78 pairs needed") that its
   A/A twin decided as `same` at 19. `--pairs N` is one look at N at 95%. Secondaries and
-  descriptive rows use 95% intervals at the final pair.
+  descriptive rows use 95% intervals at the final pair. When the primary is decided at a look with
+  fewer pairs than the tested secondaries need to clear Holm (2·2⁻ⁿ ≤ 0.05/tests: 9 pairs from 7
+  tests), the series runs on to that many pairs for them and keeps the primary's verdict from its
+  look (`--pairs N` runs exactly N). A share primary (`%`, not CPU) at 80% or more on both sides at a
+  look without a verdict stops as `saturated`: at its ceiling it moves with nothing the builds do
+  (91.4% vs 91.6% dropped frames at background priority added looks at 2.5 min a pair), so the
+  verdict says to choose another primary. A series that reaches the last look undecided says so:
+  `unclear after 40 pairs, the last planned look`.
 - **Attribution blocks**: one per variant after timing, same case, with the attribution probes,
   only when the primary differs (`--why auto`): a `same` or `underpowered` result has nothing to
   explain. `--why always` runs them for every series, `--why never` skips them.
@@ -2335,7 +2365,8 @@ under `--check`, values noisy and not compared):
 Ergonomics batch 2 (2026-11-04): `BackgroundPriority` refuses frame and input-latency metrics
 (§10.1); `page.drag`, mouse buttons on `down`/`up`, `input.rate` and `input.gap.p95` (§9.6). Built and
 linted on all three OSes; not yet run against a live window (the session was locked): a page drag's
-pacing against the page's frames, and a native drag on each OS.
+pacing against the page's frames, and a native drag on each OS. Benches stop and resume (§5.6), retry
+launches that fail and pass, stop `saturated` primaries and run on to the pairs Holm needs (§9.1).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

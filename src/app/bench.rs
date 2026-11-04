@@ -151,6 +151,48 @@ impl Drop for Variant {
     }
 }
 
+thread_local! {
+    /// The saved state `--resume` hands to the bench it starts.
+    static RESUMED: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// Where `strobe bench --stop <exp>` asks the running bench to stop (its experiment's `stop` file).
+static STOP_FILE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+/// Whether the bench should stop once the block that runs ends: Ctrl-C, SIGINT, SIGTERM, or
+/// `strobe bench --stop <exp>`. Waits (a locked session, the slot, busy CPUs) end at once.
+pub(crate) fn stop_requested() -> bool {
+    host::ctrl_c().load(std::sync::atomic::Ordering::SeqCst) || STOP_FILE.lock().unwrap().as_ref().is_some_and(|p| p.exists())
+}
+
+pub(crate) fn stop_error() -> Error {
+    Error { code: 130, message: "stopped (Ctrl-C, SIGTERM or strobe bench --stop)".into(), hint: Some("strobe bench --resume <exp> runs what is left".into()) }
+}
+
+/// Sleeps for `d`, or until a stop is asked for.
+fn nap(d: Duration) -> Result<()> {
+    let end = Instant::now() + d;
+    while let Some(left) = end.checked_duration_since(Instant::now()).filter(|l| !l.is_zero()) {
+        if stop_requested() {
+            return Err(stop_error());
+        }
+        std::thread::sleep(left.min(Duration::from_millis(500)));
+    }
+    Ok(())
+}
+
+/// Times a block is run again after a launch that failed for a reason that passes (a browser that did
+/// not open its debugging port under load, a DevTools call with no reply), before the error stands.
+const LAUNCH_RETRIES: u32 = 3;
+
+/// A launch or attach failure that another try can get past: the target never came up to talk to,
+/// as opposed to a run that failed or a validator that refused.
+fn transient(e: &Error) -> bool {
+    let m = e.message.as_str();
+    !m.contains("RunIncomplete")
+        && (e.code == 255 || m.contains("did not open its debugging port") || (e.code == 124 && m.starts_with("cdp ")) || (m.starts_with("cdp ") && m.contains("no reply in")))
+}
+
 /// Warmup runs at most, before strobe measures anyway and flags the block (`NotSteady`).
 const MAX_WARMUP: usize = 10;
 
@@ -193,7 +235,8 @@ fn process_roles(browser: &chromium::Browser) -> BTreeMap<u32, usize> {
     info["processInfo"].as_array().into_iter().flatten().filter_map(|p| Some((p["id"].as_u64()? as u32, PROCESS_ROLES.iter().position(|(t, _)| p["type"].as_str() == Some(*t))?))).collect()
 }
 
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
 struct Block {
     variant: String,
     pair: usize,
@@ -281,6 +324,8 @@ struct Ctx<'a> {
     qos: Option<String>,
     /// Why the last block's target process ran at background priority, read after its launch.
     target_qos: Option<String>,
+    /// `state.json`: the command line and each series' finished pairs or result (`checkpoint`).
+    saved: Value,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -368,6 +413,27 @@ fn cpu_list(mask: u64) -> String {
 }
 
 pub fn run(args: &Args) -> Result<Output> {
+    // `--stop <exp>`: ask a running bench to stop once its block ends; it keeps its finished pairs.
+    if let Some(exp) = args.get("stop") {
+        let dir = host::paths::experiments().join(exp);
+        if !dir.is_dir() {
+            return Err(Error::usage(format!("no experiment {exp}")));
+        }
+        std::fs::write(dir.join("stop"), b"")?;
+        let text = format!("asked {exp} to stop once its current block ends; it writes what it finished (strobe report experiment {exp}), and strobe bench --resume {exp} goes on\n");
+        return Ok(Output::new(text, json!({ "id": exp, "stop": true })));
+    }
+    // `--resume <exp>`: the same command line, from the pairs and series it had finished.
+    if let Some(exp) = args.get("resume") {
+        let dir = host::paths::experiments().join(exp);
+        let saved = store::read_json(&dir.join("state.json")).map_err(|_| Error::usage(format!("{exp} has no saved state to resume (state.json): only experiments started by this strobe or later can resume")))?;
+        let mut resumed = Args::from_json(&saved["args"]).ok_or_else(|| Error::usage(format!("{exp}: state.json holds no command line")))?;
+        resumed.set("id", exp);
+        resumed.remove("resume");
+        let _ = std::fs::remove_file(dir.join("stop"));
+        RESUMED.with(|r| *r.borrow_mut() = Some(saved));
+        return run(&resumed);
+    }
     if let Some(range) = args.get("bisect") {
         return super::bisect::run(args, range);
     }
@@ -454,7 +520,20 @@ pub fn run(args: &Args) -> Result<Output> {
         power_used: None,
         qos: host::background_qos(None),
         target_qos: None,
+        saved: RESUMED.with(|r| r.borrow_mut().take()).unwrap_or_else(|| json!({ "args": args.to_json(), "series": {} })),
     };
+    // A stop asked of an earlier run of this experiment (or a Ctrl-C a daemon saw for another) is not this one's.
+    let _ = std::fs::remove_file(dir.join("stop"));
+    *STOP_FILE.lock().unwrap() = Some(dir.join("stop"));
+    host::ctrl_c().store(false, std::sync::atomic::Ordering::SeqCst);
+    // What `--resume` needs from another folder: the bench file and directory variants as full paths.
+    ctx.saved["args"]["pos"] = json!([file]);
+    for k in ["head", "base"] {
+        if let Some(p) = args.get(k).filter(|p| Path::new(p).is_dir()).and_then(|p| std::fs::canonicalize(p).ok()) {
+            ctx.saved["args"]["flags"][k] = json!(p.display().to_string().trim_start_matches(r"\\?\"));
+        }
+    }
+    let _ = store::write_json(&dir.join("state.json"), &ctx.saved);
     ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
     if let Some(f) = args.get("filter") {
@@ -510,25 +589,72 @@ pub fn run(args: &Args) -> Result<Output> {
     if pixels_only && variants.len() < 2 {
         return Err(Error::usage("--pixels-only compares base with head: add --base <variant>"));
     }
+    // A stop (Ctrl-C, SIGTERM, `--stop`) or a failure ends the experiment with what it finished: the
+    // series done, the pairs of the one running, and the series it never reached.
+    let mut halted: Option<Error> = None;
+    let mut not_run: Vec<String> = Vec::new();
     for s in &series {
-        let out = if check {
-            check_series(&mut ctx, s, &mut variants, &config)?
+        if halted.is_none() && stop_requested() {
+            halted = Some(stop_error());
+        }
+        if halted.is_some() {
+            not_run.push(s.label());
+            continue;
+        }
+        // A resumed experiment keeps the series it had finished.
+        if let Some(done) = ctx.saved["series"][s.label()].get("done").filter(|d| d.is_object()).cloned() {
+            progress(format!("\n{}  finished before the resume: kept", s.label()));
+            all_decided &= done["decided"].as_bool().unwrap_or(false);
+            series_out.push(done);
+            continue;
+        }
+        let r = if check {
+            check_series(&mut ctx, s, &mut variants, &config)
         } else if pixels_only {
-            let target = ctx.describe["targets"][&s.target].clone();
-            release_machine(&mut ctx);
-            ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-            for v in variants.iter_mut() {
-                prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
-            }
-            let pixels = pixels_series(&mut ctx, s, &variants)?;
-            json!({ "label": s.label(), "case": s.case, "kind": "pixels", "pixels": pixels, "decided": pixels.as_array().is_some_and(|a| a.iter().all(|p| p["state"] == "same")) })
+            (|| -> Result<Value> {
+                let target = ctx.describe["targets"][&s.target].clone();
+                release_machine(&mut ctx);
+                ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
+                for v in variants.iter_mut() {
+                    prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
+                }
+                let pixels = pixels_series(&mut ctx, s, &variants)?;
+                Ok(json!({ "label": s.label(), "case": s.case, "kind": "pixels", "pixels": pixels, "decided": pixels.as_array().is_some_and(|a| a.iter().all(|p| p["state"] == "same")) }))
+            })()
         } else if leak_run {
-            leak_series(&mut ctx, s, &mut variants, &config)?
+            leak_series(&mut ctx, s, &mut variants, &config)
         } else {
-            run_series(&mut ctx, s, &mut variants, &config, started, max_time)?
+            run_series(&mut ctx, s, &mut variants, &config, started, max_time)
         };
+        let out = match r {
+            Ok(out) => out,
+            Err(e) => {
+                halted = Some(if e.code == 130 || stop_requested() { stop_error() } else { e });
+                not_run.push(s.label());
+                continue;
+            }
+        };
+        if let Some(h) = out.get("halt").filter(|h| h.is_object()) {
+            halted = Some(Error { code: h["code"].as_i64().unwrap_or(1) as i32, message: h["message"].as_str().unwrap_or("").to_string(), hint: None });
+        }
+        if out["not_run"] == true {
+            not_run.push(s.label());
+            continue;
+        }
+        if halted.is_none() {
+            checkpoint(&mut ctx, &s.label(), json!({ "done": out }));
+        }
         all_decided &= out["decided"].as_bool().unwrap_or(false);
         series_out.push(out);
+    }
+    if halted.as_ref().is_some_and(|h| h.code == 130) {
+        progress(format!("\nstopped: kept {} series; strobe bench --resume {exp} runs the rest", series_out.len()));
+    }
+    // Nothing finished and nothing to resume: the failure is the answer.
+    if let Some(e) = halted.take_if(|e| e.code != 130 && series_out.is_empty() && ctx.saved["series"].as_object().is_none_or(|o| o.is_empty())) {
+        release_machine(&mut ctx);
+        ctx.runner.exit();
+        return Err(e);
     }
     release_machine(&mut ctx);
     if let Some(p) = &ctx.power_used {
@@ -540,6 +666,9 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     if let Some(t) = &ctx.reserved {
         ctx.warnings.push(validity::info("ReservedCpus", t.text()));
+    }
+    if let Some(h) = halted.as_ref().filter(|_| check || pixels_only) {
+        ctx.warnings.push(validity::warn("Stopped", format!("{}; not run: {}", h.message, not_run.join(", "))));
     }
     if check {
         return check_output(&exp, &dir, &file, series_out, ctx.warnings);
@@ -571,7 +700,8 @@ pub fn run(args: &Args) -> Result<Output> {
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
         },
         "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v) })).collect::<Vec<_>>(),
-        "series": series_out, "warnings": ctx.warnings, "decided": all_decided,
+        "series": series_out, "warnings": ctx.warnings, "decided": all_decided && halted.is_none(),
+        "stopped": halted.as_ref().map(|h| json!({ "code": h.code, "why": h.message, "not_run": not_run })),
     });
     let text = render(&result_json);
     let mut result_json = result_json;
@@ -594,6 +724,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut out = Output::new(text, brief);
     if args.has("require-verdict") && !all_decided {
         out.code = 5;
+    }
+    if let Some(h) = &halted {
+        out.code = h.code;
     }
     Ok(out)
 }
@@ -745,6 +878,41 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     }))
 }
 
+/// The secondaries a series tests: its declared metrics and the defaults. A script's or native app's CPU
+/// per run is its main.work, so it is tested as main.busy is for a page. `cpu.app.total` is CPU over run
+/// time: once runs get shorter or longer (`rate_context`), its move says nothing about the CPU they spent
+/// (a run 84% shorter for 80% less CPU reads +28%), so it is then context.
+fn secondary_names(s: &Series, script: bool, rate_context: bool) -> Vec<String> {
+    let mut names: Vec<String> = s.metrics.clone();
+    for m in DEFAULT_SECONDARIES.iter().copied().chain(script.then_some("cpu.work")) {
+        let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context);
+        if !skip {
+            names.push(m.to_string());
+        }
+    }
+    names
+}
+
+/// The secondaries that will be tested after these pairs: those every block has a value of.
+fn tested_names(s: &Series, script: bool, blocks: &[Block], pairs: &[(usize, usize)], bound: f64) -> Vec<String> {
+    let rate_context = !same(blocks, pairs, "run.duration", bound);
+    secondary_names(s, script, rate_context).into_iter().filter(|n| model::metric(n).is_some() && blocks.iter().all(|b| b.values.get(n).is_some_and(|v| v.is_finite()))).collect()
+}
+
+/// The fewest pairs whose exact signed-rank test can clear Holm's first step across `tests` secondaries.
+fn holm_pairs(tests: usize) -> usize {
+    (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests.max(1) as f64).unwrap_or(60) as usize
+}
+
+/// Saves a series' finished blocks and pairs (or its result, once done) in `state.json`, so a bench
+/// that stops or fails keeps them and `--resume` goes on from there.
+fn checkpoint(ctx: &mut Ctx, label: &str, entry: Value) {
+    ctx.saved["series"][label] = entry;
+    if let Ok(dir) = store::experiment_dir(&ctx.exp) {
+        let _ = store::write_json(&dir.join("state.json"), &ctx.saved);
+    }
+}
+
 fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, started: Instant, max_time: Option<Duration>) -> Result<Value> {
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
@@ -762,7 +930,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         Some("auto") | None => (LOOKS.to_vec(), 1.0 - POCOCK_ALPHA),
         Some(n) => {
             let n = n.parse::<usize>().map_err(|_| Error::usage("--pairs: auto or a number"))?.max(2);
-            if n < stats::min_pairs(0.95) {
+            if n < stats::min_pairs(0.95) && !ctx.warnings.iter().any(|w| w.id == "FewPairs") {
                 ctx.warnings.push(validity::info("FewPairs", format!("--pairs {n}: below {} pairs no interval reaches 95%, so nothing gets a verdict (a smoke run)", stats::min_pairs(0.95))));
             }
             (vec![n], 0.95)
@@ -773,11 +941,26 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     progress(format!("\n{}  primary {}", s.label(), s.primary));
     let series_started = Instant::now();
     let waited_before = ctx.waited_ms;
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut pairs: Vec<(usize, usize)> = Vec::new();
+    // A resumed experiment (`--resume`) starts from the pairs it had finished.
+    let saved = &ctx.saved["series"][s.label()];
+    let mut blocks: Vec<Block> = serde_json::from_value(saved["blocks"].clone()).unwrap_or_default();
+    let mut pairs: Vec<(usize, usize)> = serde_json::from_value(saved["pairs"].clone()).unwrap_or_default();
+    pairs.retain(|&(a, b)| a < blocks.len() && b < blocks.len());
+    if !pairs.is_empty() {
+        progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
+    }
+    let script = target["kind"] == "script" || is_native(&target);
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
-    for pair in 0..max_pairs {
+    // Why the series ended early (a stop, or an error after some pairs), as the error to report.
+    let mut halted: Option<Error> = None;
+    // The primary's verdict at the look that decided it, kept while pairs continue for the secondaries.
+    let mut decided_at: Option<Comparison> = None;
+    'pairs: for pair in pairs.len()..max_pairs {
+        if stop_requested() {
+            halted = Some(stop_error());
+            break;
+        }
         let order: [usize; 2] = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
         let mut idx = [0usize; 2];
         let mut redone = 0;
@@ -787,7 +970,16 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                 let keep = ctx.keep_all || pair == 0;
                 // Timing blocks trace only what the metrics read; `--trace full` keeps every timeline category.
                 let set = if ctx.args.get("trace") == Some("full") { Set::Timing } else { Set::Lean };
-                let b = block_on_screen(ctx, s, &variants[v], pair, set, keep)?;
+                let b = match block_on_screen(ctx, s, &variants[v], pair, set, keep) {
+                    Ok(b) => b,
+                    // A stop, or an error once pairs are done: the half pair goes, the finished ones stay.
+                    Err(e) if e.code == 130 || stop_requested() || !pairs.is_empty() => {
+                        blocks.truncate(start);
+                        halted = Some(if e.code == 130 || stop_requested() { stop_error() } else { e });
+                        break 'pairs;
+                    }
+                    Err(e) => return Err(e),
+                };
                 if pair == 0 {
                     progress(format!("  {} block  {}{}", b.variant, steps_text(&b.steps), if b.locked { " · session locked" } else { "" }));
                 }
@@ -814,8 +1006,18 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             progress(format!("  pair {}: the session locked or unlocked, or the display turned off or on, between its blocks; the pair runs again", pair + 1));
         }
         pairs.push((idx[0], idx[1]));
+        checkpoint(ctx, &s.label(), json!({ "blocks": blocks, "pairs": pairs }));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
         let n = pair + 1;
+        // Decided at a look, then run on to the pairs the secondaries need to clear Holm.
+        if let Some(c) = &decided_at {
+            progress(format!("  pair {n:>2}  for the secondaries (the primary was decided: {})", c.verdict));
+            if n >= holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len()) {
+                stopped = "primary decided".into();
+                break;
+            }
+            continue;
+        }
         let look = looks.contains(&n);
         let cmp = stats::compare(&s.primary, def, &primary_pairs, bound, confidence);
         let next = looks.iter().find(|&&l| l > n).copied();
@@ -842,9 +1044,24 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             cmp.needed_pairs = Some(stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence));
         }
         let hopeless = look && n >= FUTILITY_FROM && cmp.needed_pairs.is_some_and(|need| need > max_pairs);
+        // A share at its ceiling on both sides (91% vs 92% dropped frames at background priority) moves
+        // with nothing the builds do: more pairs only narrow an interval around "same at the ceiling".
+        let medians = |side: usize| metrics::median(&primary_pairs.iter().map(|p| if side == 0 { p.0 } else { p.1 }).collect::<Vec<_>>());
+        let saturated = look && !decided && def.unit == "%" && !s.primary.starts_with("cpu.") && medians(0) >= 80.0 && medians(1) >= 80.0;
         last = Some(cmp);
         if decided {
+            // Secondaries clear Holm only from enough pairs: run on to them rather than leave them blank.
+            let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len());
+            if n < need && n < max_pairs && ctx.args.get("pairs").is_none() {
+                progress(format!("  the primary is decided; {} more pair{} so the secondaries can clear Holm ({need} pairs)", need - n, if need - n == 1 { "" } else { "s" }));
+                decided_at = last.clone();
+                continue;
+            }
             stopped = "primary decided".into();
+            break;
+        }
+        if saturated {
+            stopped = "saturated".into();
             break;
         }
         if hopeless && ctx.args.get("pairs").is_none() {
@@ -856,34 +1073,47 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             break;
         }
     }
+    if decided_at.is_some() {
+        stopped = "primary decided".into();
+    }
+    if let Some(h) = &halted {
+        if pairs.is_empty() {
+            return Ok(json!({ "label": s.label(), "case": s.case, "not_run": true, "halt": { "code": h.code, "message": h.message } }));
+        }
+        if decided_at.is_none() {
+            stopped = if h.code == 130 { "stopped".into() } else { format!("failed: {}", h.message.lines().next().unwrap_or("")) };
+        }
+    }
+    // Pairs a resumed series had finished: the comparison at the last of them.
+    if last.is_none() && !pairs.is_empty() {
+        let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
+        last = Some(stats::compare(&s.primary, def, &pp, bound, confidence));
+    }
     let primary = last.ok_or_else(|| Error::msg("no pairs completed"))?;
     let primary_decided = stopped == "primary decided" && pairs.len() >= min_pairs;
     let mut primary = primary;
     if !primary_decided {
-        primary.verdict = if stopped == "more pairs cannot decide it" || stopped == "max pairs" || stopped == "max time" {
-            match primary.needed_pairs {
+        primary.verdict = match stopped.as_str() {
+            "saturated" => format!(
+                "saturated: base {} and head {} sit near the ceiling, where the builds cannot differ; choose another primary (main.work, cpu.work)",
+                fmt::value(primary.base, def.unit),
+                fmt::value(primary.head, def.unit)
+            ),
+            "stopped" => format!("stopped after {} pairs: no verdict (resume to finish)", pairs.len()),
+            s if s.starts_with("failed") => format!("unclear: {} pairs, then the bench failed", pairs.len()),
+            "more pairs cannot decide it" | "max pairs" | "max time" => match primary.needed_pairs {
                 Some(n) if n != usize::MAX && n > pairs.len() => format!("underpowered: ~{n} pairs needed"),
+                _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => format!("unclear after {} pairs, the last planned look: the difference sits on the equivalence bound", pairs.len()),
                 _ => "unclear".into(),
-            }
-        } else {
-            "unclear".into()
+            },
+            _ => "unclear".into(),
         };
     }
     // Tail percentiles need enough frames in every block.
     let primary = tail_check(def, &blocks, primary);
-    // Secondaries: gated on the primary, Holm-corrected. A script's CPU per run is its main.work, so it
-    // is tested like main.busy is for a page.
-    let script = target["kind"] == "script" || is_native(&target);
-    // `cpu.app.total` is CPU over run time: once runs get shorter or longer, its move says nothing about
-    // the CPU they spent (a run 84% shorter for 80% less CPU reads +28%), so it is then context.
+    // Secondaries: gated on the primary, Holm-corrected.
     let rate_context = !same(&blocks, &pairs, "run.duration", bound);
-    let mut names: Vec<String> = s.metrics.clone();
-    for m in DEFAULT_SECONDARIES.iter().copied().chain(script.then_some("cpu.work")) {
-        let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context);
-        if !skip {
-            names.push(m.to_string());
-        }
-    }
+    let names = secondary_names(s, script, rate_context);
     let mut secondaries: Vec<Comparison> = Vec::new();
     for name in &names {
         let Some(d) = model::metric(name) else { continue };
@@ -913,8 +1143,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     }
     // Smallest n whose exact signed-rank test can clear Holm's first step across the tested set.
-    let tests = tested.len().max(1);
-    let holm_pairs = (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests as f64).unwrap_or(60);
+    let holm = holm_pairs(tested.len());
     let mut descriptive: Vec<Comparison> = Vec::new();
     // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
     let found: Vec<String> =
@@ -977,12 +1206,13 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut recordings = json!({});
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
+        _ if halted.is_some() => false,
         "always" => true,
         "never" => false,
         "auto" => differs,
         other => return Err(Error::usage(format!("--why: auto, always or never, not {other}"))),
     };
-    if !why && !differs {
+    if !why && !differs && halted.is_none() {
         progress("  no attribution blocks: nothing to explain (--why always runs them anyway)");
     }
     if why {
@@ -1022,17 +1252,18 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         }
     }
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
-    let pixels = if ctx.args.has("pixels") && variants.len() > 1 { pixels_series(ctx, s, variants)? } else { Value::Null };
+    let pixels = if ctx.args.has("pixels") && variants.len() > 1 && halted.is_none() { pixels_series(ctx, s, variants)? } else { Value::Null };
     if pixels.as_array().is_some_and(|a| a.iter().any(|p| p["state"] != "same")) {
         warnings.push(validity::warn("PixelsDiffer", "base and head drew different pixels at a snapshot: see pixels"));
     }
     Ok(json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
-        "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm_pairs,
+        "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
+        "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
 }
 
@@ -1166,6 +1397,11 @@ pub fn pr_markdown(r: &Value) -> String {
             out += &format!("\n- **{}:** {}\n", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
         }
         out += "\n";
+    }
+    if let Some(st) = r["stopped"].as_object() {
+        let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        let what = if st.get("code").and_then(Value::as_i64) == Some(130) { "stopped before it finished".to_string() } else { format!("failed before it finished ({})", st.get("why").and_then(Value::as_str).unwrap_or("")) };
+        out += &format!("- **Incomplete:** the bench {what}; the tables hold the pairs it finished{}.\n\n", if not_run.is_empty() { String::new() } else { format!(", and these series did not run: {}", not_run.join(", ")) });
     }
     // The bench's own notes (power plan, lost present events, …), once.
     let general: Vec<&Value> = r["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)).collect();
@@ -1442,11 +1678,15 @@ const BUSY_WAITS: u32 = 15;
 /// anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     // A series that needs no presenting window runs through a lock, in one lock state per block.
+    let mut retries = 0;
     if runs_locked(ctx, s, set) {
         loop {
             let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
             let display = host::display_state();
             let r = slotted_block(ctx, s, v, pair, set, keep);
+            if retry_launch(ctx, s, v, &r, &mut retries)? {
+                continue;
+            }
             let end = host::session_locked();
             let steady = start == end && if start { ctx.awake.unlocks() == unlocks } else { ctx.awake.locks() == locks };
             // The display turned off (or on) during the block: it ran in two machine states.
@@ -1480,14 +1720,17 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window", s.label(), v.role));
             let waiting = Instant::now();
             while host::session_locked() {
-                std::thread::sleep(Duration::from_secs(2));
+                nap(Duration::from_secs(2))?;
             }
             // The desktop and the GPU settle after an unlock.
-            std::thread::sleep(Duration::from_secs(5));
+            nap(Duration::from_secs(5))?;
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
         let r = slotted_block(ctx, s, v, pair, set, keep);
+        if retry_launch(ctx, s, v, &r, &mut retries)? {
+            continue;
+        }
         if !woken && r.as_ref().err().is_some_and(|e| e.message.contains("WindowHidden")) {
             progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
             woken = true;
@@ -1501,7 +1744,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.reg.set("waiting", format!("{} {} block: someone is using this Mac, and its window would be covered", s.label(), v.role));
             let waiting = Instant::now();
             while host::person_idle_s().is_some_and(|i| i < 60.0) {
-                std::thread::sleep(Duration::from_secs(5));
+                nap(Duration::from_secs(5))?;
             }
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
             continue;
@@ -1514,7 +1757,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             release_machine(ctx);
             ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
             let waiting = Instant::now();
-            std::thread::sleep(Duration::from_secs(60));
+            nap(Duration::from_secs(60))?;
             crate::validity::wait_quiet(None, Duration::from_secs(60));
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
             continue;
@@ -1527,6 +1770,28 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
     }
+}
+
+/// Whether to run a block again after a launch that failed for a passing reason (`transient`): up to
+/// `LAUNCH_RETRIES` times per block, after the machine has a minute to calm down, holding nothing.
+fn retry_launch(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>, retries: &mut u32) -> Result<bool> {
+    let Err(e) = r else { return Ok(false) };
+    if stop_requested() {
+        return Err(stop_error());
+    }
+    if *retries >= LAUNCH_RETRIES || !transient(e) {
+        return Ok(false);
+    }
+    *retries += 1;
+    progress(format!("  the {} launch failed ({}): runs again in 30 s ({} of {LAUNCH_RETRIES})", v.role, e.message.lines().next().unwrap_or(""), retries));
+    release_machine(ctx);
+    ctx.reg.set("waiting", format!("{} {} block: the launch failed and runs again", s.label(), v.role));
+    let waiting = Instant::now();
+    chromium::reap_orphans();
+    nap(Duration::from_secs(30))?;
+    crate::validity::wait_quiet(None, Duration::from_secs(60));
+    ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+    Ok(true)
 }
 
 /// Puts the machine in the state blocks run in: the device's bench slot (SPEC §10.1
@@ -3230,7 +3495,14 @@ fn render(r: &Value) -> String {
         }
         out += "\n";
     }
-    out += &format!("{} · strobe report experiment {} --open\n", r["id"].as_str().unwrap_or(""), r["id"].as_str().unwrap_or(""));
+    let id = r["id"].as_str().unwrap_or("");
+    if let Some(st) = r["stopped"].as_object() {
+        let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
+        let why = st.get("why").and_then(Value::as_str).unwrap_or("");
+        out += &format!("{}{}\n", if st.get("code").and_then(Value::as_i64) == Some(130) { "stopped: kept what finished".to_string() } else { format!("failed: {why}; kept what finished") }, if not_run.is_empty() { String::new() } else { format!("; not run: {}", not_run.join(", ")) });
+        out += &format!("resume  strobe bench --resume {id}\n");
+    }
+    out += &format!("{id} · strobe report experiment {id} --open\n");
     out
 }
 

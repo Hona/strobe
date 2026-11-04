@@ -255,13 +255,17 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
             (Some(_), "series") => {
                 format!("{} earlier experiment{} of this series ({})", pool.len(), if pool.len() == 1 { "" } else { "s" }, pool.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", "))
             }
-            (Some(_), _) => format!("other series measuring {} on {kind} targets here ({}); this case may differ", s.primary, pool.iter().map(|p| p.id.as_str()).collect::<Vec<_>>().join(", ")),
+            (Some(_), _) => {
+                let mut ids: Vec<&str> = pool.iter().map(|p| p.id.as_str()).collect();
+                ids.dedup();
+                format!("other series measuring {} on {kind} targets here ({}); this case may differ", s.primary, ids.join(", "))
+            }
         };
         // A block's time comes only from this series: another case's blocks say nothing about this one's.
         let (block_ms, block_source) = match same.first() {
             Some(_) => (same.iter().map(|p| p.block_ms).sum::<f64>() / same.len() as f64, format!("mean of {} earlier", same.len())),
             None => match check_block(&file_name, &s.label(), runs) {
-                Some((ms, id)) => (ms, format!("from the --check {id} plus warmup and {runs} runs (rough)")),
+                Some((ms, id)) => (ms, format!("from the --check {id} plus warmup and {runs} runs; rough: a check's block is a cold launch")),
                 None => (GUESS_BLOCK_MS, "a guess: no earlier run of this case here".to_string()),
             },
         };
@@ -401,7 +405,7 @@ fn builds(series: &[Series], describe: &Value, config: &Value, project: &Path, v
 }
 
 fn minutes(ms: f64) -> String {
-    if ms < 60_000.0 { format!("{:.0} s", ms / 1e3) } else { format!("{:.0} min", ms / 60_000.0) }
+    if ms < 60_000.0 { fmt::ms_duration(ms as u64) } else { format!("{:.0} min", ms / 60_000.0) }
 }
 
 /// One line per series for `bench`'s start: pairs, minutes, and what they rest on.
@@ -434,7 +438,11 @@ fn total_line(plan: &Value) -> String {
         t += &format!(
             "; {others} other bench{} on this device{}",
             if others == 1 { "" } else { "es" },
-            if wait > 0.0 { format!(" with ~{} of blocks left: blocks take turns, so up to that much longer", minutes(wait)) } else { String::new() }
+            if wait > 0.0 {
+                format!(" with ~{} of blocks left: blocks take turns, so up to that much longer", minutes(wait))
+            } else {
+                " (time left unknown): blocks take turns, so up to that bench's time longer".to_string()
+            }
         );
     }
     t
@@ -474,10 +482,10 @@ fn text(file: &Path, variants: &[Variant], plan: &Value, notes: &[String]) -> St
         );
         if s["sigma"].is_number() {
             t += &format!(
-                "  expect   {} at an effect of {} ({})\n",
-                series_line(s).split_once(": ").map(|x| x.1).unwrap_or(""),
-                fmt::pct(s["effect"].as_f64().unwrap_or(0.0)),
-                s["effect_source"].as_str().unwrap_or("")
+                "  expect   at an effect of {} ({}): {}\n",
+                fmt::pct(s["effect"].as_f64().unwrap_or(0.0)).replace("0.0%", "0%"),
+                s["effect_source"].as_str().unwrap_or(""),
+                series_line(s).split_once(": ").map(|x| x.1).unwrap_or("")
             );
             if let Some(x) = s["detectable"].as_f64() {
                 t += &format!(

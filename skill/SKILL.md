@@ -17,7 +17,9 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <cases>] [--target <name>]
                  [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power high|keep]
                  [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
-                 [--pixels | --pixels-only] [--reserve-cpus auto|on|off]
+                 [--pixels | --pixels-only] [--reserve-cpus auto|on|off] [--noworse 2% | metric=2%,…]
+    strobe plan <file.bench.ts> [--base <v>] [--head <v>] [--filter …] [--effect 3%] [--pilot]   before a bench: pairs and
+        minutes per series from earlier runs here (spread, block time), builds, other benches on the slot; runs nothing
         variant: a directory, a git ref, app:<id>, exe:<path>; every variant builds and serves with head's harness
         (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works
         --filter: case names, comma-separated, exact unless they hold `*` (`"window-closed*"` also runs
@@ -101,6 +103,9 @@ Everything about the app under test lives in its repo's `strobe.json`: `build` a
 ## Recipes
 
 Did my change help? `bench <file> --base origin/dev --head .` and read the verdict per series.
+Did my refactor or dependency bump make it worse? `bench <file> --base origin/dev --head . --noworse 2%` (or `noworse: "2%"` on the case; `{ "cpu.wakes": "5%" }` per metric): `no worse (≤2%)`, `worse (>2%)` or `unclear`; it decides in fewer pairs than `same`.
+How long will it take? `plan <file> --base … --head .` first: pairs and minutes per series; `underpowered` there means choose a primary with more work per run. A running bench prints an ETA after every pair.
+Rerunning? Every experiment counts the others on the same two variants: the text, the result's `ledger` and the PR table say "3rd experiment on these variants; earlier: …" with what changed. Rerunning until one says "faster" shows; paste the ledger line as it is.
 Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query style` (what invalidated style: the class, attribute, pseudo-class or custom property that changed, the nodes, the selector, the script line; attribution blocks trace it for a series declaring `main.style` or `style.count`, or with `--style`), `query summary` (per run: style ms with elements restyled, layout, paint), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
 What stands out? `query <rec or exp> insights`: forced layout, GC pressure, long tasks, work while idle, detached DOM, background load, unresolved time, and for an experiment the biggest base/head movers, each with the command that shows it.
 Where is the memory? `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting). A native app or process: what holds it (host heap, GPU memory mapped in, unmapped commit, shared, files, images; `--by layer` for totals) with `gpu.vram` beside it. On Windows, `memory.app.private` also counts the VRAM a GPU driver maps into the process: quote `memory.app.host` for the app's own memory.

@@ -91,7 +91,7 @@ locations, not only PATH.
 | pair | Two adjacent blocks of different variants; order alternates A B, B A |
 | timing / attribution block | A block with the `timing` probe set, or with profilers (§8.1) |
 | primary | The metric the experiment is about, declared before the run |
-| verdict | `faster`/`slower` (or `less`/`more`, `fewer`/`more`), `same`, `unclear`, `underpowered`, `refused` |
+| verdict | `faster`/`slower` (or `less`/`more`, `fewer`/`more`), `same`, `unclear`, `underpowered`, `refused`; with a margin, `no worse`/`worse` (§9.3) |
 | validator | A check that refuses a run (§10.1) |
 | analyser | A check that warns in the result (§10.2) |
 | census | A consistent per-process memory account at one moment (§8.6) |
@@ -204,7 +204,7 @@ ui/             embedded viewer and calibration assets
 strobe <command> [flags]
 
 Setup      up · update · leave
-Use        status · record · bench · query · report · top · track · history (§25)
+Use        status · record · bench · plan · query · report · top · track · history (§25)
 Internal   daemon · mcp · helper (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
@@ -336,7 +336,9 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
-             [--reserve-cpus auto|on|off] [--require-verdict] [--json]
+             [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
+             [--require-verdict] [--json]
+strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
 ```
@@ -953,6 +955,32 @@ flowchart LR
 - **Attribution blocks**: one per variant after timing, same case, with the attribution probes,
   only when the primary differs (`--why auto`): a `same` or `underpowered` result has nothing to
   explain. `--why always` runs them for every series, `--why never` skips them.
+- **Plan** (`strobe plan <file>` = `bench <file> --plan`, with `bench`'s `--base`, `--head`,
+  `--filter`, `--target`, `--params`, `--pairs`, `--noworse`; nothing runs): per series, the pairs and
+  minutes a bench needs to decide at the expected effect, before anything builds. Inputs, in order
+  of preference:
+  - *Spread*: the primary's per-pair differences in earlier experiments of the same series (bench
+    file name, series label, primary) on this device, each centred on its own median and pooled
+    (1.4826·MAD); with fewer than 4 such pairs, other series measuring that metric on the same kind
+    of target (labelled as such); else unknown. `--pilot` first runs 4 pairs per series (an A/A on
+    head without `--base`, no attribution), stored like any experiment, and plans from them.
+  - *Block time*: the mean of the earlier blocks' steps, else a `--check` of the case plus its
+    warmup and runs (rough), else 22 s (a guess, said as one). Warm-up blocks (`gpuCache`) and a
+    launch case's discarded launches from the earlier series' `warmup_blocks`, else two.
+  - *Expected effect*: `--effect <pct>`, else what the latest run of the series measured, else 0.
+  - *Pairs*: for an 80% chance that the look's interval clears the deciding boundary (0 or the
+    equivalence bound; the margin in non-inferiority), `((z₁₋α/₂ + z₀.₈)·σ / distance)² / 0.955`
+    with the look's level, rounded up to the next planned look and to the pairs Holm needs; an
+    effect no look reaches is `underpowered`, which the bench says at about 12 pairs. The smallest
+    effect 40 pairs decide (80%) is printed beside it.
+  - *Builds*: a directory whose build key is unchanged, or a git ref whose worktree was built, is
+    reused; otherwise the last time that build command took here (`builds/times.json`), else
+    unknown. *Queue*: other benches registered on the device's slot with the time their own ETA
+    says is left (blocks take turns, so up to that much longer).
+  `bench` prints the same plan when it starts (`plan` lines), keeps it in `result.json`
+  (`plan.estimate`), and after every pair prints an ETA: the pairs to the look the live projection
+  reaches (or to where it gives up), at the series' mean pair time so far, plus the planned time of
+  the series after it. The ETA goes into the bench's slot registration for other benches' plans.
 - **Time**: every block logs how long each step took (launch, attach, prepare, load, checks,
   setup, warmup, runs, trace, analyse, close); the result keeps the mean per step and the
   series' wall time, so where a bench's time goes is never a guess. On adais (October 2026) a
@@ -982,8 +1010,45 @@ flowchart LR
   `[min, max]` covers only `1 − 2^(1−n)` (50% at 2 pairs, 94% at 5), so it never gets a verdict;
   `--pairs N` below 6 is a smoke run (`FewPairs`).
 - **Gate**: secondary metrics get verdict words only after the primary has a verdict
-  (`faster`, `slower` or `same`), with Holm correction across secondaries. Otherwise they show
-  intervals without verdicts.
+  (`faster`, `slower` or `same`; `no worse` or `worse` in non-inferiority), with Holm correction
+  across secondaries. Otherwise they show intervals without verdicts.
+- **Non-inferiority** (`--noworse 2%`, or a case's `noworse`): the question "is head at most X%
+  worse than base?", which refactors and dependency bumps ask, instead of "did it change?". Let θ
+  be the true per-pair difference oriented so that positive is worse, and δ the margin in the same
+  scale (`ln(1 + X)` for a ratio metric where lower is better, `−ln(1 − X)` where higher is better;
+  for a count, `max(X·base, 0.5)` in its unit, as the equivalence bound).
+  - **Claims**: `no worse (≤X%)` rejects H₀: θ ≥ δ; `worse (>X%)` rejects H₀: θ ≤ δ. Otherwise
+    `unclear`. Both are one-sided tests read off the same interval the two-sided design prints: at
+    a look, `no worse` when the interval's worse end is inside the margin, `worse` when its better
+    end is beyond it. A `no worse` whose interval also excludes 0 says which way:
+    `no worse (≤2%, faster)` or `no worse (≤2%, but slower)` (measurably slower, within the margin).
+  - **Error spending**: the same five Pocock looks (8, 12, 18, 26, 40 pairs) at the same nominal
+    98.42%, so each side of an interval carries α/2 = 0.79% per look and each claim's error over all
+    looks stays at 2.5% one-sided (the two-sided Pocock constant 2.413 for 5% over five looks crosses
+    one boundary with probability 2.5%). The claims sit on opposite sides of δ: away from δ only one
+    of their nulls is true and a wrong verdict has at most 2.5%; exactly at δ both are, and either
+    verdict is wrong, 2.5% each. This is the regulatory
+    convention for non-inferiority (one-sided 2.5%), and it keeps verdict and printed interval in
+    agreement: a reader checks `no worse` against the interval's end. `--pairs N` is one look at
+    95%, the same 2.5% per side.
+  - **Stopping**: at a look the series stops on either claim. Futility (`underpowered`) and
+    `saturated` work as in the two-sided design, with the pairs still needed projected from the
+    distance between the differences' median and δ (1.4826·MAD spread). A series that reaches 40
+    pairs undecided is `unclear after 40 pairs, the last planned look: the difference sits on the
+    margin`.
+  - **Gate and Holm**: a primary in non-inferiority counts as decided for the gate with `no worse`
+    or `worse`. A secondary with a margin (`noworse: { "cpu.wakes": "5%" }`, or `--noworse
+    cpu.wakes=5%`) is tested, declared or not: its p-value is the two-sided signed-rank test of
+    `d − δ` (θ = δ), which is two one-sided tests at 2.5% each; it joins the other secondaries' two-sided
+    p-values in one Holm family at 5%, and keeps its verdict when Holm rejects and its 95% interval
+    clears the margin. Exact counters compare their exact difference with the margin, outside Holm.
+  - **Checked** (simulation of the real code, 4,000 sequential series per row, normal and t₃
+    differences, σ 1% and 3%): at the boundary θ = δ each claim came out 2.2–2.8% (nominal 2.5%;
+    standard error 0.25%), for lower- and higher-is-better metrics, and in an A/A with margin 0%
+    (the boundary again). At θ = 0, σ 3%, margin 2%: `no worse` in 94% of series after 22 pairs on
+    average, where two-sided equivalence (±2%) said `same` in 87% after 29; with t₃ tails 77% against
+    53%. A true +5% with margin 2% was `worse` in 97–100%. `--aa --noworse 0%` on a device is the A/A
+    for this mode: each claim must stay near 2.5%.
 - **Exact metrics**: a counter (`kind: exact`) that holds one value on each side in every block,
   from 2 pairs, is compared exactly: the difference is the answer, printed as `exact`, with
   `same (exact)` or a direction word. It needs no test, so it skips Holm and the primary's gate. A
@@ -1242,7 +1307,9 @@ export default bench({
   measured), `metrics` (optional extra secondaries), `targets` (optional: the targets this case
   runs on; default every target), `probes` (optional extra attribution probes), `timeout`
   (optional, ms: how long a run or reset may take, default 60 000; setup and the other hooks get at
-  least that too, so a case can idle for minutes, a model left alone before it is used).
+  least that too, so a case can idle for minutes, a model left alone before it is used), `noworse`
+  (optional: `"2%"` asks of the primary "is head at most 2% worse?", or margins per metric
+  `{ "main.work": "2%", "cpu.wakes": "5%" }`; §9.3; `--noworse` overrides per metric).
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
@@ -2270,6 +2337,21 @@ experiments/
 - Experiment ids: `exp_` + 6 hex; any unique prefix works.
 - History per series and device is `strobe track`'s own store (§25.6), not a scan of `index.jsonl`:
   only its points carry the fingerprint that keeps environments apart.
+- **Rerun ledger.** An agent that reruns a bench until one says "faster" defeats any p-value, so
+  every A/B or A/A experiment records its `identity` in `result.json` and its `index.jsonl` line:
+  its variants (a commit, with a hash of a folder's uncommitted changes to tracked files; a folder
+  and a git ref at the same clean commit are one variant; an app or executable with its file's
+  size and time; a URL), the bench file's name and content hash, the harness's content hash (files
+  over 1 MB by size and time), each series' label, case, primary and margins, and the flags that
+  chose what ran and how it was judged (all but `--base`, `--head`, `--id`, output and resume
+  flags). The ledger of an experiment is every other experiment with the same two variants in the
+  same roles: how many came before and after it, each one's verdicts, and what differed (bench
+  file, harness, cases, a series' primary or margin, flags). `bench` prints it before anything
+  builds (`ledger  3rd experiment on these variants; earlier: exp_x unclear, exp_y unclear (primary
+  main.busy → main.work)`), keeps it in `result.json` (`ledger`: `attempt`, `total`, `earlier`,
+  `later`, per-series verdicts, `changed`, `text`) and the text output, and warns `Rerun` when the
+  setup changed between attempts. `report` recomputes it when it writes, so a report of an earlier
+  experiment names the later ones too, and `--format pr` prints the line (`store::ledger::line`).
 
 ## 15. Engine
 
@@ -2334,7 +2416,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 |---|---|---|
 | `status` | `target?`, `calibrate?` | §5.4 JSON |
 | `record` | `target`, `probes?`, `for?`, `bench?`, `ring?`, `pin?`, `name?`, `timeout?` | `{ handle, valid, summary, warnings }` |
-| `bench` | `file`, `head`, `base?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
+| `bench` | `file`, `head`, `base?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
 | `query` | `handle`, `view`, view arguments, `sql?`, `top?`, `max_bytes?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
 | `report` | `view`, `handles`, `format?` | `{ path, bytes }` |
 
@@ -2534,6 +2616,18 @@ under `--check`, values noisy and not compared):
   frames and their join with inputs), and a Rune app (its AccessKit tree has not landed on Rune's dev).
 - Not checked on hardware: X Present on an X server with a real display (no such Linux machine), and
   on XWayland.
+
+Non-inferiority, plan and the rerun ledger (2026-11-05, adais, session locked; noisy smoke runs on a
+busy shared machine, values not compared): §9.3's simulation (above) ran the real `stats.rs`. A
+`script()` A/A with `--noworse 2%` said `no worse (≤2%)` for both series at pair 8, and a secondary
+with its own margin (`run.duration`, 3%) cleared Holm as `no worse (≤3%)`; the boundary A/A
+(`--noworse 0%`) ran to 40 pairs without a claim (`underpowered`). A windowless native A/A
+(`fake-tray.bench.ts`, `cpu.wakes`, 12% launch-to-launch spread, another bench sharing the slot) said
+`no worse (≤10%)` at pair 18; `plan` before it had only other series' spread (4.2%, "pair 8"), and
+after it, from that run, said pair 18. The second experiment on the same variants printed its ledger
+before building and warned `Rerun` for the changed margin and filter; `report --format pr` of the
+first named the later one. Not built: the HTML viewer does not show the ledger or the plan yet (both
+are in `result.json`).
 
 Ergonomics batch 2 (2026-11-04): `BackgroundPriority` refuses frame and input-latency metrics
 (§10.1); `page.drag`, mouse buttons on `down`/`up`, `input.rate` and `input.gap.p95` (§9.6). Built and

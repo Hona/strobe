@@ -18,8 +18,9 @@ pub fn for_experiment(id: &str, created: &str, identity: &Value) -> Value {
         if line["id"] == id || line["identity"]["variants"] != *key {
             continue;
         }
-        let entry = attempt(&line, identity);
-        if line["created"].as_str().unwrap_or("") <= created { earlier.push(entry) } else { later.push(entry) }
+        let is_later = line["created"].as_str().unwrap_or("") > created;
+        let entry = attempt(&line, identity, is_later);
+        if is_later { later.push(entry) } else { earlier.push(entry) }
     }
     let attempt_n = earlier.len() + 1;
     let total = attempt_n + later.len();
@@ -34,10 +35,7 @@ pub fn for_experiment(id: &str, created: &str, identity: &Value) -> Value {
     }
     let text = (total > 1).then(|| {
         let list = |l: &Vec<Value>| l.iter().map(|e| format!("{} {}{}", e["id"].as_str().unwrap_or(""), e["summary"].as_str().unwrap_or(""), changes(e))).collect::<Vec<_>>().join(", ");
-        let mut t = format!("{} experiment on these variants", ordinal(attempt_n));
-        if !later.is_empty() {
-            t += &format!(" of {total}");
-        }
+        let mut t = if later.is_empty() { format!("{} experiment on these variants", ordinal(attempt_n)) } else { format!("{} of {total} experiments on these variants", ordinal(attempt_n)) };
         if !earlier.is_empty() {
             t += &format!("; earlier: {}", list(&earlier));
         }
@@ -55,9 +53,10 @@ pub fn line(result: &Value) -> Option<String> {
     result["ledger"]["text"].as_str().map(str::to_string)
 }
 
-/// One other experiment on the same variants: what it found and what differed from `now`.
-fn attempt(line: &Value, now: &Value) -> Value {
-    let then = &line["identity"];
+/// One other experiment on the same variants: what it found and what differed from `current`, said in
+/// time order (from the earlier of the two to the later).
+fn attempt(line: &Value, current: &Value, later: bool) -> Value {
+    let (then, now) = if later { (current, &line["identity"]) } else { (&line["identity"], current) };
     let mut changed: Vec<String> = Vec::new();
     if then["file"] != now["file"] {
         changed.push(format!("bench file {} → {}", then["file"].as_str().unwrap_or("?"), now["file"].as_str().unwrap_or("?")));

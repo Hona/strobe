@@ -1309,7 +1309,7 @@ impl<'a> Doc<'a> {
                 // Milliseconds and bytes on one order: 1 ms of CPU against 1 MB allocated.
                 if x["unit"] == "ms" { raw } else { raw / (1024.0 * 1024.0) }
             };
-            d(b).total_cmp(&d(a))
+            d(b).total_cmp(&d(a)).then_with(|| a["function"].as_str().cmp(&b["function"].as_str()))
         });
         let mut t = String::from("\n| Kind | Function · file | Base/run | Head/run | Δ/run |\n|:---|:---|---:|---:|---:|\n");
         for m in rows.into_iter().take(top + 1) {
@@ -1337,10 +1337,14 @@ impl<'a> Doc<'a> {
         if !d["base"].is_object() || !d["head"].is_object() {
             return String::new();
         }
-        let drops: Vec<String> = d["classes"]
-            .as_array()
+        // By size of the move, then name: the diff's own order breaks ties arbitrarily.
+        let mut classes: Vec<&Value> = d["classes"].as_array().into_iter().flatten().collect();
+        classes.sort_by(|a, b| {
+            let r = |c: &Value| f(&c["delta"]["retained_size"]).abs();
+            r(b).total_cmp(&r(a)).then_with(|| a["class"].as_str().cmp(&b["class"].as_str()))
+        });
+        let drops: Vec<String> = classes
             .into_iter()
-            .flatten()
             .take(3)
             .map(|c| {
                 let r = f(&c["delta"]["retained_size"]);

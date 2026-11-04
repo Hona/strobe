@@ -587,7 +587,7 @@ pub fn memory_lines(v: &Value) -> String {
     if get("memory.app.private").is_finite() {
         s += &format!("memory   {} private", fmt::value(get("memory.app.private"), "MB"));
         if get("memory.app.host").is_finite() {
-            s += &format!(" · {} host (allocated in the processes; private also counts GPU memory held for them)", fmt::value(get("memory.app.host"), "MB"));
+            s += &format!(" · {} host (what the processes allocated; private also counts GPU memory mapped into or charged to them)", fmt::value(get("memory.app.host"), "MB"));
         }
         s += "\n";
     }

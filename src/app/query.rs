@@ -51,7 +51,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
-        "gpu" if !trace.exists() => native_gpu(&meta),
+        "gpu" if !trace.exists() => native_gpu(&dir, &meta),
         "gpu" => gpu(&trace, top),
         "hotspots" | "alloc" => {
             let by = args.get("by").unwrap_or("function");
@@ -720,7 +720,7 @@ fn gpu(trace: &Path, top: usize) -> Result<Output> {
 /// A recording without a trace (a native app, a process from outside): per adapter the target's
 /// engine use and GPU memory from the OS's GPU statistics, the device's own counters, and what
 /// reached the screen.
-fn native_gpu(meta: &Value) -> Result<Output> {
+fn native_gpu(dir: &Path, meta: &Value) -> Result<Output> {
     let os = if meta["os"].is_object() { &meta["os"] } else { &meta["gpu"] };
     if !os.is_object() {
         return Err(Error::usage("this recording has no GPU readings: they come from timing recordings (record, bench blocks kept with --keep or attribution)"));
@@ -764,10 +764,10 @@ fn native_gpu(meta: &Value) -> Result<Output> {
         text += &format!("device   {}: {}   (the whole device, every process on it)\n", d["name"].as_str().unwrap_or("?"), parts.join(" · "));
     }
     let v = &meta["values"];
-    match (v["frames.n"].as_f64(), meta["presents_refused"].as_str().or(meta["os_frames"]["refused"].as_str())) {
+    match (v["frames.n"].as_f64().filter(|_| dir.join("presents.json.gz").exists()), meta["presents_refused"].as_str().or(meta["os_frames"]["refused"].as_str())) {
         (Some(n), _) => text += &format!("frames   {n:.0} on screen (OS present events): strobe query {id} frames\n"),
         (None, Some(why)) => text += &format!("frames   refused: {why}\n"),
-        _ => {}
+        _ => text += "frames   none recorded (no window, or no OS present events)\n",
     }
     if meta["session_locked"] == true {
         text += "session  locked: the compositor drew nothing, so engine use describes no screen (GPU memory does not depend on it)\n";

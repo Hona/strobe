@@ -365,9 +365,11 @@ fn policy(html: Option<&str>) -> String {
     )
 }
 
-/// The UI and the strobe build that serve it: a daemon of another build may serve other pages.
+/// The UI and the revision of the pages strobe serves around it (bump `PAGES` when `serve` changes):
+/// a daemon of another strobe may serve other pages. Not the build hash: the daemon runs strobew.
 fn version() -> String {
-    format!("{} {}", engine::ui_version().unwrap_or_default(), super::mcp::build_id())
+    const PAGES: u32 = 2;
+    format!("{} pages {PAGES}", engine::ui_version().unwrap_or_default())
 }
 
 /// A GET to the daemon, its body when it answers 200.

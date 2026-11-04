@@ -102,6 +102,40 @@ fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
     }
 }
 
+/// Why a process (0: strobe itself) runs at background priority, if it does: the idle priority
+/// class (inherited by what it starts), efficiency mode (EcoQoS: efficiency cores, low clocks), or
+/// background mode (very low memory and IO priority).
+pub fn background_qos(pid: u32) -> Option<String> {
+    use windows_sys::Win32::System::Threading::{
+        GetPriorityClass, GetProcessInformation, IDLE_PRIORITY_CLASS, MEMORY_PRIORITY_INFORMATION, MEMORY_PRIORITY_VERY_LOW, PROCESS_POWER_THROTTLING_CURRENT_VERSION, PROCESS_POWER_THROTTLING_EXECUTION_SPEED,
+        PROCESS_POWER_THROTTLING_STATE, ProcessMemoryPriority, ProcessPowerThrottling,
+    };
+    unsafe {
+        let h = if pid == 0 { GetCurrentProcess() } else { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if h.is_null() {
+            return None;
+        }
+        let mut why = Vec::new();
+        if GetPriorityClass(h) == IDLE_PRIORITY_CLASS {
+            why.push("the idle priority class");
+        }
+        let mut t = PROCESS_POWER_THROTTLING_STATE { Version: PROCESS_POWER_THROTTLING_CURRENT_VERSION, ControlMask: 0, StateMask: 0 };
+        if GetProcessInformation(h, ProcessPowerThrottling, &mut t as *mut _ as *mut _, size_of::<PROCESS_POWER_THROTTLING_STATE>() as u32) != 0
+            && t.ControlMask & t.StateMask & PROCESS_POWER_THROTTLING_EXECUTION_SPEED != 0
+        {
+            why.push("efficiency mode (EcoQoS)");
+        }
+        let mut m = MEMORY_PRIORITY_INFORMATION { MemoryPriority: 0 };
+        if GetProcessInformation(h, ProcessMemoryPriority, &mut m as *mut _ as *mut _, size_of::<MEMORY_PRIORITY_INFORMATION>() as u32) != 0 && m.MemoryPriority == MEMORY_PRIORITY_VERY_LOW {
+            why.push("background mode");
+        }
+        if pid != 0 {
+            CloseHandle(h);
+        }
+        (!why.is_empty()).then(|| why.join(", "))
+    }
+}
+
 /// One process's memory by what holds it: its commit charge and working sets, and a walk of its
 /// address space (`VirtualQueryEx`, committed regions). None when the process cannot be opened.
 pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {

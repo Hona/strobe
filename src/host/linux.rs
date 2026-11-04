@@ -341,6 +341,23 @@ pub fn exe_of(pid: u32) -> Option<PathBuf> {
     std::fs::read_link(format!("/proc/{pid}/exe")).ok()
 }
 
+/// Why a process (0: strobe itself) runs at background priority, if it does: `SCHED_IDLE` or nice 19,
+/// both inherited by what it starts.
+pub fn background_qos(pid: u32) -> Option<String> {
+    let stat = std::fs::read_to_string(if pid == 0 { "/proc/self/stat".to_string() } else { format!("/proc/{pid}/stat") }).ok()?;
+    // Fields after the command's closing parenthesis start at field 3 (state): nice is 19, policy 41.
+    let f: Vec<&str> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+    let nice: i32 = f.get(16)?.parse().ok()?;
+    let policy: u32 = f.get(38).and_then(|p| p.parse().ok()).unwrap_or(0);
+    if policy == libc::SCHED_IDLE as u32 {
+        Some("SCHED_IDLE".into())
+    } else if nice >= 19 {
+        Some(format!("nice {nice}"))
+    } else {
+        None
+    }
+}
+
 /// PIDs of running processes whose executable is exactly `exe`.
 pub fn running(exe: &Path) -> Vec<u32> {
     let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());

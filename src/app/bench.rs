@@ -273,6 +273,10 @@ struct Ctx<'a> {
     power: Option<host::power::Power>,
     /// The plan blocks ran on, for the env line.
     power_used: Option<String>,
+    /// Why strobe runs at background priority, which every target inherits (`BackgroundPriority`).
+    qos: Option<String>,
+    /// Why the last block's target process ran at background priority, read after its launch.
+    target_qos: Option<String>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -444,6 +448,8 @@ pub fn run(args: &Args) -> Result<Output> {
         slot: None,
         power: None,
         power_used: None,
+        qos: host::background_qos(None),
+        target_qos: None,
     };
     ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
@@ -464,11 +470,15 @@ pub fn run(args: &Args) -> Result<Output> {
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
     }
-    #[cfg(target_os = "macos")]
-    if host::macos::background_priority() {
+    if let Some(why) = ctx.qos.clone() {
+        // Frames and input latencies at background priority describe no person's machine: refused
+        // (before anything builds when a primary is one). CPU metrics stay, with this warning.
+        if let Some(s) = series.iter().find(|s| foreground_metric(&s.primary)).filter(|_| !check) {
+            return Err(background_refusal(&why, &format!("{}'s primary {}", s.case, s.primary)));
+        }
         ctx.warnings.push(validity::warn(
             "BackgroundPriority",
-            "strobe runs at background priority (taskpolicy -b or its parent), and the target inherits it: macOS keeps it on the efficiency cores with its GPU throttled, so frame metrics saturate and say little; run strobe at normal priority, or compare a CPU metric (cpu.work, main.work)",
+            format!("strobe runs at {why}, and the target inherits it: the OS keeps it on slow cores or behind other work, so frame and input-latency metrics are refused; CPU metrics are kept, but compare them only with runs at the same priority (run strobe at normal priority)"),
         ));
     }
     if let Some(vm) = &env.virtual_machine {
@@ -1577,7 +1587,8 @@ fn in_slot<T>(ctx: &mut Ctx, what: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) 
 fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, set);
-        let r = any_block(ctx, s, v, pair, set, keep);
+        ctx.target_qos = None;
+        let r = any_block(ctx, s, v, pair, set, keep).and_then(|b| priority_state(ctx, s, set, b));
         let Some(report) = reserve.map(host::reserve::Reserve::finish) else { return r };
         ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
         r.map(|mut b| {
@@ -1692,6 +1703,39 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
     b
 }
 
+/// Frames on screen and input latencies: what background priority makes meaningless (SPEC §10.1
+/// `BackgroundPriority`). At background QoS a drag read 83-91% dropped frames that dropped 0.4% at
+/// normal priority.
+pub(crate) fn foreground_metric(m: &str) -> bool {
+    ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+}
+
+fn background_refusal(why: &str, what: &str) -> Error {
+    Error::refused(
+        "BackgroundPriority",
+        format!("the target runs at {why}: the OS keeps it on slow cores or behind other work, so {what}, a frame or input-latency metric, describes no person's machine"),
+        "run strobe at normal priority (not under taskpolicy -b, nice 19, SCHED_IDLE, an idle priority class or efficiency mode), or compare a CPU metric (cpu.work, main.work)",
+    )
+}
+
+/// `BackgroundPriority`: a block whose target ran at background priority (inherited from strobe, or
+/// its own) keeps no frame or input-latency values; declared ones show refused, and a primary among
+/// them refuses the block (a check run lists it refused).
+fn priority_state(ctx: &mut Ctx, s: &Series, set: Set, mut b: Block) -> Result<Block> {
+    let Some(why) = ctx.target_qos.take().or_else(|| ctx.qos.clone()).filter(|_| !matches!(set, Set::Attribution | Set::Memory)) else { return Ok(b) };
+    if foreground_metric(&s.primary) && !ctx.check {
+        return Err(background_refusal(&why, &format!("the primary {}", s.primary)));
+    }
+    b.values.retain(|k, _| !foreground_metric(k));
+    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| foreground_metric(m)) {
+        b.refused.insert(m.clone(), format!("BackgroundPriority: the target ran at {why}"));
+    }
+    if ctx.qos.is_none() && !ctx.warnings.iter().any(|w| w.id == "BackgroundPriority") {
+        ctx.warnings.push(validity::warn("BackgroundPriority", format!("a {} block's target ran at {why}: its frame and input-latency metrics are refused", b.variant)));
+    }
+    Ok(b)
+}
+
 fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
@@ -1727,6 +1771,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         chromium::launch(&window, false, ctx.pin, &[])?
     };
     let steps = RefCell::new(vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
+    ctx.target_qos = host::background_qos(Some(browser.pid));
     let lapped = std::cell::Cell::new(Instant::now());
     let lap = |name: &str| {
         steps.borrow_mut().push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));

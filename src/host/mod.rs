@@ -750,6 +750,14 @@ pub fn exists(path: &Path) -> bool {
     path.exists()
 }
 
+/// Why a process (None: strobe itself, whose priority what it launches inherits) runs at background
+/// priority: macOS `taskpolicy -b`, Windows' idle priority class, efficiency mode or background mode,
+/// Linux `SCHED_IDLE` or nice 19. There the OS keeps it on slow cores or behind everything else, so
+/// its frames and input latencies describe no person's machine (SPEC §10.1 `BackgroundPriority`).
+pub fn background_qos(pid: Option<u32>) -> Option<String> {
+    os::background_qos(pid.unwrap_or(0))
+}
+
 /// The executable path of a running process.
 pub fn exe_of(pid: u32) -> Option<PathBuf> {
     os::exe_of(pid)

@@ -139,6 +139,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         }
     };
     let drive = Drive { session: OnceCell::new(), pid: n.pid, home: home.dir.clone(), main: Cell::new(0) };
+    ctx.target_qos = host::background_qos(Some(n.pid));
     let mut steps = vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)];
     let result = runs(ctx, s, v, pair, set, keep, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
     let closing = Instant::now();

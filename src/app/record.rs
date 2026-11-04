@@ -126,6 +126,8 @@ pub fn run(args: &Args) -> Result<Output> {
         page.navigate(&target, Duration::from_secs(60))?;
     }
     let gpu = gpu?;
+    // A launched target inherits strobe's priority; an attached one runs as its user left it.
+    let qos = if attach { None } else { host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid))) };
     validity::window_visible(&page)?;
     // A headless target draws off screen, so only a headed one cares about the lock screen.
     let on_screen = !args.has("headless");
@@ -225,7 +227,7 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(Err(e)) => json!({ "refused": e.message }),
         None => Value::Null,
     };
-    let meta = json!({
+    let mut meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
         "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os, "os_frames": os_frames,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
@@ -233,6 +235,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
         "created": now_iso(), "valid": true,
     });
+    refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
     Ok(Output::new(summary_text(&meta), meta))
 }
@@ -259,6 +262,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     // A profile with `window: false` (a tray app) has no window to wait for, place or check, and
     // nothing of it reaches the display: a locked session changes none of what is recorded.
     let windowless = app.windowless;
+    let qos = host::background_qos(None).or_else(|| host::background_qos(Some(n.pid)));
     let result = (|| -> Result<Value> {
         if !windowless {
             n.wait_window(Duration::from_secs(60), &guard)?;
@@ -380,6 +384,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         for (k, x) in frame_values {
             meta["values"][k] = json!(x);
         }
+        refuse_background(&mut meta, qos.clone());
         store::write_json(&dir.join("meta.json"), &meta)?;
         Ok(meta)
     })();
@@ -441,6 +446,22 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
     Ok(meta)
 }
 
+/// `BackgroundPriority` (SPEC §10.1): a recording whose target ran at background priority keeps no
+/// frame or input-latency values; its summary says why.
+fn refuse_background(meta: &mut Value, why: Option<String>) {
+    let Some(why) = why else { return };
+    for path in ["/values", "/os_frames/values"] {
+        if let Some(o) = meta.pointer_mut(path).and_then(Value::as_object_mut) {
+            o.retain(|k, _| !super::bench::foreground_metric(k));
+        }
+    }
+    meta["background_priority"] = json!(why);
+}
+
+fn background_line(meta: &Value) -> Option<String> {
+    meta["background_priority"].as_str().map(|why| format!("frames   refused (BackgroundPriority): the target ran at {why}; frames and input latencies there describe no person's machine (CPU is kept)\n"))
+}
+
 pub fn summary_text(meta: &Value) -> String {
     let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
@@ -482,24 +503,28 @@ pub fn summary_text(meta: &Value) -> String {
         fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
         meta["probes"].as_str().unwrap_or("")
     );
-    s += &format!(
-        "frames   {} presented · {} of vsyncs dropped · display {}\n",
-        fmt::value(get("frames.n"), "count"),
-        fmt::value(get("frames.dropped.pct"), "%"),
-        if get("display.hz").is_finite() { format!("{:.0} Hz", get("display.hz")) } else { "?".into() },
-    );
-    s += &format!(
-        "interval p50 {} · p95 {} · max {}   (gap between presented frames)\n",
-        fmt::value(get("frames.interval.p50"), "ms"),
-        fmt::value(get("frames.interval.p95"), "ms"),
-        fmt::value(get("frames.interval.max"), "ms"),
-    );
-    s += &format!(
-        "latency  p50 {} · p95 {} · max {}   (frame begin to presentation)\n",
-        fmt::value(get("frames.presented.p50"), "ms"),
-        fmt::value(get("frames.presented.p95"), "ms"),
-        fmt::value(get("frames.presented.max"), "ms"),
-    );
+    if let Some(line) = background_line(meta) {
+        s += &line;
+    } else {
+        s += &format!(
+            "frames   {} presented · {} of vsyncs dropped · display {}\n",
+            fmt::value(get("frames.n"), "count"),
+            fmt::value(get("frames.dropped.pct"), "%"),
+            if get("display.hz").is_finite() { format!("{:.0} Hz", get("display.hz")) } else { "?".into() },
+        );
+        s += &format!(
+            "interval p50 {} · p95 {} · max {}   (gap between presented frames)\n",
+            fmt::value(get("frames.interval.p50"), "ms"),
+            fmt::value(get("frames.interval.p95"), "ms"),
+            fmt::value(get("frames.interval.max"), "ms"),
+        );
+        s += &format!(
+            "latency  p50 {} · p95 {} · max {}   (frame begin to presentation)\n",
+            fmt::value(get("frames.presented.p50"), "ms"),
+            fmt::value(get("frames.presented.p95"), "ms"),
+            fmt::value(get("frames.presented.max"), "ms"),
+        );
+    }
     s += &format!("main     {} busy · {} long tasks\n", fmt::value(get("main.busy"), "%"), fmt::value(get("main.tasks.long"), "count"));
     if get("cpu.app.total").is_finite() {
         s += &format!("cpu      {} of one core, all processes\n", fmt::value(get("cpu.app.total"), "%"));
@@ -559,6 +584,9 @@ fn native_summary(meta: &Value) -> String {
             fmt::value(get("frames.interval.p95"), "ms"),
             fmt::value(get("frames.dropped"), "count")
         );
+    }
+    if let Some(line) = background_line(meta) {
+        s += &line;
     }
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: take times with --probes timing\n";

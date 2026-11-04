@@ -1835,6 +1835,9 @@ fn subject(v: &Variant) -> Option<String> {
 /// and speed check takes about 4 minutes.
 const BUSY_WAITS: u32 = 15;
 
+/// How many times a macOS block whose app lost the front while nobody used the Mac runs again.
+const HIDDEN_RETRIES: u32 = 5;
+
 /// Runs a block while the screen is unlocked and lit: waits out a locked session, redoes a block the
 /// lock screen touched (Chromium hides its windows and nothing reaches the display, so its numbers
 /// describe nothing), and wakes a display that went dark on idle, once, before a block refuses
@@ -1871,6 +1874,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
     }
     let mut woken = false;
     let mut busy_waits = 0;
+    let mut hidden_retries = 0;
     loop {
         host::wake_display();
         if woken {
@@ -1912,6 +1916,14 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
                 nap(Duration::from_secs(5))?;
             }
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+            continue;
+        }
+        // macOS, nobody at the Mac: another app came forward during the block (one that opens a window
+        // or takes focus by itself). The block is discarded and runs again, a few times.
+        if hidden_retries < HIDDEN_RETRIES && r.as_ref().err().is_some_and(|e| e.message.contains(crate::target::native::COVERED) || e.message.contains(crate::target::native::NOT_ACTIVE)) {
+            hidden_retries += 1;
+            progress(format!("  another app came in front of the {} app during the block: discarded, it runs again ({hidden_retries} of {HIDDEN_RETRIES})", v.role));
+            nap(Duration::from_secs(5))?;
             continue;
         }
         // Other work (a build, an update) kept the CPUs busy through the speed check: on a shared

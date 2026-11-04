@@ -57,6 +57,13 @@ impl Power {
     }
 }
 
+impl Power {
+    /// Whether this run switched the plan (and puts the user's back when dropped).
+    pub fn switched(&self) -> bool {
+        self.saved.is_some()
+    }
+}
+
 impl Drop for Power {
     fn drop(&mut self) {
         if let Some(s) = self.saved.take() {

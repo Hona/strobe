@@ -265,6 +265,13 @@ struct Ctx<'a> {
     reserve: &'static str,
     /// What the reservations of all blocks did, merged (`plan.reserve`).
     reserved: Option<ReserveTotal>,
+    /// The machine state blocks run in, held from a block until the bench waits, builds or hands the
+    /// slot to another bench (`hold_machine`, `release_machine`): the slot, the power plan (and
+    /// keep-awake, `awake.hold`).
+    slot: Option<slot::Slot>,
+    power: Option<host::power::Power>,
+    /// The plan blocks ran on, for the env line.
+    power_used: Option<String>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -388,8 +395,9 @@ pub fn run(args: &Args) -> Result<Output> {
     chromium::reap_orphans();
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
     let config = config::load(&project);
-    let power = power_for(args)?;
-    let env = host::env();
+    // The plan switches before the first block, not now: builds and waits run on the user's own.
+    power_keep(args)?;
+    let mut env = host::env();
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
     let _own = OwnAffinity(runner_pin.and_then(host::set_affinity));
@@ -432,7 +440,11 @@ pub fn run(args: &Args) -> Result<Output> {
         reg,
         reserve,
         reserved: None,
+        slot: None,
+        power: None,
+        power_used: None,
     };
+    ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
     if series.is_empty() {
@@ -440,9 +452,6 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     if busy > 0.10 {
         ctx.warnings.push(validity::warn("Background", format!("{:.0}% of all CPUs were busy before the run; close heavy apps for tighter intervals", busy * 100.0)));
-    }
-    if let Some(why) = &power.kept {
-        ctx.warnings.push(validity::info("PowerPlan", why.clone()));
     }
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
@@ -477,6 +486,7 @@ pub fn run(args: &Args) -> Result<Output> {
             check_series(&mut ctx, s, &mut variants, &config)?
         } else if pixels_only {
             let target = ctx.describe["targets"][&s.target].clone();
+            release_machine(&mut ctx);
             ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
             for v in variants.iter_mut() {
                 prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
@@ -490,6 +500,10 @@ pub fn run(args: &Args) -> Result<Output> {
         };
         all_decided &= out["decided"].as_bool().unwrap_or(false);
         series_out.push(out);
+    }
+    release_machine(&mut ctx);
+    if let Some(p) = &ctx.power_used {
+        env.power_plan = p.clone();
     }
     ctx.runner.exit();
     for home in std::mem::take(&mut ctx.homes).into_values() {
@@ -559,6 +573,7 @@ pub fn run(args: &Args) -> Result<Output> {
 /// with what timed out and its screenshot, and the next case runs.
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
+    release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
@@ -636,6 +651,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
 /// growth verdicts for its post-GC JS heap and DOM nodes, and its suspects.
 fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
+    release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
@@ -669,6 +685,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
+    release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
@@ -1382,7 +1399,9 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         if host::session_locked() {
             progress("  waiting: the session is locked; strobe resumes when it is unlocked");
-            // Outside the bench slot: other benches run what needs no presenting window meanwhile.
+            // Nothing held while waiting: the user's power plan, sleep as they set it, and the slot, so
+            // other benches run what needs no presenting window meanwhile.
+            release_machine(ctx);
             ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window", s.label(), v.role));
             let waiting = Instant::now();
             while host::session_locked() {
@@ -1409,13 +1428,60 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
     }
 }
 
-/// Runs `f` holding the device's bench slot (SPEC §10.1 `ConcurrentBench`): no other bench's block
-/// runs meanwhile. Time spent queued for it is waiting, not run time.
+/// Puts the machine in the state blocks run in: the device's bench slot (SPEC §10.1
+/// `ConcurrentBench`; queued for it with nothing else held), then the run's power plan, settled, and
+/// keep-awake. Kept from one block to the next until the bench waits, builds, or another bench
+/// queues (`release_machine`).
+fn hold_machine(ctx: &mut Ctx, what: &str) -> Result<()> {
+    if ctx.slot.is_some() && slot::others_queued(&ctx.exp) {
+        release_machine(ctx);
+    }
+    match ctx.slot {
+        Some(_) => ctx.reg.set("running", what),
+        None => {
+            let (s, waited) = ctx.reg.acquire(what)?;
+            ctx.waited_ms += waited.as_secs_f64() * 1e3;
+            ctx.slot = Some(s);
+        }
+    }
+    if ctx.power.is_none() {
+        let p = power_for(ctx.args)?;
+        if let Some(why) = &p.kept
+            && !ctx.warnings.iter().any(|w| w.id == "PowerPlan")
+        {
+            ctx.warnings.push(validity::info("PowerPlan", why.clone()));
+        }
+        ctx.power_used.get_or_insert_with(|| p.used.clone());
+        let settle = p.switched();
+        ctx.power = Some(p);
+        if settle {
+            // Cores unpark and clocks follow the new plan's policy within a second or two.
+            std::thread::sleep(Duration::from_secs(3));
+        }
+    }
+    ctx.awake.hold(true);
+    Ok(())
+}
+
+/// Gives back what `hold_machine` took: the user's power plan, sleep as their settings say, and the
+/// slot for the next bench in line.
+fn release_machine(ctx: &mut Ctx) {
+    if ctx.power.take().is_some_and(|p| p.switched()) {
+        progress("  power plan: the user's own again");
+    }
+    ctx.awake.hold(false);
+    ctx.slot = None;
+}
+
+/// Runs `f` with the machine held for a block; hands the slot over after it when another bench waits.
 fn in_slot<T>(ctx: &mut Ctx, what: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T> {
-    let (slot, waited) = ctx.reg.acquire(what)?;
-    ctx.waited_ms += waited.as_secs_f64() * 1e3;
+    hold_machine(ctx, what)?;
     let r = f(ctx);
-    drop(slot);
+    if slot::others_queued(&ctx.exp) {
+        release_machine(ctx);
+    } else {
+        ctx.reg.set("between", "between blocks; holds the slot until the next one or a wait");
+    }
     r
 }
 
@@ -2118,16 +2184,19 @@ impl Drop for OwnAffinity {
 /// device offers and puts the user's back afterwards, even after a kill (`host::power`); `--power
 /// keep` keeps the user's. strobe pins the target to its CPUs itself, so it needs no core parking.
 pub(crate) fn power_for(args: &Args) -> Result<host::power::Power> {
-    let keep = match args.get("power").unwrap_or("high") {
-        "keep" => true,
-        "high" => false,
-        other => return Err(Error::usage(format!("--power: high or keep, not {other}"))),
-    };
-    let p = host::power::Power::for_run(keep);
+    let p = host::power::Power::for_run(power_keep(args)?);
     if p.kept.is_none() {
         progress(format!("  power plan: {} for this run", p.used));
     }
     Ok(p)
+}
+
+fn power_keep(args: &Args) -> Result<bool> {
+    match args.get("power").unwrap_or("high") {
+        "keep" => Ok(true),
+        "high" => Ok(false),
+        other => Err(Error::usage(format!("--power: high or keep, not {other}"))),
+    }
 }
 
 /// What the page showed when a step failed: its URL and a screenshot saved with the experiment.

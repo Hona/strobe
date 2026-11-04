@@ -43,6 +43,7 @@ impl Report {
     }
 }
 
+#[cfg(windows)]
 fn journal() -> std::path::PathBuf {
     super::paths::state_dir().join("reserve.json")
 }

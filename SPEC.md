@@ -863,6 +863,14 @@ flowchart LR
 | throttling | frequency below the expected range (PDH % of maximum frequency) | `cpuinfo_avg_freq` where the kernel has it | thermal state in the env line; analyser only |
 | battery | `GetSystemPowerStatus` | `/sys/class/power_supply` | IOKit |
 
+**Per-run machine state only while blocks run.** A bench switches the power plan, keeps the machine
+awake and reserves CPUs only for its blocks: the plan switches (then 3 s to settle) and keep-awake
+starts when it takes the bench slot for a block, and both stay for its next block while nothing
+else happens in between. When it builds, waits for an unlock, queues behind another bench, or hands
+the slot to one, the user's plan is back and the machine sleeps as their settings say: a bench left
+waiting for days changes nothing. Reserved CPUs last one block each. The env line names the plan
+the blocks ran on.
+
 strobe pins the target itself, so High performance's unparked cores cost it nothing: an X3D CCD's
 V-Cache preference holds through `--pin`. The plan used (with its power mode) is in every
 experiment's env line and `report --format pr` footer.
@@ -1321,7 +1329,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `AmbiguousInteraction` | over half of a block's inputs came while the native app was drawing, so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
-| `ConcurrentBench` | never refuses since benches take turns: one device slot, held by a bench only while one of its blocks runs (`--check`, attribution and launch blocks too), never while it builds or waits for an unlock, so two blocks never run at once and a bench waiting for a person blocks no other. Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/`), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time |
+| `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/`), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -1411,7 +1419,8 @@ The console display's state (`GUID_CONSOLE_DISPLAY_STATE`: off, on, dimmed) is t
 for series that run through a lock: a block during which it changed runs again, and base and head of
 a pair share one state or the pair runs again. When the display sleeps, the compositor parks and the
 GPU and CPUs idle deeper, so a pair across that change would compare two machine states. strobe keeps
-the display on (`ES_DISPLAY_REQUIRED`) only while the session is unlocked: a locked machine's display
+the machine awake only while blocks run (never while a bench waits, §9.4), and the display on
+(`ES_DISPLAY_REQUIRED`) only while the session is also unlocked: a locked machine's display
 sleeps as Windows decides, which is how locked machines run for their users, and keeping a display lit
 through days of locked benches would be strobe changing the machine. Pairs in different display states
 still compare within themselves; `DisplayOff` notes it (every pair, or how many).

@@ -1,7 +1,7 @@
 //! The device's bench slot (SPEC §10.1 `ConcurrentBench`): one block at a time across every bench on
-//! this device. A bench holds it only while a block runs, never while it builds or waits for an
-//! unlock, so a bench waiting for a person never blocks one that can run. Waiting benches take turns
-//! in the order they asked: one that just ran asks again behind those already waiting.
+//! this device. A bench takes it for a block and keeps it for its next one, never while it builds or
+//! waits for an unlock, so a bench waiting for a person never blocks one that can run. Waiting benches
+//! take turns in the order they asked: a holder hands the slot over after its block once one queues.
 //!
 //! Every running bench registers itself in `<run>/benches/<pid>.json` with what it is doing, which
 //! `strobe status` lists. The slot is an exclusive lock on `<run>/bench.slot`, which the OS releases
@@ -155,8 +155,13 @@ impl Drop for Slot {
         if let Some(f) = self.file.take() {
             let _ = f.unlock();
         }
-        self.reg.set("between", "");
+        self.reg.set("idle", "");
     }
+}
+
+/// Whether another bench waits for the slot: then the holder hands it over after its block.
+pub fn others_queued(exp: &str) -> bool {
+    list().iter().any(|b| b["exp"] != exp && b["state"] == "queued")
 }
 
 /// Every live bench on this device, oldest first: pid, exp, file, state, why, since.

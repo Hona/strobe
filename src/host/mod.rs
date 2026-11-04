@@ -78,19 +78,22 @@ pub fn display_state() -> Option<(u8, u64)> {
 /// and redo a pair whose blocks saw different states.
 pub struct Awake {
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    held: std::sync::Arc<std::sync::atomic::AtomicBool>,
     locked: std::sync::Arc<std::sync::atomic::AtomicU64>,
     unlocked: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Awake {
+    /// Tracks the lock state from now on; keeps the machine awake only while `hold(true)`.
     pub fn start() -> Awake {
         use std::sync::atomic::Ordering;
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let held = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let locked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let unlocked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (s, l, u) = (stop.clone(), locked.clone(), unlocked.clone());
+        let (s, h, l, u) = (stop.clone(), held.clone(), locked.clone(), unlocked.clone());
         std::thread::spawn(move || {
-            let mut was: Option<bool> = None;
+            let mut was: Option<(bool, bool)> = None;
             while !s.load(Ordering::Relaxed) {
                 let locked = session_locked();
                 if locked {
@@ -98,17 +101,24 @@ impl Awake {
                 } else {
                     u.fetch_add(1, Ordering::Relaxed);
                 }
-                if was != Some(locked) {
+                let hold = h.load(Ordering::Relaxed);
+                if was != Some((hold, locked)) {
                     #[cfg(any(windows, target_os = "macos"))]
-                    os::keep_awake(true, !locked);
-                    was = Some(locked);
+                    os::keep_awake(hold, hold && !locked);
+                    was = Some((hold, locked));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
             #[cfg(any(windows, target_os = "macos"))]
             os::keep_awake(false, false);
         });
-        Awake { stop, locked, unlocked }
+        Awake { stop, held, locked, unlocked }
+    }
+
+    /// Keeps the machine awake (and the display on while unlocked) or lets it sleep as the user's
+    /// settings say: a bench holds it only while its blocks run, never while it waits (within 500 ms).
+    pub fn hold(&self, on: bool) {
+        self.held.store(on, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Lock observations so far: a block during which this changed saw the lock screen.

@@ -774,7 +774,10 @@ pub fn responsible_app() -> String {
 /// parent that set it): what strobe launches inherits it, and macOS then keeps it on the efficiency
 /// cores with its GPU and IO throttled.
 pub fn background_qos(pid: u32) -> Option<String> {
-    (unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t) } > 0).then(|| "background priority (taskpolicy -b, or a parent's)".to_string())
+    // `getpriority` answers for strobe itself; for another process it read 0 under `taskpolicy -b`
+    // (air, macOS 27), while its base priority was the background band's 4 (`ps -o pri`).
+    let bg = unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t) } > 0 || (pid != 0 && task_info(pid).is_some_and(|t| (1..=4).contains(&t.pti_priority)));
+    bg.then(|| "background priority (taskpolicy -b, or a parent's)".to_string())
 }
 
 fn major_version() -> u32 {

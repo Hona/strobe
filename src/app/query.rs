@@ -58,7 +58,16 @@ pub fn run(args: &Args) -> Result<Output> {
     let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
     let trace = dir.join("trace.pftrace");
     match view {
-        "summary" => Ok(Output::new(super::record::summary_text(&meta), meta)),
+        "summary" => {
+            let mut text = super::record::summary_text(&meta);
+            let mut json = meta.clone();
+            if let Some((t, rows)) = run_phases(&dir, &meta) {
+                text += &t;
+                json["per_run"] = rows;
+            }
+            Ok(Output::new(text, json))
+        }
+        "style" => style(&dir, top),
         "sql" => {
             let sql = args.pos.get(2).ok_or_else(|| Error::usage("query <h> sql \"select …\""))?;
             sql_view(&trace, sql, top.max(50))
@@ -105,7 +114,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             memory(&dir, by, top, args.get("at"))
         }
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql"))),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql"))),
     }
 }
 
@@ -1096,6 +1105,177 @@ select w.k, s.name, s.ts, s.dur, t.tid,
         r["ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
     Ok(out)
+}
+
+/// What invalidated style in the measured runs, from the trace's invalidation tracking (attribution
+/// blocks of a series that declares `main.style` or `style.count`, or `--style`): the recalcs with
+/// the elements each restyled, and the invalidations by what changed (a class, an id, an attribute,
+/// a pseudo-class such as `:hover`, an inline style, a sheet), by the node it hit, by the selector
+/// that matched, and by the script line that made the change.
+pub fn style(dir: &Path, top: usize) -> Result<Output> {
+    let meta = attribution_meta(dir)?;
+    let sql = format!(
+        "{}
+select k, null, null, null, null, null, null, null, null from _w
+union all
+select w.k, s.name, s.dur,
+  coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount')),
+  extract_arg(s.arg_set_id, 'debug.data.reason'),
+  coalesce('class .' || extract_arg(s.arg_set_id, 'debug.data.changedClass'), 'id #' || extract_arg(s.arg_set_id, 'debug.data.changedId'),
+    'attribute [' || extract_arg(s.arg_set_id, 'debug.data.changedAttribute') || ']', 'pseudo-class :' || extract_arg(s.arg_set_id, 'debug.data.changedPseudo')),
+  extract_arg(s.arg_set_id, 'debug.data.nodeName'),
+  (select group_concat(a.display_value, char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.selectors*.selector'),
+  (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.stackTrace*')
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where (s.name = 'UpdateLayoutTree' and t.name = 'CrRendererMain') or s.name glob '*InvalidationTracking'",
+        windows_sql(meta["token"].as_str().unwrap_or(""))
+    );
+    let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
+    let measured = measured_runs(&meta, &table.rows);
+    let runs = measured.len().max(1) as f64;
+    let sym = Symbolizer::open(dir);
+    let (mut recalcs, mut recalc_ms, mut elements, mut largest) = (0u64, 0.0f64, 0.0f64, 0.0f64);
+    let mut what: BTreeMap<String, (u64, BTreeMap<String, u64>)> = BTreeMap::new();
+    let mut selectors: BTreeMap<String, u64> = BTreeMap::new();
+    let mut sources: BTreeMap<String, u64> = BTreeMap::new();
+    let mut tracked = 0u64;
+    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        if !measured.contains(&cell(0)) {
+            continue;
+        }
+        let name = cell(1);
+        if name == "UpdateLayoutTree" {
+            recalcs += 1;
+            recalc_ms += cell(2).parse::<f64>().unwrap_or(0.0) / 1e6;
+            let n = cell(3).parse::<f64>().unwrap_or(0.0);
+            elements += n;
+            largest = largest.max(n);
+            continue;
+        }
+        tracked += 1;
+        let kind = name.trim_end_matches("InvalidationTracking");
+        let change = Some(cell(5)).filter(|c| !c.is_empty()).or_else(|| Some(cell(4)).filter(|r| !r.is_empty())).unwrap_or_else(|| "(no reason given)".into());
+        let e = what.entry(format!("{change} ({kind})")).or_default();
+        e.0 += 1;
+        *e.1.entry(Some(cell(6)).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into())).or_default() += 1;
+        for sel in cell(7).split('\u{1e}').filter(|s| !s.is_empty()) {
+            *selectors.entry(sel.to_string()).or_default() += 1;
+        }
+        if let Some(f) = trace_stack(&cell(8)).into_iter().next() {
+            let fr = sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3);
+            *sources.entry(format!("{} ({})", if fr.name.is_empty() { "(anonymous)" } else { &fr.name }, fr.location())).or_default() += 1;
+        }
+    }
+    if tracked == 0 {
+        return Err(Error::usage(
+            "this recording has no style invalidation tracking: attribution blocks trace it for a series that declares main.style or style.count (or with --style); record --probes attribution --style for a page",
+        ));
+    }
+    let per = |n: u64| n as f64 / runs;
+    let mut text = format!(
+        "style invalidation · {}\n  recalcs      {:.1} per run · {} per run · {} elements restyled per run (largest recalc {} elements)\n",
+        runs_text(measured.len(), &table.rows),
+        per(recalcs),
+        fmt::value(recalc_ms / runs, "ms"),
+        fmt::value(elements / runs, "count"),
+        fmt::value(largest, "count"),
+    );
+    let ranked = |m: &BTreeMap<String, u64>| {
+        let mut v: Vec<(String, u64)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.truncate(top);
+        v
+    };
+    let mut changes: Vec<_> = what.iter().collect();
+    changes.sort_by_key(|c| std::cmp::Reverse(c.1.0));
+    text += "  what changed (per run, the nodes it hit most)\n";
+    let mut changes_json = Vec::new();
+    for (k, (n, nodes)) in changes.into_iter().take(top) {
+        let nodes = ranked(nodes);
+        text += &format!("    {:>8.1}  {k}  · {}\n", per(*n), nodes.iter().take(3).map(|(nd, c)| format!("{nd} ×{c}")).collect::<Vec<_>>().join(", "));
+        changes_json.push(json!({ "what": k, "per_run": per(*n), "count": n, "nodes": nodes }));
+    }
+    let sels = ranked(&selectors);
+    if !sels.is_empty() {
+        text += "  by selector (invalidation sets that matched)\n";
+        for (s, n) in &sels {
+            text += &format!("    {:>8.1}  {s}\n", per(*n));
+        }
+    }
+    let srcs = ranked(&sources);
+    if !srcs.is_empty() {
+        text += "  by source (the script line that made the change)\n";
+        for (s, n) in &srcs {
+            text += &format!("    {:>8.1}  {s}\n", per(*n));
+        }
+    }
+    Ok(Output::new(
+        text,
+        json!({
+            "runs": measured.len(), "recalcs_per_run": per(recalcs), "recalc_ms_per_run": recalc_ms / runs, "elements_per_run": elements / runs, "largest_recalc": largest,
+            "invalidations_per_run": per(tracked), "changes": changes_json, "selectors": sels, "sources": srcs,
+        }),
+    ))
+}
+
+/// Per measured run, the renderer main thread's style, layout and paint time and the elements style
+/// recalcs touched, from a trace that has them (timing with `--trace full`, attribution): the numbers
+/// a person would otherwise pull out with SQL over the run marks.
+pub fn run_phases(dir: &Path, meta: &Value) -> Option<(String, Value)> {
+    let token = meta["token"].as_str().filter(|t| !t.is_empty())?;
+    let trace = dir.join("trace.pftrace");
+    if !trace.exists() {
+        return None;
+    }
+    let sql = format!(
+        "{}
+select k, null, null, null, null from _w
+union all
+select w.k, s.name, s.ts, s.dur, coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount'), 0)
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where t.name = 'CrRendererMain' and s.name in ('UpdateLayoutTree', 'Layout', 'PrePaint', 'Paint')
+  order by 1, 3",
+        windows_sql(token)
+    );
+    let table = engine::query(&trace, &sql).ok()?;
+    let measured = if meta["probes"] == "attribution" { measured_runs(meta, &table.rows) } else { run_keys(&table.rows).into_iter().map(|k| k.1).collect() };
+    // [style, layout, paint] ms and elements restyled, per run; nested slices of one kind count once.
+    let mut per: BTreeMap<String, ([f64; 3], f64)> = measured.iter().map(|k| (k.clone(), ([0.0; 3], 0.0))).collect();
+    let mut end: BTreeMap<String, i64> = BTreeMap::new();
+    let mut any = false;
+    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        let Some(run) = per.get_mut(&cell(0)) else { continue };
+        let i = match cell(1).as_str() {
+            "UpdateLayoutTree" => 0,
+            "Layout" => 1,
+            _ => 2,
+        };
+        let (ts, dur) = (cell(2).parse::<i64>().unwrap_or(0), cell(3).parse::<i64>().unwrap_or(0));
+        let e = end.entry(format!("{} {i}", cell(0))).or_insert(i64::MIN);
+        if ts < *e {
+            continue;
+        }
+        *e = ts + dur;
+        run.0[i] += dur as f64 / 1e6;
+        if i == 0 {
+            run.1 += cell(4).parse::<f64>().unwrap_or(0.0);
+        }
+        any = true;
+    }
+    if !any {
+        return None;
+    }
+    let mut text = format!("per run  {} · renderer main thread\n         style ms (elements restyled)   layout ms   paint ms\n", runs_text(measured.len(), &table.rows));
+    let mut rows = Vec::new();
+    for (k, (ms, el)) in &per {
+        text += &format!("  {:<6} {:>8.1} ({:>8})          {:>9.1}   {:>8.1}\n", k.rsplit(':').next().map(|i| format!("run {i}")).unwrap_or_default(), ms[0], fmt::value(*el, "count"), ms[1], ms[2]);
+        rows.push(json!({ "run": k, "style_ms": ms[0], "elements_restyled": el, "layout_ms": ms[1], "paint_ms": ms[2] }));
+    }
+    Some((text, json!(rows)))
 }
 
 /// Garbage collection in the measured runs: collections, the main-thread pause they cost (incremental

@@ -2249,8 +2249,19 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
-        let extra_categories: Vec<&str> =
-            [(shift, "loading"), (gc, "disabled-by-default-v8.gc"), (gpu_compile, "gpu.dawn"), (gpu_compile, "disabled-by-default-gpu.dawn")].into_iter().filter(|c| c.0).map(|c| c.1).collect();
+        // What invalidated style (`query <rec> style`): attribution blocks of a series about style, or `--style`.
+        let style = set == Set::Attribution && (ctx.args.has("style") || declared.iter().any(|m| *m == "main.style" || *m == "style.count"));
+        let extra_categories: Vec<&str> = [
+            (shift, "loading"),
+            (gc, "disabled-by-default-v8.gc"),
+            (gpu_compile, "gpu.dawn"),
+            (gpu_compile, "disabled-by-default-gpu.dawn"),
+            (style, "disabled-by-default-devtools.timeline.invalidationTracking"),
+        ]
+        .into_iter()
+        .filter(|c| c.0)
+        .map(|c| c.1)
+        .collect();
         let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         let mut census: Vec<Value> = Vec::new();

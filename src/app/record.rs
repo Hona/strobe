@@ -23,7 +23,7 @@ use std::time::Duration;
 fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
     b.set("filter", case);
-    for k in ["target", "params", "id", "pin", "power", "runs"] {
+    for k in ["target", "params", "id", "pin", "power", "runs", "style"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }
@@ -59,7 +59,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         text += &if native {
             format!("next     strobe query {rec} threads · strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe query {rec} summary\n")
         } else {
-            format!("next     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n")
+            format!("next     strobe query {rec} hotspots --by package · strobe query {rec} summary (per run) · strobe query {rec} style · strobe report recording {rec} --open\n")
         };
     }
     Ok(Output::new(text, json!({ "recordings": recordings })))
@@ -154,7 +154,8 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         return Ok(Output::new(summary_text(&meta), meta));
     }
-    let tracing = probe::trace::start(&browser.cdp, set)?;
+    let style = set == Set::Attribution && args.has("style");
+    let tracing = probe::trace::start_with(&browser.cdp, set, if style { &["disabled-by-default-devtools.timeline.invalidationTracking"] } else { &[] })?;
     if set == Set::Attribution {
         probe::cpu::start(&page)?;
         probe::alloc::start(&page)?;

@@ -1246,7 +1246,8 @@ other windows. `until: "idle"` is no present of the app and no accessibility cha
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
 in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling; a page that never
-goes idle fails with how many mutations and long frames kept it busy and the top three causes:
+goes idle fails with what kept it busy first (the DOM kept changing, long frames with no DOM mutation,
+or both), how many mutations and long frames, and the top three causes:
 nodes as `tag#id.class` with the attribute or kind that changed, long frames by their longest
 script's invoker and file), `"frame"`
 (two animation frames, the usual "after next paint"), a selector, or `{ selector, text?, exact? }`
@@ -1554,7 +1555,8 @@ session.
 
 | View | Arguments | Returns |
 |---|---|---|
-| `summary` | | validity, environment, headline metrics per phase |
+| `summary` | | validity, environment, headline metrics per phase; a recording whose trace has them (attribution, `--trace full`): per measured run the renderer main thread's style ms with the elements its recalcs restyled, layout ms and paint ms, and how many runs the trace holds (warmup included) |
+| `style` | `--top` | what invalidated style in the measured runs, from the trace's invalidation tracking (`disabled-by-default-devtools.timeline.invalidationTracking`, in attribution blocks only: of a series that declares `main.style` or `style.count`, with `--style`, or `record --probes attribution --style`): recalcs per run with the elements they restyled and the largest; invalidations by what changed (a class, an id, an attribute, a pseudo-class such as `:hover`, an inline style or custom property, a sheet) with the nodes they hit, by the selector whose invalidation set matched, and by the script line that made the change (source-mapped) |
 | `frames` | `--phase` | frame percentiles, dropped vsyncs, budget misses, worst frames with handles |
 | `threads` | `--phase` | busy share by thread and category, long tasks |
 | `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` `--native` | rows with self and total time, sample counts, intervals, handles; native samples (`deep`) in the same shape, with the share that resolved (a recording without a JavaScript profile shows them by default) |
@@ -2306,8 +2308,8 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
 | 7 | — | CI budgets, history, mesh |
 
-Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;
-its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
+Query views built: `summary` (with per-run style, layout and paint), `frames`, `threads` (a native recording's: its threads' wakes and CPU;
+its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `style`, `shifts`, `gc`, `heap` (and
 `a..b heap`), `leaks`, `memory` (and `a..b memory`; native recordings by what holds the memory), `gpu`
 (a trace's GPU process; without a trace the OS's per-process GPU statistics), `insights`, `sql`,
 `progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`.

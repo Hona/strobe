@@ -22,7 +22,7 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works
         --filter: case names, comma-separated, exact unless they hold `*` (`"window-closed*"` also runs
         `window-closed-memory`); strobe prints what runs and what it skips before building
-    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
+    strobe query <rec_… | a..b | exp_…> <view> [args]    views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
         hotspots and alloc take --by function|file|package (hotspots: --native, --thread <name> for native samples);
         memory takes --by process|layer|allocator and --at <i>;
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
@@ -91,7 +91,7 @@ Everything about the app under test lives in its repo's `strobe.json`: `build` a
 ## Recipes
 
 Did my change help? `bench <file> --base origin/dev --head .` and read the verdict per series.
-Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
+Why is it slow? `bench … --why always` (or `record --probes attribution`), then on the attribution recording: `query hotspots` (CPU by function, full stacks, original file:line:column through source maps), `query layout` (forced layouts by the call that forced them), `query style` (what invalidated style: the class, attribute, pseudo-class or custom property that changed, the nodes, the selector, the script line; attribution blocks trace it for a series declaring `main.style` or `style.count`, or with `--style`), `query summary` (per run: style ms with elements restyled, layout, paint), `query alloc` (who allocates), `query gc`. `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
 What stands out? `query <rec or exp> insights`: forced layout, GC pressure, long tasks, work while idle, detached DOM, background load, unresolved time, and for an experiment the biggest base/head movers, each with the command that shows it.
 Where is the memory? `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting). A native app or process: what holds it (host heap, GPU memory mapped in, unmapped commit, shared, files, images; `--by layer` for totals) with `gpu.vram` beside it. On Windows, `memory.app.private` also counts the VRAM a GPU driver maps into the process: quote `memory.app.host` for the app's own memory.
 Which commit moved it? `bench <file> --filter <case> --bisect <good>..<bad>` (one series; each step is a full experiment).

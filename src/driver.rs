@@ -114,7 +114,13 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     const limit = setTimeout(() => {
       stop()
       const top = [...causes].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, n]) => k + " ×" + n).join("; ")
-      const what = mutations + " DOM mutations" + (frames ? ", " + frames + " frames over 50 ms (longest " + Math.round(longest) + " ms)" : "")
+      // Lead with what kept it busy: DOM mutations, long animation frames (a frame over 50 ms with no
+      // mutation: a spinner's animation on a slow core, a script on a timer), or both.
+      const muts = mutations + " DOM mutation" + (mutations === 1 ? "" : "s")
+      const longs = frames + " animation frame" + (frames === 1 ? "" : "s") + " over 50 ms (longest " + Math.round(longest) + " ms)"
+      const what = !frames ? "the DOM kept changing (" + muts + ", no long frames)"
+        : !mutations ? "long frames kept it busy (" + longs + ", no DOM mutations)"
+        : "the DOM kept changing and frames ran long (" + muts + "; " + longs + ")"
       reject(new Error("the page never went idle in " + timeout + " ms: " + what + (top ? "; most: " + top : "")))
     }, timeout)
     kick()

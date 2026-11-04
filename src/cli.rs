@@ -26,6 +26,7 @@ const SWITCHES: &[&str] = &[
     "pixels-only",
     "native",
     "os-frames",
+    "style",
 ];
 
 #[derive(Clone)]
@@ -124,7 +125,7 @@ Usage: strobe <command> [flags]
 
 Use
   status                          environment, validity preflight, recent recordings and experiments
-  record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>]
+  record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>] [--style]
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
   record --bench <file.bench.ts>#<case> [--head <variant>]
                                   record one bench case (it drives the page: clicks, keys) with the attribution probes
@@ -137,10 +138,13 @@ Use
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--bisect good..bad]           (the commit that moved the primary; one series)
+        [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
+  bench --stop <exp> | --resume <exp>
+                                  stop a running bench after its block (it keeps what finished), or go on with one
         --filter: case names, comma-separated; exact unless a name holds * (a glob)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
-                                  views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql
+                                  views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
                                   (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>)
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body

@@ -2424,8 +2424,11 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   placeholder root was followed by the full tree (70 elements), full key paths read
   (`window/content/general/card/login/switch/knob`) and key-path suffixes (`switch/knob`) matched.
   Its focus is reported only while its window has OS focus, so `:focus` never matches in a window
-  strobe keeps in the background; and posted Tab then Space left the first switch's bounds where
-  they were, which a locked session cannot tell apart from keys the app did not take.
+  strobe keeps in the background: match such an element by key and read its state instead. On a
+  switch that reports its toggle state, posted Tab then Space turned it on (its label read
+  "Lights on" in the tree), as did Tab, Tab, Shift+Tab, Space and `page.act(…, "toggle")`
+  (`role=switch` matched it). Its frames do not draw on a locked session, so drawn bounds there say
+  nothing; the tree's state does.
 - Storage: `cpu-0.cpuprofile` and `alloc-0.heapprofile` (plain JSON), `maps/` (source maps and
   function ranges), `heap-0.heapsnapshot.gz` (and `heap-s0`, `heap-s1` for memory recordings),
   `leaks.json`, census in `meta.json`, one `runner.log` and `progress.log` per experiment.

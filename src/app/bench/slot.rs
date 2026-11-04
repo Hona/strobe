@@ -104,6 +104,7 @@ impl Registration {
         let mine = self.queue(what);
         let me = self.0.exp.as_str();
         let mut shown = String::new();
+        let mut reminded = Instant::now();
         loop {
             let others = list();
             let ahead: Vec<&Value> = others
@@ -131,6 +132,16 @@ impl Registration {
                 drop(e);
                 self.write();
                 shown = why;
+                reminded = Instant::now();
+            } else if reminded.elapsed() >= Duration::from_secs(60) {
+                // A wait has no deadline: say how long it has been and what ends it, once a minute.
+                let holder = old.or_else(|| running.and_then(|r| r["pid"].as_u64()).map(|p| p as u32));
+                let ends = match holder {
+                    Some(pid) => format!("it ends when pid {pid} releases the slot or exits; stop that process if it is stuck"),
+                    None => "it ends when the benches ahead finish; strobe status lists them".to_string(),
+                };
+                super::progress(format!("  still waiting after {} ({ends})", super::super::fmt::ms_duration(started.elapsed().as_millis() as u64)));
+                reminded = Instant::now();
             }
             std::thread::sleep(Duration::from_millis(200));
         }

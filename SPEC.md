@@ -1608,10 +1608,9 @@ prints it under each case (`screen  display on · session locked · dwm.exe 3.1%
 `query <rec> summary` beside the variant's commit (`variant_git`: commit, uncommitted changes and
 their diff hash, kept in every block recording) and whether the launch found GPU shader caches.
 
-`report --format pr` shows every warning: one alert above the series condenses them (a locked
-session and a sleeping display once for all series, `Background` as how many timed blocks were
-flagged and the peak), and its validity drawer keeps each note's text; the per-block foreign CPU is
-in the per-pair tables.
+`report --format pr` keeps every warning: at most one alert or note at the top says what changes
+how to read the result, **How was it measured?** lists each note in full, and the per-block
+foreign CPU is in the per-pair tables.
 
 `Background` (built): per measured run, the busy time of the CPUs the target is pinned to (the OS
 sampler's per-CPU idle cycles) minus the target's own cycles is `cpu.foreign` (% of one core); a block
@@ -1733,54 +1732,64 @@ that stacks index, while recordings and `query` keep all);
 markdown is GitHub-flavoured.
 
 `--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
-pull request body, pasted verbatim. It reads as the HTML report does, in three depths:
+pull request body, pasted verbatim. It is written for a reader who is not a performance engineer,
+in levels of detail, each answering the next question:
 
-- **Always visible:** the bottom line (one series: its primary's change, base → head, interval,
-  verdict and the pairs head won, plus the secondaries that moved; more series: a tally and a
-  scorecard with a row per series), one `<sub>` line of setup (variants, OS, CPU with pinning and
-  reserved CPUs, power plan, GPU, browser, window and display when frames were drawn, pairs, and
-  the session state the numbers compare with: `session locked, display off`), the rerun ledger
-  when other experiments compared the same variants, at most one alert (`[!CAUTION]` for a stopped
-  bench, a refused primary, an A/A false positive, `NotSteady`, `StateDrift` or
-  `BackgroundPriority`; `[!WARNING]` for any other warning; `[!NOTE]` for context notes only), and
-  the `strobe bench` command that reruns it.
-- **One click (series `<details>`, open for one or two series and for the first two that moved or
-  were refused of more):** the tested metrics, each with base → head, the change and its interval,
-  the verdict and a 21-cell interval ruler on a shared ±10/25/50/100% scale (`│` is 0, `┤━●━├` the
-  interval and estimate, `‹ ›` past the scale, `×` refused); a Mermaid `xychart-beta` of the
-  primary per pair (bars base, line head), or a `gantt` of a launch's milestones when they lie
-  apart; a frame-pacing line when the series drew frames.
-- **Two clicks:** context metrics, the per-pair table (order, values, change, max frame gap,
-  foreign CPU of each block and the busiest other processes, kept recordings), attribution
-  (native: thread wakes and CPU by owner and thread, memory by what holds it; web: main-thread
-  phases, GC, CPU and allocation movers, the live heap's diff and head's insights), and validity
-  (variants with subjects, rig, `ReservedCpus`, the method, every note in full, drill-down
-  commands, the Perfetto line).
+- **Level 0, visible:** per series a headline and a caption, always the same shape. The headline says
+  what changed and by how much in everyday words, from the metric's name ("CPU time per run went
+  from 7.05 ms to 3.90 ms, **44% less**."; "Run time did not change meaningfully (103 ms to 103 ms).";
+  "Slow frame gaps (95th percentile) was not measured."). The caption says how sure strobe is or why
+  there is no answer ("Strobe is confident: head was better in 8 of 8 pairs."; "The difference is
+  within ±2%, which strobe counts as no change."; "about 50 pairs would settle it"; the refusal's
+  reason). Then at most one alert, only when it changes how to read the result (a stopped bench, an
+  A/A false positive, a mixed lock state, a case whose state grows), else at most one note on what
+  the numbers compare with (screen locked and display off; other apps busy in most blocks; other
+  experiments on the same builds). No intervals, metric names, rig or commands at this level.
+- **Level 1, drawers named as questions:** per series **Is it real?** (each pair, its order and the
+  other apps' CPU, with a Mermaid `xychart-beta` of base and head per pair, or a `gantt` of a
+  launch's milestones when they lie apart), **How big?** (every tested metric: plain name with its
+  id, base, head, change, the likely range and the verdict; frame pacing; the context metrics in
+  a nested drawer), **Where did it come from?** (the profiled launches: for a native app thread
+  wake-ups by owner, the threads that changed most and memory by what holds it; for a page
+  main-thread phases, garbage collection, the functions that moved most, the live heap and head's
+  insights). With several series, each series' three drawers sit in one drawer of its own. Then,
+  once, **How was it measured?** (bench file, builds with subjects, machine, isolation, other
+  load, method, stopping rule, time taken, every note strobe made, other experiments on the same
+  builds, the strobe that recorded it) and **How do I rerun it?** (the `strobe bench` command, the
+  full report, the profiled launches' views, the Perfetto line, kept recordings).
 
-Rules: changes are coloured (`$\color{…}`, dollar-backtick math so `\%` survives) only for a decided
-move in a direction, by the metric's better direction; undecided, `same`, gated and descriptive rows
-stay plain. Verdicts keep strobe's words, and a blank secondary says why: `gated on primary`,
-`unconfirmed (Holm: needs N pairs)` or `unclear (~N pairs)`; `refused: <Id>` carries its reason;
-`no worse (≤X%)`, `worse (>X%)`, `underpowered`, `saturated` and `stopped` read as such. No Mermaid
-inside a closed `<details>` (it would draw at zero width), no alert inside one, no footnotes, no
-emoji. Variants are named by commit (`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), the bench file
-by its path in its repository, never a local folder. The output is deterministic and at most 24,000
-characters (UTF-16, as GitHub counts; its limit is 65,536): a long report sheds, in order, attribution
-rows past 3, context rows that read 0 on both sides, quiet pairs of series without a direction, the
-middle pairs of a series with more than 16, the context and attribution drawers, then per-pair tables
-and charts; never a series' verdict, its tested metrics, a refusal, the alert or the rerun command.
+Rules: one idea per line; each drawer opens with one sentence on what it holds. Decided changes in
+the tables are coloured (`$\color{…}`, dollar-backtick math so `\%` survives) by the metric's better
+direction; at level 0 the change is bold, since math swaps the font mid-sentence. Undecided, `same`,
+not judged and context rows stay plain. Verdicts keep strobe's words where they read plainly and
+say why otherwise: `not judged (main metric undecided)`, `not confirmed (needs N pairs)`,
+`unclear (~N pairs)`, `not measured (<reason>)`. Frame-gap percentiles use one definition everywhere,
+each launch's percentile and the median across launches (`frames.interval.*`); shares of late frames
+count every gap. No alert inside a drawer, no footnotes, no emoji; commit subjects lose `(#123)`
+references, which would link to the PR's repository. Variants are named by commit (`1982f5313f`,
+`origin/x@7bf4e2d566`, `(dirty)`), the bench file by its path in its repository, never a local
+folder. The output is deterministic for a strobe build and at most 24,000 characters (UTF-16, as
+GitHub counts; its limit is 65,536): a long report sheds, in order, attribution rows past 3, context
+rows that read 0 on both sides, quiet pairs of series without a direction, the middle pairs of a
+series with more than 16, the context and attribution drawers, then per-pair tables and charts; never
+a series' sentence, its tested metrics, a refusal, the alert or the rerun command. Mermaid charts sit
+in closed drawers and draw when opened (checked in Chromium on github.com).
 
 The block is delimited so a reader and a tool can tell strobe's evidence from the author's text:
 
 ```
 <!-- strobe:report exp_9b3b26 v1 begin sha256:78fbde6b6f53f8b4 -->
-<sub><b>strobe 0.6.0</b> · generated by <code>strobe report experiment exp_9b3b26 --format pr</code> · …</sub>
+<sub>Generated by <code>strobe 0.6.0+f10afc0ccd</code> from experiment <code>exp_9b3b26</code>. Do not edit by hand: strobe replaces this block.</sub>
 ---
 … the report …
 ---
-<sub>end of strobe report <code>exp_9b3b26</code></sub>
+<sub>End of the strobe report for <code>exp_9b3b26</code>.</sub>
 <!-- strobe:report exp_9b3b26 end -->
 ```
+
+The version is Cargo.toml's with the commit of the build (`build.rs`, empty outside a checkout), so a
+build from main after a release does not pass for the release; the strobe that recorded the
+experiment is named in **How was it measured?**.
 
 The hash is the first 16 hex digits of the SHA-256 of the content between the markers (trimmed,
 LF line ends). Authors write their summary, discovery and change outside the block; a PR may carry

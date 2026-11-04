@@ -1702,7 +1702,9 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
 - **`guard`**: before launch strobe reads each file (and the `pid` and `url` its JSON names).
   While the app starts, after its window opens and after every close, the file must be unchanged,
   the process alive and the URL answering. Otherwise the experiment stops at once, kills the copy
-  and exits 1: an isolation gap in the profile. Never measure past disturbed user state.
+  and exits 1: an isolation gap in the profile. Never measure past disturbed user state. A guard
+  with `"os": "windows"` (`macos`, `linux`) applies on that OS only, so one profile lists every
+  OS's state; without `os`, a guard whose path names an unset variable still refuses the profile.
 - **`protocols`**: URL schemes the app registers on start live in the per-user registry
   (`HKCU\Software\Classes`), which no environment variable redirects. Strobe exports each key
   into the home before launch and restores it (or deletes it, if it was absent) on close (Windows).

@@ -137,6 +137,11 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
     let mut guards = Vec::new();
     for g in p["guard"].as_array().into_iter().flatten() {
         let Some(file) = g["file"].as_str() else { continue };
+        // A guard for another OS's state (`"os": "windows"`) guards nothing here: one profile serves
+        // every OS.
+        if g["os"].as_str().is_some_and(|o| o != os()) {
+            continue;
+        }
         let file = expand(file).map_err(|e| Error::usage(format!("app profile \"{id}\" guard: {}", e.message)))?;
         guards.push(GuardSpec { file, pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) });
     }

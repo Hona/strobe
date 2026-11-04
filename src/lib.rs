@@ -10,6 +10,7 @@ pub mod heapsnap;
 pub mod host;
 pub mod metrics;
 pub mod model;
+pub mod perfetto;
 pub mod png;
 pub mod probe;
 pub mod runner;

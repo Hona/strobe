@@ -76,6 +76,63 @@ pub fn ensure() -> Result<PathBuf> {
     Ok(exe)
 }
 
+/// The Perfetto UI of the same release (§15), unpacked once: what `strobe open` serves.
+pub fn ui_dir() -> PathBuf {
+    host::paths::engine().join(VERSION).join("ui")
+}
+
+pub fn ensure_ui() -> Result<PathBuf> {
+    let dir = ui_dir();
+    if dir.join("index.html").is_file() {
+        return Ok(dir);
+    }
+    let archive = download(UI_ASSET.0, UI_ASSET.1)?;
+    let bytes = std::fs::read(&archive)?;
+    let tmp = dir.with_extension("tmp");
+    let _ = std::fs::remove_dir_all(&tmp);
+    for (name, body) in unzip(&bytes, |n| !n.contains("..") && !n.starts_with('/'))? {
+        let path = tmp.join(&name);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(path, body)?;
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::rename(&tmp, &dir)?;
+    let _ = std::fs::remove_file(&archive);
+    Ok(dir)
+}
+
+/// The UI's version directory (`v59.1-1e9c61e98`), which must match this trace_processor's build.
+pub fn ui_version() -> Option<String> {
+    std::fs::read_dir(ui_dir()).ok()?.flatten().map(|e| e.file_name().to_string_lossy().to_string()).find(|n| n.starts_with(VERSION))
+}
+
+/// Starts `trace_processor_shell server http` on 127.0.0.1:`port` for the Perfetto UI served at
+/// `origin`, with no trace loaded (the UI streams one to it), detached; it ends itself after an hour
+/// without requests. Returns once it answers.
+pub fn httpd(port: u16, origin: &str) -> Result<()> {
+    let exe = ensure()?;
+    let port_s = port.to_string();
+    let args = ["server", "http", "--ip-address", "127.0.0.1", "--port", &port_s, "--additional-cors-origins", origin, "--idle-timeout", "60m", "--quiet"];
+    #[cfg(windows)]
+    host::win::spawn_detached(&exe, &args).map_err(|e| Error::msg(format!("start trace_processor: {e}")))?;
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        use std::process::Stdio;
+        Command::new(&exe).args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).process_group(0).spawn().map_err(|e| Error::msg(format!("start trace_processor: {e}")))?;
+    }
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+    for _ in 0..100 {
+        if std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_millis(100)).is_ok() {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Err(Error::msg(format!("trace_processor did not answer on 127.0.0.1:{port}")))
+}
+
 fn u16le(b: &[u8], at: usize) -> usize {
     u16::from_le_bytes([b[at], b[at + 1]]) as usize
 }

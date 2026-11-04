@@ -29,6 +29,8 @@ const SWITCHES: &[&str] = &[
     "style",
     "force",
     "timeline",
+    "perfetto",
+    "no-browser",
 ];
 
 #[derive(Clone)]
@@ -159,6 +161,9 @@ Use
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
                                   (md and pr print the markdown; the file's path goes to stderr)
+  open <rec_…|exp_…[/head|base|<block>|<case>]> [--perfetto] [--no-browser]
+                                  the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
+                                  and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,

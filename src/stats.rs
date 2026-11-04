@@ -66,7 +66,7 @@ fn erf(x: f64) -> f64 {
     if x >= 0.0 { y } else { -y }
 }
 
-fn normal_quantile(p: f64) -> f64 {
+pub(crate) fn normal_quantile(p: f64) -> f64 {
     // Acklam's approximation
     let a = [-39.69683028665376, 220.9460984245205, -275.9285104469687, 138.357_751_867_269, -30.66479806614716, 2.506628277459239];
     let b = [-54.47609879822406, 161.5858368580409, -155.6989798598866, 66.80131188771972, -13.28068155288572];
@@ -211,15 +211,126 @@ pub struct Comparison {
     /// A counter that held one value on each side in every block: compared exactly (SPEC §10.1).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
+    /// Non-inferiority (SPEC §9.3): the margin by which head may be worse (a fraction for ratio metrics,
+    /// the metric's unit otherwise); `p` then tests the difference against the margin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noworse: Option<f64>,
+}
+
+/// Per-pair differences of a metric: `ln(head / base)` when every value is positive and the metric is a
+/// ratio metric, else `head − base`. Returns the finite pairs, the differences and whether they are ratios.
+fn diffs(def: &MetricDef, pairs: &[(f64, f64)]) -> (Vec<(f64, f64)>, Vec<f64>, bool) {
+    let finite: Vec<(f64, f64)> = pairs.iter().copied().filter(|(a, b)| a.is_finite() && b.is_finite()).collect();
+    // Counts compare by difference: a zero on either side (no fetches, no shift) has no ratio.
+    let relative = def.kind != Kind::Exact && def.unit != "count" && def.unit != "score" && finite.iter().all(|(a, b)| *a > 0.0 && *b > 0.0);
+    let d = finite.iter().map(|(a, b)| if relative { (b / a).ln() } else { b - a }).collect();
+    (finite, d, relative)
+}
+
+/// The margin as a difference in `diffs`' scale: where "worse by exactly the margin" sits. `margin_abs`
+/// is the margin in the comparison's scale (a fraction for ratios, the unit otherwise).
+pub fn margin_shift(def: &MetricDef, relative: bool, margin_abs: f64) -> f64 {
+    let worse = if def.better == Better::Lower { 1.0 } else { -1.0 };
+    if relative { (1.0 + worse * margin_abs).max(1e-9).ln() } else { worse * margin_abs }
+}
+
+/// Non-inferiority (SPEC §9.3): is head at most `margin` worse than base? The same interval as `compare`
+/// (at `confidence`, a planned look's level for a primary), judged against the margin instead of 0:
+/// `no worse (≤X)` when its worse end lies inside the margin, `worse (>X)` when its better end lies
+/// beyond it, else `unclear`. Each claim is a one-sided test at (1 − confidence)/2; `p` is the two-sided
+/// signed-rank test of the differences against the margin, so Holm treats it like any other secondary.
+/// A `no worse` whose interval also excludes 0 says which way (`, faster` or `, but slower`).
+pub fn compare_noworse(name: &str, def: &MetricDef, pairs: &[(f64, f64)], margin: f64, confidence: f64) -> Comparison {
+    let mut c = compare(name, def, pairs, margin, confidence);
+    let (_, d, relative) = diffs(def, pairs);
+    let margin_abs = if relative { margin } else { (margin * c.base.abs()).max(0.5) };
+    let label = fmt_bound(margin, relative, margin_abs);
+    let good_low = def.better == Better::Lower;
+    c.noworse = Some(margin_abs);
+    c.bound = margin_abs;
+    // Oriented so that larger is worse.
+    let (w_est, w_lo, w_hi) = if good_low { (c.estimate, c.lo, c.hi) } else { (-c.estimate, -c.hi, -c.lo) };
+    if c.exact {
+        let (verdict, p) = if w_est <= margin_abs { (format!("no worse (≤{label}) (exact)"), 0.0) } else { (format!("worse (>{label}) (exact)"), 0.0) };
+        c.verdict = verdict;
+        c.p = p;
+        c.decided = true;
+        return c;
+    }
+    let shift = margin_shift(def, relative, margin_abs);
+    c.p = wilcoxon_p(&d.iter().map(|x| x - shift).collect::<Vec<_>>());
+    let covered = c.confidence + 1e-9 >= confidence;
+    let n = d.len();
+    let (verdict, decided) = if n < 2 || !w_est.is_finite() || !covered {
+        ("unclear".to_string(), false)
+    } else if w_hi < margin_abs {
+        let tag = if w_hi < 0.0 {
+            format!(", {}", def.words.0)
+        } else if w_lo > 0.0 {
+            format!(", but {}", def.words.1)
+        } else {
+            String::new()
+        };
+        (format!("no worse (≤{label}{tag})"), true)
+    } else if w_lo > margin_abs {
+        (format!("worse (>{label})"), true)
+    } else {
+        ("unclear".to_string(), false)
+    };
+    c.verdict = verdict;
+    c.decided = decided;
+    c.needed_pairs = (!decided && n >= 2).then(|| {
+        let hw = (c.hi - c.lo) / 2.0;
+        let dist = (margin_abs - w_est).abs();
+        let estimate = if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize };
+        estimate.max(min_pairs(confidence))
+    });
+    c
+}
+
+/// `pairs_needed` for a non-inferiority comparison: the distance that decides is the one from the
+/// differences' median to the margin (`shift`, in the differences' scale), either way.
+pub fn pairs_needed_noworse(d: &[f64], shift: f64, confidence: f64) -> usize {
+    let v: Vec<f64> = d.iter().copied().filter(|x| x.is_finite()).collect();
+    if v.len() < 2 {
+        return usize::MAX;
+    }
+    let dist = (crate::metrics::median(&v) - shift).abs();
+    let sigma = robust_sd(&v);
+    if dist <= 0.0 {
+        return usize::MAX;
+    }
+    let z = normal_quantile(1.0 - (1.0 - confidence) / 2.0);
+    (((z * sigma / dist).powi(2) / 0.955).ceil() as usize).max(min_pairs(confidence))
+}
+
+/// A robust standard deviation: 1.4826 × the median absolute deviation from the median.
+pub fn robust_sd(v: &[f64]) -> f64 {
+    let med = crate::metrics::median(v);
+    1.4826 * crate::metrics::median(&v.iter().map(|x| (x - med).abs()).collect::<Vec<_>>())
+}
+
+/// Planning (SPEC §9.1 `plan`): pairs for a `power` chance that an interval at `confidence` clears a
+/// boundary `dist` away from the true difference, for per-pair differences with spread `sigma` (same
+/// scale). Normal approximation with the Hodges–Lehmann efficiency 0.955; at least 6 pairs.
+pub fn pairs_for(sigma: f64, dist: f64, confidence: f64, power: f64) -> f64 {
+    if dist <= 0.0 || !sigma.is_finite() {
+        return f64::INFINITY;
+    }
+    let z = normal_quantile(1.0 - (1.0 - confidence) / 2.0) + normal_quantile(power);
+    ((z * sigma / dist).powi(2) / 0.955).max(min_pairs(0.95) as f64)
+}
+
+/// The smallest distance from a boundary that `n` pairs clear with `power` (the minimum detectable effect).
+pub fn detectable(sigma: f64, n: usize, confidence: f64, power: f64) -> f64 {
+    let z = normal_quantile(1.0 - (1.0 - confidence) / 2.0) + normal_quantile(power);
+    z * sigma / (0.955 * n as f64).sqrt()
 }
 
 /// Compares paired block values of metric `name` (`def` is its definition, or its family's).
 /// `pairs` holds (base, head) per pair.
 pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, confidence: f64) -> Comparison {
-    let finite: Vec<(f64, f64)> = pairs.iter().copied().filter(|(a, b)| a.is_finite() && b.is_finite()).collect();
-    // Counts compare by difference: a zero on either side (no fetches, no shift) has no ratio.
-    let relative = def.kind != Kind::Exact && def.unit != "count" && def.unit != "score" && finite.iter().all(|(a, b)| *a > 0.0 && *b > 0.0);
-    let d: Vec<f64> = finite.iter().map(|(a, b)| if relative { (b / a).ln() } else { b - a }).collect();
+    let (finite, d, relative) = diffs(def, pairs);
     let base = crate::metrics::median(&finite.iter().map(|p| p.0).collect::<Vec<_>>());
     let head = crate::metrics::median(&finite.iter().map(|p| p.1).collect::<Vec<_>>());
     // An exact counter that is stable on both sides (every block the same, from 2 pairs) has no noise
@@ -245,6 +356,7 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
             decided: true,
             needed_pairs: None,
             exact: true,
+            noworse: None,
         };
     }
     let (est, lo, hi, achieved) = hodges_lehmann(&d, confidence);
@@ -275,7 +387,7 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
         let estimate = if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize };
         estimate.max(min_pairs(confidence))
     });
-    Comparison { metric: name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs, exact: false }
+    Comparison { metric: name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs, exact: false, noworse: None }
 }
 
 /// Pairs a verdict needs, projected from a robust spread of the differences so far (1.4826·MAD,

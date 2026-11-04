@@ -112,6 +112,9 @@ struct Series {
     launch: Value,
     /// The case's `timeout` (ms) for a run or reset, when it sets one.
     timeout: Option<u64>,
+    /// Non-inferiority margins by metric (`--noworse`, the case's `noworse`): these metrics answer "is
+    /// head at most this much worse?" instead of "did it change?" (SPEC §9.3).
+    noworse: BTreeMap<String, f64>,
 }
 
 impl Series {
@@ -1531,6 +1534,9 @@ pub fn pr_markdown(r: &Value) -> String {
         variant_name(&head),
     );
     out += &format!("```sh\n{}\n```\n", rerun_command(r, &base, &head));
+    if let Some(line) = super::open::pr_line(r) {
+        out += &format!("\n{line}");
+    }
     out
 }
 
@@ -3014,12 +3020,19 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
             if only_target.is_some_and(|t| t != target) || on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) {
                 continue;
             }
+            let primary = args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string());
+            // The case's margins, then `--noworse` over them (a bare margin is the primary's).
+            let mut noworse = margins(&c["noworse"], &primary).map_err(|e| Error::usage(format!("{case}: noworse: {e}")))?;
+            if let Some(flag) = args.get("noworse") {
+                noworse.extend(margins(&json!(flag), &primary).map_err(|e| Error::usage(format!("--noworse: {e}")))?);
+            }
             for p in &combos {
                 out.push(Series {
                     case: case.clone(),
                     target: target.clone(),
                     params: p.clone(),
-                    primary: args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string()),
+                    primary: primary.clone(),
+                    noworse: noworse.clone(),
                     metrics: c["metrics"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default(),
                     reset: c["reset"].as_bool().unwrap_or(false),
                     launch: c["launch"].clone(),
@@ -3027,6 +3040,44 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
                 });
             }
         }
+    }
+    Ok(out)
+}
+
+/// Non-inferiority margins as fractions by metric, from `"2%"` or `2` (the primary's), or
+/// `"main.work=2%,cpu.wakes=5%"`, or `{ "main.work": "2%" }`.
+fn margins(v: &Value, primary: &str) -> std::result::Result<BTreeMap<String, f64>, String> {
+    let pct = |v: &Value| -> std::result::Result<f64, String> {
+        let x = match v {
+            Value::Number(n) => n.as_f64().unwrap_or(f64::NAN),
+            Value::String(s) => s.trim().trim_end_matches('%').trim().parse::<f64>().map_err(|_| format!("not a margin: {s} (use a percentage such as 2%)"))?,
+            other => return Err(format!("not a margin: {other}")),
+        };
+        if !(0.0..100.0).contains(&x) {
+            return Err(format!("{x}% is not a margin from 0% up to (not including) 100%"));
+        }
+        Ok(x / 100.0)
+    };
+    let mut out = BTreeMap::new();
+    match v {
+        Value::Null => {}
+        Value::Object(o) => {
+            for (k, x) in o {
+                out.insert(k.clone(), pct(x)?);
+            }
+        }
+        Value::String(s) if s.contains('=') => {
+            for part in s.split(',').filter(|p| !p.trim().is_empty()) {
+                let (k, x) = part.split_once('=').ok_or_else(|| format!("{part}: use metric=margin"))?;
+                out.insert(k.trim().to_string(), pct(&json!(x.trim()))?);
+            }
+        }
+        other => {
+            out.insert(primary.to_string(), pct(other)?);
+        }
+    }
+    if let Some(unknown) = out.keys().find(|k| model::metric(k).is_none()) {
+        return Err(format!("{unknown} is not a metric strobe knows"));
     }
     Ok(out)
 }

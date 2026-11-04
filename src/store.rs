@@ -6,6 +6,8 @@ use serde_json::Value;
 use std::io::Write;
 use std::path::PathBuf;
 
+pub mod ledger;
+
 /// A short random-looking id: `<prefix>_` + 6 hex.
 pub fn new_id(prefix: &str) -> String {
     let seed = host::now_ns() ^ (std::process::id() as u64).rotate_left(32);
@@ -68,6 +70,11 @@ pub fn resolve(handle: &str) -> Result<PathBuf> {
 /// Whether a resolved handle is an experiment (bench or bisect) rather than a recording.
 pub fn is_experiment(dir: &std::path::Path) -> bool {
     dir.parent().is_some_and(|parent| parent == paths::experiments())
+}
+
+/// Every line of `experiments/index.jsonl`, oldest first; lines that do not parse are skipped.
+pub fn index() -> Vec<Value> {
+    std::fs::read_to_string(paths::experiments().join("index.jsonl")).map(|t| t.lines().filter_map(|l| serde_json::from_str(l).ok()).collect()).unwrap_or_default()
 }
 
 pub fn read_json(path: &std::path::Path) -> Result<Value> {

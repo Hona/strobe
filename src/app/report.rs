@@ -61,7 +61,7 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     write_whole(&out, &body)?;
     if args.has("open") {
-        open(&out);
+        open(&out.display().to_string());
     }
     let path = out.display().to_string();
     let size = super::fmt::bytes(body.len() as f64);
@@ -214,13 +214,13 @@ pub fn markdown(data: &Value) -> String {
     format!("```\n{}\n```\n", text.trim_end())
 }
 
-fn open(path: &std::path::Path) {
-    let p = path.display().to_string();
+/// Opens a file or a URL (without `&`: cmd's `start` would split it) with the desktop's handler.
+pub(super) fn open(p: &str) {
     let _ = if cfg!(windows) {
-        std::process::Command::new("cmd").args(["/c", "start", "", &p]).spawn()
+        std::process::Command::new("cmd").args(["/c", "start", "", p]).spawn()
     } else if cfg!(target_os = "macos") {
-        std::process::Command::new("open").arg(&p).spawn()
+        std::process::Command::new("open").arg(p).spawn()
     } else {
-        std::process::Command::new("xdg-open").arg(&p).spawn()
+        std::process::Command::new("xdg-open").arg(p).spawn()
     };
 }

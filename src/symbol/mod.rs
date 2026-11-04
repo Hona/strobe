@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::path::Path;
 
-const KERNEL: u64 = 0xFFFF_8000_0000_0000;
+pub const KERNEL: u64 = 0xFFFF_8000_0000_0000;
 
 pub fn read_deep(dir: &Path) -> Result<Option<Deep>> {
     let path = dir.join("deep.json.gz");
@@ -51,7 +51,7 @@ pub struct Native {
 type Named = (u32, u64, String, String, u32);
 
 /// One resolved address: its frames innermost first (inline frames expanded).
-type Resolved = Vec<(String, String, u32, String, bool)>;
+pub type Resolved = Vec<(String, String, u32, String, bool)>;
 
 /// Symbolizes a recording's native samples (cached beside them in `deep-symbols.json.gz`).
 /// `thread`: keep only threads whose name contains it (or whose id it is); `spans`: only samples
@@ -107,11 +107,12 @@ pub fn native(dir: &Path, thread: Option<&str>, spans: Option<&[(u64, u64)]>) ->
     Ok(Some(out))
 }
 
-fn addr_key(pid: u32, addr: u64, leaf: bool) -> String {
+pub fn addr_key(pid: u32, addr: u64, leaf: bool) -> String {
     format!("{}:{addr:x}:{}", if addr >= KERNEL { 0 } else { pid }, u8::from(leaf))
 }
 
-fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
+/// Every sampled address's frames, keyed by `addr_key` (cached in `deep-symbols.json.gz`).
+pub fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
     let cache = dir.join("deep-symbols.json.gz");
     if let Ok(f) = std::fs::File::open(&cache) {
         let mut text = String::new();

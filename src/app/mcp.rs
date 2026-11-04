@@ -254,12 +254,20 @@ fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
     if host != format!("127.0.0.1:{port}") && host != format!("localhost:{port}") {
         return http::Response::text(403, "bad host");
     }
+    // The daemon's own pages (the Perfetto UI fetches its fonts and wasm in CORS mode) may read it.
+    let same = |o: &str| o == format!("http://127.0.0.1:{port}") || o == format!("http://localhost:{port}");
     if let Some(origin) = req.headers.get("origin")
         && origin != "null"
+        && !(req.method == "GET" && same(origin))
     {
         return http::Response::text(403, "cross-origin requests are not allowed");
     }
     let path = req.path.split('?').next().unwrap_or("/").to_string();
+    if req.method == "GET"
+        && let Some(r) = super::open::serve(&req, port)
+    {
+        return r;
+    }
     if req.method == "GET" && path.starts_with("/report/") {
         let handle = path.trim_start_matches("/report/");
         return match report_html(handle) {

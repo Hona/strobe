@@ -5,6 +5,7 @@ pub mod bisect;
 pub mod fmt;
 pub mod helper;
 pub mod mcp;
+pub mod open;
 pub mod outside;
 pub mod query;
 pub mod record;
@@ -78,6 +79,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "bench" => bench::run(args),
         "query" => query::run(args),
         "report" => report::run(args),
+        "open" => open::run(args),
         "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),

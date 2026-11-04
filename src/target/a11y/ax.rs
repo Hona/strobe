@@ -575,7 +575,12 @@ impl Worker {
                 if open { run("AXShowMenu", "ExpandCollapse") } else { run("AXCancel", "ExpandCollapse") }
             }
             Action::Select => {
-                if settable("AXSelected") {
+                // A radio button is chosen by pressing it: AXSelected is for items in lists, tables and
+                // tab groups, and a toolkit may take the write and do nothing with it.
+                let radio = copy(el, "AXRole").and_then(|r| cf_string(r.0)).is_some_and(|r| r == "AXRadioButton");
+                if radio {
+                    run("AXPress", "SelectionItem")
+                } else if settable("AXSelected") {
                     set("AXSelected", unsafe { kCFBooleanTrue })
                 } else {
                     run("AXPick", "SelectionItem").or_else(|_| run("AXPress", "SelectionItem"))

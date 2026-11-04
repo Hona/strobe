@@ -516,7 +516,13 @@ impl Worker {
         unsafe { AXUIElementGetPid(at.0, &mut pid) };
         let role = copy(at.0, "AXRole").and_then(|v| cf_string(v.0)).unwrap_or_default();
         let title = copy(at.0, "AXTitle").and_then(|v| cf_string(v.0)).unwrap_or_default();
-        Ok(Err(format!("{} {title:?} (process {pid})", role.trim_start_matches("AX").to_lowercase())))
+        let id = copy(at.0, "AXIdentifier").and_then(|v| cf_string(v.0)).filter(|s| !s.is_empty()).map(|s| format!(" (key {s:?})")).unwrap_or_default();
+        let what = format!("{} {title:?}{id}", role.trim_start_matches("AX").to_lowercase());
+        Ok(Err(if self.pids.contains(&(pid as u32)) {
+            format!("{what} of the app itself, such as a dialog or an overlay it shows over the element")
+        } else {
+            format!("{what} of process {pid}")
+        }))
     }
 
     fn act(&self, i: usize, action: &Action) -> Result<u64> {

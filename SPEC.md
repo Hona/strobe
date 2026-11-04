@@ -1646,6 +1646,7 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
 - `env`, `unset` (exact names or `PREFIX*`, any case on Windows), `dirs` and `files` (JSON or text; a
   string that is exactly `{port}` becomes a number) shape the copy; `args` are extra command-line
   arguments. `window: false`: the app opens no window (a tray app); `record app:<id>` waits for none.
+  `moved`: the user's folders the profile's `env` moves into the home (macOS Library rule, below).
 - **Seeds** (`home` seed folders, copied into each fresh home): a file of 64 MB or more (a model) is
   shared, not copied. strobe keeps one read-only copy per seed version in `<state>/seeds` and
   hard-links it into each home, so a launch writes nothing that size again: a fresh copy per block
@@ -1677,6 +1678,12 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   with its own bundle id, or an app this account never ran. It records which may appear and removes
   them, and the preferences domain, when the home is released. Anything else refuses `LiveChannel`
   with the folder it found. Sandboxed apps (their container is in the user's Library) are refused.
+  A bare executable's `Application Support/<name>` is the app's own convention, not Cocoa's: an app
+  that reads its data folder from an environment variable names it in the profile's `moved`
+  (`"moved": ["~/Library/Application Support/my-app"]`, with `env` pointing it into the home), and
+  strobe neither counts nor removes it; the profile's `guard` files there catch a copy that wrote
+  to it anyway. A source build launched as a bare executable then runs beside the user's installed
+  app (whose bundle keeps its own id and Preferences).
 - **Linux**: `HOME` and `XDG_*` cover what freedesktop apps store. The user's session bus is shared
   (an app that registers a unique bus name, as a single-instance GApplication does, hands off to a
   running copy: `LiveChannel` catches its executable running), and `dconf` writes through the user's

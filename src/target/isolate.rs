@@ -27,6 +27,10 @@ pub struct App {
     guards: Vec<GuardSpec>,
     protocols: Vec<String>,
     args: Vec<String>,
+    /// Folders of the user's whose data the profile's `env` moves into the home (`moved`), so the
+    /// macOS Library rule does not count them; the profile's `guard` watches them instead.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    moved: Vec<PathBuf>,
     /// The profile says `window: false`: the app opens no window (a tray app, a service).
     pub windowless: bool,
 }
@@ -114,6 +118,8 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         let file = expand(file).map_err(|e| Error::usage(format!("app profile \"{id}\" guard: {}", e.message)))?;
         guards.push(GuardSpec { file, pid: g["pid"].as_str().map(str::to_string), url: g["url"].as_str().map(str::to_string) });
     }
+    let moved: Vec<String> = strings("moved");
+    let moved = moved.iter().map(|m| expand(m).map_err(|e| Error::usage(format!("app profile \"{id}\" moved: {}", e.message)))).collect::<Result<Vec<_>>>()?;
     let kind = p["kind"].as_str().unwrap_or("electron").to_string();
     if kind != "electron" && kind != "native" {
         return Err(Error::usage(format!("app profile \"{id}\": kind is electron or native, not {kind}")));
@@ -129,6 +135,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         guards,
         protocols: strings("protocols"),
         args: strings("args"),
+        moved,
         windowless: p["window"] == false,
     })
 }
@@ -751,6 +758,9 @@ mod macos_library {
         if let Some(n) = name {
             p.push(lib.join(format!("Application Support/{n}")));
         }
+        // A folder the profile's env moves into the home (an app that reads its data folder from an
+        // environment variable) is the app's own choice, not Cocoa's: its guards watch it.
+        p.retain(|place| !app.moved.iter().any(|m| m == place));
         (id, p)
     }
 

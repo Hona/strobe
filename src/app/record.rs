@@ -250,9 +250,13 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     if set == Set::Memory {
         return Err(Error::usage("--probes memory follows a JS heap; a native app has none"));
     }
+    // `--until-line`: start when the app prints a matching line, not after a fixed settle; `--stop-line`:
+    // end at one (`--for` caps it then).
+    let line = |k: &str| args.get(k).map(|r| regex_lite::Regex::new(r).map_err(|e| Error::usage(format!("--{k}: {e}")))).transpose();
+    let (until, stop) = (line("until-line")?, line("stop-line")?);
     let home = isolate::prepare_home(app, args.get("home").map(std::path::Path::new), None)?;
     progress(format!("launching {} in an isolated home", app.exe.display()));
-    let (mut n, guard) = match nt::launch(app, &home, &[], false, None) {
+    let (mut n, guard) = match nt::launch(app, &home, &[], until.is_some() || stop.is_some(), None) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home.dir);
@@ -270,8 +274,14 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             n.place(&Window::default(), false);
             guard.check("after the app opened its window")?;
         }
-        // The app loads itself; give it time to settle before recording.
-        std::thread::sleep(Duration::from_secs(3));
+        // The app loads itself; give it time to settle before recording, or wait for the line that says it is ready.
+        match &until {
+            Some(re) => {
+                let l = wait_line(&n, re, Duration::from_secs(120))?;
+                progress(format!("start: {}", l.trim()));
+            }
+            None => std::thread::sleep(Duration::from_secs(3)),
+        }
         if !windowless {
             n.check_visible()?;
             if host::session_locked() {
@@ -291,12 +301,26 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         });
         let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
-        progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
+        progress(match &stop {
+            Some(re) => format!("recording {id} until the app prints a line matching {re}"),
+            None => format!("recording {id} for {}", fmt::ms_duration(for_ms)),
+        });
         let snap0 = wakes::Snapshot::take(&n.pids());
         let c0 = cycles();
         let t0 = host::now_ns();
-        std::thread::sleep(Duration::from_millis(for_ms));
+        match &stop {
+            Some(re) => {
+                let cap = if args.get("for").is_some() { Duration::from_millis(for_ms) } else { Duration::from_secs(600) };
+                match wait_line(&n, re, cap) {
+                    Ok(l) => progress(format!("stop: {}", l.trim())),
+                    Err(e) if e.code == 124 => progress(format!("stop: no line matched in {} (the cap)", fmt::ms_duration(cap.as_millis() as u64))),
+                    Err(e) => return Err(e),
+                }
+            }
+            None => std::thread::sleep(Duration::from_millis(for_ms)),
+        }
         let t1 = host::now_ns();
+        let for_ms = (t1 - t0) / 1_000_000;
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
         let os = sampler.stop().window(t0, t1);
@@ -393,6 +417,23 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     guard.check("after the app closed")?;
     let meta = result?;
     Ok(Output::new(summary_text(&meta), meta))
+}
+
+/// The first line of the app's output (stdout and stderr) matching `re`, within `timeout`.
+fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout: Duration) -> Result<String> {
+    let rx = n.output.as_ref().ok_or_else(|| Error::msg("the app's output is not being read"))?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return Err(Error { code: 124, message: format!("no line of the app's output matched {re} in {} s", timeout.as_secs()), hint: Some("check the pattern against what the app prints (stdout and stderr)".into()) });
+        }
+        match rx.recv_timeout(left) {
+            Ok((_, line)) if re.is_match(&line) => return Ok(line),
+            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Error::msg(format!("the app's output ended before a line matched {re}"))),
+        }
+    }
 }
 
 /// `--probes memory`: does the target keep what it allocates? A census and a heap snapshot at the

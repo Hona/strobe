@@ -286,6 +286,17 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 - A native app (`app:<id>` with a native profile, or `exe:<path> --native`) records one run from
   outside after a 3 s settle: CPU, thread wakes, IO, GPU, memory, the UI thread (`ui.cpu`,
   `ui.wakes`) and OS present events (§13.7). `--probes attribution` adds native stacks (§13.4).
+  `--until-line <regex>` starts the recording when the app prints a matching line (stdout or stderr)
+  instead of after the fixed settle, within 120 s; `--stop-line <regex>` ends it at one (`--for`
+  caps it, else 10 minutes). A program that prints its states (`device released`) records each state
+  without sleeps in the program or a script polling its output.
+- `strobe run [--pin …] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]` runs an
+  ad-hoc harness under a bench block's conditions: it takes the device's bench slot (so it never
+  overlaps a timed block), switches to the fastest power plan, pins the command to the target's CPUs
+  (`--pin auto`: the V-Cache CCD) and keeps this user's other processes off them (Windows, §9.4),
+  and puts everything back when it exits; its exit code is strobe's. It measures nothing itself: the
+  harness prints its own numbers. A harness timed the same build at 190 ms and 250–330 ms an hour
+  later while other agents kept 60% of the CPUs busy; strobe's reservation covered only its benches.
 
 ### 5.6 `strobe bench`
 

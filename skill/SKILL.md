@@ -28,6 +28,8 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         a..b works with heap and memory; exp_… takes summary, progress and insights; --reveal shows heap strings
     strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body,
         printed to stdout (the file's path on stderr)
+    strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]   a native app from the line it prints when ready (to the next line), not a fixed settle
+    strobe run [--pin auto] [--reserve-cpus on|off] -- <command>   your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.

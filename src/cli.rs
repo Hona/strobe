@@ -42,6 +42,12 @@ impl Args {
         let mut flags = HashMap::new();
         let mut iter = raw.into_iter().peekable();
         while let Some(arg) = iter.next() {
+            // `--` ends strobe's flags: the rest is a command line of its own (`strobe run -- …`).
+            if arg == "--" {
+                pos.push(arg);
+                pos.extend(iter.by_ref());
+                break;
+            }
             let name = match arg.as_str() {
                 "-h" => Some("help".to_string()),
                 "-V" => Some("version".to_string()),
@@ -150,6 +156,9 @@ Use
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
                                   (md and pr print the markdown; the file's path goes to stderr)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
+  run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
+                                  run your own harness as a bench block runs: the bench slot, the fastest power plan,
+                                  pinned to the target's CPUs with other processes kept off them; it prints its own numbers
 
 Setup
   up [--skip deep,daemon,mcp,calibrate]  install, download the engine, deep mode (one UAC prompt), start the daemon,

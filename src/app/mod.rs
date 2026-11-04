@@ -9,6 +9,7 @@ pub mod outside;
 pub mod query;
 pub mod record;
 pub mod report;
+pub mod run;
 pub mod status;
 pub mod top;
 pub mod up;
@@ -74,6 +75,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "bench" => bench::run(args),
         "query" => query::run(args),
         "report" => report::run(args),
+        "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),
         "up" => up::run(args),

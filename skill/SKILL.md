@@ -121,3 +121,4 @@ label them as noisy discovery evidence, or leave them out.
 - Heap snapshots and traces can hold user content; views redact strings unless `--reveal`.
 - Long benches keep running in the daemon: `query exp_… progress`.
 - If `strobe` isn't on PATH, use the CLI path from the MCP instructions.
+- Linux and macOS: no OS present events (frames from outside are refused; a toolkit's own present times still count). macOS counts wakes per process, IO as disk bytes, no VRAM per process, and samples stacks with `/usr/bin/sample` (untimed). Linux native stacks need `perf_event_paranoid` ≤ 2 or CAP_PERFMON; `status` says which. A macOS Cocoa app launches isolated only while its `~/Library` data does not exist (`LiveChannel` names the folder).

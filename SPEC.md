@@ -378,7 +378,8 @@ One monotonic timeline per recording.
 - Chromium: trace timestamps (base::TimeTicks). strobe calls `Tracing.recordClockSyncMarker`
   at start and end and records the OS monotonic time of each call.
 - OS, GPU and helper samples: `QueryPerformanceCounter` (Windows), `CLOCK_MONOTONIC` (Linux),
-  `mach_continuous_time` (macOS).
+  `mach_absolute_time` (macOS: the clock Metal's presented times, CoreAnimation and CVDisplayLink
+  report in; it stops while the machine sleeps, which no valid run spans).
 - strobe's own trace packets carry a `ClockSnapshot` that maps its clock to the trace clock.
 - A recording whose sync markers disagree by more than 1 ms with the mapped OS clock fails
   `ClockUnsynced` (§10.1).
@@ -827,10 +828,10 @@ flowchart LR
 | Control | Windows | Linux | macOS |
 |---|---|---|---|
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
-| power plan: the fastest the device offers for every bench and timed recording (`--power high`, the default), the user's own back after it, also after a crash or kill; `--power keep` opts out; on battery the plan is kept. Either way the context notes say so | the active vendor's High performance scheme (AMD Ryzen Balanced → AMD Ryzen High Performance), else Windows' High performance, else Ultimate performance, else on a Balanced-only device Windows 11's Best performance power mode (`powercfg /setactive`, powrprof `PowerSetActiveOverlayScheme`); the scheme and power mode to restore are journaled in `<state>/power.json` first, and any strobe that starts restores a journal whose strobe is gone | governor read only; analyser | read only |
+| power plan: the fastest the device offers for every bench and timed recording (`--power high`, the default), the user's own back after it, also after a crash or kill; `--power keep` opts out; on battery the plan is kept. Either way the context notes say so | the active vendor's High performance scheme (AMD Ryzen Balanced → AMD Ryzen High Performance), else Windows' High performance, else Ultimate performance, else on a Balanced-only device Windows 11's Best performance power mode (`powercfg /setactive`, powrprof `PowerSetActiveOverlayScheme`); the scheme and power mode to restore are journaled in `<state>/power.json` first, and any strobe that starts restores a journal whose strobe is gone | the `performance` cpufreq governor on every policy, journaled and restored the same way; it needs root, so an unprivileged strobe keeps the governor and says why | nothing to switch: the env line shows Low Power Mode and a thermal state above nominal |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
-| window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | `visibilityState` | `visibilityState` |
-| throttling | frequency below the expected range (PDH % of maximum frequency) | cpufreq | analyser only |
+| window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | X11 map state, `_NET_WM_STATE_HIDDEN`, coverage by windows above it; `visibilityState` | `kCGWindowIsOnscreen`, coverage by other apps' windows in front; `visibilityState` |
+| throttling | frequency below the expected range (PDH % of maximum frequency) | `cpuinfo_avg_freq` where the kernel has it | thermal state in the env line; analyser only |
 | battery | `GetSystemPowerStatus` | `/sys/class/power_supply` | IOKit |
 
 strobe pins the target itself, so High performance's unparked cores cost it nothing: an X3D CCD's
@@ -1521,7 +1522,21 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   and exits 1: an isolation gap in the profile. Never measure past disturbed user state.
 - **`protocols`**: URL schemes the app registers on start live in the per-user registry
   (`HKCU\Software\Classes`), which no environment variable redirects. Strobe exports each key
-  into the home before launch and restores it (or deletes it, if it was absent) on close.
+  into the home before launch and restores it (or deletes it, if it was absent) on close (Windows).
+- **macOS: `HOME` does not move an app's Library.** Cocoa resolves the home from the user's account,
+  never `HOME` (`NSHomeDirectory`, Application Support, caches, saved window state: checked on macOS
+  27), and `cfprefsd` writes preferences for the user. An app that only reads `HOME` (most CLI, Rust
+  and Node apps) is isolated as elsewhere; a Cocoa app's copy would write into the user's own
+  `~/Library` folders for its bundle id. So strobe launches such an app only while none of them exist
+  (`Preferences/<id>.plist`, `Application Support/<id>` and `/<name>`, `Caches/<id>`, `Saved
+  Application State/<id>.savedState`, `HTTPStorages`, `WebKit`, `Cookies`, `Containers/<id>`): a build
+  with its own bundle id, or an app this account never ran. It records which may appear and removes
+  them, and the preferences domain, when the home is released. Anything else refuses `LiveChannel`
+  with the folder it found. Sandboxed apps (their container is in the user's Library) are refused.
+- **Linux**: `HOME` and `XDG_*` cover what freedesktop apps store. The user's session bus is shared
+  (an app that registers a unique bus name, as a single-instance GApplication does, hands off to a
+  running copy: `LiveChannel` catches its executable running), and `dconf` writes through the user's
+  running service.
 - `extends` merges a parent profile (objects merge per key).
 - `app:<id>` launches a profile; `exe:<path>` with a profile (`exe(path, { app })` in a bench,
   `--app <id>` on `record`) launches another build of the same app, such as a source build packed
@@ -1575,6 +1590,22 @@ strobe launches an isolated copy (§13.2). `cdp:<port>` attaches to any running 
 - Linux: one sudo installs a root-owned helper with `cap_perfmon` and `cap_sys_ptrace`.
 - macOS: no deep mode in v1.
 
+As built (Linux and macOS): no helper process. Native stacks run in strobe's own process (§13.6):
+
+- **Linux**: `perf_event_open` for the user's own processes, which the kernel allows at
+  `perf_event_paranoid` ≤ 2 (the upstream default) or with CAP_PERFMON; kernel frames need ≤ 1 or
+  CAP_PERFMON. Debian and Ubuntu ship 3: `status` names the one-time step (`sudo sysctl
+  kernel.perf_event_paranoid=2`, or `sudo setcap cap_perfmon+ep` on strobe's binary); strobe never
+  prompts for it. Each thread's ring buffer is mapped; without CAP_IPC_LOCK the per-user
+  `perf_event_mlock_kb` budget may force small buffers, and the kernel's lost-sample records go to
+  `events_lost`. An inherited event cannot be mapped, so new threads are found every 50 ms instead.
+- **macOS**: the only sampler a user may run on their own processes without root or an entitlement
+  is `/usr/bin/sample` (reading another task's threads takes a task port, which `task_for_pid` gives
+  only to root, to entitled debuggers, and with Developer Mode enabled). Its samples are wall-clock
+  stack snapshots of every thread (system call leaves dropped and counted), with no times; a bench's
+  attribution block keeps them all, warmup included, and says so. Hardened and system apps cannot be
+  sampled at all.
+
 As built (Windows):
 
 - **Who runs which session.** Present events (DXGI, DxgKrnl, Win32k and Dwm-Core providers) need
@@ -1624,21 +1655,31 @@ As built (Windows):
 
 ### 13.6 Outside-in (any process)
 
+As built on each OS (2026-11-04). Every cell reads an OS API or a file; samplers never spawn. "Refused"
+means the metric is not printed and the refusal says why (rule 1), never 0.
+
 | Signal | Windows | Linux | macOS |
 |---|---|---|---|
-| process CPU, memory | `QueryProcessCycleTime` over the TSC for `cpu.app.total` per run (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between); `NtQuerySystemInformation`, PDH Process | `/proc/<pid>/stat`, `smaps_rollup` | `proc_pid_rusage`, `task_info` |
-| threads | `NtQuerySystemInformation`: context switches per thread (`cpu.wakes`); names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/*` | `proc_pidinfo` |
-| per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | `/proc/stat`, cpufreq | `host_processor_info` |
-| topology | `GetLogicalProcessorInformationEx` (L3 per CCD) | sysfs cache | `sysctl hw.perflevel*` |
-| GPU engines per process | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM fdinfo | IOReport (spike) |
-| VRAM per process | D3DKMT committed bytes in dedicated and shared segments (PDH `Dedicated Usage` also counts allocations opened from other processes) | DRM fdinfo | — |
-| device clocks, power, PCIe | NVML, ADLX | NVML, sysfs | IOReport (spike) |
-| displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow` | DRM / XRandR (spike) | CGDisplay |
-| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | — | — |
-| native stacks | ETW sampled profile through the helper (§13.4) | perf (planned) | — |
-| adapter per window | D3DKMT + DXGI | — | Metal |
-| IO | `NtQuerySystemInformation` transfer counts (the snapshot threads come from) | `/proc/<pid>/io` | `proc_pid_rusage` |
-| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | — | — |
+| process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the TSC (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
+| process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
+| threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`), no wakes: macOS keeps no per-thread count a user can read |
+| per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
+| topology, pinning | `GetLogicalProcessorInformationEx` (L3 per CCD); process affinity | sysfs cache (`index*/level` 3, `shared_cpu_list`); `sched_setaffinity` on every thread of strobe, inherited by children | no L3 groups (Apple Silicon); P and E cores named in the CPU line (`hw.perflevel*`); no affinity API: unpinned |
+| GPU engines per process (`gpu.process.3d`) | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM client statistics (`/proc/<pid>/fdinfo` of each `/dev/dri` file: `drm-engine-*` busy ns, engines mapped to Windows' types: gfx/render → 3D); a process with a GPU device open but no statistics (NVIDIA's proprietary driver, virtual GPUs) is unreadable, not 0 | IORegistry: each GPU client (`IOAccelerator` child) has its creator pid and `AppUsage.accumulatedGPUTime`; no permission. One engine: 3D |
+| VRAM per process (`gpu.vram`) | D3DKMT committed bytes in dedicated and shared segments (PDH `Dedicated Usage` also counts allocations opened from other processes) | DRM `drm-resident-*` (else `drm-total-*`, `drm-memory-*`): vram/local dedicated, gtt/system shared | refused: unified memory, a process's GPU allocations are in its footprint |
+| device counters | NVML, ADLX | amdgpu sysfs (`gpu_busy_percent`, `mem_busy_percent`, VRAM used and total); NVML not built | accelerator `PerformanceStatistics` (`Device Utilization %`, `In use system memory`) |
+| displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow`, `QueryDisplayConfig` | DRM mode setting (`DRM_IOCTL_MODE_GETCRTC`: pixel clock over the mode's totals, the CRTC holding the window's centre); virtual GPU drivers (virtio, bochs, qxl, simpledrm, …) are named virtual | `CGGetDisplaysWithRect`, `CGDisplayModeGetRefreshRate`, `CGDisplayIsBuiltin` |
+| session locked, display asleep | WTS session flags; console display state callback | logind `LockedHint` of the user's display session (system bus, one connection kept); display state not known | `CGSessionCopyCurrentDictionary` (`CGSSessionScreenIsLocked`); `CGDisplayIsAsleep`, polled every 500 ms |
+| keep awake while benching | `SetThreadExecutionState` | not built (logind's inhibitor needs file-descriptor passing) | IOKit power assertions (`PreventUserIdleSystemSleep`, `PreventUserIdleDisplaySleep`) |
+| power plan for the run | §9.4 | the `performance` cpufreq governor on every policy when strobe may write it (root), journaled and restored; else kept with the reason | none to switch: Low Power Mode and the thermal state are reported |
+| battery, virtual machine | `GetSystemPowerStatus`; firmware strings | `/sys/class/power_supply`; the CPU's `hypervisor` flag and DMI strings | `IOPSGetProvidingPowerSourceType`; `kern.hv_vmm_present` |
+| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | refused (`NoPresentSource`): no unprivileged outside view of another app's presents. DRM vblank and flip tracepoints need root tracing and name no process; X11 Present and Wayland `presentation-time` report only to the app itself. A toolkit that reports its own present times still gets frame metrics | refused (`NoPresentSource`): WindowServer's frame timing is only visible to root tracing (ktrace) or Instruments (Xcode); a toolkit that reports Metal's `presentedTime` still gets frame metrics |
+| native stacks (§13.4) | ETW sampled profile through the helper, 200 µs | in-process `perf_event_open`: per-thread `cpu-clock` at 1 ms (on-CPU samples), user registers and 16 KB of user stack per sample unwound with the modules' DWARF CFI (`framehop`), kernel frames from the kernel's callchain when allowed; threads that start later are found every 50 ms. Needs `perf_event_paranoid` ≤ 2 (Debian ships 3) or CAP_PERFMON | `/usr/bin/sample` per process at 1 ms (task suspension, every thread's user stack; samples whose leaf is a system call trap are dropped and counted; untimed: they cover the whole capture) |
+| symbols (§12.2) | PDBs (local, Microsoft's server, `symbols.servers`) | DWARF of the module, its build-id file under `/usr/lib/debug`, or `.gnu_debuglink`; symbol tables (sized); `/proc/kallsyms` | DWARF of a dSYM beside the module or in strobe's cache, made with `dsymutil` from the objects a build left; else the names and `file:line` `sample` printed |
+| adapter per window | D3DKMT + DXGI | — | — |
+| IO (`io.read`, `io.write`) | `NtQuerySystemInformation` transfer counts (every byte read and written, cached or not) | `/proc/<pid>/io` `rchar`/`wchar` (the same) | disk bytes only (`ri_diskio_bytesread`/`written`): macOS counts no cached IO per process |
+| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING`, `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it |
+| window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
 
 ### 13.7 Native apps
 
@@ -1838,7 +1879,8 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - `@hona/strobe`: the `strobe` command and the bench SDK, one npm package so a project pins one
   strobe for its people, agents and CI (`bun add -d @hona/strobe`, then `bunx strobe bench …`).
   - **The command:** `bin/strobe.js` runs the binary from `@hona/strobe-<platform>-<arch>`, an
-    optional dependency, so each machine installs only its own (win32-x64 so far).
+    optional dependency, so each machine installs only its own: win32-x64, darwin-arm64, darwin-x64,
+    linux-x64 and linux-arm64 (Linux builds are static musl binaries, for glibc and musl alike).
     `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
     install folder (§5.3), so the daemon never runs from a project's `node_modules`.
   - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native`, `headless` and the types of bench
@@ -1867,7 +1909,13 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - Bun's WebKit inspector: sampling profiler and heap through it.
 - The self-hosted Perfetto UI against a local trace_processor on a port other than its default.
 - Solid's dev hook names for `@hona/strobe-web/solid`.
-- macOS per-process GPU (IOReport); Linux refresh rate under Wayland.
+- macOS: whether `AppUsage.accumulatedGPUTime` is ns on every GPU generation (checked against
+  `Device Utilization %` on an M4); per-core frequency from IOReport; a sampler with timestamps (a
+  task port needs Developer Mode or root).
+- Linux: refresh of a native Wayland window's output (DRM gives every output's, not which one a
+  Wayland window is on); NVML for NVIDIA's proprietary driver; frames on screen for a process.
+- Accessibility drivers on macOS (AX) and Linux (AT-SPI over the session bus) for the native `page`
+  driver, once the Windows UI Automation driver's interface lands.
 - Each embedding app's product decisions for the bridge: where the toggle lives, who can turn it
   on, the indicator.
 
@@ -1906,10 +1954,10 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
 | 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe` on npm (CLI and types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
-| 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | Linux and macOS samplers; report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
+| 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
-| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled`; OS present events joined to the toolkit's frames, native stacks in attribution blocks (phase 6 row) | `scroll.latency.*` for native apps (rows carry no input kind); Linux and macOS windows and threads |
-| 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, Linux perf, symbols.electronjs.org |
+| native | native targets (§13.7): `native()` and `headless()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, window placement and checks, window-condition launches; the native bridge server, its `page` driver, `ui.*` and `count.*` from run records, `frames.json`, selector launches; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch`, `NoDisplayForBudget`, `ClockUnsynced` (bridge hello), `UnpacedSpin`, `NoPresentSource`, native `DevBuild`, `SoftwareGpu`, `Throttled`; OS present events joined to the toolkit's frames, native stacks in attribution blocks (phase 6 row) | `scroll.latency.*` for native apps (rows carry no input kind); accessibility drivers on Linux and macOS |
+| 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
 | 7 | — | CI budgets, history, mesh |
 
 Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;
@@ -1921,8 +1969,15 @@ its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `
 `VirtualMachine` (firmware strings), plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:
 `Throttling`, `CounterUnstable`, `ProbeOverhead`, `Outliers`, `CensusContaminated`.
 
-Off Windows the process and GPU samplers are stubs: process CPU is reported as unknown (never 0%),
-and nothing else from them is emitted.
+Linux and macOS (2026-11-04): the host layer, OS and GPU samplers, wakes, IO, displays, lock state,
+X11 and CoreGraphics windows, power plans, native stacks and DWARF symbols as §13.6 lists them, with
+what each OS refuses; isolated launches with macOS's Library rule (§13.2); npm packages and release
+builds for darwin-arm64, darwin-x64, linux-x64 and linux-arm64 (static musl), and a check workflow
+that builds and lints all three OSes on every push. Checked on an M4 MacBook Air (macOS 27) and a
+Debian 13 VM (2 vCPU, Xvfb, llvmpipe): `status`, a `script()` bench `--check`, an outside-in record,
+per-thread wakes, a native X11 app record, Chromium refused on llvmpipe (`SoftwareGpu`), and native
+stacks of a planted hot loop (ranked first at its line, 99.8%, DWARF-unwound stacks). Not built:
+accessibility drivers on macOS and Linux, OS present events (refused on both), macOS sample times.
 
 ### 24.2 Where the code differs from the design
 

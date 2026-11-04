@@ -634,7 +634,7 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
         let r = main.send("Profiler.stop", json!({}), None)?;
         store::write_json(&dir.join("cpu-main.cpuprofile"), &r["profile"])?;
     }
-    let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
+    let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&ctx.config["build"]["output"]))).map(|(r, d)| r.join(d));
     probe::symbols::store_maps(page, &scripts, &dir, served.as_deref())?;
     store::write_json(
         &dir.join("meta.json"),

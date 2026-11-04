@@ -1980,7 +1980,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             // The page's source maps, kept with the recording while its server still runs, so any view
             // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
             // `build.output`) turns original sources into files on disk.
-            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(ctx.config["build"]["output"].as_str())).map(|(r, d)| r.join(d));
+            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&ctx.config["build"]["output"]))).map(|(r, d)| r.join(d));
             let mut scripts = std::collections::BTreeSet::new();
             for (profile, allocs) in &segments {
                 probe::symbols::urls(profile, &mut scripts);
@@ -2609,7 +2609,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
         }
         let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
         overlay_harness(v, &root, h)?;
-        let output = build["output"].as_str().ok_or_else(|| Error::usage("a native target's build in strobe.json needs output: the executable it builds"))?;
+        let output = crate::target::isolate::per_os(&build["output"]).ok_or_else(|| Error::usage(format!("a native target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
         let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
         let built = root.join(cache_fill(output, &root));
         let exe = dest.join(built.file_name().ok_or_else(|| Error::usage(format!("build output {output} is not a file")))?);
@@ -2673,7 +2673,7 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
     let cwd = root.join(build["cwd"].as_str().unwrap_or("."));
     let key = build_key(root, build);
     let marker = host::paths::sub("builds").join(format!("{}.key", hash_str(&root.to_string_lossy())));
-    let output = build["output"].as_str().map(|o| root.join(cache_fill(o, root)));
+    let output = crate::target::isolate::per_os(&build["output"]).map(|o| root.join(cache_fill(o, root)));
     let ready = match copy {
         Some((_, dest)) => dest.exists(),
         None => output.as_ref().is_none_or(|o| o.exists()),

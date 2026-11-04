@@ -965,7 +965,9 @@ it, for app profiles they use from anywhere; `apps` merge per app.
 - `app:<id>` and `exe:<path>` need no build.
 - `build` and `serve` are what a `web()` target runs for each variant; `serve` gets a free port
   per variant. A `native(appId)` target from a directory or git ref runs `build` and launches its
-  `output`, the executable (§13.7).
+  `output`, the executable (§13.7). Like a profile's `exe`, `output` is one path or one per OS
+  (`{ "windows": "{cache}/cargo-target/release/my-app.exe", "macos": "{cache}/cargo-target/release/my-app" }`):
+  a Cargo build names `my-app.exe` only on Windows.
 - **`{cache}`** in `build.command`, `build.output` and `build.env` is a folder that outlives builds
   and is shared by every worktree of the repository (`<state>/builds/cache/<repo>`), so base and head
   reuse each other's dependency builds: `"CARGO_TARGET_DIR": "{cache}/cargo-target"`. Since both
@@ -1068,6 +1070,11 @@ export default bench({
   its own server, so mock the API under `new URL(url).origin`. Playwright stays connected for the
   whole block, so routes and init scripts keep working. What `prepare` returns is
   `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
+- On app and exe targets, `setup`, `run`, `reset` and `teardown` also get `ctx.home` (the launch's
+  private home), `ctx.env` (the environment it launched with) and `ctx.exe` (the variant's
+  executable), the same as a launch's `before`. A bench drives the copy through the app's own CLI
+  or files with them, where no driver reaches: an OS without an accessibility driver yet, or a
+  state only the app's CLI sets. Never the user's own app: those name only the isolated copy.
 - `teardown(ctx)`: on a target (with `prepare`'s context) and on the file (with the run
   context), when the block closes and while the browser is still open, for what `prepare` started.
   In a launch case it runs after the app has closed and before its home is removed, so it can stop

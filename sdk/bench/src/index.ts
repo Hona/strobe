@@ -81,6 +81,12 @@ export interface Context<P> {
   url: string
   /** The variant's folder: a git ref's worktree, or the directory it names. */
   root: string
+  /** App and exe targets: the private home the app runs in; null for web targets. Drive the app through its own files or CLI there (`Bun.spawn([ctx.exe, …], { env: ctx.env })`), never the user's. */
+  home: string | null
+  /** App and exe targets: the whole environment the app was launched with. */
+  env: Record<string, string> | null
+  /** App and exe targets: the executable this variant runs. */
+  exe: string | null
   /** What the target's `prepare` returned for this block. */
   prepared: any
 }

@@ -76,6 +76,9 @@ const context = () => ({
   variant: state.variant,
   url: state.url,
   root: state.root,
+  home: state.home,
+  env: state.env,
+  exe: state.exe,
   prepared: state.prepared,
   async phase<T>(name: string, fn: () => T | Promise<T>) {
     await request("phase", { name, edge: "start" })

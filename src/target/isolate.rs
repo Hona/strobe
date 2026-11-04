@@ -62,6 +62,26 @@ impl App {
     }
 }
 
+/// This OS's key in a per-OS value (`exe`, a build's `output`).
+pub fn os() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+/// A path for every OS, or one per OS (`{ "windows": …, "macos": …, "linux": … }`): this OS's.
+pub fn per_os(v: &Value) -> Option<&str> {
+    match v {
+        Value::String(s) => Some(s),
+        Value::Object(m) => m.get(os()).and_then(Value::as_str),
+        _ => None,
+    }
+}
+
 /// The app profile `id` from `config["apps"]`, following `extends`.
 pub fn app(id: &str, config: &Value) -> Result<App> {
     let apps = config["apps"].as_object().cloned().unwrap_or_default();
@@ -85,19 +105,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         }
     }
     let p = Value::Object(merged);
-    let os = if cfg!(windows) {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    };
-    let exe = match &p["exe"] {
-        Value::String(s) => Some(s.clone()),
-        Value::Object(m) => m.get(os).and_then(Value::as_str).map(str::to_string),
-        _ => None,
-    }
-    .ok_or_else(|| Error::usage(format!("app profile \"{id}\" has no exe for {os}")))?;
+    let exe = per_os(&p["exe"]).map(str::to_string).ok_or_else(|| Error::usage(format!("app profile \"{id}\" has no exe for {}", os())))?;
     let exe = expand(&exe).map_err(|e| Error::usage(format!("app profile \"{id}\" exe: {}", e.message)))?;
     let strings = |k: &str| p[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
     let mut guards = Vec::new();

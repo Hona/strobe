@@ -68,6 +68,9 @@ jobs:
           retention-days: 1
 
   # macOS: both architectures from the arm64 runner (x64 cross-compiled with the runner's SDK).
+  # With the signing secrets (scripts/macos-sign.sh lists them) each binary is Developer ID-signed under
+  # the hardened runtime and notarized, so macOS keeps its Accessibility and Screen Recording grants
+  # across updates; without them it ships ad-hoc signed, as before, and a tag build warns.
   macos:
     strategy:
       matrix:
@@ -75,6 +78,8 @@ jobs:
           - { target: darwin-arm64, triple: aarch64-apple-darwin }
           - { target: darwin-x64, triple: x86_64-apple-darwin }
     runs-on: macos-15
+    env:
+      SIGNING: ${{ secrets.MACOS_CERTIFICATE_P12 != '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -83,6 +88,18 @@ jobs:
         run: rustup toolchain install stable --profile minimal --target ${{ matrix.triple }} && rustup default stable
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.triple }}
+      - name: Sign and notarize (Developer ID)
+        if: env.SIGNING == 'true'
+        env:
+          MACOS_CERTIFICATE_P12: ${{ secrets.MACOS_CERTIFICATE_P12 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_NOTARY_KEY_P8: ${{ secrets.MACOS_NOTARY_KEY_P8 }}
+          MACOS_NOTARY_KEY_ID: ${{ secrets.MACOS_NOTARY_KEY_ID }}
+          MACOS_NOTARY_ISSUER_ID: ${{ secrets.MACOS_NOTARY_ISSUER_ID }}
+        run: bash scripts/macos-sign.sh target/${{ matrix.triple }}/release/strobe
+      - name: Unsigned
+        if: env.SIGNING != 'true' && startsWith(github.ref, 'refs/tags/v')
+        run: echo "::warning::no MACOS_CERTIFICATE_P12 secret; the macOS binaries ship ad-hoc signed, and every update drops their privacy grants"
       - name: Collect
         run: mkdir -p out/${{ matrix.target }} && cp target/${{ matrix.triple }}/release/strobe out/${{ matrix.target }}/
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

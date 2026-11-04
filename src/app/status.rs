@@ -150,7 +150,11 @@ fn native_drive() -> (bool, String) {
     #[cfg(target_os = "macos")]
     {
         let app = host::macos::responsible_app();
+        let own = host::macos::own_exe();
         let (ax, rec) = (host::macos::accessibility_trusted(), host::macos::screen_capture_allowed());
+        // Whose grant each permission is: one strobe inherits from the app or daemon it runs under,
+        // or strobe's own. macOS 27 passes Device Control on to a daemon's child, not Screen Recording.
+        let whose = if app == own { "strobe's own grant" } else { "inherited" };
         let mut grant = Vec::new();
         if !ax {
             grant.push(format!("accessibility to {app}: {}", host::macos::accessibility_pane()));
@@ -158,10 +162,12 @@ fn native_drive() -> (bool, String) {
         if !rec {
             grant.push(format!("Screen Recording to {}: {}", host::macos::screen_recording_grantee(), host::macos::screen_recording_pane()));
         }
+        let split = host::macos::tcc_split().is_some();
         let text = format!(
-            "accessibility API, Quartz events to the app · accessibility {} · frames: ScreenCaptureKit, Screen Recording {}{}",
+            "accessibility API, Quartz events to the app · accessibility {} ({whose}: {app}) · frames: ScreenCaptureKit, Screen Recording {}{}{}",
             if ax { "granted" } else { "missing" },
             if rec { "granted" } else { "missing" },
+            if split { format!(" (not inherited: macOS checks it against strobe itself, {own})") } else { String::new() },
             if grant.is_empty() { String::new() } else { format!(" (grant {})", grant.join("; ")) }
         );
         (ax && rec, text)

@@ -247,7 +247,12 @@ impl Guard {
             .guards
             .iter()
             .map(|g| {
-                let before = std::fs::read_to_string(&g.file).ok();
+                let before = match std::fs::read_to_string(&g.file) {
+                    Ok(t) => Some(t),
+                    // Absent is a state a guard compares; a file strobe may not read is no state at all.
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => Some(UNREADABLE.to_string()),
+                    Err(_) => None,
+                };
                 let v: Value = before.as_deref().and_then(|t| serde_json::from_str(t).ok()).unwrap_or(Value::Null);
                 let pid = g.pid.as_deref().and_then(|k| v[k].as_u64()).map(|p| p as u32);
                 let addr = g.url.as_deref().and_then(|k| v[k].as_str()).and_then(|u| u.split("://").nth(1)).and_then(|h| h.split('/').next()).and_then(|h| h.parse().ok());
@@ -290,7 +295,25 @@ impl Guard {
     fn pids(&self) -> impl Iterator<Item = u32> + '_ {
         self.checks.iter().filter_map(|c| c.pid)
     }
+
+    /// A guarded file strobe may not read (macOS 27 denies reading another developer's app data
+    /// without a prompt): it could change unseen, so nothing launches.
+    fn unreadable(&self) -> Result<()> {
+        let Some(c) = self.checks.iter().find(|c| c.before.as_deref() == Some(UNREADABLE)) else { return Ok(()) };
+        Err(Error::refused(
+            "LiveChannel",
+            format!("{} is guarded but strobe may not read it (permission denied), so a change to it would go unseen", c.file.display()),
+            if cfg!(target_os = "macos") {
+                "macOS denies reading another developer's app data (containers, group containers): guard a file outside them, or grant strobe Full Disk Access (System Settings › Privacy & Security › Full Disk Access)"
+            } else {
+                "guard a file strobe can read, or let this user read it"
+            },
+        ))
+    }
 }
+
+/// What a guard holds for a file it may not read.
+const UNREADABLE: &str = "\u{0}strobe: unreadable";
 
 pub fn alive(pid: u32) -> bool {
     host::exe_of(pid).is_some()
@@ -655,6 +678,7 @@ pub fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
 /// (such as the app's own background service) runs from its install folder or a folder named like
 /// it. Isolation should make it safe, but the user's own app is never the thing to experiment on.
 pub fn live(app: &App, guard: &Guard) -> Result<()> {
+    guard.unreadable()?;
     if !host::running(&app.exe).is_empty() {
         // An interpreter runs every script of its kind: a running one says nothing about the app.
         let stem = app.exe.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
@@ -813,10 +837,16 @@ mod macos_library {
         if sandboxed(app) {
             return Err(Error::refused("LiveChannel", format!("{id} is sandboxed: its container lives in your ~/Library, which no launch can redirect"), "measure a build without the App Sandbox entitlement"));
         }
-        if let Some(p) = places.iter().find(|p| p.exists()) {
+        // Only a folder known to be absent counts as absent: one macOS will not let strobe look at
+        // (another developer's app data, macOS 27) may exist, and `restore` would remove it.
+        if let Some(p) = places.iter().find(|p| !matches!(p.try_exists(), Ok(false))) {
             return Err(Error::refused(
                 "LiveChannel",
-                format!("{} exists: macOS keeps {id}'s data in your ~/Library whatever HOME says, so a launched copy would use and change it", p.display()),
+                format!(
+                    "{} {}: macOS keeps {id}'s data in your ~/Library whatever HOME says, so a launched copy would use and change it",
+                    p.display(),
+                    if p.try_exists().is_err() { "may exist (macOS would not let strobe look)" } else { "exists" }
+                ),
                 "measure a build with its own bundle id (or one this account never ran)",
             ));
         }
@@ -826,7 +856,7 @@ mod macos_library {
     /// Records what the launch may create, for `restore`.
     pub fn save(home: &Path, app: &App) {
         let (id, places) = places(app);
-        let list: Vec<String> = places.iter().filter(|p| !p.exists()).map(|p| p.display().to_string()).collect();
+        let list: Vec<String> = places.iter().filter(|p| matches!(p.try_exists(), Ok(false))).map(|p| p.display().to_string()).collect();
         let _ = std::fs::write(home.join(".strobe-macos-library.json"), json!({ "id": id, "created": list }).to_string());
     }
 

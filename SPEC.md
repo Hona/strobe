@@ -139,6 +139,25 @@ Installed binary: `~/.local/bin/strobe` (Linux/macOS); `%LOCALAPPDATA%\Programs\
 (Windows, on user PATH). The deep-mode helper lives where only an elevated step can write
 (§13.4).
 
+**macOS signing.** macOS keeps a privacy grant (Accessibility, called Device Control and Data Access
+on macOS 27, and Screen Recording) for a binary's designated requirement. An ad-hoc signature's
+requirement is its hash, which every release changes, so each update silently dropped the grants.
+The Release workflow signs each macOS binary with a Developer ID Application certificate under the
+hardened runtime (`packaging/macos/strobe.entitlements`: no exceptions), identifier
+`dev.hona.strobe`, and notarizes it (`scripts/macos-sign.sh`), so the requirement is the identifier
+and team and the grants survive updates. It needs five repository secrets: `MACOS_CERTIFICATE_P12`
+(the certificate with its private key as a `.p12`, base64), `MACOS_CERTIFICATE_PASSWORD`,
+`MACOS_NOTARY_KEY_P8` (an App Store Connect API key's `.p8` contents), `MACOS_NOTARY_KEY_ID` and
+`MACOS_NOTARY_ISSUER_ID`. Without them the binaries ship ad-hoc signed and a tag build warns. A bare
+executable cannot carry a stapled ticket: Gatekeeper looks it up online at its first run.
+
+**Inherited and own grants.** macOS attributes a process's permissions to its responsible process.
+On macOS 27 a child of a launchd daemon (a remote shell's, such as mesh) is AX-trusted through the
+daemon, but Screen Recording is checked against the child's own binary: ScreenCaptureKit answered
+-3801 ("user declined TCCs") with the daemon granted. `strobe status` says whose grant each
+permission is (inherited from the process it names, or strobe's own) and, for that split, names
+strobe's own executable (symlinks resolved) as the one to add in Screen & System Audio Recording.
+
 ### 4.3 Architecture (`src/`)
 
 ```

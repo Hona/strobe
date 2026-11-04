@@ -798,8 +798,26 @@ pub fn screen_recording_pane() -> &'static str {
 /// check Screen Recording against the child's own binary).
 pub fn screen_recording_grantee() -> String {
     let app = responsible_app();
-    let own = std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_default();
-    if own.is_empty() || app == own { app } else { format!("{app} (the app strobe runs under), or strobe itself at {own} if granting that app does not help") }
+    let own = own_exe();
+    match tcc_split() {
+        Some(_) => format!("strobe itself at {own} (macOS passes Device Control on from {app} to what it starts, but checks Screen Recording against strobe's own binary)"),
+        None if own.is_empty() || app == own => app,
+        None => format!("{app} (the app strobe runs under), or strobe itself at {own} if granting that app does not help"),
+    }
+}
+
+/// strobe's own executable, as System Settings lists it (symlinks resolved).
+pub fn own_exe() -> String {
+    std::env::current_exe().ok().map(|p| std::fs::canonicalize(&p).unwrap_or(p).display().to_string()).unwrap_or_default()
+}
+
+/// The inherited-versus-own split: strobe runs under another process (a daemon such as a remote
+/// shell's, an agent's app), Device Control came with it, and Screen Recording did not. On macOS 27 a
+/// launchd daemon's child is AX-trusted through its parent, while ScreenCaptureKit answers -3801
+/// ("user declined TCCs") until strobe's own binary is granted. Returns the parent it inherits from.
+pub fn tcc_split() -> Option<String> {
+    let app = responsible_app();
+    (app != own_exe() && accessibility_trusted() && !screen_capture_allowed()).then_some(app)
 }
 
 /// Screen Recording permission: needed to read another app's pixels.

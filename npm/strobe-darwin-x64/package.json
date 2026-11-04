@@ -1,0 +1,13 @@
+{
+  "name": "@hona/strobe-darwin-x64",
+  "version": "0.2.0",
+  "description": "The strobe binary for macOS x64 (Intel); installed by @hona/strobe",
+  "files": ["strobe"],
+  "os": ["darwin"],
+  "cpu": ["x64"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Hona/strobe.git" },
+  "publishConfig": {
+    "access": "public"
+  }
+}

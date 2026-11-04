@@ -21,6 +21,10 @@
     "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json"
   },
   "optionalDependencies": {
+    "@hona/strobe-darwin-arm64": "0.2.0",
+    "@hona/strobe-darwin-x64": "0.2.0",
+    "@hona/strobe-linux-arm64": "0.2.0",
+    "@hona/strobe-linux-x64": "0.2.0",
     "@hona/strobe-win32-x64": "0.2.0"
   },
   "devDependencies": {

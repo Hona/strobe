@@ -1,0 +1,13 @@
+{
+  "name": "@hona/strobe-darwin-arm64",
+  "version": "0.2.0",
+  "description": "The strobe binary for macOS arm64 (Apple silicon); installed by @hona/strobe",
+  "files": ["strobe"],
+  "os": ["darwin"],
+  "cpu": ["arm64"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Hona/strobe.git" },
+  "publishConfig": {
+    "access": "public"
+  }
+}

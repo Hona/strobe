@@ -13,7 +13,7 @@ if (!exe) {
     const dir = dirname(require.resolve(`@hona/strobe-${target}/package.json`))
     exe = join(dir, process.platform === "win32" ? "strobe.exe" : "strobe")
   } catch {
-    console.error(`strobe: no build for ${target} is installed (@hona/strobe-${target}). strobe ships for win32-x64 so far.`)
+    console.error(`strobe: no build for ${target} is installed (@hona/strobe-${target}). strobe ships for win32-x64, darwin-arm64, darwin-x64, linux-x64 and linux-arm64.`)
     process.exit(1)
   }
 }

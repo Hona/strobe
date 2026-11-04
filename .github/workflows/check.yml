@@ -1,0 +1,35 @@
+name: Check
+
+# Every push builds strobe and lints it with clippy on Windows, Linux and macOS: each OS compiles its own
+# code paths (ETW, /proc and perf events, libproc and CoreGraphics), which no other OS's build sees. No tests
+# (SPEC rule 5): builds and lints only.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, toolchain: stable-x86_64-pc-windows-gnu, rustflags: "-C link-self-contained=yes" }
+          - { os: ubuntu-24.04, toolchain: stable, rustflags: "" }
+          - { os: macos-15, toolchain: stable, rustflags: "" }
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        shell: bash
+        run: rustup toolchain install ${{ matrix.toolchain }} --profile minimal --component clippy && rustup default ${{ matrix.toolchain }}
+      - name: Clippy
+        run: cargo clippy --release --locked -- -D warnings
+      - name: Build
+        run: cargo build --release --locked

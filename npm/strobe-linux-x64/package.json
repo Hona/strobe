@@ -1,0 +1,13 @@
+{
+  "name": "@hona/strobe-linux-x64",
+  "version": "0.2.0",
+  "description": "The strobe binary for Linux x64 (static, glibc or musl); installed by @hona/strobe",
+  "files": ["strobe"],
+  "os": ["linux"],
+  "cpu": ["x64"],
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/Hona/strobe.git" },
+  "publishConfig": {
+    "access": "public"
+  }
+}

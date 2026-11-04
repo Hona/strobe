@@ -1,9 +1,10 @@
 name: Release
 
-# A version tag (v0.2.0) builds strobe and publishes its npm packages at Cargo.toml's version:
-# @hona/strobe-<platform>-<arch> with the binaries, @hona/strobe (the `strobe` command and the bench SDK) and
-# the @hona/strobe-bench alias. Windows x64 only so far. npm trusts this workflow in the npm environment
-# (trusted publishing over OIDC), so a publish needs no npm token and every version gets provenance.
+# A version tag (v0.2.0) builds strobe for every platform and publishes its npm packages at Cargo.toml's
+# version: @hona/strobe-<platform>-<arch> with the binaries (win32-x64, darwin-arm64, darwin-x64,
+# linux-x64, linux-arm64), @hona/strobe (the `strobe` command and the bench SDK) and the @hona/strobe-bench
+# alias. npm trusts this workflow in the npm environment (trusted publishing over OIDC), so a publish needs
+# no npm token and every version gets provenance.
 # npm trusts a workflow only for a package that exists. For a new package, first stage a throwaway version
 # (`npm stage publish --tag init` at 0.0.0-init), then `npm trust github <name> --file release.yml
 # --repo Hona/strobe --env npm --allow-publish`, and `npm access set mfa=publish <name>`.
@@ -18,11 +19,6 @@ permissions:
 jobs:
   windows-x64:
     runs-on: windows-latest
-    # The npm environment takes deployments from v* tags only, and npm trusts only this environment.
-    environment: npm
-    permissions:
-      contents: read
-      id-token: write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -38,6 +34,79 @@ jobs:
         run: cargo build --release --locked
         env:
           RUSTFLAGS: -C link-self-contained=yes
+      - name: Collect
+        shell: bash
+        run: mkdir -p out/win32-x64 && cp target/release/strobe.exe target/release/strobew.exe out/win32-x64/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: win32-x64
+          path: out
+          retention-days: 1
+
+  # Linux: static musl binaries, so one build runs on any distribution (glibc or musl).
+  linux:
+    strategy:
+      matrix:
+        include:
+          - { target: linux-x64, runner: ubuntu-24.04, triple: x86_64-unknown-linux-musl }
+          - { target: linux-arm64, runner: ubuntu-24.04-arm, triple: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.triple }} && rustup default stable
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.triple }}
+      - name: Collect
+        run: mkdir -p out/${{ matrix.target }} && cp target/${{ matrix.triple }}/release/strobe out/${{ matrix.target }}/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: out
+          retention-days: 1
+
+  # macOS: both architectures from the arm64 runner (x64 cross-compiled with the runner's SDK).
+  macos:
+    strategy:
+      matrix:
+        include:
+          - { target: darwin-arm64, triple: aarch64-apple-darwin }
+          - { target: darwin-x64, triple: x86_64-apple-darwin }
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.triple }} && rustup default stable
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.triple }}
+      - name: Collect
+        run: mkdir -p out/${{ matrix.target }} && cp target/${{ matrix.triple }}/release/strobe out/${{ matrix.target }}/
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.target }}
+          path: out
+          retention-days: 1
+
+  publish:
+    needs: [windows-x64, linux, macos]
+    runs-on: ubuntu-24.04
+    # The npm environment takes deployments from v* tags only, and npm trusts only this environment.
+    environment: npm
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: bin
+          merge-multiple: true
       # No caches in a release build: a poisoned cache would ship in the packages.
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
@@ -49,9 +118,8 @@ jobs:
           package-manager-cache: false
       - name: Check the tag names Cargo.toml's version
         if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
         run: |
           want="v$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
           [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; }
       - name: Publish
-        run: bun scripts/release.ts --bin target/release --publish
+        run: bun scripts/release.ts --bin bin --publish

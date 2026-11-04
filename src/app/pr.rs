@@ -373,8 +373,18 @@ impl<'a> Doc<'a> {
         } else {
             for s in &self.series {
                 let inner = self.questions(s);
-                out +=
-                    &format!("<details>\n<summary><b>{}</b>: is it real, how big, where it came from</summary>\n\n{}\n\n</details>\n\n", html_esc(s["label"].as_str().unwrap_or("")), inner.trim_end());
+                // Name only the questions this series' drawer answers (a series without profiles has no third).
+                let asks: Vec<&str> = [("Is it real?", "is it real"), ("How big?", "how big"), ("Where did it come from?", "where it came from")]
+                    .into_iter()
+                    .filter(|(q, _)| inner.contains(&format!("<b>{q}</b>")))
+                    .map(|(_, a)| a)
+                    .collect();
+                let asks = match asks.as_slice() {
+                    [] => "details".to_string(),
+                    [one] => one.to_string(),
+                    [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+                };
+                out += &format!("<details>\n<summary><b>{}</b>: {asks}</summary>\n\n{}\n\n</details>\n\n", html_esc(s["label"].as_str().unwrap_or("")), inner.trim_end());
             }
         }
         out += &self.measured();

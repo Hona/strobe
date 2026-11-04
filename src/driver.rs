@@ -80,13 +80,43 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     animating()
     const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : (exact ? " with exactly " : " containing ") + JSON.stringify(text)))) }, timeout)
   })
+  // `tag#id.class`: a node as a person finds it in DevTools.
+  const name = (n) => {
+    const el = n && n.nodeType === 1 ? n : n?.parentElement
+    if (!el) return '#' + (n?.nodeName ?? "?")
+    const cls = typeof el.className === "string" ? el.className.trim().split(/\s+/).filter(Boolean).slice(0, 2).map((c) => "." + c).join("") : ""
+    return el.tagName.toLowerCase() + (el.id ? '#' + el.id : "") + cls
+  }
   s.idle = (quiet, timeout) => new Promise((resolve, reject) => {
     let timer, po
+    // What kept the page busy, for the failure: mutations by node and kind, long frames by script.
+    const causes = new Map()
+    let mutations = 0, frames = 0, longest = 0
+    const count = (key) => causes.set(key, (causes.get(key) ?? 0) + 1)
     const stop = () => { unwatch(); if (po) po.disconnect(); clearTimeout(timer); clearTimeout(limit) }
     const kick = () => { clearTimeout(timer); timer = setTimeout(() => { stop(); resolve(true) }, quiet) }
-    const unwatch = observe(kick, { subtree: true, childList: true, attributes: true, characterData: true })
-    try { po = new PerformanceObserver(kick); po.observe({ type: "long-animation-frame" }) } catch {}
-    const limit = setTimeout(() => { stop(); reject(new Error("the page never went idle (DOM kept changing for " + timeout + " ms)")) }, timeout)
+    const unwatch = observe((records) => {
+      for (const r of records) { mutations++; count("mutation " + name(r.target) + (r.type === "attributes" ? " [" + r.attributeName + "]" : r.type === "childList" ? " (children)" : " (text)")) }
+      kick()
+    }, { subtree: true, childList: true, attributes: true, characterData: true })
+    try {
+      po = new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          frames++
+          longest = Math.max(longest, e.duration)
+          const top = [...(e.scripts ?? [])].sort((a, b) => b.duration - a.duration)[0]
+          count("long frame " + (top ? (top.invoker || "script") + (top.sourceURL ? " (" + top.sourceURL.split("/").pop() + ")" : "") : "(no script: style, layout or paint)"))
+        }
+        kick()
+      })
+      po.observe({ type: "long-animation-frame" })
+    } catch {}
+    const limit = setTimeout(() => {
+      stop()
+      const top = [...causes].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, n]) => k + " ×" + n).join("; ")
+      const what = mutations + " DOM mutations" + (frames ? ", " + frames + " frames over 50 ms (longest " + Math.round(longest) + " ms)" : "")
+      reject(new Error("the page never went idle in " + timeout + " ms: " + what + (top ? "; most: " + top : "")))
+    }, timeout)
     kick()
   })
   s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))

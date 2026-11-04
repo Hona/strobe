@@ -1200,7 +1200,10 @@ other windows. `until: "idle"` is no present of the app and no accessibility cha
 `"frame"` is the next present of the app that reached the screen.
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
-in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling), `"frame"`
+in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling; a page that never
+goes idle fails with how many mutations and long frames kept it busy and the top three causes:
+nodes as `tag#id.class` with the attribute or kind that changed, long frames by their longest
+script's invoker and file), `"frame"`
 (two animation frames, the usual "after next paint"), a selector, or `{ selector, text?, exact? }`
 (an element holding that text, as `waitFor`). Every input call records its dispatch time on the
 trace clock, which the `interaction.*` metrics use (input → the presented frame that showed the

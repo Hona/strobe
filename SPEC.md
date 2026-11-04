@@ -2042,7 +2042,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | adapter per window | D3DKMT + DXGI | — | — |
 | IO (`io.read`, `io.write`) | `NtQuerySystemInformation` transfer counts (every byte read and written, cached or not) | `/proc/<pid>/io` `rchar`/`wchar` (the same) | disk bytes only (`ri_diskio_bytesread`/`written`): macOS counts no cached IO per process |
 | accessibility tree (§13.7) | UI Automation (COM) | AT-SPI over strobe's own D-Bus client: the registry's app roots by connection pid, a level per round trip | the AX API (`AXUIElementCopyMultipleAttributeValues`, one call per element; `AXObserver`), Accessibility permission |
-| input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events posted to its process (`CGEventPostToPid`), Accessibility permission |
+| input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events: keys posted to its process (`CGEventPostToPid`), pointer events to the session at the point (AppKit drops mouse events posted to a process), Accessibility permission |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So every block of a window case makes the app the active one (`AXFrontmost`), and only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block waits for them). It activates every block, not only a covered one, because the active app's key window is another state: a Rune window at rest cost 3× the CPU as the key window (920 vs 2780 ms per 10 s on an M4), and a series whose blocks were activated only when covered mixed the two (ui.cpu 206 ms in some blocks, 1250 ms in others) |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
 macOS permissions are granted to the responsible app (the launchd-started ancestor). Every message
@@ -2154,18 +2154,21 @@ toolkit (rule 15).
     or pointer messages (`WM_POINTER*`: an app that takes only those, such as one on a UWP input
     stack, gets no posted mouse input). Pointer input on a locked session is refused
     (`SessionLocked`): the OS hit-tests every point to the lock screen.
-  - macOS (`target/a11y/cg_input.rs`): Quartz events posted to the app's process (`CGEventPostToPid`):
-    they reach no other app. Pointer: mouse events at the point carrying the window under it (the
-    fields AppKit routes a mouse event by), so AppKit's own hit test picks the view; the window
-    server's is replaced by the system-wide AX hit test that must name the app (`WindowHidden`
-    otherwise); the real cursor is moved there first without an event (`CGWarpMouseCursorPosition`)
-    and put back after. A posted click does not activate the app. Keys: the key code of the key's
+  - macOS (`target/a11y/cg_input.rs`): Quartz events. Pointer: mouse and wheel events at the point,
+    posted to the login session (`CGEventPost` at the session tap), so the window server routes them
+    as a person's: AppKit drops mouse events posted to a process (`CGEventPostToPid`; on macOS 27 a
+    Cocoa button handled none, with or without the window fields, from any event source, active or
+    not, while the session tap's click pressed it). Before each, the system-wide AX hit test at the
+    point must name the app (`WindowHidden` otherwise), so the event reaches the app's window; the
+    real cursor is moved there first without an event (`CGWarpMouseCursorPosition`) and put back
+    after. A click on a background app's window brings it to the front. Keys, posted to the app's
+    process (`CGEventPostToPid`): the key code of the key's
     position on a US keyboard with the character set on the event (`CGEventKeyboardSetUnicodeString`),
     so the text is exact on any layout (an app that maps key codes through its own layout sees the US
     key; any non-ASCII character goes as text on key code 0); modifiers as flag changes and the key's
     flags. macOS gives keys only to the active app's key window, so before keys strobe brings the app to
     the front (`AXFrontmost`) and refuses (`WindowHidden`) when it does not come: unlike Windows, typing
-    takes focus. Wheel: scroll events in pixels (continuous). Posting needs the Accessibility
+    takes focus. Wheel: scroll events in pixels (continuous), through the session as clicks. Posting needs the Accessibility
     permission (`CGPreflightPostEventAccess`; without it macOS drops events silently, so strobe refuses
     first). Window actions go through the window's AX element: `close` presses its close button,
     `minimize`/`show` set `AXMinimized` (and raise), `focus` brings the app to the front and makes the

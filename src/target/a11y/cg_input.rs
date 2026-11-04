@@ -1,13 +1,13 @@
-//! Input to a native app on macOS (SPEC §13.7): Quartz events posted to the app's own process
-//! (`CGEventPostToPid`), so they reach no other app, each stamped on the host clock just before it is
-//! posted. What each kind takes, and what it does not:
+//! Input to a native app on macOS (SPEC §13.7): Quartz events, each stamped on the host clock just
+//! before it is posted. What each kind takes, and what it does not:
 //!
-//! - Pointer: mouse events at the point, carrying the window under it (the fields AppKit routes a
-//!   mouse event by), so the app's own hit testing picks the view as for a real click. The window
-//!   server's hit test is replaced by strobe's check that no other app's window covers the point
-//!   (`WindowHidden`), and strobe moves the real cursor there first (`CGWarpMouseCursorPosition`: no
-//!   event, no click) since hover tracking reads it; it is put back when strobe is done. A posted
-//!   click does not activate the app: an app that ignores clicks while in the background ignores it.
+//! - Pointer: mouse events at the point, posted to the login session's event stream
+//!   (`CGEventPost` at the session tap), so the window server routes them as a real click: AppKit
+//!   drops mouse events posted to a process (`CGEventPostToPid`; macOS 27 handled none). strobe
+//!   first checks that the app's window is what the window server hit-tests at the point
+//!   (`WindowHidden` otherwise) and moves the real cursor there (`CGWarpMouseCursorPosition`: no
+//!   event, no click) since hover tracking reads it; it is put back when strobe is done. A click on
+//!   a background app's window brings it to the front, as a person's does.
 //! - Keys: key events with the key code of the key's position on a US keyboard and the character
 //!   itself set on the event, so the app's text is exact on any layout (an app that maps key codes
 //!   through a layout of its own sees the US key). Modifiers go down and up as flag changes and mark
@@ -34,6 +34,7 @@ unsafe extern "C" {
     fn CGEventSetIntegerValueField(e: CFTypeRef, field: u32, value: i64);
     fn CGEventKeyboardSetUnicodeString(e: CFTypeRef, len: usize, chars: *const u16);
     fn CGEventPostToPid(pid: i32, e: CFTypeRef);
+    fn CGEventPost(tap: u32, e: CFTypeRef);
     fn CGWarpMouseCursorPosition(at: CGPoint) -> i32;
     fn CGPreflightPostEventAccess() -> bool;
 }
@@ -45,6 +46,8 @@ const BUTTON_NUMBER: u32 = 3;
 const KEYCODE: u32 = 9;
 const WINDOW_UNDER_POINTER: u32 = 91;
 const WINDOW_UNDER_POINTER_THAT_CAN_HANDLE: u32 = 92;
+/// `kCGSessionEventTap`: where events enter the login session, routed by the window server.
+const SESSION_TAP: u32 = 1;
 const SHIFT: u64 = 0x20000;
 const CONTROL: u64 = 0x40000;
 const OPTION: u64 = 0x80000;
@@ -176,6 +179,13 @@ impl Poster {
         at
     }
 
+    /// A pointer event, into the session's event stream at its location.
+    fn post_pointer(&self, e: Cf) -> u64 {
+        let at = crate::host::now_ns();
+        unsafe { CGEventPost(SESSION_TAP, e.0) };
+        at
+    }
+
     fn mouse(&self, kind: u32, t: Target, button: u32, clicks: i64, flags: u64) -> Result<Cf> {
         let e = Cf::new(unsafe { CGEventCreateMouseEvent(self.source.0, kind, CGPoint { x: t.x, y: t.y }, button) }).ok_or_else(|| Error::msg("Quartz: no mouse event"))?;
         unsafe {
@@ -252,7 +262,7 @@ impl Poster {
             None => (MOUSE_MOVED, 0),
         };
         let e = self.mouse(kind, t, button, 0, flags(Mods::default()))?;
-        Ok(self.post(t.pid, e))
+        Ok(self.post_pointer(e))
     }
 
     /// A button edge at `t`, after a move there; `dbl` is a double click's second press. Returns
@@ -266,9 +276,9 @@ impl Poster {
         let held: u64 = self.st().held.iter().map(|h| h.1).fold(0, |a, b| a | b);
         let f = flags(mods) | held;
         let mv = self.mouse(if down { MOUSE_MOVED } else { [6, 7, 27][button as usize] }, t, button, 0, f)?;
-        self.post(t.pid, mv);
+        self.post_pointer(mv);
         let e = self.mouse(if down { kinds.0 } else { kinds.1 }, t, button, if dbl { 2 } else { 1 }, f)?;
-        let at = self.post(t.pid, e);
+        let at = self.post_pointer(e);
         self.st().down = down.then_some(b);
         Ok(at)
     }
@@ -281,7 +291,7 @@ impl Poster {
             CGEventSetIntegerValueField(e.0, WINDOW_UNDER_POINTER, t.window as i64);
             CGEventSetIntegerValueField(e.0, WINDOW_UNDER_POINTER_THAT_CAN_HANDLE, t.window as i64);
         }
-        Ok(self.post(t.pid, e))
+        Ok(self.post_pointer(e))
     }
 
     fn pid_of(top: isize) -> Result<u32> {

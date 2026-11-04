@@ -139,6 +139,15 @@ impl Selector {
         Ok(Selector { base, exact, focus, text, index, source })
     }
 
+    /// When the selector carries a text filter and only that missed: what the visible elements it
+    /// would match without the filter hold (up to three), for a timeout's message.
+    pub fn text_misses(&self, t: &Tree) -> Option<String> {
+        let want = self.text.as_ref()?;
+        let bare = Selector { text: None, focus: self.focus, ..self.clone() };
+        let seen: Vec<String> = t.find(&bare).into_iter().take(3).map(|i| format!("{:?}", t.nodes[i].value.as_deref().filter(|v| !v.is_empty()).unwrap_or(&t.nodes[i].name))).collect();
+        (!seen.is_empty()).then(|| format!("matched holding {}, never {}{want:?}", seen.join(", "), if self.exact { "exactly " } else { "" }))
+    }
+
     /// Whether node `i` of `t` matches, visibility aside.
     pub fn matches(&self, t: &Tree, i: usize) -> bool {
         let n = &t.nodes[i];

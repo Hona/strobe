@@ -281,7 +281,8 @@ impl Driver {
     pub fn dispatch(&self, call: &str, args: &[Value]) -> Result<Value> {
         let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
         let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
-        if args.first().is_some_and(Value::is_object) && call != "eval" {
+        // `idle(opts)` is the one call whose first argument is its options.
+        if args.first().is_some_and(Value::is_object) && call != "eval" && call != "idle" {
             return Err(Error::usage(format!(
                 "page.{call}(): a page's selector is a CSS string (a `>>>` crosses shadow roots); {{ selector, text, exact, index }} selects a native app's elements, and `until` and waitFor take text on pages"
             )));

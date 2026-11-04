@@ -189,7 +189,9 @@ mod imp {
                     return Ok((tree, i));
                 }
                 if Instant::now() >= deadline {
-                    let why = if tree.nodes.len() <= tree.windows.len() {
+                    let why = if let Some(miss) = sel.text_misses(&tree) {
+                        format!("{miss} in {} s", timeout.as_secs())
+                    } else if tree.nodes.len() <= tree.windows.len() {
                         format!(
                             "the app's windows expose no accessibility tree ({} element{}): strobe finds elements through it, so this app can be measured from outside only",
                             tree.nodes.len(),

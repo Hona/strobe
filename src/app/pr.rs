@@ -732,7 +732,7 @@ impl<'a> Doc<'a> {
                 bullets.push(format!("**A/A false positive:** **{}** moved between identical builds: the harness or the machine is not stable enough to trust a verdict here.", cell(label)));
             }
             if o == Out::Saturated {
-                bullets.push(format!("**Saturated primary:** **{}**: {}.", cell(label), cell(verdict(&s["primary"]))));
+                bullets.push(format!("**Saturated primary:** **{}**: {}.", cell(label), cell(verdict(&s["primary"]).trim_start_matches("saturated: "))));
             }
         }
         // Background load: the blocks themselves, not 16 copies of the per-block text.

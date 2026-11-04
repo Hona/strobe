@@ -53,7 +53,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
             .filter_map(|m| Some(format!("{m} {}", fmt::value(r["values"][m].as_f64()?, crate::model::metric(m).map_or("", |d| d.unit)))))
             .collect();
         if !declared.is_empty() {
-            text += &format!("check    {}   (one cold run before it)\n", declared.join(" · "));
+            text += &format!("check    {}   (one cold run before it: its own numbers, not this recording's runs)\n", declared.join(" · "));
         }
         let native = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).is_some_and(|m| m["native"] == true);
         text += &if native {
@@ -607,7 +607,7 @@ fn native_summary(meta: &Value) -> String {
         s += &launch_line(v);
         s += &format!("cpu      {} from the spawn until ready, all processes\n", fmt::value(get("cpu.work"), "ms"));
     } else {
-        s += &format!("cpu      {} of one core · {} in the run, all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
+        s += &format!("cpu      {} of one core (cpu.app.total) · {} in the run (cpu.work), all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
     }
     if get("cpu.wakes").is_finite() {
         s += &format!("wakes    {} context switches of its threads\n", fmt::value(get("cpu.wakes"), "/s"));

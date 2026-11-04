@@ -805,7 +805,11 @@ fn native_gpu(dir: &Path, meta: &Value) -> Result<Output> {
 /// runs, CPU per run from each thread's cycle counter, and its name.
 fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     let rows = store::read_json(&dir.join("threads.json"))?;
-    let all = rows.as_array().cloned().unwrap_or_default();
+    let mut all = rows.as_array().cloned().unwrap_or_default();
+    // Without per-thread wakes (macOS counts them per process), the busiest threads come first.
+    if all.iter().all(|r| r["wakes_per_s"].as_f64().is_none()) {
+        all.sort_by(|a, b| b["cpu_ms_per_run"].as_f64().unwrap_or(0.0).total_cmp(&a["cpu_ms_per_run"].as_f64().unwrap_or(0.0)));
+    }
     let mut text = format!("{:>10}  {:>12}  {:>7}  {:>7}  {:<6}  thread (started in)\n", "wakes/s", "cpu ms/run", "pid", "tid", "whose");
     for r in all.iter().take(top) {
         let started = r["module"].as_str().map(|m| format!(" ({m})")).unwrap_or_default();
@@ -826,8 +830,19 @@ fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     if all.iter().any(|r| r["origin"].is_string()) {
         text += &format!("by whose threads: app {} · driver {} · os {} (wakes/s)\n", fmt::value(sum("app"), "count"), fmt::value(sum("driver"), "count"), fmt::value(sum("os"), "count"));
     }
+    // What the processes spent that no listed thread did: threads that exited during a run (a worker
+    // that ran 4 of a run's 6 s once hid that way).
+    let runs = store::read_json(&dir.join("runs.json")).unwrap_or(Value::Null);
+    let per_run: Vec<f64> = runs.as_array().into_iter().flatten().filter_map(|r| r["cpu_ms"].as_f64()).collect();
+    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+    let total = if per_run.is_empty() { meta["values"]["cpu.work"].as_f64().unwrap_or(f64::NAN) } else { metrics::median(&per_run) };
+    let listed: f64 = all.iter().filter_map(|r| r["cpu_ms_per_run"].as_f64()).sum();
+    let gone = total - listed;
+    if gone.is_finite() && gone > (0.05 * total).max(5.0) {
+        text += &format!("{} per run in threads no longer there at the run's end (they exited during it): the processes spent {} per run, the threads above {}\n", fmt::value(gone, "ms"), fmt::value(total, "ms"), fmt::value(listed, "ms"));
+    }
     text += "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks). A thread that exited during a run is not listed\n";
-    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>() })))
+    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>(), "cpu_ms_per_run": total, "exited_ms_per_run": gone.is_finite().then_some(gone.max(0.0)) })))
 }
 
 /// A native recording's frames: per measured run, what reached the screen (OS present events), the
@@ -973,9 +988,20 @@ pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>, p
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
-    if share < 95.0 {
+    if n.samples == 0 {
+        // Nothing sampled is not the same as nothing resolved: say what the sampler gave.
+        let why = if cfg!(target_os = "macos") {
+            "/usr/bin/sample gave no stacks for these runs (the app exited or was not sampled in the measured runs' span; macOS samples carry no times, so a span with no sample stays empty)"
+        } else if cfg!(target_os = "linux") {
+            "perf events gave no samples for these runs (perf_event_paranoid, or the threads never ran in the measured span)"
+        } else {
+            "the kernel's sampled profile held no samples of the app in the measured runs (the deep helper, or the threads never ran)"
+        };
+        out.text += &format!("! no native samples: {why}\n");
+    } else if share < 95.0 {
         let missing: Vec<String> = facts["unsymbolized"].as_array().into_iter().flatten().take(3).map(|m| format!("{} ({})", m["module"].as_str().unwrap_or(""), m["samples"])).collect();
-        out.text += &format!("! Unresolved: {:.1}% of samples have no symbol (no PDB found): {}\n", 100.0 - share, missing.join(", "));
+        let what = if cfg!(windows) { "no PDB found" } else { "no symbols or DWARF found (a dSYM or an unstripped binary)" };
+        out.text += &format!("! Unresolved: {:.1}% of samples have no symbol ({what}): {}\n", 100.0 - share, missing.join(", "));
     }
     Ok(out)
 }

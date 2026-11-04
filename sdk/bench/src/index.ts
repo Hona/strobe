@@ -211,6 +211,8 @@ export interface RunCase<P> extends CaseBase {
   run(ctx: Context<P>): unknown
   /** Puts the app back between runs. Never measured. */
   reset?(ctx: Context<P>): unknown
+  /** Milliseconds a run or reset may take before it fails the block (setup gets at least this too). Default 60000. */
+  timeout?: number
   launch?: never
 }
 

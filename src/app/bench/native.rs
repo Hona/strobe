@@ -262,7 +262,7 @@ fn runs(
             other => Err(Error::msg(format!("unknown runner request {other}"))),
         }
     };
-    let t = Duration::from_secs(120);
+    let t = s.hook_timeout();
     let env = home.environment(app);
     ctx.runner.call(
         "block",
@@ -282,7 +282,7 @@ fn runs(
     let sampler = probe::os::Sampler::start(n.pid);
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
     let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
-    let run_timeout = Duration::from_secs(60);
+    let run_timeout = s.run_timeout();
     let mut runs: Vec<Run> = Vec::new();
     let mut first: Option<usize> = None;
     let mut unsteady = false;
@@ -398,7 +398,10 @@ fn runs(
     if let Some(d) = &display {
         let luid = |name: &str| samples.adapters.iter().find(|a| a.name == name).map(|a| a.luid);
         let drawing: Vec<&String> = adapters.iter().filter(|a| by_adapter[*a].get("3D").copied().unwrap_or(0.0) > 0.0).collect();
-        if !drawing.is_empty() && !drawing.iter().any(|a| luid(a) == Some(d.adapter_luid)) && !ctx.warnings.iter().any(|w| w.id == "CrossAdapterScanout") {
+        // An adapter the OS does not name for the display (id 0, or none of the sampled ones: a
+        // single-GPU Mac) is unknown, not another adapter.
+        let known = d.adapter_luid != 0 && samples.adapters.iter().any(|a| a.luid == d.adapter_luid);
+        if known && !drawing.is_empty() && !drawing.iter().any(|a| luid(a) == Some(d.adapter_luid)) && !ctx.warnings.iter().any(|w| w.id == "CrossAdapterScanout") {
             let scanout = samples.adapters.iter().find(|a| a.luid == d.adapter_luid).map_or_else(|| format!("adapter 0x{:x}", d.adapter_luid), |a| a.name.clone());
             ctx.warnings.push(validity::info(
                 "CrossAdapterScanout",
@@ -528,6 +531,10 @@ fn runs(
         None => {}
     }
     if let Some(why) = &presents_err {
+        // Said once for the bench, so frames that never show are not mistaken for none being drawn.
+        if !ctx.warnings.iter().any(|w| w.id == "NoPresentSource") {
+            ctx.warnings.push(validity::info("NoPresentSource", format!("frames refused: the OS present events gave nothing ({why}); frames.* and interaction.* are missing from every block")));
+        }
         for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
             refused.entry(m.clone()).or_insert_with(|| format!("NoPresentSource: {m}: OS present events: {why}"));
         }

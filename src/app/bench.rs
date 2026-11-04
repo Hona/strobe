@@ -110,9 +110,21 @@ struct Series {
     reset: bool,
     /// A launch case's `launch` spec (`until`, `milestones`, `before`, …); null for a run case.
     launch: Value,
+    /// The case's `timeout` (ms) for a run or reset, when it sets one.
+    timeout: Option<u64>,
 }
 
 impl Series {
+    /// How long a run or reset may take (the case's `timeout`, default 60 s).
+    fn run_timeout(&self) -> Duration {
+        Duration::from_millis(self.timeout.unwrap_or(60_000).max(1))
+    }
+
+    /// How long setup and other hooks may take: 120 s, or the case's run timeout when longer.
+    fn hook_timeout(&self) -> Duration {
+        self.run_timeout().max(Duration::from_secs(120))
+    }
+
     fn label(&self) -> String {
         let mut s = format!("{} · {}", self.case, self.target);
         for (k, v) in &self.params {
@@ -1127,8 +1139,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                 fmt::value(primary.base, def.unit),
                 fmt::value(primary.head, def.unit)
             ),
-            "stopped" => format!("stopped after {} pairs: no verdict (resume to finish)", pairs.len()),
-            s if s.starts_with("failed") => format!("unclear: {} pairs, then the bench failed", pairs.len()),
+            "stopped" => format!("stopped after {} pair{}: no verdict (resume to finish)", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
+            s if s.starts_with("failed") => format!("unclear: {} pair{}, then the bench failed", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
             "more pairs cannot decide it" | "max pairs" | "max time" => match primary.needed_pairs {
                 Some(n) if n != usize::MAX && n > pairs.len() => format!("underpowered: ~{n} pairs needed"),
                 _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => format!("unclear after {} pairs, the last planned look: the difference sits on the equivalence bound", pairs.len()),
@@ -2215,7 +2227,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 other => Err(Error::msg(format!("unknown runner request {other}"))),
             }
         };
-        let t = Duration::from_secs(120);
+        let t = s.hook_timeout();
         ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root }), t, &serve)?;
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
@@ -2283,7 +2295,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         let run_counts: RefCell<Vec<BTreeMap<String, f64>>> = RefCell::new(Vec::new());
         let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
 
-        let run_timeout = Duration::from_secs(60);
+        let run_timeout = s.run_timeout();
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
             *current.borrow_mut() = key.to_string();
@@ -2856,6 +2868,7 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
                     metrics: c["metrics"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default(),
                     reset: c["reset"].as_bool().unwrap_or(false),
                     launch: c["launch"].clone(),
+                    timeout: c["timeout"].as_u64(),
                 });
             }
         }

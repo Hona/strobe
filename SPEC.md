@@ -438,7 +438,10 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   skill and MCP registration, starts its daemon, and refreshes the deep-mode helper only where one
   is installed (its UAC prompt only when it is out of date). The same bytes already installed:
   nothing to do. `--check` says what is installed and what is available. `--on all` (every mesh
-  device) is not built.
+  device) is not built. Without a version or `--from`, an installed copy newer than the release, or
+  a local build of the same version (other bytes), stays, with a usage error that says so: an
+  update once put 0.4.0 over the main build another session's bench used, which then failed on an
+  unknown metric. `--force` replaces it anyway.
 - `leave [--yes]`: undo `up`: MCP registration, autostart, skill folder, helper, state dir
   (recordings included, after confirmation). Leaves the binary.
 
@@ -1215,7 +1218,9 @@ export default bench({
 - `cases.<name>`: `primary` (metric name, required; `launch.ready` for a launch case), `run(ctx)`
   (measured) or `launch` (a launch case, below), `reset(ctx)` (optional, between runs, never
   measured), `metrics` (optional extra secondaries), `targets` (optional: the targets this case
-  runs on; default every target), `probes` (optional extra attribution probes).
+  runs on; default every target), `probes` (optional extra attribution probes), `timeout`
+  (optional, ms: how long a run or reset may take, default 60 000; setup and the other hooks get at
+  least that too, so a case can idle for minutes, a model left alone before it is used).
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
@@ -1403,7 +1408,7 @@ sequenceDiagram
   `runner.log`. A process a hook spawns therefore never touches the protocol (Bun's `$` passes stdin
   on to its children and stalled on a protocol pipe that never closes). The script host works the
   same way (`STROBE_HOST_PORT`, `script.log`).
-- A run that throws or exceeds its timeout (default 60 s) fails the block (`RunIncomplete`).
+- A run that throws or exceeds its timeout (default 60 s, the case's `timeout`) fails the block (`RunIncomplete`).
   The refusal names the page's URL and saves a screenshot of the page next to the experiment
   (`failed-<step>-….png`), so an agent can see what the app showed instead of guessing.
 - At every run start strobe reads the DOM node count (a native app's: the elements in its

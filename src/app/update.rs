@@ -57,6 +57,21 @@ pub fn run(args: &Args) -> Result<Output> {
         if same {
             return Ok(Output::new(format!("up to date: {current} at {}", installed.display()), json!({ "installed": current, "updated": false })));
         }
+        // The latest release over a newer copy (a local build from main that others' sessions use) is a
+        // downgrade nobody asked for: an explicit version, `--from` or `--force` says so.
+        let semver = |s: &str| -> Option<(u64, u64, u64)> {
+            let v = s.split_whitespace().last()?.split(['-', '+']).next()?;
+            let mut p = v.split('.').map(|x| x.parse::<u64>().ok());
+            Some((p.next()??, p.next()??, p.next()??))
+        };
+        if wanted.is_none() && args.get("from").is_none() && !args.has("force")
+            && let (Some(a), Some(b)) = (semver(&current), semver(&reported))
+            && a >= b
+        {
+            let what = if a > b { format!("{current} is newer than npm's {reported}") } else { format!("{current} is a local build, not npm's {reported}") };
+            return Err(Error::usage(format!("the installed copy at {}: {what}; strobe update keeps it (another session may use it)", installed.display()))
+                .hint(format!("strobe update --force replaces it with npm's {reported}; strobe update <version> installs that version")));
+        }
         super::progress(format!("strobe update: {} → {reported}", if current.is_empty() { "not installed" } else { current.as_str() }));
         // This build swaps the files (whatever the new build's own install does, a running strobe
         // is renamed aside, never overwritten) and stops the daemon, so the new build's `up` starts

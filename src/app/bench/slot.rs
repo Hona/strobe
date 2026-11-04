@@ -112,7 +112,12 @@ impl Registration {
                 .filter(|b| b["exp"] != me && b["state"] == "queued" && b["queued_at"].as_str().and_then(|t| t.parse::<u128>().ok()).is_some_and(|t| t < mine))
                 .collect();
             // Builds before the slot held `bench.lock` for a whole experiment.
-            let old = std::fs::read_to_string(legacy()).ok().and_then(|t| t.trim().parse::<u32>().ok()).filter(|p| *p != std::process::id() && alive(*p));
+            // This build writes `bench.lock` too while it holds the slot: a pid that registered as a bench
+            // is a current strobe (named below as the one running a block), not an older one.
+            let old = std::fs::read_to_string(legacy())
+                .ok()
+                .and_then(|t| t.trim().parse::<u32>().ok())
+                .filter(|p| *p != std::process::id() && alive(*p) && !others.iter().any(|b| b["pid"].as_u64() == Some(*p as u64)));
             if ahead.is_empty() && old.is_none() && file.try_lock().is_ok() {
                 // And they still read it: while a block runs, one starting refuses `ConcurrentBench`.
                 let _ = std::fs::write(legacy(), std::process::id().to_string());

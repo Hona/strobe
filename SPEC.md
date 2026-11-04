@@ -128,6 +128,7 @@ state.json          { "mcp_port", "helper", "engine", "last_calibration" }
 mcp-token           MCP bearer token, user-only
 experiments/<exp>/  result.json per experiment; index.jsonl lists them (§14.2)
 recordings/<rec>/   §14.1
+history/            tracked series per device, schedules (§25.6)
 builds/<key>/       variant build cache (§9.5)
 symbols/            source maps by debug ID, PDB cache
 engine/<version>/   trace_processor (§15), sha256-checked
@@ -180,6 +181,7 @@ heapsnap.rs     V8 heap snapshots: streaming parse, dominators, classes, retaine
 metrics.rs      a block's trace → metric values
 engine/         trace_processor: the only place that runs it (§15)
 store/          experiments/ and recordings/: the only place that writes them (§14)
+history/        tracked series (the only writer of history/) and change-point detection (§25)
 runner/         the bench runner link: spawns `bun`, speaks the runner protocol (§9.6)
 stats/          paired tests, intervals, modes, power, multiplicity (§9.3)
 validity/       validators, analysers, calibration, A/A (§10)
@@ -202,7 +204,7 @@ ui/             embedded viewer and calibration assets
 strobe <command> [flags]
 
 Setup      up · update · leave
-Use        status · record · bench · query · report · top
+Use        status · record · bench · query · report · top · track · history (§25)
 Internal   daemon · mcp · helper (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
@@ -2266,7 +2268,8 @@ experiments/
 ```
 
 - Experiment ids: `exp_` + 6 hex; any unique prefix works.
-- History per metric and device comes from scanning `index.jsonl` and the results it names.
+- History per series and device is `strobe track`'s own store (§25.6), not a scan of `index.jsonl`:
+  only its points carry the fingerprint that keeps environments apart.
 
 ## 15. Engine
 
@@ -2314,6 +2317,9 @@ bridges ──────┤ user-only bridge socket        apps connect out
 - Long work (bench, long records) runs in the daemon; CLI and MCP calls attach to it and can
   detach without stopping it.
 - Idle: blocked threads and one 10 s housekeeping tick.
+- Schedules (`strobe track --schedule`, §25.6): a thread wakes once a minute, reads
+  `history/schedules.json`, runs one `git rev-parse` per schedule, and starts a detached
+  `strobe track` for a ref that moved. The track runs outside the daemon and queues for the bench slot.
 
 ## 17. MCP server
 
@@ -2329,7 +2335,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | `status` | `target?`, `calibrate?` | §5.4 JSON |
 | `record` | `target`, `probes?`, `for?`, `bench?`, `ring?`, `pin?`, `name?`, `timeout?` | `{ handle, valid, summary, warnings }` |
 | `bench` | `file`, `head`, `base?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
-| `query` | `handle`, `view`, view arguments, `sql?`, `top?`, `max_bytes?` | view JSON |
+| `query` | `handle`, `view`, view arguments, `sql?`, `top?`, `max_bytes?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
 | `report` | `view`, `handles`, `format?` | `{ path, bytes }` |
 
 - `timeout` (default 600 s): a call that runs longer returns `{ id, state: "running" }`; the
@@ -2442,7 +2448,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
 | native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | `frames.presented.*` from outside; macOS driving and ScreenCaptureKit frames not yet run with the permissions granted (§24.1) |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
-| 7 | — | CI budgets, history, mesh |
+| 7 | history: `strobe track` (points, E-divisive change points, paired confirmation, bisect to the culprit, alert hooks, daemon schedules), `history`, `query history` and `query changes`, `report history` (§25) | CI budgets, mesh; cheap paired points (each commit against the previous tracked one) |
 
 Query views built: `summary` (with per-run style, layout and paint), `frames`, `threads` (a native recording's: its threads' wakes and CPU;
 its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `style`, `shifts`, `gc`, `heap` (and
@@ -2669,3 +2675,137 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   on a real display (counts and intervals against Chromium's own frames with `record --os-frames`,
   a native flip-model window), the helper's install, task start and pipe, the kernel's sampled
   profile and its rundown, and the session's CPU cost on a busy desktop.
+
+## 25. Continuous benchmarking (`track`, `history`)
+
+Regressions land between experiments, where nobody benches. `strobe track` keeps a per-device
+history of a bench file's series over commits, finds where it moved, and proves each move with a
+paired experiment before anyone hears of it. Detection, confirmation and bisection run on the
+device itself, unattended, as Pinpoint and a perf dashboard do with a person between them.
+
+### 25.1 What is compared with what
+
+| Step | Compares | Decides |
+|---|---|---|
+| point | one commit with itself: `blocks` fresh launches (default 6) as a 3-pair A/A | nothing: a value with an interval |
+| detection | the points of one series, in commit order | a suspicion and its commit range |
+| confirmation | the commit after the change (`bad`) with the one before it (`good`): a paired A/B, `--pairs auto` (§9.1) | `confirmed`, `rejected` or `unclear` |
+| bisection | each first-parent commit in `good..bad` with `good` (§9.7) | the culprit commit |
+
+**Only confirmed changes alert (rule 1, valid or nothing).** A point is single-build blocks from one
+launch session of the machine: blocks of one day share its background load, thermal state and
+caches, and two points compare two days, not two builds. A difference between points is evidence
+for where to look; it is never a verdict. The paired A/B alternates the two builds block by block in
+one session, so drift hits both sides equally, and its interval is the one §9.3 defends. A change the
+A/B calls `same` or moves the other way is `rejected`; one without a verdict is `unclear`. Neither
+alerts, and neither is retried by itself (`strobe track --confirm <chg_…>` runs one again).
+
+### 25.2 Tracking
+
+```
+strobe track <file.bench.ts> [--ref <rev> | --range <a>..<b> [--every N]] [--filter …] [--target …] [--params …]
+             [--blocks 6] [--no-confirm] [--again] [--alert regressions|all]
+             [--alert-command '<cmd>'] [--alert-webhook <url>] [bench flags: --pin --power --reserve-cpus --runs --primary --equivalence]
+strobe track <file.bench.ts> --ref <branch> --schedule commits|nightly|<period> [the same flags]
+strobe track --schedules | --unschedule <sch_…> | --confirm [<ser_…|chg_…>]
+```
+
+- A point is one `bench --aa --head git:<commit> --pairs <blocks/2> --why never`: an ordinary
+  experiment (`exp_…`), with the bench slot, the locked-session rules (§10.5), the power plan and
+  reserved CPUs (§9.4) of any bench. Each series of the file gets a point: the median of its blocks'
+  primary values and the Hodges–Lehmann interval of those block values (in log space for ratio
+  metrics; 6 blocks cover 96.9%).
+- **A point without a value** is kept with the reason: a refused metric, fewer than 4 blocks with a
+  value, blocks both locked and unlocked, or the display turning off or on between blocks. It stays
+  in the history and the views; the detector skips it, so a refusal never splits or breaks a series.
+- `--ref` tracks one commit (default `HEAD`); `--range a..b` backfills every first-parent commit
+  from `a` (included) to `b`, `--every N` keeps every Nth and the last. A commit already tracked on
+  this device with the same file, flags and machine is skipped unless `--again` (`runs.jsonl`).
+- strobe never fetches: a ref moves when the user or their tooling fetches.
+- After the points, the detector runs on every series of the file, and each new suspected change
+  is confirmed (unless `--no-confirm`), then bisected and alerted.
+
+### 25.3 Detection
+
+E-divisive with means (Matteson and James 2014), as MongoDB's and Apache Otava's (Hunter's) nightly
+performance tooling runs it, with Otava's deterministic significance step:
+
+- Binary segmentation: a window splits at the point that maximises the energy statistic Q̂ (α = 1),
+  each side at least 3 points; accepted splits are tested again between their final neighbours until
+  none drops.
+- A split stands only when all hold: a Mann–Whitney rank test on the two sides' blocks gives
+  p < 0.001; the shift of the sides' medians is at least the equivalence bound (`--equivalence`, the
+  project's, else 2%); and it is at least 3 times the point-to-point spread (1.4826·MAD of each
+  point's distance from its side's median). Blocks of one point share a day, so the rank test alone
+  would call one noisy day a change; the spread rule keeps suspicions to moves larger than days
+  differ. Six valid points are the least the detector looks at.
+- Why this method: it assumes no distribution (benchmark values are skewed and multimodal), finds
+  shifts in the mean of any size without a penalty or hazard rate to tune (PELT needs a cost model
+  and a penalty; a Bayesian online detector needs a hazard rate and a likelihood, and answers with
+  probabilities that need a threshold), is deterministic, and has years of use on exactly this
+  problem (noisy nightly points, one per commit). Its false alarms are cheap here because nothing
+  alerts before a paired confirmation.
+- A suspicion is `(series, good, bad)`: the last valid point before the change and the first after.
+  One already known around that place (confirming, confirmed, rejected, unclear) is not raised again.
+
+### 25.4 Confirmation and bisection
+
+The confirmation is `bench --base git:<good> --head git:<bad>` narrowed to the series (`--filter`,
+`--target`, `--params`, `--primary`), `--pairs auto`, `--why never`, queued on the device's bench
+slot like any bench. `confirmed` needs the primary decided (§9.1) with its interval on the side the
+history moved. Then the culprit: the one commit when `good..bad` holds one, else `bench --bisect
+good..bad` (§9.7) whose step 0 is the confirmation itself (not run again). A stop (exit 130) or a
+failed confirmation leaves the change `suspected` for the next run.
+
+**Alerts.** A confirmed regression (a confirmed change of either direction with `--alert all`) runs
+the hooks once its culprit is known: `--alert-command` through the shell (`cmd /d /s /c` on
+Windows, `sh -c` elsewhere) with the payload on stdin and its file in `STROBE_ALERT_FILE` (60 s), and
+`--alert-webhook` as a JSON `POST` through curl (20 s). The payload is the series, the change, the
+paired verdict with its interval and the culprit: no trace, recording or string from the app. A
+webhook sends that summary where the user pointed it (rule 9: the user's choice). Schedules keep
+their hooks.
+
+### 25.5 Views
+
+- `strobe history` lists this device's series (points, last value, sparkline, open changes,
+  fingerprint); `strobe history <ser_…|file>` shows a series' points (commit, subject, median,
+  interval, n, the reason for a missing value), a sparkline, and its changes with the history's shift,
+  the paired verdict, the culprit and the alert.
+- `query history [<ser_…|file>]`, `query changes [<ser_…|file>]`, `query <ser_…> history|changes`:
+  the same as JSON. Agents use them through MCP's `query` tool (rule 8: views, not tools).
+- `report history <ser_…|file>`: a self-contained page (`viewer/history.html`, the report viewer's
+  look): each series' points with their intervals over commits, segment medians, change points
+  coloured by state, the culprit, and the tables.
+
+### 25.6 Storage and schedules
+
+```
+history/
+  schedules.json         the daemon's schedules
+  sch_<id>.lock          held by the schedule's running track
+  <device>/
+    ser_<8 hex>.jsonl    one series, append-only: a `series` line, then `point` and `change` events
+    runs.jsonl           every track run: commit, experiment, outcome
+    alerts/<chg>.json    each alert's payload
+```
+
+- **One device, one fingerprint, one series.** A series is (device, repository by its root commit,
+  bench file, series label, primary metric) on one fingerprint: OS build, CPU, GPU adapters and
+  driver versions, VM, strobe version, power plan used, battery, pinning, runs per block, session
+  lock state, console display state and target kind. A change of any of them starts a new series:
+  points across it are never compared. Devices never mix (`--on` results stay with the device that
+  ran them).
+- Events append; a change's state is its latest event's fields over the earlier ones. Points are in
+  commit order (commits reachable from it, committer time, time tracked).
+- **Schedules** (§16): the daemon checks each once a minute (one `git rev-parse` per schedule).
+  `commits` tracks the ref whenever it points at a commit not tracked yet; `nightly` or a period
+  (`6h`, `2d`) tracks it at most once per period, when it moved. The daemon starts a detached
+  `strobe track --ref <commit> --from-schedule <id>`, which holds the schedule's lock (a slow run
+  is never doubled) and queues for the bench slot like any bench: it waits for an unlock when its
+  series need a presenting window, and series that run through a lock run locked.
+
+Checked on adais (2026-11-05, session locked, script target, a throwaway repository of 20 commits
+with 30% more work planted at commit 11, tracked every third commit): 8 points (50.1–51.4 ms before,
+68.6–69.7 ms after, each ±1–3 ms), one suspected regression +37% between commits 10 and 13
+(p 3·10⁻⁹), confirmed by the paired A/B (+35% [+31% … +37%]), bisected in 2 more steps to commit 11,
+and the alert command ran with the payload.

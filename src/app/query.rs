@@ -15,6 +15,10 @@ pub fn run(args: &Args) -> Result<Output> {
     let handle = args.pos.first().ok_or_else(|| Error::usage("query needs a handle: strobe query rec_… <view>"))?;
     let view = args.pos.get(1).map(String::as_str).unwrap_or("summary");
     let top = args.num("top")?.unwrap_or(15.0) as usize;
+    // Tracked history (SPEC §25.5): `query history`, `query changes`, `query <ser_…> history|changes`.
+    if handle == "history" || handle == "changes" || handle.starts_with("ser_") {
+        return super::history::query(args);
+    }
     if let Some(dir) = store::resolve(handle).ok().filter(|d| store::is_experiment(d)) {
         if !dir.join("result.json").exists() {
             let log = std::fs::read_to_string(dir.join("progress.log")).unwrap_or_default();

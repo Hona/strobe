@@ -8,6 +8,9 @@ use serde_json::{Value, json};
 
 pub fn run(args: &Args) -> Result<Output> {
     let view = args.pos.first().ok_or_else(|| Error::usage("report <view> <handle…>: views experiment, recording"))?;
+    if view == "history" {
+        return super::history::report(args);
+    }
     let handle = args.pos.get(1).ok_or_else(|| Error::usage("report needs a handle"))?;
     let dir = store::resolve(handle)?;
     let experiment = store::is_experiment(&dir);

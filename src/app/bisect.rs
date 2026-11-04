@@ -15,6 +15,12 @@ use std::process::Command;
 /// `good`, until one commit is left: the culprit. A step without a verdict can hide the culprit
 /// behind it, so the result names those steps and is `unclear` instead of found.
 pub fn run(args: &Args, range: &str) -> Result<Output> {
+    run_from(args, range, None)
+}
+
+/// A bisect whose step 0 (`bad` against `good`) already ran: a tracked change's paired confirmation
+/// (SPEC §25.4) is that bench, so the bisect does not run it again.
+pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Result<Output> {
     let file = args.pos.first().ok_or_else(|| Error::usage("bench needs a bench file"))?;
     let file = std::fs::canonicalize(file).map_err(|_| Error::usage(format!("no such bench file: {file}")))?;
     let root = config::project_root(file.parent().unwrap_or(Path::new(".")));
@@ -31,7 +37,10 @@ pub fn run(args: &Args, range: &str) -> Result<Output> {
     progress(format!("strobe bisect {range} · {} commits on the first-parent line · {id}", candidates.len()));
     let line: Vec<Value> = candidates.iter().map(|c| json!({ "commit": c, "short": short(c), "subject": subject(&root, c) })).collect();
     let first_good = good.clone();
-    let first = step(args, &id, &log, &root, 0, &good, &bad)?;
+    let first = match first {
+        Some(out) => step_json(out, &root, 0, &good, &bad)?,
+        None => step(args, &id, &log, &root, 0, &good, &bad)?,
+    };
     let direction = moved(&first);
     let mut steps = vec![first];
     // Steps without a verdict, with the `good` each was benched against: the culprit may hide there.
@@ -101,6 +110,11 @@ fn step(args: &Args, id: &str, log: &Path, root: &Path, k: usize, base: &str, he
     progress(format!("\nstep {k}  {} against {}", short(head), short(base)));
     let out = super::bench::run(&a)?;
     super::progress_to(Some(log.to_path_buf()));
+    step_json(&out, root, k, base, head)
+}
+
+/// A step as the bisect keeps it, from the bench that ran it.
+fn step_json(out: &Output, root: &Path, k: usize, base: &str, head: &str) -> Result<Value> {
     let series = out.json["series"].as_array().cloned().unwrap_or_default();
     if series.len() != 1 {
         return Err(Error::usage(format!("--bisect follows one series, and the file has {} here: narrow it with --filter, --target or --params", series.len())));

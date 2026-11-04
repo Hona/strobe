@@ -7,6 +7,7 @@ pub mod driver;
 pub mod engine;
 pub mod etw;
 pub mod heapsnap;
+pub mod history;
 pub mod host;
 pub mod metrics;
 pub mod model;

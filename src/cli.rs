@@ -33,6 +33,10 @@ const SWITCHES: &[&str] = &[
     "no-browser",
     "plan",
     "pilot",
+    "confirm",
+    "no-confirm",
+    "schedules",
+    "again",
 ];
 
 #[derive(Clone)]
@@ -171,6 +175,14 @@ Use
                                   the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
                                   and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory
                                   (--no-browser: print the URL instead of opening it)
+  track <file.bench.ts> [--ref <rev> | --range a..b [--every N]] [--filter …] [--blocks 6] [--no-confirm]
+        [--alert-command '<cmd>'] [--alert-webhook <url>] [--alert regressions|all]
+                                  a point per series per commit in this device's history; change points are confirmed
+                                  by a paired A/B of the commits around them, then bisected; only confirmed ones alert
+  track <file> --ref <branch> --schedule commits|nightly|6h    the daemon tracks the branch (--schedules, --unschedule <id>)
+  track --confirm [<ser_…|chg_…>] confirm suspected changes (or one again)
+  history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits
+                                  (query history|changes, query <ser_…> history|changes; report history <ser_…|file>)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,

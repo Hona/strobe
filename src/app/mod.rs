@@ -4,6 +4,7 @@ pub mod bench;
 pub mod bisect;
 pub mod fmt;
 pub mod helper;
+pub mod history;
 pub mod mcp;
 pub mod open;
 pub mod outside;
@@ -13,6 +14,7 @@ pub mod report;
 pub mod run;
 pub mod status;
 pub mod top;
+pub mod track;
 pub mod up;
 pub mod update;
 
@@ -84,6 +86,8 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),
+        "track" => track::run(args),
+        "history" => history::run(args),
         "up" => up::run(args),
         "update" => update::run(args),
         "leave" => up::leave(args),

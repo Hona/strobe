@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Strobe History</title>
+<style>
+:root {
+  --canvas: #f6f7f9; --surface: #ffffff; --surface-subtle: #f0f2f6;
+  --ink: #0f172a; --ink-2: #475569; --ink-3: #64748b; --ink-4: #94a3b8;
+  --border: rgba(15, 23, 42, 0.085); --hairline: rgba(15, 23, 42, 0.065);
+  --shadow: 0 1px 3px rgba(15, 23, 42, 0.04), 0 1px 2px rgba(15, 23, 42, 0.02);
+  --win: #059669; --win-bg: rgba(5, 150, 105, 0.09); --win-border: rgba(5, 150, 105, 0.24);
+  --loss: #dc2626; --loss-bg: rgba(220, 38, 38, 0.09); --loss-border: rgba(220, 38, 38, 0.24);
+  --warn: #d97706; --warn-bg: rgba(217, 119, 6, 0.085); --warn-border: rgba(217, 119, 6, 0.26);
+  --neutral-pill-bg: rgba(15, 23, 42, 0.055); --neutral-pill-border: rgba(15, 23, 42, 0.12);
+  --accent: #2563eb; --head-tone: #1e293b; --base-tone: #94a3b8;
+  --sans: "Inter", -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, system-ui, sans-serif;
+  --display: "SF Pro Display", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --canvas: #0b0d11; --surface: #12161e; --surface-subtle: #171c26;
+    --ink: #f1f5f9; --ink-2: #cbd5e1; --ink-3: #94a3b8; --ink-4: #64748b;
+    --border: rgba(255, 255, 255, 0.085); --hairline: rgba(255, 255, 255, 0.065);
+    --shadow: 0 2px 8px rgba(0, 0, 0, 0.28);
+    --win: #34d399; --win-bg: rgba(52, 211, 153, 0.12); --win-border: rgba(52, 211, 153, 0.28);
+    --loss: #f87171; --loss-bg: rgba(248, 113, 113, 0.12); --loss-border: rgba(248, 113, 113, 0.28);
+    --warn: #fbbf24; --warn-bg: rgba(251, 191, 36, 0.10); --warn-border: rgba(251, 191, 36, 0.28);
+    --neutral-pill-bg: rgba(255, 255, 255, 0.07); --neutral-pill-border: rgba(255, 255, 255, 0.13);
+    --accent: #60a5fa; --head-tone: #e2e8f0; --base-tone: #64748b;
+  }
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+html { background: var(--canvas); color: var(--ink); font: 14px/20px var(--sans); -webkit-font-smoothing: antialiased; }
+.shell { max-width: 1040px; margin: 0 auto; padding: 28px 32px 80px; display: flex; flex-direction: column; gap: 26px; }
+.mono { font: 12px/18px var(--mono); font-variant-numeric: tabular-nums; }
+h1 { font: 600 22px/28px var(--display); letter-spacing: -0.01em; }
+h2 { font: 600 16px/22px var(--display); }
+.sub { color: var(--ink-3); }
+.card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; box-shadow: var(--shadow); padding: 18px 20px; display: flex; flex-direction: column; gap: 14px; }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 1px 8px; border-radius: 999px; font-size: 12px; line-height: 18px; border: 1px solid var(--neutral-pill-border); background: var(--neutral-pill-bg); color: var(--ink-2); white-space: nowrap; }
+.pill.loss { color: var(--loss); background: var(--loss-bg); border-color: var(--loss-border); }
+.pill.win { color: var(--win); background: var(--win-bg); border-color: var(--win-border); }
+.pill.warn { color: var(--warn); background: var(--warn-bg); border-color: var(--warn-border); }
+.chart { position: relative; }
+.chart svg { width: 100%; height: 240px; display: block; }
+.tip { position: absolute; pointer-events: none; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; box-shadow: var(--shadow); padding: 8px 10px; font-size: 12px; line-height: 17px; display: none; max-width: 360px; z-index: 2; }
+table { width: 100%; border-collapse: collapse; }
+th { text-align: left; font-weight: 500; color: var(--ink-3); font-size: 12px; padding: 4px 8px; border-bottom: 1px solid var(--border); }
+td { padding: 4px 8px; border-bottom: 1px solid var(--hairline); vertical-align: top; }
+td.num { text-align: right; white-space: nowrap; }
+tr.invalid td { color: var(--ink-4); }
+details summary { cursor: pointer; color: var(--ink-3); font-size: 13px; }
+.legend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--ink-3); font-size: 12px; }
+.note { color: var(--ink-3); font-size: 13px; }
+</style>
+</head>
+<body>
+<div class="shell" id="app"></div>
+<script>
+const DATA = /*STROBE_DATA*/null;
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+function val(v, unit) {
+  if (v == null || !isFinite(v)) return "—";
+  const d = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2;
+  if (unit === "bytes") { const a = Math.abs(v); return a >= 1048576 ? (v / 1048576).toFixed(1) + " MB" : a >= 1024 ? (v / 1024).toFixed(0) + " KB" : v.toFixed(0) + " B"; }
+  if (unit === "%") return v.toFixed(d) + "%";
+  if (unit === "count") return Number.isInteger(v) ? String(v) : v.toFixed(1);
+  return v.toFixed(d) + (unit ? " " + unit : "");
+}
+const pct = r => r == null || !isFinite(r) ? "—" : (r > 0.0005 ? "+" : r < -0.0005 ? "−" : "") + Math.abs(r * 100).toFixed(Math.abs(r) < 0.1 ? 1 : 0) + "%";
+const tone = c => c.state === "confirmed" ? (c.direction === "regression" ? "loss" : "win") : c.state === "rejected" ? "" : "warn";
+const colorOf = c => ({ loss: "var(--loss)", win: "var(--win)", warn: "var(--warn)", "": "var(--ink-4)" })[tone(c)];
+
+function chart(s, host) {
+  const unit = s.meta.unit || "";
+  const pts = s.points;
+  const W = 960, H = 240, L = 64, R = 12, T = 14, B = 26;
+  const ys = pts.filter(p => p.valid).flatMap(p => [p.lo ?? p.median, p.hi ?? p.median]).filter(v => v != null);
+  if (!ys.length) { host.innerHTML = `<p class="note">No point with a value yet.</p>`; return; }
+  let lo = Math.min(...ys), hi = Math.max(...ys);
+  const pad = (hi - lo) * 0.12 || Math.abs(hi) * 0.05 || 1; lo -= pad; hi += pad;
+  const x = i => L + (pts.length === 1 ? (W - L - R) / 2 : i * (W - L - R) / (pts.length - 1));
+  const y = v => T + (hi - v) / (hi - lo) * (H - T - B);
+  let g = "";
+  for (let k = 0; k <= 4; k++) {
+    const v = lo + (hi - lo) * k / 4;
+    g += `<line x1="${L}" x2="${W - R}" y1="${y(v)}" y2="${y(v)}" stroke="var(--hairline)"/><text x="${L - 6}" y="${y(v) + 4}" text-anchor="end" font-size="11" fill="var(--ink-3)">${esc(val(v, unit))}</text>`;
+  }
+  // Segment medians between change points that are not rejected.
+  const cps = s.changes.filter(c => c.state !== "rejected").map(c => ({ c, i: pts.findIndex(p => p.commit === c.bad) })).filter(o => o.i > 0).sort((a, b) => a.i - b.i);
+  const bounds = [0, ...cps.map(o => o.i), pts.length];
+  for (let k = 0; k + 1 < bounds.length; k++) {
+    const seg = pts.slice(bounds[k], bounds[k + 1]).filter(p => p.valid).map(p => p.median).sort((a, b) => a - b);
+    if (!seg.length) continue;
+    const m = seg.length % 2 ? seg[(seg.length - 1) / 2] : (seg[seg.length / 2 - 1] + seg[seg.length / 2]) / 2;
+    g += `<line x1="${x(bounds[k])}" x2="${x(bounds[k + 1] - 1)}" y1="${y(m)}" y2="${y(m)}" stroke="var(--accent)" stroke-opacity="0.45" stroke-width="2"/>`;
+  }
+  for (const { c, i } of cps) {
+    const cx = (x(i - 1) + x(i)) / 2;
+    g += `<line x1="${cx}" x2="${cx}" y1="${T}" y2="${H - B}" stroke="${colorOf(c)}" stroke-dasharray="4 3"/><text x="${cx + 4}" y="${T + 10}" font-size="11" fill="${colorOf(c)}">${esc(c.state)}${c.culprit && c.culprit.short ? " · " + esc(c.culprit.short.slice(0, 7)) : ""}</text>`;
+  }
+  pts.forEach((p, i) => {
+    if (!p.valid) { g += `<text x="${x(i)}" y="${H - B - 4}" text-anchor="middle" font-size="12" fill="var(--ink-4)" data-i="${i}">×</text>`; return; }
+    if (p.lo != null && p.hi != null) g += `<line x1="${x(i)}" x2="${x(i)}" y1="${y(p.lo)}" y2="${y(p.hi)}" stroke="var(--base-tone)" stroke-width="2"/>`;
+    g += `<circle cx="${x(i)}" cy="${y(p.median)}" r="3.5" fill="var(--head-tone)"/>`;
+  });
+  pts.forEach((p, i) => { g += `<rect x="${x(i) - 8}" y="${T}" width="16" height="${H - T - B}" fill="transparent" data-i="${i}"/>`; });
+  const step = Math.max(1, Math.ceil(pts.length / 10));
+  pts.forEach((p, i) => { if (i % step === 0 || i === pts.length - 1) g += `<text x="${x(i)}" y="${H - 8}" text-anchor="${pts.length > 1 && i === 0 ? "start" : pts.length > 1 && i === pts.length - 1 ? "end" : "middle"}" font-size="10" fill="var(--ink-3)" font-family="var(--mono)">${esc((p.short || "").slice(0, 7))}</text>`; });
+  host.innerHTML = `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">${g}</svg><div class="tip"></div>`;
+  const tip = host.querySelector(".tip");
+  host.querySelector("svg").addEventListener("mousemove", e => {
+    const i = e.target.dataset && e.target.dataset.i;
+    if (i == null) { tip.style.display = "none"; return; }
+    const p = pts[+i];
+    tip.innerHTML = `<div class="mono">${esc(p.short)} · ${esc((p.at || "").slice(0, 16))}</div><div>${esc(p.subject)}</div>` +
+      (p.valid ? `<div class="mono">${esc(val(p.median, unit))} [${esc(val(p.lo, unit))} … ${esc(val(p.hi, unit))}] · ${p.n} blocks</div>` : `<div>no value: ${esc(p.why)}</div>`) +
+      `<div class="mono sub">${esc(p.exp)}</div>`;
+    const r = host.getBoundingClientRect();
+    tip.style.display = "block";
+    tip.style.left = Math.min(e.clientX - r.left + 12, r.width - 300) + "px";
+    tip.style.top = (e.clientY - r.top + 12) + "px";
+  });
+  host.querySelector("svg").addEventListener("mouseleave", () => tip.style.display = "none");
+}
+
+function changeRow(s, c) {
+  const unit = s.meta.unit || "";
+  const f = (v, rel) => rel ? pct(v) : val(v, unit);
+  const cf = c.confirm || {};
+  return `<tr><td class="mono">${esc(c.id)}</td><td><span class="pill ${tone(c)}">${esc(c.state)} ${esc(c.direction)}</span></td>
+    <td class="mono">${esc(c.good_short)}..${esc(c.bad_short)}</td><td class="num mono">${esc(f(c.estimate, c.relative))}</td>
+    <td class="mono">${cf.verdict ? esc(f(cf.estimate, cf.relative)) + " [" + esc(f(cf.lo, cf.relative)) + " … " + esc(f(cf.hi, cf.relative)) + "] " + esc(cf.verdict) + "<br><span class='sub'>" + esc(cf.exp) + "</span>" : esc(c.why || "")}</td>
+    <td>${c.culprit && c.culprit.short ? `<span class="mono">${esc(c.culprit.short)}</span> ${esc(c.culprit.subject)}` : c.bisect && c.bisect.verdict ? esc(c.bisect.verdict) : "—"}${c.alerted ? `<div class="sub">alerted: ${esc(c.alerted.text)}</div>` : ""}</td></tr>`;
+}
+
+function render() {
+  const app = document.getElementById("app");
+  if (!DATA) { app.innerHTML = "<p>No data.</p>"; return; }
+  let html = `<div><h1>History</h1><div class="sub">${esc(DATA.device)} · ${DATA.series.length} series · ${esc(DATA.created)}</div></div>
+    <div class="legend"><span>● median of a commit's blocks</span><span>│ its 95% interval</span><span>— segment median</span><span>┊ change point (confirmed regressions red, improvements green, unconfirmed amber, rejected grey)</span><span>× no value (refused)</span></div>`;
+  DATA.series.forEach((s, k) => {
+    const fp = s.meta.fingerprint || {};
+    const m = fp.machine || {};
+    html += `<section class="card"><div><h2>${esc(s.meta.label)} · ${esc(s.meta.metric)}</h2>
+      <div class="sub mono">${esc(s.id)} · ${esc(s.meta.file)}</div>
+      <div class="sub">${esc([m.os, m.cpu, m.gpu, "strobe " + m.strobe, "power " + fp.power, "session " + fp.session, "display " + fp.display, fp.pin].filter(Boolean).join(" · "))}</div></div>
+      <div class="chart" id="c${k}"></div>
+      ${s.changes.length ? `<table><tr><th>change</th><th>state</th><th>range</th><th>history</th><th>paired A/B</th><th>culprit</th></tr>${s.changes.map(c => changeRow(s, c)).join("")}</table>` : `<p class="note">No change points.</p>`}
+      <details><summary>${s.points.length} points</summary><table><tr><th>date</th><th>commit</th><th>subject</th><th>median</th><th>95% interval</th><th>n</th><th>experiment</th></tr>
+      ${s.points.slice().reverse().map(p => `<tr class="${p.valid ? "" : "invalid"}"><td class="mono">${esc((p.at || "").slice(0, 10))}</td><td class="mono">${esc(p.short)}</td><td>${esc(p.subject)}</td>
+        <td class="num mono">${p.valid ? esc(val(p.median, s.meta.unit)) : "—"}</td><td class="mono">${p.valid ? esc(val(p.lo, s.meta.unit)) + " … " + esc(val(p.hi, s.meta.unit)) : esc(p.why)}</td><td class="num mono">${p.n}</td><td class="mono sub">${esc(p.exp)}</td></tr>`).join("")}</table></details>
+      <p class="note">Points are single-build blocks and never decide anything: a change point is a suspicion until a paired A/B of the commits around it confirms it.</p></section>`;
+  });
+  app.innerHTML = html;
+  DATA.series.forEach((s, k) => chart(s, document.getElementById("c" + k)));
+}
+render();
+</script>
+</body>
+</html>

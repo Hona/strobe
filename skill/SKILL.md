@@ -32,6 +32,11 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         printed to stdout (the file's path on stderr)
     strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]   a native app from the line it prints when ready (to the next line), not a fixed settle
     strobe run [--pin auto] [--reserve-cpus on|off] -- <command>   your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs
+    strobe track <file.bench.ts> [--ref <rev> | --range a..b [--every N]] [--filter <case>] [--alert-command '<cmd>'] [--alert-webhook <url>]
+        a point per series per commit in this device's history (6 single-build blocks, median and interval); change points
+        (E-divisive) are only suspicions: each is confirmed by a paired A/B of the commits around it, then bisected to the
+        culprit; only confirmed regressions alert. `--schedule commits|nightly|6h` with `--ref <branch>`: the daemon does it
+    strobe history [<ser_…|file>]    tracked series: points, sparkline, changes, culprits (query history|changes; report history <ser_…>)
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
@@ -100,6 +105,7 @@ Why is it slow? `bench … --why always` (or `record --probes attribution`), the
 What stands out? `query <rec or exp> insights`: forced layout, GC pressure, long tasks, work while idle, detached DOM, background load, unresolved time, and for an experiment the biggest base/head movers, each with the command that shows it.
 Where is the memory? `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting). A native app or process: what holds it (host heap, GPU memory mapped in, unmapped commit, shared, files, images; `--by layer` for totals) with `gpu.vram` beside it. On Windows, `memory.app.private` also counts the VRAM a GPU driver maps into the process: quote `memory.app.host` for the app's own memory.
 Which commit moved it? `bench <file> --filter <case> --bisect <good>..<bad>` (one series; each step is a full experiment).
+Did anything regress since last week? `track <file> --range <old>..<branch> --every 3` (or a `--schedule` on the branch), then `history <file>` or `query changes`: a `confirmed` change has a paired verdict and a culprit; `suspected`, `unclear` and `rejected` are not findings. A series is one device and environment: a new strobe, driver, OS build, power plan or lock state starts another.
 Which objects are alive? `query <rec> heap` (classes by retained size, detached DOM, retainer paths); `query <base rec>..<head rec> heap` compares two.
 Does a case leak? `bench <file> --filter <case> --head . --probes memory --repeat 10`: growth per run of the JS heap and DOM with an interval, and the objects from the first half still alive at the end (`query <rec> leaks`). On a native target it reads the processes' memory between runs: growth per run of `memory.app.host` with an interval (`query <rec> memory --at 0` for the first reading).
 Is an app leaking over time? `record <target> --probes memory --for 60s` (do the suspect thing meanwhile, or point it at a page that does), then `query <rec> leaks`: objects from the first half still alive at the end, with what keeps them.

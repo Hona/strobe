@@ -46,14 +46,14 @@ fn tools() -> Value {
             "reserve-cpus": s("auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows), on (every block, --check too) or off"),
             "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
             "timeout": n("seconds before returning while it keeps running (default 600)") } } },
-        { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), shifts (the largest layout shifts and the elements they moved), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class), leaks (memory recordings: objects from the first half still alive at the end, with retainer paths), memory (by process, layer or allocator; rec_a..rec_b compares), insights (rules with evidence; exp_… too); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments).",
+        { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), shifts (the largest layout shifts and the elements they moved), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class), leaks (memory recordings: objects from the first half still alive at the end, with retainer paths), memory (by process, layer or allocator; rec_a..rec_b compares), insights (rules with evidence; exp_… too); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments). Tracked history (strobe track): handle history lists this device's series (or history <ser_…|bench file> one series' points with intervals), handle changes lists suspected and confirmed changes with their paired A/B and culprit; handle ser_… takes views history and changes.",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_… or exp_… (a unique prefix works)"), "view": s("summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress, insights)"),
+            "handle": s("rec_… or exp_… (a unique prefix works); history, changes or ser_… for tracked history"), "view": s("summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress, insights)"),
             "sql": s("SQL for the sql view"), "by": s("hotspots and alloc: function, file, package; memory: process, layer, allocator"), "top": n("rows (default 15)"),
             "reveal": b("heap: show string values (redacted by default; snapshots can hold user content)"), "at": s("memory: which census (0 the first, -1 the last, default the last)") } } },
         { "name": "report", "description": "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_… or exp_…"), "view": s("experiment or recording (default from the handle)"), "format": s("html (default) or md") } } },
+            "handle": s("rec_…, exp_… or ser_… (a tracked series)"), "view": s("experiment, recording or history (default from the handle)"), "format": s("html (default) or md") } } },
     ])
 }
 
@@ -92,7 +92,15 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
         }
         "report" => {
             let h = get("handle").ok_or_else(|| Error::usage("report needs handle"))?;
-            let view = get("view").unwrap_or_else(|| if store::resolve(&h).is_ok_and(|d| store::is_experiment(&d)) { "experiment".into() } else { "recording".into() });
+            let view = get("view").unwrap_or_else(|| {
+                if h.starts_with("ser_") {
+                    "history".into()
+                } else if store::resolve(&h).is_ok_and(|d| store::is_experiment(&d)) {
+                    "experiment".into()
+                } else {
+                    "recording".into()
+                }
+            });
             a.push(view);
             a.push(h);
         }
@@ -247,6 +255,8 @@ pub fn daemon(_args: &Args) -> Result<()> {
     let log = paths::state_dir().join("log");
     let _ = std::fs::create_dir_all(&log);
     unsafe { std::env::set_var("STROBE_QUIET", "1") };
+    // Tracked branches (`strobe track --schedule`): checked once a minute.
+    std::thread::spawn(super::track::daemon_loop);
     let handler: Arc<dyn Fn(http::Request) -> http::Response + Send + Sync> = Arc::new(move |req: http::Request| serve(req, port, &token));
     http::serve(listener, handler);
     Ok(())

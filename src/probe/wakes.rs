@@ -132,10 +132,12 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeM
         .into_iter()
         .map(|((pid, tid), (n, cpu, known))| {
             let module = modules.get(&tid);
+            // macOS counts wakes per process (the tid 0 row): its threads' own wakes are unknown, not 0.
+            let unknown = cfg!(target_os = "macos") && tid != 0;
             serde_json::json!({
-                "pid": pid, "tid": tid, "name": names.get(&tid), "switches": n,
+                "pid": pid, "tid": tid, "name": names.get(&tid), "switches": if unknown { None } else { Some(n) },
                 "module": module.map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m)), "origin": module.map(|m| origin(m)),
-                "wakes_per_s": if total_ms > 0.0 { n as f64 / (total_ms / 1e3) } else { f64::NAN },
+                "wakes_per_s": if unknown { None } else if total_ms > 0.0 { Some(n as f64 / (total_ms / 1e3)) } else { Some(f64::NAN) },
                 "cpu_ms_per_run": if known { Some(cpu / runs) } else { None },
             })
         })

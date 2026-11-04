@@ -204,7 +204,7 @@ ui/             embedded viewer and calibration assets
 strobe <command> [flags]
 
 Setup      up · update · leave
-Use        status · record · bench · plan · query · report · top · track · history (§25)
+Use        status · record · bench · plan · query · report · open (§11.4) · top · track · history (§25)
 Internal   daemon · mcp · helper (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
@@ -1766,6 +1766,84 @@ An experiment's insights start with the largest base/head movers per series: CPU
 forced layout (≥ 1 ms/run) and allocations (≥ 64 KB/run) by function, matched by name and file
 name. Core migration needs the deep helper and is not built.
 
+### 11.4 Perfetto (`strobe open`)
+
+`strobe open <rec_…|exp_…[/head|base|<block>|<case>]> [--no-browser]` opens one recording in the
+Perfetto UI with everything strobe knows on one timeline. An experiment handle picks its head
+attribution recording (else its check recording, else its first kept block); `/base`, `/head`,
+`/<n>` (the n-th block over all series, from 0) and `/<case>` pick others, and a wrong pick lists
+what the experiment kept. `--perfetto` is the default viewer; `--no-browser` prints the URL.
+
+**The trace** (`perfetto.pftrace` in the recording, written whole, rebuilt on every open) is
+protobuf written by hand (no generated code, no C):
+
+- The recording's Chrome trace first, byte for byte: a trace is a sequence of packets, so strobe's
+  appended packets keep both whole. strobe never adds process or thread descriptors to a trace that
+  has them (a second thread track would read as a reused tid).
+- Stack samples as `StackSample` packets (trace_processor's `stack_sample` table, the UI's
+  StackSamples plugin: a Callstacks track per sampled thread with a flame chart, and the area
+  selection's Callstack Flamegraph). One sequence per source: `javascript` (V8 CPU profiles, each
+  sample weighted by the time to the next one, `(idle)` left out; `cpu-main` profiles on the
+  browser's main thread, the others on the thread that ran strobe's marks), `javascript.allocations`
+  (sampled allocations in bytes; they carry no time and all stand at the first measured run, which
+  the counter's name says) and `native` (ETW, perf, `sample` or strobe's own sampler, weighted by the
+  sampling interval; untimed samples count samples, so the UI offers no flame chart for them). Frames
+  are interned with their source-mapped (§8.3) or PDB/DWARF (§12.2) name, source file and line, kind
+  (native, kernel, JIT JavaScript, GC, runtime) and a mapping (the module, or the script URL); each
+  inline frame is its own frame, so the flame graph shows what was inlined where.
+- strobe's own data as tracks under one `strobe <rec>` root: `recording` (one slice over the
+  recording whose arguments are its meta: validity, timing, probes, note, warnings, environment,
+  values, OS averages), `runs and phases` (from strobe's marks in the Chrome trace, or a native
+  block's `frames.json`, with `runs.json` per run), `marks`, `inputs strobe sent`, `accessibility tree
+  changes`, `OS presents` (every present by process as a slice named by its fate, the app's frames on
+  screen, their interval in ms, vertical blanks per display path), `memory · <process>` (the readings
+  in MB), and per thread its CPU (% of a core) and wakes per second from the thread timeline (§7.4),
+  under the thread's own track when the recording has no Chrome trace. The OS sampler keeps window
+  averages, not ticks, so GPU engine use is an argument of `recording`, not a counter.
+- One clock: strobe's packets carry the host's monotonic clock (`BUILTIN_CLOCK_MONOTONIC`, QPC on
+  Windows, which V8's profile timestamps share), Chrome's clock snapshots map it; times strobe read
+  from the Chrome trace by SQL go back on its own clock. A trace without a Chrome trace gets one
+  identity clock snapshot. Checked on adais: the profile's start, the trace's marks and the slices
+  line up on QPC.
+
+Before anything opens it, trace_processor reads the file back: samples per source (a short count is
+printed as a warning), frames with names and source files, tracks, and its error stats.
+
+**Opening**, local only: the UI is the engine release's own `perfetto-ui.zip` (§15), unpacked once
+under the engine folder and served by the daemon at `/perfetto/` (an older daemon or none: by
+`strobe open` itself until Ctrl-C). Each open starts its own `trace_processor_shell server http` on
+a free port with that origin allowed (`--additional-cors-origins`), no trace loaded and an hour's
+idle timeout, and registers a session: a random token in `run/perfetto/<token>.json` (a day) naming
+the trace. The browser opens `/perfetto/s/<token>`, a page that turns on the UI's
+`cspAllowAnyWebsocketPort` flag and off its telemetry in that origin's storage, then opens
+`#!/?url=…/perfetto/t/<token>/<rec>.pftrace&rpc_port=<port>&startupCommands=…`: the UI fetches the
+trace from the daemon and streams it to the native trace_processor (no "loaded trace" prompt), pins
+`runs and phases` and the Callstacks tracks, and expands strobe's group. With several sampled
+threads in a process the UI selects the whole process at load, so the flame graph is up at once;
+a single sampled thread needs a drag over its pinned Callstacks track. Reloading the page asks once
+whether to reuse the loaded trace. If trace_processor cannot start, the UI loads the trace itself
+(WebAssembly). Every UI response carries a Content-Security-Policy of its own (this origin and
+127.0.0.1 only, the index page's inline script by hash): the UI's own policy lets it reach Google
+analytics, an extension server and a userscript, and a browser enforces both, so nothing leaves
+the machine (checked: the userscript request is blocked by CSP).
+
+Checked on adais in headless Edge (session locked): a native block (2,139 samples from strobe's own
+sampler, 7 threads) opened over the native trace_processor with the flame graph of the whole process
+up at load and a drag over one thread's Callstacks track giving that thread's (Rust names, file and
+line); a 145 MB attribution trace (53,308 JavaScript samples, all 540 script frames source-mapped)
+opened with runs and phases and the renderer's Callstacks tracks pinned. Not yet seen: a JavaScript
+flame graph drawn after a drag (headless Edge stayed at "Computing graph" on traces with a Chrome
+trace, while trace_processor ran the same flame graph query in 3 s); check in a real window.
+
+The HTML report lists `strobe open` per recording, attribution recording and kept block, as a link
+when the daemon serves the report (`/perfetto/open/<handle>` builds the trace and opens it).
+`report --format pr` adds one line after the rerun command (`open::pr_line`).
+
+When to use which: strobe's views answer with numbers and intervals (`hotspots` ranks with full
+stacks, `threads`, `frames`); Perfetto shows when things happened against each other (a long task
+beside the presents it delayed, a driver thread compiling while the UI waits) and lets a person
+browse stacks in a flame graph.
+
 ## 12. Symbols
 
 ### 12.1 JavaScript
@@ -2315,6 +2393,8 @@ recordings/rec_3f9a1c/
   runs.json             native apps: per measured run, wall and CPU time, wakes, IO, counts, accessibility elements
   frames.json           native apps: the app's pids, and per measured run its span, strobe's inputs, phase marks and accessibility change times
   threads.json          native apps: per thread wakes per second, CPU per run, name
+  timeline.json.gz      native apps: each thread's CPU and wakes per second from the launch (§7.4)
+  perfetto.pftrace      `strobe open`'s merged trace (§11.4), rebuilt on every open
 ```
 
 A native recording's stacks go to `deep.json.gz` beside these, symbolized against the variant's
@@ -2360,10 +2440,12 @@ experiments/
   `mac-amd64.zip`, `mac-arm64.zip`), downloaded by `up`, sha256-checked. No Windows arm64 build
   exists: there strobe runs the x64 build under emulation. The only place that runs it is
   `engine/`.
-- The same release's `perfetto-ui.zip` is the deep-dive viewer: the daemon serves it at
-  `/perfetto/`, connected to the recording's trace_processor.
-- One `trace_processor --httpd` per recording in use, on `127.0.0.1` and a free port, stopped
-  after 5 minutes idle.
+- The same release's `perfetto-ui.zip` (sha256-pinned, downloaded at the first `strobe open`) is
+  the deep-dive viewer: the daemon serves it at `/perfetto/`, connected to a trace_processor of the
+  same build (matching versions: the UI shows no version dialog), §11.4.
+- One `trace_processor_shell server http` per `strobe open`, on `127.0.0.1` and a free port, with
+  no trace loaded (the UI streams it in), ending itself after an hour without requests. Queries
+  (`query`, metrics) run one `trace_processor -q` each.
 - Ingest: Chrome's proto trace (`Tracing.start` with `streamFormat: "proto"`) with strobe's own
   packets (OS and GPU counters, census, phases when not in the trace) appended as counter and
   slice tracks with a `ClockSnapshot`. JSON for sources that only give JSON.
@@ -2481,7 +2563,10 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - Clock domains: Chrome's TimeTicks against QPC (Windows) and `mach_continuous_time` (macOS).
 - V8 code events in ETW for JS frames inside native stacks, on Electron.
 - Bun's WebKit inspector: sampling profiler and heap through it.
-- The self-hosted Perfetto UI against a local trace_processor on a port other than its default.
+- ~~The self-hosted Perfetto UI against a local trace_processor on a port other than its
+  default.~~ Resolved (2026-11-05, v59.1): the UI takes `rpc_port` once its
+  `cspAllowAnyWebsocketPort` flag is on, and trace_processor takes the UI's origin with
+  `--additional-cors-origins`; checked in headless Edge on adais (§11.4).
 - Solid's dev hook names for `@hona/strobe-web/solid`.
 - macOS: whether `AppUsage.accumulatedGPUTime` is ns on every GPU generation (checked against
   `Device Utilization %` on an M4); per-core frequency from IOReport; a sampler with timestamps (a
@@ -2677,8 +2762,10 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   elsewhere, without a domain (macOS shells do not export `HOSTNAME`). `update` runs the new build's
   `up` with its output relayed rather than inherited and returns when it exits, so an older build
   whose daemon inherits handles cannot hold the caller's pipe either.
-- The daemon serves `/mcp`, `/report/<handle>` and `/health` (no `/ui`, no Perfetto UI); `up` stops
-  it with the `strobe/quit` RPC. The engine runs one `trace_processor -q` per query (no `--httpd`).
+- The daemon serves `/mcp`, `/report/<handle>`, `/perfetto/` (§11.4) and `/health` (no `/ui`); it
+  accepts a GET from its own origin (the Perfetto UI fetches fonts and wasm in CORS mode) and no
+  other cross-origin request. `up` stops it with the `strobe/quit` RPC. The engine runs one
+  `trace_processor -q` per query, and one `server http` per `strobe open`.
 - Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
   are kept topmost without focus, since an occluded Chromium window stops rendering.
 - The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or

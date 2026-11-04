@@ -32,6 +32,9 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         (a driver thread that starts 25 s in and runs 30 s shows as such)
     strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: tables for a PR body,
         printed to stdout (the file's path on stderr)
+    strobe open <rec_… | exp_…[/head|base|<block>|<case>]> [--no-browser]   the recording in the Perfetto UI (local, nothing leaves
+        the machine): its Chrome trace plus CPU profiles and native stacks as flame graphs (source-mapped / PDB names, file:line),
+        runs and phases, inputs, OS presents, threads' CPU and wakes, memory, validity; --no-browser prints the URL
     strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]   a native app from the line it prints when ready (to the next line), not a fixed settle
     strobe run [--pin auto] [--reserve-cpus on|off] -- <command>   your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs
     strobe track <file.bench.ts> [--ref <rev> | --range a..b [--every N]] [--filter <case>] [--alert-command '<cmd>'] [--alert-webhook <url>]
@@ -120,6 +123,7 @@ Is a native app smooth, and where does its CPU go? `record proc:<name> --for 10s
 Where does the GPU process spend time (a frozen first frame, a slow canvas)? `query <rec> gpu` on an attribution recording, and `gpu.compile` as a bench metric. On a native or `pid:` recording, `query <rec> gpu` gives engine use and GPU memory per adapter from the OS.
 What does a launch do before it is ready? `record --bench <file>#<launch case>`: its milestones, and `query <rec> threads` for each thread's wakes and CPU from the spawn until ready (no trace needed).
 Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread, the module each started in, and whose: app, driver such as `nvwgf2umx.dll`, or os) and `query <rec> insights`. `cpu.wakes` is context switches/s (waits and preemptions, driver threads included); the insight counts the app's own threads apart.
+When did it happen, and what ran beside it? `strobe open <rec>` (or `<exp>/head`): Perfetto shows a long task beside the presents it delayed, a driver thread compiling while the UI waits, and lets a person browse stacks (drag over a Callstacks track for the flame graph). Numbers and verdicts still come from strobe's views (`hotspots`, `threads`, `frames`); Perfetto is for seeing and browsing.
 Writing the PR? `report experiment <exp> --format pr` prints the tables and the command that reruns them (paste stdout).
 
 ## Every performance claim in a PR comes from strobe

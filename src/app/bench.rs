@@ -68,6 +68,8 @@ const BACKGROUND_PCT: f64 = 25.0;
 
 /// Shown with intervals but never tested: context, not claims.
 const DESCRIPTIVE: &[&str] = &[
+    "input.rate",
+    "input.gap.p95",
     "frames.interval.p50",
     "frames.presented.p50",
     "frames.presented.p95",
@@ -178,6 +180,8 @@ struct Run {
     t1: u64,
     /// The run with its reset (ms): what it cost the block.
     total: f64,
+    /// Drags in the run: moves strobe sent per second and the 95th percentile gap (ms).
+    input: Option<(f64, f64)>,
 }
 
 /// Chromium process types (`SystemInfo.getProcessInfo`) and the metric each one's CPU goes to.
@@ -1979,6 +1983,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 n.borrow_mut().drain(None);
             }
             let c0 = counters();
+            driver.drags.borrow_mut().clear();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve).map_err(|e| {
@@ -1986,6 +1991,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             })?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
+            let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
             let (cyc1, tsc1) = cycles();
@@ -2025,7 +2031,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
                 (Some(a), Some(b)) if b > a && !roles.is_empty() => 100.0 * role1[i].saturating_sub(role0[i]) as f64 / (b - a) as f64,
                 _ => f64::NAN,
             });
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3 })
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -2214,6 +2220,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
+        // Drags: the input strobe gave, beside the frames it drew (a starved driver shows here).
+        if measured.iter().any(|r| r.input.is_some()) {
+            extra.insert("input.rate".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.0))).collect());
+            extra.insert("input.gap.p95".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.1))).collect());
+        }
         for (i, (_, metric)) in PROCESS_ROLES.iter().enumerate() {
             let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.roles[i].is_finite()).map(|(j, r)| (key(j), r.roles[i])).collect();
             if !per_run.is_empty() {

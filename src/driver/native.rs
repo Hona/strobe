@@ -27,6 +27,8 @@ pub struct Input {
 pub struct Log {
     pub inputs: Vec<Input>,
     pub marks: Vec<(String, u64)>,
+    /// Each drag's move times (a button held by `down` or `drag`), for `input.rate`.
+    pub drags: Vec<Vec<u64>>,
 }
 
 pub use imp::Session;
@@ -55,6 +57,10 @@ mod imp {
         size: Cell<Option<usize>>,
         /// Whether the OS cursor could be parked on the pointer's point (false on a locked session).
         parked: Cell<Option<bool>>,
+        /// Where the pointer last went (screen point and where it landed), and the mouse button
+        /// `down` or `drag` holds with the window it pressed in.
+        pointer: Cell<Option<(f64, f64, Target)>>,
+        pressed: Cell<Option<(Button, isize)>>,
     }
 
     impl Session {
@@ -68,7 +74,41 @@ mod imp {
                 last_input: Cell::new(0),
                 size: Cell::new(None),
                 parked: Cell::new(None),
+                pointer: Cell::new(None),
+                pressed: Cell::new(None),
             })
+        }
+
+        /// The button flag a move carries while a button is held (Windows' `MK_*`; other OSes track it).
+        fn held_flag(&self) -> usize {
+            self.pressed.get().map_or(0, |(b, _)| input::held_flag(b))
+        }
+
+        /// A pointer move to `t` at screen point (x, y), the cursor parked there; while a button is held it
+        /// is a drag's move, kept for `input.rate`.
+        fn pointer_to(&self, x: f64, y: f64, t: Target) -> Result<u64> {
+            self.park(x, y)?;
+            let at = self.poster.move_to(t, self.held_flag())?;
+            self.pointer.set(Some((x, y, t)));
+            let drag = self.pressed.get().is_some();
+            if drag && let Some(d) = self.log.borrow_mut().drags.last_mut() {
+                d.push(at);
+            }
+            self.input(at, "pointer", false);
+            Ok(at)
+        }
+
+        /// A mouse button going down or up where the pointer is.
+        fn pointer_button(&self, b: Button, down: bool) -> Result<u64> {
+            let (_, _, t) = self.pointer.get().ok_or_else(|| Error::usage("page.down(\"Mouse\") presses where the pointer is: move it first (hover, move, or down's at option)"))?;
+            let top = self.main.get();
+            let at = self.poster.button(t, b, down, false, Mods::default(), top)?;
+            self.pressed.set(down.then_some((b, top)));
+            if down {
+                self.log.borrow_mut().drags.push(vec![at]);
+            }
+            self.input(at, if down { "pointer" } else { "discrete" }, false);
+            Ok(at)
         }
 
         pub fn set_pids(&self, pids: &[u32]) {
@@ -94,6 +134,9 @@ mod imp {
         }
 
         pub fn release_all(&self) {
+            if let Some((b, _)) = self.pressed.get() {
+                let _ = self.pointer_button(b, false);
+            }
             self.poster.release_all(self.main.get());
         }
 
@@ -321,6 +364,56 @@ mod imp {
             Ok((top, to))
         }
 
+        /// `drag(selector, path, { duration, button })`: presses at the element's centre (or where the
+        /// pointer is, with `""`), moves along `path` (offsets in device-independent pixels, spread evenly
+        /// over `duration`) one move per display refresh on strobe's clock, each posted to the window it
+        /// pressed in without waiting for the app, and releases. A button `down` holds stays held.
+        /// Returns when the last input was posted.
+        fn drag(&self, sel: &str, path: &Value, o: &Value) -> Result<u64> {
+            let path = a11y::keys::parse_path(path)?;
+            let (x0, y0, t0) = if sel.is_empty() {
+                self.pointer.get().ok_or_else(|| Error::usage("page.drag(\"\", …) starts where the pointer is: move it first, or name an element"))?
+            } else {
+                let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, o["window"].as_str(), timeout(o))?;
+                self.aim(&tree, i)?
+            };
+            let b = Button::parse(o["button"].as_str())?;
+            let main = self.main.get();
+            // Screen units per device-independent pixel in the main window (physical pixels; points on macOS).
+            let (ox, _) = self.poster.client_point(main, 0.0, 0.0)?;
+            let (ux, _) = self.poster.client_point(main, 100.0, 0.0)?;
+            let unit = ((ux - ox) / 100.0).abs().max(0.01);
+            let point = |t: f64| {
+                let (dx, dy) = a11y::keys::path_at(&path, t);
+                (x0 + dx * unit, y0 + dy * unit)
+            };
+            let (x, y) = point(0.0);
+            self.pointer_to(x, y, t0.moved(x, y))?;
+            let held = self.pressed.get().is_some();
+            if held {
+                self.log.borrow_mut().drags.push(Vec::new());
+            } else {
+                self.pointer_button(b, true)?;
+            }
+            let duration = o["duration"].as_f64().unwrap_or(1000.0).max(1.0);
+            let frame = host::refresh_at(x0 as i32, y0 as i32).map_or(1000.0 / 60.0, |hz| 1000.0 / hz.max(1) as f64);
+            let steps = (duration / frame).ceil().max(1.0) as u32;
+            let start = Instant::now();
+            let mut last = 0;
+            for k in 1..=steps {
+                let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
+                if let Some(w) = due.checked_duration_since(Instant::now()) {
+                    std::thread::sleep(w);
+                }
+                let (x, y) = point(k as f64 / steps as f64);
+                last = self.pointer_to(x, y, t0.moved(x, y))?;
+            }
+            if !held {
+                last = self.pointer_button(b, false)?;
+            }
+            Ok(last)
+        }
+
         fn click(&self, sel: &str, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
             let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, opts["window"].as_str(), timeout(opts))?;
             let (x, y, t) = self.aim(&tree, i)?;
@@ -331,6 +424,7 @@ mod imp {
             let top = tree.windows[tree.nodes[i].window];
             let gap = Duration::from_millis(self.frame_ms(x, y));
             self.input(self.poster.move_to(t, 0)?, "pointer", false);
+            self.pointer.set(Some((x, y, t)));
             let mut last = 0;
             for k in 0..count {
                 // The press shows a pressed look at most; the release is the click's action, held
@@ -375,19 +469,24 @@ mod imp {
                     let o = opts(1);
                     let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
                     let (x, y, t) = self.aim(&tree, i)?;
-                    self.park(x, y)?;
-                    let at = self.poster.move_to(t, 0)?;
-                    self.input(at, "pointer", false);
+                    let at = self.pointer_to(x, y, t)?;
                     self.until(&o, at, presents)?;
                 }
                 "move" => {
                     let at = |i: usize| args.get(i).and_then(Value::as_f64).unwrap_or(0.0);
                     let o = opts(2);
                     let (x, y) = self.poster.client_point(main, at(0), at(1))?;
-                    let t = self.poster.target(&self.pids.borrow(), x, y)?;
-                    self.park(x, y)?;
-                    let at = self.poster.move_to(t, 0)?;
-                    self.input(at, "pointer", false);
+                    // While a button is held the move goes to the window it pressed in, as capture does.
+                    let t = match self.pointer.get().filter(|_| self.pressed.get().is_some()) {
+                        Some((_, _, t)) => t.moved(x, y),
+                        None => self.poster.target(&self.pids.borrow(), x, y)?,
+                    };
+                    let at = self.pointer_to(x, y, t)?;
+                    self.until(&o, at, presents)?;
+                }
+                "drag" => {
+                    let o = opts(2);
+                    let at = self.drag(&s(0), &opts(1), &o)?;
                     self.until(&o, at, presents)?;
                 }
                 "type" => {
@@ -413,6 +512,26 @@ mod imp {
                     let at = self.poster.press(top, to, mods, key)?;
                     self.input(at, "discrete", false);
                     self.until(&opts(1), at, presents)?;
+                }
+                "down" | "up" if a11y::keys::mouse_button(&s(0)).is_some() => {
+                    let o = opts(1);
+                    let b = a11y::keys::mouse_button(&s(0)).unwrap_or(Button::Left);
+                    // `at`: an element to move onto first, or a point in the main window's client area.
+                    match o.get("at") {
+                        Some(Value::String(sel)) => {
+                            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.clone()))?, o["window"].as_str(), timeout(&o))?;
+                            let (x, y, t) = self.aim(&tree, i)?;
+                            self.pointer_to(x, y, t)?;
+                        }
+                        Some(Value::Array(p)) => {
+                            let (x, y) = self.poster.client_point(main, p.first().and_then(Value::as_f64).unwrap_or(0.0), p.get(1).and_then(Value::as_f64).unwrap_or(0.0))?;
+                            let t = self.poster.target(&self.pids.borrow(), x, y)?;
+                            self.pointer_to(x, y, t)?;
+                        }
+                        _ => {}
+                    }
+                    let at = self.pointer_button(b, call == "down")?;
+                    self.until(&o, at, presents)?;
                 }
                 "down" | "up" => {
                     let (mods, key) = input::parse_chord(&s(0))?;
@@ -527,7 +646,7 @@ mod imp {
                 }
                 "goto" | "eval" => {
                     return Err(Error::usage(format!(
-                        "page.{call}() is a page's: a native app is driven through its accessibility tree and its message loop (click, hover, move, type, press, down, up, scroll, wheel, act, query, waitFor, idle, frame, wait, window, snapshot)"
+                        "page.{call}() is a page's: a native app is driven through its accessibility tree and its message loop (click, hover, move, drag, type, press, down, up, scroll, wheel, act, query, waitFor, idle, frame, wait, window, snapshot)"
                     )));
                 }
                 other => return Err(Error::msg(format!("unknown page call {other}"))),

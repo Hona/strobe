@@ -127,6 +127,20 @@ pub struct Target {
     pub screen: (i32, i32),
 }
 
+impl Target {
+    /// The same window at another screen point (physical pixels), as a drag keeps posting to the
+    /// window it pressed in, the way pointer capture does.
+    pub fn moved(self, x: f64, y: f64) -> Target {
+        let (x, y) = (x.round() as i32, y.round() as i32);
+        Target { hwnd: self.hwnd, client: (self.client.0 + x - self.screen.0, self.client.1 + y - self.screen.1), screen: (x, y) }
+    }
+}
+
+/// The button flag (`MK_*`) a move carries while `b` is held.
+pub fn held_flag(b: Button) -> usize {
+    button_messages(b).3
+}
+
 type Job = Box<dyn FnOnce(&mut State) + Send>;
 
 /// The input thread: per-monitor DPI aware, with a message queue (so it can share key state).

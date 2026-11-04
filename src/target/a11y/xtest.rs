@@ -41,6 +41,19 @@ pub struct Target {
     pub y: i32,
 }
 
+impl Target {
+    /// The same window at another root point: the X server sends the held button's motion to the
+    /// window that grabbed it.
+    pub fn moved(self, x: f64, y: f64) -> Target {
+        Target { x: x.round() as i32, y: y.round() as i32, ..self }
+    }
+}
+
+/// The X server knows which button XTest holds: motion carries it without a flag.
+pub fn held_flag(_b: Button) -> usize {
+    0
+}
+
 pub struct Poster {
     conn: RustConnection,
     root: Window,

@@ -21,6 +21,41 @@ impl Button {
     }
 }
 
+/// A mouse button as `page.down` and `page.up` name it: `Mouse` (the left one), `MouseRight`,
+/// `MouseMiddle`.
+pub fn mouse_button(name: &str) -> Option<Button> {
+    match name {
+        "Mouse" | "MouseLeft" => Some(Button::Left),
+        "MouseRight" => Some(Button::Right),
+        "MouseMiddle" => Some(Button::Middle),
+        _ => None,
+    }
+}
+
+/// Points evenly spread over a drag (`page.drag`'s path: offsets from where it starts) at `t` (0 to 1),
+/// straight between neighbours.
+pub fn path_at(path: &[(f64, f64)], t: f64) -> (f64, f64) {
+    match path.len() {
+        0 => (0.0, 0.0),
+        1 => path[0],
+        n => {
+            let f = t.clamp(0.0, 1.0) * (n - 1) as f64;
+            let i = (f.floor() as usize).min(n - 2);
+            let u = f - i as f64;
+            (path[i].0 + (path[i + 1].0 - path[i].0) * u, path[i].1 + (path[i + 1].1 - path[i].1) * u)
+        }
+    }
+}
+
+/// `page.drag`'s path from the runner: `[[dx, dy], …]` (a function's samples, or keyframes).
+pub fn parse_path(v: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
+    let pts: Option<Vec<(f64, f64)>> = v.as_array().map(|a| a.iter().map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?))).collect()).unwrap_or(None);
+    match pts {
+        Some(p) if !p.is_empty() => Ok(p),
+        _ => Err(Error::usage("page.drag(selector, path): path is [[dx, dy], …] (offsets in CSS or device-independent pixels from where the drag starts) or a function t => [dx, dy]")),
+    }
+}
+
 /// Modifier keys held for an input.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Mods {

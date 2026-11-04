@@ -59,6 +59,18 @@ pub struct Target {
     pub y: f64,
 }
 
+impl Target {
+    /// The same window at another point, as a drag keeps posting to the window it pressed in.
+    pub fn moved(self, x: f64, y: f64) -> Target {
+        Target { x, y, ..self }
+    }
+}
+
+/// macOS tracks the held button itself (`move_to` sends drags while it is down).
+pub fn held_flag(_b: Button) -> usize {
+    0
+}
+
 pub struct Poster {
     source: Cf,
     state: Mutex<State>,

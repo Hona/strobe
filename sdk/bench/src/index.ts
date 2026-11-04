@@ -33,10 +33,22 @@ export interface Page {
   type(selector: string, text: string, opts?: Options & { delay?: number }): Promise<void>
   /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. Native targets: `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
   press(key: string, opts?: Options & { selector?: string }): Promise<void>
-  /** Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys). */
-  down(key: string, opts?: Options): Promise<void>
-  /** Lets go of a key `down` pressed. */
-  up(key: string, opts?: Options): Promise<void>
+  /**
+   * Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys).
+   * A mouse button: `"Mouse"` (left), `"MouseRight"`, `"MouseMiddle"`, pressed where the pointer is, or first at `opts.at`
+   * (a selector, or `[x, y]` in the viewport); `move` then drags.
+   */
+  down(key: string, opts?: Options & { at?: string | [number, number] }): Promise<void>
+  /** Lets go of a key or mouse button `down` pressed. */
+  up(key: string, opts?: Options & { at?: string | [number, number] }): Promise<void>
+  /**
+   * Presses at `selector`'s centre (where the pointer is with `""`), moves along `path` and releases. `path` is offsets
+   * `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps), as keyframes spread evenly over
+   * `duration` (ms, default 1000) or a function of `t` from 0 to 1 (a wiggle: `t => [40 * Math.sin(t * 12 * Math.PI), 0]`).
+   * One move per display frame, paced on strobe's clock without waiting for the app to handle each; `input.rate` and
+   * `input.gap.p95` say how evenly the moves went out. A button `down` already holds stays held.
+   */
+  drag(selector: string, path: [number, number][] | ((t: number) => [number, number]), opts?: Options & { duration?: number; button?: "left" | "right" | "middle" }): Promise<void>
   /**
    * The page's pixels as `name`, for `--pixels`: an untimed block per variant captures each snapshot and strobe
    * compares base with head. Elsewhere it does nothing. Snapshot a state that does not depend on time (a still

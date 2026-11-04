@@ -39,6 +39,12 @@ const page = {
   type: (selector: string, text: string, o = {}) => driver("type", selector, text, o),
   press: (key: string, o = {}) => driver("press", key, o),
   down: (key: string, o = {}) => driver("down", key, o),
+  // A path function is sampled every 4 ms of the drag's duration; strobe moves along the samples.
+  drag: (selector: string, path: [number, number][] | ((t: number) => [number, number]), o: { duration?: number } = {}) => {
+    if (typeof path !== "function") return driver("drag", selector, path, o)
+    const n = Math.max(2, Math.ceil((o.duration ?? 1000) / 4) + 1)
+    return driver("drag", selector, Array.from({ length: n }, (_, i) => path(i / (n - 1))), o)
+  },
   up: (key: string, o = {}) => driver("up", key, o),
   snapshot: (name: string) => driver("snapshot", name),
   scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),

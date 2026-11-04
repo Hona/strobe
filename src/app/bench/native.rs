@@ -442,6 +442,11 @@ fn runs(
     for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("phase.")) {
         extra.insert(format!("phase.{name}"), per_run(&|r: &Run| super::phase_ms(&r.log.marks, name)));
     }
+    // Drags: the moves strobe posted, beside the frames the app drew.
+    if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
+        extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
+        extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
+    }
     let mut refused = BTreeMap::new();
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
@@ -688,6 +693,7 @@ fn missing(metric: &str, ui_thread: bool) -> Option<String> {
         "ui" => Some(format!("NoPresentSource: {metric} is not measured: native apps have ui.cpu and ui.wakes, from outside")),
         "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
         "phase" => Some(format!("NoPhase: {metric}: no measured run entered phase(\"{}\")", &metric[6..])),
+        "input" => Some(format!("NoInput: {metric}: no measured run dragged (page.drag, or moves while page.down(\"Mouse\") holds a button)")),
         "gpu" if metric == "gpu.compile" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
         _ => None,
     }

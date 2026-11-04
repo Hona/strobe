@@ -77,6 +77,20 @@ impl Cdp {
         Ok(reply.get("result").cloned().unwrap_or(Value::Null))
     }
 
+    /// Sends a command without waiting for its reply (dropped when it comes): a paced input stream
+    /// whose next event must not wait for the renderer to handle the last one.
+    pub fn post(&self, method: &str, params: Value, session: Option<&str>) -> Result<()> {
+        if let Some(why) = self.closed.lock().unwrap().clone() {
+            return Err(Error::unreachable(format!("cdp closed: {why}")));
+        }
+        let id = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(s) = session {
+            msg["sessionId"] = json!(s);
+        }
+        self.writer.lock().unwrap().send(Message::text(msg.to_string())).map_err(|e| Error::unreachable(format!("cdp send {method}: {e}")))
+    }
+
     /// Every event from now on (all sessions).
     pub fn events(&self) -> Receiver<Value> {
         let (tx, rx) = channel();

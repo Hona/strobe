@@ -132,11 +132,110 @@ pub struct Driver {
     pub pixels: Option<std::path::PathBuf>,
     /// Modifiers held down by `down` (CDP's bits: Alt 1, Control 2, Meta 4, Shift 8).
     held: std::cell::Cell<i64>,
+    /// Where the pointer is (CSS pixels), and the mouse buttons held (`buttons` bits: left 1, right 2,
+    /// middle 4) with the name of the last one pressed.
+    pointer: std::cell::Cell<(f64, f64)>,
+    buttons: std::cell::Cell<(i64, &'static str)>,
+    /// The display's frame period as the page's rAF sees it (ms), measured at the first drag.
+    frame_ms: std::cell::Cell<Option<f64>>,
+    /// Each drag's move times on the host clock (a button held by `down` or `drag`), for
+    /// `input.rate` and `input.gap.p95`; the block takes them per run.
+    pub drags: std::cell::RefCell<Vec<Vec<u64>>>,
 }
 
 impl Driver {
     pub fn new(page: Page, token: String) -> Driver {
-        Driver { page, token, op_timeout: Duration::from_secs(30), pixels: None, held: std::cell::Cell::new(0) }
+        Driver {
+            page,
+            token,
+            op_timeout: Duration::from_secs(30),
+            pixels: None,
+            held: std::cell::Cell::new(0),
+            pointer: std::cell::Cell::new((0.0, 0.0)),
+            buttons: std::cell::Cell::new((0, "none")),
+            frame_ms: std::cell::Cell::new(None),
+            drags: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// A pointer move to (x, y) carrying the held buttons. While one is held it is a drag's move: sent
+    /// without waiting for the renderer to handle it (`paced`), and its time is kept for `input.rate`.
+    fn pointer_move(&self, x: f64, y: f64, paced: bool) -> Result<()> {
+        let (mask, name) = self.buttons.get();
+        self.pointer.set((x, y));
+        let p = json!({ "type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": self.held.get() });
+        if mask != 0
+            && let Some(d) = self.drags.borrow_mut().last_mut()
+        {
+            d.push(crate::host::now_ns());
+        }
+        if paced { self.page.post("Input.dispatchMouseEvent", p) } else { self.page.send("Input.dispatchMouseEvent", p).map(|_| ()) }
+    }
+
+    /// A mouse button going down or up where the pointer is.
+    fn pointer_button(&self, name: &'static str, bit: i64, down: bool) -> Result<()> {
+        let (x, y) = self.pointer.get();
+        let mask = if down { self.buttons.get().0 | bit } else { self.buttons.get().0 & !bit };
+        self.buttons.set((mask, if mask == 0 { "none" } else { name }));
+        if down {
+            self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
+        }
+        let kind = if down { "mousePressed" } else { "mouseReleased" };
+        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": 1, "modifiers": self.held.get() })).map(|_| ())
+    }
+
+    /// The display's frame period (ms) from ten of the page's animation frames, once per block.
+    fn frame_period(&self) -> Result<f64> {
+        if let Some(ms) = self.frame_ms.get() {
+            return Ok(ms);
+        }
+        let t = self.wait("new Promise((r) => { const raf = window.__strobeRaf ?? requestAnimationFrame.bind(window); const t = []; const f = (ts) => { t.push(ts); if (t.length < 11) raf(f); else r(t) }; raf(f) })", Duration::from_secs(5))?;
+        let ts: Vec<f64> = t.as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+        let mut d: Vec<f64> = ts.windows(2).map(|w| w[1] - w[0]).filter(|d| *d > 0.0).collect();
+        d.sort_by(f64::total_cmp);
+        let ms = d.get(d.len() / 2).copied().unwrap_or(1000.0 / 60.0).clamp(4.0, 50.0);
+        self.frame_ms.set(Some(ms));
+        Ok(ms)
+    }
+
+    /// `drag(selector, path, { duration, button })`: presses at the element's centre (or where the pointer
+    /// is, with `""`), moves along `path` (offsets in CSS pixels, spread evenly over `duration`) one move
+    /// per display frame on strobe's clock without waiting for each to be handled, and releases. A button
+    /// already held by `down` stays held.
+    fn drag(&self, sel: &str, path: &Value, o: &Value) -> Result<Value> {
+        use crate::target::a11y::keys::{parse_path, path_at};
+        let path = parse_path(path)?;
+        let (x0, y0) = if sel.is_empty() { self.pointer.get() } else { self.locate(sel, o)? };
+        let (name, bit) = cdp_button(match o.get("button").and_then(Value::as_str).unwrap_or("left") {
+            "right" => "MouseRight",
+            "middle" => "MouseMiddle",
+            _ => "Mouse",
+        })
+        .unwrap_or(("left", 1));
+        let duration = o.get("duration").and_then(Value::as_f64).unwrap_or(1000.0).max(1.0);
+        let frame = self.frame_period()?;
+        let (dx, dy) = path_at(&path, 0.0);
+        self.pointer_move(x0 + dx, y0 + dy, false)?;
+        let held = self.buttons.get().0 & bit != 0;
+        if held {
+            self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
+        } else {
+            self.pointer_button(name, bit, true)?;
+        }
+        let steps = (duration / frame).ceil().max(1.0) as u32;
+        let start = std::time::Instant::now();
+        for k in 1..=steps {
+            let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
+            if let Some(w) = due.checked_duration_since(std::time::Instant::now()) {
+                std::thread::sleep(w);
+            }
+            let (dx, dy) = path_at(&path, k as f64 / steps as f64);
+            self.pointer_move(x0 + dx, y0 + dy, true)?;
+        }
+        if !held {
+            self.pointer_button(name, bit, false)?;
+        }
+        self.until(o)
     }
 
     fn helper(&self) -> Result<()> {
@@ -187,6 +286,7 @@ impl Driver {
             }
             "click" => {
                 let (x, y) = self.locate(&s(0), &opts(1))?;
+                self.pointer.set((x, y));
                 for (kind, extra) in [("mouseMoved", json!({})), ("mousePressed", json!({ "button": "left", "clickCount": 1 })), ("mouseReleased", json!({ "button": "left", "clickCount": 1 }))] {
                     let mut p = json!({ "type": kind, "x": x, "y": y });
                     merge(&mut p, extra);
@@ -224,14 +324,15 @@ impl Driver {
             // The pointer over an element, without a click: reveals hover-only controls, or parks the pointer.
             "hover" => {
                 let (x, y) = self.locate(&s(0), &opts(1))?;
-                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": x, "y": y }))?;
+                self.pointer_move(x, y, false)?;
                 self.until(&opts(1))
             }
             "move" => {
                 let at = |i: usize| args.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseMoved", "x": at(0), "y": at(1) }))?;
+                self.pointer_move(at(0), at(1), false)?;
                 self.until(&opts(2))
             }
+            "drag" => self.drag(&s(0), &opts(1), &opts(2)),
             "scroll" => {
                 let o = opts(1);
                 let (x, y) = self.locate(&s(0), &opts(2))?;
@@ -281,8 +382,22 @@ impl Driver {
             "frame" => self.call("__strobe.frame()"),
             // A key held across other calls (a game's WASD, a held shortcut): `down` presses it, `up` lets go.
             "down" | "up" => {
-                self.key(&s(0), call == "down")?;
-                self.until(&opts(1))
+                let o = opts(1);
+                if let Some((name, bit)) = cdp_button(&s(0)) {
+                    // `at`: a selector or [x, y] to move to first, as a person moves before pressing.
+                    match o.get("at") {
+                        Some(Value::String(sel)) => {
+                            let (x, y) = self.locate(sel, &o)?;
+                            self.pointer_move(x, y, false)?;
+                        }
+                        Some(Value::Array(p)) => self.pointer_move(p.first().and_then(Value::as_f64).unwrap_or(0.0), p.get(1).and_then(Value::as_f64).unwrap_or(0.0), false)?,
+                        _ => {}
+                    }
+                    self.pointer_button(name, bit, call == "down")?;
+                } else {
+                    self.key(&s(0), call == "down")?;
+                }
+                self.until(&o)
             }
             // The page's pixels for `--pixels`: only a pixels block captures, so timed runs never pay for it.
             "snapshot" => {
@@ -443,4 +558,38 @@ impl Page {
     pub fn send_long(&self, method: &str, params: Value) -> Result<Value> {
         self.cdp.send_timeout(method, params, Some(&self.session), Duration::from_secs(120))
     }
+
+    /// A command whose reply nobody waits for (`Cdp::post`).
+    pub fn post(&self, method: &str, params: Value) -> Result<()> {
+        self.cdp.post(method, params, Some(&self.session))
+    }
+}
+
+/// CDP's name and `buttons` bit for a mouse button `page.down` names (`Mouse`, `MouseRight`, `MouseMiddle`).
+fn cdp_button(name: &str) -> Option<(&'static str, i64)> {
+    use crate::target::a11y::keys::{Button, mouse_button};
+    mouse_button(name).map(|b| match b {
+        Button::Left => ("left", 1),
+        Button::Right => ("right", 2),
+        Button::Middle => ("middle", 4),
+    })
+}
+
+/// `input.rate` and `input.gap.p95` (SPEC §9.6): pointer moves strobe sent per second while a button was
+/// held, over the time each drag lasted, and the 95th percentile gap between consecutive moves (ms).
+/// Input that starved (a slow driver, a busy machine) shows here rather than as dropped frames.
+pub fn input_pacing(drags: &[Vec<u64>]) -> Option<(f64, f64)> {
+    let mut gaps: Vec<f64> = Vec::new();
+    let mut span = 0u64;
+    for d in drags.iter().filter(|d| d.len() >= 2) {
+        span += d[d.len() - 1].saturating_sub(d[0]);
+        gaps.extend(d.windows(2).map(|w| w[1].saturating_sub(w[0]) as f64 / 1e6));
+    }
+    if gaps.is_empty() || span == 0 {
+        return None;
+    }
+    let rate = gaps.len() as f64 / (span as f64 / 1e9);
+    gaps.sort_by(f64::total_cmp);
+    let p95 = gaps[((gaps.len() as f64 * 0.95).ceil() as usize).clamp(1, gaps.len()) - 1];
+    Some((rate, p95))
 }

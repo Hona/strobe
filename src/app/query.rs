@@ -1064,8 +1064,8 @@ select w.k, s.name, s.ts, s.dur, t.tid,
     let runs = measured.len().max(1) as f64;
     let per_run = |(n, ms): (u64, f64)| format!("{:.0} ({}) per run", n as f64 / runs, fmt::value(ms / runs, "ms"));
     let header = format!(
-        "forced layout and style by the call that forced them · {} measured runs{{mapped}}\n  forced     layout {} · style {}\n  in frames  layout {} · style {}",
-        measured.len(),
+        "forced layout and style by the call that forced them · {}{{mapped}}\n  forced     layout {} · style {}\n  in frames  layout {} · style {}",
+        runs_text(measured.len(), &table.rows),
         per_run(totals[0][0]),
         per_run(totals[0][1]),
         per_run(totals[1][0]),
@@ -1140,8 +1140,8 @@ select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
     });
     let g = |k: &str| values[k].as_f64().unwrap_or(f64::NAN);
     let mut text = format!(
-        "garbage collection · median of {} measured runs\n  collections   {:.0} minor · {:.0} major per run\n  main thread   {} per run (pauses and incremental marking)\n  helpers       {} per run (concurrent and parallel work)\n  freed         {} per run\n",
-        runs.len(),
+        "garbage collection · median of {}\n  collections   {:.0} minor · {:.0} major per run\n  main thread   {} per run (pauses and incremental marking)\n  helpers       {} per run (concurrent and parallel work)\n  freed         {} per run\n",
+        runs_text(runs.len(), &table.rows),
         g("minor_per_run"),
         g("major_per_run"),
         fmt::value(g("main_ms_per_run"), "ms"),
@@ -1184,12 +1184,24 @@ fn attribution_meta(dir: &Path) -> Result<Value> {
 /// set: the last `runs` of the run windows (a block warms up first; its attribution profilers start
 /// at the steady point).
 fn measured_runs(meta: &Value, rows: &[Vec<Option<String>>]) -> Vec<String> {
+    let mut keys = run_keys(rows);
+    let n = meta["runs"].as_u64().map_or(keys.len(), |n| n as usize).min(keys.len());
+    keys.split_off(keys.len() - n).into_iter().map(|k| k.1).collect()
+}
+
+fn run_keys(rows: &[Vec<Option<String>>]) -> Vec<(usize, String)> {
     let mut keys: Vec<(usize, String)> =
         rows.iter().filter(|r| r.get(1).is_none_or(Option::is_none)).filter_map(|r| r.first().cloned().flatten()).filter_map(|k| Some((k.rsplit(':').next()?.parse().ok()?, k))).collect();
     keys.sort();
     keys.dedup();
-    let n = meta["runs"].as_u64().map_or(keys.len(), |n| n as usize).min(keys.len());
-    keys.split_off(keys.len() - n).into_iter().map(|k| k.1).collect()
+    keys
+}
+
+/// `5 measured runs (7 in the trace: 2 warmup before them)`: a trace's run marks include warmup.
+fn runs_text(measured: usize, rows: &[Vec<Option<String>>]) -> String {
+    let all = run_keys(rows).len();
+    let s = if measured == 1 { "" } else { "s" };
+    if all > measured { format!("{measured} measured run{s} ({all} in the trace: {} warmup before)", all - measured) } else { format!("{measured} measured run{s}") }
 }
 
 /// Frames of a trace event's `beginData.stackTrace` from `key \x1f value` pairs joined by `\x1e`:

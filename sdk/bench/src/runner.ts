@@ -294,13 +294,20 @@ createInterface({ input: socket }).on("line", (line) => {
   const waiting = pending.get(message.id)
   if (waiting) {
     pending.delete(message.id)
-    if ("error" in message) waiting.reject(new Error(message.error))
+    // strobe's fix for a failed call (a missing permission, a selector to try) rides along as `hint`.
+    if ("error" in message) waiting.reject(Object.assign(new Error(message.error), message.hint ? { hint: message.hint } : {}))
     else waiting.resolve(message.ok)
     return
   }
   handle(message.op, message.args ?? {}).then(
     (ok) => write({ id: message.id, ok: ok ?? null }),
-    (error) => write({ id: message.id, error: String(error?.message ?? error), stack: String(error?.stack ?? "") }),
+    (error) =>
+      write({
+        id: message.id,
+        error: String(error?.message ?? error),
+        stack: String(error?.stack ?? ""),
+        ...(typeof error?.hint === "string" ? { hint: error.hint } : {}),
+      }),
   )
 })
 write({ ready: true })

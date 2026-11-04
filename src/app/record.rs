@@ -23,7 +23,7 @@ use std::time::Duration;
 fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
     b.set("filter", case);
-    for k in ["target", "params", "id", "pin", "power"] {
+    for k in ["target", "params", "id", "pin", "power", "runs"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }

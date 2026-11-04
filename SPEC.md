@@ -309,8 +309,13 @@ runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak 
 `--check` validates the file: one block per series on `--head`, one run per case, no warmup and
 no statistics. Each case passes, with its declared metrics' values from that run, or fails with
 the refusal, the page's URL and its screenshot; the next case still runs, and any failure exits 1.
+A failure keeps the fix strobe's driver gave (a missing permission and where to grant it) and
+names the hook once (`setup: …`, not `setup: setup: …`). Under each case, `--check` prints the
+last 10 lines the bench file's hooks wrote to the console during it (`console.log`/`error`; the
+rest stay in the experiment's `runner.log`, whose path it names).
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
-a bench) and prints its recording, to profile one build before there is anything to compare.
+a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
+and prints its recording, to profile one build before there is anything to compare.
 `--head` alone is an error that suggests `--base` or `--check`. `--runs` is the measured runs per
 block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
 described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).

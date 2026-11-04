@@ -34,6 +34,15 @@ pub fn find_bun() -> Option<PathBuf> {
     host::find_exe("bun", &[home.join(".bun").join("bin").join(exe)])
 }
 
+/// A bench hook that failed, as `RunIncomplete`: `what` names it once (the runner's own `<op>: `
+/// prefix dropped), `extra` follows the message (a screenshot), and a fix the driver gave (a missing
+/// permission and where to grant it) replaces the generic `fix`.
+pub fn incomplete(what: &str, op: &str, e: Error, extra: &str, fix: &str) -> Error {
+    let prefix = format!("{op}: ");
+    let msg = e.message.strip_prefix(&prefix).unwrap_or(&e.message);
+    Error::refused("RunIncomplete", format!("{what}: {msg}{extra}"), e.hint.as_deref().unwrap_or(fix))
+}
+
 pub struct Runner {
     child: Child,
     conn: TcpStream,
@@ -148,7 +157,9 @@ impl Runner {
                 if let Some(err) = msg.get("error").and_then(Value::as_str) {
                     let stack = msg.get("stack").and_then(Value::as_str).unwrap_or("");
                     let first = stack.lines().find(|l| l.contains(".bench.")).unwrap_or("").trim();
-                    return Err(Error::msg(format!("{op}: {err}{}", if first.is_empty() { String::new() } else { format!(" ({first})") })));
+                    let mut e = Error::msg(format!("{op}: {err}{}", if first.is_empty() { String::new() } else { format!(" ({first})") }));
+                    e.hint = msg.get("hint").and_then(Value::as_str).map(str::to_string);
+                    return Err(e);
                 }
                 return Ok(msg.get("ok").cloned().unwrap_or(Value::Null));
             }
@@ -157,7 +168,10 @@ impl Runner {
                 let args = msg.get("args").cloned().unwrap_or(Value::Null);
                 let reply = match serve(&req_op, &args) {
                     Ok(v) => json!({ "id": rid, "ok": v }),
-                    Err(e) => json!({ "id": rid, "error": e.message }),
+                    Err(e) => match e.hint {
+                        Some(h) => json!({ "id": rid, "error": e.message, "hint": h }),
+                        None => json!({ "id": rid, "error": e.message }),
+                    },
                 };
                 self.write(&reply)?;
             }

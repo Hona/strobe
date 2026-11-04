@@ -587,11 +587,17 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
     let started = Instant::now();
+    let log_from = std::fs::metadata(&ctx.runner.log).map(|m| m.len()).unwrap_or(0);
     let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (passed, error, values, refused, locked) = match r {
-        Ok(b) => (true, Value::Null, json!(b.values), json!(b.refused), b.locked),
-        Err(e) => (false, json!(e.message), Value::Null, Value::Null, false),
+    // What the bench file's hooks printed during this case (console.log/error go to runner.log).
+    let log: Vec<String> = std::fs::read(&ctx.runner.log)
+        .ok()
+        .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
+        .unwrap_or_default();
+    let (passed, error, hint, values, refused, locked) = match r {
+        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked),
+        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
@@ -600,9 +606,13 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     if passed && ctx.args.get("why") == Some("always") {
         progress(format!("  attribution block ({}; not timed)", why_text(&target)));
         let v = &variants[0];
-        // Warmed and run as in a bench: `--check`'s single cold run would start no profiler.
+        // Warmed and run as in a bench (`--runs`, default 5): `--check`'s single cold run would start no
+        // profiler, and one measured run is too few to read per-run numbers from.
         ctx.check = false;
+        let check_runs = ctx.runs;
+        ctx.runs = ctx.args.num("runs")?.unwrap_or(5.0).max(1.0) as usize;
         let attributed = if s.launch.is_object() { in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v)) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+        ctx.runs = check_runs;
         ctx.check = true;
         match attributed {
             Ok(b) => {
@@ -615,7 +625,8 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "log": log, "log_path": ctx.runner.log,
     }))
 }
 
@@ -642,6 +653,20 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
         } else {
             text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
+            if let Some(h) = s["hint"].as_str() {
+                text += &format!("      fix: {h}\n");
+            }
+        }
+        // The case's own console output: the last 10 lines, and where the rest is.
+        let log: Vec<&str> = s["log"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !log.is_empty() {
+            let skipped = log.len().saturating_sub(10);
+            for l in &log[skipped..] {
+                text += &format!("      log  {l}\n");
+            }
+            if skipped > 0 {
+                text += &format!("      log  ({skipped} earlier lines in {})\n", s["log_path"].as_str().unwrap_or("runner.log"));
+            }
         }
     }
     text += &format!("\n{} of {} cases passed (one cold run each on head, no warmup: values include first-run work such as shader compiles; nothing compared)\n", series.len() - failed, series.len());
@@ -1767,7 +1792,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             let r = ctx
                 .runner
                 .call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve)
-                .map_err(|e| Error::refused("RunIncomplete", format!("prepare: {}", e.message), "fix the target's prepare in the bench file"))?;
+                .map_err(|e| crate::runner::incomplete("prepare", "prepare", e, "", "fix the target's prepare in the bench file"))?;
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 first = join_url(origin(&url), u);
             }
@@ -1788,7 +1813,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         lap("checks");
         ctx.runner
             .call("setup", json!({}), t, &serve)
-            .map_err(|e| Error::refused("RunIncomplete", format!("setup: {}{}", e.message, snapshot(&page, &ctx.exp, "setup")), "fix the bench file's setup"))?;
+            .map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         lap("setup");
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
@@ -1852,7 +1877,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve).map_err(|e| {
-                Error::refused("RunIncomplete", format!("{} run: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "run")), "the run threw or timed out; fix the bench file or the app")
+                crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app")
             })?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
@@ -1877,7 +1902,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             if s.reset {
                 ctx.runner
                     .call("reset", json!({ "case": s.case }), run_timeout, &serve)
-                    .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}{}", s.case, e.message, snapshot(&page, &ctx.exp, "reset")), "fix the case's reset"))?;
+                    .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
             }
             let wall = (t1 - t0) as f64;
             let cpu = match (tsc0, tsc1) {

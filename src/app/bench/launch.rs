@@ -91,7 +91,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     if spec["before"] == true {
         ctx.runner
             .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
-            .map_err(|e| Error::refused("RunIncomplete", format!("{} before: {}", s.case, e.message), "fix the launch's before hook"))?;
+            .map_err(|e| crate::runner::incomplete(&format!("{} before", s.case), "before", e, "", "fix the launch's before hook"))?;
     }
     lap("before", &mut steps);
     let mut window = ctx.window.clone();

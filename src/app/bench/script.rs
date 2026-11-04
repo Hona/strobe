@@ -213,7 +213,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         let root_text = root.display().to_string();
         ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root_text }), t, &serve)?;
         let mut lapped = Instant::now();
-        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}", e.message), "fix the bench file's setup"))?;
+        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
         let measured_runs = ctx.runs;
@@ -224,14 +224,14 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             counts.borrow_mut().clear();
             counting.set(true);
             let (c0, t0) = (cpu(pid), Instant::now());
-            ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}", s.case, e.message), "the run threw or timed out"))?;
+            ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out"))?;
             let wall = t0.elapsed().as_secs_f64() * 1e3;
             let used = cpu_ms(c0, cpu(pid), wall);
             counting.set(false);
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
             runs.push((wall, used, counts.borrow().clone(), retained));
             if s.reset {
-                ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}", s.case, e.message), "fix the case's reset"))?;
+                ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
             let i = runs.len() - 1;
             if ctx.check {

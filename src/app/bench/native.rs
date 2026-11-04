@@ -274,7 +274,7 @@ fn runs(
         drive.follow(n);
     }
     lap("checks", steps);
-    ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| Error::refused("RunIncomplete", format!("setup: {}", e.message), "fix the bench file's setup"))?;
+    ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     lap("setup", steps);
     let procs0 = (host::now_ns(), host::all_processes());
     let sampler = probe::os::Sampler::start(n.pid);
@@ -307,7 +307,7 @@ fn runs(
         let t0 = host::now_ns();
         ctx.runner
             .call("run", json!({ "case": s.case }), run_timeout, &serve)
-            .map_err(|e| Error::refused("RunIncomplete", format!("{} run: {}", s.case, e.message), "the run threw or timed out; fix the bench file or the app"))?;
+            .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
         let t1 = host::now_ns();
         let c1 = cycles(n);
         let snap1 = Snapshot::take(&n.pids());
@@ -320,7 +320,7 @@ fn runs(
         if s.reset {
             ctx.runner
                 .call("reset", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}", s.case, e.message), "fix the case's reset"))?;
+                .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
         }
         runs[i].total = began.elapsed().as_secs_f64() * 1e3;
         if leak && first.is_some() {
@@ -810,7 +810,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if spec["before"] == true {
         ctx.runner
             .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
-            .map_err(|e| Error::refused("RunIncomplete", format!("{} before: {}", s.case, e.message), "fix the launch's before hook"))?;
+            .map_err(|e| crate::runner::incomplete(&format!("{} before", s.case), "before", e, "", "fix the launch's before hook"))?;
     }
     lap("before", &mut steps);
     // A launch timed to an element ends on the frame that showed it: OS present events say when.

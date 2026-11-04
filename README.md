@@ -18,17 +18,19 @@ Pages, Electron apps, `script()` targets, statistics and reports work the same e
 | | Windows | Linux | macOS |
 |---|---|---|---|
 | process and thread CPU | exact (cycle counters) | exact (CPU clocks, `schedstat`) | exact (Mach time) |
-| `cpu.wakes` | per thread | per thread | per process only |
+| `cpu.wakes` | per thread | per thread | per process only (no per-thread count without root) |
 | IO | all bytes | all bytes | disk bytes only |
 | GPU per process | D3DKMT engines and VRAM | DRM client stats (amdgpu, Intel, …); NVIDIA proprietary: unknown | GPU time per process; VRAM refused (unified memory) |
 | pinning, power plan | CCD pinning; High performance plan | `sched_setaffinity`; `performance` governor as root | none (no API); Low Power Mode reported |
 | windows | Win32 | X11 (native Wayland windows are invisible to other apps) | CoreGraphics; moving a window needs Accessibility |
 | launch `painted`/`settled` | screen pixels | X11 window pixels | needs Screen Recording, else refused |
-| frames on screen (OS) | ETW present events | refused | refused |
+| frames on screen (OS) | ETW present events | X Present completions: X11 on a real display without a compositor (Xvfb, compositors, Wayland: refused); screen times only, so `frames.interval.*` and `frames.dropped*` are refused | ScreenCaptureKit frame times of the app's windows (needs Screen Recording); screen times only, as Linux |
+| drive a native app (`page`) | UI Automation; window messages posted to the app (never takes focus) | AT-SPI; XTest (the real input path; keys need the app focused, strobe activates it) | AX API (needs Accessibility); Quartz events posted to the app's process (keys: strobe brings the app to the front) |
+| keep awake during blocks | `SetThreadExecutionState` | logind `idle` inhibitor; screen saver inhibit where the desktop has it | IOKit power assertions |
 | native stacks | ETW through a helper (one UAC) | `perf_event_open`, DWARF unwinding (needs `perf_event_paranoid` ≤ 2 or CAP_PERFMON) | `/usr/bin/sample` (untimed, waiting threads dropped) |
 | isolated native and Electron launches | full | `HOME`/`XDG_*` | `HOME`; a Cocoa app runs only if its `~/Library` data does not exist yet |
 
-Permissions strobe never asks for by itself: on macOS, Accessibility (to place another app's window) and Screen Recording (to read its pixels); on Linux, `kernel.perf_event_paranoid=2` or CAP_PERFMON for native stacks.
+Permissions strobe never asks for by itself: on macOS, Accessibility (to drive a native app and place its window) and Screen Recording (its frames and pixels), both for the app strobe runs under (Terminal, your agent's app, or a remote shell's daemon: `strobe status` names it); on Linux, `kernel.perf_event_paranoid=2` or CAP_PERFMON for native stacks, and the session's accessibility bus (at-spi2-core) to drive native apps.
 
 ```
 strobe bench perf/timeline.bench.ts --base origin/dev --head .   # did my change help? (and why)

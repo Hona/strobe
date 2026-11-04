@@ -15,8 +15,9 @@ export interface Options {
 }
 
 /**
- * Drives the target. On a native target strobe drives the app through the OS's accessibility tree and the app's
- * own message loop (posted input; the app never takes focus): selectors are accessibility ids (an element key,
+ * Drives the target. On a native target strobe drives the app through the OS's accessibility tree (UI Automation,
+ * macOS AX, Linux AT-SPI) and input of the OS's own (Windows: posted messages, the app never takes focus; macOS:
+ * Quartz events posted to the app, which comes to the front for keys; Linux: XTest): selectors are accessibility ids (an element key,
  * `"nav-history"`, or a key path, `"slider/knob"`), `role=button`, `text=General`, with a `:focus` suffix.
  * `goto` and `eval` are page-only; `act` and `query` are native-only.
  */
@@ -53,7 +54,7 @@ export interface Page {
    * handling, so it is never an input latency (`interaction.*` refuses a run that only acted).
    */
   act(selector: string, action: string, opts?: Options & { value?: string }): Promise<void>
-  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels), focused, enabled. */
+  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled. */
   query(selector: string, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean }[]>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
   waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>

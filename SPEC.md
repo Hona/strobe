@@ -96,7 +96,7 @@ locations, not only PATH.
 | analyser | A check that warns in the result (§10.2) |
 | census | A consistent per-process memory account at one moment (§8.6) |
 | bridge | `@hona/strobe-electron` inside an app's main process (§13.2) |
-| accessibility tree | what an app exposes to the OS's assistive technology (UI Automation on Windows): strobe finds and waits on a native app's elements through it (§13.7) |
+| accessibility tree | what an app exposes to the OS's assistive technology (UI Automation on Windows, the AX API on macOS, AT-SPI on Linux): strobe finds and waits on a native app's elements through it (§13.7) |
 | calibration | The known-cost page every probe must recover (§10.3) |
 | A/A | An experiment with the same build on both sides (§10.4) |
 
@@ -150,7 +150,8 @@ app/            commands (up, status, record, bench, query, report, top, update,
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
 target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
                 process.rs, isolate.rs (isolated launches), electron.rs, native.rs (native apps,
-                §13.7), a11y/ (the OS accessibility client: uia.rs; posted input: input.rs)
+                §13.7), a11y/ (the OS accessibility client: uia.rs, ax.rs, atspi.rs; input:
+                input.rs (posted messages), cg_input.rs (Quartz), xtest.rs; keys.rs shared)
 driver/         the bench file's `page`: over CDP, or a native app's accessibility tree and
                 message loop (native.rs)
 probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
@@ -494,7 +495,9 @@ What strobe reads from a native app (§13.7), per run:
   folder: its thread pool and services) (`query <rec> threads`). The `wakes-while-idle` insight
   counts the app's own threads and names driver and OS threads apart. Every adapter the app used is
   recorded (`ctx.gpu.devices`), each with its own engine use.
-- **The UI thread, from outside:** the thread that owns the main window is the app's UI thread.
+- **The UI thread, from outside:** the thread that owns the main window is the app's UI thread (on
+  macOS and Linux no thread owns a window: it is the process's main thread, where AppKit must run and
+  X11 toolkits do).
   `ui.cpu` is its CPU per run from its cycle counter (the primary for "does this UI change cost
   less" from outside: continuous, not quantized to frames) and `ui.wakes` its context switches per
   second. The bridge's split of UI work into view, layout, text, paint and encode is gone: where the
@@ -502,7 +505,10 @@ What strobe reads from a native app (§13.7), per run:
   package, per phase (`query <rec> hotspots --thread <name> --phase <name>`).
 - **Presented frames** (`frames.interval.*`, `frames.dropped*`, `frames.discarded`,
   `frames.presented.count`, `display.hz`) on Windows from the OS's present events (§7.2) of the
-  app's processes. Every native block with a window runs a present session when access allows (page
+  app's processes; on macOS from ScreenCaptureKit and on Linux X11 from X Present (§13.6), which tell
+  when a frame was shown but not when it was handed over, so there `frames.interval.*` and
+  `frames.dropped*` are refused with that reason and the rest (counts, `frames.discarded` from
+  `Skip`, `display.hz` from the display's mode) stands. Every native block with a window runs a present session when access allows (page
   waits read it live). `frames.presented.p*` (a frame's begin to its screen time) is refused: only a
   toolkit knows when it began a frame. A run in which the app presented more frames than the display
   refreshed, plus ten, refuses the frame metrics (`UnpacedSpin`).
@@ -1801,7 +1807,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the TSC (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
 | process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
 | memory by what holds it (`memory.app.host`, `query memory`, §8.6) | `VirtualQueryEx` walk of committed regions (type, protection, `GetMappedFileName`), `PROCESS_MEMORY_COUNTERS_EX2` | `/proc/<pid>/smaps` | refused: another process's regions need its task port (debuggers only) |
-| threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`), no wakes: macOS keeps no per-thread count a user can read |
+| threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`), no wakes: no public per-thread switch count exists (`thread_info`, `PROC_PIDTHREADINFO` and `PROC_PIDTHREADCOUNTS` carry CPU time, scheduling state, cycles and energy; `getrusage` switches are the caller's own); the kernel's scheduler trace (kdebug through `ktrace`) has them for root only, not built |
 | per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
 | topology, pinning | `GetLogicalProcessorInformationEx` (L3 per CCD); process affinity | sysfs cache (`index*/level` 3, `shared_cpu_list`); `sched_setaffinity` on every thread of strobe, inherited by children | no L3 groups (Apple Silicon); P and E cores named in the CPU line (`hw.perflevel*`); no affinity API: unpinned |
 | GPU engines per process (`gpu.process.3d`) | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM client statistics (`/proc/<pid>/fdinfo` of each `/dev/dri` file: `drm-engine-*` busy ns, engines mapped to Windows' types: gfx/render → 3D); a process with a GPU device open but no statistics (NVIDIA's proprietary driver, virtual GPUs) is unreadable, not 0 | IORegistry: each GPU client (`IOAccelerator` child) has its creator pid and `AppUsage.accumulatedGPUTime`; no permission. One engine: 3D |
@@ -1809,14 +1815,17 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | device counters | NVML, ADLX | amdgpu sysfs (`gpu_busy_percent`, `mem_busy_percent`, VRAM used and total); NVML not built | accelerator `PerformanceStatistics` (`Device Utilization %`, `In use system memory`) |
 | displays, refresh | `EnumDisplaySettings`, `MonitorFromWindow`, `QueryDisplayConfig` | DRM mode setting (`DRM_IOCTL_MODE_GETCRTC`: pixel clock over the mode's totals, the CRTC holding the window's centre); virtual GPU drivers (virtio, bochs, qxl, simpledrm, …) are named virtual | `CGGetDisplaysWithRect`, `CGDisplayModeGetRefreshRate`, `CGDisplayIsBuiltin` |
 | session locked, display asleep | WTS session flags; console display state callback | logind `LockedHint` of the user's display session (system bus, one connection kept); display state not known | `CGSessionCopyCurrentDictionary` (`CGSSessionScreenIsLocked`); `CGDisplayIsAsleep`, polled every 500 ms |
-| keep awake while benching | `SetThreadExecutionState` | not built (logind's inhibitor needs file-descriptor passing) | IOKit power assertions (`PreventUserIdleSystemSleep`, `PreventUserIdleDisplaySleep`) |
+| keep awake while benching | `SetThreadExecutionState` | logind's `idle` inhibitor in block mode (no idle suspend or idle action; a person may still suspend), a file descriptor passed over strobe's D-Bus client and closed to release; the display through `org.freedesktop.ScreenSaver.Inhibit` where the desktop has it. Held only while blocks run, as on Windows (§9.4) | IOKit power assertions (`PreventUserIdleSystemSleep`, `PreventUserIdleDisplaySleep`) |
 | power plan for the run | §9.4 | the `performance` cpufreq governor on every policy when strobe may write it (root), journaled and restored; else kept with the reason | none to switch: Low Power Mode and the thermal state are reported |
 | battery, virtual machine | `GetSystemPowerStatus`; firmware strings | `/sys/class/power_supply`; the CPU's `hypervisor` flag and DMI strings | `IOPSGetProvidingPowerSourceType`; `kern.hv_vmm_present` |
-| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | refused (`NoPresentSource`): no unprivileged outside view of another app's presents. DRM vblank and flip tracepoints need root tracing and name no process; X11 Present and Wayland `presentation-time` report only to the app itself. A toolkit that reports its own present times still gets frame metrics | refused (`NoPresentSource`): WindowServer's frame timing is only visible to root tracing (ktrace) or Instruments (Xcode); a toolkit that reports Metal's `presentedTime` still gets frame metrics |
+| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | X11: the Present extension's `CompleteNotify`, which any client may select on another's windows (strobe selects it on the app's windows and their children): `Flip` is scanned out at its `ust` (CLOCK_MONOTONIC, the host clock); `Copy` without a compositing manager was copied into the scanned-out screen at that vertical blank; `Skip` is discarded. Refused: a compositing manager running (`_NET_WM_CM_S<n>` owned: its later frame shows the app's), a server with no real display (no DRI3, or only virtual outputs: Xvfb presents on a timer), native Wayland (presentation feedback goes to the app alone; DRM flip tracepoints need root and name the compositor). Frames an app draws without Present (core drawing, MIT-SHM, NVIDIA's own GL) are not seen: a block with none refuses (`NoPresentSource`), never 0 | ScreenCaptureKit: one stream per on-screen window of the app (`SCContentFilter` desktop-independent window, 64×64 frames, no cursor), which delivers a frame only when the window server composited new content of that window, stamped with its display time (`SCStreamFrameInfoDisplayTime`, Mach time: the host clock); the first frame (the window as it was) is dropped. Needs Screen Recording for the app strobe runs under (refused without). Root tracing, Instruments and private window-server calls are not used |
+| frame begin (Linux, macOS) | — | no begin: X Present tells when a frame was shown, not when it was handed over | no begin: ScreenCaptureKit tells when a frame was shown. On both, `frames.interval.*` and `frames.dropped*` are refused (a gap cannot be told from rest), and inputs join on screen times (§7.4) |
 | native stacks (§13.4) | ETW sampled profile through the helper, 200 µs | in-process `perf_event_open`: per-thread `cpu-clock` at 1 ms (on-CPU samples), user registers and 16 KB of user stack per sample unwound with the modules' DWARF CFI (`framehop`), kernel frames from the kernel's callchain when allowed; threads that start later are found every 50 ms. Needs `perf_event_paranoid` ≤ 2 (Debian ships 3) or CAP_PERFMON | `/usr/bin/sample` per process at 1 ms (task suspension, every thread's user stack; samples whose leaf is a system call trap are dropped and counted; untimed: they cover the whole capture) |
 | symbols (§12.2) | PDBs (local, Microsoft's server, `symbols.servers`) | DWARF of the module, its build-id file under `/usr/lib/debug`, or `.gnu_debuglink`; symbol tables (sized); `/proc/kallsyms` | DWARF of a dSYM beside the module or in strobe's cache, made with `dsymutil` from the objects a build left; else the names and `file:line` `sample` printed |
 | adapter per window | D3DKMT + DXGI | — | — |
 | IO (`io.read`, `io.write`) | `NtQuerySystemInformation` transfer counts (every byte read and written, cached or not) | `/proc/<pid>/io` `rchar`/`wchar` (the same) | disk bytes only (`ri_diskio_bytesread`/`written`): macOS counts no cached IO per process |
+| accessibility tree (§13.7) | UI Automation (COM) | AT-SPI over strobe's own D-Bus client: the registry's app roots by connection pid, a level per round trip | the AX API (`AXUIElementCopyMultipleAttributeValues`, one call per element; `AXObserver`), Accessibility permission |
+| input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events posted to its process (`CGEventPostToPid`), Accessibility permission |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING`, `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
 
@@ -1853,9 +1862,37 @@ toolkit (rule 15).
   timer, except while a window has not answered for its tree yet (re-read every 50 ms). A provider
   that answers first with a placeholder root and builds its tree a turn later (lazy providers, such
   as AccessKit's) raises a structure change then; strobe registers for events again when a window's
-  root element changes. macOS (AX) and Linux (AT-SPI) refuse with a reason: neither could be checked
-  (the macOS device grants no Accessibility permission to a remote shell, the Linux one has no
-  display).
+  root element changes.
+  - macOS (`target/a11y/ax.rs`): the AX API. A snapshot reads each window the app's `AXWindows` lists
+    (matched to its CoreGraphics window by frame: the AX API names no window id publicly) with one
+    `AXUIElementCopyMultipleAttributeValues` per element (role, subrole, title, description, value,
+    `AXIdentifier`, position, size, focused, enabled, children, minimized), in points. The key is
+    `AXIdentifier` (AccessKit's author id); a name is the title, else the description; roles map to the
+    same ARIA names. An `AXObserver` per process on a run-loop thread of its own hears focus, value,
+    title, created and destroyed, layout, move, resize, selection, row, window and menu notifications
+    (caret and text selection moves are not changes). `hit` is the system-wide
+    `AXUIElementCopyElementAtPosition`, which the window server answers (click-through overlays
+    pass). macOS answers only a process trusted for Accessibility, and attributes strobe to the app it
+    runs under (the ancestor launchd started: Terminal, an agent's app, a remote shell's daemon):
+    without it strobe refuses with that app's name and where to turn it on.
+  - Linux (`target/a11y/atspi.rs`): AT-SPI on the session's accessibility bus, over strobe's own D-Bus
+    client (no zbus: blocking, a few hundred lines). The registry's children are the app roots; a root
+    is the app's when its connection's pid is. A snapshot reads breadth first, sending every element's
+    calls of a level (`GetAll` of `Accessible`, `GetRole`, `GetState`, `GetInterfaces`, `GetChildren`,
+    `GetExtents` in window and screen coordinates) before reading their replies, then text (`GetText`)
+    or value of what holds one: a round trip per level. Each top-level AT-SPI window is placed on its
+    X11 window (screen bounds overlap, else title) and its elements' window coordinates added to that
+    window's client origin, so toolkits that do not know their position (GTK 4) still place right. The
+    key is `AccessibleId` (AccessKit's author id, ATK's accessible id). Strobe registers its events with
+    the registry (toolkits emit only what a client registered) and listens on a second connection
+    (children, property, state, text, bounds, selection, active descendant, value, window and focus
+    events; caret moves are not changes). Toolkits that expose a tree only while assistive technology
+    is on (AccessKit, Qt) read `org.a11y.Status.IsEnabled`: strobe sets it while it drives an app when it
+    was off and sets it back after. Before every native launch strobe starts the accessibility bus if it
+    is not running (an app started before it never registers). `hit` descends
+    `GetAccessibleAtPoint` from the window. Actions are AT-SPI's: `Action` by name (click, press,
+    activate, toggle, expand or contract), `EditableText.SetTextContents` or `Value`, `Selection.SelectChild`,
+    `Component.ScrollTo` and `GrabFocus`. Checked on Xvfb with a GTK 3 app (§24).
 - **Input** (`target/a11y/input.rs`): window messages posted to the app's own message loop on a
   thread of strobe's, each stamped on the host clock just before it is posted; never `SendInput`,
   so the app never takes focus or activates.
@@ -1893,6 +1930,40 @@ toolkit (rule 15).
     or pointer messages (`WM_POINTER*`: an app that takes only those, such as one on a UWP input
     stack, gets no posted mouse input). Pointer input on a locked session is refused
     (`SessionLocked`): the OS hit-tests every point to the lock screen.
+  - macOS (`target/a11y/cg_input.rs`): Quartz events posted to the app's process (`CGEventPostToPid`):
+    they reach no other app. Pointer: mouse events at the point carrying the window under it (the
+    fields AppKit routes a mouse event by), so AppKit's own hit test picks the view; the window
+    server's is replaced by the system-wide AX hit test that must name the app (`WindowHidden`
+    otherwise); the real cursor is moved there first without an event (`CGWarpMouseCursorPosition`)
+    and put back after. A posted click does not activate the app. Keys: the key code of the key's
+    position on a US keyboard with the character set on the event (`CGEventKeyboardSetUnicodeString`),
+    so the text is exact on any layout (an app that maps key codes through its own layout sees the US
+    key; any non-ASCII character goes as text on key code 0); modifiers as flag changes and the key's
+    flags. macOS gives keys only to the active app's key window, so before keys strobe brings the app to
+    the front (`AXFrontmost`) and refuses (`WindowHidden`) when it does not come: unlike Windows, typing
+    takes focus. Wheel: scroll events in pixels (continuous). Posting needs the Accessibility
+    permission (`CGPreflightPostEventAccess`; without it macOS drops events silently, so strobe refuses
+    first). Window actions go through the window's AX element: `close` presses its close button,
+    `minimize`/`show` set `AXMinimized` (and raise), `focus` brings the app to the front and makes the
+    window main, `hide` hides the app (macOS hides apps, not windows). Rects are points.
+  - Linux (`target/a11y/xtest.rs`): XTest, the X server's own device events, so input takes the real
+    path: the server hit-tests the pointer, toolkits get the core and XInput 2 events a mouse makes, keys
+    go to the window with the input focus. The real cursor moves (put back after); before keys strobe
+    makes the app's window the active one (`_NET_ACTIVE_WINDOW`, else `SetInputFocus`) and refuses
+    (`WindowHidden`) when it does not take focus rather than type into another app; a point another
+    app's window covers (stacking order) is `WindowHidden`. Characters are their keysyms on the server's
+    keyboard mapping (Shift and AltGr columns), refused with no key, as on Windows. The wheel moves in
+    clicks (XTest's device has no smooth scrolling): one click per 100 px, a `scroll`'s steps adding up
+    into clicks, so a step that adds no click sends nothing (and a `wheel` under 50 px is refused).
+    Window actions are EWMH and ICCCM messages (`_NET_CLOSE_WINDOW` or `WM_DELETE_WINDOW`, map, unmap,
+    `WM_CHANGE_STATE` iconic, activation). Native Wayland windows take no XTest input and strobe sees
+    none (XWayland apps work); the RemoteDesktop portal would need a person's consent each session and is
+    not built.
+  - Input kinds and latency are the same on every OS: clicks, keys and the first wheel step are
+    samples; `page.act` never is (`PatternInput`). On Linux and macOS each input joins the first frame
+    shown after it (the sources have no frame begin, §13.6), at rest as on Windows: a frame the app began
+    before the input and showed after it would be taken as the input's, which the rest before each
+    measured input (two refreshes with nothing shown) and the tree-change rule make rare.
   - Accessibility actions (`page.act`: Invoke, Toggle, Value, ExpandCollapse, SelectionItem,
     ScrollItem, focus) are a labelled alternative: the app's handler runs, but no hit test and no
     pointer handling, so they are never an input latency (§7.4).
@@ -2138,7 +2209,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
-| native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | macOS (AX) and Linux (AT-SPI) driving; `frames.presented.*` from outside |
+| native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | `frames.presented.*` from outside; macOS driving and ScreenCaptureKit frames not yet run with the permissions granted (§24.1) |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
 | 7 | — | CI budgets, history, mesh |
 
@@ -2181,8 +2252,33 @@ that builds and lints all three OSes on every push. Checked (short smoke runs, n
   native stacks of the hot loop (99.8% at its line, DWARF-unwound stacks to `clone`) and of `dd`
   (kernel frames from kallsyms).
 
-Not built: accessibility drivers on macOS and Linux, OS present events (refused on both), times on
-macOS samples. Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
+Phase 2 (2026-11-04): the accessibility driver on macOS (AX, Quartz events to the app's process) and
+Linux (AT-SPI, XTest), frames on screen from ScreenCaptureKit (macOS) and X Present (Linux X11),
+Linux keep-awake (logind), and why macOS has no per-thread wakes (§13.6, §13.7). Checked (smoke runs
+under `--check`, values noisy and not compared):
+
+- Debian 13 VM, Xvfb with openbox, a fresh session bus (at-spi2-core 2.56), a GTK 3 app
+  (`scripts/dev/atspi.bench.ts`): `query`, key paths (`scroll/rows/seed-0`), `click` timed to a label
+  change (`ui.cpu` and `ui.wakes` from the main thread: driving costs the app's UI thread about 2,500
+  wakes per second while strobe re-reads its tree), `type` with a capital and `+` (Shift from the
+  keyboard mapping), `Shift+Home` and `Backspace`, `Control+a`, `down`/`up`, `hover`, `move`,
+  `window("focus")`, `idle`, `act(toggle)` and `act(setValue)`, `scroll` and `wheel` (XTest clicks).
+  `until: "frame"`, `interaction.*` and `scroll.latency.*` refused with Xvfb's reason (no DRI3, a
+  virtual output). logind listed strobe's `idle` inhibitor during the blocks and none after. One first
+  block of a fresh session found no tree (the app started before the accessibility bus strobe's own
+  call started); strobe now starts the bus before each launch.
+- M4 MacBook Air, macOS 27: builds and clippy; `strobe status` names the app the permissions belong
+  to (`~/.local/bin/mesh` for a remote shell) and that both are missing; a bench on a small Cocoa app
+  (`scripts/dev/ax.bench.ts`, `scripts/dev/cocoa-app.swift`; TextEdit is sandboxed and strobe will not
+  launch it) launches it, finds its window and refuses at the first page call with that app's name and
+  where to turn Accessibility on. Posting events without the permission: macOS drops them
+  (`CGPreflightPostEventAccess` false), so strobe refuses before posting. Not run: everything behind
+  the two permissions (AX snapshots, observers, clicks, keys, wheel, window actions, ScreenCaptureKit
+  frames and their join with inputs), and a Rune app (its AccessKit tree has not landed on Rune's dev).
+- Not checked on hardware: X Present on an X server with a real display (no such Linux machine), and
+  on XWayland.
+
+Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).
 

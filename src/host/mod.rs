@@ -51,6 +51,19 @@ pub fn session_locked() -> bool {
     }
 }
 
+/// Seconds since the last keyboard or mouse input in the session, where strobe uses it (macOS: it
+/// takes a person's focus only after a minute without input).
+pub fn person_idle_s() -> Option<f64> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(os::user_idle_s())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// Turns the display back on if it went dark on idle (a zero-pixel mouse move on Windows).
 pub fn wake_display() {
     #[cfg(windows)]

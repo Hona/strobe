@@ -734,12 +734,12 @@ fn main_win(pids: &[u32]) -> Option<Win> {
 }
 
 /// Seconds since the last keyboard, mouse or trackpad input in this login session.
-fn user_idle_s() -> f64 {
+pub fn user_idle_s() -> f64 {
     unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) }
 }
 
 /// How long nobody may have touched this Mac before strobe brings a covered app to the front.
-const IDLE_BEFORE_ACTIVATE_S: f64 = 60.0;
+pub const IDLE_BEFORE_ACTIVATE_S: f64 = 60.0;
 
 pub fn window_state(id: isize) -> Option<super::TopWindow> {
     windows(LIST_INCLUDING, id as u32).into_iter().find(|w| w.id == id as u32).map(|w| top_window(&w))

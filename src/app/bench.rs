@@ -1472,6 +1472,19 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             woken = true;
             continue;
         }
+        // macOS: someone is using the Mac, so strobe did not take their focus to uncover the window.
+        // Wait for them to leave it, as for a locked session, holding nothing meanwhile.
+        if r.as_ref().err().is_some_and(|e| e.message.contains(crate::target::native::COVERED)) && host::person_idle_s().is_some_and(|i| i < 60.0) {
+            progress(format!("  waiting: someone is using this Mac and the {} window is covered; strobe runs the block again once nobody has touched it for a minute", v.role));
+            release_machine(ctx);
+            ctx.reg.set("waiting", format!("{} {} block: someone is using this Mac, and its window would be covered", s.label(), v.role));
+            let waiting = Instant::now();
+            while host::person_idle_s().is_some_and(|i| i < 60.0) {
+                std::thread::sleep(Duration::from_secs(5));
+            }
+            ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+            continue;
+        }
         if ctx.awake.locks() == before && !host::session_locked() {
             return r;
         }

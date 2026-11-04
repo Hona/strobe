@@ -10,6 +10,9 @@ use std::process::Child;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+/// Why a macOS window counts as hidden when other apps' windows cover it.
+pub const COVERED: &str = "window is covered by other apps' windows (strobe brings it to the front only after a minute without keyboard or mouse input, and with the Accessibility permission)";
+
 pub struct Native {
     pub child: Child,
     pub pid: u32,
@@ -113,7 +116,7 @@ impl Native {
             Some(s) if !s.visible => Some("window is hidden"),
             Some(s) if s.iconic && cfg!(target_os = "macos") => Some("window is off screen (minimized, or on another Space)"),
             Some(s) if s.iconic => Some("window is minimized"),
-            Some(s) if s.cloaked && cfg!(target_os = "macos") => Some("window is covered by other apps' windows (strobe brings it to the front only after a minute without keyboard or mouse input, and with the Accessibility permission)"),
+            Some(s) if s.cloaked && cfg!(target_os = "macos") => Some(COVERED),
             Some(s) if s.cloaked => Some("window is cloaked (another virtual desktop, or hidden by the compositor)"),
             _ => None,
         };

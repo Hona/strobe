@@ -256,6 +256,8 @@ struct Builder {
     thread_tracks: HashMap<(u32, u32), u64>,
     lo: Option<u64>,
     hi: Option<u64>,
+    /// The page's runs in the Chrome trace's own time, when it has them.
+    trace_span: Option<(u64, u64)>,
     /// Measured runs in host time: anchors for samples that carry no time.
     runs: Vec<(u64, u64)>,
 }
@@ -404,6 +406,8 @@ impl Builder {
         if clock == MONOTONIC {
             self.seen(t0);
             self.seen(t1);
+        } else {
+            self.trace_span = Some(self.trace_span.map_or((t0, t1), |(a, b)| (a.min(t0), b.max(t1))));
         }
     }
 
@@ -588,36 +592,43 @@ impl Builder {
         for (i, th) in t.threads.iter().enumerate() {
             let Some(c) = cells.get(&(i as u32)) else { continue };
             let (Some(&first), Some(&last)) = (c.keys().next(), c.keys().next_back()) else { continue };
-            let name = th.name.clone().or_else(|| threads.names.get(&(th.pid, th.tid)).cloned()).unwrap_or_else(|| "thread".into());
-            let (cpu, wakes) = if self.built.chrome {
-                let g = self.track("threads (CPU and wakes)", 10, None);
-                (self.track_under(Some(g), &format!("{name} {} · CPU %", th.tid), 0, Some("%")), self.track_under(Some(g), &format!("{name} {} · wakes/s", th.tid), 0, Some("/s")))
-            } else {
-                let parent = self.thread_track(th.pid, th.tid, th.name.as_deref());
-                let mut make = |what: &str, unit: &str| {
+            // An unnamed thread goes by the module it started in (a GPU driver's worker, the OS pool).
+            let name = th
+                .name
+                .clone()
+                .or_else(|| threads.names.get(&(th.pid, th.tid)).cloned())
+                .or_else(|| th.module.as_deref().map(|m| format!("{} thread", m.rsplit(['\\', '/']).next().unwrap_or(m))))
+                .unwrap_or_else(|| "thread".into());
+            // With a Chrome trace its own thread tracks stay its own: these go under strobe's.
+            let parent = if self.built.chrome { None } else { Some(self.thread_track(th.pid, th.tid, th.name.as_deref())) };
+            let group = self.built.chrome.then(|| self.track("threads (CPU and wakes)", 10, None));
+            let mut make = |what: String, unit: &str| match parent {
+                Some(parent) => {
                     let uuid = self.uuid();
                     self.descriptor(|d| {
-                        d.u(1, uuid).u(5, parent).s(2, what).m(8, |c| {
-                            c.s(6, unit).s(7, what);
+                        d.u(1, uuid).u(5, parent).s(2, &what).m(8, |c| {
+                            c.s(6, unit).s(7, unit);
                         });
                     });
                     uuid
-                };
-                (make("CPU % (one core)", "%"), make("wakes/s", "/s"))
+                }
+                None => self.track_under(group, &format!("{what} ({})", th.tid), 0, Some(unit)),
             };
+            let cpu = make(format!("{name} · CPU % of a core"), "%");
+            let wakes = wakes_per_thread.then(|| make(format!("{name} · wakes/s"), "/s"));
             let last = last.min(t.ticks.len() - 1);
             for k in first..=last {
                 let (ms, w) = c.get(&k).copied().unwrap_or((0.0, 0));
                 let span = t.ticks[k].saturating_sub(start(k)).max(1) as f64;
                 self.counter(cpu, MONOTONIC, start(k), 100.0 * f64::from(ms) * 1e6 / span);
-                if wakes_per_thread {
-                    self.counter(wakes, MONOTONIC, start(k), f64::from(w) * 1e9 / span);
+                if let Some(wk) = wakes {
+                    self.counter(wk, MONOTONIC, start(k), f64::from(w) * 1e9 / span);
                 }
                 self.seen(start(k));
             }
             self.counter(cpu, MONOTONIC, t.ticks[last], 0.0);
-            if wakes_per_thread {
-                self.counter(wakes, MONOTONIC, t.ticks[last], 0.0);
+            if let Some(wk) = wakes {
+                self.counter(wk, MONOTONIC, t.ticks[last], 0.0);
             }
             self.count("thread CPU and wakes");
         }
@@ -709,12 +720,17 @@ impl Builder {
     /// The recording as one slice over everything it holds: its validity, timing, probes, note,
     /// warnings, environment, values and OS averages as arguments.
     fn summary(&mut self, meta: &Value) {
-        let (Some(lo), Some(hi)) = (self.lo, self.hi) else { return };
+        // A page's runs span the recording in the trace's own clock; else what strobe's clock saw.
+        let (clock, (lo, hi)) = match (self.trace_span, self.lo.zip(self.hi)) {
+            (Some(span), _) => (BOOTTIME, span),
+            (None, Some(span)) => (MONOTONIC, span),
+            (None, None) => return,
+        };
         let mut args = Vec::new();
         flatten("", meta, &["os.cores", "census", "token", "background"], &mut args);
         let track = self.track("recording", -1, None);
         let name = format!("{} · {}{}", meta["id"].as_str().unwrap_or("recording"), if meta["valid"] == false { "invalid" } else { "valid" }, meta["timing"].as_str().map(|t| format!(" · timing {t}")).unwrap_or_default());
-        self.slice(track, MONOTONIC, lo, hi, &name, &args);
+        self.slice(track, clock, lo, hi, &name, &args);
     }
 
     /// V8 CPU profiles (source-mapped frames, `(idle)` left out) and sampled allocations as stack samples.
@@ -742,7 +758,7 @@ impl Builder {
         let page_thread = page.page.or(own).unwrap_or((0, 0));
         let mut js = Stacks::new(SEQ_JS, "javascript", "time", 1);
         let mut first_ts: Option<u64> = None;
-        let (mut scripts, mut mapped) = (0usize, 0usize);
+        let (mut scripts, mut mapped) = (HashSet::new(), HashSet::new());
         for path in &profiles {
             let Ok(prof) = store::read_json(path) else { continue };
             let main = path.file_name().is_some_and(|n| n.to_string_lossy().starts_with("cpu-main"));
@@ -756,8 +772,13 @@ impl Builder {
                 })
                 .collect();
             let frames: HashMap<u64, Frame> = nodes.iter().filter_map(|n| Some((n["id"].as_u64()?, sym.call_frame(&n["callFrame"])))).collect();
-            scripts += frames.values().filter(|f| !f.url.is_empty()).count();
-            mapped += frames.values().filter(|f| f.mapped).count();
+            for f in frames.values().filter(|f| !f.url.is_empty()) {
+                let key = (f.url.clone(), f.line, f.column, f.name.clone());
+                if f.mapped {
+                    mapped.insert(key.clone());
+                }
+                scripts.insert(key);
+            }
             let mut stacks: HashMap<u64, Option<u64>> = HashMap::new();
             let samples = prof["samples"].as_array().cloned().unwrap_or_default();
             let deltas: Vec<i64> = prof["timeDeltas"].as_array().into_iter().flatten().map(|d| d.as_i64().unwrap_or(0)).collect();
@@ -818,13 +839,15 @@ impl Builder {
                     }
                 }
             }
+            self.built.frames += al.frames.len() as u64;
+            self.built.located_frames += al.located;
             self.out.extend_from_slice(&al.out);
         }
         if self.built.js_samples > 0 {
             self.built.sampled_threads += 1;
         }
-        if scripts > 0 {
-            self.built.notes.push(format!("{mapped} of {scripts} distinct script frames source-mapped to original files"));
+        if !scripts.is_empty() {
+            self.built.notes.push(format!("{} of {} distinct script frames source-mapped to original files", mapped.len(), scripts.len()));
         }
     }
 
@@ -1005,11 +1028,15 @@ impl Stacks {
         if let Some(i) = self.mappings.get(path) {
             return *i;
         }
-        let p = self.string(2, path);
+        // Perfetto joins a mapping's path parts with `/`: a Windows path reads `/C:/Windows/…`.
+        let parts: Vec<u64> = if path.contains("://") { vec![self.string(2, path)] } else { path.split(['\\', '/']).filter(|p| !p.is_empty()).map(|p| self.string(2, p)).collect() };
         let iid = self.mappings.len() as u64 + 1;
         self.mappings.insert(path.to_string(), iid);
         self.pending.m(19, |m| {
-            m.u(1, iid).u(7, p);
+            m.u(1, iid);
+            for p in &parts {
+                m.u(7, *p);
+            }
         });
         iid
     }

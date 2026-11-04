@@ -2730,7 +2730,12 @@ function renderNextStepsSection(r, s, aa) {
 }
 
 function cmdRow(cmd) {
-  return h("div", { class: "cmd-box" }, h("code", {}, cmd), copyBtn(cmd, "Copy", "cmd-copy"));
+  // Served by the daemon (/report/…), `strobe open` is a link: the daemon builds the trace and opens Perfetto.
+  const open = /^strobe open (\S+)$/.exec(cmd);
+  const link = open && location.pathname.startsWith("/report/")
+    ? h("a", { class: "btn-ghost", href: `/perfetto/open/${open[1]}`, target: "_blank" }, "Open")
+    : null;
+  return h("div", { class: "cmd-box" }, h("code", {}, cmd), link, copyBtn(cmd, "Copy", "cmd-copy"));
 }
 
 function copyBtn(text, label = "Copy", cls = "btn-ghost") {
@@ -4048,6 +4053,9 @@ function forestRow(item, dom, focus, aa) {
 function renderTraceQueriesDisclosure(r, s) {
   const cmds = [];
   const a = s.attribution || {};
+  if (a.head) cmds.push(["Open head's profiled launch in Perfetto (flame graphs, timeline)", `strobe open ${a.head}`]);
+  if (a.base) cmds.push(["Open base's profiled launch in Perfetto", `strobe open ${a.base}`]);
+  for (const b of timedBlocks(s).filter((b) => b.recording)) cmds.push([`Open the kept ${b.variant || ""} block (pair ${b.pair ?? "?"}) in Perfetto`, `strobe open ${b.recording}`]);
   if (a.head) {
     cmds.push(["CPU hotspots in head (by package)", `strobe query ${a.head} hotspots --by package`]);
     cmds.push(["Forced layout & style stacks in head", `strobe query ${a.head} layout`]);
@@ -4920,6 +4928,7 @@ function renderRecording(m) {
 
   const recId = m.id || "<rec_id>";
   const cmds = [
+    ["Open in Perfetto: one timeline with flame graphs, runs, threads and presents", `strobe open ${recId}`],
     ["Worst frames in this recording", `strobe query ${recId} frames`],
     ["Busy share by thread", `strobe query ${recId} threads`],
     /attribution|cpu/.test(String(m.probes || "")) ? ["CPU hotspots by package", `strobe query ${recId} hotspots --by package`] : null,

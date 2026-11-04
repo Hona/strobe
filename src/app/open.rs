@@ -16,13 +16,10 @@ pub fn run(args: &Args) -> Result<Output> {
     let p = prepare(&dir, &id)?;
     let mut text = p.text;
     let mut out = p.json;
-    if args.has("no-browser") {
-        text += &format!("open it in the Perfetto UI: strobe open {handle}\n");
-        return Ok(Output::new(text, out));
-    }
+    let browse = !args.has("no-browser");
     let ui = ui()?;
     // The daemon serves the UI when it is this build's; otherwise this command does, until Ctrl-C.
-    let daemon = super::mcp::running() && get(super::mcp::port(), "/perfetto/version").is_some_and(|v| Some(v) == engine::ui_version());
+    let daemon = super::mcp::running() && get(super::mcp::port(), "/perfetto/version").is_some_and(|v| v == version());
     let (port, own) = if daemon {
         (super::mcp::port(), None)
     } else {
@@ -33,7 +30,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let session = start(&p.trace, &id, port);
     let url = format!("http://127.0.0.1:{port}/perfetto/s/{}", session.token);
     text += &format!(
-        "opened {url}\n  {} · the Perfetto UI {} and the trace stay on this machine\n",
+        "{} {url}\n  {} · the Perfetto UI {} and the trace stay on this machine\n",
+        if browse { "opened" } else { "open" },
         match session.rpc {
             Some(rpc) => format!("trace_processor on 127.0.0.1:{rpc} (ends after an hour unused)"),
             None => "the UI's own trace_processor (WebAssembly)".to_string(),
@@ -45,7 +43,9 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     out["url"] = json!(url);
     out["rpc_port"] = json!(session.rpc);
-    super::report::open(&url);
+    if browse {
+        super::report::open(&url);
+    }
     if let Some(listener) = own {
         // An older daemon (or none): serve here. `strobe up` lets the daemon serve it instead.
         print!("{text}");
@@ -171,9 +171,10 @@ union all select 'stat', name, value, severity from stats where value > 0 and se
     }
     if !stacks.is_empty() {
         text += &format!(
-            "  stacks    {} · {} threads · {} frames, {} with file:line (flame graphs: select a range on a Callstacks track)\n",
+            "  stacks    {} · {} thread{} · {} frames, {} with file:line (flame graphs: select a range on a Callstacks track)\n",
             stacks.join(", "),
             b.sampled_threads,
+            if b.sampled_threads == 1 { "" } else { "s" },
             fmt::value(b.frames as f64, "count"),
             fmt::value(b.located_frames as f64, "count")
         );
@@ -182,14 +183,14 @@ union all select 'stat', name, value, severity from stats where value > 0 and se
         text += &format!("  tracks    {}\n", b.tracks.iter().map(|(k, n)| format!("{k} {}", fmt::value(*n as f64, "count"))).collect::<Vec<_>>().join(" · "));
     }
     text += &format!(
-        "  checked   trace_processor {}: {} samples, {} frames ({} named, {} with file:line), {} tracks, {}\n",
+        "  checked   trace_processor {}: {} samples, {} frames ({} named, {} with a source file), {} tracks, {}\n",
         engine::VERSION,
         fmt::value(read.values().sum::<u64>() as f64, "count"),
         fmt::value(frames as f64, "count"),
         fmt::value(named as f64, "count"),
         fmt::value(located as f64, "count"),
         fmt::value(tracks as f64, "count"),
-        if errors.is_empty() { "no import errors".to_string() } else { format!("import errors: {}", errors.join(", ")) }
+        if errors.is_empty() { "no import errors".to_string() } else { format!("its error stats: {}", errors.join(", ")) }
     );
     if !short.is_empty() {
         text += &format!("  ! trace_processor read fewer samples than were written ({})\n", short.join("; "));
@@ -258,7 +259,8 @@ fn session(token: &str) -> Option<Value> {
 }
 
 /// The page a session opens at: it turns on the UI flag that lets it reach a trace_processor on its
-/// own port and turns the UI's telemetry off (both in this origin's storage), then opens the trace.
+/// own port and turns the UI's telemetry off (both in this origin's storage), then opens the trace
+/// with strobe's runs and the sampled threads' Callstacks tracks pinned to the top.
 fn session_page(token: &str, s: &Value) -> String {
     let rec = s["recording"].as_str().unwrap_or("trace");
     let rpc = s["rpc_port"].as_u64().map(|p| format!(" + '&rpc_port={p}'")).unwrap_or_default();
@@ -267,9 +269,13 @@ fn session_page(token: &str, s: &Value) -> String {
 <p style="font:13px system-ui;color:#888">Opening {rec} in Perfetto…</p>
 <script>
 const edit = (key, change) => {{ let v = {{}}; try {{ v = JSON.parse(localStorage.getItem(key) || '{{}}') || {{}}; }} catch (e) {{}} change(v); localStorage.setItem(key, JSON.stringify(v)); }};
-edit('perfettoFeatureFlags', (f) => {{ f.cspAllowAnyWebsocketPort = true; }});
+edit('perfettoFeatureFlags', (f) => {{ f.cspAllowAnyWebsocketPort = 'OVERRIDE_TRUE'; }});
 edit('perfettoSettings', (s) => {{ s.analyticsEnable = false; }});
-location.replace('/perfetto/#!/?url=' + location.origin + '/perfetto/t/{token}/{rec}.pftrace'{rpc});
+const commands = [
+  {{ id: 'dev.perfetto.PinTracksByRegex', args: ['^runs and phases$|Callstacks', 'name'] }},
+  {{ id: 'dev.perfetto.ExpandTracksByRegex', args: ['^strobe ', 'name'] }},
+];
+location.replace('/perfetto/#!/?url=' + encodeURIComponent(location.origin + '/perfetto/t/{token}/{rec}.pftrace') + '&startupCommands=' + encodeURIComponent(JSON.stringify(commands)){rpc});
 </script>
 "#
     )
@@ -286,7 +292,7 @@ pub fn serve(req: &http::Request, port: u16) -> Option<http::Response> {
     }
     let rest = rest.strip_prefix('/')?;
     if rest == "version" {
-        return Some(http::Response::text(200, &engine::ui_version().unwrap_or_default()));
+        return Some(http::Response::text(200, &version()));
     }
     if let Some(t) = rest.strip_prefix("s/") {
         return Some(match session(t) {
@@ -320,7 +326,9 @@ pub fn serve(req: &http::Request, port: u16) -> Option<http::Response> {
         return Some(http::Response::text(404, "not found"));
     }
     let body = std::fs::read(engine::ui_dir().join(file)).ok()?;
-    let kind = match Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("") {
+    let ext = Path::new(file).extension().and_then(|e| e.to_str()).unwrap_or("");
+    let csp = Some(policy((ext == "html").then(|| String::from_utf8_lossy(&body).to_string()).as_deref()));
+    let kind = match ext {
         "html" => html,
         "js" => "text/javascript; charset=utf-8",
         "css" => "text/css; charset=utf-8",
@@ -331,7 +339,35 @@ pub fn serve(req: &http::Request, port: u16) -> Option<http::Response> {
         "svg" => "image/svg+xml",
         _ => "application/octet-stream",
     };
-    Some(http::Response::new(200, kind, body))
+    Some(http::Response { csp, ..http::Response::new(200, kind, body) })
+}
+
+/// What the UI may reach: this origin and a trace_processor on 127.0.0.1. Its own policy also lets
+/// it load Google analytics, an internal extension server and a userscript; a browser enforces both
+/// policies, so nothing leaves the machine. A page's inline scripts are allowed by their hashes.
+fn policy(html: Option<&str>) -> String {
+    use base64::Engine;
+    use sha2::Digest;
+    let mut script = String::from("'self' 'unsafe-eval' 'wasm-unsafe-eval' blob:");
+    let mut rest = html.unwrap_or("");
+    while let Some(at) = rest.find("<script") {
+        let Some(open) = rest[at..].find('>') else { break };
+        let tag = &rest[at..at + open];
+        let body = &rest[at + open + 1..];
+        let Some(close) = body.find("</script>") else { break };
+        if !tag.contains("src=") {
+            script += &format!(" 'sha256-{}'", base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(&body.as_bytes()[..close])));
+        }
+        rest = &body[close..];
+    }
+    format!(
+        "default-src 'self'; script-src {script}; worker-src 'self' blob:; connect-src 'self' http://127.0.0.1:* ws://127.0.0.1:* blob: data:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; object-src 'none'"
+    )
+}
+
+/// The UI and the strobe build that serve it: a daemon of another build may serve other pages.
+fn version() -> String {
+    format!("{} {}", engine::ui_version().unwrap_or_default(), super::mcp::build_id())
 }
 
 /// A GET to the daemon, its body when it answers 200.

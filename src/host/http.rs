@@ -17,11 +17,13 @@ pub struct Response {
     pub status: u16,
     pub content_type: &'static str,
     pub body: Vec<u8>,
+    /// A Content-Security-Policy header, enforced on top of any the page sets itself.
+    pub csp: Option<String>,
 }
 
 impl Response {
     pub fn new(status: u16, content_type: &'static str, body: impl Into<Vec<u8>>) -> Response {
-        Response { status, content_type, body: body.into() }
+        Response { status, content_type, body: body.into(), csp: None }
     }
     pub fn text(status: u16, body: &str) -> Response {
         Response::new(status, "text/plain; charset=utf-8", body.as_bytes().to_vec())
@@ -77,7 +79,8 @@ pub fn write_response(stream: &mut TcpStream, r: &Response) {
         415 => "Unsupported Media Type",
         _ => "Error",
     };
-    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n", r.status, r.content_type, r.body.len());
+    let csp = r.csp.as_ref().map(|c| format!("Content-Security-Policy: {c}\r\n")).unwrap_or_default();
+    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{csp}Connection: close\r\n\r\n", r.status, r.content_type, r.body.len());
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(&r.body);
     let _ = stream.flush();

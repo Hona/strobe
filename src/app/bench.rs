@@ -1297,7 +1297,9 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
     let d: Vec<f64> = pairs.iter().map(|&(a, b)| (val(&blocks[b], &s.primary) / val(&blocks[a], &s.primary)).ln()).filter(|x| x.is_finite()).collect();
     if d.len() >= 8 {
         let rho = validity::spearman(&d);
-        if rho.abs() > 0.6 {
+        // A trend smaller than 1% end to end (rounding of a near-constant difference) changes no verdict.
+        let range = d.iter().copied().fold(f64::NEG_INFINITY, f64::max) - d.iter().copied().fold(f64::INFINITY, f64::min);
+        if rho.abs() > 0.6 && range >= 0.01 {
             w.push(validity::warn("Drift", format!("the difference trends across pairs (Spearman {rho:.2}): the machine changed during the run")));
         }
     }

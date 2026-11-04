@@ -1412,9 +1412,11 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 ### 10.2 Analysers (warn in the result)
 
 `MultimodalDistribution` · `HighVariance` · `Underpowered` · `StateDrift` · `Background` ·
-`Throttling` · `Drift` (trend across pairs) · `CounterUnstable` · `ProbeOverhead` ·
+`Throttling` · `Drift` (trend across pairs: Spearman |ρ| > 0.6 with tied ranks averaged, over ≥ 8 pairs, and the log-ratio moving at least 1% end to end, so a near-constant difference never trends) · `CounterUnstable` · `ProbeOverhead` ·
 `Unresolved` (samples without a symbol above 5%) · `PowerPlan` (the user's plan was kept: `--power
-keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine` · `CursorNotParked` (a native block's OS cursor could not be moved onto the pointer's points, so hover tracking saw it elsewhere)
+keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine` · `BackgroundPriority`
+(macOS: strobe runs at background priority, `taskpolicy -b` or a parent's, which the target inherits;
+efficiency cores and a throttled GPU saturate frame metrics, so it suggests normal priority or a CPU primary) · `CursorNotParked` (a native block's OS cursor could not be moved onto the pointer's points, so hover tracking saw it elsewhere)
 · `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed) · `DisplayOff`
 (pairs ran with the console display off, §10.5) · `CrossAdapterScanout` (a native app draws on one GPU
 while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`

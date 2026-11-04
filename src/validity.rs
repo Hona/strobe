@@ -308,9 +308,18 @@ pub fn spearman(values: &[f64]) -> f64 {
     }
     let mut idx: Vec<usize> = (0..n).collect();
     idx.sort_by(|&a, &b| values[a].total_cmp(&values[b]));
+    // Ties share their mean rank: with order-of-arrival ranks, a constant series read as a perfect trend.
     let mut rank = vec![0.0; n];
-    for (r, &i) in idx.iter().enumerate() {
-        rank[i] = r as f64;
+    let mut start = 0;
+    while start < n {
+        let mut end = start + 1;
+        while end < n && values[idx[end]] == values[idx[start]] {
+            end += 1;
+        }
+        for &i in &idx[start..end] {
+            rank[i] = (start + end - 1) as f64 / 2.0;
+        }
+        start = end;
     }
     let mean = (n - 1) as f64 / 2.0;
     let (mut num, mut da, mut db) = (0.0, 0.0, 0.0);

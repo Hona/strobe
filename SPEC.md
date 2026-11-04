@@ -1231,7 +1231,7 @@ renders into one (a diff or code viewer) counts as a change.
 | `wheel(selector, { dx?, dy? }, opts?)` | one mouse-wheel event over the element (the viewport's centre with `""`) |
 | `window(action, opts?)` | native apps: `show`, `hide`, `minimize`, `focus` or `close` a window (`opts.window`: a title, or part of one; default the main window) |
 | `act(selector, action, opts?)` | native apps: an accessibility action (`invoke`, `toggle`, `setValue` with `opts.value`, `expand`, `collapse`, `select`, `scrollIntoView`, `focus`); never an input latency |
-| `query(selector, opts?)` | native apps: the visible elements it matches now, with key path, role, name, value, screen rect, focus and enabled |
+| `query(selector, opts?)` | native apps: the visible elements it matches now, with key path, role, name, value, screen rect, focus, enabled and checked (a toggle's or radio's state, else null) |
 
 On a native target strobe drives the app through the OS's accessibility tree and its message loop
 (§13.7), for any app with an accessibility tree: every call above but `goto` and `eval`, with the same
@@ -1916,7 +1916,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | IO (`io.read`, `io.write`) | `NtQuerySystemInformation` transfer counts (every byte read and written, cached or not) | `/proc/<pid>/io` `rchar`/`wchar` (the same) | disk bytes only (`ri_diskio_bytesread`/`written`): macOS counts no cached IO per process |
 | accessibility tree (§13.7) | UI Automation (COM) | AT-SPI over strobe's own D-Bus client: the registry's app roots by connection pid, a level per round trip | the AX API (`AXUIElementCopyMultipleAttributeValues`, one call per element; `AXObserver`), Accessibility permission |
 | input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events posted to its process (`CGEventPostToPid`), Accessibility permission |
-| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING`, `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So a covered main window is brought to the front by activating its app (`AXFrontmost`), only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block is `WindowHidden` instead) |
+| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So a covered main window is brought to the front by activating its app (`AXFrontmost`), only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block is `WindowHidden` instead) |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
 macOS permissions are granted to the responsible app (the launchd-started ancestor). Every message
 that asks for one names the pane for the running macOS (13–26: Accessibility; 27 and later: Device
@@ -1985,9 +1985,11 @@ toolkit (rule 15).
     is on (AccessKit, Qt) read `org.a11y.Status.IsEnabled`: strobe sets it while it drives an app when it
     was off and sets it back after. Before every native launch strobe starts the accessibility bus if it
     is not running (an app started before it never registers). `hit` descends
-    `GetAccessibleAtPoint` from the window. Actions are AT-SPI's: `Action` by name (click, press,
+    `GetAccessibleAtPoint` from the window; an element there that no child list names (GTK 4's text
+    inside an entry) stands for its nearest ancestor (`Parent`) the read had. Actions are AT-SPI's: `Action` by name (click, press,
     activate, toggle, expand or contract), `EditableText.SetTextContents` or `Value`, `Selection.SelectChild`,
-    `Component.ScrollTo` and `GrabFocus`. Checked on Xvfb with a GTK 3 app (§24).
+    `Component.ScrollTo` and `GrabFocus`. Checked on Xvfb with a GTK 3 app, GTK 3's widget factory,
+    zenity (GTK 4) and AccessKit apps, and on XWayland under a headless weston (§24).
 - **Input** (`target/a11y/input.rs`): window messages posted to the app's own message loop on a
   thread of strobe's, each stamped on the host clock just before it is posted; never `SendInput`,
   so the app never takes focus or activates.
@@ -2053,7 +2055,12 @@ toolkit (rule 15).
     Window actions are EWMH and ICCCM messages (`_NET_CLOSE_WINDOW` or `WM_DELETE_WINDOW`, map, unmap,
     `WM_CHANGE_STATE` iconic, activation). Native Wayland windows take no XTest input and strobe sees
     none (XWayland apps work); the RemoteDesktop portal would need a person's consent each session and is
-    not built.
+    not built. An app given `WAYLAND_DISPLAY` that shows no X11 window fails its launch saying so, with
+    the fix (`unset` it in the app profile, or the app's own X11 switch). On XWayland the compositor
+    gives the X focus, only while its seat's keyboard is on that window: keys there are refused with that
+    reason when the window does not take it (a headless compositor's seat has none).
+  - On every OS a click waits for its element to be enabled (a click on a disabled one does nothing):
+    a selector whose first match stays disabled times out naming it.
   - Input kinds and latency are the same on every OS: clicks, keys and the first wheel step are
     samples; `page.act` never is (`PatternInput`). On Linux and macOS each input joins the first frame
     shown after it (the sources have no frame begin, §13.6), at rest as on Windows: a frame the app began
@@ -2262,8 +2269,6 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
   task port needs Developer Mode or root).
 - Linux: refresh of a native Wayland window's output (DRM gives every output's, not which one a
   Wayland window is on); NVML for NVIDIA's proprietary driver; frames on screen for a process.
-- Accessibility drivers on macOS (AX) and Linux (AT-SPI over the session bus) for the native `page`
-  driver, once the Windows UI Automation driver's interface lands.
 - Each embedding app's product decisions for the bridge: where the toggle lives, who can turn it
   on, the indicator.
 
@@ -2362,6 +2367,26 @@ under `--check`, values noisy and not compared):
   virtual output). logind listed strobe's `idle` inhibitor during the blocks and none after. One first
   block of a fresh session found no tree (the app started before the accessibility bus strobe's own
   call started); strobe now starts the bus before each launch.
+- Same VM, AccessKit apps (Rune `dev` `c35fe19`, `examples/hello` and `examples/settings`, debug
+  builds on lavapipe), read through `query`'s `checked`: `hello`'s switch toggles by `act`, by click and
+  by Tab then Space, and `act(focus)` then `switch:focus` matches (unlike Windows, X11 gives the window
+  focus, so `:focus` works); `settings`' switch rows toggle by `act` and by click, a swatch radio and a
+  theme segment check by click and by `act(select)`, the slider reads "Animation speed" with value 1.
+  Its rows, radios and slider are not focusable (Tab moves no focus the tree shows, `GrabFocus` does
+  nothing) and its slider takes no `setValue` (pyatspi's write is ignored too): the app's, not strobe's.
+  AccessKit answers the tree on its own thread, so `ui.cpu` and `ui.wakes` read 0 while strobe reads it.
+- Same VM, stock GTK apps: `gtk3-widget-factory` (GTK 3) reads 6 check boxes, 8+ radios, 5 sliders and
+  their states; a radio checks by click and by `act(select)`, a slider takes `setValue` (50 to 30); its
+  first check box in tree order is disabled, so a click on `role=checkbox` now waits and names it
+  instead of clicking and doing nothing; `idle` never settles there (spinners animate). zenity 4
+  (GTK 4): a click lands in its entry (GTK 4 hit-tests to a text element no child list names; strobe
+  takes its ancestor) and keys reach it (Enter closes the dialog), but GTK 4's entry reports no text
+  through AT-SPI (pyatspi reads "" after typing too), so a wait on typed text cannot pass.
+- Same VM, headless weston 14 with XWayland: Rune `hello` with `WAYLAND_DISPLAY` opens a native
+  Wayland window, and its launch fails naming that and the fix; with the profile's `unset`, it opens
+  on XWayland, strobe finds the window (weston's manager keeps no `_NET_CLIENT_LIST_STACKING`; found
+  through `WM_STATE`), `act` and click toggle the switch, and keys are refused with the XWayland
+  reason (the headless seat has no keyboard, so no window takes the X focus).
 - M4 MacBook Air, macOS 27: builds and clippy; `strobe status` names the app the permissions belong
   to (`~/.local/bin/mesh` for a remote shell) and that both are missing; a bench on a small Cocoa app
   (`scripts/dev/ax.bench.ts`, `scripts/dev/cocoa-app.swift`; TextEdit is sandboxed and strobe will not

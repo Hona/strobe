@@ -52,13 +52,30 @@ fn resource_dpi(x: &X) -> Option<u32> {
     text.lines().find_map(|l| l.strip_prefix("Xft.dpi:")).and_then(|v| v.trim().parse::<f64>().ok()).map(|d| d.round() as u32)
 }
 
-/// Managed top-level windows, bottom to top (the window manager's stacking list, else the root's children).
+/// Managed top-level windows, bottom to top: the window manager's stacking list, else the root's
+/// children, each frame stood for by the client window in it (ICCCM's `WM_STATE`), since a manager
+/// without the list (an XWayland manager) still reparents clients into frames.
 fn clients(x: &X) -> Vec<Window> {
     let stacked = prop32(x, x.root, "_NET_CLIENT_LIST_STACKING");
     if !stacked.is_empty() {
         return stacked;
     }
-    x.conn.query_tree(x.root).ok().and_then(|c| c.reply().ok()).map(|t| t.children).unwrap_or_default()
+    children(x, x.root).into_iter().map(|w| client_in(x, w, 2).unwrap_or(w)).collect()
+}
+
+fn children(x: &X, win: Window) -> Vec<Window> {
+    x.conn.query_tree(win).ok().and_then(|c| c.reply().ok()).map(|t| t.children).unwrap_or_default()
+}
+
+/// The window at or under `win` (at most `depth` levels down) that has `WM_STATE`.
+fn client_in(x: &X, win: Window, depth: u32) -> Option<Window> {
+    if !prop32(x, win, "WM_STATE").is_empty() {
+        return Some(win);
+    }
+    if depth == 0 {
+        return None;
+    }
+    children(x, win).into_iter().rev().find_map(|c| client_in(x, c, depth - 1))
 }
 
 struct Info {

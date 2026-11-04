@@ -304,7 +304,7 @@ impl Tree {
         let n = &self.nodes[i];
         json!({
             "key": n.id, "path": self.key_path(i), "role": if role_name(n.role).is_empty() { n.role_text.as_str() } else { role_name(n.role) }, "name": n.name, "value": n.value,
-            "rect": self.visible_rect(i).unwrap_or(n.rect), "focused": n.focused, "enabled": n.enabled, "window": self.windows.get(n.window),
+            "rect": self.visible_rect(i).unwrap_or(n.rect), "focused": n.focused, "enabled": n.enabled, "checked": n.toggled, "window": self.windows.get(n.window),
         })
     }
 }

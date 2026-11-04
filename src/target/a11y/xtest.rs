@@ -333,9 +333,14 @@ impl Poster {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+        let xwayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
         Err(Error::refused(
             "WindowHidden",
-            "keys go to the window with the X input focus, and the app's window did not take it (the window manager kept another window focused)",
+            if xwayland {
+                "keys go to the window with the X input focus, and the app's window did not take it: on XWayland the compositor gives it, only while its seat's keyboard is on that window (a headless compositor's seat has no keyboard)"
+            } else {
+                "keys go to the window with the X input focus, and the app's window did not take it (the window manager kept another window focused)"
+            },
             "let the app's window be focused while strobe types into it",
         ))
     }

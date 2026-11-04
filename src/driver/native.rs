@@ -414,8 +414,30 @@ mod imp {
             Ok(last)
         }
 
+        /// `find`, then until the element is enabled: a click on a disabled one does nothing.
+        fn find_enabled(&self, sel: &Selector, window: Option<&str>, t: Duration) -> Result<(Tree, usize)> {
+            let deadline = Instant::now() + t;
+            loop {
+                let seen = self.a11y.changes().count;
+                let (tree, i) = self.find(sel, window, deadline.saturating_duration_since(Instant::now()))?;
+                if tree.nodes[i].enabled {
+                    return Ok((tree, i));
+                }
+                if Instant::now() >= deadline {
+                    let n = &tree.nodes[i];
+                    let what = Some(tree.key_path(i)).filter(|p| !p.is_empty()).unwrap_or_else(|| format!("{} {:?}", n.role_text, n.name));
+                    return Err(Error {
+                        code: 124,
+                        message: format!("selector {:?}: {what} stayed disabled for {} s, and a click on a disabled element does nothing", sel.source, t.as_secs()),
+                        hint: Some("wait for what enables it, or pick an enabled element (page.query lists enabled)".into()),
+                    });
+                }
+                self.a11y.wait_change(seen, deadline);
+            }
+        }
+
         fn click(&self, sel: &str, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
-            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, opts["window"].as_str(), timeout(opts))?;
+            let (tree, i) = self.find_enabled(&Selector::parse(&Value::String(sel.into()))?, opts["window"].as_str(), timeout(opts))?;
             let (x, y, t) = self.aim(&tree, i)?;
             let b = Button::parse(opts["button"].as_str())?;
             let mods = Mods::parse_list(&opts["modifiers"])?;

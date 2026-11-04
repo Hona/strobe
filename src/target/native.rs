@@ -53,6 +53,20 @@ impl Native {
         self.child.try_wait().ok().flatten().map(|s| s.code().unwrap_or(-1))
     }
 
+    /// Why no window may show on Linux: the app was given a Wayland display, where toolkits open a
+    /// native Wayland window, which no other client sees.
+    fn wayland_note(&self) -> &'static str {
+        let wayland = cfg!(target_os = "linux")
+            && self.pids().iter().any(|p| {
+                std::fs::read(format!("/proc/{p}/environ")).is_ok_and(|e| e.split(|&b| b == 0).any(|kv| kv.strip_prefix(b"WAYLAND_DISPLAY=").is_some_and(|v| !v.is_empty())))
+            });
+        if wayland {
+            ": the app has WAYLAND_DISPLAY, and a native Wayland window is invisible to strobe (Wayland shows no client another's windows, and takes no XTest input); run it under X11 or XWayland: unset WAYLAND_DISPLAY in the app profile (`unset`), or use the app's own switch to X11"
+        } else {
+            ""
+        }
+    }
+
     /// Waits for the app's main window: its largest visible top-level window.
     pub fn wait_window(&mut self, timeout: Duration, guard: &Guard) -> Result<TopWindow> {
         let deadline = Instant::now() + timeout;
@@ -69,7 +83,7 @@ impl Native {
             }
             guard.check("while the app started")?;
             if Instant::now() > deadline {
-                return Err(Error::unreachable(format!("{} opened no visible window in {} s", self.exe.display(), timeout.as_secs())));
+                return Err(Error::unreachable(format!("{} opened no visible window in {} s{}", self.exe.display(), timeout.as_secs(), self.wayland_note())));
             }
             std::thread::sleep(Duration::from_millis(50));
         }

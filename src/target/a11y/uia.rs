@@ -103,6 +103,7 @@ const PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_HeadingLevelPropertyId,
     UIA_IsDialogPropertyId,
     UIA_ToggleToggleStatePropertyId,
+    UIA_SelectionItemIsSelectedPropertyId,
     UIA_IsInvokePatternAvailablePropertyId,
     UIA_IsTogglePatternAvailablePropertyId,
     UIA_IsValuePatternAvailablePropertyId,
@@ -372,11 +373,17 @@ unsafe fn read(e: &IUIAutomationElement, parent: Option<usize>, window: usize) -
             | pattern(UIA_IsScrollPatternAvailablePropertyId, PATTERN_SCROLL)
             | pattern(UIA_IsScrollItemPatternAvailablePropertyId, PATTERN_SCROLL_ITEM);
         let heading = e.GetCachedPropertyValue(UIA_HeadingLevelPropertyId).ok().and_then(|v| i32::try_from(&v).ok()).is_some_and(|l| l != HeadingLevel_None.0 && l != 0);
-        let toggled = (patterns & PATTERN_TOGGLE != 0).then(|| e.GetCachedPropertyValue(UIA_ToggleToggleStatePropertyId).ok().and_then(|v| i32::try_from(&v).ok()) == Some(ToggleState_On.0));
+        let role = e.CachedControlType().map(|c| c.0).unwrap_or(0);
+        let toggled = if patterns & PATTERN_TOGGLE != 0 {
+            Some(e.GetCachedPropertyValue(UIA_ToggleToggleStatePropertyId).ok().and_then(|v| i32::try_from(&v).ok()) == Some(ToggleState_On.0))
+        } else {
+            // A radio button is checked through SelectionItem.
+            (role == UIA_RadioButtonControlTypeId.0 && patterns & PATTERN_SELECT != 0).then(|| bool_of(e, UIA_SelectionItemIsSelectedPropertyId))
+        };
         Node {
             id: s(e.CachedAutomationId()),
             name: s(e.CachedName()),
-            role: e.CachedControlType().map(|c| c.0).unwrap_or(0),
+            role,
             role_text: s(e.CachedLocalizedControlType()),
             value: value.filter(|_| patterns & PATTERN_VALUE != 0),
             rect: [r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64],

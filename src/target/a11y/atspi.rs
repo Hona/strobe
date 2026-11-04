@@ -441,8 +441,20 @@ impl Worker {
                 _ => break,
             }
         }
-        let Some(&at) = self.index.get(&cur) else {
-            return Ok(Err(format!("an element the last read did not have ({})", cur.1)));
+        // A provider may hit-test to an element no child list names (GTK 4's text inside an entry):
+        // its nearest ancestor the read had stands for it.
+        let first = cur.1.clone();
+        let mut at = self.index.get(&cur).copied();
+        for _ in 0..16 {
+            if at.is_some() {
+                break;
+            }
+            let Some(up) = self.bus.get_property(&cur.0, &cur.1, ACC, "Parent").ok().as_ref().and_then(obj).filter(|p| p.1 != NULL && *p != cur) else { break };
+            at = self.index.get(&up).copied();
+            cur = up;
+        }
+        let Some(at) = at else {
+            return Ok(Err(format!("an element the last read did not have ({first})")));
         };
         // The element or one inside it; or one of its ancestors, when the provider hit-tests no finer.
         if self.last.within(at, i) || self.last.within(i, at) {

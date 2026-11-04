@@ -66,8 +66,8 @@ export interface Page {
    * handling, so it is never an input latency (`interaction.*` refuses a run that only acted).
    */
   act(selector: string, action: string, opts?: Options & { value?: string }): Promise<void>
-  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled. */
-  query(selector: string, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean }[]>
+  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled, checked (a switch, check box, radio or toggle button's state; null for others). */
+  query(selector: string, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean; checked: boolean | null }[]>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
   waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */

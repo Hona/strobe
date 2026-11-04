@@ -5,6 +5,21 @@ pub mod paths;
 pub mod power;
 #[cfg(windows)]
 pub mod win;
+#[cfg(target_os = "linux")]
+pub mod dbus;
+#[cfg(target_os = "linux")]
+pub mod linux;
+#[cfg(target_os = "macos")]
+pub mod macos;
+#[cfg(target_os = "linux")]
+pub mod x11;
+
+#[cfg(target_os = "linux")]
+use linux as os;
+#[cfg(target_os = "macos")]
+use macos as os;
+#[cfg(windows)]
+use win as os;
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -18,10 +33,7 @@ pub fn now_ns() -> u64 {
     }
     #[cfg(not(windows))]
     {
-        use std::sync::OnceLock;
-        use std::time::Instant;
-        static START: OnceLock<Instant> = OnceLock::new();
-        START.get_or_init(Instant::now).elapsed().as_nanos() as u64
+        os::now_ns()
     }
 }
 
@@ -34,7 +46,7 @@ pub fn session_locked() -> bool {
     }
     #[cfg(not(windows))]
     {
-        false
+        os::session_locked()
     }
 }
 
@@ -53,7 +65,7 @@ pub fn display_state() -> Option<(u8, u64)> {
     }
     #[cfg(not(windows))]
     {
-        None
+        unix_display_state()
     }
 }
 
@@ -86,14 +98,14 @@ impl Awake {
                     u.fetch_add(1, Ordering::Relaxed);
                 }
                 if was != Some(locked) {
-                    #[cfg(windows)]
-                    win::keep_awake(true, !locked);
+                    #[cfg(any(windows, target_os = "macos"))]
+                    os::keep_awake(true, !locked);
                     was = Some(locked);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            #[cfg(windows)]
-            win::keep_awake(false, false);
+            #[cfg(any(windows, target_os = "macos"))]
+            os::keep_awake(false, false);
         });
         Awake { stop, locked, unlocked }
     }
@@ -136,8 +148,7 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     }
     #[cfg(not(windows))]
     {
-        let _ = root;
-        Vec::new()
+        os::process_tree(root)
     }
 }
 
@@ -175,8 +186,7 @@ pub fn threads(pids: &[u32]) -> (Vec<ThreadInfo>, Vec<(u32, u64, u64)>) {
     }
     #[cfg(not(windows))]
     {
-        let _ = pids;
-        (Vec::new(), Vec::new())
+        os::threads(pids)
     }
 }
 
@@ -188,8 +198,7 @@ pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     }
     #[cfg(not(windows))]
     {
-        let _ = tid;
-        None
+        os::thread_cycles_of(tid)
     }
 }
 
@@ -200,8 +209,7 @@ pub fn thread_name(tid: u32) -> Option<String> {
     }
     #[cfg(not(windows))]
     {
-        let _ = tid;
-        None
+        os::thread_name(tid)
     }
 }
 
@@ -237,8 +245,7 @@ pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     }
     #[cfg(not(windows))]
     {
-        let _ = pids;
-        None
+        os::main_window(pids)
     }
 }
 
@@ -250,8 +257,7 @@ pub fn window_state(hwnd: isize) -> Option<TopWindow> {
     }
     #[cfg(not(windows))]
     {
-        let _ = hwnd;
-        None
+        os::window_state(hwnd)
     }
 }
 
@@ -261,7 +267,7 @@ pub fn place_window(w: &TopWindow, x: i32, y: i32, client: Option<(u32, u32)>) {
     #[cfg(windows)]
     win::place_window(w, x, y, client);
     #[cfg(not(windows))]
-    let _ = (w, x, y, client);
+    os::place_window(w, x, y, client);
 }
 
 /// Every process on the machine, from one system snapshot (no process is opened, so protected
@@ -273,7 +279,7 @@ pub fn all_processes() -> Vec<ProcInfo> {
     }
     #[cfg(not(windows))]
     {
-        Vec::new()
+        os::all_processes()
     }
 }
 
@@ -286,8 +292,7 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
     }
     #[cfg(not(windows))]
     {
-        let _ = root;
-        Vec::new()
+        os::tree_pids(root)
     }
 }
 
@@ -300,21 +305,24 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     }
     #[cfg(not(windows))]
     {
-        out.clear();
-        false
+        os::idle_cycles(out)
     }
 }
 
 /// The time stamp counter (x64), the unit of `ProcInfo::cycles`; None on other architectures.
 pub fn tsc() -> Option<u64> {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(windows, target_arch = "x86_64"))]
     {
         #[allow(unused_unsafe)]
         Some(unsafe { std::arch::x86_64::_rdtsc() })
     }
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(all(windows, not(target_arch = "x86_64")))]
     {
         None
+    }
+    #[cfg(not(windows))]
+    {
+        Some(now_ns())
     }
 }
 
@@ -327,7 +335,7 @@ pub fn thread_cycles() -> u64 {
     }
     #[cfg(not(windows))]
     {
-        0
+        os::thread_cycles()
     }
 }
 
@@ -348,6 +356,8 @@ pub fn ctrl_c() -> &'static std::sync::atomic::AtomicBool {
     static FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     #[cfg(windows)]
     win::on_ctrl_c(&FLAG);
+    #[cfg(not(windows))]
+    unix_ctrl_c(&FLAG);
     &FLAG
 }
 
@@ -355,16 +365,13 @@ pub fn ctrl_c() -> &'static std::sync::atomic::AtomicBool {
 /// background service lives outside the tree but belongs to the target).
 pub fn process_set(root: u32, home: Option<&Path>) -> Vec<ProcTimes> {
     let mut set = process_tree(root);
-    #[cfg(windows)]
     if let Some(h) = home {
-        for pid in win::running_under(h) {
+        for pid in running_under(h) {
             if !set.iter().any(|p| p.pid == pid) {
                 set.extend(process_tree(pid));
             }
         }
     }
-    #[cfg(not(windows))]
-    let _ = home;
     set.sort_by_key(|p| p.pid);
     set.dedup_by_key(|p| p.pid);
     set
@@ -403,8 +410,7 @@ pub fn topology() -> Topology {
     }
     #[cfg(not(windows))]
     {
-        let n = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
-        Topology { logical: n, groups: Vec::new() }
+        os::topology()
     }
 }
 
@@ -416,8 +422,13 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
     }
     #[cfg(not(windows))]
     {
-        let _ = mask;
-        None
+        #[cfg(target_os = "linux")]
+        return os::set_affinity(mask);
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = mask;
+            None
+        }
     }
 }
 
@@ -425,7 +436,9 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
 pub fn set_thread_affinity(mask: u64) {
     #[cfg(windows)]
     win::set_thread_affinity(mask);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "linux")]
+    os::set_thread_affinity(mask);
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = mask;
 }
 
@@ -455,7 +468,7 @@ pub fn env_power_plan() -> String {
     }
     #[cfg(not(windows))]
     {
-        String::new()
+        os::power_plan()
     }
 }
 
@@ -467,7 +480,7 @@ pub fn on_battery() -> bool {
     }
     #[cfg(not(windows))]
     {
-        false
+        os::on_battery()
     }
 }
 
@@ -476,11 +489,11 @@ pub fn env() -> Env {
     #[cfg(windows)]
     let (os, cpu, power_plan, on_battery) = (win::os_name(), win::cpu_name(), env_power_plan(), win::on_battery());
     #[cfg(not(windows))]
-    let (os, cpu, power_plan, on_battery) = (std::env::consts::OS.to_string(), String::new(), String::new(), false);
+    let (os, cpu, power_plan, on_battery) = (os::os_name(), os::cpu_name(), env_power_plan(), os::on_battery());
     #[cfg(windows)]
     let virtual_machine = win::virtual_machine();
     #[cfg(not(windows))]
-    let virtual_machine = None;
+    let virtual_machine = os::virtual_machine();
     Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, virtual_machine, strobe: env!("CARGO_PKG_VERSION").to_string() }
 }
 
@@ -492,8 +505,7 @@ pub fn system_busy(ms: u64) -> f64 {
     }
     #[cfg(not(windows))]
     {
-        let _ = ms;
-        0.0
+        os::system_busy(ms)
     }
 }
 
@@ -507,8 +519,7 @@ pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
     }
     #[cfg(not(windows))]
     {
-        let _ = pids;
-        None
+        os::window_pixels(pids)
     }
 }
 
@@ -520,8 +531,7 @@ pub fn raise_windows(root: u32) -> usize {
     }
     #[cfg(not(windows))]
     {
-        let _ = root;
-        0
+        os::raise_windows(&tree_pids(root))
     }
 }
 
@@ -533,8 +543,7 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     }
     #[cfg(not(windows))]
     {
-        let _ = (x, y);
-        None
+        os::refresh_at(x, y)
     }
 }
 
@@ -569,8 +578,7 @@ pub fn display_of(hwnd: isize) -> Option<DisplayPath> {
     }
     #[cfg(not(windows))]
     {
-        let _ = hwnd;
-        None
+        os::display_of(hwnd)
     }
 }
 
@@ -594,4 +602,94 @@ pub fn home() -> PathBuf {
 
 pub fn exists(path: &Path) -> bool {
     path.exists()
+}
+
+/// The executable path of a running process.
+pub fn exe_of(pid: u32) -> Option<PathBuf> {
+    os::exe_of(pid)
+}
+
+/// PIDs of running processes whose executable is exactly `exe`.
+pub fn running(exe: &Path) -> Vec<u32> {
+    os::running(exe)
+}
+
+/// PIDs of running processes whose executable lives under `dir` (on Linux also: whose working folder does).
+pub fn running_under(dir: &Path) -> Vec<u32> {
+    os::running_under(dir)
+}
+
+/// SIGINT sets `flag` instead of ending strobe.
+#[cfg(unix)]
+pub fn unix_ctrl_c(flag: &'static std::sync::atomic::AtomicBool) {
+    use std::sync::atomic::{AtomicPtr, Ordering};
+    static TARGET: AtomicPtr<std::sync::atomic::AtomicBool> = AtomicPtr::new(std::ptr::null_mut());
+    extern "C" fn handler(_: libc::c_int) {
+        let flag = TARGET.load(Ordering::SeqCst);
+        if !flag.is_null() {
+            unsafe { (*flag).store(true, Ordering::SeqCst) };
+        }
+    }
+    if TARGET.swap(flag as *const _ as *mut _, Ordering::SeqCst).is_null() {
+        unsafe { libc::signal(libc::SIGINT, handler as *const () as libc::sighandler_t) };
+    }
+}
+
+/// The main display on (1) or asleep (0), and how often that changed, from a poll every 500 ms that
+/// starts on first use (macOS); None where the OS does not say (Linux).
+#[cfg(unix)]
+fn unix_display_state() -> Option<(u8, u64)> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+        static STATE: AtomicU8 = AtomicU8::new(u8::MAX);
+        static CHANGES: AtomicU64 = AtomicU64::new(0);
+        static STARTED: std::sync::Once = std::sync::Once::new();
+        STARTED.call_once(|| {
+            STATE.store(macos::display_on() as u8, Ordering::Relaxed);
+            std::thread::spawn(|| {
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let v = macos::display_on() as u8;
+                    if STATE.swap(v, Ordering::Relaxed) != v {
+                        CHANGES.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        });
+        Some((STATE.load(Ordering::Relaxed), CHANGES.load(Ordering::Relaxed)))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// 32-bit pixels (`stride` bytes per row) averaged into a 16×16 grid of 4-byte cells, sampling every
+/// second pixel of each cell.
+#[cfg(unix)]
+pub fn grid16(bytes: &[u8], width: usize, height: usize, stride: usize) -> Vec<u8> {
+    let mut out = vec![0u8; 16 * 16 * 4];
+    for cy in 0..16 {
+        for cx in 0..16 {
+            let (x0, x1, y0, y1) = (cx * width / 16, (cx + 1) * width / 16, cy * height / 16, (cy + 1) * height / 16);
+            let mut sum = [0u64; 4];
+            let mut n = 0u64;
+            for y in (y0..y1).step_by(2) {
+                for x in (x0..x1).step_by(2) {
+                    let at = y * stride + x * 4;
+                    if let Some(px) = bytes.get(at..at + 4) {
+                        for (s, p) in sum.iter_mut().zip(px) {
+                            *s += *p as u64;
+                        }
+                        n += 1;
+                    }
+                }
+            }
+            for (k, s) in sum.iter().enumerate() {
+                out[(cy * 16 + cx) * 4 + k] = (s / n.max(1)) as u8;
+            }
+        }
+    }
+    out
 }

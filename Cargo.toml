@@ -40,6 +40,21 @@ rustc-demangle = "0.1"
 # C++ symbol names in Microsoft's public PDBs (`?Present@CDXGISwapChain@@…`); pure Rust.
 msvc-demangler = "0.11"
 
+[target.'cfg(unix)'.dependencies]
+# Linux and macOS system calls (affinity, CPU clocks, sysctl, proc_pidinfo, perf_event_open, dlopen); bindings only, no C build.
+libc = "0.2"
+# Native stacks on Linux and macOS: functions, files, lines and inline frames from DWARF (ELF, dSYM); pure Rust.
+addr2line = { version = "0.26", default-features = false, features = ["std"] }
+gimli = { version = "0.33", default-features = false, features = ["read", "std"] }
+# Reading ELF and Mach-O modules: sections, segments, symbols, build ids; pure Rust.
+object = { version = "0.39", default-features = false, features = ["read_core", "elf", "macho", "std", "compression"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# X11 windows (find, place, keep on top, read pixels) over the pure-Rust connection; no libxcb.
+x11rb = { version = "0.13", default-features = false }
+# Unwinding sampled user stacks with the modules' DWARF unwind tables (.eh_frame); pure Rust.
+framehop = { version = "0.16", default-features = false }
+
 [target.'cfg(windows)'.dependencies]
 # Win32: QPC clock, process CPU times, toolhelp snapshots, affinity, power plans, PDH, window state.
 windows-sys = { version = "0.59", features = [

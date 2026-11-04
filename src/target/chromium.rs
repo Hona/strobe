@@ -107,19 +107,12 @@ pub fn reap_orphans() {
         if owner == std::process::id() {
             continue;
         }
-        #[cfg(windows)]
-        {
-            let alive = host::win::exe_of(owner).is_some_and(|exe| exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("strobe")));
-            if alive {
-                continue;
-            }
-            for pid in host::win::running_under(&e.path()) {
-                super::isolate::kill_tree(pid);
-            }
-        }
-        #[cfg(not(windows))]
-        if std::process::Command::new("kill").args(["-0", &owner.to_string()]).status().is_ok_and(|s| s.success()) {
+        let alive = host::exe_of(owner).is_some_and(|exe| exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("strobe")));
+        if alive {
             continue;
+        }
+        for pid in host::running_under(&e.path()) {
+            super::isolate::kill_tree(pid);
         }
         super::isolate::restore_protocols(&e.path());
         let _ = std::fs::remove_dir_all(e.path());
@@ -166,6 +159,11 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     }
     if headless {
         args.push("--headless=new".into());
+    }
+    // Chromium refuses to start as root on Linux unless its sandbox is off (containers, CI machines).
+    #[cfg(target_os = "linux")]
+    if unsafe { libc::geteuid() } == 0 {
+        args.push("--no-sandbox".into());
     }
     args.extend(extra.iter().cloned());
     args.push("about:blank".into());
@@ -307,8 +305,7 @@ impl Browser {
         if let Some(p) = self.profile.take() {
             // Detached children (an Electron app's own background service) outlive the tree: end
             // everything that runs from the private home.
-            #[cfg(windows)]
-            for pid in crate::host::win::running_under(&p) {
+            for pid in crate::host::running_under(&p) {
                 super::isolate::kill_tree(pid);
             }
             super::isolate::restore_protocols(&p);

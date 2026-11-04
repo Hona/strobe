@@ -4,6 +4,7 @@
 use super::Output;
 use crate::cli::Args;
 use crate::model::{Error, Result};
+#[cfg(windows)]
 use serde_json::json;
 
 pub fn run(args: &Args) -> Result<Output> {

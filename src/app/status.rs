@@ -47,9 +47,15 @@ pub fn run(args: &Args) -> Result<Output> {
     let deep = crate::etw::access();
     #[cfg(windows)]
     let deep_text = super::helper::describe(&deep);
-    #[cfg(not(windows))]
-    let deep_text = "not on this OS".to_string();
-    if !deep.presents() {
+    #[cfg(target_os = "linux")]
+    let deep_text = match crate::probe::perf::access() {
+        (true, true) => "native stacks: perf events, kernel frames included · no OS present events on Linux".to_string(),
+        (true, false) => "native stacks: perf events, user frames (kernel frames need perf_event_paranoid 1 or CAP_PERFMON) · no OS present events on Linux".to_string(),
+        _ => format!("native stacks off: {} · no OS present events on Linux", crate::probe::perf::refusal().unwrap_or_default()),
+    };
+    #[cfg(target_os = "macos")]
+    let deep_text = "native stacks: /usr/bin/sample (every thread's stack each 1 ms, untimed) · no OS present events on macOS".to_string();
+    if !deep.presents() && cfg!(windows) {
         problems.push("no OS present events (native frame metrics are refused): strobe up".into());
     }
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };

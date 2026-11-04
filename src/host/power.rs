@@ -2,12 +2,16 @@
 //! afterwards. The plan to restore is journaled in `<state>/power.json` before anything changes, so a
 //! strobe that was killed mid-run puts it back the next time any strobe starts (`restore_stale`).
 
-use serde_json::{Value, json};
+use serde_json::Value;
 
 /// Windows' own schemes and Windows 11 power modes (overlays on Balanced).
+#[cfg(windows)]
 const BALANCED: &str = "381b4222-f694-41f0-9685-ff5bb260df2e";
+#[cfg(windows)]
 const HIGH: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
+#[cfg(windows)]
 const ULTIMATE: &str = "e9a42b02-d5df-448d-aa00-03f14749eb61";
+#[cfg(windows)]
 const BEST_PERFORMANCE: &str = "ded574b5-45a0-4f42-8737-46345c09c238";
 
 /// While alive, the run's power plan; dropping it restores the user's.
@@ -42,13 +46,13 @@ impl Power {
         if super::on_battery() {
             return kept(format!("{plan} (kept: on battery, where a faster plan drains it and clocks follow the battery anyway)"));
         }
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             imp::switch(&plan)
         }
-        #[cfg(not(windows))]
+        #[cfg(target_os = "macos")]
         {
-            kept(format!("{plan} (kept: strobe switches power plans on Windows only)"))
+            kept(format!("{plan} (kept: macOS has no power plan to switch; Low Power Mode off is its fastest)"))
         }
     }
 }
@@ -56,7 +60,7 @@ impl Power {
 impl Drop for Power {
     fn drop(&mut self) {
         if let Some(s) = self.saved.take() {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "linux"))]
             imp::restore(&s);
             let _ = std::fs::remove_file(journal());
             let _ = s;
@@ -73,7 +77,7 @@ pub fn restore_stale() {
         return;
     }
     let s = Saved { scheme: v["scheme"].as_str().unwrap_or("").to_string(), overlay: v["overlay"].as_str().map(str::to_string) };
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     if !s.scheme.is_empty() {
         imp::restore(&s);
     }
@@ -81,8 +85,9 @@ pub fn restore_stale() {
     let _ = std::fs::remove_file(journal());
 }
 
+#[cfg(any(windows, target_os = "linux"))]
 fn save(s: &Saved) -> bool {
-    std::fs::write(journal(), json!({ "pid": std::process::id(), "scheme": s.scheme, "overlay": s.overlay }).to_string()).is_ok()
+    std::fs::write(journal(), serde_json::json!({ "pid": std::process::id(), "scheme": s.scheme, "overlay": s.overlay }).to_string()).is_ok()
 }
 
 #[cfg(windows)]
@@ -209,6 +214,58 @@ mod imp {
             && overlay().as_deref() != Some(o.as_str())
         {
             set_overlay(o);
+        }
+    }
+}
+
+/// Linux: the cpufreq governor of every CPU policy. `performance` is the "High performance" plan; it
+/// needs root (the files are root's), so an unprivileged strobe keeps the user's governor and says so.
+/// The journal's `scheme` holds each policy's governor (`policy0=schedutil,…`).
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::*;
+
+    fn policies() -> Vec<std::path::PathBuf> {
+        std::fs::read_dir("/sys/devices/system/cpu/cpufreq").into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.join("scaling_governor").is_file()).collect()
+    }
+
+    fn governor(p: &std::path::Path) -> String {
+        std::fs::read_to_string(p.join("scaling_governor")).map(|s| s.trim().to_string()).unwrap_or_default()
+    }
+
+    pub fn switch(plan: &str) -> Power {
+        let kept = |why: String| Power { used: plan.to_string(), kept: Some(why), saved: None };
+        let list = policies();
+        if list.is_empty() {
+            return kept(format!("{plan} (kept: no frequency policy to switch, as in most virtual machines)"));
+        }
+        if list.iter().all(|p| governor(p) == "performance") {
+            return Power { used: plan.to_string(), kept: None, saved: None };
+        }
+        let offers = std::fs::read_to_string(list[0].join("scaling_available_governors")).unwrap_or_default();
+        if !offers.split_whitespace().any(|g| g == "performance") {
+            return kept(format!("{plan} (kept: this cpufreq driver offers no performance governor)"));
+        }
+        let saved = Saved { scheme: list.iter().map(|p| format!("{}={}", p.file_name().unwrap_or_default().to_string_lossy(), governor(p))).collect::<Vec<_>>().join(","), overlay: None };
+        if std::fs::OpenOptions::new().write(true).open(list[0].join("scaling_governor")).is_err() {
+            return kept(format!("{plan} (kept: switching the governor needs root; run as root or set it to performance yourself)"));
+        }
+        if !save(&saved) {
+            return kept(format!("{plan} (kept: strobe could not journal it to put it back)"));
+        }
+        if !list.iter().all(|p| std::fs::write(p.join("scaling_governor"), "performance").is_ok()) {
+            restore(&saved);
+            let _ = std::fs::remove_file(journal());
+            return kept(format!("{plan} (kept: the governor did not switch)"));
+        }
+        Power { used: super::super::env_power_plan(), kept: None, saved: Some(saved) }
+    }
+
+    pub fn restore(s: &Saved) {
+        for part in s.scheme.split(',') {
+            if let Some((policy, gov)) = part.split_once('=') {
+                let _ = std::fs::write(std::path::Path::new("/sys/devices/system/cpu/cpufreq").join(policy).join("scaling_governor"), gov);
+            }
         }
     }
 }

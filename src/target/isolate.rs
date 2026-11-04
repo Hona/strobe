@@ -268,10 +268,7 @@ impl Guard {
 }
 
 pub fn alive(pid: u32) -> bool {
-    #[cfg(windows)]
-    return host::win::exe_of(pid).is_some();
-    #[cfg(not(windows))]
-    return Command::new("kill").args(["-0", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
+    host::exe_of(pid).is_some()
 }
 
 /// Seed files this large are shared, not copied into each home: a copy per launch writes the whole
@@ -387,8 +384,7 @@ pub fn new_home() -> PathBuf {
 /// Ends what still runs from `home` (an app's detached service) and restores the URL schemes saved
 /// in it, without deleting it: a warm home is launched again.
 pub fn release_home(home: &Path) {
-    #[cfg(windows)]
-    for pid in host::win::running_under(home) {
+    for pid in host::running_under(home) {
         kill_tree(pid);
     }
     restore_protocols(home);
@@ -543,6 +539,8 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
         std::fs::write(path, text)?;
     }
     save_protocols(&home, &app.protocols);
+    #[cfg(target_os = "macos")]
+    macos_library::save(&home, app);
     let text = |p: &Path| p.display().to_string();
     let mut env: Vec<(String, String)> = [
         ("USERPROFILE", text(&home)),
@@ -632,22 +630,23 @@ pub fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
 /// (such as the app's own background service) runs from its install folder or a folder named like
 /// it. Isolation should make it safe, but the user's own app is never the thing to experiment on.
 pub fn live(app: &App, guard: &Guard) -> Result<()> {
-    #[cfg(windows)]
-    {
-        if !host::win::running(&app.exe).is_empty() {
-            return Err(Error::refused("LiveChannel", format!("{} is running: that is your app", app.exe.display()), "measure another build or channel, or close it"));
-        }
-        let dir = app.exe.parent().map(|d| d.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let folder = app.exe.parent().and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
-        for pid in guard.pids() {
-            let Some(exe) = host::win::exe_of(pid) else { continue };
-            let path = exe.to_string_lossy().to_lowercase();
-            if (!folder.is_empty() && path.contains(&format!("\\{folder}\\"))) || (!dir.is_empty() && path.starts_with(&dir)) {
-                return Err(Error::refused("LiveChannel", format!("your live {} runs from this app ({})", app.id, exe.display()), "measure another build or channel"));
-            }
+    if !host::running(&app.exe).is_empty() {
+        return Err(Error::refused("LiveChannel", format!("{} is running: that is your app", app.exe.display()), "measure another build or channel, or close it"));
+    }
+    // The install folder: a macOS app's bundle, else the executable's folder.
+    let install = app.exe.ancestors().find(|a| a.extension().is_some_and(|e| e == "app")).or(app.exe.parent());
+    let sep = std::path::MAIN_SEPARATOR;
+    let dir = install.map(|d| d.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let folder = install.and_then(|d| d.file_name()).map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    for pid in guard.pids() {
+        let Some(exe) = host::exe_of(pid) else { continue };
+        let path = exe.to_string_lossy().to_lowercase();
+        if (!folder.is_empty() && path.contains(&format!("{sep}{folder}{sep}"))) || (!dir.is_empty() && path.starts_with(&dir)) {
+            return Err(Error::refused("LiveChannel", format!("your live {} runs from this app ({})", app.id, exe.display()), "measure another build or channel"));
         }
     }
-    let _ = (app, guard);
+    #[cfg(target_os = "macos")]
+    macos_library::check(app)?;
     Ok(())
 }
 
@@ -690,6 +689,8 @@ fn save_protocols(home: &Path, schemes: &[String]) {
 
 /// Puts every saved scheme back as it was before the launch (deleting one that did not exist).
 pub fn restore_protocols(home: &Path) {
+    #[cfg(target_os = "macos")]
+    macos_library::restore(home);
     #[cfg(windows)]
     for e in std::fs::read_dir(home).into_iter().flatten().flatten() {
         let name = e.file_name().to_string_lossy().to_string();
@@ -709,11 +710,97 @@ pub fn restore_protocols(home: &Path) {
 }
 
 pub fn kill_tree(pid: u32) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    } else {
-        // A command target leads its own process group: end the group, then the process.
-        let _ = Command::new("kill").args(["-9", &format!("-{pid}")]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-        let _ = Command::new("kill").args(["-9", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(windows)]
+    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+    #[cfg(unix)]
+    {
+        // A command target leads its own process group: end the group, then every process of the
+        // tree, children first (a child outside the group would outlive its parent otherwise).
+        let tree = host::tree_pids(pid);
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        for p in tree.iter().rev() {
+            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+        }
+    }
+}
+
+/// macOS keeps an app's data where no environment variable reaches: Cocoa resolves the home from the
+/// user's account, never `HOME` (`NSHomeDirectory`, Application Support, caches, saved window state),
+/// and `cfprefsd` writes its preferences for the user. A launched copy writes into the user's own
+/// `~/Library` folders for its bundle id. So strobe launches such an app only while none of those
+/// folders exist (a build with its own bundle id, or an app this user never ran), records which it
+/// may create, and removes them (and the preferences domain) when the launch is released. A sandboxed
+/// app's container is in the user's Library too: refused.
+#[cfg(target_os = "macos")]
+mod macos_library {
+    use super::*;
+
+    /// The bundle id (an app bundle's `CFBundleIdentifier`), else the executable's name, which is
+    /// what Cocoa uses for a bare executable's preferences.
+    fn ids(app: &App) -> (String, Option<String>) {
+        let bundle = app.exe.ancestors().find(|a| a.extension().is_some_and(|e| e == "app"));
+        let id = bundle.and_then(|b| host::output(Command::new("plutil").args(["-extract", "CFBundleIdentifier", "raw", "-o", "-"]).arg(b.join("Contents/Info.plist"))));
+        let name = bundle.and_then(|b| b.file_stem()).map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| app.exe.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        (id.clone().unwrap_or_else(|| name.clone()), id.is_some().then_some(name))
+    }
+
+    fn places(app: &App) -> (String, Vec<PathBuf>) {
+        let (id, name) = ids(app);
+        let lib = host::home().join("Library");
+        let mut p = vec![
+            lib.join(format!("Preferences/{id}.plist")),
+            lib.join(format!("Application Support/{id}")),
+            lib.join(format!("Caches/{id}")),
+            lib.join(format!("Saved Application State/{id}.savedState")),
+            lib.join(format!("HTTPStorages/{id}")),
+            lib.join(format!("WebKit/{id}")),
+            lib.join(format!("Cookies/{id}.binarycookies")),
+            lib.join(format!("Containers/{id}")),
+        ];
+        if let Some(n) = name {
+            p.push(lib.join(format!("Application Support/{n}")));
+        }
+        (id, p)
+    }
+
+    fn sandboxed(app: &App) -> bool {
+        let bundle = app.exe.ancestors().find(|a| a.extension().is_some_and(|e| e == "app")).map(Path::to_path_buf).unwrap_or_else(|| app.exe.clone());
+        host::output(Command::new("codesign").args(["-d", "--entitlements", "-", "--xml"]).arg(&bundle).stderr(Stdio::null())).is_some_and(|x| x.contains("com.apple.security.app-sandbox"))
+    }
+
+    pub fn check(app: &App) -> Result<()> {
+        let (id, places) = places(app);
+        if sandboxed(app) {
+            return Err(Error::refused("LiveChannel", format!("{id} is sandboxed: its container lives in your ~/Library, which no launch can redirect"), "measure a build without the App Sandbox entitlement"));
+        }
+        if let Some(p) = places.iter().find(|p| p.exists()) {
+            return Err(Error::refused(
+                "LiveChannel",
+                format!("{} exists: macOS keeps {id}'s data in your ~/Library whatever HOME says, so a launched copy would use and change it", p.display()),
+                "measure a build with its own bundle id (or one this account never ran)",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Records what the launch may create, for `restore`.
+    pub fn save(home: &Path, app: &App) {
+        let (id, places) = places(app);
+        let list: Vec<String> = places.iter().filter(|p| !p.exists()).map(|p| p.display().to_string()).collect();
+        let _ = std::fs::write(home.join(".strobe-macos-library.json"), json!({ "id": id, "created": list }).to_string());
+    }
+
+    /// Removes what the launch created in the user's Library, and its preferences domain.
+    pub fn restore(home: &Path) {
+        let Some(v) = std::fs::read_to_string(home.join(".strobe-macos-library.json")).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return };
+        let id = v["id"].as_str().unwrap_or("");
+        let created: Vec<&str> = v["created"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        if !id.is_empty() && created.iter().any(|p| p.ends_with(&format!("Preferences/{id}.plist"))) {
+            let _ = Command::new("defaults").args(["delete", id]).stdout(Stdio::null()).stderr(Stdio::null()).status();
+        }
+        for p in created {
+            let p = Path::new(p);
+            let _ = if p.is_dir() { std::fs::remove_dir_all(p) } else { std::fs::remove_file(p) };
+        }
     }
 }

@@ -630,7 +630,12 @@ mod imp {
                 "act" => {
                     let o = opts(2);
                     let (_, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
-                    let action = Action::parse(&s(1), o["value"].as_str())?;
+                    // `{ value: 0.2 }` is as good as `{ value: "0.2" }` (a number was dropped as "").
+                    let value = match &o["value"] {
+                        Value::Number(n) => Some(n.to_string()),
+                        v => v.as_str().map(str::to_string),
+                    };
+                    let action = Action::parse(&s(1), value.as_deref())?;
                     let at = self.a11y.act(i, &action)?;
                     self.input(at, "pattern", false);
                     self.until(&o, at, presents)?;

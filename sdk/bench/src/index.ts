@@ -1,7 +1,13 @@
 // @hona/strobe: write benchmarks as small TypeScript files (SPEC §9.6).
 
-/** A visible element: a selector, or one whose text contains `text` (or is exactly it, trimmed). */
-export type Selector = string | { selector: string; text?: string; exact?: boolean }
+/**
+ * A visible element: a selector, or one whose text contains `text` (or is exactly it, trimmed). `index` (native apps)
+ * takes that match, 0-based in tree order, among identical ones (six check boxes all named "checkbutton").
+ */
+export type Selector = string | { selector: string; text?: string; exact?: boolean; index?: number }
+
+/** A page's CSS selector; on native apps a {@link Selector} object too. */
+export type Element = Selector
 
 /** When an input call resolves: `"idle"` (no DOM change or long frame for 300 ms), `"frame"` (after next paint), or a visible element. */
 export type Until = "idle" | "frame" | Selector
@@ -24,23 +30,23 @@ export interface Options {
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
   goto(url: string, opts?: Options): Promise<void>
-  click(selector: string, opts?: Options): Promise<void>
+  click(selector: Element, opts?: Options): Promise<void>
   /** Moves the pointer onto `selector` without a click: reveals hover-only controls, or parks the pointer. */
-  hover(selector: string, opts?: Options): Promise<void>
+  hover(selector: Element, opts?: Options): Promise<void>
   /** Moves the pointer to a point in the viewport (CSS pixels), such as away from anything that reacts to hover. */
   move(x: number, y: number, opts?: Options): Promise<void>
   /** Focuses `selector` (clicking it if focus is elsewhere), then sends one key event per character. */
-  type(selector: string, text: string, opts?: Options & { delay?: number }): Promise<void>
+  type(selector: Element, text: string, opts?: Options & { delay?: number }): Promise<void>
   /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. Native targets: `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
-  press(key: string, opts?: Options & { selector?: string }): Promise<void>
+  press(key: string, opts?: Options & { selector?: Element }): Promise<void>
   /**
    * Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys).
    * A mouse button: `"Mouse"` (left), `"MouseRight"`, `"MouseMiddle"`, pressed where the pointer is, or first at `opts.at`
    * (a selector, or `[x, y]` in the viewport); `move` then drags.
    */
-  down(key: string, opts?: Options & { at?: string | [number, number] }): Promise<void>
+  down(key: string, opts?: Options & { at?: Element | [number, number] }): Promise<void>
   /** Lets go of a key or mouse button `down` pressed. */
-  up(key: string, opts?: Options & { at?: string | [number, number] }): Promise<void>
+  up(key: string, opts?: Options & { at?: Element | [number, number] }): Promise<void>
   /**
    * Presses at `selector`'s centre (where the pointer is with `""`), moves along `path` and releases. `path` is offsets
    * `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps), as keyframes spread evenly over
@@ -48,16 +54,16 @@ export interface Page {
    * One move per display frame, paced on strobe's clock without waiting for the app to handle each; `input.rate` and
    * `input.gap.p95` say how evenly the moves went out. A button `down` already holds stays held.
    */
-  drag(selector: string, path: [number, number][] | ((t: number) => [number, number]), opts?: Options & { duration?: number; button?: "left" | "right" | "middle" }): Promise<void>
+  drag(selector: Element, path: [number, number][] | ((t: number) => [number, number]), opts?: Options & { duration?: number; button?: "left" | "right" | "middle" }): Promise<void>
   /**
    * The page's pixels as `name`, for `--pixels`: an untimed block per variant captures each snapshot and strobe
    * compares base with head. Elsewhere it does nothing. Snapshot a state that does not depend on time (a still
    * page, an app's deterministic step), or the two builds differ for reasons of their own.
    */
   snapshot(name: string): Promise<void>
-  scroll(selector: string, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
+  scroll(selector: Element, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
   /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`. */
-  wheel(selector: string, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
+  wheel(selector: Element, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
   /** Native targets: shows, hides, minimizes, focuses or closes a window (`opts.window`, default the main one). `close` is the title bar's close (the app's own close path). */
   window(action: "show" | "hide" | "minimize" | "focus" | "close", opts?: Options): Promise<void>
   /**
@@ -65,11 +71,11 @@ export interface Page {
    * (`opts.value`), `expand`, `collapse`, `select`, `scrollIntoView`, `focus`. It skips hit testing and pointer
    * handling, so it is never an input latency (`interaction.*` refuses a run that only acted).
    */
-  act(selector: string, action: string, opts?: Options & { value?: string }): Promise<void>
+  act(selector: Element, action: string, opts?: Options & { value?: string }): Promise<void>
   /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled, checked (a switch, check box, radio or toggle button's state; null for others). */
-  query(selector: string, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean; checked: boolean | null }[]>
+  query(selector: Element, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean; checked: boolean | null }[]>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
-  waitFor(selector: string, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
+  waitFor(selector: Element, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */
   idle(opts?: { timeout?: number }): Promise<void>
   wait(ms: number): Promise<void>

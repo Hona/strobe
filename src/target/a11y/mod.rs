@@ -94,19 +94,22 @@ pub struct Selector {
     exact: bool,
     focus: bool,
     text: Option<String>,
+    /// `{ index }`: the match to take, 0-based in tree order, among identical ones.
+    index: usize,
     pub source: String,
 }
 
 impl Selector {
-    /// A selector string, or `{ selector, text?, exact? }`.
+    /// A selector string, or `{ selector, text?, exact?, index? }`.
     pub fn parse(v: &Value) -> Result<Selector> {
         let (s, text, exact) = match v {
             Value::String(s) => (s.clone(), None, false),
             Value::Object(o) => {
                 (o.get("selector").and_then(Value::as_str).unwrap_or("").to_string(), o.get("text").and_then(Value::as_str).map(str::to_string), o.get("exact") == Some(&Value::Bool(true)))
             }
-            _ => return Err(Error::usage(format!("a native selector is a string or {{ selector, text, exact }}, not {v}"))),
+            _ => return Err(Error::usage(format!("a native selector is a string or {{ selector, text, exact, index }}, not {v}"))),
         };
+        let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
         let source = s.clone();
         let (s, focus) = match s.strip_suffix(":focus") {
             Some(rest) => (rest.to_string(), true),
@@ -133,7 +136,7 @@ impl Selector {
         } else {
             Base::Key(s.split('/').map(str::to_string).collect())
         };
-        Ok(Selector { base, exact, focus, text, source })
+        Ok(Selector { base, exact, focus, text, index, source })
     }
 
     /// Whether node `i` of `t` matches, visibility aside.
@@ -263,9 +266,9 @@ impl Tree {
         (x1 - x0 >= 1.0 && y1 - y0 >= 1.0).then_some([x0, y0, x1 - x0, y1 - y0])
     }
 
-    /// Visible matches in tree order.
+    /// Visible matches in tree order, from the selector's `index` on (the first is the one it means).
     pub fn find(&self, sel: &Selector) -> Vec<usize> {
-        (0..self.nodes.len()).filter(|&i| sel.matches(self, i) && self.visible_rect(i).is_some()).collect()
+        (0..self.nodes.len()).filter(|&i| sel.matches(self, i) && self.visible_rect(i).is_some()).skip(sel.index).collect()
     }
 
     /// The node's key path: the ids of it and its keyed ancestors, root first.

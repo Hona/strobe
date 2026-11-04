@@ -1274,9 +1274,11 @@ On a native target strobe drives the app through the OS's accessibility tree and
 (AutomationId) or key path (`"slider/knob"`: earlier segments are the ids of the element's nearest
 ancestors that have one), `role=<role>` (control type; ARIA's names: `button`, `textbox`, `checkbox`,
 `switch`, `heading`, `dialog`, …), `text=<text>` (the name or a text field's value, substring unless
-`exact`), each with a `:focus` suffix. Only visible elements match (bounds inside their clipping
-ancestors, not offscreen); the first in tree order wins, searching the main window, then the app's
-other windows. `until: "idle"` is no present of the app and no accessibility change for 300 ms;
+`exact`), each with a `:focus` suffix. Every call takes the object form too, `{ selector, text?,
+exact?, index? }`, where `index` takes that match (0-based in tree order) among identical ones (six
+check boxes all named "checkbutton"); a page's selector stays a CSS string and an object says so.
+Only visible elements match (bounds inside their clipping ancestors, not offscreen); the first in
+tree order wins, searching the main window, then the app's other windows. `until: "idle"` is no present of the app and no accessibility change for 300 ms;
 `"frame"` is the next present of the app that reached the screen.
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one

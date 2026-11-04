@@ -350,11 +350,11 @@ mod imp {
         /// the main window's UI thread's focus window. An element without focus is clicked first, as
         /// a person clicks into a field (that click is no keystroke), except a control with its own
         /// window on a locked session, where no click can be aimed.
-        fn key_target(&self, sel: &str, o: &Value, presents: &RefCell<Option<PresentCapture>>) -> Result<(isize, Option<isize>)> {
-            if sel.is_empty() {
+        fn key_target(&self, sel: &Value, o: &Value, presents: &RefCell<Option<PresentCapture>>) -> Result<(isize, Option<isize>)> {
+            if no_selector(sel) {
                 return Ok((self.main.get(), None));
             }
-            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, o["window"].as_str(), timeout(o))?;
+            let (tree, i) = self.find(&Selector::parse(sel)?, o["window"].as_str(), timeout(o))?;
             let top = tree.windows[tree.nodes[i].window];
             let own = tree.nodes[i].hwnd;
             let to = (own != 0 && own != top).then_some(own);
@@ -369,12 +369,12 @@ mod imp {
         /// over `duration`) one move per display refresh on strobe's clock, each posted to the window it
         /// pressed in without waiting for the app, and releases. A button `down` holds stays held.
         /// Returns when the last input was posted.
-        fn drag(&self, sel: &str, path: &Value, o: &Value) -> Result<u64> {
+        fn drag(&self, sel: &Value, path: &Value, o: &Value) -> Result<u64> {
             let path = a11y::keys::parse_path(path)?;
-            let (x0, y0, t0) = if sel.is_empty() {
+            let (x0, y0, t0) = if no_selector(sel) {
                 self.pointer.get().ok_or_else(|| Error::usage("page.drag(\"\", …) starts where the pointer is: move it first, or name an element"))?
             } else {
-                let (tree, i) = self.find(&Selector::parse(&Value::String(sel.into()))?, o["window"].as_str(), timeout(o))?;
+                let (tree, i) = self.find(&Selector::parse(sel)?, o["window"].as_str(), timeout(o))?;
                 self.aim(&tree, i)?
             };
             let b = Button::parse(o["button"].as_str())?;
@@ -436,8 +436,8 @@ mod imp {
             }
         }
 
-        fn click(&self, sel: &str, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
-            let (tree, i) = self.find_enabled(&Selector::parse(&Value::String(sel.into()))?, opts["window"].as_str(), timeout(opts))?;
+        fn click(&self, sel: &Value, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
+            let (tree, i) = self.find_enabled(&Selector::parse(sel)?, opts["window"].as_str(), timeout(opts))?;
             let (x, y, t) = self.aim(&tree, i)?;
             let b = Button::parse(opts["button"].as_str())?;
             let mods = Mods::parse_list(&opts["modifiers"])?;
@@ -479,17 +479,24 @@ mod imp {
         opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::from_secs(30))
     }
 
+    /// No selector given: `""`, or none at all.
+    fn no_selector(sel: &Value) -> bool {
+        sel.is_null() || sel.as_str() == Some("")
+    }
+
     impl Session {
         /// One page call from the runner. `pixels`: a pixels block's folder for `snapshot`.
         pub fn dispatch(&self, call: &str, args: &[Value], presents: &RefCell<Option<PresentCapture>>, pixels: Option<&std::path::Path>) -> Result<Value> {
             let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
             let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
+            // A selector as the bench gave it: a string, or `{ selector, text, exact, index }`.
+            let sel = |i: usize| args.get(i).cloned().unwrap_or(Value::String(String::new()));
             let main = self.main.get();
             match call {
-                "click" => self.click(&s(0), &opts(1), presents, "discrete")?,
+                "click" => self.click(&sel(0), &opts(1), presents, "discrete")?,
                 "hover" => {
                     let o = opts(1);
-                    let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     let (x, y, t) = self.aim(&tree, i)?;
                     let at = self.pointer_to(x, y, t)?;
                     self.until(&o, at, presents)?;
@@ -508,13 +515,13 @@ mod imp {
                 }
                 "drag" => {
                     let o = opts(2);
-                    let at = self.drag(&s(0), &opts(1), &o)?;
+                    let at = self.drag(&sel(0), &opts(1), &o)?;
                     self.until(&o, at, presents)?;
                 }
                 "type" => {
                     let o = opts(2);
                     let delay = Duration::from_millis(o["delay"].as_f64().unwrap_or(0.0).max(0.0) as u64);
-                    let (top, to) = self.key_target(&s(0), &o, presents)?;
+                    let (top, to) = self.key_target(&sel(0), &o, presents)?;
                     self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
                     let mut last = 0;
                     for (k, c) in s(1).chars().enumerate() {
@@ -530,7 +537,7 @@ mod imp {
                 "press" => {
                     let (mods, key) = input::parse_chord(&s(0))?;
                     let o = opts(1);
-                    let (top, to) = self.key_target(o["selector"].as_str().unwrap_or(""), &o, presents)?;
+                    let (top, to) = self.key_target(&o["selector"], &o, presents)?;
                     let at = self.poster.press(top, to, mods, key)?;
                     self.input(at, "discrete", false);
                     self.until(&opts(1), at, presents)?;
@@ -540,8 +547,8 @@ mod imp {
                     let b = a11y::keys::mouse_button(&s(0)).unwrap_or(Button::Left);
                     // `at`: an element to move onto first, or a point in the main window's client area.
                     match o.get("at") {
-                        Some(Value::String(sel)) => {
-                            let (tree, i) = self.find(&Selector::parse(&Value::String(sel.clone()))?, o["window"].as_str(), timeout(&o))?;
+                        Some(at @ (Value::String(_) | Value::Object(_))) => {
+                            let (tree, i) = self.find(&Selector::parse(at)?, o["window"].as_str(), timeout(&o))?;
                             let (x, y, t) = self.aim(&tree, i)?;
                             self.pointer_to(x, y, t)?;
                         }
@@ -567,7 +574,7 @@ mod imp {
                 "scroll" => {
                     let d = opts(1);
                     let o = opts(2);
-                    let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     let (x, y, t) = self.aim(&tree, i)?;
                     self.park(x, y)?;
                     self.input(self.poster.move_to(t, 0)?, "pointer", false);
@@ -604,7 +611,7 @@ mod imp {
                         let (x, y) = self.poster.client_point(main, w.client.0 as f64 / w.scale() / 2.0, w.client.1 as f64 / w.scale() / 2.0)?;
                         (x, y, self.poster.target(&self.pids.borrow(), x, y)?)
                     } else {
-                        let (tree, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                        let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                         self.aim(&tree, i)?
                     };
                     self.park(x, y)?;
@@ -620,7 +627,7 @@ mod imp {
                 }
                 "act" => {
                     let o = opts(2);
-                    let (_, i) = self.find(&Selector::parse(&Value::String(s(0)))?, o["window"].as_str(), timeout(&o))?;
+                    let (_, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     let action = Action::parse(&s(1), o["value"].as_str())?;
                     let at = self.a11y.act(i, &action)?;
                     self.input(at, "pattern", false);
@@ -629,13 +636,16 @@ mod imp {
                 "query" => {
                     let o = opts(1);
                     let tree = self.snapshot(o["window"].as_str())?;
-                    let sel = Selector::parse(&Value::String(s(0)))?;
+                    let sel = Selector::parse(&sel(0))?;
                     let found: Vec<Value> = tree.find(&sel).into_iter().map(|i| tree.describe(i)).collect();
                     return Ok(Value::Array(found));
                 }
                 "waitFor" => {
                     let o = opts(1);
-                    let mut sel = json!({ "selector": s(0) });
+                    let mut sel = match sel(0) {
+                        o @ Value::Object(_) => o,
+                        _ => json!({ "selector": s(0) }),
+                    };
                     for k in ["text", "exact"] {
                         if let Some(v) = o.get(k) {
                             sel[k] = v.clone();

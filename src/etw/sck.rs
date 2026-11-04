@@ -280,9 +280,10 @@ fn output_class() -> Id {
 impl Capture {
     pub fn start() -> Result<Capture> {
         if unsafe { CGPreflightScreenCaptureAccess() } == 0 {
-            let app = crate::host::macos::responsible_app();
+            let who = crate::host::macos::screen_recording_grantee();
             return Err(Error::msg(format!(
-                "frames on screen come from ScreenCaptureKit, which needs the Screen Recording permission for {app} (the app strobe runs under): System Settings › Privacy & Security › Screen & System Audio Recording"
+                "frames on screen come from ScreenCaptureKit, which needs the Screen Recording permission for {who}: {}",
+                crate::host::macos::screen_recording_pane()
             )));
         }
         let queue = unsafe { dispatch_queue_create(c"strobe.frames".as_ptr(), std::ptr::null()) };

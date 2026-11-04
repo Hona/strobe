@@ -146,11 +146,18 @@ fn native_drive() -> (bool, String) {
     {
         let app = host::macos::responsible_app();
         let (ax, rec) = (host::macos::accessibility_trusted(), host::macos::screen_capture_allowed());
+        let mut grant = Vec::new();
+        if !ax {
+            grant.push(format!("accessibility to {app}: {}", host::macos::accessibility_pane()));
+        }
+        if !rec {
+            grant.push(format!("Screen Recording to {}: {}", host::macos::screen_recording_grantee(), host::macos::screen_recording_pane()));
+        }
         let text = format!(
-            "accessibility API, Quartz events to the app · Accessibility {} · frames: ScreenCaptureKit, Screen Recording {}{}",
+            "accessibility API, Quartz events to the app · accessibility {} · frames: ScreenCaptureKit, Screen Recording {}{}",
             if ax { "granted" } else { "missing" },
             if rec { "granted" } else { "missing" },
-            if ax && rec { String::new() } else { format!(" (grant to {app}: System Settings › Privacy & Security)") }
+            if grant.is_empty() { String::new() } else { format!(" (grant {})", grant.join("; ")) }
         );
         (ax && rec, text)
     }

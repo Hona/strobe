@@ -758,6 +758,38 @@ pub fn responsible_app() -> String {
     }
 }
 
+/// Whether strobe runs at background priority (`taskpolicy -b`, or a parent that set it): what it
+/// launches inherits it, and macOS then keeps the target on the efficiency cores with its GPU and
+/// IO throttled.
+pub fn background_priority() -> bool {
+    unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, 0) > 0 }
+}
+
+fn major_version() -> u32 {
+    sysctl_string("kern.osproductversion").and_then(|v| v.split('.').next().and_then(|m| m.trim().parse().ok())).unwrap_or(0)
+}
+
+/// Where System Settings lists the accessibility permission, with the URL that opens it: macOS 27
+/// renamed the pane (the permission and its URL kept their names).
+pub fn accessibility_pane() -> String {
+    let name = if major_version() >= 27 { "Device Control and Data Access" } else { "Accessibility" };
+    format!("System Settings › Privacy & Security › {name} (open \"x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility\")")
+}
+
+/// Where System Settings lists the Screen Recording permission, with the URL that opens it.
+pub fn screen_recording_pane() -> &'static str {
+    "System Settings › Privacy & Security › Screen & System Audio Recording (open \"x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture\")"
+}
+
+/// Who to grant Screen Recording: the responsible app, and strobe itself by path when it runs
+/// under a daemon or agent (macOS has been seen to pass Accessibility on to such a child but to
+/// check Screen Recording against the child's own binary).
+pub fn screen_recording_grantee() -> String {
+    let app = responsible_app();
+    let own = std::env::current_exe().ok().map(|p| p.display().to_string()).unwrap_or_default();
+    if own.is_empty() || app == own { app } else { format!("{app} (the app strobe runs under), or strobe itself at {own} if granting that app does not help") }
+}
+
 /// Screen Recording permission: needed to read another app's pixels.
 pub fn screen_capture_allowed() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() != 0 }

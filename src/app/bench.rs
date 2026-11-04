@@ -464,6 +464,13 @@ pub fn run(args: &Args) -> Result<Output> {
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
     }
+    #[cfg(target_os = "macos")]
+    if host::macos::background_priority() {
+        ctx.warnings.push(validity::warn(
+            "BackgroundPriority",
+            "strobe runs at background priority (taskpolicy -b or its parent), and the target inherits it: macOS keeps it on the efficiency cores with its GPU throttled, so frame metrics saturate and say little; run strobe at normal priority, or compare a CPU metric (cpu.work, main.work)",
+        ));
+    }
     if let Some(vm) = &env.virtual_machine {
         ctx.warnings.push(validity::warn("VirtualMachine", format!("running in a virtual machine ({vm}): its timings move with the host's load; prefer bare metal")));
     }

@@ -142,10 +142,11 @@ pub struct Ax {
 fn untrusted() -> Error {
     let app = crate::host::macos::responsible_app();
     // The fix goes in the message too: a page call's error reaches the bench output without its hint.
+    let pane = crate::host::macos::accessibility_pane();
     Error::usage(format!(
-        "macOS lets strobe read another app's accessibility tree and send it input only with the Accessibility permission, which {app} (the app strobe runs under) does not have: System Settings › Privacy & Security › Accessibility, turn on {app}"
+        "macOS lets strobe read another app's accessibility tree and send it input only with the accessibility permission, which {app} (the app strobe runs under) does not have: {pane}, turn on {app}"
     ))
-    .hint(format!("System Settings › Privacy & Security › Accessibility: turn on {app}, then run again (once per app)"))
+    .hint(format!("{pane}: turn on {app}, then run again (once per app)"))
 }
 
 fn check(e: AXError, what: &str) -> Result<()> {

@@ -1866,6 +1866,11 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events posted to its process (`CGEventPostToPid`), Accessibility permission |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING`, `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
+macOS permissions are granted to the responsible app (the launchd-started ancestor). Every message
+that asks for one names the pane for the running macOS (13–26: Accessibility; 27 and later: Device
+Control and Data Access) with the URL that opens it (`?Privacy_Accessibility`,
+`?Privacy_ScreenCapture`). Screen Recording has been seen to be checked against strobe's own binary
+when it runs under a daemon that holds the grant, so that message names strobe's path too.
 
 ### 13.7 Native apps
 

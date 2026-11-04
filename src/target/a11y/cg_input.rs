@@ -144,8 +144,9 @@ impl Poster {
         // Posting events to another process needs the same Accessibility permission; without it macOS drops them silently.
         if !unsafe { CGPreflightPostEventAccess() } {
             let app = crate::host::macos::responsible_app();
+            let pane = crate::host::macos::accessibility_pane();
             return Err(Error::usage(format!(
-                "macOS drops input strobe posts to another app without the Accessibility permission, which {app} (the app strobe runs under) does not have: System Settings › Privacy & Security › Accessibility, turn on {app}"
+                "macOS drops input strobe posts to another app without the accessibility permission, which {app} (the app strobe runs under) does not have: {pane}, turn on {app}"
             )));
         }
         // A private event state: the user's own held keys do not mark strobe's events.

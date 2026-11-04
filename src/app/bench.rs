@@ -447,6 +447,13 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
+    if let Some(f) = args.get("filter") {
+        let (text, err) = filter_report(&ctx.describe, f);
+        if let Some(e) = err {
+            return Err(e);
+        }
+        progress(text);
+    }
     let series = expand(&ctx.describe, args)?;
     if series.is_empty() {
         return Err(Error::usage("no series matches --filter / --target / --params"));
@@ -2345,7 +2352,7 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
     let mut out = Vec::new();
     let targets = describe["targets"].as_object().cloned().unwrap_or_default();
     for (case, c) in describe["cases"].as_object().cloned().unwrap_or_default() {
-        if filter.is_some_and(|f| !glob(f, &case)) {
+        if filter.is_some_and(|f| !case_matches(f, &case)) {
             continue;
         }
         // A case may name the targets it runs on; by default it runs on every target.
@@ -2462,6 +2469,29 @@ fn url_glob(pattern: &str, url: &str) -> bool {
 
 fn value_text(v: &Value) -> String {
     v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())
+}
+
+/// `--filter`: comma-separated case names, each exact unless it holds `*` (a glob over the whole name).
+fn case_matches(filter: &str, case: &str) -> bool {
+    filter.split(',').map(str::trim).filter(|f| !f.is_empty()).any(|f| glob(f, case))
+}
+
+/// Which cases `--filter` picked and which it left out, before anything builds. Cases left out
+/// that start with an exact filter are named with the glob that would take them too.
+fn filter_report(describe: &Value, filter: &str) -> (String, Option<Error>) {
+    let cases: Vec<String> = describe["cases"].as_object().map(|o| o.keys().cloned().collect()).unwrap_or_default();
+    let (picked, left): (Vec<&String>, Vec<&String>) = cases.iter().partition(|c| case_matches(filter, c));
+    let list = |v: &[&String]| v.iter().map(|c| format!("\"{c}\"")).collect::<Vec<_>>().join(", ");
+    let near: Vec<&String> = left.iter().copied().filter(|c| filter.split(',').map(str::trim).any(|f| !f.contains('*') && !f.is_empty() && c.starts_with(f))).collect();
+    let mut text = format!("filter \"{filter}\" (exact names, or globs with *): runs {}", if picked.is_empty() { "nothing".to_string() } else { list(&picked) });
+    if !left.is_empty() {
+        text += &format!(" · skips {}", list(&left));
+    }
+    if !near.is_empty() {
+        text += &format!(" · to run {} too: --filter \"{}*\"", list(&near), filter.trim());
+    }
+    let err = picked.is_empty().then(|| Error::usage(format!("--filter \"{filter}\" matches no case")).hint(format!("cases: {} (exact names, or globs with *)", list(&cases.iter().collect::<Vec<_>>()))));
+    (text, err)
 }
 
 fn glob(pattern: &str, text: &str) -> bool {

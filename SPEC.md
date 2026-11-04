@@ -290,7 +290,7 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 
 ```
 strobe bench <file.bench.ts> --head <variant> [--base <variant>]
-             [--filter <case glob>] [--target <name>] [--params <k=v,...|all>]
+             [--filter <cases>] [--target <name>] [--params <k=v,...|all>]
              [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
@@ -299,7 +299,12 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
 ```
 
 Every series in the file (case × target × params, narrowed by `--filter`, `--target` and
-`--params`) gets its own verdict. With `--base`: the A/B pipeline in §9. Without it: `--aa`
+`--params`) gets its own verdict. `--filter` takes case names separated by commas; each is exact
+unless it holds `*`, a glob over the whole name: `--filter window-closed` runs only that case,
+`--filter "window-closed*"` also `window-closed-memory`. Before anything builds, strobe prints
+the cases the filter runs and skips, and for an exact name that other cases start with, the glob
+that would take them too; a filter that matches nothing is a usage error that lists the cases.
+With `--base`: the A/B pipeline in §9. Without it: `--aa`
 runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak run (§8.6), and
 `--check` validates the file: one block per series on `--head`, one run per case, no warmup and
 no statistics. Each case passes, with its declared metrics' values from that run, or fails with

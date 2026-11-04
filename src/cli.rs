@@ -122,12 +122,13 @@ Use
   record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)
-  bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <case>] [--pairs auto|N]
+  bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <cases>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power high|keep] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--bisect good..bad]           (the commit that moved the primary; one series)
+        --filter: case names, comma-separated; exact unless a name holds * (a glob)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots alloc layout shifts gc heap leaks memory insights sql

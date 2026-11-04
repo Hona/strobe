@@ -36,7 +36,7 @@ fn tools() -> Value {
           "inputSchema": { "type": "object", "required": ["file"], "properties": {
             "file": s("path to the .bench.ts file"), "head": s("variant under test: a directory (default .), a git ref, url:<href>"),
             "base": s("baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"), "aa": b("same build on both sides (checks the method)"), "check": b("validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
-            "filter": s("case glob"), "target": s("one target name from the file"), "params": s("k=v,k2=v2, or all (adds every parameter's more values)"),
+            "filter": s("case names, comma-separated; exact unless a name holds * (a glob)"), "target": s("one target name from the file"), "params": s("k=v,k2=v2, or all (adds every parameter's more values)"),
             "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
             "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks; memory runs a leak run per variant (no --base needed)"), "repeat": n("leak run: N runs to the middle snapshot and N more to the last (default 10)"), "bisect": s("good..bad: find the commit on the first-parent line that moved the primary (one series)"),
             "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("high (default: the fastest plan for the run, restored after) or keep"),

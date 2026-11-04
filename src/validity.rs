@@ -5,7 +5,6 @@ use crate::model::{Error, Result};
 use crate::target::chromium::{Browser, Page};
 use serde::Serialize;
 use serde_json::Value;
-use std::path::PathBuf;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Warning {
@@ -287,29 +286,6 @@ pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
     saved[&key] = serde_json::json!({ "ms": kept });
     let _ = std::fs::write(&path, saved.to_string());
     Ok(ratio)
-}
-
-/// Holds the per-device bench lock while alive.
-pub struct Lock(PathBuf);
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
-
-pub fn lock() -> Result<Lock> {
-    let path = host::paths::run().join("bench.lock");
-    if let Ok(text) = std::fs::read_to_string(&path)
-        && let Ok(pid) = text.trim().parse::<u32>()
-        && pid != std::process::id()
-        // A lock a killed bench left behind can name a pid the OS gave to something else since.
-        && host::process_tree(pid).first().is_some_and(|p| p.name.to_lowercase().starts_with("strobe"))
-    {
-        return Err(Error::refused("ConcurrentBench", format!("another bench (pid {pid}) is running on this device"), "wait for it to finish; two benches on one device disturb each other"));
-    }
-    std::fs::write(&path, std::process::id().to_string())?;
-    Ok(Lock(path))
 }
 
 /// The speed baseline from calibration, if any.

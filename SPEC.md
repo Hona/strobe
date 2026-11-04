@@ -294,7 +294,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
-             [--require-verdict] [--json]
+             [--reserve-cpus auto|on|off] [--require-verdict] [--json]
 ```
 
 Every series in the file (case × target × params, narrowed by `--filter`, `--target` and
@@ -361,10 +361,18 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
 
 ### 5.10 `strobe update` / `strobe leave`
 
-- `update [--version <x.y.z>] [--check]`: download the release for this OS and arch with
-  `gh release download`, verify `SHA256SUMS`, swap the binary (Windows: rename the running
-  file to `*.old`), take over the daemon, refresh the skill and the helper (one UAC on admin
-  Windows, §13.4). `--on all` runs it on every mesh device.
+- `update [<x.y.z>] [--from <path>] [--check]`: install the latest published release over the
+  installed copy, or that version, or with `--from` a local build (a strobe executable or the
+  folder holding it and strobew). A release comes from npm (`@hona/strobe-<platform>-<arch>`, the
+  package `@hona/strobe` installs), its tarball checked against the registry's sha512 integrity.
+  The running strobe copies each binary beside the installed one and swaps it in by rename (Windows
+  lets a running executable be renamed, not overwritten; the old copy stays as `*.old` until nothing
+  runs it, whatever the new build's own install code does) and stops the daemon unless it is
+  running a bench. Then the installed new build runs its own `up --skip calibrate`: it writes its
+  skill and MCP registration, starts its daemon, and refreshes the deep-mode helper only where one
+  is installed (its UAC prompt only when it is out of date). The same bytes already installed:
+  nothing to do. `--check` says what is installed and what is available. `--on all` (every mesh
+  device) is not built.
 - `leave [--yes]`: undo `up`: MCP registration, autostart, skill folder, helper, state dir
   (recordings included, after confirmation). Leaves the binary.
 
@@ -849,6 +857,7 @@ flowchart LR
 |---|---|---|---|
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
 | power plan: the fastest the device offers for every bench and timed recording (`--power high`, the default), the user's own back after it, also after a crash or kill; `--power keep` opts out; on battery the plan is kept. Either way the context notes say so | the active vendor's High performance scheme (AMD Ryzen Balanced → AMD Ryzen High Performance), else Windows' High performance, else Ultimate performance, else on a Balanced-only device Windows 11's Best performance power mode (`powercfg /setactive`, powrprof `PowerSetActiveOverlayScheme`); the scheme and power mode to restore are journaled in `<state>/power.json` first, and any strobe that starts restores a journal whose strobe is gone | the `performance` cpufreq governor on every policy, journaled and restored the same way; it needs root, so an unprivileged strobe keeps the governor and says why | nothing to switch: the env line shows Low Power Mode and a thermal state above nominal |
+| keep this user's other processes off the target's CPUs during each timed block (`--reserve-cpus`, below) | process default CPU sets, swept every 200 ms, journaled | not built | not built |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
 | window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | X11 map state, `_NET_WM_STATE_HIDDEN`, coverage by windows above it; `visibilityState` | `kCGWindowIsOnscreen`, coverage by other apps' windows in front; `visibilityState` |
 | throttling | frequency below the expected range (PDH % of maximum frequency) | `cpuinfo_avg_freq` where the kernel has it | thermal state in the env line; analyser only |
@@ -860,6 +869,43 @@ experiment's env line and `report --format pr` footer.
 
 Builds run unpinned (strobe's own pin, which a build inherits, is lifted for them), and after a build
 strobe waits up to 30 s for the CPUs to go quiet before any timed block.
+
+**Reserved CPUs** (`--reserve-cpus auto|on|off`, Windows). Pinning keeps the target on its CPUs; it
+does not keep anything else off them, and agents, builds and editors left to the scheduler land there.
+For the length of each timed block (`auto`, the default: A/B, A/A and bisect blocks; not `--check`,
+attribution, leak or pixels blocks; `on` adds those), strobe gives every other process of this user
+in this session a default CPU set without the target's CPUs, and gives each its own back when the
+block ends:
+
+- Left alone: other users' and system processes, protected processes, strobe's own tree (the target,
+  the runner, servers), other strobe processes, and processes whose affinity already lies inside the
+  target's CPUs (pinned there on purpose) or outside them. A process that already had a default CPU
+  set keeps the part of it outside the target's CPUs. Elevated processes of this user cannot be
+  opened by an unelevated strobe: they stay and are named.
+- New processes (a build spawning compilers): CPU sets are not inherited, so a thread on strobe's CPUs
+  diffs the process list every 200 ms and moves what started since; a new process runs on the
+  target's CPUs for at most that long. Its own cost is measured per block (`overhead_pct`, % of one
+  core, on strobe's CPUs; `setup_ms`, the first sweep before the block starts). On adais with about
+  420 processes and many agents: 13–18 ms to move 225–250 processes before a block, then 3.3–3.5%
+  of one core for the sweeps (a system process snapshot each 200 ms; sweeps that find nothing new
+  stop there).
+- CPU sets, not affinity masks: they need only `PROCESS_SET_LIMITED_INFORMATION`, restore exactly
+  (changing a process's affinity overwrites every thread's own mask, which nothing can put back), and
+  held as hard as affinity here (24 busy threads with a 16-CPU set ran 0% on the other CPUs, also with
+  those 16 CPUs fully loaded). Threads that selected CPU sets themselves or set an affinity mask keep
+  them; such a thread's work stays visible as `cpu.foreign` (`Background`).
+- Restored only where the set is still strobe's: a process whose set something else changed since
+  keeps that one. What changes is journaled in `<state>/reserve.json` before the first change, and any
+  strobe that starts restores a journal whose strobe is gone (killed, crashed).
+- Context: every block records what it moved (`reserve`), the experiment's `plan.reserve` merges
+  them, and a `ReservedCpus` note (in the text result and `report --format pr`) says how many
+  processes moved per block, which could not, and the sweep's cost; the PR footer says "other
+  processes kept off CPUs <list>". An unpinned target (`--pin none`) reserves nothing and says so.
+
+`auto` is the default because the reservation changes nothing the target sees (its CPUs, its plan,
+its process tree) while it removes the largest source of noise on a shared machine, it lasts only
+while a block runs, and it is undone even after a kill. Processes moved slow down only by the CPUs
+they lose for that time.
 
 Provenance stored with every experiment and recording: CPU, topology, pinning, power plan, OS build, GPU and driver,
 displays and the adapter driving the window, window size and scale, browser or Electron and
@@ -1275,7 +1321,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `AmbiguousInteraction` | over half of a block's inputs came while the native app was drawing, so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
-| `ConcurrentBench` | another bench runs on this device |
+| `ConcurrentBench` | never refuses since benches take turns: one device slot, held by a bench only while one of its blocks runs (`--check`, attribution and launch blocks too), never while it builds or waits for an unlock, so two blocks never run at once and a bench waiting for a person blocks no other. Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/`), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -1950,6 +1996,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | samplers while recording | ≤ 0.5% of one core |
 | OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
+| reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block) |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
@@ -2030,7 +2077,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 |---|---|---|
 | 0a | proto trace to trace_processor, presented frames by SQL | strobe counter packets with a `ClockSnapshot` (§6) |
 | 0b | — | the bridge (`@hona/strobe-electron`) |
-| 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update` |
+| 1 | daemon (MCP over HTTP), MCP, skill, `up`/`leave`, `status`, calibration (busy, idle) | calibration of alloc, layout, timers, leak; `status <target>`; `update --on` |
 | 2 | `bench`: bench files, runner, driver, variants (directory, git, `app:`, `exe:`, `url:`), pairs, Pocock looks, futility, verdicts, Holm, `--aa`, `--check`; launch cases, `command()` and `script()` targets, `mock`, `teardown`, `{ run, more }` params, counters, `net.*`, `layout.shift`; `@hona/strobe` on npm (CLI and types); validators `SoftwareGpu`, `DevBuild` (Vite), `WindowHidden`, `SessionLocked`, `ConcurrentBench`, `RunIncomplete`, `Throttled`, `TailTooShort`, `LiveChannel` | `VariantMismatch`, `NoDisplayForBudget`, `DebuggerAttached`, `ClockUnsynced`; the A/A report (§10.4); the overhead block (§8.2) |
 | 3 | isolated Electron launches (§13.2); leaks over time (`record --probes memory`); bench leak runs (`--probes memory --repeat`); census by process with Chromium allocators | the bridge, GPU and page census layers, multi-process heaps |
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
@@ -2086,7 +2133,16 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
   removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a
-  daemon running an older build unless that daemon is mid-bench. Bun is required for bench files.
+  daemon running another build (`/health` reports a hash of the daemon's executable, taken at its
+  start) unless that daemon is mid-bench. Bun is required for bench files. `up` prints each step to
+  stderr as it finishes and returns one summary line. It starts the daemon detached (no console, no
+  inherited handles, its own process group, its install folder as working directory, out of the
+  caller's job where the job allows it) and makes its own standard handles non-inheritable first: a
+  daemon that inherited the shell's output pipe or console kept `strobe up` from returning in a
+  captured shell or console. The device name is `COMPUTERNAME` on Windows and `gethostname`
+  elsewhere, without a domain (macOS shells do not export `HOSTNAME`). `update` runs the new build's
+  `up` with its output relayed rather than inherited and returns when it exits, so an older build
+  whose daemon inherits handles cannot hold the caller's pipe either.
 - The daemon serves `/mcp`, `/report/<handle>` and `/health` (no `/ui`, no Perfetto UI); `up` stops
   it with the `strobe/quit` RPC. The engine runs one `trace_processor -q` per query (no `--httpd`).
 - Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows

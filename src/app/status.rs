@@ -42,6 +42,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if !engine::installed() {
         problems.push("trace_processor not downloaded yet (strobe up, or on first use)".into());
     }
+    // Benches on this device and what each does: running a block, queued for the slot, waiting for an
+    // unlock, building.
+    let benches = super::bench::slot::list();
     let daemon = super::mcp::running();
     let skill = super::up::skill_state();
     let deep = crate::etw::access();
@@ -68,7 +71,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "calibration": calibration, "recordings": recordings.iter().map(|r| &r.0).collect::<Vec<_>>(),
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
         "session_locked": locked, "valid": problems.is_empty(), "problems": problems,
-        "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill,
+        "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill, "benches": benches,
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
@@ -102,6 +105,22 @@ pub fn run(args: &Args) -> Result<Output> {
             _ => "not installed: strobe up installs it",
         }
     );
+    if benches.is_empty() {
+        t += "    benches    none running\n";
+    }
+    for (i, b) in benches.iter().enumerate() {
+        let file = b["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\");
+        let file = std::path::Path::new(file).file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+        let why = b["why"].as_str().filter(|w| !w.is_empty()).map(|w| format!(": {w}")).unwrap_or_default();
+        t += &format!(
+            "    {}  {} {file} (pid {}) · {} since {}{why}\n",
+            if i == 0 { "benches  " } else { "         " },
+            b["exp"].as_str().unwrap_or(""),
+            b["pid"],
+            b["state"].as_str().unwrap_or(""),
+            b["since"].as_str().unwrap_or("")
+        );
+    }
     t += &format!("    data       {} recordings, {} experiments shown · {}\n", recordings.len(), experiments.len(), super::fmt::bytes(disk as f64));
     for (id, _) in &experiments {
         t += &format!("               {id}\n");

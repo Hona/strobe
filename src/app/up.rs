@@ -20,31 +20,46 @@ const SKILL: &str = include_str!("../../skill/SKILL.md");
 const CALIBRATION: &str = include_str!("../../calibration/index.html");
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
-struct Steps {
-    text: String,
+/// Setup steps, printed to stderr as each finishes (some take seconds); the command's own output is
+/// then one summary line, so the list shows once.
+pub(super) struct Steps {
     json: serde_json::Map<String, Value>,
     problems: usize,
 }
 
 impl Steps {
-    fn line(&mut self, mark: &str, name: &str, detail: impl Into<String>) {
+    pub(super) fn new(title: &str) -> Steps {
+        eprintln!("{title}");
+        Steps { json: serde_json::Map::new(), problems: 0 }
+    }
+
+    pub(super) fn line(&mut self, mark: &str, name: &str, detail: impl Into<String>) {
         let d = detail.into();
         if mark == "✗" || mark == "!" {
             self.problems += 1;
         }
-        let line = format!("  {mark} {:<10} {d}\n", name);
-        eprint!("{line}");
-        self.text += &line;
+        eprintln!("  {mark} {:<10} {d}", name);
         self.json.insert(name.to_string(), json!({ "ok": mark == "✓", "detail": d }));
+    }
+
+    pub(super) fn done(self, what: &str) -> Output {
+        let text = match self.problems {
+            0 => format!("{what}: done"),
+            1 => format!("{what}: done; 1 step needs attention (marked above)"),
+            n => format!("{what}: done; {n} steps need attention (marked above)"),
+        };
+        Output::new(text, Value::Object(self.json))
     }
 }
 
 pub fn run(args: &Args) -> Result<Output> {
+    // Nothing `up` starts (the daemon, opencode's CLI) may hold a shell's pipe after `up` exits.
+    #[cfg(windows)]
+    host::win::private_std_handles();
     let check = args.has("check");
     let skip: Vec<&str> = args.get("skip").map(|s| s.split(',').collect()).unwrap_or_default();
-    let device = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")).unwrap_or_default().to_lowercase();
-    let mut s = Steps { text: format!("strobe up · {device}\n"), json: serde_json::Map::new(), problems: 0 };
-    eprint!("{}", s.text);
+    let device = host::device_name();
+    let mut s = Steps::new(&format!("strobe up · {device}"));
     let env = host::env();
     let topo = host::topology();
     let groups: Vec<String> =
@@ -61,7 +76,7 @@ pub fn run(args: &Args) -> Result<Output> {
         None => s.line("!", "bun", "missing: bench files need Bun (https://bun.sh)"),
     }
     if check {
-        return Ok(Output::new(s.text, Value::Object(s.json)));
+        return Ok(s.done("strobe up --check"));
     }
     // Binary on PATH.
     let (installed, updated) = install_self(&mut s)?;
@@ -96,14 +111,10 @@ pub fn run(args: &Args) -> Result<Output> {
             Err(e) => s.line("✗", "calibrate", e.message),
         }
     }
-    let mut out = Output::new(s.text, Value::Object(s.json));
-    if s.problems > 0 {
-        out.code = 0;
-    }
-    Ok(out)
+    Ok(s.done("strobe up"))
 }
 
-fn install_dir() -> PathBuf {
+pub(super) fn install_dir() -> PathBuf {
     if cfg!(windows) { std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(host::home).join("Programs").join("strobe") } else { host::home().join(".local").join("bin") }
 }
 
@@ -119,25 +130,56 @@ fn install_self(s: &mut Steps) -> Result<(PathBuf, bool)> {
     let me = std::env::current_exe()?;
     let from = me.parent().unwrap_or(Path::new(".")).to_path_buf();
     let same = std::fs::canonicalize(&from).ok() == std::fs::canonicalize(&dir).ok();
-    if !same {
-        for name in ["strobe", "strobew"] {
-            let src = from.join(exe(name));
-            if !src.is_file() {
-                continue;
-            }
-            let dst = dir.join(exe(name));
+    let changed = !same && replace_binaries(&from, &dir)?;
+    let on_path = path_has(&dir);
+    s.line("✓", "binary", format!("{}{}{}", dir.join(exe("strobe")).display(), if changed { " · replaced" } else { "" }, if on_path { "" } else { " · added to PATH (new terminals)" }));
+    Ok((dir, changed))
+}
+
+/// Puts the strobe binaries in `from` over those in `dir`; says whether any changed.
+pub(super) fn replace_binaries(from: &Path, dir: &Path) -> Result<bool> {
+    let mut changed = false;
+    for name in ["strobe", "strobew"] {
+        let src = from.join(exe(name));
+        let dst = dir.join(exe(name));
+        if !src.is_file() {
+            // A build without strobew: an older strobew left here would run the daemon.
             if dst.exists() {
-                // A running daemon locks its binary on Windows: move it aside first.
-                let old = dir.join(format!("{}.old", exe(name)));
-                let _ = std::fs::remove_file(&old);
-                let _ = std::fs::rename(&dst, &old);
+                set_aside(dir, name)?;
+                changed = true;
             }
-            std::fs::copy(&src, &dst)?;
+            continue;
+        }
+        if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
+            continue;
+        }
+        // Copy beside it, then swap: a running binary (the daemon, the strobe running `update`)
+        // can be renamed on Windows but not overwritten.
+        let new = dir.join(format!("{}.new", exe(name)));
+        std::fs::copy(&src, &new)?;
+        if dst.exists() {
+            set_aside(dir, name)?;
+        }
+        std::fs::rename(&new, &dst)?;
+        changed = true;
+    }
+    Ok(changed)
+}
+
+/// Moves `name` out of the way as `name.old` (or `.old1`, … while an older one still runs), after
+/// removing the old copies nothing runs any more.
+fn set_aside(dir: &Path, name: &str) -> Result<()> {
+    let file = exe(name);
+    for entry in std::fs::read_dir(dir)?.flatten() {
+        let n = entry.file_name().to_string_lossy().to_string();
+        if n.starts_with(&format!("{file}.old")) {
+            let _ = std::fs::remove_file(entry.path());
         }
     }
-    let on_path = path_has(&dir);
-    s.line("✓", "binary", format!("{}{}", dir.join(exe("strobe")).display(), if on_path { "" } else { " · added to PATH (new terminals)" }));
-    Ok((dir, !same))
+    let free = (0..100).map(|i| dir.join(if i == 0 { format!("{file}.old") } else { format!("{file}.old{i}") })).find(|p| !p.exists());
+    let to = free.ok_or_else(|| Error::msg(format!("{}: 100 old copies still running", dir.join(&file).display())))?;
+    std::fs::rename(dir.join(&file), to)?;
+    Ok(())
 }
 
 fn path_has(dir: &Path) -> bool {
@@ -173,17 +215,18 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     host::win::set_user_value(RUN_KEY, "strobe", Some(&format!("\"{}\" daemon", daemon_exe.display())), false);
     let _ = RUN_KEY;
     // The daemon runs MCP calls in its own process: a new build only counts once it restarts.
-    if updated && mcp::running() {
+    let stale = mcp::running() && (updated || mcp::daemon_build().is_some_and(|b| b != mcp::file_id(&daemon_exe)));
+    if stale {
         if daemon_benching() {
             s.line("!", "daemon", "keeps the previous build until its bench finishes; run strobe up again then");
-        } else {
-            let _ = quit_daemon();
-            for _ in 0..30 {
-                if !mcp::running() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+            return Ok(());
+        }
+        let _ = quit_daemon();
+        for _ in 0..30 {
+            if !mcp::running() {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(100));
         }
     }
     if !mcp::running() {
@@ -204,15 +247,18 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
 }
 
 fn spawn_detached(exe: &Path, args: &[&str]) -> Result<()> {
-    let mut c = Command::new(exe);
-    c.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
     #[cfg(windows)]
     {
-        use std::os::windows::process::CommandExt;
-        // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW
-        c.creation_flags(0x0000_0008 | 0x0000_0200 | 0x0800_0000);
+        host::win::spawn_detached(exe, args).map_err(|e| Error::msg(format!("start {}: {e}", exe.display())))?;
     }
-    c.spawn().map_err(|e| Error::msg(format!("start {}: {e}", exe.display())))?;
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::process::CommandExt;
+        let mut c = Command::new(exe);
+        // Its own session: a terminal closing does not take the daemon with it.
+        c.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).current_dir(exe.parent().unwrap_or(Path::new("/"))).process_group(0);
+        c.spawn().map_err(|e| Error::msg(format!("start {}: {e}", exe.display())))?;
+    }
     Ok(())
 }
 
@@ -408,7 +454,9 @@ pub fn calibrate(full: bool) -> Result<Value> {
 }
 
 pub fn leave(args: &Args) -> Result<Output> {
-    let mut s = Steps { text: "strobe leave\n".into(), json: serde_json::Map::new(), problems: 0 };
+    #[cfg(windows)]
+    host::win::private_std_handles();
+    let mut s = Steps::new("strobe leave");
     #[cfg(windows)]
     host::win::set_user_value(RUN_KEY, "strobe", None, false);
     s.line("✓", "autostart", "removed");
@@ -467,16 +515,15 @@ pub fn leave(args: &Args) -> Result<Output> {
     } else {
         s.line("i", "state", format!("kept {} (pass --yes to delete recordings and experiments)", paths::state_dir().display()));
     }
-    Ok(Output::new(s.text, Value::Object(s.json)))
+    Ok(s.done("strobe leave"))
 }
 
-/// Whether the bench holding the device's bench lock runs inside the daemon (MCP benches do).
-fn daemon_benching() -> bool {
-    let Some(pid) = std::fs::read_to_string(paths::run().join("bench.lock")).ok().and_then(|t| t.trim().parse::<u32>().ok()) else { return false };
-    host::process_tree(pid).iter().any(|p| p.pid == pid && p.name.to_lowercase().starts_with("strobew"))
+/// Whether a bench runs inside the daemon (MCP benches do): restarting it would kill that bench.
+pub(super) fn daemon_benching() -> bool {
+    super::bench::slot::daemon_benching()
 }
 
-fn quit_daemon() -> Result<()> {
+pub(super) fn quit_daemon() -> Result<()> {
     use std::io::Write;
     let port = mcp::port();
     let token = mcp::token()?;

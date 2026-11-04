@@ -39,7 +39,8 @@ fn tools() -> Value {
             "filter": s("case glob"), "target": s("one target name from the file"), "params": s("k=v,k2=v2, or all (adds every parameter's more values)"),
             "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
             "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks; memory runs a leak run per variant (no --base needed)"), "repeat": n("leak run: N runs to the middle snapshot and N more to the last (default 10)"), "bisect": s("good..bad: find the commit on the first-parent line that moved the primary (one series)"),
-            "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("keep (default) or high (High performance plan for the run, restored after)"),
+            "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("high (default: the fastest plan for the run, restored after) or keep"),
+            "reserve-cpus": s("auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows), on (every block, --check too) or off"),
             "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
             "timeout": n("seconds before returning while it keeps running (default 600)") } } },
         { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), shifts (the largest layout shifts and the elements they moved), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class), leaks (memory recordings: objects from the first half still alive at the end, with retainer paths), memory (by process, layer or allocator; rec_a..rec_b compares), insights (rules with evidence; exp_… too); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments).",
@@ -237,6 +238,8 @@ pub fn port() -> u16 {
 pub fn daemon(_args: &Args) -> Result<()> {
     let port = port();
     let token = token()?;
+    // Hashed now: `up` renames this executable aside when it installs a new build.
+    let _ = build_id();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| Error::msg(format!("port {port} is taken ({e}); is a strobe daemon already running?")))?;
     let log = paths::state_dir().join("log");
     let _ = std::fs::create_dir_all(&log);
@@ -265,7 +268,7 @@ fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
         };
     }
     if path == "/health" {
-        return http::Response::new(200, "application/json", json!({ "strobe": env!("CARGO_PKG_VERSION") }).to_string().into_bytes());
+        return http::Response::new(200, "application/json", json!({ "strobe": env!("CARGO_PKG_VERSION"), "build": build_id() }).to_string().into_bytes());
     }
     if path != "/mcp" {
         return http::Response::text(404, "not found");
@@ -291,6 +294,32 @@ fn report_html(handle: &str) -> Result<String> {
     let dir = store::resolve(handle)?;
     let (view, data) = if store::is_experiment(&dir) { ("experiment", store::read_json(&dir.join("result.json"))?) } else { ("recording", store::read_json(&dir.join("meta.json"))?) };
     Ok(super::report::html(view, &data))
+}
+
+/// This process's executable, hashed once: `up` restarts a daemon whose build is not the installed one
+/// (one version number covers many builds).
+pub fn build_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| std::env::current_exe().map(|p| file_id(&p)).unwrap_or_default())
+}
+
+pub fn file_id(path: &std::path::Path) -> String {
+    use sha2::Digest;
+    std::fs::read(path).map(|b| sha2::Sha256::digest(b).iter().take(8).map(|x| format!("{x:02x}")).collect()).unwrap_or_default()
+}
+
+/// The running daemon's build (`/health`), when it answers; empty from builds before it said.
+pub fn daemon_build() -> Option<String> {
+    use std::io::Read;
+    let port = port();
+    let mut s = std::net::TcpStream::connect_timeout(&std::net::SocketAddr::from(([127, 0, 0, 1], port)), Duration::from_millis(500)).ok()?;
+    s.set_read_timeout(Some(Duration::from_secs(2))).ok()?;
+    write!(s, "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n").ok()?;
+    let mut text = String::new();
+    let _ = s.read_to_string(&mut text);
+    let body = text.split_once("\r\n\r\n")?.1;
+    let v: Value = serde_json::from_str(body.trim()).ok()?;
+    Some(v["build"].as_str().unwrap_or("").to_string())
 }
 
 /// Is a daemon answering on this device?

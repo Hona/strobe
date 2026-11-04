@@ -139,6 +139,9 @@ Use
 Setup
   up [--skip deep,daemon,mcp,calibrate]  install, download the engine, deep mode (one UAC prompt), start the daemon,
                                   register MCP and the skill
+  update [<version>] [--from <path>] [--check]
+                                  install the latest npm release (or that version, or a local build) over the installed
+                                  copy; refreshes the skill, MCP, the helper where installed, and restarts the daemon
   leave [--yes]                   undo up (--yes also deletes recordings and experiments)
 
 Targets   https://… · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native] · cdp:<port> · cdp:ws://… · file:<path>

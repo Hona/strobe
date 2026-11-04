@@ -12,6 +12,7 @@ pub mod report;
 pub mod status;
 pub mod top;
 pub mod up;
+pub mod update;
 
 use crate::cli::{Args, HELP};
 use crate::model::{Error, Result};
@@ -66,6 +67,8 @@ pub fn dispatch(args: &Args) -> Result<Output> {
     }
     // A strobe killed mid-run left the user on its power plan: put theirs back first.
     crate::host::power::restore_stale();
+    // And the CPU sets of processes it moved off a timed block's CPUs (`--reserve-cpus`).
+    crate::host::reserve::restore_stale();
     match args.command.as_str() {
         "record" => record::run(args),
         "bench" => bench::run(args),
@@ -74,6 +77,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "status" => status::run(args),
         "top" => top::run(args),
         "up" => up::run(args),
+        "update" => update::run(args),
         "leave" => up::leave(args),
         "helper" => helper::run(args),
         "mcp" => mcp::stdio().map(|_| Output::new(String::new(), Value::Null)),

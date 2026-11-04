@@ -26,6 +26,7 @@ use std::time::{Duration, Instant};
 mod launch;
 mod native;
 mod script;
+pub mod slot;
 
 /// Secondaries that get tested (Holm across these only). Fewer tests keep the correction reachable.
 const DEFAULT_SECONDARIES: &[&str] = &["frames.interval.p95", "frames.dropped.pct", "main.busy", "interaction.p95", "cpu.app.total"];
@@ -218,6 +219,10 @@ struct Block {
     /// idles deeper), so both blocks of a pair share it.
     #[serde(skip_serializing_if = "Option::is_none")]
     display: Option<u8>,
+    /// What `--reserve-cpus` did in this block: processes moved, started during it, not movable, and
+    /// the sweep's own CPU (% of one core).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserve: Option<Value>,
 }
 
 struct Ctx<'a> {
@@ -254,6 +259,96 @@ struct Ctx<'a> {
     harness: Harness,
     /// The repository the bench file is in: git refs resolve and worktrees are made there.
     project: PathBuf,
+    /// This bench in the device's registry: what it does now, for `strobe status` and the slot queue.
+    reg: slot::Registration,
+    /// `--reserve-cpus`: auto (timed blocks), on (every block) or off.
+    reserve: &'static str,
+    /// What the reservations of all blocks did, merged (`plan.reserve`).
+    reserved: Option<ReserveTotal>,
+}
+
+/// Every block's reservation, merged for the experiment's context.
+#[derive(Clone, Debug, Default, Serialize)]
+struct ReserveTotal {
+    cpus: u64,
+    blocks: u32,
+    /// Per name, the most of that executable one block moved.
+    moved: BTreeMap<String, u32>,
+    moved_per_block: f64,
+    started: u32,
+    failed: BTreeMap<String, String>,
+    restored: u32,
+    /// Processes moved in all blocks together (each block counts its own).
+    moved_total: u32,
+    overhead_pct_max: f64,
+    overhead_pct_mean: f64,
+    setup_ms_mean: f64,
+}
+
+impl ReserveTotal {
+    fn add(&mut self, r: &host::reserve::Report) {
+        let n = self.blocks as f64;
+        self.cpus = r.cpus;
+        self.moved_per_block = (self.moved_per_block * n + r.moved_total() as f64) / (n + 1.0);
+        self.overhead_pct_mean = (self.overhead_pct_mean * n + r.overhead_pct) / (n + 1.0);
+        self.overhead_pct_max = self.overhead_pct_max.max(r.overhead_pct);
+        self.setup_ms_mean = (self.setup_ms_mean * n + r.setup_ms) / (n + 1.0);
+        self.moved_total += r.moved_total();
+        self.blocks += 1;
+        for (k, v) in &r.moved {
+            let e = self.moved.entry(k.clone()).or_default();
+            *e = (*e).max(*v);
+        }
+        self.started += r.started;
+        self.failed.extend(r.failed.clone());
+        self.restored += r.restored;
+    }
+
+    /// One line for the plan, the context note and the PR footer.
+    fn text(&self) -> String {
+        let cpus = cpu_list(self.cpus);
+        let mut top: Vec<(&String, &u32)> = self.moved.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+        let names = top.iter().take(4).map(|(n, c)| if **c > 1 { format!("{n} ×{c}") } else { n.to_string() }).collect::<Vec<_>>().join(", ");
+        let mut t = format!("other processes of this user kept off CPUs {cpus} during {} timed block{}: {:.0} moved per block ({names}{})", self.blocks, if self.blocks == 1 { "" } else { "s" }, self.moved_per_block, if top.len() > 4 { ", …" } else { "" });
+        if self.started > 0 {
+            t += &format!(", {} more started during blocks and moved within 200 ms", self.started);
+        }
+        if !self.failed.is_empty() {
+            let mut by: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+            for (n, why) in &self.failed {
+                by.entry(why.as_str()).or_default().push(n.as_str());
+            }
+            let failed = by.iter().map(|(why, names)| format!("{} ({why})", names.iter().take(4).copied().collect::<Vec<_>>().join(", ") + if names.len() > 4 { ", …" } else { "" })).collect::<Vec<_>>().join("; ");
+            t += &format!("; {} could not be moved: {failed}", self.failed.len());
+        }
+        let back = self.restored as f64 / self.moved_total.max(1) as f64;
+        t += &format!(
+            "; {:.0}% put back after (the rest exited or changed their own set); moving took {:.0} ms before each block, and the sweep then cost {:.2}% of one core on strobe's CPUs (max {:.2}%)",
+            100.0 * back,
+            self.setup_ms_mean,
+            self.overhead_pct_mean,
+            self.overhead_pct_max
+        );
+        t
+    }
+}
+
+/// `0-15`, `0-7,16-23`: a CPU mask as ranges.
+fn cpu_list(mask: u64) -> String {
+    let mut parts = Vec::new();
+    let mut c = 0;
+    while c < 64 {
+        if mask >> c & 1 == 1 {
+            let start = c;
+            while c < 64 && mask >> c & 1 == 1 {
+                c += 1;
+            }
+            parts.push(if c - 1 == start { start.to_string() } else { format!("{start}-{}", c - 1) });
+        }
+        c += 1;
+    }
+    parts.join(",")
 }
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -282,7 +377,14 @@ pub fn run(args: &Args) -> Result<Output> {
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
     super::progress_to(Some(dir.join("progress.log")));
-    let _lock = validity::lock()?;
+    let reserve = match args.get("reserve-cpus").unwrap_or("auto") {
+        "auto" => "auto",
+        "on" => "on",
+        "off" => "off",
+        other => return Err(Error::usage(format!("--reserve-cpus: auto, on or off, not {other}"))),
+    };
+    // Benches share the device by taking turns per block (the slot); this one registers what it does.
+    let reg = slot::Registration::new(&exp, &file.display().to_string());
     chromium::reap_orphans();
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
     let config = config::load(&project);
@@ -327,6 +429,9 @@ pub fn run(args: &Args) -> Result<Output> {
         // Per bench: a long-lived daemon runs benches of several repositories.
         harness: harness(&file, &project, &config),
         project: project.clone(),
+        reg,
+        reserve,
+        reserved: None,
     };
     ctx.describe = ctx.runner.describe()?;
     let series = expand(&ctx.describe, args)?;
@@ -372,6 +477,7 @@ pub fn run(args: &Args) -> Result<Output> {
             check_series(&mut ctx, s, &mut variants, &config)?
         } else if pixels_only {
             let target = ctx.describe["targets"][&s.target].clone();
+            ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
             for v in variants.iter_mut() {
                 prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
             }
@@ -388,6 +494,9 @@ pub fn run(args: &Args) -> Result<Output> {
     ctx.runner.exit();
     for home in std::mem::take(&mut ctx.homes).into_values() {
         let _ = std::fs::remove_dir_all(home);
+    }
+    if let Some(t) = &ctx.reserved {
+        ctx.warnings.push(validity::info("ReservedCpus", t.text()));
     }
     if check {
         return check_output(&exp, &dir, &file, series_out, ctx.warnings);
@@ -414,7 +523,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
         "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
         "plan": {
-            "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa,
+            "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa, "reserve": ctx.reserved, "reserve_mode": ctx.reserve,
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
         },
@@ -450,6 +559,7 @@ pub fn run(args: &Args) -> Result<Output> {
 /// with what timed out and its screenshot, and the next case runs.
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
+    ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
@@ -469,7 +579,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         let v = &variants[0];
         // Warmed and run as in a bench: `--check`'s single cold run would start no profiler.
         ctx.check = false;
-        let attributed = if s.launch.is_object() { launch::attribution(ctx, s, v) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+        let attributed = if s.launch.is_object() { in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v)) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
         ctx.check = true;
         match attributed {
             Ok(b) => {
@@ -526,6 +636,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
 /// growth verdicts for its post-GC JS heap and DOM nodes, and its suspects.
 fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
+    ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
@@ -558,6 +669,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
+    ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
@@ -796,7 +908,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress(format!("  attribution blocks ({}; not timed)", why_text(&target)));
         for v in variants.iter() {
             // A launch's attribution is a launch of its own, profiled from the first statement.
-            let attributed = if s.launch.is_object() { launch::attribution(ctx, s, v) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+            let attributed = if s.launch.is_object() { in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v)) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
             match attributed {
                 Ok(b) => {
                     progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
@@ -929,9 +1041,9 @@ fn cells(c: &Value) -> (String, String, String, String) {
 /// pixels and warnings, then the setup and the command that reruns it.
 /// Whether a note belongs in a PR table: every warning, and the context notes a reader needs to
 /// know what the numbers compare with (a locked session, a sleeping display, the power plan, a
-/// GPU that does not drive the display, a smoke run's few pairs).
+/// GPU that does not drive the display, a smoke run's few pairs, other processes kept off the target's CPUs).
 fn in_pr(w: &Value) -> bool {
-    w["level"] == "warn" || ["SessionLocked", "DisplayOff", "PowerPlan", "CrossAdapterScanout", "FewPairs", "StaleCalibration"].contains(&w["id"].as_str().unwrap_or(""))
+    w["level"] == "warn" || ["SessionLocked", "DisplayOff", "PowerPlan", "CrossAdapterScanout", "FewPairs", "StaleCalibration", "ReservedCpus"].contains(&w["id"].as_str().unwrap_or(""))
 }
 
 pub fn pr_markdown(r: &Value) -> String {
@@ -983,8 +1095,9 @@ pub fn pr_markdown(r: &Value) -> String {
         out += "\n";
     }
     let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
+    let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!(" · other processes kept off CPUs {}", cpu_list(c))).unwrap_or_default();
     out += &format!(
-        "`{}` against `{}`, alternating fresh launches: {} · {} · power plan {} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
+        "`{}` against `{}`, alternating fresh launches: {} · {} · power plan {}{reserved} · {gpu} · {} · {}×{} · {} Hz display. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
         base["label"].as_str().unwrap_or("base"),
         head["label"].as_str().unwrap_or("head"),
         r["env"]["os"].as_str().unwrap_or(""),
@@ -1242,7 +1355,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         loop {
             let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
             let display = host::display_state();
-            let r = any_block(ctx, s, v, pair, set, keep);
+            let r = slotted_block(ctx, s, v, pair, set, keep);
             let end = host::session_locked();
             let steady = start == end && if start { ctx.awake.unlocks() == unlocks } else { ctx.awake.locks() == locks };
             // The display turned off (or on) during the block: it ran in two machine states.
@@ -1269,6 +1382,8 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         if host::session_locked() {
             progress("  waiting: the session is locked; strobe resumes when it is unlocked");
+            // Outside the bench slot: other benches run what needs no presenting window meanwhile.
+            ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window", s.label(), v.role));
             let waiting = Instant::now();
             while host::session_locked() {
                 std::thread::sleep(Duration::from_secs(2));
@@ -1278,7 +1393,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
-        let r = any_block(ctx, s, v, pair, set, keep);
+        let r = slotted_block(ctx, s, v, pair, set, keep);
         if !woken && r.as_ref().err().is_some_and(|e| e.message.contains("WindowHidden")) {
             progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
             woken = true;
@@ -1291,6 +1406,61 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             let _ = std::fs::remove_dir_all(dir);
         }
         progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
+    }
+}
+
+/// Runs `f` holding the device's bench slot (SPEC §10.1 `ConcurrentBench`): no other bench's block
+/// runs meanwhile. Time spent queued for it is waiting, not run time.
+fn in_slot<T>(ctx: &mut Ctx, what: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T> {
+    let (slot, waited) = ctx.reg.acquire(what)?;
+    ctx.waited_ms += waited.as_secs_f64() * 1e3;
+    let r = f(ctx);
+    drop(slot);
+    r
+}
+
+/// One block in the bench slot, with this user's other processes kept off the target's CPUs while it
+/// runs (`--reserve-cpus`, SPEC §9.4).
+fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+    in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
+        let reserve = reserve_for(ctx, set);
+        let r = any_block(ctx, s, v, pair, set, keep);
+        let Some(report) = reserve.map(host::reserve::Reserve::finish) else { return r };
+        ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
+        r.map(|mut b| {
+            b.reserve = Some(json!({ "moved": report.moved_total(), "started": report.started, "failed": report.failed.len(), "restored": report.restored, "overhead_pct": report.overhead_pct, "setup_ms": report.setup_ms }));
+            b
+        })
+    })
+}
+
+/// Starts the reservation a block gets: `auto` for timed blocks (not `--check`, attribution, memory
+/// or pixels blocks), `on` for every block, `off` never. It needs a pinned target.
+fn reserve_for(ctx: &mut Ctx, set: Set) -> Option<host::reserve::Reserve> {
+    let timed = !ctx.check && matches!(set, Set::Lean | Set::Timing) && ctx.pixels_dir.is_none();
+    let wanted = match ctx.reserve {
+        "on" => true,
+        "off" => false,
+        _ => timed,
+    };
+    if !wanted {
+        return None;
+    }
+    let noted = ctx.warnings.iter().any(|w| w.id == "ReservedCpus");
+    let Some(cpus) = ctx.pin else {
+        if !noted {
+            ctx.warnings.push(validity::info("ReservedCpus", "other processes were not kept off the target's CPUs: the target is not pinned (--pin none, or no V-Cache CCD for --pin auto)"));
+        }
+        return None;
+    };
+    match host::reserve::Reserve::start(cpus) {
+        Ok(r) => Some(r),
+        Err(why) => {
+            if !noted {
+                ctx.warnings.push(validity::info("ReservedCpus", format!("other processes were not kept off the target's CPUs: {why}")));
+            }
+            None
+        }
     }
 }
 
@@ -1916,6 +2086,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             refused: BTreeMap::new(),
             locked: false,
             display: None,
+            reserve: None,
         })
     })();
     lapped.set(Instant::now());
@@ -2675,7 +2846,8 @@ fn render(r: &Value) -> String {
             Some("mixed") => "session locked in some pairs only: nothing decided",
             _ => "visible",
         };
-        out += &format!("plan   {} · power plan {} · {screen}, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
+        let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!(" · others kept off CPUs {}", cpu_list(c))).unwrap_or_default();
+        out += &format!("plan   {}{reserved} · power plan {} · {screen}, unthrottled\n", r["plan"]["pin"].as_str().unwrap_or(""), env["power_plan"].as_str().unwrap_or("?"));
         let per_block = if s["kind"] == "launch" {
             "one timed launch per block · first launch of each variant discarded".to_string()
         } else {

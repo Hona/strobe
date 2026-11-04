@@ -3,6 +3,7 @@
 pub mod http;
 pub mod paths;
 pub mod power;
+pub mod reserve;
 #[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]
@@ -598,6 +599,21 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     {
         os::refresh_at(x, y)
     }
+}
+
+/// This machine's name, lower case and without a domain: `COMPUTERNAME` on Windows, `gethostname`
+/// elsewhere (shells keep `HOSTNAME` unexported, and macOS adds `.local`).
+pub fn device_name() -> String {
+    #[cfg(windows)]
+    let name = std::env::var("COMPUTERNAME").unwrap_or_default();
+    #[cfg(not(windows))]
+    let name = {
+        let mut buf = [0u8; 256];
+        let ok = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) } == 0;
+        let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+        if ok { String::from_utf8_lossy(&buf[..end]).to_string() } else { std::env::var("HOSTNAME").unwrap_or_default() }
+    };
+    name.split('.').next().unwrap_or("").to_lowercase()
 }
 
 /// The module each thread started in (its path), per tid, for `(pid, tid)` pairs (Windows only).

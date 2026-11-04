@@ -274,6 +274,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             refused: BTreeMap::new(),
             locked: false,
             display: None,
+            reserve: None,
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may

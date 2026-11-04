@@ -374,6 +374,54 @@ pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// Starts a process that outlives this one and holds nothing of it: no console, no inherited handles
+/// (a shell reading this process's output through a pipe waits until every holder of the pipe's write
+/// end exits, so a daemon that inherited it kept `strobe up` from returning), its own process group,
+/// its own folder as working directory, and out of this process's job when the job allows it.
+pub fn spawn_detached(exe: &std::path::Path, args: &[&str]) -> std::io::Result<u32> {
+    use windows_sys::Win32::System::Threading::{CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW};
+    let mut line = format!("\"{}\"", exe.display());
+    for a in args {
+        line += " ";
+        line += a;
+    }
+    let app = wide(&exe.display().to_string());
+    let dir = exe.parent().map(|d| wide(&d.display().to_string()));
+    let mut last = std::io::Error::other("CreateProcessW");
+    // A job without breakaway refuses the flag (access denied): then the daemon stays in it.
+    for flags in [DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_BREAKAWAY_FROM_JOB, DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP] {
+        let mut cmd = wide(&line);
+        unsafe {
+            let mut si: STARTUPINFOW = zeroed();
+            si.cb = size_of::<STARTUPINFOW>() as u32;
+            let mut pi: PROCESS_INFORMATION = zeroed();
+            let cwd = dir.as_ref().map_or(std::ptr::null(), |d| d.as_ptr());
+            if CreateProcessW(app.as_ptr(), cmd.as_mut_ptr(), std::ptr::null(), std::ptr::null(), 0, flags, std::ptr::null(), cwd, &si, &mut pi) != 0 {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                return Ok(pi.dwProcessId);
+            }
+        }
+        last = std::io::Error::last_os_error();
+    }
+    Err(last)
+}
+
+/// Makes this process's standard handles non-inheritable, so nothing it starts keeps a shell's pipe
+/// open after it exits. Children given inherited stdio still get it: Rust duplicates those handles.
+pub fn private_std_handles() {
+    use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        unsafe {
+            let h = GetStdHandle(which);
+            if !h.is_null() && h != INVALID_HANDLE_VALUE {
+                SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0);
+            }
+        }
+    }
+}
+
 /// Sets (or with `None`, deletes) a string value under HKEY_CURRENT_USER.
 pub fn set_user_value(key: &str, name: &str, value: Option<&str>, expand: bool) -> bool {
     use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_EXPAND_SZ, REG_SZ, RegDeleteKeyValueW, RegSetKeyValueW};
@@ -990,6 +1038,17 @@ fn system_processes(names: bool) -> Vec<SysProc> {
             },
             create: p.create,
         });
+    });
+    out
+}
+
+/// Every process from one system snapshot: pid, parent, creation time (FILETIME units), session
+/// and executable name.
+pub fn procs() -> Vec<(u32, u32, i64, u32, String)> {
+    let mut out = Vec::with_capacity(512);
+    each_process(|p, _| {
+        let name = if p.name.is_null() { String::new() } else { unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(p.name, p.name_len as usize / 2)) } };
+        out.push((p.pid as u32, p.parent as u32, p.create, p.session, name));
     });
     out
 }

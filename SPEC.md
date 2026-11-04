@@ -335,7 +335,9 @@ the refusal, the page's URL and its screenshot; the next case still runs, and an
 A failure keeps the fix strobe's driver gave (a missing permission and where to grant it) and
 names the hook once (`setup: …`, not `setup: setup: …`). Under each case, `--check` prints the
 last 10 lines the bench file's hooks wrote to the console during it (`console.log`/`error`; the
-rest stay in the experiment's `runner.log`, whose path it names).
+rest stay in the experiment's `runner.log`, whose path it names). Each passing case keeps its
+block's recording and prints it (`rec  rec_… · strobe query rec_… threads`), and `query <exp> <view>`
+on a check of one case answers from that recording (with several, it lists them).
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
 a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
 and prints its recording, to profile one build before there is anything to compare.
@@ -1459,7 +1461,9 @@ and the CPU metrics kept say to compare them only at the same priority) · `Curs
 · `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed) · `DisplayOff`
 (pairs ran with the console display off, §10.5) · `CrossAdapterScanout` (a native app draws on one GPU
 while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`
-(the present session's consumer over 0.5% of a core) · `PresentsLost`.
+(the present session's consumer over 0.5% of a core) · `PresentsLost` · `VariantChanged` (a folder
+variant's commit or uncommitted changes differ, when a series builds it, from when the bench started:
+later series measure what it holds then).
 
 `report --format pr` prints every warning and the context notes that say what the numbers compare
 with: `SessionLocked`, `DisplayOff`, `PowerPlan`, `CrossAdapterScanout`, `FewPairs`, `StaleCalibration`.
@@ -1584,7 +1588,12 @@ markdown is GitHub-flavoured. `--format pr` writes an experiment for a pull requ
 series a table of the primary and tested metrics (base, head, change [interval], verdict), the
 context metrics in a folded `<details>`, pixels and warnings, then one line of setup (variants,
 OS, CPU, GPU, browser, window, display; a field strobe does not have, such as a native app's
-browser, is left out rather than shown empty) and the `strobe bench` command that reruns it.
+browser, is left out rather than shown empty) and the `strobe bench` command that reruns it. The
+setup names each variant by its commit (`6c23f8032f`, `origin/dev (fe04656465)`, and "with uncommitted
+changes" for a folder that had them), not a folder, so the line means something in another repo's PR.
+The rerun command keeps every flag that chose what ran and how (`--filter`, `--primary`, `--pairs`,
+`--runs`, `--probes`, `--params`, `--aa`, …; the experiment stores its command line) and names a folder
+variant by its commit.
 Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
 stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed
 over the target once flushed, so the file is whole when the command returns and a reader never

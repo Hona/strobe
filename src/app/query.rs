@@ -26,7 +26,23 @@ pub fn run(args: &Args) -> Result<Output> {
         return match view {
             "summary" | "progress" => Ok(Output::new(result["text"].as_str().unwrap_or("").to_string(), result)),
             "insights" => experiment_insights(&result),
-            other => Err(Error::usage(format!("experiments support summary, progress and insights; use a recording handle for {other} (see the result's recordings)"))),
+            other => {
+                // A check of one case has one recording: its views answer for the experiment.
+                let mut recs: Vec<String> = result["series"].as_array().into_iter().flatten().filter_map(|s| s["recording"].as_str().map(str::to_string)).collect();
+                if result["kind"] == "check" && recs.len() == 1 {
+                    let mut a = args.clone();
+                    a.pos[0] = recs.remove(0);
+                    return run(&a);
+                }
+                for s in result["series"].as_array().into_iter().flatten() {
+                    recs.extend(["base", "head"].iter().filter_map(|r| s["attribution"][r].as_str().map(str::to_string)));
+                    recs.extend(s["attribution"].as_str().map(str::to_string));
+                }
+                Err(Error::usage(format!(
+                    "experiments support summary, progress and insights; {other} reads a recording{}",
+                    if recs.is_empty() { " (this experiment kept none)".to_string() } else { format!(": strobe query <rec> {other} with one of {}", recs.join(", ")) }
+                )))
+            }
         };
     }
     // `a..b`: two recordings compared (heap snapshots by class).

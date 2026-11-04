@@ -141,6 +141,21 @@ struct Variant {
     server: Option<Child>,
     /// A native target's executable built for this variant (strobe.json `build`), copied out of the build.
     exe: Option<PathBuf>,
+    /// The commit a directory or git variant is at (short), and whether a directory had uncommitted changes.
+    commit: Option<String>,
+    dirty: bool,
+    /// A directory variant's git state when the bench started (`tree_state`): its builds must see the same.
+    state: Option<String>,
+    /// When a build found the directory changed since then (`VariantChanged`).
+    changed: Vec<String>,
+}
+
+/// A checkout's commit and a hash of its uncommitted changes to tracked files: what a build of it reads.
+fn tree_state(root: &Path) -> Option<String> {
+    use sha2::Digest;
+    let sha = host::output(Command::new("git").arg("-C").arg(root).args(["rev-parse", "HEAD"]))?;
+    let diff = Command::new("git").arg("-C").arg(root).args(["diff", "HEAD", "--no-ext-diff", "--binary"]).output().ok()?;
+    Some(format!("{sha} {:x}", sha2::Sha256::digest(&diff.stdout)))
 }
 
 impl Drop for Variant {
@@ -667,6 +682,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(t) = &ctx.reserved {
         ctx.warnings.push(validity::info("ReservedCpus", t.text()));
     }
+    for text in variants.iter().flat_map(|v| v.changed.iter()) {
+        ctx.warnings.push(validity::warn("VariantChanged", text.clone()));
+    }
     if let Some(h) = halted.as_ref().filter(|_| check || pixels_only) {
         ctx.warnings.push(validity::warn("Stopped", format!("{}; not run: {}", h.message, not_run.join(", "))));
     }
@@ -699,7 +717,12 @@ pub fn run(args: &Args) -> Result<Output> {
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
         },
-        "variants": variants.iter().map(|v| json!({ "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v) })).collect::<Vec<_>>(),
+        "variants": variants.iter().map(|v| json!({
+            "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
+            "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
+        })).collect::<Vec<_>>(),
+        // The command line, for the rerun line under a PR table.
+        "args": ctx.saved["args"],
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided && halted.is_none(),
         "stopped": halted.as_ref().map(|h| json!({ "code": h.code, "why": h.message, "not_run": not_run })),
     });
@@ -742,16 +765,17 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     }
     let started = Instant::now();
     let log_from = std::fs::metadata(&ctx.runner.log).map(|m| m.len()).unwrap_or(0);
-    let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, false);
+    // Kept, so its views (`query <rec> threads`, …) can follow up on what the check showed.
+    let r = block_on_screen(ctx, s, &variants[0], 0, Set::Lean, true);
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
     // What the bench file's hooks printed during this case (console.log/error go to runner.log).
     let log: Vec<String> = std::fs::read(&ctx.runner.log)
         .ok()
         .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
         .unwrap_or_default();
-    let (passed, error, hint, values, refused, locked) = match r {
-        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked),
-        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false),
+    let (passed, error, hint, values, refused, locked, recording) = match r {
+        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked, json!(b.recording)),
+        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
@@ -780,6 +804,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "recording": recording,
         "log": log, "log_path": ctx.runner.log,
     }))
 }
@@ -802,6 +827,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
+            if let Some(rec) = s["recording"].as_str() {
+                text += &format!("      rec  {rec} · strobe query {rec} {}\n", if s["target_kind"] == "native" { "threads" } else { "summary" });
+            }
             if let Some(rec) = s["attribution"].as_str() {
                 text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
             }
@@ -1424,12 +1452,41 @@ pub fn pr_markdown(r: &Value) -> String {
     ]);
     out += &format!(
         "`{}` against `{}`, alternating fresh launches: {context}. Intervals over pairs (Wilcoxon signed-rank, Hodges–Lehmann); secondaries gated on the primary and Holm-corrected.\n\n",
-        base["label"].as_str().unwrap_or("base"),
-        head["label"].as_str().unwrap_or("head"),
+        variant_name(&base),
+        variant_name(&head),
     );
-    let file = r["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\").replace('\\', "/");
-    out += &format!("```sh\nstrobe bench {file} --base {} --head {}\n```\n", base["spec"].as_str().unwrap_or("<base>"), head["spec"].as_str().unwrap_or("."));
+    out += &format!("```sh\n{}\n```\n", rerun_command(r, &base, &head));
     out
+}
+
+/// The `strobe bench` line that reruns an experiment: its bench file, its variants by commit where it
+/// has one (a folder is a commit plus whatever is in it now), and every flag that chose what ran
+/// and how (filter, primary, pairs, runs, probes, …), not the handles.
+fn rerun_command(r: &Value, base: &Value, head: &Value) -> String {
+    let file = r["file"].as_str().unwrap_or("").trim_start_matches(r"\\?\").replace('\\', "/");
+    let quote = |s: &str| if s.is_empty() || s.contains([' ', '"', '\'', '*', '&', '|', '<', '>', ';']) { format!("\"{}\"", s.replace('"', "\\\"")) } else { s.to_string() };
+    let spec = |v: &Value, fallback: &str| match (v["kind"].as_str(), v["commit"].as_str()) {
+        (Some("dir"), Some(c)) => c.to_string(),
+        _ => v["spec"].as_str().unwrap_or(fallback).to_string(),
+    };
+    let flags = r["args"]["flags"].as_object();
+    let mut line = format!("strobe bench {}", quote(&file));
+    if flags.is_some_and(|f| f.contains_key("aa")) {
+        line += &format!(" --aa --head {}", quote(&spec(head, ".")));
+    } else {
+        line += &format!(" --base {} --head {}", quote(&spec(base, "<base>")), quote(&spec(head, ".")));
+    }
+    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open"];
+    let mut rest: Vec<(&String, &Value)> = flags.into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).collect();
+    rest.sort_by(|a, b| a.0.cmp(b.0));
+    for (k, v) in rest {
+        match v.as_str() {
+            Some("true") => line += &format!(" --{k}"),
+            Some(x) => line += &format!(" --{k} {}", quote(x)),
+            None => {}
+        }
+    }
+    line
 }
 
 /// One snapshot's line: `same`, `differ` with how many pixels moved beyond the launch noise, or only one side.
@@ -2952,18 +3009,33 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
             let sha = host::output(Command::new("git").arg("-C").arg(&root).args(["rev-parse", "--short=10", "HEAD"])).unwrap_or_default();
             let dirty = host::output(Command::new("git").arg("-C").arg(&root).args(["status", "--porcelain", "--untracked-files=no"])).is_some_and(|s| !s.is_empty());
             let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            (Kind::Dir, format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }), Some(root))
+            let mut v = Variant { role, spec: spec.to_string(), kind: Kind::Dir, label: if sha.is_empty() { name } else { format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }) }, root: Some(root.clone()), base_url: None, server: None, exe: None, commit: None, dirty, state: tree_state(&root), changed: Vec::new() };
+            v.commit = (!sha.is_empty()).then_some(sha);
+            return Ok(v);
         } else {
             (Kind::Git(spec.to_string()), spec.to_string(), None)
         }
     };
-    let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None, exe: None };
+    let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None, exe: None, commit: None, dirty: false, state: None, changed: Vec::new() };
     if let Kind::Git(r) = &v.kind {
         let sha = host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", "--short=10", r]))
             .ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
         v.label = format!("{r}@{sha}");
+        v.commit = Some(sha);
     }
     Ok(v)
+}
+
+/// How a report names a variant: its commit (a ref that is not the commit itself in front, a
+/// directory's uncommitted changes after), else its label.
+fn variant_name(v: &Value) -> String {
+    let Some(commit) = v["commit"].as_str() else { return v["label"].as_str().unwrap_or("").to_string() };
+    let spec = v["spec"].as_str().unwrap_or("");
+    let mut name = if v["kind"] == "git" && !commit.starts_with(spec) && !spec.starts_with(commit) { format!("{spec} ({commit})") } else { commit.to_string() };
+    if v["dirty"] == true {
+        name += " with uncommitted changes";
+    }
+    name
 }
 
 /// The bench's harness: the bench file's folder, the strobe.json in use and strobe.json's `harness` paths, in
@@ -3051,6 +3123,25 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 
 /// Builds and serves a variant for `web` targets (once per experiment).
 fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness, project: &Path) -> Result<()> {
+    // A directory is built when each series starts, from whatever it holds then: say so when that is
+    // not what it held when the bench started (another branch checked out, edits saved meanwhile).
+    if let (Kind::Dir, Some(root), Some(was)) = (&v.kind, v.root.clone(), v.state.clone()) {
+        let now = tree_state(&root);
+        if now.as_ref() != Some(&was) {
+            let short = |s: &str| s.split(' ').next().unwrap_or("").chars().take(10).collect::<String>();
+            let text = format!(
+                "{}'s folder {} changed since the bench started (commit {} then, {} now{}): later series build what it holds now; bench a commit (a git ref) to pin it",
+                v.role,
+                root.display(),
+                short(&was),
+                now.as_deref().map(short).unwrap_or_else(|| "?".into()),
+                if now.as_deref().map(short) == Some(short(&was)) { ", its uncommitted changes differ" } else { "" }
+            );
+            progress(format!("  ! {text}"));
+            v.changed.push(text);
+            v.state = now;
+        }
+    }
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
     // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
     if matches!(target["kind"].as_str(), Some("command") | Some("script")) {

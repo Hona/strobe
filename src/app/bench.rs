@@ -1416,10 +1416,16 @@ fn subject(v: &Variant) -> Option<String> {
     (out.status.success() && !s.is_empty()).then_some(s)
 }
 
+/// How many times a block waits for other work to end before `Background` refuses it: each wait
+/// and speed check takes about 4 minutes.
+const BUSY_WAITS: u32 = 15;
+
 /// Runs a block while the screen is unlocked and lit: waits out a locked session, redoes a block the
 /// lock screen touched (Chromium hides its windows and nothing reaches the display, so its numbers
 /// describe nothing), and wakes a display that went dark on idle, once, before a block refuses
-/// `WindowHidden`. The block's own checks still refuse anything else.
+/// `WindowHidden`. It also waits out someone using a Mac whose window it would cover, and other work
+/// that keeps the CPUs busy (`Background`) for up to about an hour. The block's own checks still refuse
+/// anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     // A series that needs no presenting window runs through a lock, in one lock state per block.
     if runs_locked(ctx, s, set) {
@@ -1445,6 +1451,7 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
     }
     let mut woken = false;
+    let mut busy_waits = 0;
     loop {
         host::wake_display();
         if woken {
@@ -1482,6 +1489,19 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             while host::person_idle_s().is_some_and(|i| i < 60.0) {
                 std::thread::sleep(Duration::from_secs(5));
             }
+            ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+            continue;
+        }
+        // Other work (a build, an update) kept the CPUs busy through the speed check: on a shared
+        // machine it ends. Wait for it, holding nothing, and run the block again; an hour of it refuses.
+        if busy_waits < BUSY_WAITS && r.as_ref().err().is_some_and(|e| e.message.starts_with("Background: ")) {
+            busy_waits += 1;
+            progress(format!("  waiting: other work keeps the CPUs busy ({}); strobe runs the {} block again once it ends", r.as_ref().err().map(|e| e.message.rsplit("busiest processes (% of a core): ").next().unwrap_or("").to_string()).unwrap_or_default(), v.role));
+            release_machine(ctx);
+            ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
+            let waiting = Instant::now();
+            std::thread::sleep(Duration::from_secs(60));
+            crate::validity::wait_quiet(None, Duration::from_secs(60));
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
             continue;
         }

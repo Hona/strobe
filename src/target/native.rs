@@ -152,8 +152,14 @@ impl Native {
             Some(s) if inactive(s.pid) => Some(NOT_ACTIVE),
             _ => None,
         };
+        // macOS: which apps' windows still cover it (after strobe brought the app forward, a window
+        // that opens or floats on top), so the refusal says what to close.
+        #[cfg(target_os = "macos")]
+        let by = state.as_ref().filter(|_| why == Some(COVERED)).map(|s| host::macos::covering(s.hwnd)).filter(|c| !c.is_empty()).map(|c| format!("; in front of it: {}", c.join(", "))).unwrap_or_default();
+        #[cfg(not(target_os = "macos"))]
+        let by = String::new();
         match why {
-            Some(why) => Err(Error::refused("WindowHidden", format!("the app's {why}"), "keep the window visible and unminimized while strobe measures; a hidden window may skip its frames")),
+            Some(why) => Err(Error::refused("WindowHidden", format!("the app's {why}{by}"), "keep the window visible and unminimized while strobe measures; a hidden window may skip its frames")),
             None => Ok(()),
         }
     }

@@ -256,7 +256,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             lap("node", &mut steps);
         }
         let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
+        // What the launch ended on, once its values and profiles are taken.
+        let end = shown::page(ctx, s, v, pair, "end", &page);
+        shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| shown::page_shows(&page, sel))?;
         Ok(Block {
+            shown: Some(shown::Shown { start: shown::Screen::default(), end }),
             variant: v.role.to_string(),
             pair,
             values,

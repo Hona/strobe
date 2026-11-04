@@ -302,6 +302,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             display: None,
             screen: None,
             reserve: None,
+            shown: None,
         })
     })();
     host.into_inner().exit();

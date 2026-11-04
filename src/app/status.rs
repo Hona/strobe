@@ -105,7 +105,16 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!(
         "  {} daemon     {}\n",
         mark(daemon),
-        if daemon { format!("running on 127.0.0.1:{} (MCP)", super::mcp::port()) } else { "not running: strobe up starts it (MCP calls need it)".into() }
+        if daemon {
+            let build = match super::mcp::daemon_build() {
+                Some(b) if b == super::mcp::build_id() => " · this build".to_string(),
+                Some(b) if !b.is_empty() => format!(" · another build ({b}; this is {}): strobe up restarts it once its bench ends", super::mcp::build_id()),
+                _ => String::new(),
+            };
+            format!("running on 127.0.0.1:{} (MCP){build}", super::mcp::port())
+        } else {
+            "not running: strobe up starts it (MCP calls need it)".into()
+        }
     );
     t += &format!(
         "  {} skill      {}\n",

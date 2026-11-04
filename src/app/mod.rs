@@ -5,6 +5,7 @@ pub mod bisect;
 pub mod fmt;
 pub mod helper;
 pub mod history;
+pub mod look;
 pub mod mcp;
 pub mod open;
 pub mod outside;
@@ -45,7 +46,9 @@ pub fn main() -> i32 {
         return fail(&e, args.json());
     }
     if args.has("version") {
-        println!("strobe {}", env!("CARGO_PKG_VERSION"));
+        // `update` reads the version as the second word; the commit and build tell local builds apart.
+        let commit = env!("STROBE_COMMIT");
+        println!("strobe {} ({}build {})", env!("CARGO_PKG_VERSION"), if commit.is_empty() { String::new() } else { format!("{commit}, ") }, mcp::build_id());
         return 0;
     }
     if args.command.is_empty() || (args.has("help") && args.command.is_empty()) {
@@ -84,6 +87,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "query" => query::run(args),
         "report" => report::run(args),
         "open" => open::run(args),
+        "look" => look::run(args),
         "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),

@@ -291,6 +291,17 @@ fn runs(
     lap("checks", steps);
     ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     lap("setup", steps);
+    // What the window shows before the runs: its titles and pixels, and its tree only when setup
+    // already drove the app (reading it now would connect strobe to the app for the runs).
+    let main = n.window.as_ref().map(|w| w.hwnd);
+    let start = (!windowless).then(|| {
+        let se = drive.session.get().ok_or_else(|| "not read before the runs (the case had not driven the app yet)".to_string());
+        shown::native(ctx, s, v, pair, "start", &n.pids(), main, se)
+    });
+    if let Some(sc) = &start {
+        let se = drive.session.get();
+        shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
+    }
     let procs0 = (host::now_ns(), host::all_processes());
     let sampler = probe::os::Sampler::start(n.pid);
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
@@ -375,6 +386,16 @@ fn runs(
     if !windowless {
         n.check_visible()?;
     }
+    // What the window showed after the runs, its tree included: every probe has stopped.
+    let shown = match start {
+        Some(start) => {
+            let main = n.window.as_ref().map(|w| w.hwnd);
+            let end = shown::native(ctx, s, v, pair, "end", &n.pids(), main, drive.get().map_err(|e| e.message));
+            shown::expect(&s.expect, &end, "after the runs", true, &|sel| drive.get().and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
+            Some(shown::Shown { start, end })
+        }
+        None => None,
+    };
     let measured = &runs[first..];
     let key = |j: usize| format!("run:{}", first + j);
     let per_run = |f: &dyn Fn(&Run) -> f64| -> BTreeMap<String, f64> { measured.iter().enumerate().map(|(j, r)| (key(j), f(r))).filter(|(_, x)| x.is_finite()).collect() };
@@ -713,6 +734,7 @@ fn runs(
         refused,
         leak: leak_result,
         screen: Some(screen),
+        shown,
         ..Block::default()
     })
 }
@@ -1076,6 +1098,16 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         }
         let pixels = watcher.map(joined).unwrap_or_default();
         lap("milestones", &mut steps);
+        // What the launch ended on (the window it was waiting for, or a first-run dialog over it).
+        let shown = match host::main_window(&n.pids()).filter(|_| !windowless) {
+            Some(w) => {
+                let session = Session::open(&n.pids(), w.hwnd);
+                let end = shown::native(ctx, s, v, pair, "end", &n.pids(), Some(w.hwnd), session.as_ref().map_err(|e| e.message.clone()));
+                shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| session.as_ref().map_err(|e| Error::msg(e.message.clone())).and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
+                Some(shown::Shown { start: shown::Screen::default(), end })
+            }
+            None => None,
+        };
         let mut values = BTreeMap::new();
         let ready_ms = ready.0 - n.epoch_ms;
         values.insert("launch.ready".to_string(), ready_ms);
@@ -1144,7 +1176,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         } else {
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), ..Block::default() })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, ..Block::default() })
     })();
     // A launch that failed before its recording still ends the helper's session.
     if let Some(Ok(c)) = stacks.take() {

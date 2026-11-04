@@ -204,7 +204,7 @@ ui/             embedded viewer and calibration assets
 strobe <command> [flags]
 
 Setup      up · update · leave
-Use        status · record · bench · plan · query · report · open (§11.4) · top · track · history (§25)
+Use        status · record · bench · plan · query · report · open (§11.4) · look (§5.12) · top · track · history (§25)
 Internal   daemon · mcp · helper (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
@@ -369,6 +369,7 @@ unless it holds `*`, a glob over the whole name: `--filter window-closed` runs o
 `--filter "window-closed*"` also `window-closed-memory`. Before anything builds, strobe prints
 the cases the filter runs and skips, and for an exact name that other cases start with, the glob
 that would take them too; a filter that matches nothing is a usage error that lists the cases.
+`--target` takes target names the same way (comma-separated, globs with `*`).
 With `--base`: the A/B pipeline in §9. Without it: `--aa`
 runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak run (§8.6), and
 `--check` validates the file: one block per series on `--head`, one run per case, no warmup and
@@ -449,8 +450,20 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   runs it, whatever the new build's own install code does) and stops the daemon unless it is
   running a bench. Then the installed new build runs its own `up --skip calibrate`: it writes its
   skill and MCP registration, starts its daemon, and refreshes the deep-mode helper only where one
-  is installed (its UAC prompt only when it is out of date). The same bytes already installed:
-  nothing to do. `--check` says what is installed and what is available. `--on all` (every mesh
+  is installed (its UAC prompt only when it is out of date). The same build already installed
+  (the same build id, below; the same bytes for copies without one): nothing to do. A daemon left
+  running its bench restarts as the installed build once no bench runs in it (it checks once a
+  minute and runs the installed copy's `up --skip deep,mcp,calibrate`; only a daemon running from
+  the install folder does).
+
+  **Build id.** `build.rs` hashes every source file of the binaries (FNV-1a over `src`, the bench
+  SDK, the viewer, the skill, the calibration page, `Cargo.toml`, `Cargo.lock`), the target and the
+  profile into `STROBE_BUILD_ID`. `strobe` and `strobew` come from one run of it, so they carry the
+  same id, where a hash of each executable differed and the daemon (strobew on Windows) never matched
+  the CLI. The id sits in the executable behind a `strobe-build-id:` marker, so `up` and `update` read
+  an installed copy's id without running it. `strobe --version` prints `strobe 0.6.0 (a1b2c3d4e5,
+  build 0123456789abcdef)`, `/health` the daemon's id, `status` whether the daemon is this build, and
+  every bench's first line its version and commit. `--check` says what is installed and what is available. `--on all` (every mesh
   device) is not built. Without a version or `--from`, an installed copy newer than the release, or
   a local build of the same version (other bytes), stays, with a usage error that says so: an
   update once put 0.4.0 over the main build another session's bench used, which then failed on an
@@ -461,6 +474,19 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
 ### 5.11 `strobe daemon` / `strobe mcp` / `strobe helper` (hidden)
 
 `daemon`: §16. `mcp`: the MCP server on stdio, for debugging. `helper`: §13.4.
+
+### 5.12 `strobe look`
+
+`look <url | file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000]
+[--full] [--headed] [--timeout 30s]`: a page in a fresh headless Chromium (strobe's usual flags and a
+throwaway profile), nothing measured, for checking that a UI loads and says what it should (an
+agent on a locked session, a report or tool page) without writing a browser script. After the load
+event (and `--until`'s element visible, then `--wait`) it prints the title, the address, the visible
+headings and dialogs, the console messages and uncaught exceptions with where they came from, the
+page's visible text (`innerText`, the first `--chars`), and writes a screenshot (`--full`: the whole
+page). A local file opens as `file://`. Exit 124 when the load event or `--until` never came; the
+page's own errors are listed, not an exit code. It is a CLI command only, not an MCP tool (§17): it
+answers no measurement question.
 
 ## 6. Clock
 
@@ -1310,7 +1336,12 @@ export default bench({
   (optional, ms: how long a run or reset may take, default 60 000; setup and the other hooks get at
   least that too, so a case can idle for minutes, a model left alone before it is used), `noworse`
   (optional: `"2%"` asks of the primary "is head at most 2% worse?", or margins per metric
-  `{ "main.work": "2%", "cpu.wakes": "5%" }`; §9.3; `--noworse` overrides per metric).
+  `{ "main.work": "2%", "cpu.wakes": "5%" }`; §9.3; `--noworse` overrides per metric), `expect`
+  (optional, also on a target, the case's keys over the target's: the screen every block must show,
+  `{ title, heading, url, visible }`; strings match as substrings, RegExps as patterns, `visible`
+  takes accessibility selectors for a native app and CSS selectors for a page; a block on another
+  screen is refused `WrongScreen`, §10.1, and without it strobe still records what each block
+  showed, §10.2).
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
@@ -1561,12 +1592,13 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`; a native app whose executable imports a debug C runtime, such as `ucrtbased.dll`) |
 | `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs, or another window over the point strobe would click (the OS hit-tests elsewhere). On macOS the app must also be the active app (strobe makes it so in every block); while someone uses the Mac the block does not refuse but waits, holding nothing, until a minute passes without input, then activates the app and runs it again; a block whose app lost the front while nobody used the Mac (another app opened a window or took focus by itself) is discarded and runs again, up to 5 times |
+| `WrongScreen` | a block's window or page is not on the screen its case's (or target's) `expect` names (§9.6): a title, a dialog or heading, an address, or selectors that must be visible, read before the runs and after them (never inside one). A first-run dialog over the pane the case meant fails the block instead of timing it. Before a native app's runs, only titles are checked unless setup already drove the app: reading its tree there would connect strobe to it for the runs |
 | `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
 | `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric) |
 | `AmbiguousInteraction` | over half of a block's inputs came while the native app was drawing, so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
-| `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/`), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
+| `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/`), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -1597,7 +1629,27 @@ its pacing is broken, such as an app composited while the session is locked at a
 second on a 165 Hz display, so it draws as fast as it can and its CPU and GPU numbers describe that;
 said for every series, declared frame metrics or not, with the session and display state; native
 `record` and `record pid:` keep it as `unpaced` and `query summary` prints it) · `GpuCacheGrowing`
-(a variant's GPU shader caches still grew in its third warm-up block, §13.2).
+(a variant's GPU shader caches still grew in its third warm-up block, §13.2) · `ScreenChanged`
+(base and head ended their runs on different screens, or some blocks of one variant did: below).
+
+**What was on screen.** Every block of a windowed native target, a page or an Electron app reads
+what it showed before its warmup runs and after its measured runs (a launch: once it was ready),
+outside every timed span and after the probes stop: the app's visible windows' titles, the open
+dialogs and headings of its accessibility tree (a page: `document.title`, its address, open dialogs
+and `h1`/`h2` headings), and a 64-bit difference hash of the window's pixels (`PrintWindow`, X11
+`GetImage`, `CGWindowListCreateImage` with Screen Recording; a page's screenshot). The tree is read
+before the runs only when setup already drove the app, since a connected client makes a lazy
+provider build and keep its tree; after the runs it is always read. What cannot be read says why
+(`missing`: no Screen Recording, no Accessibility). A 320-pixel thumbnail is kept in the experiment's
+`shown/` folder for the first block of each series and variant, and for any block whose label or
+hash (20 of 64 bits or more) differs from it. Blocks keep `shown { start, end }`; a series keeps
+`shown { base, head, changed }` with the screen most blocks ended on (`'Hex Settings · General'`:
+the first title, then up to two headings), the other screens and how many blocks showed each, and
+the first block's thumbnail inline. Base and head on different labels (or, with no text read,
+hashes 20 bits apart), or blocks of one variant on several, warn `ScreenChanged`. Text output prints
+`shown  'X'` per series (`--check`: per case, with what could not be read and the thumbnail's path),
+the PR block an `On screen:` line under each series' caption (`bench::shown_line`) and an alert, and
+the viewer the label with the thumbnail per variant.
 
 **Screen state.** Every native block and Chromium block, `record` of a native app and `record pid:`
 keep `screen` in their meta: the display (`on`, `off`, `dimmed`: `GUID_CONSOLE_DISPLAY_STATE` on
@@ -2234,7 +2286,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the TSC (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
 | process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
 | memory by what holds it (`memory.app.host`, `query memory`, §8.6) | `VirtualQueryEx` walk of committed regions (type, protection, `GetMappedFileName`), `PROCESS_MEMORY_COUNTERS_EX2` | `/proc/<pid>/smaps` | refused: another process's regions need its task port (debuggers only) |
-| threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`), no wakes: no public per-thread switch count exists (`thread_info`, `PROC_PIDTHREADINFO` and `PROC_PIDTHREADCOUNTS` carry CPU time, scheduling state, cycles and energy; `getrusage` switches are the caller's own); the kernel's scheduler trace (kdebug through `ktrace`) has them for root only, not built |
+| threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`: any same-user process, no permission; `task_threads` would need `task_for_pid`, which is root's), no wakes: no public per-thread switch count exists (`thread_info`, `PROC_PIDTHREADINFO` and `PROC_PIDTHREADCOUNTS` carry CPU time, scheduling state, cycles and energy; `getrusage` switches are the caller's own); the kernel's scheduler trace (kdebug through `ktrace`) has them for root only, not built |
 | per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
 | topology, pinning | `GetLogicalProcessorInformationEx` (L3 per CCD); process affinity | sysfs cache (`index*/level` 3, `shared_cpu_list`); `sched_setaffinity` on every thread of strobe, inherited by children | no L3 groups (Apple Silicon); P and E cores named in the CPU line (`hw.perflevel*`); no affinity API: unpinned |
 | GPU engines per process (`gpu.process.3d`) | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM client statistics (`/proc/<pid>/fdinfo` of each `/dev/dri` file: `drm-engine-*` busy ns, engines mapped to Windows' types: gfx/render → 3D); a process with a GPU device open but no statistics (NVIDIA's proprietary driver, virtual GPUs) is unreadable, not 0 | IORegistry: each GPU client (`IOAccelerator` child) has its creator pid and `AppUsage.accumulatedGPUTime`; no permission. One engine: 3D |
@@ -2802,6 +2854,24 @@ no Screen Recording, `--check` smoke runs, values noisy and not compared):
   `input.rate` 58.5/s at 60 Hz with `input.gap.p95` 70 to 75 ms, and the recording presented 2
   frames over the drag (the window likely occluded): not diagnosed.
 
+Ergonomics batch 4 (2026-11-05, adais, session locked; `--check` smoke runs, values noisy and not
+compared): what was on screen per block, `expect` and `WrongScreen`, `ScreenChanged` (§10.1, §10.2,
+§9.6); `look` (§5.12); the build id both binaries carry (§5.10), the daemon following an update once
+its bench ends; `--target` globs; `--check` keeping the slot between its blocks; every declared
+metric in a `--check` line (value, refusal or none); `act(setValue)` without a value is a usage
+error; `record pid:` lists its six busiest threads by CPU (on macOS from `proc_pidinfo`, no
+permission); macOS window sizes in pixels on the window's own display (a 980 × 760 point window
+read 490 × 380 on a Retina display); a covered macOS window names the apps in front of it; a
+windowed native `--check` or `record --bench` block that meets a hidden window on an unlocked screen
+waits and retries as bench blocks do (it failed at once: such series may run locked under
+`--check`, which took another path). Checked on Character Map (`scripts/dev`): titles and a
+thumbnail read before and after the runs, `expect: { title }` passed, `{ heading: /Welcome/ }` and
+`{ visible }` on a missing key refused `WrongScreen` naming what showed; a page's `look` printed its
+headings, console messages and an uncaught error with where; the PR line and the viewer's row from
+an injected result. Not run: macOS and Linux reads (titles from CoreGraphics need Screen Recording;
+the tree reads through AX and AT-SPI), a live A/B with `ScreenChanged`, the daemon's restart after
+an update.
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).
@@ -2835,7 +2905,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
   removes that PATH entry. Autostart is the HKCU `Run` key (not Task Scheduler). `up` restarts a
   daemon running another build (`/health` reports a hash of the daemon's executable, taken at its
-  start) unless that daemon is mid-bench. Bun is required for bench files. `up` prints each step to
+  start; now the build id both binaries carry, §5.10) unless that daemon is mid-bench. Bun is required for bench files. `up` prints each step to
   stderr as it finishes and returns one summary line. It starts the daemon detached (no console, no
   inherited handles, its own process group, its install folder as working directory, out of the
   caller's job where the job allows it) and makes its own standard handles non-inheritable first: a

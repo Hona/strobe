@@ -37,6 +37,8 @@ const SWITCHES: &[&str] = &[
     "no-confirm",
     "schedules",
     "again",
+    "headed",
+    "full",
 ];
 
 #[derive(Clone)]
@@ -185,6 +187,9 @@ Use
   track --confirm [<ser_…|chg_…>] confirm suspected changes (or one again)
   history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits
                                   (query history|changes, query <ser_…> history|changes; report history <ser_…|file>)
+  look <url|file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000] [--full] [--headed]
+                                  a page in a headless browser, nothing measured: title, address, headings, visible text,
+                                  console messages and uncaught errors, and a screenshot (exit 124 when it never loads)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,

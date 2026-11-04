@@ -49,7 +49,11 @@ pub fn run(args: &Args) -> Result<Output> {
         let reported = Command::new(&new).arg("--version").stdin(Stdio::null()).output().ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
         let Some(reported) = reported else { return Err(Error::msg(format!("{} does not run (strobe --version failed)", new.display()))) };
         let current = Command::new(&installed).arg("--version").stdin(Stdio::null()).output().ok().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
-        let same = sha256(&installed).ok().is_some_and(|a| sha256(&new).ok().as_ref() == Some(&a));
+        // One build id is one build (its sources, target and profile); copies without one compare bytes.
+        let same = match (super::mcp::file_build(&installed), super::mcp::file_build(&new)) {
+            (Some(a), Some(b)) => a == b,
+            _ => sha256(&installed).ok().is_some_and(|a| sha256(&new).ok().as_ref() == Some(&a)),
+        };
         if args.has("check") {
             let text = if same { format!("up to date: {current}") } else { format!("installed {}; available {reported}{}", if current.is_empty() { "nothing".into() } else { current.clone() }, version.as_deref().map(|v| format!(" (npm {v})")).unwrap_or_default()) };
             return Ok(Output::new(text, json!({ "installed": current, "available": reported, "current": same })));
@@ -60,7 +64,8 @@ pub fn run(args: &Args) -> Result<Output> {
         // The latest release over a newer copy (a local build from main that others' sessions use) is a
         // downgrade nobody asked for: an explicit version, `--from` or `--force` says so.
         let semver = |s: &str| -> Option<(u64, u64, u64)> {
-            let v = s.split_whitespace().last()?.split(['-', '+']).next()?;
+            // `strobe 0.6.0 (a1b2c3d4e5, build …)`: the version is the second word.
+            let v = s.split_whitespace().nth(1)?.split(['-', '+']).next()?;
             let mut p = v.split('.').map(|x| x.parse::<u64>().ok());
             Some((p.next()??, p.next()??, p.next()??))
         };
@@ -68,11 +73,11 @@ pub fn run(args: &Args) -> Result<Output> {
             && let (Some(a), Some(b)) = (semver(&current), semver(&reported))
             && a >= b
         {
-            let what = if a > b { format!("{current} is newer than npm's {reported}") } else { format!("{current} is a local build, not npm's {reported}") };
+            let what = if a > b { format!("{current} is newer than npm's {reported}") } else { format!("{current} is another build than npm's {reported}") };
             return Err(Error::usage(format!("the installed copy at {}: {what}; strobe update keeps it (another session may use it)", installed.display()))
                 .hint(format!("strobe update --force replaces it with npm's {reported}; strobe update <version> installs that version")));
         }
-        super::progress(format!("strobe update: {} → {reported}", if current.is_empty() { "not installed" } else { current.as_str() }));
+        super::progress(format!("installing {reported} over {}", if current.is_empty() { "nothing" } else { current.as_str() }));
         // This build swaps the files (whatever the new build's own install does, a running strobe
         // is renamed aside, never overwritten) and stops the daemon, so the new build's `up` starts
         // its own.
@@ -81,7 +86,7 @@ pub fn run(args: &Args) -> Result<Output> {
         super::up::replace_binaries(&source, &dir)?;
         if super::mcp::running() {
             if super::up::daemon_benching() {
-                super::progress("  the daemon keeps the previous build until its bench finishes; run strobe up then");
+                super::progress("  the daemon keeps the previous build until its bench finishes, then restarts as this one by itself");
             } else {
                 let _ = super::up::quit_daemon();
                 for _ in 0..30 {

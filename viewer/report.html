@@ -338,6 +338,11 @@ header.topbar {
 .status-pill.warn { background: var(--warn-bg); border-color: var(--warn-border); color: var(--warn-ink); }
 
 .eyebrow-meta { font: 500 12px/18px var(--sans); letter-spacing: 0.02em; text-transform: uppercase; color: var(--ink-3); }
+.shown-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font: 400 12px/16px var(--sans); color: var(--ink-2); }
+.shown-row.warn { color: var(--warn-ink); }
+.shown-side { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.shown-thumb { width: 96px; height: auto; border: 1px solid var(--border); display: block; }
+.shown-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
 
 .hero-headline {
   font: 650 34px/42px var(--display);
@@ -2163,6 +2168,26 @@ function buildHeroProse(r, s, c, cl, aa) {
   );
 }
 
+// What each build showed on screen in its blocks (result.json `series[].shown`), with a thumbnail of
+// its first block: a bench measured on the wrong screen shows here, and `changed` marks base and head apart.
+function renderShown(s) {
+  const sh = s?.shown;
+  if (!sh) return null;
+  const roles = ["base", "head"].filter((r) => sh[r] && (sh[r].end || sh[r].thumb));
+  if (!roles.length) return null;
+  const text = (v) => !v.end ? "nothing read" : v.start && v.start !== v.end ? `'${v.start}' → '${v.end}'` : `'${v.end}'`;
+  return h("div", { class: `shown-row${sh.changed ? " warn" : ""}`, title: sh.changed ? "Base and head showed different screens (ScreenChanged)" : "What each build showed on screen" },
+    roles.map((role) => {
+      const v = sh[role];
+      const others = (v.others || []).map((o) => `${o.blocks} on '${o.label}'`).join(", ");
+      return h("div", { class: "shown-side" },
+        v.thumb ? h("img", { class: "shown-thumb", src: v.thumb, alt: `${role} screen` }) : null,
+        h("span", { class: "shown-label", title: others ? `other blocks: ${others}` : text(v) }, `On screen · ${capFirst(role)}: ${text(v)}${others ? ` (+${others})` : ""}`)
+      );
+    })
+  );
+}
+
 function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
   const c = s.primary || {};
   const m = c.metric || "?";
@@ -2204,7 +2229,8 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
           h("span", { class: "eyebrow-meta" }, `${s.label || s.case || "Benchmark"} · Primary: ${labelOf(m)}`)
         ),
         h("h1", { class: "hero-headline" }, headline),
-        buildHeroProse(r, s, c, cl, aa)
+        buildHeroProse(r, s, c, cl, aa),
+        renderShown(s)
       ),
       h("div", { class: "hero-metrics-grid" },
         h("div", { style: "min-width:0" },

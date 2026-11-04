@@ -360,7 +360,9 @@ impl<'a> Doc<'a> {
         let mut out = String::new();
         for s in &self.series {
             let (head, caption) = self.sentence(s);
-            out += &format!("**{}:** {head}\n{caption}\n\n", cell(s["label"].as_str().unwrap_or("")));
+            // What each build showed on screen (`bench::shown_line`), so a reader sees what was measured.
+            let screen = super::bench::shown_line(s).map(|l| format!("\nOn screen: {}.", cell(&l))).unwrap_or_default();
+            out += &format!("**{}:** {head}\n{caption}{screen}\n\n", cell(s["label"].as_str().unwrap_or("")));
         }
         let (alert, note) = self.top_note();
         if let Some((kind, text)) = alert {
@@ -495,6 +497,8 @@ impl<'a> Doc<'a> {
             Some(("CAUTION", "Two identical builds came out different: this setup is not stable enough to trust a verdict yet.".to_string()))
         } else if warn("SessionLocked") {
             Some(("CAUTION", "Some pairs ran with the screen locked and some unlocked, so nothing was decided.".to_string()))
+        } else if warn("ScreenChanged") {
+            Some(("CAUTION", "The blocks did not all show the same screen (see On screen), so part of the difference may be what was on screen, not the change.".to_string()))
         } else if has("NotSteady") || has("StateDrift") {
             let which: Vec<String> =
                 self.series.iter().filter(|s| has_warning(s, "NotSteady") || has_warning(s, "StateDrift")).map(|s| format!("**{}**", cell(s["label"].as_str().unwrap_or("")))).collect();
@@ -1414,6 +1418,7 @@ fn warning_name(id: &str) -> &str {
         "BackgroundPriority" => "Background priority",
         "StaleCalibration" => "Stale calibration",
         "VariantChanged" => "Variant changed",
+        "ScreenChanged" => "Different screens",
         other => other,
     }
 }

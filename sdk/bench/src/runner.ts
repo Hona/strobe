@@ -137,6 +137,7 @@ function describe() {
         targets: c.targets,
         timeout: c.timeout,
         noworse: c.noworse,
+        expect: c.expect && plain(c.expect),
         launch: c.launch && {
           ...plain(c.launch),
           milestones: Object.fromEntries(

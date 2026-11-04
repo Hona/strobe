@@ -657,6 +657,7 @@ struct Win {
     bounds: CGRect,
     onscreen: bool,
     alpha: f64,
+    owner: String,
 }
 
 const LIST_ALL: u32 = 0;
@@ -678,6 +679,7 @@ fn windows(option: u32, relative: u32) -> Vec<Win> {
                 bounds,
                 onscreen: cf_i64(cf_get(d, "kCGWindowIsOnscreen")) == Some(1),
                 alpha: cf_f64(cf_get(d, "kCGWindowAlpha")).unwrap_or(1.0),
+                owner: cf_string(cf_get(d, "kCGWindowOwnerName")).unwrap_or_default(),
             })
         })
         .collect()
@@ -702,16 +704,36 @@ fn covered(w: &Win) -> f64 {
     hit as f64 / 256.0
 }
 
-/// Rects are in points (global display coordinates), not pixels; `dpi` is 96 × the display's
-/// backing scale. The client size is the whole frame: CoreGraphics does not separate the title bar.
+/// The apps whose normal windows in front of window `id` overlap it, front first (kCGWindowOwnerName
+/// needs no permission): what keeps a covered window covered.
+pub fn covering(id: isize) -> Vec<String> {
+    let all = windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0);
+    let Some(w) = all.iter().find(|w| w.id == id as u32) else { return Vec::new() };
+    let b = w.bounds;
+    let mut out: Vec<String> = Vec::new();
+    for o in all.iter().take_while(|o| o.id != w.id).filter(|o| o.layer == 0 && o.alpha > 0.0 && o.pid != w.pid) {
+        let ob = o.bounds;
+        let overlaps = ob.origin.x < b.origin.x + b.size.width && b.origin.x < ob.origin.x + ob.size.width && ob.origin.y < b.origin.y + b.size.height && b.origin.y < ob.origin.y + ob.size.height;
+        let name = if o.owner.is_empty() { format!("process {}", o.pid) } else { o.owner.clone() };
+        if overlaps && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
+/// Rects are in points (global display coordinates), not pixels; `dpi` is 96 × the backing scale of
+/// the display the window is on. The client size is in physical pixels, as on the other OSes (it was
+/// points, so a 980 × 760 point window on a Retina display read as 490 × 380 once divided by its
+/// scale), and is the whole frame: CoreGraphics does not separate the title bar.
 fn top_window(w: &Win) -> super::TopWindow {
     let b = w.bounds;
-    let scale = scale_at(b.origin);
+    let scale = scale_at(CGPoint { x: b.origin.x + b.size.width / 2.0, y: b.origin.y + b.size.height / 2.0 });
     super::TopWindow {
         hwnd: w.id as isize,
         pid: w.pid,
         rect: (b.origin.x as i32, b.origin.y as i32, b.size.width as i32, b.size.height as i32),
-        client: (b.size.width as i32, b.size.height as i32),
+        client: ((b.size.width * scale).round() as i32, (b.size.height * scale).round() as i32),
         visible: w.onscreen && w.alpha > 0.0,
         // Without the Accessibility permission a minimized window and one on another Space look alike: off screen.
         iconic: !w.onscreen,

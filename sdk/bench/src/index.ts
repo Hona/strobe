@@ -211,6 +211,24 @@ interface CaseBase {
   targets?: string[]
   /** Non-inferiority: "is head at most this much worse?" instead of "did it change?". `"2%"` for the primary, or margins per metric (`{ "cpu.wakes": "5%" }`). Verdicts `no worse (≤2%)`, `worse (>2%)`, `unclear`. `--noworse` overrides. */
   noworse?: string | number | Record<string, string | number>
+  /** What each block must show (over its target's `expect`); a block on another screen is refused `WrongScreen` instead of timed. */
+  expect?: Expect
+}
+
+/**
+ * The screen a block must show, read before its runs and after them (never inside one). Strings match
+ * as substrings. Without it strobe still records what each block showed and warns `ScreenChanged`
+ * when base and head (or some blocks) showed different screens.
+ */
+export interface Expect {
+  /** A window title of the app (any visible window), or the page's title. */
+  title?: string | RegExp
+  /** An open dialog or a heading in the accessibility tree (a page's `h1`/`h2` or dialog). */
+  heading?: string | RegExp
+  /** A page's address. */
+  url?: string | RegExp
+  /** Elements that must be visible: accessibility selectors for a native app, CSS selectors for a page. */
+  visible?: Element | Element[]
 }
 
 /** A case of runs inside an open target: measured `run`, unmeasured `reset`. */
@@ -240,13 +258,15 @@ interface Hooks<P> {
   prepare?: (ctx: PrepareContext<P>) => unknown
   /** When the block closes, for what `prepare` started (a server, a temporary folder). */
   teardown?: (ctx: PrepareContext<P>) => unknown
+  /** What every block of this target must show (a case's `expect` adds to it). */
+  expect?: Expect
 }
 
 export type Target<P> =
   | ({ kind: "web"; url: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P>)
   | ({ kind: "url"; href: string; viewport?: Viewport; scale?: number } & Hooks<P>)
-  | { kind: "app"; id: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache }
-  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache }
+  | { kind: "app"; id: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect }
+  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect }
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
   | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
@@ -315,6 +335,8 @@ export interface NativeOptions {
    * run while the session is locked.
    */
   window?: false
+  /** What every block of this target must show (a case's `expect` adds to it). */
+  expect?: Expect
 }
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
@@ -341,9 +363,14 @@ export interface Bench<Params extends Record<string, ParamValues>> {
   cases: Record<string, Case<Values<Params>>>
 }
 
-/** The project's production build, served per variant from `strobe.json`, in a strobe-launched Chromium. */
+/**
+ * The project's production build, served per variant from `strobe.json`, in a strobe-launched Chromium.
+ * A page needs no `gpuCache` choice: each block gets a fresh browser profile (a cold first visit for the
+ * page's own caches) whose warmup runs fill Chromium's GPU caches before the measured runs, and the GPU
+ * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
+ */
 export function web<P = any>(opts: { url?: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P> = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale }
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */
@@ -352,12 +379,12 @@ export function url<P = any>(href: string, opts: { viewport?: Viewport; scale?: 
 }
 
 /** An installed Electron app, by its profile in strobe.json `apps`, in a fresh isolated home seeded from `home`. */
-export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport; gpuCache?: GpuCache } = {}): Target<P> {
+export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect } = {}): Target<P> {
   return { kind: "app", id, ...opts }
 }
 
 /** A packaged Electron app by path; `app` borrows a profile from strobe.json `apps` for it. */
-export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache } = {}): Target<P> {
+export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect } = {}): Target<P> {
   return { kind: "exe", path, ...opts }
 }
 

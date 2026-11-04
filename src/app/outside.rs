@@ -125,6 +125,10 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         values.insert("ui.wakes".into(), t.switches as f64 / (ms / 1e3));
     }
     let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
+    // The busiest threads by CPU, for the summary: per-thread CPU needs no permission on any OS.
+    let mut busy: Vec<&wakes::ThreadSpan> = span.threads.iter().filter(|t| t.tid != 0 && t.cpu_ms.is_some_and(|c| c > 0.0)).collect();
+    busy.sort_by(|a, b| b.cpu_ms.unwrap_or(0.0).total_cmp(&a.cpu_ms.unwrap_or(0.0)));
+    let threads_top: Vec<Value> = busy.iter().take(6).map(|t| json!({ "tid": t.tid, "pid": t.pid, "name": names.get(&t.tid), "cpu_ms": t.cpu_ms })).collect();
     let spans = std::slice::from_ref(&span);
     store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(spans, &names, &wakes::modules(spans))))?;
     store::write_json(&dir.join("runs.json"), &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]))?;
@@ -175,7 +179,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
         "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,
         "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true, "screen": screen,
-        "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })),
+        "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })), "threads_top": threads_top,
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
     Ok(Output::new(super::record::summary_text(&meta), meta))
@@ -227,6 +231,15 @@ pub fn text(meta: &Value) -> String {
     }
     if get("ui.cpu").is_finite() {
         s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
+    }
+    for (i, t) in meta["threads_top"].as_array().into_iter().flatten().enumerate() {
+        s += &format!(
+            "{}{} {}  {}\n",
+            if i == 0 { "threads  " } else { "         " },
+            fmt::pad(&fmt::value(t["cpu_ms"].as_f64().unwrap_or(f64::NAN), "ms"), 10),
+            t["name"].as_str().map(str::to_string).unwrap_or_else(|| format!("thread {}", t["tid"])),
+            if t["pid"] != meta["pid"] { format!("(pid {})", t["pid"]) } else { String::new() }
+        );
     }
     s += &super::record::memory_lines(v);
     s += &format!(

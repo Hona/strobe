@@ -249,17 +249,40 @@ pub fn port() -> u16 {
 pub fn daemon(_args: &Args) -> Result<()> {
     let port = port();
     let token = token()?;
-    // Hashed now: `up` renames this executable aside when it installs a new build.
-    let _ = build_id();
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| Error::msg(format!("port {port} is taken ({e}); is a strobe daemon already running?")))?;
     let log = paths::state_dir().join("log");
     let _ = std::fs::create_dir_all(&log);
     unsafe { std::env::set_var("STROBE_QUIET", "1") };
     // Tracked branches (`strobe track --schedule`): checked once a minute.
     std::thread::spawn(super::track::daemon_loop);
+    std::thread::spawn(follow_installed);
     let handler: Arc<dyn Fn(http::Request) -> http::Response + Send + Sync> = Arc::new(move |req: http::Request| serve(req, port, &token));
     http::serve(listener, handler);
     Ok(())
+}
+
+/// An installed daemon whose copy `strobe update` replaced while it ran a bench (the update left it
+/// for its bench, and said to run `strobe up` later): once no bench runs in it, the installed build's
+/// own `up` restarts the daemon as that build. Checked once a minute; a daemon run from elsewhere (a
+/// build folder) is left alone.
+fn follow_installed() {
+    let dir = super::up::install_dir();
+    let mine = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+    if mine.as_deref().and_then(|d| std::fs::canonicalize(d).ok()) != std::fs::canonicalize(&dir).ok() {
+        return;
+    }
+    let name = |n: &str| if cfg!(windows) { format!("{n}.exe") } else { n.to_string() };
+    loop {
+        std::thread::sleep(Duration::from_secs(60));
+        let daemon = if dir.join(name("strobew")).is_file() { dir.join(name("strobew")) } else { dir.join(name("strobe")) };
+        let Some(installed) = file_build(&daemon) else { continue };
+        if installed == build_id() || super::up::daemon_benching() {
+            continue;
+        }
+        if super::up::spawn_detached(&dir.join(name("strobe")), &["up", "--skip", "deep,mcp,calibrate"]).is_ok() {
+            return;
+        }
+    }
 }
 
 fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
@@ -317,11 +340,32 @@ fn report_html(handle: &str) -> Result<String> {
     Ok(super::report::html(view, &data))
 }
 
-/// This process's executable, hashed once: `up` restarts a daemon whose build is not the installed one
-/// (one version number covers many builds).
+/// This build's identity, stamped by `build.rs` from its sources, target and profile: the same in
+/// `strobe` and `strobew`, so any command can ask whether the daemon is this build. `up` restarts a
+/// daemon whose build is not the installed one (one version number covers many builds). Kept in the
+/// executable behind a marker, so `file_build` reads it from an installed copy without running it.
+#[used]
+static BUILD_MARK: &str = concat!("strobe-build-id:", env!("STROBE_BUILD_ID"));
+
+const MARK_PREFIX: &str = "strobe-build-id:";
+
 pub fn build_id() -> &'static str {
-    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    ID.get_or_init(|| std::env::current_exe().map(|p| file_id(&p)).unwrap_or_default())
+    &BUILD_MARK[MARK_PREFIX.len()..]
+}
+
+/// The build id stamped in an executable, when it has one (builds before the id had none).
+pub fn file_build(path: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    let needle = MARK_PREFIX.as_bytes();
+    let mut at = 0;
+    while let Some(i) = bytes[at..].windows(needle.len()).position(|w| w == needle) {
+        let start = at + i + needle.len();
+        if let Some(id) = bytes.get(start..start + 16).filter(|id| id.iter().all(u8::is_ascii_hexdigit)) {
+            return Some(String::from_utf8_lossy(id).to_string());
+        }
+        at = start;
+    }
+    None
 }
 
 pub fn file_id(path: &std::path::Path) -> String {

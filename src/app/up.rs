@@ -215,10 +215,11 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     host::win::set_user_value(RUN_KEY, "strobe", Some(&format!("\"{}\" daemon", daemon_exe.display())), false);
     let _ = RUN_KEY;
     // The daemon runs MCP calls in its own process: a new build only counts once it restarts.
-    let stale = mcp::running() && (updated || mcp::daemon_build().is_some_and(|b| b != mcp::file_id(&daemon_exe)));
+    let installed = mcp::file_build(&daemon_exe).unwrap_or_else(|| mcp::file_id(&daemon_exe));
+    let stale = mcp::running() && (updated || mcp::daemon_build().is_some_and(|b| b != installed));
     if stale {
         if daemon_benching() {
-            s.line("!", "daemon", "keeps the previous build until its bench finishes; run strobe up again then");
+            s.line("i", "daemon", "keeps the previous build until its bench finishes, then restarts as this one by itself (within a minute)");
             return Ok(());
         }
         let _ = quit_daemon();
@@ -246,7 +247,7 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     Ok(())
 }
 
-fn spawn_detached(exe: &Path, args: &[&str]) -> Result<()> {
+pub(super) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<()> {
     #[cfg(windows)]
     {
         host::win::spawn_detached(exe, args).map_err(|e| Error::msg(format!("start {}: {e}", exe.display())))?;

@@ -27,7 +27,10 @@ mod launch;
 mod native;
 pub mod plan;
 mod script;
+mod shown;
 pub mod slot;
+
+pub use shown::shown_line;
 
 /// Secondaries that get tested (Holm across these only). Fewer tests keep the correction reachable.
 const DEFAULT_SECONDARIES: &[&str] = &["frames.interval.p95", "frames.dropped.pct", "main.busy", "interaction.p95", "cpu.app.total"];
@@ -116,6 +119,9 @@ struct Series {
     /// Non-inferiority margins by metric (`--noworse`, the case's `noworse`): these metrics answer "is
     /// head at most this much worse?" instead of "did it change?" (SPEC §9.3).
     noworse: BTreeMap<String, f64>,
+    /// What the block must show (`expect`: the target's, with the case's keys over it): a block on
+    /// another screen is refused `WrongScreen`.
+    expect: Value,
 }
 
 impl Series {
@@ -374,6 +380,9 @@ struct Block {
     /// the sweep's own CPU (% of one core).
     #[serde(skip_serializing_if = "Option::is_none")]
     reserve: Option<Value>,
+    /// What the window or page showed before the runs and after them (`shown`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    shown: Option<shown::Shown>,
 }
 
 struct Ctx<'a> {
@@ -433,6 +442,9 @@ struct Ctx<'a> {
     saved: Value,
     /// Per series, the planned time of the series after it (ms), for the ETA (`plan`).
     eta_after: BTreeMap<String, f64>,
+    /// Per series, variant and moment, the first block's screen and hash: a thumbnail is kept for it
+    /// and for blocks that showed something else (`shown`).
+    shown_seen: BTreeMap<String, (String, Option<u64>)>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -600,7 +612,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
     let _own = OwnAffinity(runner_pin.and_then(host::set_affinity));
-    progress(format!("strobe bench {} · {exp}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default()));
+    progress(format!("strobe bench {} · {exp} · {}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(), super::pr::version()));
     let busy = host::system_busy(1000);
     isolate::prune_gpu_caches();
     let runner = Runner::spawn(&file, dir.join("runner.log"), runner_pin)?;
@@ -648,6 +660,7 @@ pub fn run(args: &Args) -> Result<Output> {
         target_qos: None,
         saved: RESUMED.with(|r| r.borrow_mut().take()).unwrap_or_else(|| json!({ "args": args.to_json(), "series": {} })),
         eta_after: BTreeMap::new(),
+        shown_seen: BTreeMap::new(),
     };
     // A stop asked of an earlier run of this experiment (or a Ctrl-C a daemon saw for another) is not this one's.
     let _ = std::fs::remove_file(dir.join("stop"));
@@ -919,9 +932,12 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         .ok()
         .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
         .unwrap_or_default();
-    let (passed, error, hint, values, refused, locked, recording, screen) = match r {
-        Ok(b) => (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked, json!(b.recording), b.screen.unwrap_or(Value::Null)),
-        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null),
+    let (passed, error, hint, values, refused, locked, recording, screen, shown) = match r {
+        Ok(b) => {
+            let shown = shown::summarize(std::slice::from_ref(&b)).0;
+            (true, Value::Null, Value::Null, json!(b.values), json!(b.refused), b.locked, json!(b.recording), b.screen.unwrap_or(Value::Null), shown)
+        }
+        Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
@@ -954,7 +970,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
-        "recording": recording, "screen": screen,
+        "recording": recording, "screen": screen, "shown": shown,
         "log": log, "log_path": ctx.runner.log,
     }))
 }
@@ -973,7 +989,14 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         // A launch's milestones too, declared or not: when each line or pixel change came.
         let declared: Vec<&str> = s["declared"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         let milestones = s["values"].as_object().into_iter().flatten().map(|(k, _)| k.as_str()).filter(|k| k.starts_with("launch.") && !declared.contains(k));
-        let value = declared.iter().copied().chain(milestones).filter_map(shown).collect::<Vec<_>>().join(" · ");
+        // Every declared metric, with its value, its refusal, or that it got none: a metric left out
+        // read as measured and fine.
+        let value = declared
+            .iter()
+            .map(|n| shown(n).unwrap_or_else(|| format!("{n} no value (nothing in this block measured it)")))
+            .chain(milestones.filter_map(shown))
+            .collect::<Vec<_>>()
+            .join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
@@ -982,6 +1005,15 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
             if let Some(line) = screen_line(&s["screen"]) {
                 text += &format!("      screen  {line}\n");
+            }
+            let missing: Vec<&str> = s["shown"]["head"]["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|m| !m.contains("before the runs")).collect();
+            match shown_line(s) {
+                Some(line) => text += &format!("      shown  {line}{}\n", if missing.is_empty() { String::new() } else { format!(" (not read: {})", missing.join("; ")) }),
+                None if !missing.is_empty() => text += &format!("      shown  nothing read: {}\n", missing.join("; ")),
+                None => {}
+            }
+            if let Some(p) = s["shown"]["head"]["thumb_path"].as_str() {
+                text += &format!("      thumb  {p}\n");
             }
             if let Some(rec) = s["attribution"].as_str() {
                 text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
@@ -1437,6 +1469,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     let mut warnings: Vec<Warning> = Vec::new();
     analyse(s, def, &blocks, &pairs, &mut warnings);
+    let (shown, screen_warnings) = shown::summarize(&blocks);
+    warnings.extend(screen_warnings);
     // A number from a locked screen is not comparable with one from an unlocked screen: pairs that
     // ran in both states decide nothing.
     let locked_pairs = pairs.iter().filter(|&&(a, _)| blocks[a].locked).count();
@@ -1537,7 +1571,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
-        "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings,
+        "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
 }
@@ -1912,6 +1946,9 @@ const HIDDEN_RETRIES: u32 = 5;
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
     // A series that needs no presenting window runs through a lock, in one lock state per block.
     let mut retries = 0;
+    // A series that may run locked but met a hidden window on an unlocked screen (a `--check` or
+    // `record --bench` of a windowed native case): it waits and retries as on-screen blocks do.
+    let mut hidden_unlocked = false;
     if runs_locked(ctx, s, set) {
         loop {
             let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
@@ -1924,6 +1961,10 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             let steady = start == end && if start { ctx.awake.unlocks() == unlocks } else { ctx.awake.locks() == locks };
             // The display turned off (or on) during the block: it ran in two machine states.
             let lit = display.is_none_or(|(_, n)| host::display_state().is_some_and(|(_, m)| m == n));
+            if steady && lit && !start && r.as_ref().err().is_some_and(|e| e.message.starts_with("WindowHidden")) {
+                hidden_unlocked = true;
+                break;
+            }
             if steady && lit {
                 return r.map(|mut b| {
                     b.display = display.map(|d| d.0);
@@ -2011,7 +2052,14 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             continue;
         }
         if ctx.awake.locks() == before && !host::session_locked() {
-            return r;
+            return if hidden_unlocked {
+                r.map(|mut b| {
+                    b.display = host::display_state().map(|d| d.0);
+                    session_state(s, b, false)
+                })
+            } else {
+                r
+            };
         }
         if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
             let _ = std::fs::remove_dir_all(dir);
@@ -2047,7 +2095,7 @@ fn retry_launch(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>, retri
 /// keep-awake. Kept from one block to the next until the bench waits, builds, or another bench
 /// queues (`release_machine`).
 fn hold_machine(ctx: &mut Ctx, what: &str) -> Result<()> {
-    if ctx.slot.is_some() && slot::others_queued(&ctx.exp) {
+    if ctx.slot.is_some() && !ctx.check && slot::others_queued(&ctx.exp) {
         release_machine(ctx);
     }
     match ctx.slot {
@@ -2091,7 +2139,9 @@ fn release_machine(ctx: &mut Ctx) {
 fn in_slot<T>(ctx: &mut Ctx, what: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) -> Result<T> {
     hold_machine(ctx, what)?;
     let r = f(ctx);
-    if slot::others_queued(&ctx.exp) {
+    // A `--check` keeps the slot from one short untimed block to the next (its builds and waits still
+    // hand it over): taking turns per block made a 9-case check take 25 minutes beside a long bench.
+    if !ctx.check && slot::others_queued(&ctx.exp) {
         release_machine(ctx);
     } else {
         ctx.reg.set("between", "between blocks; holds the slot until the next one or a wait");
@@ -2436,6 +2486,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
         }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        let start = shown::page(ctx, s, v, pair, "start", &page);
+        shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
         lap("setup");
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
@@ -2703,6 +2755,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             }
             lap("heap");
         }
+        // What the page showed after the runs, once the trace and profilers have stopped.
+        let end = shown::page(ctx, s, v, pair, "end", &page);
+        shown::expect(&s.expect, &end, "after the runs", true, &|sel| shown::page_shows(&page, sel))?;
         if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
             && !ctx.warnings.iter().any(|w| w.id == "Teardown")
         {
@@ -2860,6 +2915,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             display: None,
             screen: Some(screen),
             reserve: None,
+            shown: Some(shown::Shown { start, end }),
         })
     })();
     lapped.set(Instant::now());
@@ -3082,7 +3138,8 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
         // A case may name the targets it runs on; by default it runs on every target.
         let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
         for target in targets.keys() {
-            if only_target.is_some_and(|t| t != target) || on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) {
+            // `--target`: target names as `--filter` takes cases (comma-separated, globs with *).
+            if only_target.is_some_and(|t| !case_matches(t, target)) || on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) {
                 continue;
             }
             let primary = args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string());
@@ -3091,8 +3148,15 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
             if let Some(flag) = args.get("noworse") {
                 noworse.extend(margins(&json!(flag), &primary).map_err(|e| Error::usage(format!("--noworse: {e}")))?);
             }
+            let mut expect = targets[target]["expect"].clone();
+            if let (Some(t), Some(c)) = (expect.as_object_mut(), c["expect"].as_object()) {
+                t.extend(c.clone());
+            } else if c["expect"].is_object() {
+                expect = c["expect"].clone();
+            }
             for p in &combos {
                 out.push(Series {
+                    expect: expect.clone(),
                     case: case.clone(),
                     target: target.clone(),
                     params: p.clone(),
@@ -3836,7 +3900,11 @@ fn render(r: &Value) -> String {
         };
         out += &format!("blocks {} pairs ({} fresh launches) · {per_block} · stopped: {}\n", s["pairs"], s["launches"], s["stopped"].as_str().unwrap_or(""));
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
-        out += &format!("time   {} · per block {}\n\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
+        out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
+        if let Some(line) = shown_line(&s) {
+            out += &format!("shown  {line}{}\n", if s["shown"]["changed"] == true { "  ! different screens (ScreenChanged)" } else { "" });
+        }
+        out.push('\n');
         out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
         let mut rows = vec![(true, s["primary"].clone())];
         rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));

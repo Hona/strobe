@@ -323,6 +323,49 @@ mod imp {
             }
         }
 
+        /// What the app's windows show: their names, then their visible open dialogs' and headings'
+        /// names in tree order (at most 6). A provider that answers first with a placeholder root
+        /// (lazy, such as AccessKit's) gets up to `t` to build its tree.
+        pub fn screen(&self, t: Duration) -> Result<(Vec<String>, Vec<String>)> {
+            let deadline = Instant::now() + t;
+            let mut seen = self.a11y.changes().count;
+            let mut tree = self.snapshot(None)?;
+            while tree.nodes.len() <= tree.windows.len() && Instant::now() < deadline {
+                self.a11y.wait_change(seen, deadline);
+                seen = self.a11y.changes().count;
+                tree = self.snapshot(None)?;
+            }
+            let text = |i: usize| {
+                let n = &tree.nodes[i];
+                let s = if n.name.trim().is_empty() { n.value.clone().unwrap_or_default() } else { n.name.clone() };
+                s.split_whitespace().collect::<Vec<_>>().join(" ")
+            };
+            let names: Vec<String> = (0..tree.nodes.len()).filter(|&i| tree.nodes[i].parent.is_none()).map(text).filter(|s| !s.is_empty()).collect();
+            let mut marks: Vec<String> = Vec::new();
+            for dialog in [true, false] {
+                for i in 0..tree.nodes.len() {
+                    let n = &tree.nodes[i];
+                    let wanted = if dialog { n.dialog && n.parent.is_some() } else { n.heading };
+                    if wanted && tree.visible_rect(i).is_some() {
+                        let s = text(i);
+                        if !s.is_empty() && !marks.contains(&s) && marks.len() < 6 {
+                            marks.push(s);
+                        }
+                    }
+                }
+            }
+            Ok((names, marks))
+        }
+
+        /// Whether a selector matches a visible element within `t`.
+        pub fn shows(&self, sel: &Value, t: Duration) -> Result<bool> {
+            match self.find(&Selector::parse(sel)?, None, t) {
+                Ok(_) => Ok(true),
+                Err(e) if e.code == 124 => Ok(false),
+                Err(e) => Err(e),
+            }
+        }
+
         /// Elements in the app's windows now (`StateDrift`).
         pub fn count_elements(&self) -> Result<usize> {
             Ok(self.snapshot(None)?.nodes.len())

@@ -16,6 +16,8 @@ pub mod perf;
 #[cfg(target_os = "macos")]
 pub mod sample;
 pub mod shifts;
+#[cfg(windows)]
+pub mod suspend;
 pub mod symbols;
 pub mod trace;
 pub mod wakes;

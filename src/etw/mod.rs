@@ -269,10 +269,46 @@ impl PresentCapture {
     }
 }
 
-/// A sampled-stack session for a process tree, in the helper (attribution only).
+/// Whether native stacks can be sampled here: the helper (Windows), or without it strobe's own
+/// suspend-and-unwind sampler (Windows x64); perf events (Linux); `sample` (macOS).
+pub fn stacks_available() -> bool {
+    access().helper || cfg!(all(windows, target_arch = "x86_64"))
+}
+
+/// Why a recording has no native stacks.
+pub fn no_stacks() -> &'static str {
+    if cfg!(windows) {
+        "native stacks need the deep helper (strobe up, SPEC §13.4), or an x64 build of strobe to sample them itself"
+    } else if cfg!(target_os = "macos") {
+        "native stacks need /usr/bin/sample"
+    } else {
+        "native stacks need perf_event_paranoid at 2 or less, or CAP_PERFMON"
+    }
+}
+
+/// How samples were taken, when strobe took them itself without the helper (`probe::suspend`).
+pub fn stacks_how(d: &Deep) -> String {
+    match &d.suspend {
+        Some(s) => format!(
+            "; sampled without the deep helper by suspending each busy thread once per {:.0} ms of its CPU ({} threads; each stall {:.0} µs mean, {:.0} µs p99, {:.0} µs max; user frames only{})",
+            d.interval_us / 1e3,
+            s.threads,
+            s.stall_us_mean,
+            s.stall_us_p99,
+            s.stall_us_max,
+            if s.capped > 0 { format!("; {} over the rate cap", s.capped) } else { String::new() }
+        ),
+        None => String::new(),
+    }
+}
+
+/// A sampled-stack session for a process tree (attribution only): the kernel's sampled profile in
+/// the helper, else (Windows) strobe's own sampler, which needs no elevation.
 pub struct StackCapture {
     #[cfg(windows)]
-    client: helper::Client,
+    client: Option<helper::Client>,
+    #[cfg(windows)]
+    suspend: Option<crate::probe::suspend::Capture>,
     #[cfg(target_os = "linux")]
     perf: crate::probe::perf::Capture,
     #[cfg(target_os = "macos")]
@@ -281,11 +317,22 @@ pub struct StackCapture {
 
 impl StackCapture {
     pub fn start(root: u32) -> crate::model::Result<StackCapture> {
+        StackCapture::start_with(root, false)
+    }
+
+    /// `unprivileged`: strobe's own sampler even when the helper is installed (Windows;
+    /// `record pid:… --probes stacks-unprivileged`).
+    pub fn start_with(root: u32, unprivileged: bool) -> crate::model::Result<StackCapture> {
+        #[cfg(not(windows))]
+        let _ = unprivileged;
         #[cfg(windows)]
         {
+            if unprivileged || !access().helper {
+                return Ok(StackCapture { client: None, suspend: Some(crate::probe::suspend::Capture::start(root)?) });
+            }
             let mut client = helper::Client::connect()?;
             client.call(serde_json::json!({ "op": "stacks.start", "root": root }))?;
-            Ok(StackCapture { client })
+            Ok(StackCapture { client: Some(client), suspend: None })
         }
         #[cfg(target_os = "linux")]
         return Ok(StackCapture { perf: crate::probe::perf::Capture::start(root)? });
@@ -297,8 +344,11 @@ impl StackCapture {
     pub fn stop(self) -> crate::model::Result<Deep> {
         #[cfg(windows)]
         {
-            let mut c = self.client;
-            let mut deep: Deep = serde_json::from_value(c.call(serde_json::json!({ "op": "stacks.stop" }))?)?;
+            let mut deep: Deep = match (self.client, self.suspend) {
+                (Some(mut c), _) => serde_json::from_value(c.call(serde_json::json!({ "op": "stacks.stop" }))?)?,
+                (None, Some(s)) => s.stop()?,
+                (None, None) => return Err(crate::model::Error::msg("no stack session")),
+            };
             fill_from_processes(&mut deep);
             Ok(deep)
         }
@@ -390,6 +440,25 @@ pub struct Deep {
     /// Samples left out of `stacks`, by why (macOS: a thread waiting or inside the kernel).
     #[serde(default)]
     pub dropped: std::collections::BTreeMap<String, u64>,
+    /// Sampled from strobe's own process without the helper (`probe::suspend`): what it cost.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub suspend: Option<SuspendStats>,
+}
+
+/// What sampling stacks by suspending threads cost the target (`query hotspots` prints it).
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SuspendStats {
+    pub samples: u64,
+    /// Threads sampled at least once.
+    pub threads: usize,
+    /// Each sample's stall of its thread: from the suspend to the resume (µs).
+    pub stall_us_mean: f64,
+    pub stall_us_p99: f64,
+    pub stall_us_max: f64,
+    /// Samples the rate cap left out.
+    pub capped: u64,
+    /// Threads that could not be opened for sampling (another user's, protected, 32-bit).
+    pub unopened: usize,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

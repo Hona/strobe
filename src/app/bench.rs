@@ -1603,7 +1603,9 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
 
 /// What an attribution block records for this target.
 fn why_text(target: &Value) -> &'static str {
-    if is_native(target) { "OS samples and native stacks (through the deep helper)" } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
+    if is_native(target) {
+        if crate::etw::access().helper || !cfg!(windows) { "OS samples and native stacks" } else { "OS samples and native stacks (sampled without the deep helper: user frames, a short stall per sample)" }
+    } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
 }
 
 /// The view that explains an attribution recording of a target of this kind.

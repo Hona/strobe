@@ -1144,6 +1144,12 @@ pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>, p
         let what = if cfg!(windows) { "no PDB found" } else { "no symbols or DWARF found (a dSYM or an unstripped binary)" };
         out.text += &format!("! Unresolved: {:.1}% of samples have no symbol ({what}): {}\n", 100.0 - share, missing.join(", "));
     }
+    // Sampled by strobe itself without the helper: how, and what it cost the threads.
+    let deep: Option<crate::etw::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
+    if let Some(d) = deep.filter(|d| d.suspend.is_some()) {
+        out.text += &format!("i native stacks{}\n", crate::etw::stacks_how(&d));
+        out.json["suspend"] = json!(d.suspend);
+    }
     Ok(out)
 }
 

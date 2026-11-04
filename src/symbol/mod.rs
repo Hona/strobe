@@ -6,7 +6,7 @@ pub mod dwarf;
 pub mod pdb;
 
 use crate::etw::Deep;
-use crate::model::Result;
+use crate::model::{Error, Result};
 use crate::probe::symbols::Frame;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -58,6 +58,9 @@ type Resolved = Vec<(String, String, u32, String, bool)>;
 /// inside one of these host-clock spans (a phase).
 pub fn native(dir: &Path, thread: Option<&str>, spans: Option<&[(u64, u64)]>) -> Result<Option<Native>> {
     let Some(deep) = read_deep(dir)? else { return Ok(None) };
+    if deep.untimed && spans.is_some() {
+        return Err(Error::usage("these native samples carry no times (macOS sample): a phase cannot select them; drop --phase"));
+    }
     let resolved = resolve_all(dir, &deep)?;
     let mut by_stack: HashMap<(u32, u32), u64> = HashMap::new();
     for s in &deep.samples {

@@ -109,6 +109,10 @@ windows-sys = { version = "0.59", features = [
   "Win32_NetworkManagement_NetManagement",
   # Native app snapshots: a window's own rendering of itself (PrintWindow).
   "Win32_Storage_Xps",
+  # Native stacks without the helper: a thread's registers (CONTEXT) and the target's stack and
+  # unwind data (ReadProcessMemory).
+  "Win32_System_Diagnostics_Debug",
+  "Win32_System_Kernel",
 ] }
 
 [profile.release]

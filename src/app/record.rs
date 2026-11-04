@@ -320,7 +320,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
+        let stacks = (set == Set::Attribution && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
@@ -385,10 +385,10 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let stacks_note = match stacks {
             Some(Ok(d)) => {
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                format!("native stacks: {} samples (query hotspots)", d.samples.len())
+                format!("native stacks: {} samples (query hotspots){}", d.samples.len(), crate::etw::stacks_how(&d))
             }
             Some(Err(e)) => format!("native stacks failed: {}", e.message),
-            None => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
+            None => crate::etw::no_stacks().into(),
         };
         let ms = (t1 - t0) as f64 / 1e6;
         let mut values: BTreeMap<&str, f64> = BTreeMap::new();

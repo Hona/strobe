@@ -1970,13 +1970,39 @@ As built (Windows):
   merge by timestamp and thread. The user's strobe adds thread names (`GetThreadDescription`) and
   module lists the rundown missed. Recordings keep `deep.json.gz` (modules, unique stacks,
   samples), symbolized on read (§12.2).
-- **Why ETW, not suspending threads from outside**: a non-elevated sampler (SuspendThread,
-  GetThreadContext, unwinding with the target's unwind tables over ReadProcessMemory) would avoid
-  the prompt, but it stops each thread for tens of microseconds per sample (5 kHz across a dozen
-  threads perturbs the target far more than an interrupt-time stack walk), can only sample threads
-  it already knows to be running (biased toward threads that just ran), sees no kernel or driver
-  frames, and needs an unwinder strobe would own. One prompt at setup is the cheaper price
-  (rule 11).
+- **Why ETW first, not suspending threads from outside**: a non-elevated sampler stops each thread
+  for tens of microseconds per sample (5 kHz across a dozen threads perturbs the target far more
+  than an interrupt-time stack walk), can only sample threads it knows ran (biased toward threads
+  that just ran), sees no kernel frames, and needs an unwinder strobe owns. One prompt at setup is
+  the cheaper price (rule 11), so the helper stays the default.
+- **Without the helper** (not installed), native stacks
+  in attribution blocks and `record --probes deep` come from strobe's own sampler instead
+  (`probe/suspend.rs`, x64; never in a timing block: only attribution uses stacks), and `record pid:…
+  --probes stacks-unprivileged` asks for it even with the helper. Every 100 ms it lists the tree's
+  threads and which of them ran (one system snapshot); every 2 ms (a high-resolution waitable timer,
+  no change to the system's timer resolution) it reads those threads' cycle counters, and a thread
+  that used another 2 ms of CPU since its last sample is sampled: `SuspendThread`, `GetThreadContext`
+  (control and integer registers; it returns once the suspend landed), one `ReadProcessMemory` of up
+  to 64 KB of stack from RSP to the TEB's stack base, `ResumeThread`. Unwinding happens after the
+  resume, on that copy: x64 unwind data (the exception directory's `RUNTIME_FUNCTION`s and their
+  `UNWIND_INFO`, chained entries, machine frames) read once per module and function from the target's
+  memory, an epilog at the innermost frame run forward as `RtlVirtualUnwind` does, a function without
+  unwind data treated as a leaf; it stops outside every module (JIT code) or the copy. Samples go into
+  the same `deep.json.gz` as the helper's (each one 2 ms of that thread's CPU, `interval_us` 2000) and
+  resolve with the same PDB code. Capped at one sample per thread per 2 ms and 4,000 a second; the
+  sampler thread runs at highest priority so it is not preempted between a suspend and its resume.
+  The recording keeps what it cost (`suspend`: samples, threads, each sample's suspend-to-resume time
+  as mean, p99 and max, samples the cap left out, threads it could not open), and the block note and
+  `query hotspots` print it. Measured on adais (Hex's dictation case, cold GPU caches, 13 threads):
+  46 µs mean, 90 µs p99 per sample, so a thread busy all the time is stopped about 2.3% of its time
+  (4.5% at p99). The maximum, 80 ms, is a thread inside a driver's system call: a suspend lands only
+  when the thread returns to user mode, so it ran in the kernel meanwhile and the time is an upper
+  bound. It found what the user-mode prototype did: 94.7% of the case's samples in `nvgpucomp64.dll`
+  (NVIDIA's shader compiler) on a driver thread, and the app's own threads with full stacks and
+  lines. Caveats, said in the note: no kernel frames; threads that start and finish within 100 ms are
+  missed; a thread that ran and then waits when sampled shows where it waits; while a thread is
+  stopped it may hold a lock (the loader's, a heap's) another of the app's threads then waits on.
+  strobe takes no lock of the target's and calls nothing in it, so the target cannot stall strobe.
 
 ### 13.5 Bun and Node
 
@@ -2529,6 +2555,11 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   threads used 26 ms. By hand, a 40 s dictation in one home: 41.3 s of the process's CPU cold, 20.7 s
   after one killed launch, 2.8 s after a second. The cache files grow when the process ends, killed
   or not. Each variant's store is lent by renaming folders into the home and back.
+- macOS native stacks in a bench's attribution block came back empty ("0 samples"): `sample`'s
+  untimed samples all carry the capture's start, before the warmup runs, and the block kept only
+  samples inside its measured runs. Untimed samples are kept whole now, as §13.4 says, and `--phase`
+  refuses them. `sample` itself works on air (macOS 27.0.1: 1,549 samples of a 2 s capture of a
+  same-user process, through `strobe run` in the bench slot).
 - Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread --phase`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`

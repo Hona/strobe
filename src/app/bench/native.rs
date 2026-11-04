@@ -239,7 +239,7 @@ fn runs(
             Err(e) => presents_err = Some(e.message),
         }
     }
-    let stacks = (set == Set::Attribution && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
+    let stacks = (set == Set::Attribution && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
     let current = RefCell::new(String::new());
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
     let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
@@ -659,12 +659,21 @@ fn runs(
         let stacks_note = match &stacks {
             Some(Ok(d)) => {
                 let mut d = d.clone();
-                d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1));
+                // Untimed samples (macOS `sample`) all carry the capture's start, before the warmup
+                // runs: keeping only the measured runs' span dropped every one of them.
+                if !d.untimed {
+                    d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1));
+                }
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                format!("native stacks: {} samples (query hotspots)", d.samples.len())
+                format!(
+                    "native stacks: {} samples (query hotspots){}{}",
+                    d.samples.len(),
+                    crate::etw::stacks_how(&d),
+                    if d.untimed { "; untimed (macOS sample): they cover the warmup runs and the resets too" } else { "" }
+                )
             }
             Some(Err(e)) => format!("native stacks failed: {}", e.message),
-            None if set == Set::Attribution => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
+            None if set == Set::Attribution => crate::etw::no_stacks().into(),
             None => String::new(),
         };
         store::write_json(
@@ -894,7 +903,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     };
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
-    let mut stacks = (profile && crate::etw::access().helper).then(|| crate::etw::StackCapture::start(n.pid));
+    let mut stacks = (profile && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1100,12 +1109,14 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             let ready_ns = n.at_ns + ((ready.0 - n.epoch_ms).max(0.0) * 1e6) as u64;
             let stacks_note = match stacks.take().map(|r| r.and_then(|c| c.stop())) {
                 Some(Ok(mut d)) => {
-                    d.samples.retain(|x| x.0 >= n.at_ns && x.0 <= ready_ns);
+                    if !d.untimed {
+                        d.samples.retain(|x| x.0 >= n.at_ns && x.0 <= ready_ns);
+                    }
                     crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                    format!("native stacks from just after the spawn until ready: {} samples (query hotspots)", d.samples.len())
+                    format!("native stacks from just after the spawn until ready: {} samples (query hotspots){}", d.samples.len(), crate::etw::stacks_how(&d))
                 }
                 Some(Err(e)) => format!("native stacks failed: {}", e.message),
-                None => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
+                None => crate::etw::no_stacks().into(),
             };
             let mut meta_values = json!(values);
             if let Some(span) = &launch_span {

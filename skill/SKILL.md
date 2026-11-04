@@ -40,7 +40,7 @@ Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `
 
 Probe sets: `timing` (default) · `attribution` (CPU stacks, allocations, forced layouts, GC, a heap snapshot; its times are perturbed) · `memory` (three heap snapshots for leaks, no trace) · `deep` (native stacks of a process tree, Windows; perturbed)
 
-On Windows, OS present events (what reached the screen, for any native or Chromium window) and native stacks need `strobe up`'s one UAC prompt (Performance Log Users and the deep-mode helper); without it, those metrics are refused and `status` says why. `record https://… --os-frames` puts them beside Chromium's own frames.
+On Windows, OS present events (what reached the screen, for any native or Chromium window) and native stacks need `strobe up`'s one UAC prompt (Performance Log Users and the deep-mode helper); without it, present metrics are refused and `status` says why, and native stacks in attribution blocks and `--probes deep` come from strobe's own sampler (it suspends each busy thread once per 2 ms of its CPU, about 50 µs a sample; user frames only; the note and `query hotspots` say so; `record pid:… --probes stacks-unprivileged` asks for it with the helper too). `record https://… --os-frames` puts them beside Chromium's own frames.
 
 Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (invalid; the reason is in the result) · `5` inconclusive · `124` timeout · `255` unreachable
 

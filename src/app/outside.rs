@@ -43,8 +43,8 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let name = host::all_processes().into_iter().find(|p| p.pid == root).map(|p| p.name).unwrap_or_default();
     let deep = match args.get("probes").unwrap_or("timing") {
         "timing" => false,
-        "deep" | "attribution" => true,
-        other => return Err(Error::usage(format!("--probes for a process: timing or deep, not {other}"))),
+        "deep" | "attribution" | "stacks-unprivileged" => true,
+        other => return Err(Error::usage(format!("--probes for a process: timing, deep or stacks-unprivileged, not {other}"))),
     };
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,
@@ -57,7 +57,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
     if deep {
-        let cap = etw::StackCapture::start(root)?;
+        let cap = etw::StackCapture::start_with(root, args.get("probes") == Some("stacks-unprivileged"))?;
         progress(format!("sampling native stacks of {name} ({root}) for {}", fmt::ms_duration(for_ms)));
         std::thread::sleep(Duration::from_millis(for_ms));
         let d = cap.stop()?;
@@ -69,7 +69,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         let meta = json!({
             "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "deep", "token": "", "duration_ms": for_ms,
             "env": host::env(), "values": {}, "native": facts, "samples": d.samples.len(), "events_lost": d.events_lost, "pids": d.pids,
-            "timing": "perturbed", "created": super::record::now_iso(), "valid": true,
+            "timing": "perturbed", "created": super::record::now_iso(), "valid": true, "suspend": d.suspend,
         });
         store::write_json(&dir.join("meta.json"), &meta)?;
         let text = format!(

@@ -149,7 +149,12 @@ fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
                 }
                 None => {
                     let kernel = a >= KERNEL;
-                    out.insert(key, vec![(if kernel { "(kernel)".into() } else { "(unknown module)".into() }, String::new(), 0, if kernel { "(kernel)".into() } else { "(unknown)".into() }, false)]);
+                    let frame = match deep.located.iter().find(|l| l.0 == s.1 && l.1 == a) {
+                        // A frame the sampling tool named, in an image it did not list.
+                        Some((_, _, name, file, line)) => (demangle_any(name), file.clone(), *line, file_package(file).unwrap_or_else(|| "(unknown)".into()), true),
+                        None => (if kernel { "(kernel)".into() } else { "(unknown module)".into() }, String::new(), 0, if kernel { "(kernel)".into() } else { "(unknown)".into() }, false),
+                    };
+                    out.insert(key, vec![frame]);
                 }
             }
         }

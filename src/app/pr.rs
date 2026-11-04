@@ -247,18 +247,6 @@ fn delta(c: &Value, x: f64) -> String {
     if c["relative"] == true { fmt::pct(x) } else { fmt::signed(x, abs_unit(unit)) }
 }
 
-fn interval(c: &Value) -> String {
-    if c["exact"] == true {
-        return "exact".into();
-    }
-    let (lo, hi) = (f(&c["lo"]), f(&c["hi"]));
-    if !lo.is_finite() || !hi.is_finite() {
-        return "no interval".into();
-    }
-    format!("[{} … {}]", delta(c, lo), delta(c, hi))
-}
-
-/// `7.05 → 3.90 ms`: both sides, the unit once when they share it.
 /// `−54% to −32%`, or `exact` for a counter that held one value per side.
 fn range(c: &Value) -> String {
     if c["exact"] == true {
@@ -596,16 +584,16 @@ impl<'a> Doc<'a> {
         if s["not_run"] == true {
             return format!("Not run: {}.\n\n", cell(s["halt"]["message"].as_str().unwrap_or("the bench stopped before this series")));
         }
-        let mut t = String::from("| Side | Measure | Verdict |\n|:---|:---|:---|\n");
+        let mut t = String::from("Growth per run of what the app kept after garbage collection, from readings between runs.\n\n| Build | Measure | Verdict |\n|:---|:---|:---|\n");
         for side in ["base", "head"] {
             let l = &s["leak"][side];
-            for part in ["native_host", "js_heap", "dom_nodes"] {
+            for (part, name) in [("native_host", "Heap memory"), ("js_heap", "JavaScript heap"), ("dom_nodes", "DOM nodes")] {
                 if let Some(v) = l[part]["verdict"].as_str() {
-                    t += &format!("| {side} | {} | {} |\n", code(part), cell(v));
+                    t += &format!("| {side} | {name} <sub>{}</sub> | {} |\n", code(part), cell(v));
                 }
             }
         }
-        t + "\n"
+        format!("<details>\n<summary><b>How big?</b> Growth per run, by build</summary>\n\n{t}\n</details>\n\n")
     }
 
     /// The tested metrics (main first) or the context metrics: base, head, the change, the range it
@@ -1633,21 +1621,27 @@ fn chart_unit(unit: &str, max: f64) -> (f64, String) {
 fn bisect(r: &Value) -> String {
     let id = r["id"].as_str().unwrap_or("");
     let file = repo_relative(r["file"].as_str().unwrap_or(""));
-    let range = r["range"].as_str().unwrap_or("").split("..").map(|c| c.chars().take(10).collect::<String>()).collect::<Vec<_>>().join("..");
-    let mut t = format!("**{}** ({}) · bisect of {} over {}: **{}**\n\n", code(&file), code(id), code(r["metric"].as_str().unwrap_or("")), code(&range), cell(r["verdict"].as_str().unwrap_or("")));
-    t += "| Step | Commit (against good) | Pairs | Change [CI] | Outcome |\n|---:|:---|---:|---:|:---|\n";
+    let span = r["range"].as_str().unwrap_or("").split("..").map(|c| c.chars().take(10).collect::<String>()).collect::<Vec<_>>().join("..");
+    let m = r["metric"].as_str().unwrap_or("");
+    let verdict_line = r["verdict"].as_str().unwrap_or("");
+    let head = match verdict_line.strip_prefix("found: ") {
+        Some(rest) => format!("**Bisect:** {} changed at {}.", noun(m), cell(rest)),
+        None => format!("**Bisect:** {}.", cell(verdict_line)),
+    };
+    let mut t = format!("{head}\nSearched {} in {}, one full comparison per step.\n\n", code(&span), code(&file));
+    t += "<details>\n<summary><b>Which commit?</b> Each step of the search</summary>\n\n| Step | Commit, against the last good one | Pairs | Change | Likely range | Verdict |\n|---:|:---|---:|---:|---:|:---|\n";
     for s in r["steps"].as_array().into_iter().flatten() {
         let o = outcome(s, false);
         t += &format!(
-            "| {} | {} {} | {} | {} <sub>{}</sub> | {} |\n",
+            "| {} | {} {} | {} | {} | {} | {} |\n",
             s["step"],
             code(s["short"].as_str().unwrap_or("")),
-            cell(s["subject"].as_str().unwrap_or("")),
+            cell(&no_refs(s["subject"].as_str().unwrap_or(""))),
             s["pairs"],
             ink(&delta(s, f(&s["estimate"])), tone(s, o), false),
-            interval(s),
+            range(s),
             cell(verdict(s))
         );
     }
-    t + &format!("\n<sub>Each step: <code>strobe report experiment &lt;step experiment&gt; --format pr</code>; this bisect: <code>strobe report experiment {id} --open</code>.</sub>\n")
+    t + &format!("\nEach step is an experiment of its own (`strobe report experiment <step> --format pr`); the whole search: `strobe report experiment {id} --open`.\n\n</details>\n")
 }

@@ -19,6 +19,14 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTableVi
     }
 
     func applicationDidFinishLaunching(_ note: Notification) {
+        // ⌘A and the other editing keys reach a text field through the Edit menu's key equivalents.
+        let main = NSMenu()
+        let edit = NSMenuItem()
+        edit.submenu = NSMenu(title: "Edit")
+        edit.submenu!.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        main.addItem(NSMenuItem())
+        main.addItem(edit)
+        NSApp.mainMenu = main
         window.title = "strobe dev app"
         let add = keyed(NSButton(title: "Add", target: self, action: #selector(onAdd)), "add")
         let check = keyed(NSButton(checkboxWithTitle: "Enabled", target: nil, action: nil), "check")

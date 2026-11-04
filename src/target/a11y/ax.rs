@@ -554,7 +554,10 @@ impl Worker {
                     return Err(Error::usage("the element's value cannot be set through its accessibility tree"));
                 }
                 let current = copy(el, "AXValue");
-                if current.as_ref().is_some_and(|c| cf_string(c.0).is_none() && cf_f64(c.0).is_some()) {
+                // A range control takes a number even when its value reads as text ("1.00×": an app
+                // that names its value exposes that text as AXValue, and a string set is not a number).
+                let range = copy(el, "AXRole").and_then(|r| cf_string(r.0)).is_some_and(|r| matches!(r.as_str(), "AXSlider" | "AXIncrementor" | "AXStepper" | "AXScrollBar" | "AXLevelIndicator"));
+                if current.as_ref().is_some_and(|c| cf_string(c.0).is_none() && cf_f64(c.0).is_some()) || (range && v.trim().parse::<f64>().is_ok()) {
                     let d: f64 = v.trim().parse().map_err(|_| Error::usage(format!("setValue {v:?}: this element holds a number")))?;
                     let n = Cf(unsafe { CFNumberCreate(std::ptr::null(), 13, &d as *const f64 as *const c_void) });
                     set("AXValue", n.0)

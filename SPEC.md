@@ -152,6 +152,15 @@ and team and the grants survive updates. It needs five repository secrets: `MACO
 `MACOS_NOTARY_ISSUER_ID`. Without them the binaries ship ad-hoc signed and a tag build warns. A bare
 executable cannot carry a stapled ticket: Gatekeeper looks it up online at its first run.
 
+**Windows metadata.** Defender's machine-learning classifier quarantined unsigned builds as
+`Trojan:Win32/Bearfoos.A!ml`: strobe does what droppers do (copies itself into Program Files with a
+scheduled task, elevates once, suspends threads and reads other processes' memory, sets their
+affinity, replaces its own executable). Each executable carries a version resource (CompanyName,
+FileDescription, FileVersion, InternalName, LegalCopyright, OriginalFilename, ProductName,
+ProductVersion from Cargo.toml) and an application manifest (`asInvoker`, Windows 10 and 11, no DPI
+awareness: strobe sets that per thread). `build.rs` writes both as a COFF `.rsrc` object and links it:
+no resource compiler. The binaries are not Authenticode-signed yet.
+
 **Inherited and own grants.** macOS attributes a process's permissions to its responsible process.
 On macOS 27 a child of a launchd daemon (a remote shell's, such as mesh) is AX-trusted through the
 daemon, but Screen Recording is checked against the child's own binary: ScreenCaptureKit answered

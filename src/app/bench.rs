@@ -2488,10 +2488,14 @@ fn filter_report(describe: &Value, filter: &str) -> (String, Option<Error>) {
     if !left.is_empty() {
         text += &format!(" · skips {}", list(&left));
     }
-    if !near.is_empty() {
-        text += &format!(" · to run {} too: --filter \"{}*\"", list(&near), filter.trim());
+    let glob_hint = if near.is_empty() { String::new() } else { format!("to run {}: --filter \"{}*\"", list(&near), filter.trim()) };
+    if !glob_hint.is_empty() {
+        text += &format!(" · {glob_hint} too");
     }
-    let err = picked.is_empty().then(|| Error::usage(format!("--filter \"{filter}\" matches no case")).hint(format!("cases: {} (exact names, or globs with *)", list(&cases.iter().collect::<Vec<_>>()))));
+    let err = picked.is_empty().then(|| {
+        let cases = format!("cases: {} (exact names, or globs with *)", list(&cases.iter().collect::<Vec<_>>()));
+        Error::usage(format!("--filter \"{filter}\" matches no case")).hint(if glob_hint.is_empty() { cases } else { format!("{glob_hint} · {cases}") })
+    });
     (text, err)
 }
 
@@ -2771,7 +2775,7 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
         let whole = if saved { format!("; all of it: {}", log.display()) } else { String::new() };
         return Err(Error::msg(format!("build {role} failed{code}: {cmd}\n{tail}")).hint(format!(
             "it ran in {} with this machine's defaults{whole}. A toolchain or variable the build needs goes in strobe.json build.env, or build.{}.env for this OS only",
-            cwd.display(),
+            cwd.display().to_string().trim_start_matches(r"\\?\"),
             crate::target::isolate::os()
         )));
     }

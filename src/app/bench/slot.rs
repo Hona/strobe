@@ -83,6 +83,13 @@ impl Registration {
         self.write();
     }
 
+    /// The bench's time still to run in blocks (ms), as `plan` and its ETA see it: another bench's plan
+    /// adds it to that bench's wait for the slot.
+    pub fn set_eta(&self, ms: f64) {
+        self.0.entry.lock().unwrap()["eta_ms"] = json!(ms.round());
+        self.write();
+    }
+
     fn queue(&self, why: &str) -> u128 {
         let at = now_ns();
         {
@@ -107,10 +114,8 @@ impl Registration {
         let mut reminded = Instant::now();
         loop {
             let others = list();
-            let ahead: Vec<&Value> = others
-                .iter()
-                .filter(|b| b["exp"] != me && b["state"] == "queued" && b["queued_at"].as_str().and_then(|t| t.parse::<u128>().ok()).is_some_and(|t| t < mine))
-                .collect();
+            let ahead: Vec<&Value> =
+                others.iter().filter(|b| b["exp"] != me && b["state"] == "queued" && b["queued_at"].as_str().and_then(|t| t.parse::<u128>().ok()).is_some_and(|t| t < mine)).collect();
             // Builds before the slot held `bench.lock` for a whole experiment.
             // This build writes `bench.lock` too while it holds the slot: a pid that registered as a bench
             // is a current strobe (named below as the one running a block), not an older one.
@@ -126,7 +131,12 @@ impl Registration {
             let running = others.iter().find(|b| b["state"] == "running" && b["exp"] != me);
             let why = match (old, running, ahead.len()) {
                 (Some(pid), _, _) => format!("{what}: waiting for the bench of an older strobe (pid {pid}) to finish"),
-                (None, Some(r), n) => format!("{what}: waiting for the bench slot (pid {} runs a block of {}{})", r["pid"], r["exp"].as_str().unwrap_or(""), if n > 0 { format!("; {n} queued before this one") } else { String::new() }),
+                (None, Some(r), n) => format!(
+                    "{what}: waiting for the bench slot (pid {} runs a block of {}{})",
+                    r["pid"],
+                    r["exp"].as_str().unwrap_or(""),
+                    if n > 0 { format!("; {n} queued before this one") } else { String::new() }
+                ),
                 (None, None, n) if n > 0 => format!("{what}: waiting for the bench slot ({n} queued before this one)"),
                 _ => format!("{what}: waiting for the bench slot"),
             };

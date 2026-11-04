@@ -27,7 +27,9 @@ pub fn for_experiment(id: &str, created: &str, identity: &Value) -> Value {
     let mut series = json!({});
     for s in identity["series"].as_array().into_iter().flatten() {
         let label = s["label"].as_str().unwrap_or("");
-        let found = |list: &Vec<Value>| list.iter().filter_map(|e| e["verdicts"].as_array()?.iter().find(|v| v["series"] == label).map(|v| json!({ "id": e["id"], "verdict": v["verdict"] }))).collect::<Vec<_>>();
+        let found = |list: &Vec<Value>| {
+            list.iter().filter_map(|e| e["verdicts"].as_array()?.iter().find(|v| v["series"] == label).map(|v| json!({ "id": e["id"], "verdict": v["verdict"] }))).collect::<Vec<_>>()
+        };
         series[label] = json!({ "earlier": found(&earlier), "later": found(&later) });
     }
     let text = (total > 1).then(|| {

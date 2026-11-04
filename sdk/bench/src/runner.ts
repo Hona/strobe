@@ -136,6 +136,7 @@ function describe() {
         reset: !!c.reset,
         targets: c.targets,
         timeout: c.timeout,
+        noworse: c.noworse,
         launch: c.launch && {
           ...plain(c.launch),
           milestones: Object.fromEntries(

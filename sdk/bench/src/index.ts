@@ -209,6 +209,8 @@ interface CaseBase {
   metrics?: string[]
   /** The targets this case runs on. Default: every target. */
   targets?: string[]
+  /** Non-inferiority: "is head at most this much worse?" instead of "did it change?". `"2%"` for the primary, or margins per metric (`{ "cpu.wakes": "5%" }`). Verdicts `no worse (≤2%)`, `worse (>2%)`, `unclear`. `--noworse` overrides. */
+  noworse?: string | number | Record<string, string | number>
 }
 
 /** A case of runs inside an open target: measured `run`, unmeasured `reset`. */

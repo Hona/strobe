@@ -13,6 +13,10 @@ pub fn run(args: &Args) -> Result<Output> {
     let experiment = store::is_experiment(&dir);
     let mut data: Value = if experiment { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
     if experiment {
+        // The rerun ledger as of now: experiments on the same variants since this one ran count too.
+        if data["identity"].is_object() {
+            data["ledger"] = store::ledger::for_experiment(data["id"].as_str().unwrap_or(""), data["created"].as_str().unwrap_or(""), &data["identity"]);
+        }
         // Insights read the same recordings: in parallel with the per-side views.
         let snapshot = data.clone();
         let insights = std::thread::scope(|scope| {

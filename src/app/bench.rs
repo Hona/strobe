@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 
 mod launch;
 mod native;
+pub mod plan;
 mod script;
 pub mod slot;
 
@@ -180,6 +181,69 @@ fn variant_git(v: &Variant) -> Value {
     json!({ "spec": v.spec, "commit": v.commit, "dirty": v.dirty, "changes": changes })
 }
 
+/// What a variant is for the rerun ledger: a commit (with a hash of a folder's uncommitted changes),
+/// an app or executable with its file's size and time, or a URL. A folder and a git ref at the same
+/// clean commit are the same variant.
+fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
+    let stamp = |p: &Path| {
+        std::fs::metadata(p).ok().map(|m| format!("@{}-{}", m.len(), m.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_secs()))).unwrap_or_default()
+    };
+    match &v.kind {
+        Kind::Dir => match v.state.as_deref().and_then(|s| s.split_once(' ')) {
+            Some((sha, diff)) if v.dirty => format!("{sha}+{}", &diff[..12.min(diff.len())]),
+            Some((sha, _)) => sha.to_string(),
+            None => format!("dir:{}", v.root.as_deref().unwrap_or(Path::new(&v.spec)).display()),
+        },
+        Kind::Git(r) => host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", &format!("{r}^{{commit}}")])).unwrap_or_else(|| v.commit.clone().unwrap_or_default()),
+        Kind::App(id) => format!("app:{id}{}", isolate::app(id, config).map(|a| stamp(&a.exe)).unwrap_or_default()),
+        Kind::Exe(p) => format!("exe:{}{}", p.display(), stamp(p)),
+        Kind::Url(h) => format!("url:{h}"),
+    }
+}
+
+/// The experiment's identity for the rerun ledger (`store::ledger`, SPEC §14.2): its variants, the bench
+/// file and harness by content, its series with their primaries and margins, and the flags that chose
+/// what ran and how it was judged.
+fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, series: &[Series], project: &Path, config: &Value) -> Value {
+    use sha2::Digest;
+    let short = |d: &[u8]| d.iter().take(6).map(|b| format!("{b:02x}")).collect::<String>();
+    let file_hash = std::fs::read(file).map(|b| short(&sha2::Sha256::digest(&b))).unwrap_or_default();
+    // The harness by content; large files (seed models) by size and time, which is enough to see a change.
+    let mut h = sha2::Sha256::new();
+    let mut files: Vec<PathBuf> = harness
+        .paths
+        .iter()
+        .flat_map(|p| {
+            let src = harness.from.join(p);
+            if src.is_dir() { walk(&src) } else { vec![src] }
+        })
+        .collect();
+    files.sort();
+    for f in files {
+        let Ok(m) = std::fs::metadata(&f) else { continue };
+        h.update(f.strip_prefix(&harness.from).unwrap_or(&f).to_string_lossy().replace('\\', "/").as_bytes());
+        if m.len() <= 1 << 20 {
+            h.update(std::fs::read(&f).unwrap_or_default());
+        } else {
+            h.update(format!("{}-{:?}", m.len(), m.modified().ok()).as_bytes());
+        }
+    }
+    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan"];
+    let flags: serde_json::Map<String, Value> = args.to_json()["flags"].as_object().into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut ids: Vec<String> = variants.iter().map(|v| variant_identity(v, project, config)).collect();
+    if ids.len() == 1 {
+        ids.insert(0, ids[0].clone());
+    }
+    json!({
+        "variants": ids,
+        "file": file.file_name().map(|f| f.to_string_lossy().to_string()),
+        "file_hash": file_hash,
+        "harness": short(&h.finalize()),
+        "flags": flags,
+        "series": series.iter().map(|s| json!({ "label": s.label(), "case": s.case, "primary": s.primary, "noworse": s.noworse })).collect::<Vec<_>>(),
+    })
+}
+
 impl Drop for Variant {
     fn drop(&mut self) {
         if let Some(mut s) = self.server.take() {
@@ -226,8 +290,7 @@ const LAUNCH_RETRIES: u32 = 3;
 /// as opposed to a run that failed or a validator that refused.
 fn transient(e: &Error) -> bool {
     let m = e.message.as_str();
-    !m.contains("RunIncomplete")
-        && (e.code == 255 || m.contains("did not open its debugging port") || (e.code == 124 && m.starts_with("cdp ")) || (m.starts_with("cdp ") && m.contains("no reply in")))
+    !m.contains("RunIncomplete") && (e.code == 255 || m.contains("did not open its debugging port") || (e.code == 124 && m.starts_with("cdp ")) || (m.starts_with("cdp ") && m.contains("no reply in")))
 }
 
 /// Warmup runs at most, before strobe measures anyway and flags the block (`NotSteady`).
@@ -368,6 +431,8 @@ struct Ctx<'a> {
     target_qos: Option<String>,
     /// `state.json`: the command line and each series' finished pairs or result (`checkpoint`).
     saved: Value,
+    /// Per series, the planned time of the series after it (ms), for the ETA (`plan`).
+    eta_after: BTreeMap<String, f64>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -413,7 +478,13 @@ impl ReserveTotal {
         let mut top: Vec<(&String, &u32)> = self.moved.iter().collect();
         top.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
         let names = top.iter().take(4).map(|(n, c)| if **c > 1 { format!("{n} ×{c}") } else { n.to_string() }).collect::<Vec<_>>().join(", ");
-        let mut t = format!("other processes of this user kept off CPUs {cpus} during {} timed block{}: {:.0} moved per block ({names}{})", self.blocks, if self.blocks == 1 { "" } else { "s" }, self.moved_per_block, if top.len() > 4 { ", …" } else { "" });
+        let mut t = format!(
+            "other processes of this user kept off CPUs {cpus} during {} timed block{}: {:.0} moved per block ({names}{})",
+            self.blocks,
+            if self.blocks == 1 { "" } else { "s" },
+            self.moved_per_block,
+            if top.len() > 4 { ", …" } else { "" }
+        );
         if self.started > 0 {
             t += &format!(", {} more started during blocks and moved within 200 ms", self.started);
         }
@@ -422,7 +493,11 @@ impl ReserveTotal {
             for (n, why) in &self.failed {
                 by.entry(why.as_str()).or_default().push(n.as_str());
             }
-            let failed = by.iter().map(|(why, names)| format!("{} ({why})", names.iter().take(4).copied().collect::<Vec<_>>().join(", ") + if names.len() > 4 { ", …" } else { "" })).collect::<Vec<_>>().join("; ");
+            let failed = by
+                .iter()
+                .map(|(why, names)| format!("{} ({why})", names.iter().take(4).copied().collect::<Vec<_>>().join(", ") + if names.len() > 4 { ", …" } else { "" }))
+                .collect::<Vec<_>>()
+                .join("; ");
             t += &format!("; {} could not be moved: {failed}", self.failed.len());
         }
         let back = self.restored as f64 / self.moved_total.max(1) as f64;
@@ -468,7 +543,8 @@ pub fn run(args: &Args) -> Result<Output> {
     // `--resume <exp>`: the same command line, from the pairs and series it had finished.
     if let Some(exp) = args.get("resume") {
         let dir = host::paths::experiments().join(exp);
-        let saved = store::read_json(&dir.join("state.json")).map_err(|_| Error::usage(format!("{exp} has no saved state to resume (state.json): only experiments started by this strobe or later can resume")))?;
+        let saved = store::read_json(&dir.join("state.json"))
+            .map_err(|_| Error::usage(format!("{exp} has no saved state to resume (state.json): only experiments started by this strobe or later can resume")))?;
         let mut resumed = Args::from_json(&saved["args"]).ok_or_else(|| Error::usage(format!("{exp}: state.json holds no command line")))?;
         resumed.set("id", exp);
         resumed.remove("resume");
@@ -476,7 +552,13 @@ pub fn run(args: &Args) -> Result<Output> {
         RESUMED.with(|r| *r.borrow_mut() = Some(saved));
         return run(&resumed);
     }
+    if args.has("plan") {
+        return plan::run(args);
+    }
     if let Some(range) = args.get("bisect") {
+        if args.has("noworse") {
+            return Err(Error::usage("--bisect looks for the commit that moved the primary; --noworse asks whether head is at most a margin worse: run them separately"));
+        }
         return super::bisect::run(args, range);
     }
     let file = args.pos.first().ok_or_else(|| Error::usage("bench needs a bench file: strobe bench perf/x.bench.ts --base <variant> --head <variant>"))?;
@@ -565,6 +647,7 @@ pub fn run(args: &Args) -> Result<Output> {
         qos: host::background_qos(None),
         target_qos: None,
         saved: RESUMED.with(|r| r.borrow_mut().take()).unwrap_or_else(|| json!({ "args": args.to_json(), "series": {} })),
+        eta_after: BTreeMap::new(),
     };
     // A stop asked of an earlier run of this experiment (or a Ctrl-C a daemon saw for another) is not this one's.
     let _ = std::fs::remove_file(dir.join("stop"));
@@ -625,6 +708,32 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
         None => vec![resolve_variant("head", &head_spec, &project, &config)?],
     };
+    // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
+    // builds, so rerunning until one says "faster" shows.
+    let compares = !check && !leak_run && variants.len() == 2;
+    let ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config) } else { Value::Null };
+    let ledger = store::ledger::for_experiment(&exp, &super::record::now_iso(), &ident);
+    if let Some(t) = ledger["text"].as_str() {
+        progress(format!("ledger  {t}"));
+    }
+    if ledger["changed"] == true {
+        ctx.warnings.push(validity::warn(
+            "Rerun",
+            "earlier experiments on these same variants ran another bench file, harness, case, primary, margin or flags (the ledger names them): a verdict reached by changing the setup until one says what you hoped is not a verdict",
+        ));
+    }
+    // The plan (SPEC §9.1): pairs and minutes per series from earlier runs here, and the ETA it keeps.
+    let estimate = if compares && !args.has("pixels-only") { plan::estimate(&series, &ctx.describe, &file, args, &config, &project, &variants, Some(&exp)) } else { Value::Null };
+    let planned: Vec<f64> = estimate["series"].as_array().into_iter().flatten().map(|s| s["ms"].as_f64().unwrap_or(0.0)).collect();
+    for (i, s) in series.iter().enumerate() {
+        ctx.eta_after.insert(s.label(), planned.iter().skip(i + 1).sum());
+    }
+    if estimate.is_object() {
+        for line in plan::summary(&estimate) {
+            progress(format!("plan    {line}"));
+        }
+        ctx.reg.set_eta(estimate["blocks_ms"].as_f64().unwrap_or(0.0));
+    }
     let started = Instant::now();
     let max_time = args.get("max-time").map(duration_ms).transpose()?.map(Duration::from_millis);
     let mut series_out = Vec::new();
@@ -751,7 +860,9 @@ pub fn run(args: &Args) -> Result<Output> {
             "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa, "reserve": ctx.reserved, "reserve_mode": ctx.reserve, "gpu_cache": ctx.gpu_cache,
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
+            "estimate": estimate,
         },
+        "identity": ident, "ledger": ledger,
         "variants": variants.iter().map(|v| json!({
             "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
             "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
@@ -766,7 +877,7 @@ pub fn run(args: &Args) -> Result<Output> {
     result_json["text"] = json!(text);
     store::write_json(&dir.join("result.json"), &result_json)?;
     store::append_index(&json!({
-        "id": exp, "created": result_json["created"], "file": result_json["file"],
+        "id": exp, "created": result_json["created"], "file": result_json["file"], "identity": result_json["identity"],
         "verdicts": result_json["series"].as_array().map(|a| a.iter().map(|s| json!({ "series": s["label"], "primary": s["primary"]["metric"], "verdict": s["primary"]["verdict"] })).collect::<Vec<_>>()),
     }))?;
     // Handles, not payloads (SPEC §17): per-frame arrays stay in result.json for reports and views.
@@ -824,7 +935,11 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         ctx.check = false;
         let check_runs = ctx.runs;
         ctx.runs = ctx.args.num("runs")?.unwrap_or(5.0).max(1.0) as usize;
-        let attributed = if s.launch.is_object() { in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v)) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+        let attributed = if s.launch.is_object() {
+            in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v))
+        } else {
+            block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true)
+        };
         ctx.runs = check_runs;
         ctx.check = true;
         match attributed {
@@ -976,6 +1091,16 @@ fn holm_pairs(tests: usize) -> usize {
     (2..=60).find(|n| 2.0 / 2f64.powi(*n) <= 0.05 / tests.max(1) as f64).unwrap_or(60) as usize
 }
 
+/// `ETA ~12.5 min`: the pairs left to `target` at this series' mean pair time so far, plus the planned
+/// time of the series after it; kept in the bench's registration for other benches' plans.
+fn eta(ctx: &mut Ctx, s: &Series, blocks: &[Block], pairs: &[(usize, usize)], target: usize) -> String {
+    let block = |b: &Block| b.steps.iter().map(|x| x.1).sum::<f64>();
+    let pair_ms = pairs.iter().map(|&(a, b)| block(&blocks[a]) + block(&blocks[b])).sum::<f64>() / pairs.len().max(1) as f64;
+    let ms = target.saturating_sub(pairs.len()) as f64 * pair_ms + ctx.eta_after.get(&s.label()).copied().unwrap_or(0.0);
+    ctx.reg.set_eta(ms);
+    format!("ETA ~{}", fmt::ms_duration(ms as u64))
+}
+
 /// Saves a series' finished blocks and pairs (or its result, once done) in `state.json`, so a bench
 /// that stops or fails keeps them and `--resume` goes on from there.
 fn checkpoint(ctx: &mut Ctx, label: &str, entry: Value) {
@@ -1016,12 +1141,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         Some(m) => stats::compare_noworse(&s.primary, def, pp, m, confidence),
         None => stats::compare(&s.primary, def, pp, bound, confidence),
     };
-    progress(format!(
-        "\n{}  primary {}{}",
-        s.label(),
-        s.primary,
-        margin.map(|m| format!(" · no worse than {}%?", (m * 1000.0).round() / 10.0)).unwrap_or_default()
-    ));
+    progress(format!("\n{}  primary {}{}", s.label(), s.primary, margin.map(|m| format!(" · no worse than {}%?", (m * 1000.0).round() / 10.0)).unwrap_or_default()));
     let series_started = Instant::now();
     let waited_before = ctx.waited_ms;
     // A resumed experiment (`--resume`) starts from the pairs it had finished.
@@ -1139,8 +1259,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let n = pair + 1;
         // Decided at a look, then run on to the pairs the secondaries need to clear Holm.
         if let Some(c) = &decided_at {
-            progress(format!("  pair {n:>2}  for the secondaries (the primary was decided: {})", c.verdict));
-            if n >= holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len()) {
+            let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len());
+            let eta = eta(ctx, s, &blocks, &pairs, need);
+            progress(format!("  pair {n:>2}  for the secondaries (the primary was decided: {}) · {eta}", c.verdict));
+            if n >= need {
                 stopped = "primary decided".into();
                 break;
             }
@@ -1149,8 +1271,28 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let look = looks.contains(&n);
         let cmp = compare_primary(&primary_pairs);
         let next = looks.iter().find(|&&l| l > n).copied();
+        let decided = look && cmp.decided;
+        // Give up only at a look from 12 pairs, on a robust projection: early intervals are [min, max]
+        // of few Walsh averages, so one odd pair would stop a series that more pairs decide.
+        let d: Vec<f64> = primary_pairs.iter().map(|&(a, b)| if cmp.relative { (b / a).ln() } else { b - a }).collect();
+        let mut cmp = cmp;
+        if !cmp.decided {
+            cmp.needed_pairs = Some(match cmp.noworse {
+                Some(m) => stats::pairs_needed_noworse(&d, stats::margin_shift(def, cmp.relative, m), confidence),
+                None => stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence),
+            });
+        }
+        // Where this series likely ends: at the look its projection reaches, or where it gives up.
+        let target = if decided || ctx.args.get("pairs").is_some() {
+            if decided { n } else { max_pairs }
+        } else {
+            let need = cmp.needed_pairs.unwrap_or(max_pairs).max(n + 1);
+            let at = if need > max_pairs { need.min(FUTILITY_FROM.max(n + 1)) } else { need };
+            looks.iter().copied().find(|&l| l >= at).unwrap_or(max_pairs)
+        };
+        let eta = eta(ctx, s, &blocks, &pairs, target);
         progress(format!(
-            "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {}",
+            "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {} · {eta}",
             n,
             fmt::value(val(&blocks[idx[0]], &s.primary), def.unit),
             fmt::value(val(&blocks[idx[1]], &s.primary), def.unit),
@@ -1163,17 +1305,6 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                 (false, None) => String::new(),
             }
         ));
-        let decided = look && cmp.decided;
-        // Give up only at a look from 12 pairs, on a robust projection: early intervals are [min, max]
-        // of few Walsh averages, so one odd pair would stop a series that more pairs decide.
-        let d: Vec<f64> = primary_pairs.iter().map(|&(a, b)| if cmp.relative { (b / a).ln() } else { b - a }).collect();
-        let mut cmp = cmp;
-        if !cmp.decided {
-            cmp.needed_pairs = Some(match cmp.noworse {
-                Some(m) => stats::pairs_needed_noworse(&d, stats::margin_shift(def, cmp.relative, m), confidence),
-                None => stats::pairs_needed(&d, if cmp.relative { (1.0 + bound).ln() } else { cmp.bound }, confidence),
-            });
-        }
         let hopeless = look && n >= FUTILITY_FROM && cmp.needed_pairs.is_some_and(|need| need > max_pairs);
         // A share at its ceiling on both sides (91% vs 92% dropped frames at background priority) moves
         // with nothing the builds do: more pairs only narrow an interval around "same at the ceiling".
@@ -1358,7 +1489,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress(format!("  attribution blocks ({}; not timed)", why_text(&target)));
         for v in variants.iter() {
             // A launch's attribution is a launch of its own, profiled from the first statement.
-            let attributed = if s.launch.is_object() { in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v)) } else { block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true) };
+            let attributed = if s.launch.is_object() {
+                in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v))
+            } else {
+                block_on_screen(ctx, s, v, usize::MAX, Set::Attribution, true)
+            };
             match attributed {
                 Ok(b) => {
                     progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
@@ -1540,8 +1675,15 @@ pub fn pr_markdown(r: &Value) -> String {
     }
     if let Some(st) = r["stopped"].as_object() {
         let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
-        let what = if st.get("code").and_then(Value::as_i64) == Some(130) { "stopped before it finished".to_string() } else { format!("failed before it finished ({})", st.get("why").and_then(Value::as_str).unwrap_or("")) };
-        out += &format!("- **Incomplete:** the bench {what}; the tables hold the pairs it finished{}.\n\n", if not_run.is_empty() { String::new() } else { format!(", and these series did not run: {}", not_run.join(", ")) });
+        let what = if st.get("code").and_then(Value::as_i64) == Some(130) {
+            "stopped before it finished".to_string()
+        } else {
+            format!("failed before it finished ({})", st.get("why").and_then(Value::as_str).unwrap_or(""))
+        };
+        out += &format!(
+            "- **Incomplete:** the bench {what}; the tables hold the pairs it finished{}.\n\n",
+            if not_run.is_empty() { String::new() } else { format!(", and these series did not run: {}", not_run.join(", ")) }
+        );
     }
     // The bench's own notes (power plan, lost present events, …), once.
     let general: Vec<&Value> = r["warnings"].as_array().into_iter().flatten().filter(|w| in_pr(w)).collect();
@@ -1550,6 +1692,10 @@ pub fn pr_markdown(r: &Value) -> String {
     }
     if !general.is_empty() {
         out += "\n";
+    }
+    // The rerun ledger (`store::ledger`): the other experiments on these variants and what they found.
+    if let Some(t) = store::ledger::line(r) {
+        out += &format!("- **Ledger:** {t}.\n\n");
     }
     let gpu = r["gpu"]["devices"].as_array().and_then(|d| d.first()).and_then(Value::as_str).unwrap_or("");
     let context = fmt::fields([
@@ -1644,8 +1790,14 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
 /// What an attribution block records for this target.
 fn why_text(target: &Value) -> &'static str {
     if is_native(target) {
-        if crate::etw::access().helper || !cfg!(windows) { "OS samples and native stacks" } else { "OS samples and native stacks (sampled without the deep helper: user frames, a short stall per sample)" }
-    } else { "CPU and allocation stacks, forced layouts, GC, a heap snapshot" }
+        if crate::etw::access().helper || !cfg!(windows) {
+            "OS samples and native stacks"
+        } else {
+            "OS samples and native stacks (sampled without the deep helper: user frames, a short stall per sample)"
+        }
+    } else {
+        "CPU and allocation stacks, forced layouts, GC, a heap snapshot"
+    }
 }
 
 /// The view that explains an attribution recording of a target of this kind.
@@ -1947,7 +2099,9 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         }
         // macOS: someone is using the Mac, so strobe did not take their focus to uncover the window.
         // Wait for them to leave it, as for a locked session, holding nothing meanwhile.
-        if r.as_ref().err().is_some_and(|e| e.message.contains(crate::target::native::COVERED) || e.message.contains(crate::target::native::NOT_ACTIVE)) && host::person_idle_s().is_some_and(|i| i < 60.0) {
+        if r.as_ref().err().is_some_and(|e| e.message.contains(crate::target::native::COVERED) || e.message.contains(crate::target::native::NOT_ACTIVE))
+            && host::person_idle_s().is_some_and(|i| i < 60.0)
+        {
             progress(format!("  waiting: someone is using this Mac, and strobe measures the {} app as the active one; it runs the block again once nobody has touched the Mac for a minute", v.role));
             release_machine(ctx);
             ctx.reg.set("waiting", format!("{} {} block: someone is using this Mac (the app must be the active one)", s.label(), v.role));
@@ -1970,7 +2124,11 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
         // machine it ends. Wait for it, holding nothing, and run the block again; an hour of it refuses.
         if busy_waits < BUSY_WAITS && r.as_ref().err().is_some_and(|e| e.message.starts_with("Background: ")) {
             busy_waits += 1;
-            progress(format!("  waiting: other work keeps the CPUs busy ({}); strobe runs the {} block again once it ends", r.as_ref().err().map(|e| e.message.rsplit("busiest processes (% of a core): ").next().unwrap_or("").to_string()).unwrap_or_default(), v.role));
+            progress(format!(
+                "  waiting: other work keeps the CPUs busy ({}); strobe runs the {} block again once it ends",
+                r.as_ref().err().map(|e| e.message.rsplit("busiest processes (% of a core): ").next().unwrap_or("").to_string()).unwrap_or_default(),
+                v.role
+            ));
             release_machine(ctx);
             ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
             let waiting = Instant::now();
@@ -2156,7 +2314,9 @@ fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
 fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
     let t = &ctx.describe["targets"][&s.target];
     let offscreen = |m: &str| {
-        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase."].iter().any(|p| m.starts_with(p)) || m == "run.duration" || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
+        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase."].iter().any(|p| m.starts_with(p))
+            || m == "run.duration"
+            || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     match t["kind"].as_str().unwrap_or("") {
         "script" => true,
@@ -2402,9 +2562,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             validity::window_visible(&page)?;
         }
         lap("checks");
-        ctx.runner
-            .call("setup", json!({}), t, &serve)
-            .map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         lap("setup");
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
@@ -2479,9 +2637,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
             driver.drags.borrow_mut().clear();
             driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
-            ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve).map_err(|e| {
-                crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app")
-            })?;
+            ctx.runner
+                .call("run", json!({ "case": s.case }), run_timeout, &serve)
+                .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
             let input = crate::driver::input_pacing(&driver.drags.take());
@@ -3273,7 +3431,20 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
             let sha = host::output(Command::new("git").arg("-C").arg(&root).args(["rev-parse", "--short=10", "HEAD"])).unwrap_or_default();
             let dirty = host::output(Command::new("git").arg("-C").arg(&root).args(["status", "--porcelain", "--untracked-files=no"])).is_some_and(|s| !s.is_empty());
             let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-            let mut v = Variant { role, spec: spec.to_string(), kind: Kind::Dir, label: if sha.is_empty() { name } else { format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }) }, root: Some(root.clone()), base_url: None, server: None, exe: None, commit: None, dirty, state: tree_state(&root), changed: Vec::new() };
+            let mut v = Variant {
+                role,
+                spec: spec.to_string(),
+                kind: Kind::Dir,
+                label: if sha.is_empty() { name } else { format!("{name}@{sha}{}", if dirty { " (dirty)" } else { "" }) },
+                root: Some(root.clone()),
+                base_url: None,
+                server: None,
+                exe: None,
+                commit: None,
+                dirty,
+                state: tree_state(&root),
+                changed: Vec::new(),
+            };
             v.commit = (!sha.is_empty()).then_some(sha);
             return Ok(v);
         } else {
@@ -3441,7 +3612,8 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
         }
         let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
         overlay_harness(v, &root, h)?;
-        let output = crate::target::isolate::per_os(&build["output"]).ok_or_else(|| Error::usage(format!("a native target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
+        let output = crate::target::isolate::per_os(&build["output"])
+            .ok_or_else(|| Error::usage(format!("a native target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
         let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
         let built = root.join(cache_fill(output, &root));
         let exe = dest.join(built.file_name().ok_or_else(|| Error::usage(format!("build output {output} is not a file")))?);
@@ -3517,6 +3689,7 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
     // Builds run on every CPU: strobe itself is pinned to the runner's CPUs, and children inherit
     // that. The pin comes back after it, and the machine settles before any timed block.
     let _unpinned = Unpinned::start();
+    let build_started = Instant::now();
     // A package with its own lockfile below the repository root (a site in a Rust repo) gets its own install:
     // a fresh worktree has none.
     if (cwd.join("bun.lock").exists() || cwd.join("bun.lockb").exists()) && !cwd.join("node_modules").exists() {
@@ -3570,7 +3743,17 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
         }
     }
     std::fs::write(marker, key)?;
+    // How long this build took here, for `plan` (SPEC §9.1).
+    let times = host::paths::sub("builds").join("times.json");
+    let mut all = store::read_json(&times).unwrap_or_else(|_| json!({}));
+    all[build_time_key(build)] = json!({ "ms": build_started.elapsed().as_secs_f64() * 1e3, "command": build["command"], "at": super::record::now_iso() });
+    let _ = store::write_json(&times, &all);
     Ok(())
+}
+
+/// A build's entry in `builds/times.json`: its command and folder as written in strobe.json.
+fn build_time_key(build: &Value) -> String {
+    hash_str(&format!("{}\n{}", build["command"], build["cwd"]))
 }
 
 /// While alive, strobe (and what it starts) may use every CPU; dropping it restores strobe's pin and
@@ -3824,6 +4007,9 @@ fn render(r: &Value) -> String {
         if looks.len() > 1 {
             out += &format!("  primary: {:.1}% intervals at planned looks ({} pairs), 95% overall (Pocock); others 95%\n", 100.0 * (1.0 - alpha), looks.join(", "));
         }
+        if s["primary"]["noworse"].is_number() {
+            out += "  no worse: the primary's interval against its margin, not 0: \"no worse\" once its worse end is inside it, \"worse\" once its better end is beyond it; each one-sided, 2.5% overall\n";
+        }
         let holm = s["holm_pairs"].as_u64().unwrap_or(0);
         if s["pairs"].as_u64().unwrap_or(0) < holm && s["decided"].as_bool() == Some(true) {
             out += &format!("  secondaries can only clear Holm from {holm} pairs: add --pairs {holm} for their verdicts\n");
@@ -3857,8 +4043,15 @@ fn render(r: &Value) -> String {
     if let Some(st) = r["stopped"].as_object() {
         let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let why = st.get("why").and_then(Value::as_str).unwrap_or("");
-        out += &format!("{}{}\n", if st.get("code").and_then(Value::as_i64) == Some(130) { "stopped: kept what finished".to_string() } else { format!("failed: {why}; kept what finished") }, if not_run.is_empty() { String::new() } else { format!("; not run: {}", not_run.join(", ")) });
+        out += &format!(
+            "{}{}\n",
+            if st.get("code").and_then(Value::as_i64) == Some(130) { "stopped: kept what finished".to_string() } else { format!("failed: {why}; kept what finished") },
+            if not_run.is_empty() { String::new() } else { format!("; not run: {}", not_run.join(", ")) }
+        );
         out += &format!("resume  strobe bench --resume {id}\n");
+    }
+    if let Some(t) = store::ledger::line(r) {
+        out += &format!("ledger  {t}\n");
     }
     out += &format!("{id} · strobe report experiment {id} --open\n");
     out
@@ -3870,10 +4063,16 @@ mod phase_tests {
 
     #[test]
     fn a_phase_sums_its_spans_and_is_unknown_when_never_entered() {
-        let marks: Vec<(String, u64)> = [("run:0:phase:finish:start", 1_000_000), ("run:0:phase:other:start", 1_500_000), ("run:0:phase:finish:end", 4_000_000), ("run:0:phase:finish:start", 10_000_000), ("run:0:phase:finish:end", 12_500_000)]
-            .into_iter()
-            .map(|(k, t)| (k.to_string(), t))
-            .collect();
+        let marks: Vec<(String, u64)> = [
+            ("run:0:phase:finish:start", 1_000_000),
+            ("run:0:phase:other:start", 1_500_000),
+            ("run:0:phase:finish:end", 4_000_000),
+            ("run:0:phase:finish:start", 10_000_000),
+            ("run:0:phase:finish:end", 12_500_000),
+        ]
+        .into_iter()
+        .map(|(k, t)| (k.to_string(), t))
+        .collect();
         assert_eq!(phase_ms(&marks, "finish"), 5.5);
         assert!(phase_ms(&marks, "other").is_nan());
         assert!(phase_ms(&marks, "start").is_nan());

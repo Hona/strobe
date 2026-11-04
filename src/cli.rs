@@ -31,6 +31,8 @@ const SWITCHES: &[&str] = &[
     "timeline",
     "perfetto",
     "no-browser",
+    "plan",
+    "pilot",
 ];
 
 #[derive(Clone)]
@@ -150,6 +152,10 @@ Use
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--bisect good..bad]           (the commit that moved the primary; one series)
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
+        [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
+  plan <file.bench.ts> [--base <variant>] [--head <variant>] [--filter …] [--effect <pct>] [--pilot]
+                                  before a bench: pairs and minutes per series from earlier runs here, builds, the slot's
+                                  queue (= bench --plan; --pilot runs 4 pairs first to learn the spread)
   bench --stop <exp> | --resume <exp>
                                   stop a running bench after its block (it keeps what finished), or go on with one
         --filter: case names, comma-separated; exact unless a name holds * (a glob)
@@ -164,6 +170,7 @@ Use
   open <rec_…|exp_…[/head|base|<block>|<case>]> [--perfetto] [--no-browser]
                                   the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
                                   and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory
+                                  (--no-browser: print the URL instead of opening it)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,

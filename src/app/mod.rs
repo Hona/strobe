@@ -77,6 +77,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
     match args.command.as_str() {
         "record" => record::run(args),
         "bench" => bench::run(args),
+        "plan" => bench::plan::run(args),
         "query" => query::run(args),
         "report" => report::run(args),
         "open" => open::run(args),

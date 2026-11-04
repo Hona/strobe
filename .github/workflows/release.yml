@@ -91,11 +91,12 @@ jobs:
           path: out
           retention-days: 1
 
+  # On a v* tag this publishes. Run by hand on a branch, it packs every package without publishing (a dry run).
   publish:
     needs: [windows-x64, linux, macos]
     runs-on: ubuntu-24.04
     # The npm environment takes deployments from v* tags only, and npm trusts only this environment.
-    environment: npm
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'npm' || '' }}
     permissions:
       contents: read
       id-token: write
@@ -122,4 +123,4 @@ jobs:
           want="v$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
           [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; }
       - name: Publish
-        run: bun scripts/release.ts --bin bin --publish
+        run: bun scripts/release.ts --bin bin ${{ startsWith(github.ref, 'refs/tags/v') && '--publish' || '' }}

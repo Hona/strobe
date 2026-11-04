@@ -109,10 +109,12 @@ impl Native {
             self.window = Some(s.clone());
         }
         let why = match &state {
-            None => Some("its window closed"),
-            Some(s) if !s.visible => Some("its window is hidden"),
-            Some(s) if s.iconic => Some("its window is minimized"),
-            Some(s) if s.cloaked => Some("its window is cloaked (another virtual desktop, or hidden by the compositor)"),
+            None => Some("window closed"),
+            Some(s) if !s.visible => Some("window is hidden"),
+            Some(s) if s.iconic && cfg!(target_os = "macos") => Some("window is off screen (minimized, or on another Space)"),
+            Some(s) if s.iconic => Some("window is minimized"),
+            Some(s) if s.cloaked && cfg!(target_os = "macos") => Some("window is covered by other apps' windows (strobe brings it to the front only after a minute without keyboard or mouse input, and with the Accessibility permission)"),
+            Some(s) if s.cloaked => Some("window is cloaked (another virtual desktop, or hidden by the compositor)"),
             _ => None,
         };
         match why {

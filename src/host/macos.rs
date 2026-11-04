@@ -65,6 +65,7 @@ unsafe extern "C" {
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> CFTypeRef;
+    fn CGEventSourceSecondsSinceLastEventType(state: i32, event_type: u32) -> f64;
     fn CGRectMakeWithDictionaryRepresentation(dict: CFTypeRef, rect: *mut CGRect) -> u8;
     fn CGSessionCopyCurrentDictionary() -> CFTypeRef;
     fn CGMainDisplayID() -> u32;
@@ -722,12 +723,23 @@ fn top_window(w: &Win) -> super::TopWindow {
 
 /// The largest normal window of `pids` (over 100×100 points), on screen first.
 pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
-    let all = windows(LIST_ALL | EXCLUDE_DESKTOP, 0);
-    all.iter()
+    main_win(pids).as_ref().map(top_window)
+}
+
+fn main_win(pids: &[u32]) -> Option<Win> {
+    windows(LIST_ALL | EXCLUDE_DESKTOP, 0)
+        .into_iter()
         .filter(|w| pids.contains(&w.pid) && w.layer == 0 && w.bounds.size.width * w.bounds.size.height > 10_000.0)
         .max_by(|a, b| (a.onscreen, a.bounds.size.width * a.bounds.size.height).partial_cmp(&(b.onscreen, b.bounds.size.width * b.bounds.size.height)).unwrap_or(std::cmp::Ordering::Equal))
-        .map(top_window)
 }
+
+/// Seconds since the last keyboard, mouse or trackpad input in this login session.
+fn user_idle_s() -> f64 {
+    unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) }
+}
+
+/// How long nobody may have touched this Mac before strobe brings a covered app to the front.
+const IDLE_BEFORE_ACTIVATE_S: f64 = 60.0;
 
 pub fn window_state(id: isize) -> Option<super::TopWindow> {
     windows(LIST_INCLUDING, id as u32).into_iter().find(|w| w.id == id as u32).map(|w| top_window(&w))
@@ -932,7 +944,21 @@ pub fn window_image(id: isize) -> Option<crate::png::Image> {
     Some(crate::png::Image { width, height, rgba })
 }
 
-/// macOS lets no app put another app's window on top without activating it (which takes focus): none.
-pub fn raise_windows(_pids: &[u32]) -> usize {
-    0
+/// macOS lets no app put another app's window on top without activating it, which takes the keyboard
+/// focus. So strobe activates the app only when other apps' windows cover its main window and nobody
+/// has used this Mac for a minute (an idle laptop running a bench, its apps maximized): a person at the
+/// keyboard keeps their focus, and a covered window stays `WindowHidden`. Returns 1 when the window
+/// is in view.
+pub fn raise_windows(pids: &[u32]) -> usize {
+    let Some(w) = main_win(pids) else { return 0 };
+    if !w.onscreen {
+        return 0;
+    }
+    if covered(&w) == 0.0 {
+        return 1;
+    }
+    if user_idle_s() < IDLE_BEFORE_ACTIVATE_S || !accessibility_trusted() {
+        return 0;
+    }
+    usize::from(crate::target::a11y::ax::activate(w.pid).is_ok() && covered(&w) == 0.0)
 }

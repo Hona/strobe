@@ -270,6 +270,7 @@ fn runs(
         &serve,
     )?;
     if !windowless {
+        n.raise();
         n.check_visible()?;
         drive.follow(n);
     }

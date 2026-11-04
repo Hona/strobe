@@ -51,6 +51,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
         "frames" => frames(&trace, &meta, top),
         "threads" => threads(&trace, top),
+        "gpu" if !trace.exists() => native_gpu(&meta),
         "gpu" => gpu(&trace, top),
         "hotspots" | "alloc" => {
             let by = args.get("by").unwrap_or("function");
@@ -79,6 +80,12 @@ pub fn run(args: &Args) -> Result<Output> {
             let by = args.get("by").unwrap_or("process");
             if !matches!(by, "process" | "layer" | "allocator") {
                 return Err(Error::usage(format!("--by: process, layer or allocator, not {by}")));
+            }
+            if dir.join("memory.json").exists() {
+                return native_memory(&dir, &meta, by, top, args.get("at"));
+            }
+            if meta["native"] == true || meta["pid"].is_u64() {
+                return Err(Error::usage(format!("this native recording has no memory reading: {}", crate::probe::memory::why_empty())));
             }
             memory(&dir, by, top, args.get("at"))
         }
@@ -530,9 +537,35 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
     Ok(Output::new(text, json))
 }
 
-/// Memory of `b` against `a` by process type and layer, at each recording's last census.
+/// A native recording's memory by what holds it (`memory.json`): one reading (`--at`, default the last).
+fn native_memory(dir: &Path, meta: &Value, by: &str, top: usize, at: Option<&str>) -> Result<Output> {
+    let (r, label) = reading_at(dir, at)?;
+    let (text, json) = crate::probe::memory::view(&r, &label, if by == "process" { "process" } else { "layer" }, top, &meta["values"]);
+    Ok(Output::new(text, json))
+}
+
+/// A native recording's memory reading by index (`--at 0`, negative from the end) or its last.
+fn reading_at(dir: &Path, at: Option<&str>) -> Result<(Value, String)> {
+    let all = store::read_json(&dir.join("memory.json"))?["readings"].as_array().cloned().unwrap_or_default();
+    if all.is_empty() {
+        return Err(Error::usage(format!("this recording has no memory reading: {}", crate::probe::memory::why_empty())));
+    }
+    let i = match at.map(|a| a.parse::<i64>()) {
+        None => all.len() - 1,
+        Some(Ok(i)) if i < 0 => all.len().saturating_sub(i.unsigned_abs() as usize),
+        Some(Ok(i)) => (i as usize).min(all.len() - 1),
+        Some(Err(_)) => return Err(Error::usage("--at: a reading index (0 is the first, -1 the last)")),
+    };
+    Ok((all[i].clone(), format!("reading {} of {}", i + 1, all.len())))
+}
+
+/// Memory of `b` against `a` by process type and layer, at each recording's last census (native
+/// recordings: by what holds it, at each one's last reading).
 pub fn memory_diff(a: &Path, b: &Path, top: usize) -> Result<Output> {
     let totals = |dir: &Path| -> Result<BTreeMap<String, f64>> {
+        if dir.join("memory.json").exists() {
+            return Ok(crate::probe::memory::totals(&reading_at(dir, None)?.0).into_iter().collect());
+        }
         let (c, _) = census_at(dir, None)?;
         let mut m: BTreeMap<String, f64> = BTreeMap::new();
         for p in c["processes"].as_array().into_iter().flatten() {
@@ -684,6 +717,65 @@ fn gpu(trace: &Path, top: usize) -> Result<Output> {
     sql_view(trace, &sql, top)
 }
 
+/// A recording without a trace (a native app, a process from outside): per adapter the target's
+/// engine use and GPU memory from the OS's GPU statistics, the device's own counters, and what
+/// reached the screen.
+fn native_gpu(meta: &Value) -> Result<Output> {
+    let os = if meta["os"].is_object() { &meta["os"] } else { &meta["gpu"] };
+    if !os.is_object() {
+        return Err(Error::usage("this recording has no GPU readings: they come from timing recordings (record, bench blocks kept with --keep or attribution)"));
+    }
+    let id = meta["id"].as_str().unwrap_or("");
+    let mut text = String::from("gpu      the target's processes, from the OS's per-process GPU statistics, over the recording\n");
+    if os["gpu_3d_pct"].is_null() && os["gpu_memory"].is_null() && os["vram_dedicated_mb"].is_null() {
+        text += "         unavailable: no per-process GPU statistics opened on this machine (Windows D3DKMT, Linux DRM client statistics, macOS IORegistry)\n";
+    }
+    let engines = os["gpu_adapters"].as_object().cloned().unwrap_or_default();
+    let memory = os["gpu_memory"].as_object().cloned().unwrap_or_default();
+    let mut adapters: Vec<&String> = engines.keys().chain(memory.keys()).collect();
+    adapters.sort();
+    adapters.dedup();
+    for a in &adapters {
+        text += &format!("  {a}\n");
+        if let Some(e) = engines.get(*a).and_then(Value::as_object) {
+            let mut e: Vec<(&String, f64)> = e.iter().map(|(k, v)| (k, v.as_f64().unwrap_or(0.0))).collect();
+            e.sort_by(|x, y| y.1.total_cmp(&x.1));
+            text += &format!("    engines  {}   (% of one engine)\n", e.iter().map(|(k, v)| format!("{k} {}", fmt::value(*v, "%"))).collect::<Vec<_>>().join(" · "));
+        }
+        if let Some(m) = memory.get(*a) {
+            let mb = |i: usize| fmt::bytes(m[i].as_f64().unwrap_or(f64::NAN) * 1048576.0);
+            text += &format!("    memory   {} dedicated · {} shared (system memory)\n", mb(0), mb(1));
+        }
+    }
+    if adapters.is_empty() && !os["gpu_3d_pct"].is_null() {
+        text += &format!(
+            "  no engine time or GPU memory on any adapter · VRAM {} · shared {}\n",
+            fmt::value(os["vram_dedicated_mb"].as_f64().unwrap_or(f64::NAN), "MB"),
+            fmt::value(os["vram_shared_mb"].as_f64().unwrap_or(f64::NAN), "MB")
+        );
+    }
+    if let Some(u) = os["gpu_unreadable_pids"].as_array().filter(|u| !u.is_empty()) {
+        text += &format!("  unreadable: pids {} (left out of the sums)\n", u.iter().map(|p| p.to_string()).collect::<Vec<_>>().join(", "));
+    }
+    let d = &os["device"];
+    if d.is_object() {
+        let f = |k: &str, unit: &str| d[k].as_f64().map(|v| format!("{} {}", k.split('_').next().unwrap_or(k), fmt::value(v, unit)));
+        let parts: Vec<String> = [f("gpu_pct", "%"), f("mem_pct", "%"), f("gfx_mhz", "MHz"), f("power_w", "W"), f("temp_c", "°C"), f("vram_used_mb", "MB")].into_iter().flatten().collect();
+        text += &format!("device   {}: {}   (the whole device, every process on it)\n", d["name"].as_str().unwrap_or("?"), parts.join(" · "));
+    }
+    let v = &meta["values"];
+    match (v["frames.n"].as_f64(), meta["presents_refused"].as_str().or(meta["os_frames"]["refused"].as_str())) {
+        (Some(n), _) => text += &format!("frames   {n:.0} on screen (OS present events): strobe query {id} frames\n"),
+        (None, Some(why)) => text += &format!("frames   refused: {why}\n"),
+        _ => {}
+    }
+    if meta["session_locked"] == true {
+        text += "session  locked: the compositor drew nothing, so engine use describes no screen (GPU memory does not depend on it)\n";
+    }
+    text += "no trace: a browser GPU process's tasks by name need a Chromium attribution recording\n";
+    Ok(Output::new(text, json!({ "gpu": os, "frames": v["frames.n"], "session_locked": meta["session_locked"] })))
+}
+
 /// A native recording's threads, busiest waker first: context switches per second over the measured
 /// runs, CPU per run from each thread's cycle counter, and its name.
 fn native_threads(dir: &Path, top: usize) -> Result<Output> {
@@ -696,8 +788,8 @@ fn native_threads(dir: &Path, top: usize) -> Result<Output> {
             "{:>10}  {:>12}  {:>7}  {:>7}  {:<6}  {}{started}\n",
             fmt::value(r["wakes_per_s"].as_f64().unwrap_or(f64::NAN), "count"),
             fmt::value(r["cpu_ms_per_run"].as_f64().unwrap_or(f64::NAN), "count"),
-            r["pid"],
-            r["tid"],
+            r["pid"].as_u64().unwrap_or(0),
+            r["tid"].as_u64().unwrap_or(0),
             r["origin"].as_str().unwrap_or("?"),
             r["name"].as_str().unwrap_or("(unnamed)")
         );

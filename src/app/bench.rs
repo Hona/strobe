@@ -88,6 +88,7 @@ const DESCRIPTIVE: &[&str] = &[
     "gpu.vram",
     "gpu.shared",
     "memory.app.private",
+    "memory.app.host",
     "cpu.wakes",
     "io.read",
     "io.write",
@@ -622,7 +623,10 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
                 .map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit))))
                 .or_else(|| s["refused"][name].as_str().map(|why| format!("{name} refused ({why})")))
         };
-        let value = s["declared"].as_array().into_iter().flatten().filter_map(|m| m.as_str().and_then(shown)).collect::<Vec<_>>().join(" · ");
+        // A launch's milestones too, declared or not: when each line or pixel change came.
+        let declared: Vec<&str> = s["declared"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        let milestones = s["values"].as_object().into_iter().flatten().map(|(k, _)| k.as_str()).filter(|k| k.starts_with("launch.") && !declared.contains(k));
+        let value = declared.iter().copied().chain(milestones).filter_map(shown).collect::<Vec<_>>().join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
@@ -665,17 +669,24 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
         let b = block_on_screen(ctx, s, v, 0, Set::Memory, true)?;
         progress(format!("  {} block  {}", b.variant, steps_text(&b.steps)));
         let mut entry = b.leak.clone().unwrap_or(Value::Null);
-        progress(format!("  {:<5} js heap  {}", v.role, entry["js_heap"]["verdict"].as_str().unwrap_or("")));
-        progress(format!("  {:<5} dom      {}", v.role, entry["dom_nodes"]["verdict"].as_str().unwrap_or("")));
-        decided &= entry["js_heap"]["decided"].as_bool() == Some(true);
+        // A native target has no JS heap: its host memory (memory.app.host) is what grows.
+        if entry["native_host"].is_object() {
+            progress(format!("  {:<5} host     {}", v.role, entry["native_host"]["verdict"].as_str().unwrap_or("")));
+            decided &= entry["native_host"]["decided"].as_bool() == Some(true);
+        } else {
+            progress(format!("  {:<5} js heap  {}", v.role, entry["js_heap"]["verdict"].as_str().unwrap_or("")));
+            progress(format!("  {:<5} dom      {}", v.role, entry["dom_nodes"]["verdict"].as_str().unwrap_or("")));
+            decided &= entry["js_heap"]["decided"].as_bool() == Some(true);
+        }
         entry["recording"] = json!(b.recording);
         entry["values"] = json!(b.values);
         leak[v.role] = entry;
     }
-    let head = &leak["head"]["js_heap"];
+    let (metric, part) = if leak["head"]["native_host"].is_object() { ("memory.app.host", "native_host") } else { ("js.heap.growth", "js_heap") };
+    let head = &leak["head"][part];
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak",
-        "primary": { "metric": "js.heap.growth", "verdict": head["verdict"], "decided": head["decided"] },
+        "primary": { "metric": metric, "verdict": head["verdict"], "decided": head["decided"] },
         "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
         "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
     }))
@@ -1549,8 +1560,8 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
 /// Whether a series can run while the session is locked (SPEC §10.1 `SessionLocked`): nothing it
 /// measures needs a presenting window. Script targets; leak runs; and a native target with
 /// `window: false` (a tray app), or any native target under `--check` (no verdict: it validates the
-/// file), whose metrics are all CPU (`ui.*` too), memory, IO, counters, its run time, GPU use as a
-/// secondary (refused while locked) and launch milestones (not pixels).
+/// file), whose metrics are all CPU (`ui.*` too), memory (GPU memory too), IO, counters, its run
+/// time, GPU use as a secondary (refused while locked) and launch milestones (not pixels).
 fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
     let t = &ctx.describe["targets"][&s.target];
     let offscreen = |m: &str| {
@@ -1560,19 +1571,27 @@ fn runs_locked(ctx: &Ctx, s: &Series, set: Set) -> bool {
         "script" => true,
         _ if set == Set::Memory => true,
         "native" if t["window"] == false || ctx.check || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => {
-            !s.primary.starts_with("gpu.") && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
+            !gpu_use(&s.primary) && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
         }
         _ => false,
     }
 }
 
+/// GPU use (engine time, compiles), as opposed to GPU memory (`gpu.vram`, `gpu.shared`): what the app
+/// allocated is the same whether or not a compositor shows it, but the work a GPU does for a screen
+/// nobody sees is not.
+fn gpu_use(metric: &str) -> bool {
+    metric.starts_with("gpu.") && metric != "gpu.vram" && metric != "gpu.shared"
+}
+
 /// Records a block's lock state. On a locked screen the compositor draws nothing, so GPU use there
-/// describes no person's screen: its values go, and a series that declares one shows it refused.
+/// describes no person's screen: its values go, and a series that declares one shows it refused. GPU
+/// memory stays: allocations need no presenting window, and both blocks of a pair share the state.
 fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
     b.locked = locked;
     if locked {
-        b.values.retain(|k, _| !k.starts_with("gpu."));
-        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("gpu.")) {
+        b.values.retain(|k, _| !gpu_use(k));
+        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| gpu_use(m)) {
             b.refused.insert(m.clone(), "SessionLocked: the session was locked, so the compositor drew nothing and GPU use describes no screen".into());
         }
     }
@@ -2867,7 +2886,12 @@ fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>, Option<u64
 fn leak_text(r: &Value, s: &Value, file: &str) -> String {
     let n = s["runs_per_half"].as_u64().unwrap_or(0);
     let mut out = format!("strobe bench {file} · {} · leak run\n", s["label"].as_str().unwrap_or(""));
-    out += &format!("plan   warmup, then S0 · {n} runs · S1 · {n} runs · S2 · a post-GC census after every run · {}\n", r["plan"]["pin"].as_str().unwrap_or(""));
+    let plan = if s["primary"]["metric"] == "memory.app.host" {
+        format!("warmup, then {} runs with the processes' memory read before the first and after each", 2 * n)
+    } else {
+        format!("warmup, then S0 · {n} runs · S1 · {n} runs · S2 · a post-GC census after every run")
+    };
+    out += &format!("plan   {plan} · {}\n", r["plan"]["pin"].as_str().unwrap_or(""));
     out += &format!("time   {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64));
     for v in r["variants"].as_array().into_iter().flatten() {
         let role = v["role"].as_str().unwrap_or("");
@@ -2881,6 +2905,15 @@ fn leak_text(r: &Value, s: &Value, file: &str) -> String {
         let bytes = |x: f64| format!("{}{}", if x < 0.0 { "−" } else { "+" }, fmt::bytes(x.abs()));
         let nodes = |x: f64| format!("{x:+.1}");
         out += &format!("\n{role} {}\n", v["label"].as_str().unwrap_or(""));
+        // A native target: its processes' memory read between runs, no heap snapshots.
+        if l["native_host"].is_object() {
+            out += &format!("  host      {}  · {}\n", l["native_host"]["verdict"].as_str().unwrap_or(""), range(&l["native_host"], &bytes));
+            if l["native_private"].is_object() {
+                out += &format!("  private   {}  · {}\n", l["native_private"]["verdict"].as_str().unwrap_or(""), range(&l["native_private"], &bytes));
+            }
+            out += &format!("  next      strobe query {} memory --at 0 · strobe query {} memory\n", l["recording"].as_str().unwrap_or(""), l["recording"].as_str().unwrap_or(""));
+            continue;
+        }
         out += &format!("  js heap   {}  · {}\n", l["js_heap"]["verdict"].as_str().unwrap_or(""), range(&l["js_heap"], &bytes));
         out += &format!("  dom       {}  · {}\n", l["dom_nodes"]["verdict"].as_str().unwrap_or(""), range(&l["dom_nodes"], &nodes));
         let sus = &l["suspects"];
@@ -2890,7 +2923,11 @@ fn leak_text(r: &Value, s: &Value, file: &str) -> String {
         }
         out += &format!("  next      strobe query {} leaks · strobe query {} memory\n", l["recording"].as_str().unwrap_or(""), l["recording"].as_str().unwrap_or(""));
     }
-    out += "\n  slopes: Theil–Sen over the censuses, Sen's 95% interval; bound max(16 KB, 0.1% of the heap) and 1 DOM node per run\n\n";
+    out += if s["primary"]["metric"] == "memory.app.host" {
+        "\n  slopes: Theil–Sen over the readings, Sen's 95% interval; bound max(16 KB, 0.1% of host memory) per run\n  host is memory.app.host (heap, stacks, anonymous memory), read before run 1 and after every run; private is memory.app.private\n\n"
+    } else {
+        "\n  slopes: Theil–Sen over the censuses, Sen's 95% interval; bound max(16 KB, 0.1% of the heap) and 1 DOM node per run\n\n"
+    };
     out
 }
 

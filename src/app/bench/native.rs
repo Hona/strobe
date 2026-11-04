@@ -8,6 +8,7 @@ use super::launch::{Line, found_all, joined, milestones, no_page, screen_times, 
 use super::*;
 use crate::driver::native::{Log, Session};
 use crate::etw::{PresentCapture, frames};
+use crate::probe::memory;
 use crate::probe::wakes::{self, Snapshot, Span};
 use crate::target::native::{self as nt, Native};
 use std::cell::OnceCell;
@@ -112,13 +113,10 @@ fn frame_metric(metric: &str) -> bool {
 }
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
-    if set == Set::Memory {
-        return Err(Error::usage("a leak run (--probes memory) follows a JS heap; a native target has none"));
-    }
     let target = ctx.describe["targets"][&s.target].clone();
     let app = app(v, &target, &ctx.config)?;
     // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
-    let timed = set != Set::Attribution && ctx.pixels_dir.is_none();
+    let timed = set != Set::Attribution && set != Set::Memory && ctx.pixels_dir.is_none();
     if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
         return Err(Error::refused(
             "DevBuild",
@@ -217,7 +215,7 @@ fn runs(
     // in attribution blocks, through the helper.
     let presents: RefCell<Option<PresentCapture>> = RefCell::new(None);
     let mut presents_err: Option<String> = None;
-    if !windowless && set != Set::Attribution {
+    if !windowless && set != Set::Attribution && set != Set::Memory {
         match PresentCapture::start() {
             Ok(c) => *presents.borrow_mut() = Some(c),
             Err(e) => presents_err = Some(e.message),
@@ -282,7 +280,12 @@ fn runs(
     let mut runs: Vec<Run> = Vec::new();
     let mut first: Option<usize> = None;
     let mut unsteady = false;
-    while first.is_none_or(|f| runs.len() < f + ctx.runs) {
+    // A leak run (`--probes memory`, SPEC §8.6): 2 × N runs after warmup, the processes' memory read
+    // before the first and after each, between runs.
+    let leak = set == Set::Memory;
+    let measured_runs = if leak { 2 * ctx.runs } else { ctx.runs };
+    let mut readings: Vec<memory::Reading> = Vec::new();
+    while first.is_none_or(|f| runs.len() < f + measured_runs) {
         let i = runs.len();
         let began = Instant::now();
         if !windowless {
@@ -316,6 +319,9 @@ fn runs(
                 .map_err(|e| Error::refused("RunIncomplete", format!("{} reset: {}", s.case, e.message), "fix the case's reset"))?;
         }
         runs[i].total = began.elapsed().as_secs_f64() * 1e3;
+        if leak && first.is_some() {
+            readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - first.unwrap_or(0))));
+        }
         if ctx.check {
             first = Some(0);
         } else if first.is_none() {
@@ -326,7 +332,10 @@ fn runs(
             };
             if steady || i >= MAX_WARMUP {
                 unsteady = !steady;
-                first = Some(if steady && set != Set::Attribution { i - 1 } else { i + 1 });
+                first = Some(if steady && set != Set::Attribution && !leak { i - 1 } else { i + 1 });
+                if leak {
+                    readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
+                }
             }
         }
     }
@@ -519,6 +528,15 @@ fn runs(
     if private_mb > 0.0 {
         values.insert("memory.app.private".into(), private_mb);
     }
+    // What holds that memory (host, GPU, files, images), read after the runs; a leak run read it
+    // between them.
+    if !leak {
+        readings.push(memory::Reading::take(&n.processes(), "after the runs"));
+    }
+    if let Some(r) = readings.last() {
+        values.extend(r.values().into_iter().map(|(k, x)| (k.to_string(), x)));
+    }
+    let leak_result = leak.then(|| native_leak(&readings, ctx.runs));
     if let Some(v) = gpu_runs.last().and_then(|g| g.vram_dedicated_mb) {
         values.insert("gpu.vram".into(), v);
     }
@@ -574,6 +592,7 @@ fn runs(
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }
+        store::write_json(&dir.join("memory.json"), &json!({ "readings": readings }))?;
         // Native stacks of the measured runs only: warmup runs, and each run's reset between them,
         // are sampled too (the session runs throughout) and are not the case.
         let stacks_note = match &stacks {
@@ -593,7 +612,9 @@ fn runs(
                 "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
                 "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": refused, "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
-                "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
+                // The OS and GPU samples over the measured runs, for `query gpu`.
+                "os": samples.window(measured[0].t0, measured[measured.len() - 1].t1), "leak": leak_result,
+                "timing": if set == Set::Timing || set == Set::Lean { "clean" } else { "perturbed" },
                 "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
             }),
         )?;
@@ -619,8 +640,25 @@ fn runs(
         recording,
         background,
         refused,
+        leak: leak_result,
         ..Block::default()
     })
+}
+
+/// A native leak run's verdict (SPEC §8.6): growth per run of the processes' host memory (heap,
+/// stacks, anonymous memory: `memory.app.host`) over the 2 × N + 1 readings, Theil–Sen with Sen's
+/// 95% interval, against max(16 KB, 0.1% of it) per run. A native allocator keeps freed memory for
+/// reuse, so a heap that fills up and then holds steady reads "grows, then levels off".
+fn native_leak(readings: &[memory::Reading], n: usize) -> Value {
+    let complete = readings.iter().all(memory::Reading::complete) && !readings.is_empty();
+    if !complete {
+        return json!({ "native_host": { "verdict": format!("unclear: no complete memory reading ({})", memory::why_empty()), "decided": false }, "runs": 2 * n });
+    }
+    let host: Vec<f64> = readings.iter().map(|r| r.host() as f64).collect();
+    let private: Vec<f64> = readings.iter().map(|r| r.processes.iter().map(|m| m.private).sum::<u64>() as f64).collect();
+    let bytes = |v: f64| format!("{}{}", if v < 0.0 { "−" } else { "+" }, fmt::bytes(v.abs()));
+    let bound = (0.001 * metrics::median(&host)).max(16_384.0);
+    json!({ "runs": 2 * n, "readings": readings.len(), "native_host": growth(&host, n, bound, &bytes), "native_private": growth(&private, n, bound, &bytes), "host_bytes": host, "private_bytes": private })
 }
 
 /// Why a declared metric has no value on a native target.
@@ -934,6 +972,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             (sample.at, sample.cycles)
         };
         lap("ready", &mut steps);
+        // An attribution launch's threads from the spawn until ready: wakes and CPU per thread without
+        // a trace, read once it is ready (threads that already exited are not in it).
+        let launch_span = profile.then(|| wakes::span(&Snapshot::empty(n.at_ns, clock.0), &Snapshot::take(&n.pids())));
         // The tree's cycles at ready (it started at zero) over the time stamp counter's rate.
         let cpu_ms = match (clock.0, host::tsc()) {
             (Some(a), Some(b)) if b > a && ready.1 > 0 => ready.1 as f64 / ((b - a) as f64 / (clock.1.elapsed().as_secs_f64() * 1e3)),
@@ -997,11 +1038,23 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 Some(Err(e)) => format!("native stacks failed: {}", e.message),
                 None => "native stacks need the deep helper (strobe up, SPEC §13.4)".into(),
             };
+            let mut meta_values = json!(values);
+            if let Some(span) = &launch_span {
+                let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
+                let spans = std::slice::from_ref(span);
+                store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(spans, &names, &wakes::modules(spans))))?;
+                store::write_json(&dir.join("runs.json"), &json!([{ "run": "launch", "ms": span.ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]))?;
+                if !span.threads.is_empty() {
+                    meta_values["cpu.wakes"] = json!(span.wakes_per_s());
+                    meta_values["io.read"] = json!(span.io_read);
+                    meta_values["io.write"] = json!(span.io_write);
+                }
+            }
             store::write_json(
                 &dir.join("meta.json"),
                 &json!({
                     "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label,
-                    "target": app.exe, "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
+                    "target": app.exe, "probes": "attribution", "runs": 1, "values": meta_values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
                     "timing": "perturbed",
                     "note": format!("a native launch's attribution: its values and output, not timed; {stacks_note}"),
                 }),

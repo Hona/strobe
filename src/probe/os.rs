@@ -373,6 +373,9 @@ pub struct Summary {
     pub vram_dedicated_mb: Option<f64>,
     /// The tree's shared GPU memory over all adapters, last value in the window.
     pub vram_shared_mb: Option<f64>,
+    /// Adapter → the tree's (dedicated, shared) GPU memory on it, MB, last value in the window.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub gpu_memory: BTreeMap<String, (f64, f64)>,
     /// Tree PIDs the GPU fields exclude because their statistics could not be opened (a warning).
     pub gpu_unreadable_pids: Vec<u32>,
     /// NVML averages for the device behind `gpu_adapter` (the first device when the tree used
@@ -476,6 +479,10 @@ impl Samples {
             if cfg!(not(target_os = "macos")) {
                 s.vram_dedicated_mb = Some(last.vram.iter().map(|m| m.dedicated).sum::<u64>() as f64 / MB);
                 s.vram_shared_mb = Some(last.vram.iter().map(|m| m.shared).sum::<u64>() as f64 / MB);
+                for m in last.vram.iter().filter(|m| m.dedicated + m.shared > 0) {
+                    let e = s.gpu_memory.entry(adapter_name(m.adapter)).or_default();
+                    (e.0, e.1) = (e.0 + m.dedicated as f64 / MB, e.1 + m.shared as f64 / MB);
+                }
             }
             s.gpu_unreadable_pids = self.gpu_unreadable.clone();
         }

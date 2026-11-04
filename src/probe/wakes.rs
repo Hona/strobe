@@ -32,6 +32,11 @@ impl Snapshot {
         }
     }
 
+    /// Nothing yet, at `at_ns` (a tree about to start): a span from it counts every thread from zero.
+    pub fn empty(at_ns: u64, tsc: Option<u64>) -> Snapshot {
+        Snapshot { at_ns, tsc, ..Snapshot::default() }
+    }
+
     pub fn is_empty(&self) -> bool {
         self.threads.is_empty()
     }

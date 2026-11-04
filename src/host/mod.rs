@@ -163,6 +163,51 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     }
 }
 
+/// One process's memory by what holds it (SPEC §8.6), in bytes. Windows walks its address space
+/// (committed regions); Linux reads `smaps` (resident and swapped pages).
+#[derive(Clone, Debug, Default, Serialize)]
+pub struct MemoryMap {
+    pub pid: u32,
+    pub name: String,
+    /// What `memory.app.private` reads: the commit charge (Windows), which includes commit held for
+    /// the process's GPU allocations; private resident and swapped pages (Linux), device mappings too.
+    pub private: u64,
+    /// `memory.app.host`: memory the process allocated in its own address space (heap, stacks,
+    /// anonymous mappings), without GPU memory mapped into it.
+    pub host: u64,
+    /// GPU memory mapped for the CPU: write-combined or uncached regions (Windows: a GPU driver maps
+    /// the VRAM it allocates for the process this way, and Windows charges it as commit), GPU device
+    /// mappings (Linux). `gpu.vram` and `gpu.shared` count the allocations themselves.
+    pub gpu_mapped: u64,
+    /// Shared memory sections (pagefile-backed on Windows, shmem and memfd on Linux).
+    pub shared: u64,
+    /// Mapped data files.
+    pub files: u64,
+    /// Executables and libraries: code and their data.
+    pub image: u64,
+    /// Windows: commit charged to the process with no private mapping in its address space (page
+    /// tables, commit a driver holds for it).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmapped: Option<u64>,
+    pub working_set: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub private_working_set: Option<u64>,
+}
+
+/// `pid`'s memory by what holds it. None where it cannot be read: a process strobe cannot open, and
+/// on macOS any other process (its regions need its task port, which only a debugger gets).
+pub fn memory_map(pid: u32) -> Option<MemoryMap> {
+    #[cfg(any(windows, target_os = "linux"))]
+    {
+        os::memory_map(pid)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
 /// One process from a system snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct ProcInfo {

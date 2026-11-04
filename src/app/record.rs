@@ -29,15 +29,38 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         }
     }
     let out = super::bench::run(&b)?;
-    let recordings: Vec<Value> = out.json["series"].as_array().into_iter().flatten().filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()? }))).collect();
+    let recordings: Vec<Value> = out.json["series"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "declared": s["declared"] })))
+        .collect();
     if recordings.is_empty() {
         return Err(Error::msg(format!("{case}: no recording (the case failed or matched nothing):\n{}", out.text)));
     }
     let mut text = String::new();
     for r in &recordings {
         let rec = r["recording"].as_str().unwrap_or("");
-        text +=
-            &format!("{rec} · {} · attribution\nnext     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n", r["case"].as_str().unwrap_or(""));
+        text += &format!("{rec} · {} · attribution\n", r["case"].as_str().unwrap_or(""));
+        // The check run before it (one cold run, timed): its launch milestones and declared metrics.
+        text += &launch_line(&r["values"]);
+        let declared: Vec<String> = r["declared"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter(|m| !m.starts_with("launch."))
+            .filter_map(|m| Some(format!("{m} {}", fmt::value(r["values"][m].as_f64()?, crate::model::metric(m).map_or("", |d| d.unit)))))
+            .collect();
+        if !declared.is_empty() {
+            text += &format!("check    {}   (one cold run before it)\n", declared.join(" · "));
+        }
+        let native = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).is_some_and(|m| m["native"] == true);
+        text += &if native {
+            format!("next     strobe query {rec} threads · strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe query {rec} summary\n")
+        } else {
+            format!("next     strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe report recording {rec} --open\n")
+        };
     }
     Ok(Output::new(text, json!({ "recordings": recordings })))
 }
@@ -322,6 +345,10 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             values.insert("gpu.shared", v);
         }
         values.insert("memory.app.private", n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
+        // What holds that memory (host, GPU, files, images), read after the window.
+        let reading = probe::memory::Reading::take(&n.processes(), "after the recording");
+        values.extend(reading.values());
+        store::write_json(&dir.join("memory.json"), &json!({ "readings": [&reading] }))?;
         // The UI thread: the main window's, from its own cycle counter and context switches.
         let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
         if let Some(t) = ui_tid.and_then(|tid| span.threads.iter().find(|t| t.tid == tid)) {
@@ -504,22 +531,19 @@ fn native_summary(meta: &Value) -> String {
     let id = meta["id"].as_str().unwrap_or("");
     let target = meta["target"].as_str().map(str::to_string).unwrap_or_else(|| meta["target"].to_string());
     let mut s = format!("{id} · {target} · {} · {} · native\n", fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)), meta["probes"].as_str().unwrap_or(""));
-    s += &format!("cpu      {} of one core · {} in the run, all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
+    if meta["launch"] == true {
+        s += &launch_line(v);
+        s += &format!("cpu      {} from the spawn until ready, all processes\n", fmt::value(get("cpu.work"), "ms"));
+    } else {
+        s += &format!("cpu      {} of one core · {} in the run, all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
+    }
     if get("cpu.wakes").is_finite() {
         s += &format!("wakes    {} context switches of its threads\n", fmt::value(get("cpu.wakes"), "/s"));
     }
     if get("io.read").is_finite() {
         s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
     }
-    if get("memory.app.private").is_finite() {
-        s += &format!(
-            "gpu      3D {} · VRAM {} · shared {} · memory {} private\n",
-            fmt::value(get("gpu.process.3d"), "%"),
-            fmt::value(get("gpu.vram"), "MB"),
-            fmt::value(get("gpu.shared"), "MB"),
-            fmt::value(get("memory.app.private"), "MB")
-        );
-    }
+    s += &memory_lines(v);
     if get("ui.cpu").is_finite() {
         s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
     }
@@ -534,7 +558,39 @@ fn native_summary(meta: &Value) -> String {
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: take times with --probes timing\n";
     }
-    s += &format!("next     strobe query {id} threads · strobe query {id} frames\n");
+    s += &if meta["launch"] == true {
+        format!("next     strobe query {id} threads (spawn until ready) · strobe query {id} hotspots\n")
+    } else {
+        format!("next     strobe query {id} threads · strobe query {id} memory · strobe query {id} gpu · strobe query {id} frames\n")
+    };
+    s
+}
+
+/// A launch's milestones from the spawn, ready first: `launch   ready 412 ms · up 380 ms · painted 300 ms`.
+pub fn launch_line(v: &Value) -> String {
+    let mut ms: Vec<(&str, f64)> = v.as_object().into_iter().flatten().filter_map(|(k, x)| Some((k.strip_prefix("launch.")?, x.as_f64()?))).collect();
+    if ms.is_empty() {
+        return String::new();
+    }
+    ms.sort_by(|a, b| (a.0 != "ready").cmp(&(b.0 != "ready")).then(a.1.total_cmp(&b.1)));
+    format!("launch   {}   (from the spawn)\n", ms.iter().map(|(k, x)| format!("{k} {}", fmt::value(*x, "ms"))).collect::<Vec<_>>().join(" · "))
+}
+
+/// A native target's GPU use and memory: what the GPU's statistics say and what holds the processes'
+/// memory (`memory.app.host` beside `memory.app.private`).
+pub fn memory_lines(v: &Value) -> String {
+    let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let mut s = String::new();
+    if get("gpu.process.3d").is_finite() || get("gpu.vram").is_finite() {
+        s += &format!("gpu      3D {} · VRAM {} · shared {}\n", fmt::value(get("gpu.process.3d"), "%"), fmt::value(get("gpu.vram"), "MB"), fmt::value(get("gpu.shared"), "MB"));
+    }
+    if get("memory.app.private").is_finite() {
+        s += &format!("memory   {} private", fmt::value(get("memory.app.private"), "MB"));
+        if get("memory.app.host").is_finite() {
+            s += &format!(" · {} host (allocated in the processes; private also counts GPU memory held for them)", fmt::value(get("memory.app.host"), "MB"));
+        }
+        s += "\n";
+    }
     s
 }
 

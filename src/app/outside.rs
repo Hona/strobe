@@ -1,5 +1,6 @@
 //! `strobe record pid:<n>|proc:<name>` (SPEC §13.6): any running process, from the outside. Timing:
-//! what the OS put on the screen for its tree (present events), its CPU (cycle counters) and GPU.
+//! what the OS put on the screen for its tree (present events), its CPU (cycle counters), its threads'
+//! wakes and CPU, IO, GPU, and what holds its memory: the views a launched native app gets.
 //! `--probes deep`: native stacks from the kernel's sampled profile (attribution, through the helper).
 
 use super::{Output, fmt, progress};
@@ -7,7 +8,7 @@ use crate::cli::{Args, duration_ms};
 use crate::etw::{self, frames};
 use crate::host;
 use crate::model::{Error, Result};
-use crate::probe;
+use crate::probe::{self, wakes};
 use crate::store;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -81,19 +82,48 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
     let sampler = probe::os::Sampler::start(root);
     let cycles = || host::process_tree(root).iter().map(|p| p.cycles).sum::<u64>();
+    // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
+    let snap0 = wakes::Snapshot::take(&host::tree_pids(root));
     let (c0, tsc0, t0) = (cycles(), host::tsc(), host::now_ns());
     progress(format!("recording {name} ({root}) for {}", fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     let (c1, tsc1, t1) = (cycles(), host::tsc(), host::now_ns());
+    let tree = host::process_tree(root);
+    let pids: Vec<u32> = tree.iter().map(|p| p.pid).collect();
+    let span = wakes::span(&snap0, &wakes::Snapshot::take(&pids));
     let os = sampler.stop().window(t0, t1);
     let presents = presents.and_then(|p| p.stop());
     let session_locked = locked(&awake);
+    let ms = (t1 - t0) as f64 / 1e6;
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
     if let (Some(a), Some(b)) = (tsc0, tsc1)
         && b > a
     {
         values.insert("cpu.app.total".into(), 100.0 * c1.saturating_sub(c0) as f64 / (b - a) as f64);
+        values.insert("cpu.work".into(), c1.saturating_sub(c0) as f64 / (b - a) as f64 * ms);
     }
+    if !span.threads.is_empty() {
+        values.insert("cpu.wakes".into(), span.wakes_per_s());
+        values.insert("io.read".into(), span.io_read as f64);
+        values.insert("io.write".into(), span.io_write as f64);
+    }
+    // The UI thread: the thread that owns the tree's main window, when it has one.
+    let ui_tid = host::main_window(&pids).and_then(|w| host::window_thread(w.hwnd));
+    if let Some(t) = ui_tid.and_then(|tid| span.threads.iter().find(|t| t.tid == tid)) {
+        if let Some(c) = t.cpu_ms {
+            values.insert("ui.cpu".into(), c);
+        }
+        values.insert("ui.wakes".into(), t.switches as f64 / (ms / 1e3));
+    }
+    let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
+    let spans = std::slice::from_ref(&span);
+    store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(spans, &names, &wakes::modules(spans))))?;
+    store::write_json(&dir.join("runs.json"), &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]))?;
+    // What holds the tree's memory, read after the window.
+    values.insert("memory.app.private".into(), tree.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
+    let reading = probe::memory::Reading::take(&tree, "after the recording");
+    values.extend(reading.values().into_iter().map(|(k, v)| (k.to_string(), v)));
+    store::write_json(&dir.join("memory.json"), &json!({ "readings": [&reading] }))?;
     if let Some(p) = os.gpu_3d_pct {
         values.insert("gpu.process.3d".into(), p);
     }
@@ -126,7 +156,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     };
     let meta = json!({
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
-        "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked,
+        "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,
         "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true,
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -171,12 +201,19 @@ pub fn text(meta: &Value) -> String {
         s += "session  locked: CPU and GPU numbers compare only with other locked recordings\n";
     }
     if get("cpu.app.total").is_finite() {
-        s += &format!("cpu      {} of one core, process tree", fmt::value(get("cpu.app.total"), "%"));
-        if get("gpu.process.3d").is_finite() {
-            s += &format!(" · gpu 3D {}", fmt::value(get("gpu.process.3d"), "%"));
-        }
-        s += "\n";
+        s += &format!("cpu      {} of one core · {} in the window, process tree\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
     }
-    s += &format!("next     strobe query {id} summary · strobe record {} --probes deep (native stacks)\n", meta["target"].as_str().unwrap_or(""));
+    if get("cpu.wakes").is_finite() {
+        s += &format!("wakes    {} context switches of its threads\n", fmt::value(get("cpu.wakes"), "/s"));
+        s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
+    }
+    if get("ui.cpu").is_finite() {
+        s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
+    }
+    s += &super::record::memory_lines(v);
+    s += &format!(
+        "next     strobe query {id} threads · strobe query {id} memory · strobe query {id} gpu · strobe record {} --probes deep (native stacks)\n",
+        meta["target"].as_str().unwrap_or("")
+    );
     s
 }

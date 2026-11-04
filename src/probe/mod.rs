@@ -9,6 +9,7 @@ pub mod gpu_linux;
 #[cfg(target_os = "macos")]
 pub mod gpu_macos;
 pub mod heap;
+pub mod memory;
 pub mod os;
 #[cfg(target_os = "linux")]
 pub mod perf;

@@ -86,6 +86,51 @@ fn private_bytes(pid: u32) -> u64 {
         * 1024
 }
 
+/// One process's memory by what holds it, from `smaps`: per mapping its resident pages, private ones
+/// (clean, dirty and swapped, as `private_bytes` counts) and what backs it.
+pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
+    let text = read(format!("/proc/{pid}/smaps"))?;
+    // (perms, path, resident, private resident, swapped) per mapping.
+    let mut maps: Vec<(String, String, u64, u64, u64)> = Vec::new();
+    for line in text.lines() {
+        let mut f = line.split_whitespace();
+        let first = f.next().unwrap_or("");
+        if first.contains('-') && !first.ends_with(':') {
+            let perms = f.next().unwrap_or("").to_string();
+            let path = f.nth(3).map(|p| line[line.find(p).unwrap_or(0)..].to_string()).unwrap_or_default();
+            maps.push((perms, path, 0, 0, 0));
+        } else if let Some(m) = maps.last_mut() {
+            let kb = f.next().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+            match first {
+                "Rss:" => m.2 += kb,
+                "Private_Clean:" | "Private_Dirty:" => m.3 += kb,
+                "Swap:" => m.4 += kb,
+                _ => {}
+            }
+        }
+    }
+    // A file with an executable mapping is a module: its other segments (data, relocations) are too.
+    let modules: std::collections::HashSet<&str> = maps.iter().filter(|m| m.0.contains('x') && m.1.starts_with('/')).map(|m| m.1.as_str()).collect();
+    let mut out = super::MemoryMap { pid, ..super::MemoryMap::default() };
+    let gpu = |p: &str| ["/dev/dri/", "/dev/nvidia", "/dev/kgsl", "/dev/mali", "/dev/accel/"].iter().any(|d| p.starts_with(d));
+    let mut private_resident = 0;
+    for (perms, path, rss, resident, swap) in &maps {
+        out.private += resident + swap;
+        out.working_set += rss;
+        private_resident += resident;
+        let shared_mem = perms.ends_with('s') || ["/dev/shm/", "/memfd:", "/SYSV"].iter().any(|d| path.starts_with(d));
+        match () {
+            _ if gpu(path) => out.gpu_mapped += rss + swap,
+            _ if shared_mem => out.shared += rss + swap,
+            _ if modules.contains(path.as_str()) || path.starts_with("[v") => out.image += rss,
+            _ if path.starts_with('/') => out.files += rss,
+            _ => out.host += resident + swap,
+        }
+    }
+    out.private_working_set = Some(private_resident);
+    Some(out)
+}
+
 /// Children by parent, following only children that started no earlier than their parent (a reused pid).
 fn tree_of(all: &[Stat], root: u32) -> Vec<usize> {
     let Some(r) = all.iter().position(|p| p.pid == root) else { return Vec::new() };

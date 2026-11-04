@@ -102,6 +102,95 @@ fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
     }
 }
 
+/// One process's memory by what holds it: its commit charge and working sets, and a walk of its
+/// address space (`VirtualQueryEx`, committed regions). None when the process cannot be opened.
+pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
+    use windows_sys::Win32::System::Memory::{
+        MEM_COMMIT, MEM_IMAGE, MEM_MAPPED, MEM_PRIVATE, MEMORY_BASIC_INFORMATION, PAGE_EXECUTE_READWRITE, PAGE_EXECUTE_WRITECOPY, PAGE_NOCACHE, PAGE_READWRITE, PAGE_WRITECOMBINE, PAGE_WRITECOPY,
+        VirtualQueryEx,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{K32GetMappedFileNameW, PROCESS_MEMORY_COUNTERS_EX2};
+    use windows_sys::Win32::System::Threading::{PROCESS_QUERY_INFORMATION, PROCESS_VM_READ};
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let mut m = super::MemoryMap { pid, ..super::MemoryMap::default() };
+        // The private working set needs Windows 11 (or Server 2022); the commit charge is everywhere.
+        let mut c: PROCESS_MEMORY_COUNTERS_EX2 = zeroed();
+        c.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX2>() as u32;
+        if K32GetProcessMemoryInfo(h, &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) != 0 {
+            (m.private, m.working_set, m.private_working_set) = (c.PrivateUsage as u64, c.WorkingSetSize as u64, Some(c.PrivateWorkingSetSize as u64));
+        } else {
+            let mut e: PROCESS_MEMORY_COUNTERS_EX = zeroed();
+            e.cb = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            if K32GetProcessMemoryInfo(h, &mut e as *mut _ as *mut PROCESS_MEMORY_COUNTERS, e.cb) == 0 {
+                CloseHandle(h);
+                return None;
+            }
+            (m.private, m.working_set) = (e.PrivateUsage as u64, e.WorkingSetSize as u64);
+        }
+        // Commit the walk can place: committed private regions, and copy-on-write pages of images and
+        // views (charged when mapped). The rest of the charge has no private mapping in the process.
+        let (mut placed, mut addr) = (0u64, 0usize);
+        let (mut view, mut file) = (usize::MAX, false);
+        let mut name = [0u16; 520];
+        for _ in 0..4_000_000 {
+            let mut r: MEMORY_BASIC_INFORMATION = zeroed();
+            if VirtualQueryEx(h, addr as *const _, &mut r, size_of::<MEMORY_BASIC_INFORMATION>()) == 0 {
+                break;
+            }
+            let size = r.RegionSize as u64;
+            if r.State == MEM_COMMIT {
+                // Write-combined or uncached: memory a device reads, mapped for the CPU (a GPU driver's
+                // host-visible allocations), not the app's own data.
+                let device = r.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE) != 0;
+                let base = r.Protect & 0xff;
+                let copy = base == PAGE_WRITECOPY || base == PAGE_EXECUTE_WRITECOPY;
+                match r.Type {
+                    MEM_PRIVATE => {
+                        placed += size;
+                        if device {
+                            m.gpu_mapped += size;
+                        } else {
+                            m.host += size;
+                        }
+                    }
+                    MEM_IMAGE => {
+                        m.image += size;
+                        if copy || base == PAGE_READWRITE || base == PAGE_EXECUTE_READWRITE {
+                            placed += size;
+                        }
+                    }
+                    MEM_MAPPED => {
+                        if copy {
+                            placed += size;
+                        }
+                        if r.AllocationBase as usize != view {
+                            view = r.AllocationBase as usize;
+                            file = K32GetMappedFileNameW(h, r.BaseAddress, name.as_mut_ptr(), name.len() as u32) != 0;
+                        }
+                        match () {
+                            _ if device => m.gpu_mapped += size,
+                            _ if file => m.files += size,
+                            _ => m.shared += size,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            match (r.BaseAddress as usize).checked_add(r.RegionSize) {
+                Some(next) if next > addr => addr = next,
+                _ => break,
+            }
+        }
+        CloseHandle(h);
+        m.unmapped = Some(m.private.saturating_sub(placed));
+        Some(m)
+    }
+}
+
 pub fn topology() -> Topology {
     let logical = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
     let mut groups = Vec::new();

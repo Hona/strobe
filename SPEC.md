@@ -485,7 +485,9 @@ What strobe reads from a native app (§13.7), per run:
   so the count is a lower bound then), `io.read` and `io.write` (bytes, the same snapshots),
   `gpu.process.3d` (3D engine time summed over every adapter the processes used: one that draws on
   one GPU and computes on another uses both), `gpu.vram` (dedicated), `gpu.shared` (GPU memory in
-  system memory: all of an integrated GPU's), `memory.app.private`, `run.duration`. Per thread: wakes
+  system memory: all of an integrated GPU's), `memory.app.private` (Windows: the commit charge, which
+  includes the commit Windows charges for the processes' GPU allocations), `memory.app.host` (what the
+  processes allocated in their own address space, without GPU memory: §8.6), `run.duration`. Per thread: wakes
   per second and CPU per run from the thread's cycle counter, named by `GetThreadDescription`, with
   the module it started in (its Win32 start address, `ThreadQuerySetWin32StartAddress`) and whose it
   is: `app`, `driver` (from the driver store, such as a GPU driver's workers) or `os` (the Windows
@@ -751,6 +753,38 @@ optional and gets its own leak run, nothing is paired), in one block with no tra
 Checked on a planted leak (800 objects kept per click, 5 clicks per run, N = 5): `leaks +356 KB/run
 [+345 … +378]`, 20,000 suspects of the planted class. A real scroll case without a leak grows about
 +30 KB/run, all compiled code: `no app leak`.
+
+**Native memory by what holds it** (`probe::memory`, built). A native app's private bytes are not its
+host memory: on Windows the commit charge includes the commit Windows charges for the process's GPU
+allocations, so a tray app holding a 725 MB model in VRAM read 841 MB "private" with 101 MB of its own.
+A reading splits each process of the tree, at sample points between runs (it walks the process's
+address space, which holds its memory lock for a moment; never inside a timed run):
+
+| Part | Windows (`VirtualQueryEx`, committed regions) | Linux (`/proc/<pid>/smaps`) |
+|---|---|---|
+| `private` (`memory.app.private`) | the commit charge (`PrivateUsage`) | private resident + swapped pages (as `smaps_rollup`) |
+| `host` (`memory.app.host`) | committed `MEM_PRIVATE` regions, write-combined and uncached ones left out | private pages of anonymous mappings (heap, stacks, `[anon:…]`) |
+| `gpu mapped` | committed regions mapped write-combined or uncached: a GPU driver's CPU view of the memory it allocated for the process (checked: an NVIDIA Vulkan app's VRAM, 727 MB against `gpu.vram` 725 MB) | resident pages of GPU device mappings (`/dev/dri/*`, `/dev/nvidia*`, …) |
+| `unmapped` | commit charge the walk cannot place: charge − private regions − copy-on-write pages of images and views (page tables, commit a driver holds) | — |
+| `shared` | committed views of pagefile-backed sections | resident shared memory (`s` mappings, `/dev/shm`, memfd, SysV) |
+| `files`, `image` | committed views of data files; images (code and their data) | resident pages of other files; of files with an executable mapping |
+| working set | `WorkingSetSize` and `PrivateWorkingSetSize` (Windows 11) | `Rss`; private resident |
+
+`memory.app.host` is given only when every process of the tree was read (a process strobe cannot open
+is listed, never counted as 0). macOS gives another process's regions only to a debugger (its task
+port), so there is no reading there; `memory.app.private` is the physical footprint, GPU allocations
+included. Readings are taken after the runs of every native bench block and after `record exe:`,
+`record app:` and `record pid:` windows, stored in `memory.json`; `query <rec> memory` shows a reading
+by process (default) or by part (`--by layer`), `--at <i>` picks one, `a..b memory` diffs two by part.
+
+**Native leak runs** (`bench <file> --probes memory --repeat <N>` on a native target, built): warmup
+until steady, a reading, then 2N runs with a reading after each; growth per run of the tree's host
+memory (and of its private bytes) is the Theil–Sen slope over the 2N + 1 readings with Sen's interval,
+judged as for the JS heap against max(16 KB, 0.1% of host memory) per run. A native allocator keeps
+freed memory for reuse, so a heap that fills and holds reads `grows, then levels off`. No snapshots:
+the readings say how much, not which objects. Checked on a planted leak (a windowless app keeping 1 MB
+every 250 ms, 1 s runs, N = 4): `leaks +5.2 MB/run [+4.8 … +5.8]`; the same app without the leak:
+`unclear: +0 B … +201 KB/run`.
 
 ### 8.7 Imports (`file:`)
 
@@ -1402,9 +1436,13 @@ lock when nothing it measures reaches a screen:
   is not refused there);
 - a native target with `window: false` (a tray app), or any native target under `--check` (it
   validates a bench file and gives no verdict), whose declared metrics are all `cpu.*`, `ui.*`,
-  `memory.*`, `io.*`, `count.*`, `run.duration` and launch milestones (a launch ends on
-  `until: { milestone }`). `gpu.*` may be a secondary: on a locked screen the compositor draws
-  nothing, so it is refused in locked blocks (and as a primary the series waits for an unlock).
+  `memory.*`, `io.*`, `count.*`, GPU memory (`gpu.vram`, `gpu.shared`), `run.duration` and launch
+  milestones (a launch ends on `until: { milestone }`). GPU use (`gpu.process.3d`, `gpu.compile`)
+  may be a secondary: on a locked screen the compositor draws nothing and the app's presents reach
+  no screen, so the GPU work in a locked block describes no person's screen; it is refused in locked
+  blocks (and as a primary the series waits for an unlock). GPU memory is what the app allocated,
+  which needs no presenting window: it is kept, like `memory.*`, and both blocks of a pair share the
+  lock state (an app that frees GPU memory when nothing shows it reads less on both sides).
 
 Everything else waits for an unlock as before: presented frames, `interaction.*`, `scroll.*`,
 `display.*`, `launch.painted|settled`, headed Chromium and Electron pages, and native apps with a
@@ -1432,9 +1470,10 @@ sleeps as Windows decides, which is how locked machines run for their users, and
 through days of locked benches would be strobe changing the machine. Pairs in different display states
 still compare within themselves; `DisplayOff` notes it (every pair, or how many).
 
-`record pid:|proc:` on a locked session records CPU, GPU and stacks (`--probes deep`) and refuses only
-its frames; `record app:<id>` of a profile with `window: false` waits for no window and runs on a
-locked session.
+`record pid:|proc:` on a locked session records what `record exe:` gives (CPU, threads' wakes and CPU,
+IO, the UI thread, GPU, memory by what holds it) and stacks (`--probes deep`), and refuses only its
+frames; `record app:<id>` of a profile with `window: false` waits for no window and runs on a locked
+session.
 
 ## 11. Views and reports
 
@@ -1451,10 +1490,10 @@ locked session.
 | `shifts` | | the five largest layout shifts of an attribution block (a series declaring `layout.shift`): score, run, time into it, and the elements that moved with their rects before and after |
 | `gc` | | per measured run: minor and major collections, main-thread GC time (pauses and incremental marking), helper-thread GC time, bytes freed |
 | `stack` | `<id>` | callers to the root, with source locations and packages |
-| `memory` | `--by process\|layer\|allocator` `--at <i>`; `a..b memory` | a census (default the last): per process OS private bytes, working set, Chromium allocators by effective size and the unexplained rest (an estimate); by layer across processes; by allocator; `a..b` by layer and process type. Readings of the snapshotted renderer after its first snapshot are starred (CensusContaminated) |
+| `memory` | `--by process\|layer\|allocator` `--at <i>`; `a..b memory` | a census (default the last): per process OS private bytes, working set, Chromium allocators by effective size and the unexplained rest (an estimate); by layer across processes; by allocator; `a..b` by layer and process type. Readings of the snapshotted renderer after its first snapshot are starred (CensusContaminated). A native recording: a reading by process or by part (host, GPU mapped, unmapped commit, shared, files, images, §8.6), with `gpu.vram` and `gpu.shared` beside it |
 | `heap` | `--top` `--reveal`; `a..b heap` | live objects by class (count, self and retained size), detached DOM, the largest owners with complete retainer paths; `a..b` diffs two recordings by class; strings redacted unless `--reveal`. Bench attribution blocks and `record --probes attribution\|memory` take one post-GC snapshot after the trace stops |
 | `leaks` | `--top` `--reveal` | a memory recording's suspects: objects allocated between its first and middle snapshots and alive at the end, by class, with retainer paths (bench slopes per process and layer: planned) |
-| `gpu` | | adapter, engines and VRAM per process, device counters |
+| `gpu` | | a trace: the browser GPU process's tasks by name. Without one (a native app, a process from outside): per adapter the tree's engine use and GPU memory (dedicated, shared) from the OS's per-process statistics, the device's counters, what reached the screen or why not, and the lock state |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
 | `insights` | (`exp_…` too) | rule hits with their numbers and the commands that show the evidence; for an experiment, the largest base/head movers per series first |
 | `timeline` | `--from --to --thread` | bounded event list for a range |
@@ -1761,6 +1800,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 |---|---|---|---|
 | process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the TSC (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
 | process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
+| memory by what holds it (`memory.app.host`, `query memory`, §8.6) | `VirtualQueryEx` walk of committed regions (type, protection, `GetMappedFileName`), `PROCESS_MEMORY_COUNTERS_EX2` | `/proc/<pid>/smaps` | refused: another process's regions need its task port (debuggers only) |
 | threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`), no wakes: macOS keeps no per-thread count a user can read |
 | per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
 | topology, pinning | `GetLogicalProcessorInformationEx` (L3 per CCD); process affinity | sysfs cache (`index*/level` 3, `shared_cpu_list`); `sched_setaffinity` on every thread of strobe, inherited by children | no L3 groups (Apple Silicon); P and E cores named in the CPU line (`hw.perflevel*`); no affinity API: unpinned |
@@ -2104,8 +2144,21 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 
 Query views built: `summary`, `frames`, `threads` (a native recording's: its threads' wakes and CPU;
 its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `shifts`, `gc`, `heap` (and
-`a..b heap`), `leaks`, `memory` (and `a..b memory`), `insights`, `sql`, `progress`. Not yet: `stack`,
-`gpu`, `cpu`, `timeline`, `--phase`/`--thread`, `--max-bytes`. Analysers built: `HighVariance`,
+`a..b heap`), `leaks`, `memory` (and `a..b memory`; native recordings by what holds the memory), `gpu`
+(a trace's GPU process; without a trace the OS's per-process GPU statistics), `insights`, `sql`,
+`progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`.
+
+Native recordings and launches (2026-11-04, adais, session locked): `record pid:|proc:` writes the
+views `record exe:` writes (`threads.json`, `runs.json`, `memory.json`, the OS samples for `query gpu`);
+it used to keep only the tree's CPU. An attribution launch of a native target (`record --bench
+<file>#<launch case>`, `--why`) keeps its threads from the spawn until ready (wakes, CPU per thread,
+IO) without a trace, since a hidden launch has no window and often no deep helper. Launch milestones
+show in `--check` lines (declared or not), in `record --bench` text with the check run's declared
+metrics, and in a native launch recording's summary. Checked on the user's tray app (read only):
+`record pid:` gave 841 MB private = 101 MB host + 727 MB GPU mapped + 3.9 MB unmapped, against
+`gpu.vram` 725 MB; and on a windowless dev app (`scripts/dev/fake-tray.bench.ts`): `gpu.vram` kept and
+`gpu.process.3d` refused in locked `--check` blocks, `launch.up` in the check line, a launch recording's
+`query threads`, and native leak runs (§8.6). Analysers built: `HighVariance`,
 `MultimodalDistribution` (no cause named), `StateDrift`, `Drift`, `Background`, `PowerPlan`,
 `Battery`, `StaleCalibration`, `Unresolved` (script samples without a source map, from 5%),
 `VirtualMachine` (firmware strings), plus `NotSteady`, `FewPairs`, `HeapSnapshot`, `Attribution`. Not yet:

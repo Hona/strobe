@@ -11,6 +11,8 @@ pub fn value(v: f64, unit: &str) -> String {
     } else {
         2
     };
+    // A value that rounds to zero prints without a sign (not −0.00%).
+    let v = if (v * 10f64.powi(digits as i32)).round() == 0.0 { 0.0 } else { v };
     match unit {
         "ms" => format!("{v:.digits$} ms"),
         "%" => format!("{v:.digits$}%"),

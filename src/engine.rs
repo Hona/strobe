@@ -210,7 +210,11 @@ impl Table {
 /// Runs SQL against a trace and returns the last statement's result.
 pub fn query(trace: &Path, sql: &str) -> Result<Table> {
     let exe = ensure()?;
-    let file = host::paths::run().join(format!("q-{}-{}.sql", std::process::id(), host::now_ns()));
+    // A counter beside the time: a report's views query in parallel, and two of them once took the same
+    // name in one clock tick, so one removed the other's SQL before trace_processor read it.
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let file = host::paths::run().join(format!("q-{}-{}-{n}.sql", std::process::id(), host::now_ns()));
     std::fs::write(&file, sql)?;
     let out = Command::new(exe).arg("-q").arg(&file).arg(trace).output()?;
     let _ = std::fs::remove_file(&file);

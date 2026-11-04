@@ -1973,11 +1973,23 @@ Linux and macOS (2026-11-04): the host layer, OS and GPU samplers, wakes, IO, di
 X11 and CoreGraphics windows, power plans, native stacks and DWARF symbols as §13.6 lists them, with
 what each OS refuses; isolated launches with macOS's Library rule (§13.2); npm packages and release
 builds for darwin-arm64, darwin-x64, linux-x64 and linux-arm64 (static musl), and a check workflow
-that builds and lints all three OSes on every push. Checked on an M4 MacBook Air (macOS 27) and a
-Debian 13 VM (2 vCPU, Xvfb, llvmpipe): `status`, a `script()` bench `--check`, an outside-in record,
-per-thread wakes, a native X11 app record, Chromium refused on llvmpipe (`SoftwareGpu`), and native
-stacks of a planted hot loop (ranked first at its line, 99.8%, DWARF-unwound stacks). Not built:
-accessibility drivers on macOS and Linux, OS present events (refused on both), macOS sample times.
+that builds and lints all three OSes on every push. Checked (short smoke runs, not timed benches):
+
+- M4 MacBook Air, macOS 27, on battery: `status`; a `script()` bench `--check`; an outside-in record
+  of a busy process; an isolated record of a small Cocoa app with its own bundle id (window found
+  and checked, 133 wakes/s for the process, CPU per thread, nothing left in `~/Library`); native
+  stacks of a planted hot loop (`sample`, symbols from a dSYM `dsymutil` made: ranked first at its
+  line, 99.2%, full paths).
+- Debian 13 VM (2 vCPU, root, Xvfb with openbox, llvmpipe): `status`; a `script()` bench `--check`;
+  an isolated record of a windowless native app (99 wakes/s on its 10 ms sleeper thread, 3007 ms CPU
+  on its worker); an isolated record of an X11 app; Chromium refused on llvmpipe (`SoftwareGpu`);
+  native stacks of the hot loop (99.8% at its line, DWARF-unwound stacks to `clone`) and of `dd`
+  (kernel frames from kallsyms).
+
+Not built: accessibility drivers on macOS and Linux, OS present events (refused on both), times on
+macOS samples. Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
+none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
+macOS window placement and pixels (they need Accessibility and Screen Recording).
 
 ### 24.2 Where the code differs from the design
 

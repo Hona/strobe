@@ -128,8 +128,17 @@ pub fn access() -> Access {
 /// (pid, start, screen time or 0 when it never reached the screen), the newest 65,536.
 #[derive(Default)]
 pub struct Live {
-    presents: std::sync::Mutex<std::collections::VecDeque<(u32, u64, u64)>>,
+    presents: std::sync::Mutex<LiveQueue>,
     cv: std::sync::Condvar,
+}
+
+/// The presents, and each process's latest start: a wait asks for that between every sleep, and
+/// finding it in the queue (65,536 presents after a few minutes of frames) cost strobe's main thread
+/// most of its CPU inside a native block's runs on air.
+#[derive(Default)]
+struct LiveQueue {
+    all: std::collections::VecDeque<(u32, u64, u64)>,
+    last: std::collections::HashMap<u32, u64>,
 }
 
 /// What `Live` says about some processes: the first present that reached the screen after a time
@@ -144,21 +153,23 @@ pub struct LiveView {
 impl Live {
     pub fn push(&self, pid: u32, start: u64, screen: u64) {
         let mut q = self.presents.lock().unwrap_or_else(|e| e.into_inner());
-        q.push_back((pid, start, screen));
-        if q.len() > 65_536 {
-            q.pop_front();
+        q.all.push_back((pid, start, screen));
+        if q.all.len() > 65_536 {
+            q.all.pop_front();
         }
+        let last = q.last.entry(pid).or_default();
+        *last = (*last).max(start);
         self.cv.notify_all();
     }
 
-    /// Waits up to `wait` for a present of `pids` that started after `after` and reached the screen.
+    /// Waits up to `wait` for a present of `pids` that started after `after` and reached the screen
+    /// (`after` = `u64::MAX`: only the latest start, without reading the queue).
     pub fn view(&self, pids: &[u32], after: u64, wait: std::time::Duration) -> LiveView {
         let deadline = std::time::Instant::now() + wait;
         let mut q = self.presents.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let mine = || q.iter().filter(|p| pids.contains(&p.0));
-            let next = mine().filter(|p| p.1 > after && p.2 > 0).min_by_key(|p| p.1);
-            let last = mine().map(|p| p.1).max().unwrap_or(0);
+            let next = if after == u64::MAX { None } else { q.all.iter().filter(|p| pids.contains(&p.0) && p.1 > after && p.2 > 0).min_by_key(|p| p.1).copied() };
+            let last = pids.iter().filter_map(|p| q.last.get(p)).copied().max().unwrap_or(0);
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if next.is_some() || left.is_zero() {
                 return LiveView { next_start_ns: next.map_or(0, |p| p.1), next_screen_ns: next.map_or(0, |p| p.2), last_start_ns: last };

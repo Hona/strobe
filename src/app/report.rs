@@ -105,7 +105,7 @@ pub fn run(args: &Args) -> Result<Output> {
         } else {
             format!("updated {} with {id} ({how}, {}); the report is also in {path}\n", done.url, super::fmt::bytes(body.len() as f64))
         };
-        return Ok(Output::new(text, json!({ "path": path, "bytes": body.len(), "pr": done.url, "images": done.images, "unchanged": done.unchanged })));
+        return Ok(Output::new(text, json!({ "path": path, "bytes": body.len(), "pr": done.url, "images": done.images, "unchanged": done.unchanged, "seen": done.seen })));
     }
     if args.has("open") {
         open(&out.display().to_string());

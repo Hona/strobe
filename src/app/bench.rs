@@ -4,7 +4,7 @@ use super::{Output, fmt, progress, stop_error, stop_requested};
 use crate::cli::{Args, duration_ms};
 use crate::config;
 use crate::driver::Driver;
-use crate::host;
+use crate::host::{self, git};
 use crate::metrics;
 use crate::model::{self, Error, Hidden, MetricDef, Refusal, Result, ValidatorId, VerdictKind};
 use crate::png;
@@ -175,9 +175,9 @@ struct Variant {
 /// A checkout's commit and a hash of its uncommitted changes to tracked files: what a build of it reads.
 fn tree_state(root: &Path) -> Option<String> {
     use sha2::Digest;
-    let sha = host::output(Command::new("git").arg("-C").arg(root).args(["rev-parse", "HEAD"]))?;
-    let diff = Command::new("git").arg("-C").arg(root).args(["diff", "HEAD", "--no-ext-diff", "--binary"]).output().ok()?;
-    Some(format!("{sha} {:x}", sha2::Sha256::digest(&diff.stdout)))
+    let sha = git::out(root, &["rev-parse", "HEAD"])?;
+    let diff = git::bytes(root, &["diff", "HEAD", "--no-ext-diff", "--binary"])?;
+    Some(format!("{sha} {:x}", sha2::Sha256::digest(diff)))
 }
 
 /// What a recording says about the variant it ran: the commit, uncommitted changes and their hash
@@ -200,7 +200,7 @@ fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
             Some((sha, _)) => sha.to_string(),
             None => format!("dir:{}", v.root.as_deref().unwrap_or(Path::new(&v.spec)).display()),
         },
-        Kind::Git(r) => host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", &format!("{r}^{{commit}}")])).unwrap_or_else(|| v.commit.clone().unwrap_or_default()),
+        Kind::Git(r) => git::commit(project, r).unwrap_or_else(|| v.commit.clone().unwrap_or_default()),
         Kind::App(id) => format!("app:{id}{}", isolate::app(id, config).map(|a| stamp(&a.exe)).unwrap_or_default()),
         Kind::Exe(p) => format!("exe:{}{}", p.display(), stamp(p)),
         Kind::Url(h) => format!("url:{h}"),
@@ -2086,9 +2086,7 @@ pub(crate) fn screen_line(s: &Value) -> Option<String> {
 /// The commit subject of a git variant, so a report still says what was compared days later.
 fn subject(v: &Variant) -> Option<String> {
     let root = v.root.as_ref()?;
-    let out = Command::new("git").arg("-C").arg(root).args(["log", "-1", "--format=%s"]).output().ok()?;
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (out.status.success() && !s.is_empty()).then_some(s)
+    Some(git::subject(root, "HEAD")).filter(|s| !s.is_empty())
 }
 
 /// How many times a block waits for other work to end before `Background` refuses it: each wait
@@ -3556,8 +3554,8 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
         let p = if Path::new(spec).is_absolute() { PathBuf::from(spec) } else { std::env::current_dir()?.join(spec) };
         if p.is_dir() {
             let root = std::fs::canonicalize(&p)?;
-            let sha = host::output(Command::new("git").arg("-C").arg(&root).args(["rev-parse", "--short=10", "HEAD"])).unwrap_or_default();
-            let dirty = host::output(Command::new("git").arg("-C").arg(&root).args(["status", "--porcelain", "--untracked-files=no"])).is_some_and(|s| !s.is_empty());
+            let sha = git::out(&root, &["rev-parse", "--short=10", "HEAD"]).unwrap_or_default();
+            let dirty = git::out(&root, &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
             let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
             let mut v = Variant {
                 role,
@@ -3581,7 +3579,7 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
     };
     let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None, exe: None, commit: None, dirty: false, state: None, changed: Vec::new() };
     if let Kind::Git(r) = &v.kind {
-        let sha = host::output(Command::new("git").arg("-C").arg(project).args(["rev-parse", "--short=10", r]))
+        let sha = git::out(project, &["rev-parse", "--short=10", r])
             .ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
         v.label = format!("{r}@{sha}");
         v.commit = Some(sha);
@@ -3598,8 +3596,7 @@ struct Harness {
 
 fn harness(file: &Path, project: &Path, config: &Value) -> Harness {
     let dir = file.parent().unwrap_or(Path::new("."));
-    let from = host::output(Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"]))
-        .map(PathBuf::from)
+    let from = git::toplevel(dir)
         .and_then(|p| std::fs::canonicalize(p).ok())
         .unwrap_or_else(|| project.to_path_buf());
     let rel = |p: &Path| std::fs::canonicalize(p).ok().and_then(|c| c.strip_prefix(&from).ok().map(Path::to_path_buf));
@@ -3774,7 +3771,7 @@ fn cache_fill(s: &str, root: &Path) -> String {
     if !s.contains("{cache}") {
         return s.to_string();
     }
-    let common = host::output(Command::new("git").arg("-C").arg(root).args(["rev-parse", "--path-format=absolute", "--git-common-dir"]))
+    let common = git::out(root, &["rev-parse", "--path-format=absolute", "--git-common-dir"])
         .and_then(|d| std::fs::canonicalize(d).ok())
         .unwrap_or_else(|| root.to_path_buf());
     let dir = host::paths::sub("builds").join("cache").join(hash_str(&common.to_string_lossy().to_lowercase()));
@@ -3904,7 +3901,7 @@ impl Drop for Unpinned {
 }
 
 fn build_key(root: &Path, build: &Value) -> String {
-    let git = |a: &[&str]| host::output(Command::new("git").arg("-C").arg(root).args(a)).unwrap_or_default();
+    let git = |a: &[&str]| git::out(root, a).unwrap_or_default();
     // In a worktree strobe made for a git ref, untracked files are strobe's own (a script target's
     // harness): they do not change what the build sees.
     let owned = std::fs::canonicalize(root).ok().zip(std::fs::canonicalize(host::paths::sub("builds")).ok()).is_some_and(|(r, b)| r.starts_with(b));
@@ -3922,24 +3919,15 @@ fn hash_str(s: &str) -> String {
 /// into tracked files) must not carry into this bench. Ignored files (dependencies, build output)
 /// stay, so builds and installs are reused.
 fn worktree(r: &str, project: &Path) -> Result<PathBuf> {
-    let git = || {
-        let mut c = Command::new("git");
-        c.arg("-C").arg(project);
-        c
-    };
-    let sha = host::output(git().args(["rev-parse", r])).ok_or_else(|| Error::usage(format!("unknown git ref {r} in {}", project.display())))?;
+    let sha = git::out(project, &["rev-parse", r]).ok_or_else(|| Error::usage(format!("unknown git ref {r} in {}", project.display())))?;
     let dir = host::paths::sub("builds").join(&sha[..12.min(sha.len())]);
     if dir.join(".git").exists() {
-        let at = |a: &[&str]| Command::new("git").arg("-C").arg(&dir).args(a).stdout(Stdio::null()).stderr(Stdio::null()).status().is_ok_and(|s| s.success());
-        if !(at(&["checkout", "--force", "--detach", &sha]) && at(&["clean", "-fd"])) {
+        if !(git::ok(&dir, &["checkout", "--force", "--detach", &sha]) && git::ok(&dir, &["clean", "-fd"])) {
             return Err(Error::msg(format!("could not reset the worktree for {r} at {}", dir.display())).hint("remove that folder; strobe makes it again"));
         }
     } else {
         progress(format!("  worktree {r} → {}", dir.display()));
-        let ok = git().args(["worktree", "add", "--detach"]).arg(&dir).arg(&sha).stdout(Stdio::null()).status()?.success();
-        if !ok {
-            return Err(Error::msg(format!("git worktree add for {r} failed")));
-        }
+        git::run(project, &["worktree", "add", "--detach", &dir.to_string_lossy(), &sha]).map_err(|e| Error::msg(format!("git worktree add for {r} failed: {}", e.message)))?;
         if dir.join("bun.lock").exists() || dir.join("bun.lockb").exists() {
             let _unpinned = Unpinned::start();
             progress("  bun install (worktree)");

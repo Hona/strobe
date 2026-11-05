@@ -8,7 +8,7 @@ use super::{Output, fmt, progress};
 use crate::cli::Args;
 use crate::config;
 use crate::history::{self, detect};
-use crate::host;
+use crate::host::{self, git, git::commit_time, git::short, git::subject};
 use crate::model::{self, Error, Kind, Result};
 use crate::stats;
 use crate::store;
@@ -108,7 +108,7 @@ fn commits(args: &Args, root: &Path) -> Result<Vec<String>> {
         let (a, b) = range.split_once("..").ok_or_else(|| Error::usage("--range <from>..<to>"))?;
         let (a, b) = (rev_parse(root, a)?, rev_parse(root, b)?);
         let mut list = vec![a.clone()];
-        list.extend(git(root, &["rev-list", "--first-parent", "--reverse", &format!("{a}..{b}")])?.lines().map(str::to_string));
+        list.extend(git::run(root, &["rev-list", "--first-parent", "--reverse", &format!("{a}..{b}")])?.lines().map(str::to_string));
         let every = args.num("every")?.unwrap_or(1.0).max(1.0) as usize;
         let last = list.len() - 1;
         return Ok(list.into_iter().enumerate().filter(|(i, _)| i % every == 0 || *i == last).map(|(_, c)| c).collect());
@@ -176,7 +176,7 @@ fn point_args(args: &Args, file: &Path, commit: &str, blocks: usize, exp: &str) 
 fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, statics: &Value, key: &Value) -> Result<(Vec<String>, String, Vec<Value>)> {
     let exp = store::new_id("exp");
     let (subject, commit_time) = (subject(root, commit), commit_time(root, commit));
-    let depth: u64 = git(root, &["rev-list", "--count", commit]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
+    let depth: u64 = git::run(root, &["rev-list", "--count", commit]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     progress(format!("\n{} {subject} · {exp}", short(commit)));
     let a = point_args(args, file, commit, blocks, &exp)?;
     let result = super::bench::run(&a).and_then(super::unless_halted);
@@ -445,7 +445,7 @@ fn confirm(args: &Args, s: &history::Series, c: &Value) -> Result<(String, Value
     }
     // The culprit: the one commit in the range, or a bisect that starts from this A/B.
     let root = PathBuf::from(s.meta["root"].as_str().unwrap_or("."));
-    let range: Vec<String> = git(&root, &["rev-list", "--first-parent", &format!("{good}..{bad}")]).unwrap_or_default().lines().map(str::to_string).collect();
+    let range: Vec<String> = git::run(&root, &["rev-list", "--first-parent", &format!("{good}..{bad}")]).unwrap_or_default().lines().map(str::to_string).collect();
     let mut culprit = Value::Null;
     let mut bisect = Value::Null;
     if range.len() <= 1 {
@@ -698,41 +698,20 @@ fn spawn(argv: &[String]) -> std::io::Result<()> {
 
 // git
 
-fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output()?;
-    if !out.status.success() {
-        return Err(Error::msg(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
-}
-
 fn rev_parse(root: &Path, rev: &str) -> Result<String> {
-    let rev = rev.strip_prefix("git:").unwrap_or(rev);
-    git(root, &["rev-parse", "--verify", &format!("{rev}^{{commit}}")]).map(|s| s.trim().to_string()).map_err(|_| Error::usage(format!("{rev} is not a commit in {}", root.display())))
-}
-
-fn subject(root: &Path, rev: &str) -> String {
-    git(root, &["log", "-1", "--format=%s", rev]).map(|s| s.trim().to_string()).unwrap_or_default()
-}
-
-fn commit_time(root: &Path, rev: &str) -> u64 {
-    git(root, &["log", "-1", "--format=%ct", rev]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0)
+    git::commit(root, rev).ok_or_else(|| Error::usage(format!("{} is not a commit in {}", rev.strip_prefix("git:").unwrap_or(rev), root.display())))
 }
 
 /// The repository's identity across clones and worktrees: its first root commit.
 fn repo_id(root: &Path) -> String {
-    let mut roots: Vec<String> = git(root, &["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default().lines().map(str::to_string).collect();
+    let mut roots: Vec<String> = git::run(root, &["rev-list", "--max-parents=0", "HEAD"]).unwrap_or_default().lines().map(str::to_string).collect();
     roots.sort();
     roots.first().cloned().unwrap_or_else(|| root.display().to_string())
 }
 
 fn rel(root: &Path, file: &Path) -> String {
-    let top = git(root, &["rev-parse", "--show-toplevel"]).map(|s| PathBuf::from(s.trim())).unwrap_or_else(|_| root.to_path_buf());
+    let top = git::toplevel(root).unwrap_or_else(|| root.to_path_buf());
     let top = std::fs::canonicalize(&top).unwrap_or(top);
     let f = std::fs::canonicalize(file).unwrap_or(file.to_path_buf());
     f.strip_prefix(&top).map(|p| p.display().to_string().replace('\\', "/")).unwrap_or_else(|_| file.display().to_string())
-}
-
-pub(crate) fn short(rev: &str) -> String {
-    rev.chars().take(10).collect()
 }

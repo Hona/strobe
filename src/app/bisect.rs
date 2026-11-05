@@ -3,11 +3,11 @@
 use super::{Output, fmt, progress};
 use crate::cli::Args;
 use crate::config;
+use crate::host::git::{self, short, subject};
 use crate::model::{Error, Result, VerdictKind};
 use crate::store;
 use serde_json::{Value, json};
 use std::path::Path;
-use std::process::Command;
 
 /// Walks `git rev-list --first-parent good..bad`. First benches `bad` against `good` to learn which
 /// way the primary moved; then each step benches the middle commit against `good` with the same
@@ -30,7 +30,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     let dir = store::experiment_dir(&id)?;
     // Its steps' own scopes stack on it: `bench --stop <bisect>` stops the step that runs.
     let _scope = super::experiment_scope(&dir);
-    let mut candidates = git(&root, &["rev-list", "--first-parent", "--reverse", &format!("{good}..{bad}")])?.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut candidates = git::run(&root, &["rev-list", "--first-parent", "--reverse", &format!("{good}..{bad}")])?.lines().map(str::to_string).collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(Error::usage(format!("{range}: no commits from good to bad on the first-parent line")));
     }
@@ -196,22 +196,5 @@ fn text(r: &Value) -> String {
 }
 
 fn rev_parse(root: &Path, rev: &str) -> Result<String> {
-    let rev = rev.strip_prefix("git:").unwrap_or(rev);
-    git(root, &["rev-parse", "--verify", &format!("{rev}^{{commit}}")]).map(|s| s.trim().to_string()).map_err(|_| Error::usage(format!("--bisect: {rev} is not a commit in {}", root.display())))
-}
-
-fn subject(root: &Path, rev: &str) -> String {
-    git(root, &["log", "-1", "--format=%s", rev]).map(|s| s.trim().to_string()).unwrap_or_default()
-}
-
-fn short(rev: &str) -> String {
-    rev.chars().take(10).collect()
-}
-
-fn git(root: &Path, args: &[&str]) -> Result<String> {
-    let out = Command::new("git").arg("-C").arg(root).args(args).output()?;
-    if !out.status.success() {
-        return Err(Error::msg(format!("git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr).trim())));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    git::commit(root, rev).ok_or_else(|| Error::usage(format!("--bisect: {} is not a commit in {}", rev.strip_prefix("git:").unwrap_or(rev), root.display())))
 }

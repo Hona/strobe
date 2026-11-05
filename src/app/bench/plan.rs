@@ -386,7 +386,7 @@ fn builds(series: &[Series], describe: &Value, config: &Value, project: &Path, v
                 Kind::Git(_) => v
                     .commit
                     .as_deref()
-                    .and_then(|c| host::output(std::process::Command::new("git").arg("-C").arg(project).args(["rev-parse", c])))
+                    .and_then(|c| host::git::out(project, &["rev-parse", c]))
                     .map(|sha| host::paths::sub("builds").join(&sha[..12.min(sha.len())])),
                 _ => v.root.clone(),
             };

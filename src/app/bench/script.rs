@@ -25,7 +25,7 @@ fn place(bench_file: &Path, entry: &str, root: &Path) -> Result<PathBuf> {
     let source = std::fs::canonicalize(dir.join(entry)).map_err(|_| Error::usage(format!("script entry {entry}: no such file next to {}", bench_file.display())))?;
     // Relative to the repository, not the folder with strobe.json: a variant's folder is a whole checkout (a git
     // ref's worktree, or a directory variant), so a harness under games/x/perf is at games/x/perf there too.
-    let repo = host::output(std::process::Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"])).map(PathBuf::from);
+    let repo = host::git::toplevel(dir);
     let project = std::fs::canonicalize(repo.unwrap_or_else(|| config::project_root(dir)))?;
     let rel = source.strip_prefix(&project).map_err(|_| Error::usage(format!("script entry {} is outside the project {}", source.display(), project.display())))?;
     let placed = root.join(rel);

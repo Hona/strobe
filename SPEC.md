@@ -203,7 +203,7 @@ validity/       validators, analysers, calibration, A/A (§10)
 symbol/         source maps, packages, owners, PDBs (§12)
 report/         views → text, JSON, markdown, HTML (§11)
 mcp/            MCP server: Streamable HTTP for the daemon, stdio (hidden)
-host/           paths, processes, sockets, autostart, opencode registration, mesh
+host/           paths, processes, sockets, autostart, opencode registration, mesh, git
 ui/             embedded viewer and calibration assets
 ```
 
@@ -1969,7 +1969,7 @@ series' base and head load at once; series load one after another. On adais, `re
 a 350 MB-trace experiment went from 16–17 s, 6.8 GB peak (strobe and its trace_processor
 children, seven at once) to 6–9 s, 2.1 GB (two at once); strobe's own peak from 1.4 GB to 0.6 GB.
 
-`--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
+`--format pr` (`app/pr.rs`, `app/pr/`) writes an experiment as one block of GitHub-flavoured Markdown for a
 pull request body, pasted verbatim. Few words, two drawers:
 
 - **Hero:** one heading line: `#` alone in a body (`--format pr` to stdout), with `--update-pr` one
@@ -2074,7 +2074,10 @@ the block; a PR may carry one block per experiment. `--update-pr <n>` (through `
 owner/repo` for another repository) replaces that experiment's block in pull request `n`'s body, or
 appends it, and leaves the rest of the body as it was; a block whose content no longer matches its
 hash was edited by hand and is refused unless `--force`. A block already there with the same hash
-is left alone (no edit, no new uploads). A body over 65,536 characters is refused.
+is left alone (no edit, no new uploads). A body over 65,536 characters is refused. After an edit
+strobe reads the body back, at once and again 3 s later: GitHub can serve the old body for a moment,
+and an `--update-pr` of another experiment read then would splice into it and drop this block. When
+the block still does not show, it says so (`seen: false` in `--json`): check before the next update.
 
 Images in the block: GitHub has no API that uploads an image into a pull request body; `gh pr
 create|edit --attach <file>` (gh 2.100+) does it headlessly, and replaces a body's `![alt](./file)`
@@ -3511,7 +3514,10 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   reports a moment after it registers), so pair 1 always ran twice; strobe now reads it when the bench
   starts. `Drift` now reads differences for metrics compared by difference (it took `ln(head/base)`,
   which dropped every pair of a count and any pair with a 0). A leak run whose growth is V8's own
-  (`no app leak`) now says `same` as its kind, not the `leaks` kind it replaced.
+  (`no app leak`) now says `same` as its kind, not the `leaks` kind it replaced. Git questions go
+  through `host::git` (bench, bisect, track, plan, script targets); `pr.rs` is split into
+  `pr/extract.rs` (what a result says), `pr/markdown.rs` (the document) and `pr/github.rs` (markers,
+  splicing, `gh`).
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

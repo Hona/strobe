@@ -702,6 +702,9 @@ struct Ctx<'a> {
     shown_seen: BTreeMap<String, (String, Option<u64>)>,
     /// Base and head run different targets of the bench file (SPEC §9.10).
     implementations: bool,
+    /// The journeys an implementation comparison compares (its series without a parity gap): the
+    /// family a decided primary runs on for (`stats::family_min_pairs`, SPEC §9.3).
+    journeys: usize,
     /// ... and on different engines: one engine's own metrics are not compared, and Chromium sides are
     /// measured from outside as a native app is (`outside_in`).
     cross_engine: bool,
@@ -1084,6 +1087,7 @@ pub fn run(args: &Args) -> Result<Output> {
         eta_after: BTreeMap::new(),
         shown_seen: BTreeMap::new(),
         implementations: false,
+        journeys: 0,
         cross_engine: false,
         fixture: None,
         projects: BTreeMap::new(),
@@ -1114,6 +1118,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     ctx.projects = target_projects(&ctx.describe)?;
     ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
+    ctx.journeys = series.iter().filter(|s| s.gap.is_none()).count();
     if ctx.implementations {
         for v in &variants {
             let t = v.target.as_deref().unwrap_or("");
@@ -1341,8 +1346,13 @@ pub fn run(args: &Args) -> Result<Output> {
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided && halted.is_none(),
         "stopped": halted.as_ref().map(|h| json!({ "code": h.code, "why": h.message, "not_run": not_run })),
     });
-    let text = render(&result_json);
     let mut result_json = result_json;
+    // The journeys as one family (SPEC §9.3): `scoreboard`, and each primary's `p_repeated` and
+    // `holm_decided`, as every report reads them.
+    if ctx.implementations {
+        super::family::Board::of(&result_json).write(&mut result_json);
+    }
+    let text = render(&result_json);
     result_json["text"] = json!(text);
     store::write_json(&dir.join("result.json"), &result_json)?;
     store::append_index(&json!({
@@ -1821,6 +1831,14 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     };
     let max_pairs = *looks.last().unwrap_or(&40);
     let min_pairs = looks[0];
+    // An implementation comparison's journeys are one family (SPEC §9.3): a primary decided better or
+    // worse runs on to the pairs at which its repeated p can clear Holm across them.
+    let journeys = ctx.journeys;
+    let family_looks = looks.clone();
+    let implementations = ctx.implementations;
+    let family = move |c: &Comparison| {
+        if implementations && matches!(c.kind, VerdictKind::Better | VerdictKind::Worse) { stats::family_min_pairs(journeys, &family_looks) } else { 0 }
+    };
     // Non-inferiority (SPEC §9.3): the same interval at the same looks, judged against the margin.
     let margin = s.noworse.get(&s.primary).copied();
     let compare_primary = |pp: &[(f64, f64)]| match margin {
@@ -1905,9 +1923,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         checkpoint(ctx, &s.label(), json!({ "blocks": blocks, "pairs": pairs }));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
         let n = pair + 1;
-        // Decided at a look, then run on to the pairs the secondaries need to clear Holm.
+        // Decided at a look, then run on to the pairs the secondaries need to clear Holm (and the
+        // journeys' family, `family`).
         if let Some(c) = &decided_at {
-            let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len());
+            let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len()).max(family(c));
             let eta = eta(ctx, s, &blocks, &pairs, need);
             progress(format!("  pair {n:>2}  for the secondaries (the primary was decided: {}) · {eta}", c.verdict));
             if n >= need {
@@ -1964,9 +1983,12 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         last = Some(cmp);
         if decided {
             // Secondaries clear Holm only from enough pairs: run on to them rather than leave them blank.
-            let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len());
+            let holm = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len());
+            let fam = last.as_ref().map(&family).unwrap_or(0);
+            let need = holm.max(fam);
             if n < need && n < max_pairs && ctx.args.get("pairs").is_none() {
-                progress(format!("  the primary is decided; {} more pair{} so the secondaries can clear Holm ({need} pairs)", need - n, if need - n == 1 { "" } else { "s" }));
+                let why = if fam > holm { format!("its verdict can clear Holm across the {journeys} journeys") } else { "the secondaries can clear Holm".to_string() };
+                progress(format!("  the primary is decided; {} more pair{} so {why} ({need} pairs)", need - n, if need - n == 1 { "" } else { "s" }));
                 decided_at = last.clone();
                 continue;
             }
@@ -5607,6 +5629,19 @@ fn render(r: &Value) -> String {
         out += "\n";
     }
     let id = r["id"].as_str().unwrap_or("");
+    // An implementation comparison's journeys as one family (SPEC §9.3).
+    if r["scoreboard"].is_object() {
+        let board = super::family::Board::of(r);
+        let (head, rest) = board.counts();
+        let gaps = board.family.gaps;
+        let correction = board.correction();
+        out += &format!(
+            "family  {}{}{}\n",
+            fmt::fields(std::iter::once(format!("{head} compared journeys")).chain(rest).chain((gaps > 0).then(|| format!("{gaps} not comparable")))),
+            if correction.is_empty() { "" } else { " · " },
+            correction
+        );
+    }
     if let Some(st) = r["stopped"].as_object() {
         let not_run: Vec<&str> = st.get("not_run").and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).collect();
         let why = st.get("why").and_then(Value::as_str).unwrap_or("");

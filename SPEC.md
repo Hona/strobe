@@ -1316,12 +1316,16 @@ flowchart LR
     journey `no worse` at its own 2.5% one-sided, with no multiplicity correction (Berger 1982).
   - **Checked** (simulation of the real `stats.rs`, 2,000 families per row, normal and t₃ log-ratio
     differences, σ 1% and 3%, looks 8–40 at 98.42%, runs on to family_min_pairs): A/A families of 3,
-    5, 8 and 10 journeys counted any journey `better` in 0.2–1.6% (FWER ≤ 5%; per journey without
-    Holm the same families showed a win in 2.5–20%); one journey exactly at a 5% margin and the rest
-    at 0 or at the margin: "no worse in all" 1.9–2.9% (nominal 2.5%, standard error 0.35%); every
-    journey truly −30% (σ 3%): all M counted in 100% of families for M = 3, 5, 7, 10 when they run on
-    to family_min_pairs, in 0% when they stop at 8 pairs; three true −20% journeys among eight: 3.00
-    of 3 counted, nulls falsely counted in 0.8% of families.
+    5, 8 and 10 journeys counted any journey `better` in 0.25–1.4% and any `worse` in 0.25–2.0%
+    (each FWER ≤ 5%; per journey without Holm the same families showed a win in 2.2–22%); one
+    journey exactly at a 5% margin and the rest at 0 or at the margin: "no worse in all" 1.9–2.7%
+    (nominal 2.5%, standard error 0.35%); every journey truly −30% (σ 3%): all M counted in 100% of
+    families for M = 3, 5, 7, 10 when they run on to family_min_pairs, in 0% when they stop at 8
+    pairs; three true −20% journeys among eight: 3.00 of 3 counted, a null counted better or worse
+    in 2.4% of families. Mirror (the same draws with the sides swapped, six journeys: two −20%, two
+    +20%, two 0): `better` and `worse` swapped in every one of 500 families; in 14 a null journey
+    read `same` on one side and `unclear` on the other, because the ±2% bound is set on the ratio
+    (ln 0.98 to ln 1.02 is not symmetric), which stops one side's series at an earlier look.
 - **Exact metrics**: a counter (`kind: exact`) that holds one value on each side in every block,
   from 2 pairs, is compared exactly: the difference is the answer, printed as `exact`, with
   `same (exact)` or a direction word. It needs no test, so it skips Holm and the primary's gate. A
@@ -2015,8 +2019,11 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 - **result.json** (`schema/result.v1.json`): `comparison` (`builds` | `implementations`),
   `variants[].{name, target, target_kind, engine, repo, process_set {median_count, by_program}}`,
   `fixture`, `fairness { window {client_dip, scale, display, hz}, adapter, input, frames, gpu_cache,
-  priority, observer {base, head, reads_per_run} }`, `scoreboard` (filled by the scoreboard work),
-  and per series `hero` (the case's `hero: true`), `targets`, `target_kinds`, `adapted`,
+  priority, observer {base, head, reads_per_run} }`, `scoreboard { journeys, compared, better, same,
+  worse, unclear, gaps, better_alone, worse_alone, family, all_no_worse }` (the journeys as one
+  family, §9.3; the text output's `family` line), each primary's `p_repeated` and `holm_decided`
+  (its better or worse verdict confirmed across the family), and per series `hero` (the case's
+  `hero: true`), `targets`, `target_kinds`, `adapted`,
   `equivalence`, `per_side`, and for a gap `gap { side, name, missing, reason }`. Roles stay `base`
   and `head`; the ledger's identity is `<target>=<build>` per side.
 - **Checked** (phase 1): vps (Linux VM) and adais (Windows, locked) with a windowless planted-work
@@ -4075,9 +4082,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   plot (`app/card/forest.rs`), `--format badge --scoreboard` and the viewer's implementation mode are
   built; checked by simulating the real `stats.rs` (9.3) and by rendering hand-written results of 1,
   3, 6 and 10 journeys (a regression, a 2.4× increase, a gap, Care notes, per-side numbers,
-  equivalence checks). The bench does not yet write `comparison`, `variants[].name`, `fixture`,
-  `fairness`, `per_side`, `equivalence`, `p_repeated`, `holm_decided` or `scoreboard`, nor run on to
-  `family_min_pairs`: the reports compute the family from the stored blocks until it does. Every
+  equivalence checks, a regression decided on its own only) and its mirror (the same draws with the
+  sides swapped: better 4, worse 2, same 1, unclear 2 against better 2, worse 4, same 1, unclear 2).
+  The bench writes `scoreboard`, `p_repeated` and `holm_decided` (`family::Board::write`, also the
+  text output's `family` line) and runs a primary decided better or worse on to
+  `family_min_pairs(journeys)`; reports read a result without them by computing the family from its
+  blocks. Not built yet: `equivalence` (phase 2), per-side attribution (phase 4), so Where each
+  spends its time and the thumbnails show only once those exist. Every
   card's pair strip is now on a log-ratio scale (it was `(head − base) / base`, which drew −80% four
   times closer to no change than +400%); builds-mode PR blocks are unchanged (55 stored experiments
   matched byte for byte, the version line aside); 2 of their 55 cards moved their dots. A note's
@@ -4105,7 +4116,8 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 - Implementation comparisons, phase 1 (§9.10): sides, per-target projects, fixtures, comparability,
   pages from outside, parity gaps. Not built yet: journeys with input (OS input to pages, `ui`
   adapters and `@name`, `expect.same`, `InputMismatch`, `NotEquivalent`, `driver.reads`,
-  `ObserverCost`), the scoreboard and its card and PR block, per-side attribution, tracking. Checked
+  `ObserverCost`), per-side attribution, tracking (the scoreboard, its card and PR block came after:
+  see the entry above). Checked
   with a windowless app that spins `--work` ms every 25 ms and asks the fixture (a copy of it) once a
   tick, 1 s runs, 8 pairs each: vps (Linux VM) A/A through two targets `+0.2% [−0.3 … +0.7]` no worse
   (≤2%); planted 2× `+97% [+96 … +98]` and its mirror `−49%` (ln ratios +0.678 and −0.673); the tick's

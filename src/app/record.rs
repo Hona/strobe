@@ -110,8 +110,19 @@ pub fn run(args: &Args) -> Result<Output> {
         None => target,
     };
     // A timed recording runs on the fastest power plan, as a bench does (SPEC §9.4); attribution,
-    // deep and memory recordings are not timed.
-    let _power = if args.get("probes").unwrap_or("timing") == "timing" { Some(super::bench::power_for(args)?) } else { None };
+    // deep and memory recordings are not timed. A plan it switched to is said in the result, not as
+    // a progress line on stderr that reads like an error.
+    let power = if args.get("probes").unwrap_or("timing") == "timing" { Some(super::bench::power_quiet(args)?) } else { None };
+    let mut out = recorded(args, target)?;
+    if let Some(p) = power.filter(|p| p.switched())
+        && !out.text.is_empty()
+    {
+        out.text += &format!("power    {} for this recording; the user's own plan is back\n", p.used);
+    }
+    Ok(out)
+}
+
+fn recorded(args: &Args, target: String) -> Result<Output> {
     if target.starts_with("pid:") || target.starts_with("proc:") {
         return super::outside::record(args, &target);
     }

@@ -4471,12 +4471,18 @@ impl Drop for OwnAffinity {
 /// The run's power plan (SPEC §9.4): `--power high` (the default) switches to the fastest plan the
 /// device offers and puts the user's back afterwards, even after a kill (`host::power`); `--power
 /// keep` keeps the user's. strobe pins the target to its CPUs itself, so it needs no core parking.
+/// A progress line says so only when the plan changed: a plan already in use is the env line's.
 pub(crate) fn power_for(args: &Args) -> Result<host::power::Power> {
-    let p = host::power::Power::for_run(power_keep(args)?);
-    if p.kept.is_none() {
-        progress(format!("  power plan: {} for this run", p.used));
+    let p = power_quiet(args)?;
+    if p.switched() {
+        progress(format!("  power plan: {} for this run (the user's own comes back after it)", p.used));
     }
     Ok(p)
+}
+
+/// `power_for` without the progress line, for a command that says it in its result (`record`).
+pub(crate) fn power_quiet(args: &Args) -> Result<host::power::Power> {
+    Ok(host::power::Power::for_run(power_keep(args)?))
 }
 
 fn power_keep(args: &Args) -> Result<bool> {

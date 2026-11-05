@@ -15,9 +15,9 @@ const RUNNER: &str = include_str!("../sdk/bench/src/runner.ts");
 const PRELOAD: &str = include_str!("../sdk/bench/src/preload.ts");
 const HOST: &str = include_str!("../sdk/bench/src/host.mjs");
 
-/// Writes the embedded SDK under the state dir (once per strobe version) and returns its folder.
+/// Writes the embedded SDK under the state dir (once per strobe build) and returns its folder.
 pub fn sdk_dir() -> Result<PathBuf> {
-    let dir = paths::sdk().join(env!("CARGO_PKG_VERSION"));
+    let dir = paths::sdk().join(env!("STROBE_BUILD_ID"));
     std::fs::create_dir_all(&dir)?;
     for (name, body) in [("index.ts", INDEX), ("runner.ts", RUNNER), ("preload.ts", PRELOAD), ("host.mjs", HOST)] {
         let p = dir.join(name);

@@ -188,12 +188,6 @@ impl Hidden for std::process::Command {
     }
 }
 
-/// Whether the installed helper is this build (`up` refreshes it otherwise).
-pub fn helper_current() -> bool {
-    let Ok(installed) = std::fs::read(helper_exe()) else { return false };
-    source_exe().and_then(|p| std::fs::read(p).ok()).is_some_and(|mine| mine == installed)
-}
-
 /// The binary the helper runs: the windowless build beside this one, so the task opens no console.
 fn source_exe() -> Option<PathBuf> {
     let me = std::env::current_exe().ok()?;
@@ -394,7 +388,7 @@ struct Conn {
 impl Conn {
     fn handle(&mut self, req: &Value, sid: &str) -> Result<Value> {
         match req["op"].as_str().unwrap_or("") {
-            "hello" => Ok(json!({ "ok": { "pid": std::process::id(), "version": env!("CARGO_PKG_VERSION") } })),
+            "hello" => Ok(json!({ "ok": { "pid": std::process::id(), "build": env!("STROBE_BUILD_ID"), "protocol": env!("STROBE_HELPER_PROTOCOL") } })),
             "presents.start" => {
                 if self.presents.is_none() {
                     self.presents = Some(super::present::Capture::start()?);
@@ -581,7 +575,7 @@ impl Client {
                 let owner = pipe_owner(h);
                 let owned = owner.as_deref().is_some_and(|o| o == sid || o == ADMINISTRATORS || o == SYSTEM);
                 if image && owned {
-                    return Ok(Client(h));
+                    return Client(h).hello();
                 }
                 unsafe { CloseHandle(h) };
                 return Err(Error::msg(format!(
@@ -610,6 +604,24 @@ impl Client {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    /// Refuses a helper whose protocol is not this build's: `strobe update` (or another build) left an
+    /// older copy installed, whose requests and replies may differ in what they mean.
+    fn hello(mut self) -> Result<Client> {
+        let hi = self.call(json!({ "op": "hello" }))?;
+        let protocol = hi["protocol"].as_str().unwrap_or("");
+        if protocol != env!("STROBE_HELPER_PROTOCOL") {
+            return Err(Error::msg(format!(
+                "the installed deep-mode helper is another build ({}, protocol {}; this build {}, protocol {})",
+                hi["build"].as_str().or(hi["version"].as_str()).unwrap_or("unknown"),
+                if protocol.is_empty() { "unknown" } else { protocol },
+                env!("STROBE_BUILD_ID"),
+                env!("STROBE_HELPER_PROTOCOL")
+            ))
+            .hint("run strobe up from this build to install its helper (one UAC prompt)"));
+        }
+        Ok(self)
     }
 
     pub fn call(&mut self, req: Value) -> Result<Value> {

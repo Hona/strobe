@@ -9,6 +9,8 @@ use std::path::Path;
 use std::process::Command;
 
 const SOURCES: &[&str] = &["src", "sdk/bench/src", "viewer", "skill", "calibration", "Cargo.toml", "Cargo.lock", "build.rs"];
+/// What the helper runs and returns: its requests, the present and stack sessions, `Presents` and `Deep`.
+const HELPER_SOURCES: &[&str] = &["src/etw"];
 
 /// FNV-1a, 64 bits: stable across Rust releases, unlike the standard library's hasher.
 fn fnv(h: &mut u64, bytes: &[u8]) {
@@ -53,6 +55,15 @@ fn main() {
         fnv(&mut h, std::env::var(k).unwrap_or_default().as_bytes());
     }
     println!("cargo:rustc-env=STROBE_BUILD_ID={h:016x}");
+    // The deep-mode helper's protocol (`STROBE_HELPER_PROTOCOL`): a hash of the sources that make its
+    // operations and what they return. A client refuses a helper that differs, while builds that
+    // changed only other files keep using the installed one.
+    let mut p = 0xcbf2_9ce4_8422_2325u64;
+    for f in files.iter().filter(|f| HELPER_SOURCES.iter().any(|s| f.starts_with(s))) {
+        fnv(&mut p, f.to_string_lossy().replace('\\', "/").as_bytes());
+        fnv(&mut p, &std::fs::read(f).unwrap_or_default());
+    }
+    println!("cargo:rustc-env=STROBE_HELPER_PROTOCOL={p:016x}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         windows_resources();
     }

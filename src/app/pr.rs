@@ -1,6 +1,8 @@
 //! `report experiment <exp> --format pr` (SPEC §11.2): an experiment as one delimited block of
-//! GitHub-flavoured Markdown for a pull request body: one line per series in plain words, at most one
-//! caveat, then a Details drawer (metrics, pairs, profiles, method) and a Rerun drawer. The block sits between two HTML comments that carry a hash of what strobe wrote, so a tool can
+//! GitHub-flavoured Markdown for a pull request body: one hero line, a caution for what got worse, one
+//! line per series in plain words, at most one caveat, then a Details drawer (metrics, pairs,
+//! profiles, method) and a Rerun drawer. The block sits between two HTML comments that carry a hash
+//! of what strobe wrote, so a tool can
 //! find it, replace it (`--update-pr`) and see when someone edited it by hand.
 
 use super::fmt;
@@ -62,8 +64,8 @@ fn utf16(s: &str) -> usize {
 /// The report between its two quiet visible boundary lines.
 fn framed(r: &Value, level: u8) -> String {
     let id = r["id"].as_str().unwrap_or("");
-    let top = format!("<sub>Strobe report <code>{id}</code> · generated, do not edit by hand</sub>");
-    let bottom = format!("<sub>End of strobe report <code>{id}</code></sub>");
+    let top = format!("<sub>strobe · {id} · generated</sub>");
+    let bottom = format!("<sub>strobe · {id} · end of generated report</sub>");
     let body = if r["kind"] == "bisect" { bisect(r) } else { Doc::new(r, level).render() };
     format!("{top}\n\n{}\n\n{bottom}", body.trim())
 }
@@ -253,6 +255,14 @@ fn before_after(c: &Value) -> String {
     }
 }
 
+/// `7.10 → 3.89 ms`: before → this PR, the unit once when they share it; it may break after the arrow.
+fn arrow(b: &str, h: &str) -> String {
+    match (b.rsplit_once(' '), h.rsplit_once(' ')) {
+        (Some((bn, bu)), Some((_, hu))) if bu == hu && bn.parse::<f64>().is_ok() => format!("{bn}\u{a0}→ {}", nb(h)),
+        _ => format!("{}\u{a0}→ {}", nb(b), nb(h)),
+    }
+}
+
 fn html_esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
 }
@@ -339,52 +349,62 @@ impl<'a> Doc<'a> {
         Doc { r, level, aa: r["plan"]["aa"] == true, id: r["id"].as_str().unwrap_or(""), series: r["series"].as_array().map(|a| a.iter().collect()).unwrap_or_default() }
     }
 
-    /// What a reader sees: one line per series (and a second only for what got worse or a warning
-    /// about that series), at most one caveat for the report, then two drawers: Details (metrics,
-    /// pairs, profiles, method under plain headings) and Rerun.
+    /// What a reader sees: the hero line, one caution with every regression, one line per series (and
+    /// a second only for untested drift or a warning about that series), at most one caveat for the
+    /// report, then two drawers: Details (metrics, pairs, profiles, method under plain headings) and
+    /// Rerun.
     fn render(&self) -> String {
         let mut out = String::new();
-        // The hero: each decided win as the biggest text GitHub draws, with what got decidedly worse
-        // beside it just as big; without a win, one calm heading that says what happened.
-        let wins = self.wins();
-        let celebrate = !wins.is_empty();
+        // The hero: one `#` line, bigger than the `##` sections an author writes above the block, with
+        // the decided wins of the main metrics; without one, what happened, calmly, or the regression.
+        let (wins, second) = self.win_phrases();
+        let mut regs = self.regression_lines();
+        let hero = if !wins.is_empty() {
+            wins.join(" · ")
+        } else if let Some(i) = regs.iter().position(|r| r.0) {
+            format!("Regression: {}", regs.remove(i).2)
+        } else {
+            self.calm()
+        };
         // A card image (`--format card`, attached by `--update-pr`) leads when there is one; the
-        // headings stay, so the result reads without images.
+        // heading stays, so the result reads without images.
         if let Some(url) = self.r["card"]["url"].as_str() {
-            let alt = if celebrate { wins.iter().map(|w| w.0.replace('\u{a0}', " ")).collect::<Vec<_>>().join(", ") } else { self.calm() };
-            out += &format!("![{}]({url})\n\n", alt.replace(['[', ']'], ""));
+            out += &format!("![{}]({url})\n\n", hero.replace('\u{a0}', " ").replace(['[', ']'], ""));
         }
-        // `#`: bigger than the `##` sections an author writes above the block.
-        for (head, caption) in wins.iter().chain(&self.hero_regressions()) {
-            out += &format!("# {head}\n<sub>{caption}</sub>\n\n");
+        out += &format!("# {hero}\n\n");
+        // What got decidedly worse: as hard to miss, but never in a win's typography.
+        if !regs.is_empty() {
+            out += "> [!CAUTION]\n";
+            out += &regs.iter().map(|r| format!("> **Regression:** {}", r.1)).collect::<Vec<_>>().join("\n");
+            out += "\n\n";
         }
-        if !celebrate {
-            out += &format!("# {}\n\n", self.calm());
-        }
+        // The proof: every series once, by name.
         for s in &self.series {
-            let mut lines: Vec<String> = Vec::new();
-            // A series whose main result a hero already says needs no line of its own.
-            let lost = celebrate && self.primary_out(s) == Out::Worse && !verdict(&s["primary"]).starts_with("worse");
-            if !self.in_hero(s) && !lost {
-                let mut line = self.sentence(s);
-                // A series' badge image (`--format card`) stands in for its bold change.
-                if let Some(url) = self.r["card"]["badges"][s["label"].as_str().unwrap_or("")].as_str()
-                    && let (Some(a), Some(b)) = (line.find("**"), line.rfind("**"))
-                    && b > a + 2
-                {
-                    let change = line[a + 2..b].to_string();
-                    line = format!("{}![{change} per pair]({url}){}", &line[..a], &line[b + 2..]);
-                }
-                lines.push(format!("**{}:** {line}", cell(&self.title(s))));
+            let mut line = self.sentence(s);
+            // A series' badge image (`--format card`) stands in for its bold change.
+            if let Some(url) = self.r["card"]["badges"][s["label"].as_str().unwrap_or("")].as_str()
+                && let (Some(a), Some(b)) = (line.find("**"), line.rfind("**"))
+                && b > a + 2
+            {
+                let change = line[a + 2..b].to_string();
+                line = format!("{}![{change}]({url}){}", &line[..a], &line[b + 2..]);
             }
-            if let Some(b) = self.regressions(s, celebrate) {
+            // The hero's second win, from this series: its proof too.
+            if let Some((x, c)) = second
+                && std::ptr::eq(x, *s)
+            {
+                let m = c["metric"].as_str().unwrap_or("");
+                line = format!("{}; {} **{}** (medians {}), likely {}.", line.trim_end_matches('.'), lc(&self.noun_in(s, m)), nb(&delta(c, f(&c["estimate"]))), before_after(c), range(c));
+            }
+            if unsteady(s) {
+                line = format!("{}; **unsteady case**: its work grew each run.", line.trim_end_matches('.'));
+            }
+            let mut lines = vec![format!("**{}:** {line}", cell(&self.title(s)))];
+            if let Some(b) = self.drift(s) {
                 lines.push(format!("**But** {b}."));
             }
             if let Some(c) = caveat(s) {
                 lines.push(c);
-            }
-            if lines.is_empty() {
-                continue;
             }
             out += &lines.join("\n");
             out += "\n\n";
@@ -402,7 +422,11 @@ impl<'a> Doc<'a> {
             d += &self.attribution_section();
         }
         d += &self.method();
-        out += &drawer("<b>Details</b> · metrics, pairs, profiles and method", &d);
+        d += "\n";
+        if self.level < 5 {
+            d += &self.also_measured();
+        }
+        out += &drawer("<b>Details</b> · metrics, pairs, profiles, method", &d);
         out += &self.rerun_drawer();
         out
     }
@@ -482,7 +506,7 @@ impl<'a> Doc<'a> {
             Out::Better | Out::Worse if !verdict(c).starts_with("worse") => {
                 let (k, word) = if o == Out::Better { (w, "better") } else { (n - w, "worse") };
                 let small = if verdict(c).contains("(small)") { format!(", perhaps by under {}", bound.trim_start_matches('±')) } else { String::new() };
-                format!("{noun} **{change}** per pair ({medians}), {word} in {k} of {n}{small}.")
+                format!("{noun} **{change}** per pair ({medians}), {word} in {k} of {n} pairs, likely {}{small}.", range(c))
             }
             Out::AaFalse => format!("identical builds differed by **{change}** in {}: don't trust this setup yet.", lc(&noun)),
             Out::Same if self.aa => format!("identical builds matched on {} within {bound}.", lc(&noun)),
@@ -504,21 +528,11 @@ impl<'a> Doc<'a> {
         }
     }
 
-    /// What got worse while the main metric did not say so: tested metrics decided worse, untested
-    /// metrics whose whole likely range lies past the bound on the worse side, and late frames.
-    /// `in_hero`: the tested regressions and late frames are already headings above.
-    fn regressions(&self, s: &Value, in_hero: bool) -> Option<String> {
-        let mut parts: Vec<String> = Vec::new();
-        for c in tested(s).into_iter().skip(1) {
-            if outcome(c, self.aa) == Out::Worse && !in_hero {
-                parts.push(format!("{} {}", lc(&noun(c["metric"].as_str().unwrap_or(""))), nb(&delta(c, f(&c["estimate"])))));
-            }
-        }
-        if let Some((b, h, k, n)) = late_frames(s, self.r)
-            && h - b >= 0.01
-            && !in_hero
-        {
-            parts.push(format!("late frames rose from {:.1}% to {:.1}% (in {k} of {n} pairs, not tested)", b * 100.0, h * 100.0));
+    /// Untested metrics whose whole likely range lies past the bound on the worse side: not decided,
+    /// so a plain line, never the caution. An unsteady case drifts by itself, so it says none.
+    fn drift(&self, s: &Value) -> Option<String> {
+        if unsteady(s) {
+            return None;
         }
         let mut untested: Vec<(f64, String)> = Vec::new();
         for c in all_rows(s).into_iter().skip(1) {
@@ -534,23 +548,22 @@ impl<'a> Doc<'a> {
             let lower = better_of(m) == Better::Lower;
             let bound = if b.is_finite() && b > 0.0 { b } else { 0.02 };
             if lo.is_finite() && hi.is_finite() && ((lower && lo > bound) || (!lower && hi < -bound)) {
-                let size = if c["relative"] == true { f(&c["estimate"]).abs() } else { (f(&c["estimate"]) / f(&c["base"]).abs().max(1e-9)).abs() };
-                untested.push((size, format!("{} {}", lc(&noun(m)), nb(&delta(c, f(&c["estimate"]))))));
+                untested.push((size(c), format!("{} {}", lc(&noun(m)), nb(&delta(c, f(&c["estimate"]))))));
             }
         }
         untested.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
-        if !untested.is_empty() {
-            let more = untested.len().saturating_sub(2);
-            let list: Vec<String> = untested.into_iter().take(2).map(|x| x.1).collect();
-            let list = if more > 0 { format!("{} and {more} more", list.join(", ")) } else { join_and(&list) };
-            parts.push(format!("{list} (not tested)"));
+        if untested.is_empty() {
+            return None;
         }
-        (!parts.is_empty()).then(|| parts.join("; "))
+        let more = untested.len().saturating_sub(2);
+        let list: Vec<String> = untested.into_iter().take(2).map(|x| x.1).collect();
+        let list = if more > 0 { format!("{} and {more} more", list.join(", ")) } else { join_and(&list) };
+        Some(format!("{list} (not tested)"))
     }
 
-    /// A decided change as a hero says it: "44% less CPU time", "219 MB less GPU memory", "Time until
-    /// ready: 15% faster", in the metric's own words for the direction it moved.
-    fn hero_phrase(&self, c: &Value) -> String {
+    /// A decided change in the metric's own words for the direction it moved: the amount (`44%`,
+    /// `219 MB`, a number and its unit kept together), the word, the thing.
+    fn hero_parts(&self, c: &Value) -> (String, &'static str, String) {
         let m = c["metric"].as_str().unwrap_or("");
         let est = f(&c["estimate"]);
         let (good, bad) = model::metric(m).map(|d| d.words).unwrap_or(("less", "more"));
@@ -559,95 +572,95 @@ impl<'a> Doc<'a> {
         let amount = match c["relative"] == true {
             true if pct < 10.0 => format!("{pct:.1}%"),
             true => format!("{pct:.0}%"),
-            false => disp(est.abs(), abs_unit(unit_of(m))),
+            false => nb(&disp(est.abs(), abs_unit(unit_of(m)))),
         };
-        let thing = lc(&noun(m)).trim_end_matches(" per run").to_string();
-        if matches!(word, "faster" | "slower" | "smoother" | "choppier") { nb(&format!("{}: {amount} {word}", capitalize(&thing))) } else { nb(&format!("{amount} {word} {thing}")) }
+        (amount, word, lc(&noun(m)).trim_end_matches(" per run").to_string())
     }
 
-    /// A hero's caption: the series (when there are several), the medians, the pairs, the likely range.
-    fn hero_caption(&self, s: &Value, c: &Value) -> String {
-        let m = c["metric"].as_str().unwrap_or("");
-        let (w, n) = wins(&pairs(s), m);
-        let (k, word) = if outcome(c, self.aa) == Out::Worse { (n - w, "worse") } else { (w, "better") };
-        let per = self.noun_in(s, m).split_once(" per ").map(|(_, p)| format!(" per {p}")).unwrap_or_default();
-        let mut parts = Vec::new();
-        if self.multi() {
-            parts.push(html_esc(&self.title(s)));
+    /// "44% less CPU time", "Time until ready: 15% faster".
+    fn hero_phrase(&self, c: &Value) -> String {
+        let (amount, word, thing) = self.hero_parts(c);
+        phrase(&amount, word, &thing)
+    }
+
+    /// The hero's wins: each series' main metric that decidedly improved, in the series' order, the
+    /// same metric in several series said once (`19–23% less CPU time`), at most three. A single win
+    /// from one series makes room for one tested metric of another kind that also won there.
+    fn win_phrases(&self) -> (Vec<String>, Option<(&'a Value, &'a Value)>) {
+        let celebrates = |s: &Value| !self.aa && s["kind"] != "leak" && s["not_run"] != true && self.primary_out(s) == Out::Better && !verdict(&s["primary"]).starts_with("worse");
+        let mut groups: Vec<(String, Vec<&'a Value>)> = Vec::new();
+        for s in self.series.iter().copied().filter(|s| celebrates(s)) {
+            let c = &s["primary"];
+            let key = format!("{}|{}", c["metric"].as_str().unwrap_or(""), self.hero_parts(c).1);
+            match groups.iter_mut().find(|g| g.0 == key) {
+                Some(g) => g.1.push(c),
+                None => groups.push((key, vec![c])),
+            }
         }
-        parts.push(format!("medians {}{per}", before_after(c)));
-        parts.push(format!("{word} in {k} of {n} pairs"));
-        parts.push(format!("likely {}", range(c)));
-        parts.join(" · ")
+        let mut out: Vec<String> = groups
+            .iter()
+            .take(3)
+            .map(|(_, cs)| {
+                let parts: Vec<(String, &'static str, String)> = cs.iter().map(|c| self.hero_parts(c)).collect();
+                let mut sized: Vec<(f64, &String)> = cs.iter().zip(&parts).map(|(c, p)| (size(c), &p.0)).collect();
+                sized.sort_by(|a, b| a.0.total_cmp(&b.0));
+                let (lo, hi) = (sized[0].1, sized[sized.len() - 1].1);
+                let amount = if lo == hi { lo.clone() } else { span(lo, hi) };
+                phrase(&amount, parts[0].1, &parts[0].2)
+            })
+            .collect();
+        let mut second = None;
+        if let [(_, cs)] = groups.as_slice()
+            && cs.len() == 1
+            && let Some(s) = self.series.iter().copied().find(|s| std::ptr::eq(&s["primary"], cs[0]))
+        {
+            let main = family(cs[0]["metric"].as_str().unwrap_or(""));
+            let extra = tested(s)
+                .into_iter()
+                .skip(1)
+                .filter(|c| outcome(c, self.aa) == Out::Better && !verdict(c).starts_with("worse") && family(c["metric"].as_str().unwrap_or("")) != main)
+                .max_by(|a, b| size(a).total_cmp(&size(b)).then(b["metric"].as_str().cmp(&a["metric"].as_str())));
+            if let Some(c) = extra {
+                out.push(self.hero_phrase(c));
+                second = Some((s, c));
+            }
+        }
+        (out, second)
     }
 
-    /// The decided wins, at most three, biggest first: every series' main metric that improved, then
-    /// the tested metrics that improved, each metric once.
-    fn wins(&self) -> Vec<(String, String)> {
-        self.win_rows().into_iter().map(|(s, c)| (self.hero_phrase(c), self.hero_caption(s, c))).collect()
-    }
-
-    /// Series whose main result a hero already says.
-    fn in_hero(&self, s: &Value) -> bool {
-        self.win_rows().iter().any(|(x, c)| std::ptr::eq(*x, s) && std::ptr::eq(*c, &s["primary"]))
-    }
-
-    fn win_rows(&self) -> Vec<(&'a Value, &'a Value)> {
-        let size = |c: &Value| if c["relative"] == true { f(&c["estimate"]).abs() } else { (f(&c["estimate"]) / f(&c["base"]).abs().max(1e-9)).abs() };
-        let mut main: Vec<(f64, &'a Value, &'a Value)> = Vec::new();
-        let mut rest: Vec<(f64, &'a Value, &'a Value)> = Vec::new();
+    /// Everything decidedly worse, one line each: (a main metric, the line, the hero phrase). A main
+    /// metric that got worse, a tested metric that got worse, and late frames up by a point or more.
+    fn regression_lines(&self) -> Vec<(bool, String, String)> {
+        let mut out = Vec::new();
+        // `30% more thread wake-ups in *Warm* (7 of 8 pairs)`: the pairs this PR did worse in.
+        let line = |s: &Value, ph: &str, k: usize, n: usize| {
+            let who = if self.multi() { format!(" in *{}*", html_esc(&self.title(s))) } else { String::new() };
+            format!("{}{who} ({k} of {n} pairs)", lc(ph))
+        };
         for s in self.series.iter().copied() {
             if self.aa || s["kind"] == "leak" || s["not_run"] == true {
                 continue;
             }
-            // A series whose main metric did not win celebrates nothing, whatever else improved.
-            if self.primary_out(s) != Out::Better || verdict(&s["primary"]).starts_with("worse") {
-                continue;
-            }
-            for (i, c) in tested(s).into_iter().enumerate() {
-                let o = if i == 0 { self.primary_out(s) } else { outcome(c, self.aa) };
-                if o == Out::Better && !verdict(c).starts_with("worse") {
-                    if i == 0 { main.push((size(c), s, c)) } else { rest.push((size(c), s, c)) }
-                }
-            }
-        }
-        let order = |v: &mut Vec<(f64, &Value, &Value)>| v.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2["metric"].as_str().cmp(&b.2["metric"].as_str())));
-        order(&mut main);
-        order(&mut rest);
-        let mut chosen: Vec<(f64, &Value, &Value)> = Vec::new();
-        // Each series' main metric is its own win; another metric adds a win only once.
-        chosen.extend(main.into_iter().take(3));
-        for x in rest {
-            if chosen.len() < 3 && !chosen.iter().any(|y| y.2["metric"] == x.2["metric"]) {
-                chosen.push(x);
-            }
-        }
-        order(&mut chosen);
-        chosen.into_iter().map(|(_, s, c)| (s, c)).collect()
-    }
-
-    /// What got decidedly worse beside the wins, as big as they are: tested metrics decided worse and
-    /// late frames.
-    fn hero_regressions(&self) -> Vec<(String, String)> {
-        if self.wins().is_empty() {
-            return Vec::new();
-        }
-        let mut out = Vec::new();
-        for s in &self.series {
+            let worse = |c: &Value| {
+                let (w, n) = wins(&pairs(s), c["metric"].as_str().unwrap_or(""));
+                (n - w, n)
+            };
             let p = &s["primary"];
-            if self.primary_out(s) == Out::Worse && !verdict(p).starts_with("worse") {
-                out.push((format!("But {}", self.hero_phrase(p)), self.hero_caption(s, p)));
+            if self.primary_out(s) == Out::Worse {
+                let (ph, (k, n)) = (self.hero_phrase(p), worse(p));
+                out.push((true, line(s, &ph, k, n), ph));
             }
             for c in tested(s).into_iter().skip(1) {
                 if outcome(c, self.aa) == Out::Worse {
-                    out.push((format!("But {}", self.hero_phrase(c)), self.hero_caption(s, c)));
+                    let (ph, (k, n)) = (self.hero_phrase(c), worse(c));
+                    out.push((false, line(s, &ph, k, n), ph));
                 }
             }
             if let Some((b, h, k, n)) = late_frames(s, self.r)
                 && h - b >= 0.01
             {
-                let who = if self.multi() { format!("{} · ", html_esc(&self.title(s))) } else { String::new() };
-                out.push((nb(&format!("But late frames rose from {:.1}% to {:.1}%", b * 100.0, h * 100.0)), format!("{who}more late frames in {k} of {n} pairs · not tested")));
+                let ph = format!("late frames rose from {:.1}% to {:.1}%", b * 100.0, h * 100.0);
+                out.push((false, line(s, &ph, k, n), ph));
             }
         }
         out
@@ -735,27 +748,18 @@ impl<'a> Doc<'a> {
         }
     }
 
-    /// A table's first column for series `s` at row `i`: its title on its first row, empty after.
+    /// Before series `s`'s first row (`i` 0) of a table across series, a row with its title, so no
+    /// column is spent on it; GitHub fills the row's other cells.
     fn series_cell(&self, s: &Value, i: usize) -> String {
-        match (self.multi(), i) {
-            (false, _) => String::new(),
-            (true, 0) => format!("| **{}** ", cell(&self.title(s))),
-            (true, _) => "| ".to_string(),
-        }
-    }
-
-    fn series_head(&self) -> (&'static str, &'static str) {
-        if self.multi() { ("| Series ", "|:---") } else { ("", "") }
+        if self.multi() && i == 0 { format!("| **{}** |\n", cell(&self.title(s))) } else { String::new() }
     }
 
     // ---------- Details ----------
 
-    /// Every tested metric of every series in one table, then the untested ones.
+    /// Every tested metric of every series in one table.
     fn metrics(&self) -> String {
-        let (sh, ss) = self.series_head();
-        let mut t = format!("#### Metrics\n\n{sh}| Metric | Before | This PR | Change | Likely range | Verdict |\n{ss}|:---|---:|---:|---:|---:|:---|\n");
-        let mut ctx = format!("{sh}| Also measured, not tested | Before | This PR | Change | Likely range |\n{ss}|:---|---:|---:|---:|---:|\n");
-        let (mut any_ctx, mut zeros, mut conf_main, mut conf_rest) = (false, Vec::<String>::new(), String::new(), String::new());
+        let mut t = String::from("#### Metrics\n\n| Metric | Before | This PR | Change | Likely range | Verdict |\n|:---|---:|---:|---:|---:|:---|\n");
+        let (mut conf_main, mut conf_rest) = (String::new(), String::new());
         for s in &self.series {
             if s["not_run"] == true || s["kind"] == "leak" {
                 t += &format!("{}| {} | | | | | {} |\n", self.series_cell(s, 0), if s["kind"] == "leak" { "Memory growth per run" } else { "Not run" }, cell(verdict(&s["primary"])));
@@ -773,14 +777,38 @@ impl<'a> Doc<'a> {
                     conf_rest = conf(c);
                 }
             }
-            if self.level >= 5 {
+        }
+        let foot = if conf_main.is_empty() {
+            "Change: the median of the pairs' own changes.".to_string()
+        } else if !conf_rest.is_empty() && conf_rest != conf_main {
+            format!("Likely range: {conf_main} confidence for the main metric, {conf_rest} for the others. Change: the median of the pairs' own changes.")
+        } else {
+            format!("Likely range: {conf_main} confidence. Change: the median of the pairs' own changes.")
+        };
+        t + &format!("\n<sub>{foot}</sub>\n\n")
+    }
+
+    /// The metrics measured but not tested, last: what moved in a table, what held still in a line.
+    fn also_measured(&self) -> String {
+        let mut t = String::from("| Metric | Before | This PR | Change | Likely range |\n|:---|---:|---:|---:|---:|\n");
+        let (mut any, mut zeros, mut held) = (false, Vec::<String>::new(), Vec::<(String, String)>::new());
+        for s in &self.series {
+            if s["not_run"] == true || s["kind"] == "leak" {
                 continue;
             }
             let (rows, z) = context(s);
-            zeros.extend(z.into_iter().map(|m| lc(&noun(&m)).trim_end_matches(" per run").to_string()));
-            for (i, c) in rows.into_iter().enumerate() {
-                any_ctx = true;
+            zeros.extend(z);
+            let mut i = 0;
+            for c in rows {
                 let o = outcome(c, self.aa);
+                let m = c["metric"].as_str().unwrap_or("");
+                // Unchanged: the same value on both sides and a range that never left zero.
+                let zero = delta(c, 0.0);
+                if o != Out::Refused && value(c, "base") == value(c, "head") && delta(c, f(&c["lo"])) == zero && delta(c, f(&c["hi"])) == zero {
+                    held.push((lc(&noun(m)).trim_end_matches(" per run").to_string(), nb(&value(c, "base"))));
+                    continue;
+                }
+                any = true;
                 let (chg, rng) = change_cells(c, o);
                 let rng = if o == Out::Refused {
                     let (id, why) = refusal(verdict(c));
@@ -788,31 +816,48 @@ impl<'a> Doc<'a> {
                 } else {
                     rng
                 };
-                ctx += &format!("{}| {} | {} | {} | {chg} | {rng} |\n", self.series_cell(s, i), cell(&noun(c["metric"].as_str().unwrap_or(""))), nb(&value(c, "base")), nb(&value(c, "head")));
+                t += &format!("{}| {} | {} | {} | {chg} | {rng} |\n", self.series_cell(s, i), cell(&noun(m)), nb(&value(c, "base")), nb(&value(c, "head")));
+                i += 1;
             }
         }
+        // `run time (8.01 s, 20.0 s)`: a name once, with each series' value.
+        let mut by: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for (name, v) in held {
+            let e = by.entry(name).or_default();
+            if !e.contains(&v) {
+                e.push(v);
+            }
+        }
+        zeros.sort();
+        zeros.dedup();
         let mut foot = Vec::new();
-        if !conf_main.is_empty() {
-            foot.push(if !conf_rest.is_empty() && conf_rest != conf_main {
-                format!("Likely range: {conf_main} confidence for the main metric, {conf_rest} for the others. Change: the median of the pairs' own changes.")
-            } else {
-                format!("Likely range: {conf_main} confidence. Change: the median of the pairs' own changes.")
-            });
+        if !by.is_empty() {
+            foot.push(format!("Unchanged: {}.", by.iter().map(|(n, v)| format!("{n} ({})", v.join(", "))).collect::<Vec<_>>().join(", ")));
         }
-        t += &format!("\n<sub>{}</sub>\n\n", foot.join(" "));
-        if any_ctx {
-            t += &ctx;
-            zeros.sort();
-            zeros.dedup();
-            if !zeros.is_empty() {
-                t += &format!("\n<sub>Zero in both builds: {}.</sub>\n", join_and(&zeros));
+        if !zeros.is_empty() {
+            let io = zeros.iter().any(|m| m == "io.read") && zeros.iter().any(|m| m == "io.write");
+            let mut names: Vec<String> = zeros.iter().filter(|m| !(io && (*m == "io.read" || *m == "io.write"))).map(|m| lc(&noun(m)).trim_end_matches(" per run").to_string()).collect();
+            if io {
+                names.insert(0, "file and pipe reads and writes".into());
             }
-            t += "\n";
+            foot.push(format!("Zero in both builds: {}.", join_and(&names)));
         }
-        t
+        if !any && foot.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("#### Also measured, not tested\n\n");
+        if any {
+            out += &t;
+            out += "\n";
+        }
+        if !foot.is_empty() {
+            out += &format!("<sub>{}</sub>\n\n", foot.join(" "));
+        }
+        out
     }
 
-    /// Every pair of every series: a real change shows in most of them.
+    /// Every pair of every series: a real change shows in most of them. Each cell is before → this PR,
+    /// so the table stays narrow enough for a phone.
     fn pairs_section(&self) -> String {
         let all: Vec<(&Value, Vec<Pair>)> = self.series.iter().map(|s| (*s, pairs(s))).filter(|(_, p)| !p.is_empty()).collect();
         if all.is_empty() {
@@ -820,16 +865,16 @@ impl<'a> Doc<'a> {
         }
         let foreign = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "cpu.foreign.max").is_finite()));
         let frames = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "frames.n") > 0.0 && bv(p.base, "frames.interval.max").is_finite()));
-        let (sh, ss) = self.series_head();
-        let mut t = format!("#### Pairs\n\n{sh}| Pair | Before | This PR | Change |");
-        let mut sep = format!("{ss}|---:|---:|---:|---:|");
+        let metric = if self.multi() { "Main metric".to_string() } else { noun(all[0].0["primary"]["metric"].as_str().unwrap_or("")) };
+        let mut t = format!("#### Pairs\n\n| Pair | {}, before → this PR | Change |", cell(&metric));
+        let mut sep = String::from("|:---|---:|---:|");
         if frames {
-            t += " Longest frame gap, before | this PR |";
-            sep += "---:|---:|";
+            t += " Longest frame gap |";
+            sep += "---:|";
         }
         if foreign {
-            t += " Other apps' CPU, before | this PR |";
-            sep += "---:|---:|";
+            t += " Other apps' CPU |";
+            sep += "---:|";
         }
         t += &format!("\n{sep}\n");
         let mut left = 0;
@@ -839,7 +884,10 @@ impl<'a> Doc<'a> {
             let unit = unit_of(m);
             let flagged = |p: &Pair| bv(p.base, "cpu.foreign.max") >= 25.0 || bv(p.head, "cpu.foreign.max") >= 25.0;
             let directional = matches!(self.primary_out(s), Out::Better | Out::Worse | Out::AaFalse);
-            let mut row = 0;
+            if self.multi() {
+                // The series names its rows, so no column is spent on it.
+                t += &self.series_cell(s, 0);
+            }
             for (i, p) in ps.iter().enumerate() {
                 // Shedding: a series without a direction keeps its flagged pairs; a long one its ends and its flagged pairs.
                 let keep = !(self.level >= 3 && !directional && !flagged(p)) && !(self.level >= 4 && ps.len() > 16 && !(i < 4 || i + 2 >= ps.len() || flagged(p)));
@@ -852,10 +900,9 @@ impl<'a> Doc<'a> {
                 }
                 let (a, b) = (bv(p.base, m), bv(p.head, m));
                 let d = if a > 0.0 && unit != "count" { fmt::pct(b / a - 1.0) } else { signed_disp(b - a, abs_unit(unit)) };
-                t += &format!("{}| {} <sub>{}</sub> | {} | {} | {} |", self.series_cell(s, row), p.n, if p.ab { "AB" } else { "BA" }, nb(&disp(a, unit)), nb(&disp(b, unit)), nb(&d));
-                row += 1;
+                t += &format!("| {} <sub>{}</sub> | {} | {} |", p.n, if p.ab { "AB" } else { "BA" }, arrow(&disp(a, unit), &disp(b, unit)), nb(&d));
                 if frames {
-                    t += &format!(" {} | {} |", nb(&disp(bv(p.base, "frames.interval.max"), "ms")), nb(&disp(bv(p.head, "frames.interval.max"), "ms")));
+                    t += &format!(" {} |", arrow(&disp(bv(p.base, "frames.interval.max"), "ms"), &disp(bv(p.head, "frames.interval.max"), "ms")));
                 }
                 if foreign {
                     let pct = |x: f64| {
@@ -867,7 +914,7 @@ impl<'a> Doc<'a> {
                             format!("{x:.0}%")
                         }
                     };
-                    t += &format!(" {} | {} |", pct(bv(p.base, "cpu.foreign.max")), pct(bv(p.head, "cpu.foreign.max")));
+                    t += &format!(" {}\u{a0}→ {} |", pct(bv(p.base, "cpu.foreign.max")), pct(bv(p.head, "cpu.foreign.max")));
                 }
                 t += "\n";
             }
@@ -904,6 +951,14 @@ impl<'a> Doc<'a> {
             let share = |v: &[f64], lo: f64, hi: f64| v.iter().filter(|x| **x >= lo * vs && **x < hi * vs).count() as f64 / v.len() as f64;
             // Percentiles as frames.interval.* defines them (each launch's own, the median across launches).
             let rows = all_rows(s);
+            // Only pacing that changed: on-time frames by half a point, or the p99 gap by a tenth.
+            let p99 = |side: &str, v: &[f64]| {
+                rows.iter().find(|c| c["metric"] == "frames.interval.p99").map(|c| f(&c[side])).filter(|x| x.is_finite()).unwrap_or(v[((v.len() - 1) as f64 * 0.99).round() as usize])
+            };
+            let (pb, ph) = (p99("base", &b), p99("head", &h));
+            if (share(&b, 0.0, 1.5) - share(&h, 0.0, 1.5)).abs() < 0.005 && (ph / pb - 1.0).abs() < 0.10 {
+                continue;
+            }
             let gap = |name: &str, side: &str| {
                 let pooled = |v: &[f64]| {
                     if name.ends_with("max") {
@@ -948,15 +1003,14 @@ impl<'a> Doc<'a> {
             return String::new();
         }
         let top = if self.level >= 1 { 3 } else { 4 };
-        let (sh, ss) = self.series_head();
         let mut t = String::from("#### Where it came from\n\n");
         // Native: threads and memory.
-        let mut th = format!("{sh}| Thread | Started in | Wake-ups/s, before | this PR | CPU per run, before | this PR |\n{ss}|:---|:---|---:|---:|---:|---:|\n");
-        let mut mem = format!("{sh}| Memory | Before | This PR | Change |\n{ss}|:---|---:|---:|---:|\n");
+        let mut th = String::from("| Thread | Started in | Wake-ups/s, before → this PR | CPU per run, before → this PR |\n|:---|:---|---:|---:|\n");
+        let mut mem = String::from("| Memory | Before | This PR | Change |\n|:---|---:|---:|---:|\n");
         let (mut any_th, mut any_mem) = (false, false);
         // Web: main thread, then the functions that moved.
-        let mut main = format!("{sh}| Main thread, per run | Before | This PR |\n{ss}|:---|---:|---:|\n");
-        let mut fns = format!("{sh}| Function | File | What, per run | Before | This PR | Change |\n{ss}|:---|:---|:---|---:|---:|---:|\n");
+        let mut main = String::from("| Main thread, per run | Before | This PR |\n|:---|---:|---:|\n");
+        let mut fns = String::from("| Function | File | What, per run | Before | This PR | Change |\n|:---|:---|:---|---:|---:|---:|\n");
         let (mut any_main, mut any_fns) = (false, false);
         let mut heaps = Vec::new();
         for s in &prof {
@@ -965,13 +1019,11 @@ impl<'a> Doc<'a> {
                 let count = x.3.max(y.3);
                 let name = if count > 1 { format!("{} ×{count}", code(&name)) } else { code(&name) };
                 th += &format!(
-                    "{}| {name} | {} | {} | {} | {} | {} |\n",
+                    "{}| {name} | {} | {} | {} |\n",
                     self.series_cell(s, i),
                     if module.is_empty() { "—".to_string() } else { code(&module) },
-                    sig3(x.1),
-                    sig3(y.1),
-                    nb(&disp(x.2, "ms")),
-                    nb(&disp(y.2, "ms"))
+                    arrow(&sig3(x.1), &sig3(y.1)),
+                    arrow(&disp(x.2, "ms"), &disp(y.2, "ms"))
                 );
             }
             let layers: Vec<&Value> = s["memory_diff"]["rows"].as_array().into_iter().flatten().filter(|r| f(&r["delta_bytes"]).abs() >= 64.0 * 1024.0).take(top).collect();
@@ -1044,6 +1096,9 @@ impl<'a> Doc<'a> {
                 t += "\n";
             }
         }
+        if !(any_th || any_mem || any_main || any_fns) {
+            return String::new();
+        }
         let recs: Vec<String> = prof.iter().map(|s| format!("{} → {}", code(s["attribution"]["base"].as_str().unwrap_or("")), code(s["attribution"]["head"].as_str().unwrap_or("")))).collect();
         let mut foot = format!("From one profiled launch per build ({}), apart from the timed pairs; profiling slows a launch, so read these as directions.", recs.join(", "));
         if !heaps.is_empty() {
@@ -1059,7 +1114,17 @@ impl<'a> Doc<'a> {
     /// The functions whose CPU time or allocations moved most, biggest first (1 ms against 1 MB).
     fn movers_sorted(&self, s: &Value) -> Vec<&'a Value> {
         let Some(i) = self.insight_series(s) else { return Vec::new() };
-        let mut rows: Vec<&Value> = i["movers"].as_array().into_iter().flatten().collect();
+        // The browser's own native frames (`requestAnimationFrame`) gather sampling time the trace
+        // counts elsewhere, so they can exceed all the main thread's work: only page code explains.
+        let native = |x: &Value| x["unit"] == "ms" && x["function"].as_str().unwrap_or("").ends_with(" (native)");
+        // When the main metric moved decidedly, the functions that moved the same way explain it.
+        let p = &s["primary"];
+        let way = match self.primary_out(s) {
+            Out::Better | Out::Worse if better_of(p["metric"].as_str().unwrap_or("")) == Better::Lower => f(&p["estimate"]).signum(),
+            _ => 0.0,
+        };
+        let along = |x: &Value| way == 0.0 || (f(&x["head_per_run"]) - f(&x["base_per_run"])).signum() == way;
+        let mut rows: Vec<&Value> = i["movers"].as_array().into_iter().flatten().filter(|x| !native(x) && along(x)).collect();
         let d = |x: &Value| {
             let raw = (f(&x["head_per_run"]) - f(&x["base_per_run"])).abs();
             if x["unit"] == "ms" { raw } else { raw / (1024.0 * 1024.0) }
@@ -1171,7 +1236,7 @@ impl<'a> Doc<'a> {
                 t += &format!("- **Kept launches{}:** {}\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() }, kept.join(", "));
             }
         }
-        drawer("<b>Rerun</b> · the command and the recordings", &t)
+        drawer("<b>Rerun</b> · command and recordings", &t)
     }
 
     /// The `strobe bench` line that reruns the experiment from the repository's root: the bench file by
@@ -1272,13 +1337,45 @@ fn caveat(s: &Value) -> Option<String> {
         Some("**Mixed lock state:** some pairs ran locked and some unlocked, so nothing was decided.".into())
     } else if warn("ScreenChanged") {
         Some("**Different screens:** the builds did not all show the same screen, so part of the difference may be the screen.".into())
-    } else if has_warning(s, "NotSteady") || has_warning(s, "StateDrift") {
-        Some("**Unsteady case:** its work grew each run, so this may not mean what it seems.".into())
     } else if has_warning(s, "BackgroundPriority") {
         Some("**Background priority:** the app was throttled in some blocks.".into())
     } else {
         None
     }
+}
+
+/// A change's size for ranking: relative changes as they are, absolute ones against their base.
+fn size(c: &Value) -> f64 {
+    if c["relative"] == true { f(&c["estimate"]).abs() } else { (f(&c["estimate"]) / f(&c["base"]).abs().max(1e-9)).abs() }
+}
+
+/// "44% less CPU time", or "Time until ready: 15% faster" for words that need their subject first.
+fn phrase(amount: &str, word: &str, thing: &str) -> String {
+    if matches!(word, "faster" | "slower" | "smoother" | "choppier") { format!("{}: {amount} {word}", capitalize(thing)) } else { format!("{amount} {word} {thing}") }
+}
+
+/// `19–23%`, `120–219 MB`: two amounts of one unit as a span.
+fn span(lo: &str, hi: &str) -> String {
+    let split = |s: &str| -> (String, String) {
+        let i = s.find(|ch: char| !(ch.is_ascii_digit() || ch == '.')).unwrap_or(s.len());
+        (s[..i].to_string(), s[i..].to_string())
+    };
+    let ((ln, lu), (hn, hu)) = (split(lo), split(hi));
+    if lu == hu { format!("{ln}–{hn}{hu}") } else { format!("{lo}–{hi}") }
+}
+
+/// What a metric measures, so a hero says each kind of thing once.
+fn family(m: &str) -> &str {
+    match m {
+        "cpu.wakes" => "wakes",
+        _ if m.starts_with("memory.") || m == "gpu.vram" || m == "gpu.shared" || m.starts_with("js.heap") => "memory",
+        _ => m.split('.').next().unwrap_or(m),
+    }
+}
+
+/// A case whose work grew from run to run: its numbers may not mean what they seem.
+fn unsteady(s: &Value) -> bool {
+    has_warning(s, "NotSteady") || has_warning(s, "StateDrift")
 }
 
 /// The display's refresh rate the series ran at.
@@ -1289,7 +1386,7 @@ fn refresh(ps: &[Pair], r: &Value) -> f64 {
 }
 
 /// Late frames (a gap of 1.5 frame times or more) as shares of all gaps, before and this PR, and in
-/// how many pairs this PR had more (by a point or more), of those with frames on both sides.
+/// how many pairs this PR had a larger share of them, of those with frames on both sides.
 fn late_frames(s: &Value, r: &Value) -> Option<(f64, f64, usize, usize)> {
     let ps = pairs(s);
     let vs = 1000.0 / refresh(&ps, r);
@@ -1307,7 +1404,7 @@ fn late_frames(s: &Value, r: &Value) -> Option<(f64, f64, usize, usize)> {
         lh += xh;
         th += gh.len();
         n += 1;
-        if xh as f64 / gh.len() as f64 - xb as f64 / gb.len() as f64 >= 0.01 {
+        if xh as f64 / gh.len() as f64 > xb as f64 / gb.len() as f64 {
             worse += 1;
         }
     }

@@ -69,20 +69,19 @@ In a pull request, the evidence is strobe's block and the words are yours:
 strobe report experiment exp_9b3b26 --format pr --update-pr 1229   # replace (or add) the block in PR #1229's body
 ```
 
-The block starts and ends with a quiet "Strobe report" line, between two HTML comments that carry a hash of its content, so a hand edit shows. What a reviewer sees before opening anything:
+The block starts and ends with a quiet "strobe · <exp> · generated" line, between two HTML comments that carry a hash of its content, so a hand edit shows. What a reviewer sees before opening anything:
 
-> # 219 MB less GPU memory
-> <sub>Window closed memory · medians 219 → 0 MB · better in 8 of 8 pairs</sub>
+> # 44% less CPU time · 78% less app memory
 >
-> # 78% less app memory
-> <sub>Window closed memory · medians 229 → 50.4 MB · better in 8 of 8 pairs</sub>
+> **Window closed:** CPU time per 8 s run **−44%** per pair (medians 7.05 → 3.90 ms), better in 8 of 8 pairs, likely −54% to −32%.
 >
-> # 44% less CPU time
-> <sub>Window closed · medians 7.05 → 3.90 ms per 8 s run · better in 8 of 8 pairs</sub>
+> **Window closed memory:** App memory **−78%** per pair (medians 229 → 50.4 MB), better in 8 of 8 pairs, likely −78% to −77%.
 >
 > *Measured with the screen locked and the display off: compare only with runs measured the same way.*
 >
-> ▸ **Details** · metrics, pairs, profiles and method
-> ▸ **Rerun** · the command and the recordings
+> ▸ **Details** · metrics, pairs, profiles, method
+> ▸ **Rerun** · command and recordings
+
+Anything decidedly worse (a metric, or late frames) sits in one caution alert right under the hero line.
 
 Built like [mesh](https://github.com/Hona/mesh): one small native binary, a per-user daemon, CLI and MCP with the same names and JSON, and a built-in skill for opencode.

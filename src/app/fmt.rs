@@ -70,7 +70,10 @@ pub fn pct(r: f64) -> String {
 
 pub fn signed(v: f64, unit: &str) -> String {
     let body = value(v.abs(), unit);
-    if v < 0.0 {
+    // One that shows as zero has no sign (`0 MB`, not `−0 MB`).
+    if body == value(0.0, unit) {
+        body
+    } else if v < 0.0 {
         format!("−{body}")
     } else if v > 0.0 {
         format!("+{body}")

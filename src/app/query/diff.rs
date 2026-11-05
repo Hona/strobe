@@ -592,11 +592,14 @@ fn rows_text(rows: &[(String, f64, f64)], top: usize, show: impl Fn(f64) -> Stri
     (text, json_rows)
 }
 
+/// A change with its sign, none when it shows as zero (`0 MB`, not `−0 MB`).
 fn signed(v: f64, show: &impl Fn(f64) -> String) -> String {
+    let body = show(v.abs());
     match v {
-        v if v > 0.0 => format!("+{}", show(v)),
-        v if v < 0.0 => format!("−{}", show(-v)),
-        _ => show(0.0),
+        _ if body == show(0.0) => body,
+        v if v > 0.0 => format!("+{body}"),
+        v if v < 0.0 => format!("−{body}"),
+        _ => body,
     }
 }
 

@@ -92,7 +92,9 @@ pub fn run(args: &Args) -> Result<Output> {
         None => 10_000,
     };
     let attach = target.starts_with("cdp:") || target.starts_with("ws://");
-    chromium::reap_orphans();
+    for l in isolate::reap_dead_owners() {
+        progress(l);
+    }
     let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?))?;
     // `exe:<path> --app <id>` borrows an app profile for another build of that app.
     let app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {

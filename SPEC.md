@@ -2295,6 +2295,17 @@ Strobe launches any Electron app the same way, with no change to the app:
   app is never the thing to experiment on. An interpreter as the executable (python, node, bun,
   a shell, …) runs any script, so a running one says nothing about the app: the refusal says so and
   asks for the script itself (shebang and `chmod +x`, or a launcher) as the executable.
+  A running copy that strobe itself launched is not the user's. Every process strobe launches (an
+  isolated app, a browser, a command target) carries `STROBE_HOME=<its home or profile>` and
+  `STROBE_OWNER=<strobe pid>:<strobe start time>` in its environment, and what it starts inherits
+  them; strobe reads them from the environment only, never the command line (Windows: the PEB's
+  environment block; macOS: `KERN_PROCARGS2` past the executable path and the arguments, before
+  the kernel's own strings; Linux: `/proc/<pid>/environ`), so a shell or search whose arguments
+  name a strobe folder is never taken for one. A stamped copy is a leftover when its strobe is
+  gone (no process with that pid and start time: a reused pid is not it), or when it is this
+  strobe's and its home was already released: strobe ends it and launches. When its strobe still
+  holds it, the refusal names that strobe ("in the isolated home of another strobe (pid N)").
+  Otherwise the refusal names the running pids and the command that closes them.
 - On close, every process running from the home is killed (detached children outlive the tree),
   then the home is deleted.
 - **GPU shader caches** (`gpuCache`, a native or app target option, else the app profile's;
@@ -2565,7 +2576,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | keep awake while benching | `SetThreadExecutionState` | logind's `idle` inhibitor in block mode (no idle suspend or idle action; a person may still suspend), a file descriptor passed over strobe's D-Bus client and closed to release; the display through `org.freedesktop.ScreenSaver.Inhibit` where the desktop has it. Held only while blocks run, as on Windows (§9.4) | IOKit power assertions (`PreventUserIdleSystemSleep`, `PreventUserIdleDisplaySleep`) |
 | power plan for the run | §9.4 | the `performance` cpufreq governor on every policy when strobe may write it (root), journaled and restored; else kept with the reason | none to switch: Low Power Mode and the thermal state are reported |
 | battery, virtual machine | `GetSystemPowerStatus`; firmware strings | `/sys/class/power_supply`; the CPU's `hypervisor` flag and DMI strings | `IOPSGetProvidingPowerSourceType`; `kern.hv_vmm_present` |
-| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | X11: the Present extension's `CompleteNotify`, which any client may select on another's windows (strobe selects it on the app's windows and their children): `Flip` is scanned out at its `ust` (CLOCK_MONOTONIC, the host clock); `Copy` without a compositing manager was copied into the scanned-out screen at that vertical blank; `Skip` is discarded. Refused: a compositing manager running (`_NET_WM_CM_S<n>` owned: its later frame shows the app's), a server with no real display (no DRI3, or only virtual outputs: Xvfb presents on a timer), native Wayland (presentation feedback goes to the app alone; DRM flip tracepoints need root and name the compositor). Frames an app draws without Present (core drawing, MIT-SHM, NVIDIA's own GL) are not seen: a block with none refuses (`NoPresentSource`), never 0 | ScreenCaptureKit: one stream per on-screen window of the app, of that window alone on its display (`SCContentFilter` of the display including only the window, the window's frame as the source rectangle, half its size in points, no cursor; a window that moves or resizes gets a new stream), each frame stamped with its display time (`SCStreamFrameInfoDisplayTime`, Mach time: the host clock) and its dirty rectangles. A frame counts only when a dirty rectangle lies outside the window's corners (26 points square) and its title-bar buttons (the top left 80 × 32 points): on macOS 27 the window server redraws those by itself 15 to 60 times a second on an idle window, and a desktop-independent window stream reported the whole window changed at every refresh, so an idle Rune, Hex or AppKit window read 60 frames a second and `idle` never came. The first frame (the window as it was) is dropped. Needs Screen Recording for the app strobe runs under (refused without). Root tracing, Instruments and private window-server calls are not used |
+| frames on screen | ETW present events (PresentMon's subset: flip model incl. composition swapchains, Vulkan, legacy blt), vertical blanks | X11: the Present extension's `CompleteNotify`, which any client may select on another's windows (strobe selects it on the app's windows and their children): `Flip` is scanned out at its `ust` (CLOCK_MONOTONIC, the host clock); `Copy` without a compositing manager was copied into the scanned-out screen at that vertical blank; `Skip` is discarded. Refused: a compositing manager running (`_NET_WM_CM_S<n>` owned: its later frame shows the app's), a server with no real display (no DRI3, or only virtual outputs: Xvfb presents on a timer), native Wayland (presentation feedback goes to the app alone; DRM flip tracepoints need root and name the compositor). Frames an app draws without Present (core drawing, MIT-SHM, NVIDIA's own GL) are not seen: a block with none refuses (`NoPresentSource`), never 0 | ScreenCaptureKit: one stream per on-screen window of the app, of that window alone on its display (`SCContentFilter` of the display including only the window, the window's frame as the source rectangle, half its size in points, no cursor; a window that moves or resizes gets a new stream), each frame stamped with its display time (`SCStreamFrameInfoDisplayTime`, Mach time: the host clock) and its dirty rectangles. A frame counts only when a dirty rectangle lies outside the window's corners (26 points square) and its title-bar buttons (the top left 80 × 32 points): on macOS 27 the window server redraws those by itself 15 to 60 times a second on an idle window, and a desktop-independent window stream reported the whole window changed at every refresh, so an idle window of any toolkit, AppKit's included, read 60 frames a second and `idle` never came. The first frame (the window as it was) is dropped. What the consumer spends (air, M4, macOS 27): a frame whose dirty rectangles are all corners and buttons is not locked or read (2 to 8 µs; locking one cost 40 to 80 µs); the last frame that counted is kept retained and locked rather than copied, and the next is compared with it row by row, every 16th row first, stopping at the first difference (a sixth of the bytes on a changed frame); a changed frame then costs about 70 µs to lock, 35 µs to compare and 50 µs to release the one before. An idle native window (its corners redrawn about 60 times a second) went from 0.28-0.30% to 0.073% of a core over a 13 s block; one redrawing 44 times a second, 24% less than copying changed rows (0.81% → 0.62%), and 17% less again with the row order. BGRA at half size stays: 4:2:0 YCbCr or a quarter-size frame cost a third less but missed 8 to 15% of the frames of a small overlay animating faint level changes (rounded away). A window the app excludes from screen capture (`kCGWindowSharingState` 0, `NSWindowSharingNone`: a capture overlay, its ink) gets no stream, since one would hold none of its pixels and still cost strobe a frame per refresh (an excluded full-screen window cost 1.9% of a core and counted 0 frames); a watcher thread looks for them every 500 ms (and at each window lookup), the session lists each with when it was first and last seen on screen, and a block that showed one during a measured run (not during setup or a reset) refuses its frame metrics (`NoPresentSource: the app showed window N, which it excludes from screen capture …`): the frames of its other windows would read as all of the app's. Needs Screen Recording for the app strobe runs under (refused without). Root tracing, Instruments and private window-server calls are not used |
 | frame begin (Linux, macOS) | — | no begin: X Present tells when a frame was shown, not when it was handed over | no begin: ScreenCaptureKit tells when a frame was shown. On both, `frames.interval.*` and `frames.dropped*` are refused (a gap cannot be told from rest), and inputs join on screen times (§7.4) |
 | native stacks (§13.4) | ETW sampled profile through the helper, 200 µs | in-process `perf_event_open`: per-thread `cpu-clock` at 1 ms (on-CPU samples), user registers and 16 KB of user stack per sample unwound with the modules' DWARF CFI (`framehop`), kernel frames from the kernel's callchain when allowed; threads that start later are found every 50 ms. Needs `perf_event_paranoid` ≤ 2 (Debian ships 3) or CAP_PERFMON | `/usr/bin/sample` per process at 1 ms (task suspension, every thread's user stack; samples whose leaf is a system call trap are dropped and counted; untimed: they cover the whole capture) |
 | symbols (§12.2) | PDBs (local, Microsoft's server, `symbols.servers`) | DWARF of the module, its build-id file under `/usr/lib/debug`, or `.gnu_debuglink`; symbol tables (sized); `/proc/kallsyms` | DWARF of a dSYM beside the module or in strobe's cache, made with `dsymutil` from the objects a build left (a failed `dsymutil` leaves a `missing` marker for a day, as a PDB server's miss does); else the names and `file:line` `sample` printed |
@@ -3246,6 +3257,27 @@ under the case in `--check`. An attribution `record --bench` of a 0.8 s case had
 60 s report wait: `sample` was still reading Hex's 84 MB of symbols at the stop and dropped the
 SIGINT (an hour before the bound); with the start wait it analysed in 0.4 s with 32 samples.
 
+Leftovers and capture cost (13.2, 13.7; 2026-11-05): everything strobe launches carries
+`STROBE_HOME` and `STROBE_OWNER` (pid and start time), read back from the environment only (the
+PEB on Windows, `KERN_PROCARGS2` past the arguments on macOS, `/proc/<pid>/environ` on Linux);
+`bench`, `record` and `look` end the roots of what a gone strobe left and remove its folders through
+`remove_home`, releasing a home ends everything stamped with it, and `LiveChannel` tells a
+leftover, a live strobe's copy and the user's apart. ScreenCaptureKit streams skip windows the app
+excludes from capture (watched every 500 ms; frames refused by window when one was on screen
+during a measured run), leave corner-only frames unread, keep the last counted frame instead of
+copying it, and compare rows every 16th first. Checked on air (macOS 27.0.1, M4), adais (Windows,
+locked) and vps (Linux): a process stamped with a gone strobe, and one stamped with a live strobe's
+pid but another start time (a reused pid), were ended; one stamped with a live strobe, one with
+only `HOME`/`USERPROFILE` in a strobe home, and a shell whose arguments named `--user-data-dir=`,
+`HOME=`, `STROBE_HOME=` and `STROBE_OWNER=` of a strobe home kept running; a copy no strobe launched
+was refused with its pid and the command that closes it, one a live strobe holds with that
+strobe's pid. On air a `look` killed with -9 left a native app running under launchd and the next
+`look` ended it; an overlay excluded from capture that opened and closed during a `record pid:`
+refused its frames by window id, and one closed before the recording did not; the window-open
+case of a native app's idle bench went from 0.28-0.30% to 0.073% of a core in the consumer, frame
+counts at rest matched the old path (350-354 a 8 s window), and a Cocoa app's `ax.bench.ts --check`
+passed 8 of 8.
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).
@@ -3319,7 +3351,17 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   accepts a GET from its own origin (the Perfetto UI fetches fonts and wasm in CORS mode) and no
   other cross-origin request. `up` stops it with the `strobe/quit` RPC. The engine runs one
   `trace_processor -q` per query, and one `server http` per `strobe open`.
-- Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
+- Every launch reaps leftovers (browsers and homes) of strobe processes that died: `bench` before
+  it starts and before a block that retries its launch, `record` and `look` (pages and apps)
+  before they launch. A leftover is a process stamped `STROBE_OWNER` with a strobe that is gone,
+  or with this strobe for a home it released, whether or not the folder still exists. Only the
+  roots of a leftover tree are ended (their children go with them), each checked again right
+  before (same stamp). Each one ended prints a line (`ended <exe> (pid N): the strobe that launched
+  it (pid M) is gone and left it running`). Then each `run/home-…` and `run/profile-…` folder whose
+  `.strobe-owner` names a strobe that is gone (a folder without one: by the pid in its name) is
+  removed as a released home is: what runs from it ended, URL schemes restored, lent GPU caches
+  returned, shared seeds unlinked. Releasing a home (after a block, closing a browser) ends every
+  process stamped with it, so a detached child does not outlive its block. Target windows
   are kept topmost without focus, since an occluded Chromium window stops rendering.
 - Typed outcomes, crash-safe store and strict config (2026-11-05): validators are `ValidatorId`
   and refusals `Refusal` values on the error (§10.1); comparisons carry `kind` and `refusal`,

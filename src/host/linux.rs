@@ -362,6 +362,18 @@ pub fn background_qos(pid: u32) -> Option<String> {
     }
 }
 
+/// A process's environment as it was started (`/proc/<pid>/environ`); None for a process of another
+/// user.
+pub fn env_of(pid: u32) -> Option<Vec<String>> {
+    let bytes = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+    Some(bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect())
+}
+
+/// When a process started (clock ticks after boot), which with its pid names it uniquely.
+pub fn start_time(pid: u32) -> Option<u64> {
+    stat(pid).map(|s| s.start)
+}
+
 /// PIDs of running processes whose executable is exactly `exe`.
 pub fn running(exe: &Path) -> Vec<u32> {
     let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());

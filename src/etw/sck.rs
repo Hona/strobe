@@ -22,7 +22,7 @@
 
 #![allow(non_upper_case_globals)]
 
-use super::{Live, Present, Presents};
+use super::{Live, Present, Presents, Unshared};
 use crate::host::macos::{CFTypeRef, CGRect, cf_array, cf_i64, cf_rect};
 use crate::model::{Error, Result};
 use std::collections::HashMap;
@@ -111,46 +111,122 @@ unsafe extern "C" {
     fn CVPixelBufferGetHeight(buf: *mut c_void) -> usize;
 }
 
-/// 32-bit BGRA, the frames strobe asks for.
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRetain(cf: CFTypeRef) -> CFTypeRef;
+    fn CFRelease(cf: CFTypeRef);
+}
+
+/// 32-bit BGRA, the frames strobe asks for. A 4:2:0 YCbCr format or a quarter-size frame read
+/// fewer bytes, but on air (macOS 27) both missed 8 to 15% of the frames of a small overlay that
+/// animates faint level changes: they rounded away.
 const BGRA: u32 = u32::from_be_bytes(*b"BGRA");
 
-/// Whether the pixels of `rects` in this frame differ from the last frame's, which `prev` keeps
-/// (tightly packed BGRA, refreshed where they differ). The window server reports display damage in
-/// the window's rectangle even where only another app's window changed under it, and redraws a
-/// window's edges with the same pixels: only a changed pixel is a new frame of the app's. None
-/// when the frame has no readable pixels.
-fn pixels_changed(image: *mut c_void, rects: &[CGRect], prev: &mut Vec<u8>) -> Option<bool> {
-    if image.is_null() || unsafe { CVPixelBufferLockBaseAddress(image, 1) } != 0 {
-        return None;
-    }
-    let (base, stride, w, h) = unsafe { (CVPixelBufferGetBaseAddress(image), CVPixelBufferGetBytesPerRow(image), CVPixelBufferGetWidth(image), CVPixelBufferGetHeight(image)) };
-    let mut changed = Some(false);
-    if base.is_null() || stride < w * 4 {
-        changed = None;
-    } else if prev.len() != w * h * 4 {
-        // The first readable frame: everything is as it was.
-        prev.resize(w * h * 4, 0);
-        for y in 0..h {
-            prev[y * w * 4..(y + 1) * w * 4].copy_from_slice(unsafe { std::slice::from_raw_parts(base.add(y * stride), w * 4) });
+/// Rows compared in a first pass over a frame's rectangles: every 16th, then the rows between. A
+/// frame that changed is usually told after a few rows of each rectangle rather than a whole
+/// rectangle (on air a sixth of the bytes, 17% less CPU), and a frame that did not reads every row
+/// once either way.
+const ROW_STRIDE: usize = 16;
+
+/// A frame's pixels, locked for reading: the base address, bytes per row, width and height.
+#[derive(Clone, Copy)]
+struct Pixels {
+    base: *const u8,
+    stride: usize,
+    w: usize,
+    h: usize,
+}
+
+impl Pixels {
+    /// Locks `image` for reading; None (left unlocked) when it has no readable BGRA pixels.
+    fn lock(image: *mut c_void) -> Option<Pixels> {
+        if image.is_null() || unsafe { CVPixelBufferLockBaseAddress(image, 1) } != 0 {
+            return None;
         }
-    } else {
-        for r in rects {
+        let p = unsafe { Pixels { base: CVPixelBufferGetBaseAddress(image), stride: CVPixelBufferGetBytesPerRow(image), w: CVPixelBufferGetWidth(image), h: CVPixelBufferGetHeight(image) } };
+        if p.base.is_null() || p.stride < p.w * 4 {
+            unsafe { CVPixelBufferUnlockBaseAddress(image, 1) };
+            return None;
+        }
+        Some(p)
+    }
+
+    fn row(&self, y: usize, x0: usize, x1: usize) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.base.add(y * self.stride + x0 * 4), (x1 - x0) * 4) }
+    }
+}
+
+/// Whether any pixel of `rects` differs between two frames of one size; stops at the first.
+fn differs(now: &Pixels, was: &Pixels, rects: &[CGRect]) -> bool {
+    let (w, h) = (now.w, now.h);
+    let boxes: Vec<(usize, usize, usize, usize)> = rects
+        .iter()
+        .map(|r| {
             let x0 = (r.origin.x.floor().max(0.0) as usize).min(w);
             let x1 = ((r.origin.x + r.size.width).ceil().max(0.0) as usize).min(w);
             let y0 = (r.origin.y.floor().max(0.0) as usize).min(h);
             let y1 = ((r.origin.y + r.size.height).ceil().max(0.0) as usize).min(h);
-            for y in y0..y1 {
-                let now = unsafe { std::slice::from_raw_parts(base.add(y * stride + x0 * 4), (x1 - x0) * 4) };
-                let was = &mut prev[(y * w + x0) * 4..(y * w + x1) * 4];
-                if now != was {
-                    was.copy_from_slice(now);
-                    changed = Some(true);
-                }
+            (x0, x1, y0, y1)
+        })
+        .collect();
+    (0..ROW_STRIDE).any(|phase| boxes.iter().any(|&(x0, x1, y0, y1)| (y0 + phase..y1).step_by(ROW_STRIDE).any(|y| now.row(y, x0, x1) != was.row(y, x0, x1))))
+}
+
+/// The last frame whose pixels count, kept as the frame itself (retained and locked for reading)
+/// rather than copied: a frame is compared with it and replaces it only when it changed.
+#[derive(Default)]
+struct Prev {
+    image: usize,
+    pixels: Option<Pixels>,
+}
+
+// SAFETY: the frame is only read, under the sink's lock, and released once.
+unsafe impl Send for Prev {}
+
+impl Prev {
+    fn keep(&mut self, image: *mut c_void, pixels: Pixels) {
+        self.release();
+        unsafe { CFRetain(image as CFTypeRef) };
+        (self.image, self.pixels) = (image as usize, Some(pixels));
+    }
+
+    fn release(&mut self) {
+        if self.image != 0 {
+            unsafe {
+                CVPixelBufferUnlockBaseAddress(self.image as *mut c_void, 1);
+                CFRelease(self.image as CFTypeRef);
             }
         }
+        // Field by field: assigning a whole `Prev` would drop the old one, which releases again.
+        (self.image, self.pixels) = (0, None);
     }
-    unsafe { CVPixelBufferUnlockBaseAddress(image, 1) };
-    changed
+}
+
+impl Drop for Prev {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+/// Whether the pixels of `rects` in this frame differ from the last counted frame's (`prev`). The
+/// window server reports display damage in the window's rectangle even where only another app's
+/// window changed under it, and redraws a window's edges with the same pixels: only a changed pixel
+/// is a new frame of the app's. A frame with no such rectangle is not read at all (most of an idle
+/// window's frames: its corners and title-bar buttons; locking one cost 40 to 80 µs on air). The
+/// first readable frame is the window as it was. None when the frame has no readable pixels.
+fn pixels_changed(image: *mut c_void, rects: &[CGRect], prev: &mut Prev) -> Option<bool> {
+    if rects.is_empty() && prev.pixels.is_some() {
+        return Some(false);
+    }
+    let now = Pixels::lock(image)?;
+    let same_size = prev.pixels.is_some_and(|p| (p.w, p.h) == (now.w, now.h));
+    let changed = same_size && prev.pixels.is_some_and(|was| differs(&now, &was, rects));
+    if changed || !same_size {
+        prev.keep(image, now);
+    } else {
+        unsafe { CVPixelBufferUnlockBaseAddress(image, 1) };
+    }
+    Some(changed)
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -313,8 +389,8 @@ struct Sink {
     /// The frames' size in pixels and pixels per point, for their dirty rectangles.
     size: (f64, f64),
     scale: f64,
-    /// The last frame's pixels (`pixels_changed`).
-    prev: Mutex<Vec<u8>>,
+    /// The last counted frame (`pixels_changed`).
+    prev: Mutex<Prev>,
     /// The first complete frame is the window as it was when the stream started, not a new one.
     seen_first: std::sync::atomic::AtomicBool,
 }
@@ -324,6 +400,40 @@ struct Shared {
     presents: Vec<Present>,
     events: u64,
     consumer_ns: u64,
+}
+
+/// The app's windows it excludes from screen capture, looked for every 500 ms on a thread of its own
+/// (and at each `track`), so a block knows when one was on screen whether or not anything tracks the
+/// app meanwhile, and one shown and closed during setup is not counted against the measured runs.
+#[derive(Default)]
+struct Watch {
+    pids: Vec<u32>,
+    /// Each window's span: first and last seen on screen (each within 500 ms of when it was).
+    seen: HashMap<u32, Unshared>,
+    stop: bool,
+}
+
+impl Watch {
+    /// Notes which of the app's windows on screen it excludes from capture, and returns them.
+    fn look(&mut self) -> Vec<u32> {
+        let now = crate::host::now_ns();
+        let on = crate::host::macos::unshared_windows(&self.pids);
+        for &(id, pid) in &on {
+            self.seen.entry(id).or_insert(Unshared { pid, window: id as u64, first_ns: now, last_ns: now }).last_ns = now;
+        }
+        on.into_iter().map(|w| w.0).collect()
+    }
+}
+
+type Watcher = Arc<(Mutex<Watch>, std::sync::Condvar)>;
+
+fn watch_unshared(w: Watcher) {
+    let (state, cv) = &*w;
+    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    while !s.stop {
+        s.look();
+        s = cv.wait_timeout(s, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
+    }
 }
 
 pub struct Capture {
@@ -336,6 +446,9 @@ pub struct Capture {
     t0: u64,
     /// Why a window has no stream, when one failed to start.
     failed: Option<String>,
+    /// Windows of the app it excludes from screen capture, which get no stream.
+    watch: Watcher,
+    watcher: Option<std::thread::JoinHandle<()>>,
 }
 
 /// `stream:didOutputSampleBuffer:ofType:` of strobe's output class.
@@ -430,7 +543,23 @@ impl Capture {
             )));
         }
         let queue = unsafe { dispatch_queue_create(c"strobe.frames".as_ptr(), std::ptr::null()) };
-        Ok(Capture { shared: Arc::new(Mutex::new(Shared::default())), live: Arc::new(Live::default()), streams: HashMap::new(), pids: Vec::new(), tracked: None, queue, t0: crate::host::now_ns(), failed: None })
+        let watch: Watcher = Arc::default();
+        let watcher = {
+            let w = watch.clone();
+            std::thread::Builder::new().name("strobe-unshared".into()).spawn(move || watch_unshared(w)).ok()
+        };
+        Ok(Capture {
+            shared: Arc::new(Mutex::new(Shared::default())),
+            live: Arc::new(Live::default()),
+            streams: HashMap::new(),
+            pids: Vec::new(),
+            tracked: None,
+            queue,
+            t0: crate::host::now_ns(),
+            failed: None,
+            watch,
+            watcher,
+        })
     }
 
     /// Streams each on-screen window of `pids` (read again at most every 500 ms), and returns once a
@@ -442,14 +571,22 @@ impl Capture {
         self.pids = pids.to_vec();
         self.tracked = Some(Instant::now());
         let pool = unsafe { objc_autoreleasePoolPush() };
+        // A window the app excludes from screen capture gets no stream (one would hold none of its
+        // pixels, and cost strobe a stream per refresh): `Presents::unshared` says it was there.
+        let unshared = {
+            let mut w = self.watch.0.lock().unwrap_or_else(|e| e.into_inner());
+            w.pids = pids.to_vec();
+            w.look()
+        };
         // A window that moved or resized gets a new stream: its source rectangle is the old frame.
-        let moved: Vec<u32> = self.streams.iter().filter(|(id, s)| crate::host::window_state(**id as isize).is_some_and(|w| Some(w.rect) != s.rect)).map(|(id, _)| *id).collect();
+        let moved: Vec<u32> =
+            self.streams.iter().filter(|(id, s)| unshared.contains(id) || crate::host::window_state(**id as isize).is_some_and(|w| Some(w.rect) != s.rect)).map(|(id, _)| *id).collect();
         for id in moved {
             if let Some(s) = self.streams.remove(&id) {
                 self.drop_stream(s);
             }
         }
-        let ids: Vec<u32> = crate::host::top_windows(pids).into_iter().map(|w| w.0 as u32).filter(|id| !self.streams.contains_key(id)).collect();
+        let ids: Vec<u32> = crate::host::top_windows(pids).into_iter().map(|w| w.0 as u32).filter(|id| !self.streams.contains_key(id) && !unshared.contains(id)).collect();
         if ids.is_empty() {
             unsafe { objc_autoreleasePoolPop(pool) };
             return;
@@ -515,6 +652,7 @@ impl Capture {
         send!((); config, "setHeight:", usize = h as usize);
         send!((); config, "setPixelFormat:", u32 = BGRA);
         send!((); config, "setShowsCursor:", i8 = 0);
+        // Strobe keeps one frame (the last that counted) besides the one it reads.
         send!((); config, "setQueueDepth:", isize = 8);
         // As often as the window changes (the window server composites at most once a refresh).
         send!((); config, "setMinimumFrameInterval:", CMTime = CMTime { value: 1, timescale: 1000, flags: 1, epoch: 0 });
@@ -528,7 +666,7 @@ impl Capture {
             return Err(Error::msg("ScreenCaptureKit made no stream for the window"));
         }
         let output: Id = send!(Id; output_class(), "new");
-        let sink = Box::new(Sink { pid, window: id, shared: self.shared.clone(), live: self.live.clone(), size: (w, h), scale: w / source.size.width.max(1.0), prev: Mutex::new(Vec::new()), seen_first: false.into() });
+        let sink = Box::new(Sink { pid, window: id, shared: self.shared.clone(), live: self.live.clone(), size: (w, h), scale: w / source.size.width.max(1.0), prev: Mutex::new(Prev::default()), seen_first: false.into() });
         unsafe { object_setIvar(output, class_getInstanceVariable(output_class(), c"sink".as_ptr()), Box::into_raw(sink) as Id) };
         let mut err: Id = std::ptr::null_mut();
         let added: i8 = send!(i8; stream, "addStreamOutput:type:sampleHandlerQueue:error:", Id = output, isize = 0, *mut c_void = self.queue, *mut Id = &mut err);
@@ -577,6 +715,13 @@ impl Capture {
     }
 
     pub fn stop(mut self) -> Result<Presents> {
+        let mut unshared: Vec<Unshared> = {
+            let mut w = self.watch.0.lock().unwrap_or_else(|e| e.into_inner());
+            w.look();
+            w.seen.drain().map(|(_, u)| u).collect()
+        };
+        self.end_watch();
+        unshared.sort_by_key(|u| (u.first_ns, u.window));
         let pool = unsafe { objc_autoreleasePoolPush() };
         for (_, s) in std::mem::take(&mut self.streams) {
             self.drop_stream(s);
@@ -598,14 +743,27 @@ impl Capture {
             t1_ns: crate::host::now_ns(),
             no_begin: true,
             only: None,
+            unshared,
         })
     }
 }
 
 impl Drop for Capture {
     fn drop(&mut self) {
+        self.end_watch();
         for (_, s) in std::mem::take(&mut self.streams) {
             self.drop_stream(s);
+        }
+    }
+}
+
+impl Capture {
+    /// Stops the excluded-window watcher and waits for it.
+    fn end_watch(&mut self) {
+        self.watch.0.lock().unwrap_or_else(|e| e.into_inner()).stop = true;
+        self.watch.1.notify_all();
+        if let Some(t) = self.watcher.take() {
+            let _ = t.join();
         }
     }
 }

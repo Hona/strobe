@@ -596,7 +596,9 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     // Benches share the device by taking turns per block (the slot); this one registers what it does.
     let reg = slot::Registration::new(&exp, &file.display().to_string());
-    chromium::reap_orphans();
+    for l in crate::target::isolate::reap_dead_owners() {
+        progress(l);
+    }
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
     let config = config::load(&project)?;
     // The plan switches before the first block, not now: builds and waits run on the user's own.
@@ -2107,7 +2109,9 @@ fn retry_launch(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>, retri
     release_machine(ctx);
     ctx.reg.set("waiting", format!("{} {} block: the launch failed and runs again", s.label(), v.role));
     let waiting = Instant::now();
-    chromium::reap_orphans();
+    for l in crate::target::isolate::reap_dead_owners() {
+        progress(format!("  {l}"));
+    }
     nap(Duration::from_secs(30))?;
     crate::validity::wait_quiet(None, Duration::from_secs(60));
     ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;

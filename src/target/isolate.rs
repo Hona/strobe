@@ -443,13 +443,162 @@ pub fn new_home() -> PathBuf {
     host::paths::run().join(format!("home-{}-{}", std::process::id(), host::now_ns()))
 }
 
-/// Ends what still runs from `home` (an app's detached service) and restores the URL schemes saved
-/// in it, without deleting it: a warm home is launched again.
-pub fn release_home(home: &Path) {
-    for pid in host::running_under(home) {
-        kill_tree(pid);
+/// Every process strobe launches (an isolated app, a browser, a command target) carries the folder it
+/// was launched for (its home or browser profile) in this variable, and whatever it starts inherits
+/// it. Read from the environment only, never the command line: a person's shell or search whose
+/// arguments name a strobe folder is not strobe's.
+pub const HOME_VAR: &str = "STROBE_HOME";
+/// And the strobe that launched it: `<pid>:<start time>`, so a reused pid is not that strobe.
+pub const OWNER_VAR: &str = "STROBE_OWNER";
+
+/// The file in a home or profile that names its strobe the way `OWNER_VAR` does.
+const OWNER_FILE: &str = ".strobe-owner";
+
+/// This strobe as `OWNER_VAR` names it.
+pub fn owner_stamp() -> &'static str {
+    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    STAMP.get_or_init(|| format!("{}:{}", std::process::id(), host::start_time(std::process::id()).unwrap_or(0)))
+}
+
+/// A folder as a key: case and separators folded on Windows.
+fn key(p: &Path) -> String {
+    let s = p.display().to_string();
+    if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s }
+}
+
+/// Homes and profiles this strobe launched into and has not released.
+static HELD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+fn held(dir: &str) -> bool {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|h| h == dir)
+}
+
+/// The variables a launch for `dir` carries (`HOME_VAR`, `OWNER_VAR`); `dir` is held until it is
+/// released, and names this strobe in its owner file.
+pub fn launch_env(dir: &Path) -> [(String, String); 2] {
+    let _ = std::fs::write(dir.join(OWNER_FILE), owner_stamp());
+    let k = key(dir);
+    let mut h = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if !h.contains(&k) {
+        h.push(k);
     }
+    [(HOME_VAR.into(), dir.display().to_string()), (OWNER_VAR.into(), owner_stamp().into())]
+}
+
+fn let_go(dir: &Path) {
+    let k = key(dir);
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != k);
+}
+
+/// A process's stamp: the folder it was launched for, and its strobe's pid and start time.
+#[derive(Clone, Debug, PartialEq)]
+struct Stamp {
+    home: String,
+    pid: u32,
+    start: u64,
+}
+
+fn parse_owner(s: &str) -> Option<(u32, u64)> {
+    let (p, t) = s.trim().split_once(':')?;
+    Some((p.parse().ok()?, t.parse().ok()?))
+}
+
+fn stamp_of(pid: u32) -> Option<Stamp> {
+    let env = host::env_of(pid)?;
+    let var = |name: &str| env.iter().find_map(|e| e.split_once('=').filter(|(k, _)| env_name_is(k, name)).map(|(_, v)| v.to_string()));
+    let (owner, start) = parse_owner(&var(OWNER_VAR)?)?;
+    Some(Stamp { home: key(Path::new(&var(HOME_VAR)?)), pid: owner, start })
+}
+
+/// Whether the strobe a stamp names runs: that pid, started at that time.
+fn owner_alive(pid: u32, start: u64) -> bool {
+    host::start_time(pid) == Some(start)
+}
+
+/// A stamped process is a leftover when its strobe is gone, or when it is this strobe's and the
+/// folder it was launched for was released (a detached child that outlived its launch).
+fn leftover(s: &Stamp) -> bool {
+    if s.pid == std::process::id() { !held(&s.home) } else { !owner_alive(s.pid, s.start) }
+}
+
+/// Every running process strobe stamped, but strobe itself: (pid, parent, stamp).
+fn stamped() -> Vec<(u32, u32, Stamp)> {
+    let me = std::process::id();
+    host::all_processes().into_iter().filter(|p| p.pid != 0 && p.pid != me).filter_map(|p| Some((p.pid, p.parent, stamp_of(p.pid)?))).collect()
+}
+
+/// Ends the trees of `procs` from their roots (a process whose parent is not among them), each
+/// checked again right before it ends (its stamp unchanged: not a reused pid). Returns the ended
+/// roots, named before any ended.
+fn end_roots(procs: &[(u32, u32, Stamp)]) -> Vec<(u32, String, Stamp)> {
+    let roots: Vec<(u32, String, Stamp)> = procs
+        .iter()
+        .filter(|(_, parent, _)| !procs.iter().any(|(p, _, _)| p == parent))
+        .map(|(pid, _, s)| (*pid, host::exe_of(*pid).map(|e| e.display().to_string()).unwrap_or_else(|| format!("process {pid}")), s.clone()))
+        .collect();
+    roots
+        .into_iter()
+        .filter(|(pid, _, s)| {
+            let same = stamp_of(*pid).as_ref() == Some(s);
+            if same {
+                kill_tree(*pid);
+            }
+            same
+        })
+        .collect()
+}
+
+/// The processes launched for `dir` (stamped with it), whoever launched them.
+pub fn pids_in_home(dir: &Path) -> Vec<u32> {
+    let k = key(dir);
+    stamped().into_iter().filter(|(_, _, s)| s.home == k).map(|(p, _, _)| p).collect()
+}
+
+/// Ends what dead strobes left behind, and the folders they left: every stamped process whose
+/// strobe is gone (a crash, a kill, a signal before it closed its target) or that outlived a folder
+/// this strobe released, then every home or profile under `run/` whose strobe is gone (its GPU
+/// caches go back, shared seeds unlink, URL schemes are restored). Returns a line per process ended.
+pub fn reap_dead_owners() -> Vec<String> {
+    let dead: Vec<(u32, u32, Stamp)> = stamped().into_iter().filter(|(_, _, s)| leftover(s)).collect();
+    let mut lines: Vec<String> = end_roots(&dead)
+        .into_iter()
+        .map(|(pid, exe, s)| {
+            if s.pid == std::process::id() {
+                format!("ended {exe} (pid {pid}): this strobe launched it for a folder it already released")
+            } else {
+                format!("ended {exe} (pid {pid}): the strobe that launched it (pid {}) is gone and left it running", s.pid)
+            }
+        })
+        .collect();
+    let Ok(entries) = std::fs::read_dir(host::paths::run()) else { return lines };
+    for e in entries.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let Some(named) = name.strip_prefix("profile-").or_else(|| name.strip_prefix("home-")).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
+        let gone = match std::fs::read_to_string(e.path().join(OWNER_FILE)).ok().as_deref().and_then(parse_owner) {
+            Some((pid, start)) => pid != std::process::id() && !owner_alive(pid, start),
+            // A folder from before owner files: its strobe by the pid in its name.
+            None => named != std::process::id() && !host::exe_of(named).is_some_and(|exe| exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("strobe"))),
+        };
+        if !gone {
+            continue;
+        }
+        let k = key(&e.path());
+        let left: Vec<(u32, u32, Stamp)> = stamped().into_iter().filter(|(_, _, s)| s.home == k).collect();
+        lines.extend(end_roots(&left).into_iter().map(|(pid, exe, _)| format!("ended {exe} (pid {pid}): it ran from {}, a folder of a strobe that is gone", e.path().display())));
+        restore_protocols(&e.path());
+        remove_home(&e.path());
+    }
+    lines
+}
+
+/// Ends what still runs from `home` (an app's detached service, anything stamped with it) and
+/// restores the URL schemes saved in it, without deleting it: a warm home is launched again.
+pub fn release_home(home: &Path) {
+    let k = key(home);
+    let left: Vec<(u32, u32, Stamp)> = stamped().into_iter().filter(|(_, _, s)| s.home == k).collect();
+    end_roots(&left);
     restore_protocols(home);
+    let_go(home);
 }
 
 /// Where GPU drivers keep compiled shaders, relative to a home whose per-user folders the launch
@@ -574,6 +723,7 @@ pub fn prune_gpu_caches() {
 
 /// Removes a home once nothing holds its files any more.
 pub fn remove_home(home: &Path) {
+    let_go(home);
     keep_gpu_caches(home);
     unshare(home);
     for _ in 0..20 {
@@ -743,6 +893,8 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     .map(|(k, v)| (k.to_string(), v))
     .collect();
     env.extend(app.env.iter().map(|(k, v)| (k.clone(), fill(v))));
+    // Last, so no profile replaces them: what tells strobe's launches (and what they start) apart.
+    env.extend(launch_env(&home));
     let gpu_warm = app.gpu_cache.as_deref().map(|store| lend_gpu_caches(&home, store));
     Ok(Home { dir: home, port, env, shared, gpu_warm })
 }
@@ -825,7 +977,8 @@ pub fn interpreter(exe: &Path) -> bool {
 /// it. Isolation should make it safe, but the user's own app is never the thing to experiment on.
 pub fn live(app: &App, guard: &Guard) -> Result<()> {
     guard.unreadable()?;
-    if !host::running(&app.exe).is_empty() {
+    let mut running = host::running(&app.exe);
+    if !running.is_empty() {
         // An interpreter runs every script of its kind: a running one says nothing about the app.
         if interpreter(&app.exe) {
             return Err(Error::refused(
@@ -834,7 +987,43 @@ pub fn live(app: &App, guard: &Guard) -> Result<()> {
                 "launch the script itself as the executable (a shebang line and chmod +x on Linux and macOS, or a small launcher), so the app has an executable of its own",
             ));
         }
-        return Err(Error::refused("LiveChannel", format!("{} is running: that is your app", app.exe.display()), "measure another build or channel, or close it"));
+        // A copy strobe launched (stamped) is not the user's: a leftover is ended; one that a
+        // running strobe (this one included) still holds is named.
+        let stamps: Vec<(u32, Option<Stamp>)> = running.iter().map(|&p| (p, stamp_of(p))).collect();
+        let left: Vec<(u32, u32, Stamp)> = stamps.iter().filter_map(|(p, s)| s.clone().filter(leftover).map(|s| (*p, 0, s))).collect();
+        if !end_roots(&left).is_empty() {
+            for _ in 0..50 {
+                running = host::running(&app.exe);
+                if !running.iter().any(|p| left.iter().any(|l| l.0 == *p)) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+        }
+        if let Some((pid, Some(s))) = stamps.iter().find(|(p, s)| running.contains(p) && s.as_ref().is_some_and(|s| !leftover(s))) {
+            return Err(if s.pid == std::process::id() {
+                Error::refused(
+                    "LiveChannel",
+                    format!("{} is running (pid {pid}) from {}, a home this strobe launched it into and has not released", app.exe.display(), s.home),
+                    "a launch did not close: end that process",
+                )
+            } else {
+                Error::refused(
+                    "LiveChannel",
+                    format!("{} is running (pid {pid}) in the isolated home of another strobe (pid {}) that is measuring it", app.exe.display(), s.pid),
+                    "wait for that strobe to finish, or stop it; strobe ends such a copy by itself once that strobe is gone",
+                )
+            });
+        }
+        if !running.is_empty() {
+            let pids: Vec<String> = running.iter().map(u32::to_string).collect();
+            let how = if cfg!(windows) { format!("taskkill /PID {}", pids.join(" /PID ")) } else { format!("kill {}", pids.join(" ")) };
+            return Err(Error::refused(
+                "LiveChannel",
+                format!("{} is running (pid {}): that is your app (no strobe launched it)", app.exe.display(), pids.join(", ")),
+                format!("measure another build or channel, or close it ({how})"),
+            ));
+        }
     }
     // The install folder: a macOS app's bundle, else the executable's folder.
     let install = app.exe.ancestors().find(|a| a.extension().is_some_and(|e| e == "app")).or(app.exe.parent());
@@ -864,8 +1053,7 @@ impl Drop for Launching {
         kill_tree(self.pid);
         if let Some(h) = self.home.take() {
             release_home(&h);
-            keep_gpu_caches(&h);
-            let _ = std::fs::remove_dir_all(h);
+            remove_home(&h);
         }
     }
 }

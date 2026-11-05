@@ -133,6 +133,7 @@ impl Capture {
             t1_ns: crate::host::now_ns(),
             no_begin: true,
             only: Some("the X Present extension".into()),
+            unshared: Vec::new(),
         })
     }
 }

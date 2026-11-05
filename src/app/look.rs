@@ -77,6 +77,9 @@ fn native(args: &Args, target: &str) -> Result<Output> {
     let wait = Duration::from_millis(args.get("wait").map(duration_ms).transpose()?.unwrap_or(2000));
     let timeout = Duration::from_millis(args.get("timeout").map(duration_ms).transpose()?.unwrap_or(60_000));
     let keys = args.num("keys")?.unwrap_or(40.0).max(0.0) as usize;
+    for l in crate::target::isolate::reap_dead_owners() {
+        progress(l);
+    }
     let home = isolate::prepare_home(&app, args.get("home").map(Path::new), None)?;
     progress(format!("look: launching {} in an isolated home", app.exe.display()));
     let (mut n, guard) = match nt::launch(&app, &home, &[], false, None) {
@@ -178,6 +181,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let chars = args.num("chars")?.unwrap_or(4000.0).max(0.0) as usize;
     let timeout = Duration::from_millis(args.get("timeout").map(duration_ms).transpose()?.unwrap_or(30_000));
     let window = Window { x: 0, y: 0, width, height, scale: args.num("scale")? };
+    for l in crate::target::isolate::reap_dead_owners() {
+        progress(l);
+    }
     let browser = chromium::launch(&window, !args.has("headed"), None, &[])?;
     let result = (|| -> Result<Output> {
         let page = browser.page()?;

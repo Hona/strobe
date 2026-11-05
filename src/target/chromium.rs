@@ -96,29 +96,6 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
     dirs.into_iter().map(|d| d.1).collect()
 }
 
-/// Ends what a dead strobe left behind: a browser or app still running from its private profile or
-/// home (`profile-<pid>-…`, `home-<pid>-…` under `run/`), and the folder. A killed strobe once left a
-/// calibration Chromium on screen for hours.
-pub fn reap_orphans() {
-    let Ok(entries) = std::fs::read_dir(host::paths::run()) else { return };
-    for e in entries.flatten() {
-        let name = e.file_name().to_string_lossy().to_string();
-        let Some(owner) = name.strip_prefix("profile-").or_else(|| name.strip_prefix("home-")).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if owner == std::process::id() {
-            continue;
-        }
-        let alive = host::exe_of(owner).is_some_and(|exe| exe.file_stem().is_some_and(|s| s.to_string_lossy().to_lowercase().starts_with("strobe")));
-        if alive {
-            continue;
-        }
-        for pid in host::running_under(&e.path()) {
-            super::isolate::kill_tree(pid);
-        }
-        super::isolate::restore_protocols(&e.path());
-        let _ = std::fs::remove_dir_all(e.path());
-    }
-}
-
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
     let exe = find().ok_or_else(|| Error::msg("no Chromium found").hint("install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER"))?;
@@ -168,12 +145,21 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     args.extend(extra.iter().cloned());
     args.push("about:blank".into());
     let previous = cpus.and_then(host::set_affinity);
-    let spawned = Command::new(&exe).args(&args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    let spawned = Command::new(&exe).args(&args).envs(super::isolate::launch_env(&profile)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
     if previous.is_some() {
         host::set_affinity(previous.unwrap_or(0));
     }
-    let child = spawned.map_err(|e| Error::msg(format!("launch {}: {e}", exe.display())))?;
+    let child = match spawned {
+        Ok(c) => c,
+        Err(e) => {
+            super::isolate::release_home(&profile);
+            super::isolate::remove_home(&profile);
+            return Err(Error::msg(format!("launch {}: {e}", exe.display())));
+        }
+    };
     let pid = child.id();
+    // A launch that fails from here ends the browser and its profile.
+    let mut launching = super::isolate::Launching { pid, home: Some(profile.clone()) };
     let port_file = profile.join("DevToolsActivePort");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let text = loop {
@@ -192,6 +178,8 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     let ws = format!("ws://127.0.0.1:{port}{path}");
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
+    launching.home = None;
+    std::mem::forget(launching);
     Ok(Browser { cdp, ws, child: Some(child), pid, profile: Some(profile), exe, version, window: window.clone() })
 }
 
@@ -368,19 +356,10 @@ impl Browser {
         }
         if let Some(p) = self.profile.take() {
             // Detached children (an Electron app's own background service) outlive the tree: end
-            // everything that runs from the private home.
-            for pid in crate::host::running_under(&p) {
-                super::isolate::kill_tree(pid);
-            }
-            super::isolate::restore_protocols(&p);
-            super::isolate::keep_gpu_caches(&p);
-            // Chromium may hold files for a moment after exit.
-            for _ in 0..20 {
-                if std::fs::remove_dir_all(&p).is_ok() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
+            // everything launched for the private home, then remove it (Chromium may hold files for
+            // a moment after exit: `remove_home` retries).
+            super::isolate::release_home(&p);
+            super::isolate::remove_home(&p);
         }
     }
 }

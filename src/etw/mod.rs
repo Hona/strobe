@@ -75,6 +75,19 @@ pub struct Presents {
     /// none of them may still draw another way, so no frames is not zero frames.
     #[serde(default)]
     pub only: Option<String>,
+    /// Windows the app excludes from screen capture (macOS `NSWindowSharingNone`), seen on screen
+    /// and not streamed: what they draw is unseen. Each with when strobe first and last saw it there
+    /// (host clock; the last is the first look that found it gone, so the span may be longer).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unshared: Vec<Unshared>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Unshared {
+    pub pid: u32,
+    pub window: u64,
+    pub first_ns: u64,
+    pub last_ns: u64,
 }
 
 /// Whether this process may run the real-time present session itself, else why not.

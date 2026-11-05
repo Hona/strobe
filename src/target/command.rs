@@ -85,6 +85,7 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     for (k, v) in &spec.env {
         cmd.env(k, fill(v));
     }
+    cmd.envs(super::isolate::launch_env(home));
     cmd.current_dir(&spec.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let previous = cpus.and_then(host::set_affinity);
     let epoch = epoch_ms();

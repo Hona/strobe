@@ -116,6 +116,10 @@ pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: O
         out.refused = Some(format!("NoPresentSource: the app showed no frame through {only} in the runs: it may draw another way, which strobe does not see"));
         out.values.clear();
     }
+    if let Some(why) = unshared(p, pids, runs) {
+        out.refused = Some(why);
+        out.values.clear();
+    }
     if p.no_begin {
         for m in NEED_BEGIN {
             out.values.remove(*m);
@@ -127,6 +131,22 @@ pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: O
     }
     out
 }
+
+/// Why frames are refused when the app showed a window it excludes from screen capture during a
+/// measured run (`runs`, not the resets between them): what that window draws is unseen, and the
+/// frames of its other windows would read as all of the app's.
+pub fn unshared(p: &Presents, pids: &[u32], runs: &[(u64, u64)]) -> Option<String> {
+    let mut ids: Vec<u64> = p.unshared.iter().filter(|u| pids.contains(&u.pid) && runs.iter().any(|r| u.first_ns <= r.1 && u.last_ns >= r.0)).map(|u| u.window).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    let list = ids.iter().map(u64::to_string).collect::<Vec<_>>().join(", ");
+    match ids.len() {
+        0 => None,
+        1 => Some(format!("NoPresentSource: the app showed window {list}, which it excludes from screen capture (sharing type none), so what it draws cannot be seen; strobe streams no such window")),
+        n => Some(format!("NoPresentSource: the app showed {n} windows ({list}) it excludes from screen capture (sharing type none), so what they draw cannot be seen; strobe streams no such window")),
+    }
+}
+
 /// Missed refreshes and the intervals between frames shown while the target kept drawing.
 fn gaps(shown: &[Shown], refresh_ns: f64) -> (usize, Vec<f64>) {
     let mut by: BTreeMap<u64, Vec<&Shown>> = BTreeMap::new();

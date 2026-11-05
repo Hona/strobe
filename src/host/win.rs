@@ -497,6 +497,79 @@ pub fn exe_of(pid: u32) -> Option<std::path::PathBuf> {
     }
 }
 
+/// A process's environment block (`NAME=value` strings), read from its PEB's process parameters
+/// (x64 layout: `ProcessParameters` at 0x20, `Environment` at 0x80, `EnvironmentSize` at 0x3F0), up
+/// to its terminating empty string or `EnvironmentSize` (at most 4 MiB), page by page so a block
+/// that ends before a page boundary still reads. Never the command line. None when the process
+/// cannot be opened for reading (another user's, protected) or strobe is a 32-bit build.
+pub fn env_of(pid: u32) -> Option<Vec<String>> {
+    use windows_sys::Win32::System::Diagnostics::Debug::ReadProcessMemory;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    use windows_sys::Win32::System::Threading::PROCESS_VM_READ;
+    type Query = unsafe extern "system" fn(*mut std::ffi::c_void, u32, *mut std::ffi::c_void, u32, *mut u32) -> i32;
+    static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+    if cfg!(not(target_pointer_width = "64")) {
+        return None;
+    }
+    let query = (*QUERY.get_or_init(|| {
+        let ntdll = wide("ntdll.dll");
+        let f = unsafe { GetProcAddress(GetModuleHandleW(ntdll.as_ptr()), c"NtQueryInformationProcess".as_ptr() as *const u8) }?;
+        Some(unsafe { std::mem::transmute::<unsafe extern "system" fn() -> isize, Query>(f) })
+    }))?;
+    let h = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ, 0, pid) };
+    if h.is_null() {
+        return None;
+    }
+    let read = |at: u64, buf: &mut [u8]| -> bool {
+        let mut n = 0usize;
+        unsafe { ReadProcessMemory(h, at as *const _, buf.as_mut_ptr() as *mut _, buf.len(), &mut n) != 0 && n == buf.len() }
+    };
+    let u64_at = |at: u64| {
+        let mut b = [0u8; 8];
+        read(at, &mut b).then(|| u64::from_le_bytes(b))
+    };
+    let out = (|| {
+        // PROCESS_BASIC_INFORMATION: the PEB's address is its second field.
+        let mut basic = [0usize; 6];
+        let mut got = 0u32;
+        if unsafe { query(h, 0, basic.as_mut_ptr() as *mut _, size_of::<[usize; 6]>() as u32, &mut got) } < 0 || basic[1] == 0 {
+            return None;
+        }
+        let params = u64_at(basic[1] as u64 + 0x20).filter(|p| *p != 0)?;
+        let env = u64_at(params + 0x80).filter(|p| *p != 0)?;
+        let size = u64_at(params + 0x3F0).map(|s| s as usize).filter(|s| *s > 0).unwrap_or(usize::MAX).min(4 << 20);
+        let mut units: Vec<u16> = Vec::new();
+        let mut at = env;
+        while units.len() * 2 < size && !units.windows(2).any(|w| w == [0, 0]) {
+            // To the next page boundary (a read across into an unmapped page fails whole).
+            let len = ((4096 - (at % 4096)) as usize).min(size - units.len() * 2).max(2) & !1;
+            let mut page = vec![0u8; len];
+            if !read(at, &mut page) {
+                break;
+            }
+            units.extend(page.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)));
+            at += len as u64;
+        }
+        (!units.is_empty()).then(|| String::from_utf16_lossy(&units).split('\0').take_while(|s| !s.is_empty()).map(str::to_string).collect())
+    })();
+    unsafe { CloseHandle(h) };
+    out
+}
+
+/// When a process started (its creation time, 100 ns units), which with its pid names it uniquely.
+pub fn start_time(pid: u32) -> Option<u64> {
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
+        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+        CloseHandle(h);
+        ok.then_some((c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64)
+    }
+}
+
 /// Starts a process that outlives this one and holds nothing of it: no console, no inherited handles
 /// (a shell reading this process's output through a pipe waits until every holder of the pipe's write
 /// end exits, so a daemon that inherited it kept `strobe up` from returning), its own process group,

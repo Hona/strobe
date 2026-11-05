@@ -790,6 +790,17 @@ pub fn running(exe: &Path) -> Vec<u32> {
     os::running(exe)
 }
 
+/// A process's environment (`NAME=value`), never its arguments, where this user may read it.
+pub fn env_of(pid: u32) -> Option<Vec<String>> {
+    os::env_of(pid)
+}
+
+/// When a process started, in units of its OS (only compared for equality): with its pid it names
+/// one process, since a reused pid starts later.
+pub fn start_time(pid: u32) -> Option<u64> {
+    os::start_time(pid)
+}
+
 /// PIDs of running processes whose executable lives under `dir` (on Linux also: whose working folder does).
 pub fn running_under(dir: &Path) -> Vec<u32> {
     os::running_under(dir)

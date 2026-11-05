@@ -570,6 +570,68 @@ pub fn exe_of(pid: u32) -> Option<PathBuf> {
     (n > 0).then(|| PathBuf::from(String::from_utf8_lossy(&buf[..n as usize]).to_string()))
 }
 
+/// A process's environment (`NAME=value`), from `KERN_PROCARGS2`: argc, the executable path, NUL
+/// padding, argc arguments, then the environment up to an empty string, then the kernel's own
+/// strings (applev), which are left out. Arguments are never read as environment. None for a
+/// process of another user. One buffer of `KERN_ARGMAX` bytes per thread, reused.
+pub fn env_of(pid: u32) -> Option<Vec<String>> {
+    thread_local! {
+        static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    BUF.with(|buf| {
+        let mut buf = buf.borrow_mut();
+        if buf.is_empty() {
+            let mut max: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>();
+            let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+            if unsafe { libc::sysctl(mib.as_mut_ptr(), 2, &mut max as *mut _ as *mut c_void, &mut len, std::ptr::null_mut(), 0) } != 0 || max <= 0 {
+                return None;
+            }
+            buf.resize(max as usize, 0);
+        }
+        let mut len = buf.len();
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid as libc::c_int];
+        if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) } != 0 || len < 4 {
+            return None;
+        }
+        Some(procargs_env(&buf[..len]))
+    })
+}
+
+/// The environment strings of a `KERN_PROCARGS2` buffer (see `env_of`).
+fn procargs_env(b: &[u8]) -> Vec<String> {
+    let argc = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]).max(0) as usize;
+    let mut at = 4;
+    // The executable path, then the padding after it.
+    at += b[at..].iter().position(|c| *c == 0).unwrap_or(b.len() - at);
+    at += b[at..].iter().position(|c| *c != 0).unwrap_or(b.len() - at);
+    let next = |at: &mut usize| -> Option<&[u8]> {
+        if *at >= b.len() {
+            return None;
+        }
+        let end = *at + b[*at..].iter().position(|c| *c == 0).unwrap_or(b.len() - *at);
+        let s = &b[*at..end];
+        *at = end + 1;
+        Some(s)
+    };
+    for _ in 0..argc {
+        if next(&mut at).is_none() {
+            return Vec::new();
+        }
+    }
+    let mut env = Vec::new();
+    while let Some(s) = next(&mut at).filter(|s| !s.is_empty()) {
+        env.push(String::from_utf8_lossy(s).to_string());
+    }
+    env
+}
+
+/// When a process started (µs since the epoch), which with its pid names it uniquely: a reused pid
+/// starts later.
+pub fn start_time(pid: u32) -> Option<u64> {
+    bsd(pid).map(|b| b.start)
+}
+
 pub fn running(exe: &Path) -> Vec<u32> {
     let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     all_pids().into_iter().filter(|&p| exe_of(p).is_some_and(|e| e == want)).collect()
@@ -667,6 +729,9 @@ struct Win {
     onscreen: bool,
     alpha: f64,
     owner: String,
+    /// `kCGWindowSharingState`: 0 when the app excludes the window from screen capture
+    /// (`NSWindowSharingNone`), 1 or 2 when other apps may read it.
+    sharing: i64,
 }
 
 const LIST_ALL: u32 = 0;
@@ -689,6 +754,7 @@ fn windows(option: u32, relative: u32) -> Vec<Win> {
                 onscreen: cf_i64(cf_get(d, "kCGWindowIsOnscreen")) == Some(1),
                 alpha: cf_f64(cf_get(d, "kCGWindowAlpha")).unwrap_or(1.0),
                 owner: cf_string(cf_get(d, "kCGWindowOwnerName")).unwrap_or_default(),
+                sharing: cf_i64(cf_get(d, "kCGWindowSharingState")).unwrap_or(1),
             })
         })
         .collect()
@@ -963,6 +1029,13 @@ pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
                 .then(|| Some((cf_i64(cf_get(d, "kCGWindowNumber"))? as isize, cf_string(cf_get(d, "kCGWindowName")).unwrap_or_default(), false)))?
         })
         .collect()
+}
+
+/// The on-screen windows of `pids` (as `top_windows` lists them) that the app excludes from screen
+/// capture (`NSWindowSharingNone`): a ScreenCaptureKit stream of one never holds its content, so
+/// nothing it draws can be seen.
+pub fn unshared_windows(pids: &[u32]) -> Vec<(u32, u32)> {
+    windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0).into_iter().filter(|w| pids.contains(&w.pid) && (0..1000).contains(&w.layer) && w.alpha > 0.0 && w.sharing == 0).map(|w| (w.id, w.pid)).collect()
 }
 
 /// The frontmost on-screen window of `pids` holding a point (points, global display space).

@@ -2969,6 +2969,9 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `bun`, `python3`, …) is refused before launch, and one that exits with a failure before it opens a
   debugging port fails then, not after 60 s. `pid:`/`proc:` record only (`--probes timing|deep`).
   Variants also take `url:<href>` (an already running origin).
+- macOS completion handlers (ScreenCaptureKit) are blocks with copy and dispose helpers, so the
+  framework's copy keeps their context alive after strobe stops waiting; frame callbacks drain on
+  their serial queue before a stream's sink is freed.
 - Native targets: `cpu.work` with `cpu.app.total` tested by default, as for scripts; `cpu.wakes`,
   `io.*` and `ui.*` descriptive unless declared. Warmup compares the tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
   the calibration. Declared metrics a native target cannot give are listed refused with their reason,

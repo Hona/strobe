@@ -45,8 +45,9 @@ unsafe extern "C" {
 }
 
 unsafe extern "C" {
-    static _NSConcreteGlobalBlock: c_void;
+    static _NSConcreteStackBlock: c_void;
     fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
+    fn dispatch_sync_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
 }
 
 #[link(name = "ScreenCaptureKit", kind = "framework")]
@@ -96,11 +97,22 @@ macro_rules! send {
 struct Descriptor {
     reserved: u64,
     size: u64,
+    copy: extern "C" fn(*mut Block, *const Block),
+    dispose: extern "C" fn(*const Block),
+    signature: *const c_char,
 }
 
-static DESCRIPTOR: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64 };
+// SAFETY: only static data, read by the blocks runtime.
+unsafe impl Sync for Descriptor {}
 
-/// A block whose context outlives every call (a global block: `Block_copy` returns it as is).
+static DESCRIPTOR: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64, copy: copy_ctx, dispose: dispose_ctx, signature: c"v24@?0@8@16".as_ptr() };
+static DESCRIPTOR_ERROR: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64, copy: copy_ctx, dispose: dispose_ctx, signature: c"v16@?0@8".as_ptr() };
+
+/// A completion block as the compiler makes one: it starts on the "stack" (strobe's own allocation),
+/// and a framework that keeps it `Block_copy`s it to the heap, where the blocks runtime counts its
+/// references and calls `dispose` after the last one, possibly long after the handler ran (the XPC
+/// reply that carried it is freed later, on another queue). Its context, an `Arc`, is shared by every
+/// copy, so it lives until the framework's copy is gone.
 #[repr(C)]
 struct Block {
     isa: *const c_void,
@@ -111,7 +123,18 @@ struct Block {
     ctx: *const c_void,
 }
 
-const BLOCK_IS_GLOBAL: i32 = 1 << 28;
+const BLOCK_HAS_COPY_DISPOSE: i32 = 1 << 25;
+const BLOCK_HAS_SIGNATURE: i32 = 1 << 30;
+
+/// The blocks runtime copied `src` into `dst` (bytes already moved): the copy holds the context too.
+extern "C" fn copy_ctx(_dst: *mut Block, src: *const Block) {
+    unsafe { Arc::increment_strong_count((*src).ctx as *const Done) };
+}
+
+/// The last reference to a heap copy went away.
+extern "C" fn dispose_ctx(b: *const Block) {
+    unsafe { Arc::decrement_strong_count((*b).ctx as *const Done) };
+}
 
 /// What a completion handler hands back: its two object arguments (retained), once it ran.
 type Done = (Mutex<Option<(usize, usize)>>, Condvar);
@@ -136,14 +159,15 @@ extern "C" fn completed_error(b: *mut Block, e: Id) {
 }
 
 /// Calls `f` with a completion block and waits up to `wait` for it: the handler's (object, error),
-/// both retained (the caller releases them); `error_only` for a handler of just an error. On a
-/// timeout the block is leaked, so a late call stays safe.
+/// both retained (the caller releases them); `error_only` for a handler of just an error. The
+/// framework keeps its own copy of the block for as long as it wants (`Block`), so neither a late
+/// call after a timeout nor the framework releasing its copy after this returns touches freed memory.
 fn with_completion(wait: Duration, error_only: bool, f: impl FnOnce(*mut Block)) -> Option<(Id, Id)> {
     let done: Arc<Done> = Arc::new((Mutex::new(None), Condvar::new()));
-    let invoke = if error_only { completed_error as *const c_void } else { completed as *const c_void };
-    let block = Box::new(Block { isa: unsafe { &_NSConcreteGlobalBlock }, flags: BLOCK_IS_GLOBAL, reserved: 0, invoke, descriptor: &DESCRIPTOR, ctx: Arc::into_raw(done.clone()) as *const c_void });
-    let ptr = Box::into_raw(block);
-    f(ptr);
+    let (invoke, descriptor) = if error_only { (completed_error as *const c_void, &DESCRIPTOR_ERROR) } else { (completed as *const c_void, &DESCRIPTOR) };
+    let mut block = Block { isa: unsafe { &_NSConcreteStackBlock }, flags: BLOCK_HAS_COPY_DISPOSE | BLOCK_HAS_SIGNATURE, reserved: 0, invoke, descriptor, ctx: Arc::as_ptr(&done) as *const c_void };
+    // The method returns before the handler runs; a framework that calls it later copied the block.
+    f(&raw mut block);
     let deadline = Instant::now() + wait;
     let mut got = done.0.lock().unwrap_or_else(|e| e.into_inner());
     while got.is_none() {
@@ -153,13 +177,7 @@ fn with_completion(wait: Duration, error_only: bool, f: impl FnOnce(*mut Block))
         }
         got = done.1.wait_timeout(got, left).unwrap_or_else(|e| e.into_inner()).0;
     }
-    let out = got.take().map(|(a, e)| (a as Id, e as Id));
-    drop(got);
-    unsafe {
-        drop(Arc::from_raw((*ptr).ctx as *const Done));
-        drop(Box::from_raw(ptr));
-    }
-    out
+    got.take().map(|(a, e)| (a as Id, e as Id))
 }
 
 fn description(e: Id) -> String {
@@ -393,13 +411,15 @@ impl Capture {
             let ivar = class_getInstanceVariable(output_class(), c"sink".as_ptr());
             let sink = object_getIvar(s.output, ivar) as *mut Sink;
             object_setIvar(s.output, ivar, std::ptr::null_mut());
-            objc_release(s.stream);
-            objc_release(s.output);
+            // The queue may still run a callback that read the sink before it was cleared: the queue
+            // is serial, so once an empty call queued now has run, every earlier one has.
+            extern "C" fn nothing(_: *mut c_void) {}
+            dispatch_sync_f(self.queue, std::ptr::null_mut(), nothing);
             if !sink.is_null() {
-                // The queue may still run a callback that read the sink before it was cleared.
-                std::thread::sleep(Duration::from_millis(20));
                 drop(Box::from_raw(sink));
             }
+            objc_release(s.stream);
+            objc_release(s.output);
         }
     }
 

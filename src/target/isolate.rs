@@ -601,6 +601,36 @@ pub fn release_home(home: &Path) {
     let_go(home);
 }
 
+/// While alive, a stop of strobe (Ctrl-C, SIGINT, SIGTERM) ends what runs from `home`, removes it when
+/// `prepare_home` made it now, and exits 130, for a command with no stop points of its own (`look`):
+/// it leaves nothing running for the next strobe to reap. Dropped, it watches no more.
+pub struct EndOnStop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+pub fn end_on_stop(home: &Home) -> EndOnStop {
+    use std::sync::atomic::Ordering;
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (flag, watching, dir, fresh) = (host::ctrl_c(), done.clone(), home.dir.clone(), home.fresh);
+    std::thread::spawn(move || {
+        while !watching.load(Ordering::SeqCst) {
+            if flag.load(Ordering::SeqCst) {
+                release_home(&dir);
+                if fresh {
+                    remove_home(&dir);
+                }
+                std::process::exit(130);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    });
+    EndOnStop(done)
+}
+
+impl Drop for EndOnStop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 /// Ends what a launch started, whatever state it is in: the child, its tree and its group
 /// (`Owned::end`), then everything stamped with its folder; releases the folder and, with `remove`,
 /// deletes it.

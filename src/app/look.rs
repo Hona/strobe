@@ -95,6 +95,8 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         progress(l);
     }
     let home = isolate::prepare_home(&app, args.get("home").map(Path::new), None)?;
+    // A look stopped midway (Ctrl-C, SIGTERM) closes the app instead of leaving it running.
+    let _stop = isolate::end_on_stop(&home);
     progress(format!("look: launching {} in an isolated home", app.exe.display()));
     let (mut n, guard) = match nt::launch(&app, &home, &[], false, None) {
         Ok(x) => x,

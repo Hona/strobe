@@ -659,7 +659,8 @@ locked session too (pixels and input do not), so an `expect` can be checked befo
 names the newest build of it a bench made (a directory or git-ref variant's output in strobe's
 `builds/out`), with the `look exe:<path> --app <id>` that opens it. `--build` (with `app:<id>`) first
 builds the checkout strobe runs in with strobe.json's `build`, as a bench of that folder builds it
-(an unchanged one is reused), and looks at that executable.
+(an unchanged one is reused), and looks at that executable. A look stopped midway (Ctrl-C, SIGINT,
+SIGTERM) closes the app and removes its home before it exits 130 (`isolate::end_on_stop`).
 
 ## 6. Clock
 

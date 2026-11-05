@@ -3748,14 +3748,19 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // waits out, not `Throttled`.
             Err(e) => {
                 let (foreign, busiest) = loaded.or_else(|| during.map(|d| d.stop(ctx.pin, &browser))).unwrap_or_default();
+                let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
+                let who = if who.is_empty() { "none named (system work)".to_string() } else { who };
                 return Err(if foreign >= BACKGROUND_PCT {
-                    let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
                     Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {foreign:.0}% of a core busy ({})", e.message))
-                        .detail(format!("busiest processes (% of a core): {}", if who.is_empty() { "none named (system work)".into() } else { who }))
+                        .detail(format!("busiest processes (% of a core): {who}"))
                         .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
                         .into()
                 } else {
-                    e
+                    // Too little other work to be the cause, but named, so a reader can tell.
+                    match e.refusal {
+                        Some(r) => (*r).detail(format!("other work on the target's CPUs meanwhile: {foreign:.0}% of a core; busiest processes (% of a core): {who}")).into(),
+                        None => e,
+                    }
                 });
             }
             Ok(r) => r,

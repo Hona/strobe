@@ -89,21 +89,42 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   // `text` matches a substring of the element's text, label or value, or all of one (trimmed) when `exact`.
   const has = (el, text, exact) => text == null || [el.textContent ?? "", el.getAttribute("aria-label") ?? "", typeof el.value === "string" ? el.value : ""].some((t) => (exact ? t.trim() === text.trim() : t.includes(text)))
   const up = (el) => el.parentElement ?? el.getRootNode().host ?? null
+  // The elements a text alone can match: those with a text node of their own that holds it, and those whose label or
+  // value does, in tree order. A walk of the text nodes, not of every element's whole text (the page's, its body's, each
+  // container's: large strings on a large page, built on its main thread on every check of a wait).
+  const holders = (text, exact) => {
+    const out = new Set()
+    const w = document.createTreeWalker(document, NodeFilter.SHOW_TEXT)
+    for (let n = w.nextNode(); n; n = w.nextNode()) if (n.parentElement && (exact ? n.data.trim() === text.trim() : n.data.includes(text))) out.add(n.parentElement)
+    for (const el of document.querySelectorAll("[aria-label], input, textarea, select")) out.add(el)
+    return [...out].sort((a, b) => (a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1))
+  }
   // A selector as strobe parsed it (`{ css, role, text, exact, index, focus }`): CSS (every element without), then
-  // its filters, the cheap ones first. With a text, only the innermost matches count: every ancestor's text holds it
-  // too. It runs on the page's main thread inside a run whenever a wait checks, so it stops at the match it needs and
-  // measures the layout of no element past it.
+  // its filters, the cheap ones first. With a text, only the innermost visible matches count: every ancestor's text
+  // holds it too, and a hidden descendant's (an icon's title, a screen-reader label) must not hide the element. It
+  // runs on the page's main thread inside a run whenever a wait checks, so without a text it stops at the match it
+  // needs and measures the layout of no element past it.
   s.find = (q) => {
-    let found = query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
-      .filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact))
-    if (q.text != null) {
-      const outer = new Set()
-      for (const el of found) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
-      found = found.filter((el) => !outer.has(el))
-    }
+    const bare = q.css == null && q.role == null && q.text != null
+    const all = bare ? holders(q.text, q.exact) : query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
+    const found = all.filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact))
     let left = q.index ?? 0
-    for (const el of found) if (visible(el) && left-- === 0) return el
-    return null
+    if (q.text == null) {
+      for (const el of found) if (visible(el) && left-- === 0) return el
+      return null
+    }
+    // An icon's text (an SVG <title>, drawn nowhere) stands for the nearest visible element around it that holds it
+    // too; any other hidden holder (opacity 0, display: none) matches nothing, not an ancestor such as the body.
+    const lift = (el) => {
+      if (visible(el)) return el
+      if (el.namespaceURI !== "http://www.w3.org/2000/svg") return null
+      for (let p = up(el); p; p = up(p)) if (visible(p)) return has(p, q.text, q.exact) ? p : null
+      return null
+    }
+    const shown = [...new Set(bare ? found.map(lift).filter(Boolean) : found.filter(visible))]
+    const outer = new Set()
+    for (const el of shown) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
+    return shown.filter((el) => !outer.has(el))[left] ?? null
   }
   s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
   s.box = (q) => {
@@ -442,10 +463,12 @@ impl Driver {
         }
         let sel = Self::sel(sel)?;
         let (x, y) = self.locate(&sel, o)?;
-        if self.page.eval(&format!("__strobe.focused({})", sel.page_spec()))?.as_bool() != Some(true) {
-            for kind in ["mousePressed", "mouseReleased"] {
-                self.mouse(kind, (x, y), Some(Button::Left), if kind == "mousePressed" { 1 } else { 0 }, 1, 0)?;
-            }
+        if self.call(&format!("__strobe.focused({})", sel.page_spec()))?.as_bool() != Some(true) {
+            let held = self.buttons.get().0;
+            self.pointer.set((x, y));
+            self.mouse("mouseMoved", (x, y), None, held, 0, 0)?;
+            self.mouse("mousePressed", (x, y), Some(Button::Left), held | 1, 1, 0)?;
+            self.mouse("mouseReleased", (x, y), Some(Button::Left), held, 1, 0)?;
         }
         Ok(())
     }
@@ -611,7 +634,7 @@ impl Driver {
     /// Waits for the element, then returns the point to send input at.
     fn locate(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64)> {
         self.wait_for(sel, self.timeout(opts))?;
-        let b = self.page.eval(&format!("__strobe.box({})", sel.page_spec()))?;
+        let b = self.call(&format!("__strobe.box({})", sel.page_spec()))?;
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
@@ -643,6 +666,8 @@ impl Driver {
             Key::Named(n) => keys::dom(n),
             Key::Char(c) => keys::dom_char(c),
         };
+        // A character a US keyboard types with Shift (`A`, `+`) holds Shift, as the native posters press it.
+        let modifiers = modifiers | if matches!(key, Key::Char(c) if keys::us_key(c).is_some_and(|k| k.1)) { 8 } else { 0 };
         if modifiers & 8 != 0
             && let Some(c) = d.text.as_deref().and_then(|t| t.chars().next()).filter(|c| d.key.chars().count() == 1 && c.is_ascii_graphic())
         {

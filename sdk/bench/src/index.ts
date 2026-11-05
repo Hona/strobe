@@ -3,9 +3,9 @@
 /**
  * A visible element, in one grammar for pages and native apps: a base (on a page a CSS selector, `>>>` crossing
  * shadow roots; on a native app an element key or key path, `"nav-history"`, `"slider/knob"`), then filters:
- * `role=<role>` (ARIA's role names), `text=<text>` (a substring of its text, label or value; quoted,
- * `text="General"`, all of it, trimmed), `index=<n>` (that match, 0-based in tree order, among identical ones: six
- * check boxes all named "checkbutton") and a `:focus` suffix. `"role=heading text=\"General\""`,
+ * `role=<role>` (ARIA's role names), `text=<text>` (a substring of its text, label or value; `text==<text>` all of
+ * it, trimmed; quotes hold spaces: `text="Copy session"`), `index=<n>` (that match, 0-based in tree order, among
+ * identical ones: six check boxes all named "checkbutton") and a `:focus` suffix. `'role=heading text=="General"'`,
  * `".row text=Draft index=1"`. The object form says the same, its `selector` in the string grammar.
  */
 export type Selector = string | { selector?: string; role?: string; text?: string; exact?: boolean; index?: number; focus?: boolean }

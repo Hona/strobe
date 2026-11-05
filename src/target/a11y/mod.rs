@@ -4,7 +4,7 @@
 //!
 //! Selectors (`Selector`, one grammar with pages): an element key or a key path (`"slider/knob"`:
 //! the last segment is the element's key, earlier ones the keys of its nearest ancestors that have
-//! one), then `role=<x>`, `text=<x>` (name or value, substring unless quoted or exact), `index=<n>`,
+//! one), then `role=<x>`, `text=<x>` (name or value, a substring; `text==<x>` all of it), `index=<n>`,
 //! and an optional `:focus` suffix. The key is the element's AutomationId (Windows), AXIdentifier
 //! (macOS) or AccessibleId (AT-SPI): where toolkits put an author's id. Roles are ARIA's names,
 //! mapped from each OS's own roles. Only elements a person could see match: non-empty bounds inside
@@ -97,8 +97,9 @@ enum Base {
 
 /// A parsed selector, one grammar for pages and native apps: a base (an element key or key path on
 /// a native app, CSS on a page), then filters: `role=<role>`, `text=<text>` (a substring of its name
-/// or value; quoted, `text="General"`, the whole of it, trimmed), `index=<n>` (the nth match in tree
-/// order, from 0) and a `:focus` suffix. `role=heading text="General"`. The object form
+/// or value; `text==<text>` the whole of it, trimmed; either quoted to hold spaces, `\"` a quote:
+/// `text="Copy session"`), `index=<n>` (the nth match in tree order, from 0) and a `:focus` suffix.
+/// `role=heading text=="General"`. The object form
 /// `{ selector, role, text, exact, index, focus }` says the same, its `selector` in the string
 /// grammar.
 #[derive(Clone, Debug, PartialEq)]
@@ -113,14 +114,17 @@ pub struct Selector {
 }
 
 /// The selector grammar, for errors.
-const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav-history\", \"slider/knob\"; CSS on a page), then role=<role>, text=<text> (text=\"<text>\" for the whole text), index=<n>, and an optional :focus suffix; or { selector, role, text, exact, index, focus }";
+const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav-history\", \"slider/knob\"; CSS on a page), then role=<role>, text=<text> (a substring; text==<text> the whole text; quoted to hold spaces, text=\"Copy session\"), index=<n>, and an optional :focus suffix; or { selector, role, text, exact, index, focus }";
 
 /// Splits a selector string at whitespace outside quotes, brackets and parentheses. A quote opens a
-/// quoted value only at a value's start (after `=` or a space), so `text=don't` is one word.
+/// quoted value only at a value's start (after `=`, `(`, `[` or a space), so `text=don't` is one
+/// word; inside one, a backslash keeps the next character (`\"`).
 fn tokens(s: &str) -> Result<Vec<String>> {
-    let (mut out, mut cur, mut depth, mut quote) = (Vec::new(), String::new(), 0i32, None::<char>);
+    let (mut out, mut cur, mut depth, mut quote, mut escaped) = (Vec::new(), String::new(), 0i32, None::<char>, false);
     for c in s.chars() {
         match (quote, c) {
+            (Some(_), _) if escaped => escaped = false,
+            (Some(_), '\\') => escaped = true,
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') if cur.is_empty() || cur.ends_with(['=', '(', '[']) => quote = Some(c),
@@ -145,6 +149,22 @@ fn tokens(s: &str) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// A value as written: a quoted one without its quotes and with its escapes resolved.
+fn unquote(x: &str) -> String {
+    let q = x.chars().next().filter(|q| matches!(q, '"' | '\'') && x.len() >= 2 && x.ends_with(*q));
+    let Some(_) = q else { return x.to_string() };
+    let (mut out, mut escaped) = (String::new(), false);
+    for c in x[1..x.len() - 1].chars() {
+        if escaped || c != '\\' {
+            out.push(c);
+            escaped = false;
+        } else {
+            escaped = true;
+        }
+    }
+    out
+}
+
 impl Selector {
     /// A selector string, or the object form, for `dialect`.
     pub fn parse(v: &Value, dialect: Dialect) -> Result<Selector> {
@@ -163,21 +183,33 @@ impl Selector {
             _ => v.to_string(),
         };
         let bad = |why: String| Error::usage(format!("selector {source:?}: {why}; a selector is {GRAMMAR}"));
-        let (s, mut focus) = match s.trim().strip_suffix(":focus") {
-            Some(rest) => (rest, true),
-            None => (s.trim(), false),
-        };
+        let mut toks = tokens(s.trim())?;
+        // `:focus` ends the last token outside quotes (`text="a:focus"` holds it): a filter's or a native
+        // key's suffix, or a token of its own. A page's CSS keeps its own (`textarea, input:focus`).
+        let mut focus = false;
+        if toks.last().is_some_and(|t| t == ":focus") {
+            toks.pop();
+            focus = true;
+        } else if let Some(rest) = toks.last().and_then(|t| t.strip_suffix(":focus")).map(str::to_string)
+            && (dialect == Dialect::Native || rest.split_once('=').is_some_and(|(k, _)| matches!(k, "role" | "text" | "index")))
+        {
+            if let Some(last) = toks.last_mut() {
+                *last = rest;
+            }
+            focus = true;
+        }
         let (mut base, mut role, mut text, mut exact, mut index) = (Vec::new(), None, None, false, None);
-        for t in tokens(s)? {
+        for t in toks {
             let term = t.split_once('=').filter(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphabetic()));
             match term {
                 None if role.is_some() || text.is_some() || index.is_some() => return Err(bad(format!("{t:?} after a filter: the base comes first"))),
                 None => base.push(t),
-                Some(("role", r)) if role.is_none() => role = Some(r.to_ascii_lowercase()),
+                Some(("role", r)) if role.is_none() => role = Some(unquote(r).to_ascii_lowercase()),
+                // `text=` a substring, `text==` the whole text; quotes only hold spaces.
                 Some(("text", x)) if text.is_none() => {
-                    let quoted = x.len() >= 2 && (x.starts_with('"') && x.ends_with('"') || x.starts_with('\'') && x.ends_with('\''));
-                    exact = quoted;
-                    text = Some(if quoted { x[1..x.len() - 1].to_string() } else { x.to_string() });
+                    let whole = x.strip_prefix('=');
+                    exact = whole.is_some();
+                    text = Some(unquote(whole.unwrap_or(x)));
                 }
                 Some(("index", n)) if index.is_none() => index = Some(n.parse::<usize>().map_err(|_| bad(format!("index={n} is not a whole number")))?),
                 Some((k @ ("role" | "text" | "index"), _)) => return Err(bad(format!("{k} given twice"))),

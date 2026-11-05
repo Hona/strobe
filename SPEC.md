@@ -1481,13 +1481,17 @@ handed to the page's helper or matched against the accessibility tree: a base, t
   has its `role` attribute's first token, else the role its HTML implies (`h2` heading, `a[href]` link,
   `input[type=checkbox]` checkbox, …).
 - `text=<text>`: a substring of the element's name or value (a page: its text, `aria-label` or value);
-  quoted, `text="General"`, the whole of it, trimmed. On a page only the innermost matches count, since
-  every ancestor's text holds the text too.
+  `text==<text>` the whole of it, trimmed. Quotes hold spaces and nothing else (`text="Copy session"`
+  is a substring; `\"` is a quote inside them). On a page only the innermost visible matches count,
+  since every ancestor's text holds the text too (a hidden descendant that holds it, an icon's title,
+  does not hide its element). A text with no base or role is looked for in the page's text nodes, not
+  in every element's whole text, so there it matches text within one text node.
 - `index=<n>`: that match, 0-based in tree order, among identical ones (six check boxes all named
   "checkbutton"); `nth=` says to use `index=`.
-- a `:focus` suffix: the focused element.
+- a `:focus` suffix on the last filter or key, or alone: the focused element. A page's CSS keeps its own
+  `:focus` (`textarea, input:focus`), and one inside quotes is text.
 
-`role=heading text="General"`, `.row text=Draft index=1`, `slider/knob:focus`. The base comes first;
+`role=heading text=="General"`, `.row text=Draft index=1`, `slider/knob:focus`. The base comes first;
 a filter given twice, an unknown `x=` or an unclosed quote is a usage error that quotes the grammar. Every
 call takes the object form too, `{ selector, role, text, exact, index, focus }`, its `selector` in the
 string grammar. `until`, `waitFor`, `expect.visible`, `look --until` and a native launch's `until` take
@@ -1501,7 +1505,7 @@ On a native target strobe drives the app through the OS's accessibility tree and
 `until` and `timeout` options plus `window`. A wait reads the tree again on each change the app
 announces, at most once per 16 ms while changes come in a burst (an animation's every frame), since
 each read costs the app's own provider work; while the tree is a placeholder (a few elements per
-window: a lazy provider such as AccessKit, which on macOS fills in without an event) it reads again
+window: a lazy provider, which on macOS fills in without an event) it reads again
 every 50 ms. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
 says which kept it busy, with counts: the frames of the app that reached the screen in the last second
 (from the block's present events), its accessibility changes in that second and over the whole wait,

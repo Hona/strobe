@@ -108,6 +108,8 @@ const PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_IsInvokePatternAvailablePropertyId,
     UIA_IsTogglePatternAvailablePropertyId,
     UIA_IsValuePatternAvailablePropertyId,
+    UIA_IsRangeValuePatternAvailablePropertyId,
+    UIA_RangeValueValuePropertyId,
     UIA_IsExpandCollapsePatternAvailablePropertyId,
     UIA_IsSelectionItemPatternAvailablePropertyId,
     UIA_IsScrollPatternAvailablePropertyId,
@@ -122,6 +124,7 @@ const WATCHED: &[UIA_PROPERTY_ID] = &[
     UIA_IsEnabledPropertyId,
     UIA_HasKeyboardFocusPropertyId,
     UIA_ValueValuePropertyId,
+    UIA_RangeValueValuePropertyId,
     UIA_ToggleToggleStatePropertyId,
     UIA_ExpandCollapseExpandCollapseStatePropertyId,
     UIA_SelectionItemIsSelectedPropertyId,
@@ -306,12 +309,21 @@ impl Worker {
                     p.Toggle().map_err(err("Toggle"))?;
                     t
                 }
-                Action::SetValue(v) => {
-                    let p: IUIAutomationValuePattern = e.GetCurrentPatternAs(UIA_ValuePatternId).map_err(missing("Value"))?;
-                    let t = crate::host::now_ns();
-                    p.SetValue(&BSTR::from(v.as_str())).map_err(err("SetValue"))?;
-                    t
-                }
+                // A range control (a slider) takes a number through RangeValue, as AX and AT-SPI set one;
+                // anything else its text through Value.
+                Action::SetValue(v) => match (v.trim().parse::<f64>(), e.GetCurrentPatternAs::<IUIAutomationRangeValuePattern>(UIA_RangeValuePatternId)) {
+                    (Ok(d), Ok(p)) => {
+                        let t = crate::host::now_ns();
+                        p.SetValue(d).map_err(err("RangeValue.SetValue"))?;
+                        t
+                    }
+                    _ => {
+                        let p: IUIAutomationValuePattern = e.GetCurrentPatternAs(UIA_ValuePatternId).map_err(missing("Value or RangeValue"))?;
+                        let t = crate::host::now_ns();
+                        p.SetValue(&BSTR::from(v.as_str())).map_err(err("SetValue"))?;
+                        t
+                    }
+                },
                 Action::Expand | Action::Collapse => {
                     let p: IUIAutomationExpandCollapsePattern = e.GetCurrentPatternAs(UIA_ExpandCollapsePatternId).map_err(missing("ExpandCollapse"))?;
                     let t = crate::host::now_ns();
@@ -391,12 +403,18 @@ unsafe fn read(e: &IUIAutomationElement, parent: Option<usize>, window: usize) -
             // A radio button is checked through SelectionItem.
             (role == UIA_RadioButtonControlTypeId.0 && patterns & PATTERN_SELECT != 0).then(|| bool_of(e, UIA_SelectionItemIsSelectedPropertyId))
         };
+        // A range control without a text value (a slider): its number.
+        let range = || bool_of(e, UIA_IsRangeValuePatternAvailablePropertyId).then(|| e.GetCachedPropertyValue(UIA_RangeValueValuePropertyId).ok().and_then(|v| f64::try_from(&v).ok())).flatten().map(|d| d.to_string());
+        let value = match value.filter(|_| patterns & PATTERN_VALUE != 0) {
+            Some(t) if !t.is_empty() => Some(t),
+            t => range().or(t),
+        };
         Node {
             id: s(e.CachedAutomationId()),
             name: s(e.CachedName()),
             role,
             role_text,
-            value: value.filter(|_| patterns & PATTERN_VALUE != 0),
+            value,
             rect: [r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64],
             focused: e.CachedHasKeyboardFocus().is_ok_and(|b| b.as_bool()),
             enabled: e.CachedIsEnabled().is_ok_and(|b| b.as_bool()),
@@ -450,7 +468,12 @@ impl Accessibility for Uia {
     fn value(&self, i: usize) -> Result<Option<String>> {
         self.call(move |s| {
             let e = s.elements.get(i).ok_or_else(|| Error::msg("value: no such element in the last snapshot"))?;
-            Ok(unsafe { e.GetCurrentPropertyValue(UIA_ValueValuePropertyId) }.ok().and_then(|v| BSTR::try_from(&v).ok()).map(|b| b.to_string()))
+            let text = unsafe { e.GetCurrentPropertyValue(UIA_ValueValuePropertyId) }.ok().and_then(|v| BSTR::try_from(&v).ok()).map(|b| b.to_string());
+            let range = || unsafe { e.GetCurrentPropertyValue(UIA_RangeValueValuePropertyId) }.ok().and_then(|v| f64::try_from(&v).ok()).map(|d| d.to_string());
+            Ok(match text {
+                Some(t) if !t.is_empty() => Some(t),
+                t => range().or(t),
+            })
         })
     }
 

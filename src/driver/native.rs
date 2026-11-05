@@ -184,13 +184,17 @@ mod imp {
             Ok(t)
         }
 
-        /// A read of the tree inside a wait: the first at once, each later one no sooner than
-        /// `REREAD` after the one before (never past `deadline`).
-        fn reread(&self, window: Option<&str>, last: &mut Option<Instant>, deadline: Instant) -> Result<Tree> {
-            if let Some(w) = last.map(|at| (at + REREAD).min(deadline)).and_then(|next| next.checked_duration_since(Instant::now())) {
+        /// A read of the tree inside a wait (`reads`: how many it took so far, and when the last
+        /// began). The first and the first re-read after a change go at once, so a step whose
+        /// reaction comes in one change costs no sleep; from the second re-read on, a read waits until
+        /// `REREAD` after the one before (never past `deadline`): only a burst is spread out.
+        fn reread(&self, window: Option<&str>, reads: &mut (u32, Option<Instant>), deadline: Instant) -> Result<Tree> {
+            if reads.0 >= 2
+                && let Some(w) = reads.1.map(|at| (at + REREAD).min(deadline)).and_then(|next| next.checked_duration_since(Instant::now()))
+            {
                 std::thread::sleep(w);
             }
-            *last = Some(Instant::now());
+            *reads = (reads.0 + 1, Some(Instant::now()));
             self.snapshot(window)
         }
 
@@ -199,10 +203,10 @@ mod imp {
         /// `settle`). An app with no tree at all says so.
         fn find(&self, sel: &Selector, window: Option<&str>, timeout: Duration) -> Result<(Tree, usize)> {
             let deadline = Instant::now() + timeout;
-            let mut read = None;
+            let mut reads = (0, None);
             loop {
                 let seen = self.a11y.changes().count;
-                let tree = self.reread(window, &mut read, deadline)?;
+                let tree = self.reread(window, &mut reads, deadline)?;
                 if let Some(&i) = tree.find(sel).first() {
                     return Ok((tree, i));
                 }
@@ -387,13 +391,13 @@ mod imp {
 
         /// What the app's windows show: their names, then their visible open dialogs' and headings'
         /// names in tree order (at most 6). A provider that answers first with a placeholder root
-        /// (lazy, such as AccessKit's: `sparse`) gets up to `t` to build its tree; a full tree is read
+        /// (lazy: `sparse`) gets up to `t` to build its tree; a full tree is read
         /// once.
         pub fn screen(&self, t: Duration) -> Result<(Vec<String>, Vec<String>)> {
             let deadline = Instant::now() + t;
             let mut seen = self.a11y.changes().count;
             let mut tree = self.snapshot(None)?;
-            // AccessKit's first answer is a few nodes (Hex: 6 of over 100) and the rest comes a moment
+            // A lazy provider's first answer is a few nodes (6 of over 100 in one app) and the rest comes a moment
             // later, without a notification on macOS: while the tree is a placeholder, read again on
             // each change and every 250 ms, until it is not or two reads agree on a tree (a small app's
             // whole tree is a few nodes).
@@ -545,13 +549,8 @@ mod imp {
         /// `find`, then until the element is enabled: a click on a disabled one does nothing.
         fn find_enabled(&self, sel: &Selector, window: Option<&str>, t: Duration) -> Result<(Tree, usize)> {
             let deadline = Instant::now() + t;
-            let mut read: Option<Instant> = None;
             loop {
                 let seen = self.a11y.changes().count;
-                if let Some(w) = read.map(|at| (at + REREAD).min(deadline)).and_then(|next| next.checked_duration_since(Instant::now())) {
-                    std::thread::sleep(w);
-                }
-                read = Some(Instant::now());
                 let (tree, i) = self.find(sel, window, deadline.saturating_duration_since(Instant::now()))?;
                 if tree.nodes[i].enabled {
                     return Ok((tree, i));
@@ -583,7 +582,8 @@ mod imp {
                     ))
                     .hint("check what it holds with page.query; a control that takes no accessibility writes takes typing (page.type), and a value it clamps or rounds is set as the value it shows"));
                 }
-                self.a11y.wait_change(seen, deadline);
+                // An app may apply the value without announcing it: read again at least every 50 ms.
+                self.a11y.wait_change(seen, (Instant::now() + Duration::from_millis(50)).min(deadline));
             }
         }
 
@@ -616,7 +616,7 @@ mod imp {
     }
 
     /// A tree that is a placeholder at most: none yet, or a few elements per window. A lazy provider
-    /// (AccessKit) answers first with one and builds the rest a moment later, without a change event
+    /// answers first with one and builds the rest a moment later, without a change event
     /// on macOS.
     fn sparse(tree: &Tree) -> bool {
         tree.nodes.len() <= tree.windows.len().max(1) * 8
@@ -639,13 +639,33 @@ mod imp {
 
     /// Whether a value read back is the one written: the same text (trimmed), or the same number, also
     /// when the app shows it with a unit (`0.5` and `"0.50 ×"`).
+    /// Single precision is close enough: a toolkit that keeps a slider's value in an f32 reads 0.2 back
+    /// as 0.200000003.
     fn same_value(want: &str, got: &str) -> bool {
-        let num = |s: &str| {
-            let s = s.trim();
-            let end = s.find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))).unwrap_or(s.len());
-            s[..end].parse::<f64>().ok()
+        want.trim() == got.trim() || matches!((want.trim().parse::<f64>().ok(), leading_number(got)), (Some(a), Some(b)) if (a - b).abs() <= 1e-5 * a.abs().max(b.abs()).max(1.0))
+    }
+
+    /// The number a text starts with (`"0.50 ×"`, `"10em"`, `"-3e2 px"`): a sign, digits, a point and
+    /// an exponent only when digits follow it.
+    fn leading_number(s: &str) -> Option<f64> {
+        let b = s.trim().as_bytes();
+        let digits = |mut i: usize| {
+            while i < b.len() && b[i].is_ascii_digit() {
+                i += 1;
+            }
+            i
         };
-        want.trim() == got.trim() || matches!((want.trim().parse::<f64>().ok(), num(got)), (Some(a), Some(b)) if (a - b).abs() <= 1e-9 * a.abs().max(1.0))
+        let mut end = digits(usize::from(matches!(b.first(), Some(b'-' | b'+'))));
+        if b.get(end) == Some(&b'.') {
+            end = digits(end + 1);
+        }
+        if matches!(b.get(end), Some(b'e' | b'E')) {
+            let at = end + 1 + usize::from(matches!(b.get(end + 1), Some(b'-' | b'+')));
+            if b.get(at).is_some_and(u8::is_ascii_digit) {
+                end = digits(at);
+            }
+        }
+        std::str::from_utf8(&b[..end]).ok()?.parse().ok()
     }
 
     fn parse_sel(v: &Value) -> Result<Selector> {

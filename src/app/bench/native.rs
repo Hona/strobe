@@ -113,11 +113,12 @@ fn frame_metric(metric: &str) -> bool {
     ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
 }
 
-pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    let set = x.set;
     let target = ctx.describe["targets"][&s.target].clone();
     let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
-    let timed = set != Set::Attribution && set != Set::Memory && ctx.pixels_dir.is_none();
+    let timed = set != Set::Attribution && set != Set::Memory && x.pixels.is_none();
     if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
         return Err(Error::refused(
             "DevBuild",
@@ -143,12 +144,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
     ctx.target_qos = host::background_qos(Some(n.pid));
     // The per-thread timeline, from the launch to the last run's end, in untimed blocks (`--check`,
     // attribution): its system snapshot each second costs strobe about 1% of a core.
-    let timeline = (ctx.check || set == Set::Attribution).then(|| {
+    let timeline = (x.untimed || set == Set::Attribution).then(|| {
         let (root, dir) = (n.pid, home.dir.clone());
         wakes::Timeline::start(move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect())
     });
     let mut steps = vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)];
-    let result = runs(ctx, s, v, pair, set, keep, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
+    let result = runs(ctx, s, v, pair, x, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
     if let (Some(t), Ok(b)) = (timeline, &result) {
         let t = t.stop();
         if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
@@ -191,8 +192,7 @@ fn runs(
     s: &Series,
     v: &Variant,
     pair: usize,
-    set: Set,
-    keep: bool,
+    x: &Exec,
     target: &Value,
     app: &isolate::App,
     home: &isolate::Home,
@@ -202,6 +202,7 @@ fn runs(
     steps: &mut Vec<(String, f64)>,
     ratio: Option<f64>,
 ) -> Result<Block> {
+    let (set, keep) = (x.set, x.keep);
     let lapped = Cell::new(Instant::now());
     let lap = |name: &str, steps: &mut Vec<(String, f64)>| {
         steps.push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));
@@ -243,7 +244,7 @@ fn runs(
     let current = RefCell::new(String::new());
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
     let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
-    let pixels = ctx.pixels_dir.clone();
+    let pixels = x.pixels.clone();
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "driver" => {
@@ -313,7 +314,7 @@ fn runs(
     // A leak run (`--probes memory`, SPEC §8.6): 2 × N runs after warmup, the processes' memory read
     // before the first and after each, between runs.
     let leak = set == Set::Memory;
-    let measured_runs = if leak { 2 * ctx.runs } else { ctx.runs };
+    let measured_runs = if leak { 2 * x.runs } else { x.runs };
     let mut readings: Vec<memory::Reading> = Vec::new();
     while first.is_none_or(|f| runs.len() < f + measured_runs) {
         let i = runs.len();
@@ -343,16 +344,23 @@ fn runs(
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
         runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), log, changes: Vec::new(), elements, t0, t1, total: 0.0 });
+        // A key or button the run left held would be down in the next one.
+        if let Some(se) = drive.session.get() {
+            se.release_all();
+        }
         if s.reset {
             ctx.runner
                 .call("reset", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
+            if let Some(se) = drive.session.get() {
+                se.release_all();
+            }
         }
         runs[i].total = began.elapsed().as_secs_f64() * 1e3;
         if leak && first.is_some() {
             readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - first.unwrap_or(0))));
         }
-        if ctx.check {
+        if x.untimed {
             first = Some(0);
         } else if first.is_none() {
             // Steady once two runs do the same work, within 5% or 1 ms, as for pages (SPEC §9.1).
@@ -414,7 +422,7 @@ fn runs(
     adapters.sort_by(|a, b| by_adapter[b].values().sum::<f64>().total_cmp(&by_adapter[a].values().sum::<f64>()));
     let adapter = adapters.first().cloned().or_else(|| gpu_runs.iter().find_map(|g| g.gpu_adapter.clone()));
     // `SoftwareGpu` from outside: an adapter the app's GPU work ran on is a software one.
-    if let Some(a) = adapters.iter().chain(adapter.iter()).find(|a| software_adapter(a)) {
+    if let Some(a) = adapters.iter().chain(adapter.iter()).find(|a| validity::is_software_gpu(a)) {
         return Err(Error::refused(
             "SoftwareGpu",
             format!("the app renders on a software adapter ({a})"),
@@ -484,7 +492,7 @@ fn runs(
         extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
         extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
     }
-    let mut refused = BTreeMap::new();
+    let mut refused: BTreeMap<String, Refusal> = BTreeMap::new();
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
     let foreign: Vec<f64> = gpu_runs
@@ -555,7 +563,7 @@ fn runs(
             match frames_refused {
                 Some(why) => {
                     for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
-                        refused.insert(m.clone(), why.clone());
+                        refused.insert(m.clone(), line(&why));
                     }
                 }
                 None => {
@@ -564,7 +572,7 @@ fn runs(
                     values.extend(f.values);
                     for m in std::iter::once(&s.primary).chain(&s.metrics) {
                         if let Some(w) = f.partial.get(m) {
-                            refused.entry(m.clone()).or_insert_with(|| w.clone());
+                            refused.entry(m.clone()).or_insert_with(|| line(w));
                         }
                     }
                     // Only what the series declares is listed refused; the rest has no value.
@@ -572,7 +580,7 @@ fn runs(
                     reactions.values(p.events_lost, &mut values, &mut why);
                     for m in std::iter::once(&s.primary).chain(&s.metrics) {
                         if let Some(w) = why.get(m) {
-                            refused.entry(m.clone()).or_insert_with(|| w.clone());
+                            refused.entry(m.clone()).or_insert_with(|| line(w));
                         }
                     }
                 }
@@ -590,7 +598,7 @@ fn runs(
             ctx.warnings.push(validity::info("NoPresentSource", format!("frames refused: the OS present events gave nothing ({why}); frames.* and interaction.* are missing from every block")));
         }
         for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
-            refused.entry(m.clone()).or_insert_with(|| format!("NoPresentSource: {m}: OS present events: {why}"));
+            refused.entry(m.clone()).or_insert_with(|| Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {why}")));
         }
     }
     // Inputs given through accessibility actions skip hit testing and pointer handling: they are
@@ -601,7 +609,10 @@ fn runs(
         for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
             refused.insert(
                 m.clone(),
-                format!("PatternInput: {m}: the runs acted through accessibility actions (page.act), which skip hit testing and pointer handling; click, type or press for input latency"),
+                Refusal::new(
+                    ValidatorId::PatternInput,
+                    format!("{m}: the runs acted through accessibility actions (page.act), which skip hit testing and pointer handling; click, type or press for input latency"),
+                ),
             );
         }
     }
@@ -617,7 +628,7 @@ fn runs(
     if let Some(r) = readings.last() {
         values.extend(r.values().into_iter().map(|(k, x)| (k.to_string(), x)));
     }
-    let leak_result = leak.then(|| native_leak(&readings, ctx.runs));
+    let leak_result = leak.then(|| native_leak(&readings, x.runs));
     if let Some(v) = gpu_runs.last().and_then(|g| g.vram_dedicated_mb) {
         values.insert("gpu.vram".into(), v);
     }
@@ -637,15 +648,14 @@ fn runs(
             continue;
         }
         if let Some(why) = missing(m, ui_tid.is_some()) {
-            refused.insert(m.clone(), why);
+            refused.insert(m.clone(), line(&why));
         }
     }
     for m in refused.keys() {
         values.remove(m);
     }
     if let Some(why) = refused.get(&s.primary) {
-        let (id, text) = why.split_once(": ").unwrap_or((why.as_str(), ""));
-        return Err(Error::refused(id, format!("{}: {text}", s.primary), "pick a primary this target can measure"));
+        return Err(Refusal { summary: format!("{}: {}", s.primary, why.summary), ..why.clone() }.fix("pick a primary this target can measure").into());
     }
     if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
         ctx.warnings.push(validity::warn(
@@ -701,7 +711,7 @@ fn runs(
             &dir.join("meta.json"),
             &json!({
                 "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
-                "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": refused, "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
+                "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": super::refusal_map(&refused), "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
                 "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
                 // The OS and GPU samples over the measured runs, for `query gpu`.
@@ -773,10 +783,10 @@ fn missing(metric: &str, ui_thread: bool) -> Option<String> {
     }
 }
 
-/// Software rasterizers by adapter name.
-fn software_adapter(name: &str) -> bool {
-    let n = name.to_lowercase();
-    ["basic render", "warp", "llvmpipe", "lavapipe", "swiftshader", "softpipe"].iter().any(|s| n.contains(s))
+/// A refusal line (`<validator>: <why>`) from the frame readers and `missing`, typed. Every line
+/// they write names a validator; one that did not would be strobe's bug, refused as unseen frames.
+fn line(why: &str) -> Refusal {
+    Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why))
 }
 
 /// How a native launch ends.
@@ -833,10 +843,10 @@ fn watch(pid: u32, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender
     out
 }
 
-pub(super) fn launch(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Result<Block> {
+pub(super) fn launch(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let key = format!("{}\n{}", s.label(), v.role);
     // One launch per variant and series is discarded first, as for apps (SPEC §9.6).
-    if !ctx.check && ctx.launched.insert(key) {
+    if !x.untimed && ctx.launched.insert(key) {
         progress(format!("  {} warm-up launch (discarded)", v.role));
         launch_once(ctx, s, v, pair, false)?;
     }

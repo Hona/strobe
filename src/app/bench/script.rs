@@ -177,7 +177,8 @@ fn cpu_ms(a: (u64, Option<u64>, u64), b: (u64, Option<u64>, u64), wall_ms: f64) 
 /// One run: wall ms, CPU ms, its counters, the heap it retained (MB), and its phase marks.
 type ScriptRun = (f64, f64, BTreeMap<String, f64>, f64, Vec<(String, u64)>);
 
-pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep: bool) -> Result<Block> {
+pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    let (set, keep) = (x.set, x.keep);
     let target = ctx.describe["targets"][&s.target].clone();
     let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a script target runs in a variant's folder (a directory or a git ref)", v.role)))?;
     let id = store::new_id("rec");
@@ -210,7 +211,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
             "phase" => {
                 if counting.get() {
                     let name = a["name"].as_str().unwrap_or("phase");
-                    marks.borrow_mut().push((format!("phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
+                    marks.borrow_mut().push((format!("run:phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
                 }
                 Ok(Value::Bool(true))
             }
@@ -226,7 +227,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
-        let measured_runs = ctx.runs;
+        let measured_runs = x.runs;
         let mut runs: Vec<ScriptRun> = Vec::new();
         let mut first: Option<usize> = None;
         while first.is_none_or(|f| runs.len() < f + measured_runs) {
@@ -245,7 +246,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Se
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
             let i = runs.len() - 1;
-            if ctx.check {
+            if x.untimed {
                 first = Some(0);
             } else if first.is_none() {
                 // Steady once two runs cost the same CPU, within 5% or 1 ms, as for pages (SPEC §9.2).

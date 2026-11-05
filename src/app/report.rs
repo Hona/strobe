@@ -16,6 +16,11 @@ pub fn run(args: &Args) -> Result<Output> {
     let dir = store::resolve(handle)?;
     let experiment = store::is_experiment(&dir);
     let mut data: Value = if experiment { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
+    // `bench --blocks`: one build's values, nothing compared, so nothing for a PR, a card or a badge to say.
+    let compares = data["series"].as_array().is_none_or(|a| a.iter().any(|s| s["kind"] != "blocks"));
+    if let Some(format @ ("pr" | "card" | "badge")) = args.get("format").filter(|_| experiment && !compares) {
+        return Err(Error::usage(format!("{handle} measured one build (bench --blocks): it compares nothing, so there is no {format} for it")).hint(format!("strobe report experiment {handle} draws its blocks (html); strobe history shows a tracked point")));
+    }
     // A card or badge needs only the result: no views, no insights.
     if let Some(format @ ("card" | "badge")) = args.get("format") {
         if !experiment {

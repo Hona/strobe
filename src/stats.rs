@@ -258,10 +258,20 @@ pub fn verdict_kind(verdict: &str, def: Option<&MetricDef>) -> VerdictKind {
         "underpowered" => VerdictKind::Underpowered,
         "saturated" => VerdictKind::Saturated,
         "stopped" => VerdictKind::Stopped,
+        // A leak run's growth (`leaks 120 KB/run`).
+        "leaks" => VerdictKind::Worse,
         w if def.is_some_and(|d| w == d.words.0) => VerdictKind::Better,
         w if def.is_some_and(|d| w == d.words.1) => VerdictKind::Worse,
         _ => VerdictKind::Unclear,
     }
+}
+
+/// What a comparison as result.json keeps it decided: its `verdict_kind`, or, in files from before
+/// that field, what its words say.
+pub fn kind_of(c: &serde_json::Value) -> VerdictKind {
+    c.get("verdict_kind")
+        .and_then(|k| serde_json::from_value(k.clone()).ok())
+        .unwrap_or_else(|| verdict_kind(c["verdict"].as_str().unwrap_or(""), crate::model::metric(c["metric"].as_str().unwrap_or(""))))
 }
 
 /// The refusal a `refused (<validator>): <why>` verdict names, for result.json files from before

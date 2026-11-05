@@ -286,24 +286,29 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
         let margin = s.noworse.get(&s.primary).copied();
         // In the differences' scale: log ratios, or the unit for counts.
         let theta = if relative { (1.0 + effect).max(1e-9).ln() } else { effect * base_value };
-        let (expect, need) = match (sigma, def) {
+        // The verdict expected, in words and whether it is a difference to explain (attribution blocks).
+        let (expect, need, differs) = match (sigma, def) {
             (Some(sig), Some(def)) => match margin {
                 Some(m) => {
                     let m_abs = if relative { m } else { (m * base_value.abs()).max(0.5) };
                     let shift = stats::margin_shift(def, relative, m_abs);
                     let worse = if def.better == model::Better::Lower { theta } else { -theta };
-                    let word = if worse < shift.abs() { format!("no worse (≤{}%)", (m * 1000.0).round() / 10.0) } else { format!("worse (>{}%)", (m * 1000.0).round() / 10.0) };
-                    (word, stats::pairs_for(sig, (shift - theta).abs(), confidence, POWER))
+                    let need = stats::pairs_for(sig, (shift - theta).abs(), confidence, POWER);
+                    if worse < shift.abs() { (format!("no worse (≤{}%)", (m * 1000.0).round() / 10.0), need, false) } else { (format!("worse (>{}%)", (m * 1000.0).round() / 10.0), need, true) }
                 }
                 None => {
                     let b = if relative { (1.0 + bound).ln() } else { (bound * base_value.abs()).max(0.5) };
                     let differs = stats::pairs_for(sig, theta.abs(), confidence, POWER);
                     let same = if b > theta.abs() { stats::pairs_for(sig, b - theta.abs(), confidence, POWER) } else { f64::INFINITY };
                     let improved = (theta < 0.0) == (def.better == model::Better::Lower);
-                    if differs < same { ((if improved { def.words.0 } else { def.words.1 }).to_string(), differs) } else { (format!("same (±{}%)", (bound * 1000.0).round() / 10.0), same) }
+                    if differs < same {
+                        ((if improved { def.words.0 } else { def.words.1 }).to_string(), differs, true)
+                    } else {
+                        (format!("same (±{}%)", (bound * 1000.0).round() / 10.0), same, false)
+                    }
                 }
             },
-            _ => (String::new(), f64::NAN),
+            _ => (String::new(), f64::NAN, false),
         };
         let max_pairs = fixed.unwrap_or(*LOOKS.last().unwrap_or(&40));
         let look = if need.is_finite() {
@@ -323,7 +328,6 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
             (None, None) if sigma.is_some() => FUTILITY_FROM,
             (None, None) => LOOKS[0],
         };
-        let differs = !expect.starts_with("same") && !expect.starts_with("no worse") && !expect.is_empty();
         let attribution = why == "always" || (why == "auto" && differs);
         let attribution_ms = if attribution { 2.0 * same.first().and_then(|p| p.attribution_ms).unwrap_or(1.5 * block_ms) } else { 0.0 };
         let ms = 2.0 * pairs as f64 * block_ms + warmup_ms + attribution_ms;

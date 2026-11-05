@@ -8,7 +8,8 @@
 
 use super::Output;
 use crate::cli::Args;
-use crate::model::{self, Better, Error, Result};
+use crate::model::{self, Better, Error, Result, VerdictKind};
+use crate::stats;
 use resvg::{tiny_skia, usvg};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -157,21 +158,21 @@ fn unit_of(m: &str) -> &'static str {
 
 /// One comparison as the report reads it (the same reading as `--format pr`).
 fn outcome(c: &Value, aa: bool) -> Out {
-    let v = verdict(c);
+    if verdict(c).is_empty() {
+        return Out::Unclear;
+    }
     let (lo, hi) = (f(&c["lo"]), f(&c["hi"]));
-    match v {
-        "·" => Out::Other,
-        "—" | "" => Out::Unclear,
-        _ if v.starts_with("refused") => Out::Refused,
-        _ if v.starts_with("same") || v.starts_with("no worse") => Out::Same,
-        _ if v.starts_with("saturated") => Out::Other,
-        _ if v.starts_with("stopped") => Out::Unclear,
-        _ if v.starts_with("worse") => Out::Worse,
-        _ if v.starts_with("unclear") || v.starts_with("underpowered") => Out::Unclear,
-        _ if !(hi < 0.0 || lo > 0.0) => Out::Unclear,
-        _ if aa => Out::AaFalse,
-        _ if (hi < 0.0) == lower_better(metric(c)) => Out::Better,
-        _ => Out::Worse,
+    match stats::kind_of(c) {
+        VerdictKind::Descriptive | VerdictKind::Saturated => Out::Other,
+        VerdictKind::Untested | VerdictKind::Stopped | VerdictKind::Unclear | VerdictKind::Underpowered => Out::Unclear,
+        VerdictKind::Refused => Out::Refused,
+        VerdictKind::Same | VerdictKind::NoWorse => Out::Same,
+        // `worse (>2%)`: beyond a no-worse margin.
+        VerdictKind::Worse if c["noworse"].is_number() => Out::Worse,
+        VerdictKind::Better | VerdictKind::Worse if !(hi < 0.0 || lo > 0.0) => Out::Unclear,
+        VerdictKind::Better | VerdictKind::Worse if aa => Out::AaFalse,
+        VerdictKind::Better | VerdictKind::Worse if (hi < 0.0) == lower_better(metric(c)) => Out::Better,
+        VerdictKind::Better | VerdictKind::Worse => Out::Worse,
     }
 }
 
@@ -180,7 +181,7 @@ fn primary_out(s: &Value, aa: bool) -> Out {
         return Out::NotRun;
     }
     if s["kind"] == "leak" {
-        return if verdict(&s["primary"]).starts_with("leaks") {
+        return if stats::kind_of(&s["primary"]) == VerdictKind::Worse {
             Out::Worse
         } else if s["decided"] == true {
             Out::Same
@@ -551,7 +552,8 @@ fn calm(series: &[&Value], aa: bool) -> (String, Option<Box<Tile>>) {
     }
     if let Some(s) = find(Out::Refused) {
         let v = verdict(&s["primary"]);
-        let why = v.split_once("): ").map(|x| x.1).or_else(|| v.split_once(": ").map(|x| x.1)).unwrap_or("");
+        // Results from before comparisons kept their refusal: from the verdict's words.
+        let why = s["primary"]["refusal"]["summary"].as_str().or_else(|| v.split_once("): ").map(|x| x.1)).or_else(|| v.split_once(": ").map(|x| x.1)).unwrap_or("");
         let plain = match why.split_once(" frames < ") {
             Some((have, need)) => format!("too few frames ({have} per launch, {need} needed)"),
             None if why.is_empty() => "strobe refused the measurement".into(),

@@ -210,7 +210,7 @@ pub mod refusal_lines {
 }
 
 /// What a comparison decided (SPEC §9.3), whatever words its verdict uses.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum VerdictKind {
     /// Head is better: `faster`, `less`, `fewer`, `smoother`, … (small or exact included).

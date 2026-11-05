@@ -1,5 +1,5 @@
 //! `strobe track`: continuous benchmarking (SPEC §25). Each tracked commit gets one point per series
-//! (single-build blocks, run as a short A/A so both halves alternate as every bench does), stored in
+//! (timed blocks of that commit alone, `bench --blocks`), stored in
 //! the device's append-only history; change points on that history are only suspicions, and each one
 //! is confirmed by a paired A/B of the commits around it and, when confirmed, bisected to the commit
 //! that did it. Only confirmed changes alert.
@@ -157,7 +157,7 @@ fn run_key(args: &Args, file: &Path, commit: &str, statics: &Value) -> Value {
     json!({ "file": file, "commit": commit, "flags": flags, "env": statics })
 }
 
-/// The bench a point runs: the commit against itself, `blocks` blocks, no attribution.
+/// The bench a point runs: `blocks` timed blocks of the commit alone (`--blocks`), no attribution.
 fn point_args(args: &Args, file: &Path, commit: &str, blocks: usize, exp: &str) -> Result<Args> {
     let mut a = Args::parse(vec!["bench".into(), file.display().to_string()])?;
     for k in PASS {
@@ -166,8 +166,7 @@ fn point_args(args: &Args, file: &Path, commit: &str, blocks: usize, exp: &str) 
         }
     }
     a.set("head", &format!("git:{commit}"));
-    a.set("aa", "true");
-    a.set("pairs", &blocks.div_ceil(2).to_string());
+    a.set("blocks", &blocks.to_string());
     a.set("why", "never");
     a.set("id", exp);
     Ok(a)
@@ -458,7 +457,7 @@ fn confirm(args: &Args, s: &history::Series, c: &Value) -> Result<(String, Value
         match super::bisect::run_from(&b, &format!("{good}..{bad}"), Some(&out)) {
             Ok(r) => {
                 let v = r.json["verdict"].as_str().unwrap_or("").to_string();
-                if v.starts_with("found") {
+                if super::bisect::Outcome::of(&r.json) == Some(super::bisect::Outcome::Found) {
                     culprit = r.json["culprit"].clone();
                 }
                 bisect = json!({ "exp": bid, "verdict": v, "remaining": r.json["remaining"] });

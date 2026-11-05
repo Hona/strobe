@@ -65,6 +65,12 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
         }
     }
     let culprit = direction.map(|_| json!({ "commit": bad, "short": short(&bad), "subject": subject(&root, &bad) }));
+    // What the bisect found, for code (`track`, `--require-verdict`): the words below are for people.
+    let outcome = match (&culprit, undecided.is_empty()) {
+        (None, _) => Outcome::NoChange,
+        (Some(_), true) => Outcome::Found,
+        (Some(_), false) => Outcome::Unclear,
+    };
     let verdict = match (&culprit, undecided.is_empty()) {
         (None, _) => format!("no change: {} did not move between good and bad ({})", steps[0]["metric"].as_str().unwrap_or(""), steps[0]["verdict"].as_str().unwrap_or("")),
         (Some(_), true) => format!("found: {} {}", short(&bad), subject(&root, &bad)),
@@ -85,17 +91,36 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     let result = json!({
         "id": id, "kind": "bisect", "file": file, "range": range, "created": super::record::now_iso(),
         "metric": steps[0]["metric"], "series": steps[0]["series"], "steps": steps, "culprit": culprit, "verdict": verdict, "verdict_kind": verdict_kind,
-        "good": first_good, "commits": line, "remaining": remaining,
+        "outcome": outcome, "good": first_good, "commits": line, "remaining": remaining,
     });
     let text = text(&result);
     let mut result = result;
     result["text"] = json!(text);
     store::write_json(&dir.join("result.json"), &result)?;
     let mut out = Output::new(text, result);
-    if args.has("require-verdict") && !verdict_found(&out.json) {
+    if args.has("require-verdict") && outcome == Outcome::Unclear {
         out.code = 5;
     }
     Ok(out)
+}
+
+/// What a bisect found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Outcome {
+    /// The one commit that moved the primary.
+    Found,
+    /// Good and bad did not differ: there is no culprit.
+    NoChange,
+    /// The likeliest culprit, behind steps without a verdict.
+    Unclear,
+}
+
+impl Outcome {
+    /// A bisect result's outcome.
+    pub(crate) fn of(r: &Value) -> Option<Outcome> {
+        serde_json::from_value(r["outcome"].clone()).ok()
+    }
 }
 
 /// One bisect step: a full experiment of `head` against `base` with the bisect's own settings.
@@ -141,10 +166,6 @@ fn moved(s: &Value) -> Option<i8> {
     } else {
         None
     }
-}
-
-fn verdict_found(r: &Value) -> bool {
-    r["verdict"].as_str().is_some_and(|v| v.starts_with("found") || v.starts_with("no change"))
 }
 
 fn change(s: &Value) -> String {

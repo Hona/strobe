@@ -6,7 +6,8 @@
 //! find it, replace it (`--update-pr`) and see when someone edited it by hand.
 
 use super::fmt;
-use crate::model::{self, Better, Error, Result};
+use crate::model::{self, Better, Error, Result, VerdictKind};
+use crate::stats;
 use crate::store;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -306,7 +307,7 @@ pub fn hero(r: &Value) -> Hero<'_> {
     let mut wins = Vec::new();
     for s in d.series.iter().copied() {
         let c = &s["primary"];
-        if d.aa || s["kind"] == "leak" || s["not_run"] == true || d.primary_out(s) != Out::Better || verdict(c).starts_with("worse") {
+        if d.aa || s["kind"] == "leak" || s["not_run"] == true || d.primary_out(s) != Out::Better || beyond_margin(c) {
             continue;
         }
         // The same groups as `win_phrases`, at most three.
@@ -373,23 +374,57 @@ fn f(v: &Value) -> f64 {
     v.as_f64().unwrap_or(f64::NAN)
 }
 
-fn outcome(c: &Value, aa: bool) -> Out {
-    let v = verdict(c);
+fn kind(c: &Value) -> VerdictKind {
+    stats::kind_of(c)
+}
+
+/// `worse (>2%)`: head worse by more than a no-worse margin, not a directional `slower`.
+fn beyond_margin(c: &Value) -> bool {
+    kind(c) == VerdictKind::Worse && c["noworse"].is_number()
+}
+
+/// Which way a no-worse interval also clears 0: worse (`no worse (≤2%, but slower)`), better
+/// (`, faster`), or neither. An exact one says neither.
+fn noworse_side(c: &Value) -> Option<Out> {
+    if c["exact"] == true {
+        return None;
+    }
     let (lo, hi) = (f(&c["lo"]), f(&c["hi"]));
-    match v {
-        "·" => Out::Desc,
-        "—" | "" => Out::Gated,
-        _ if v.starts_with("refused") => Out::Refused,
-        _ if v.starts_with("same") => Out::Same,
-        _ if v.starts_with("saturated") => Out::Saturated,
-        _ if v.starts_with("stopped") => Out::Stopped,
-        _ if v.starts_with("no worse") && v.contains(", but ") => Out::NoWorseSlower,
-        _ if v.starts_with("no worse") => Out::NoWorse,
-        _ if v.starts_with("worse") => Out::Worse,
-        _ if v.starts_with("unclear") || v.starts_with("underpowered") => Out::Unclear,
-        _ if !(hi < 0.0 || lo > 0.0) => Out::Unclear,
-        _ if aa => Out::AaFalse,
-        _ => {
+    let (w_lo, w_hi) = if better_of(c["metric"].as_str().unwrap_or("")) == Better::Lower { (lo, hi) } else { (-hi, -lo) };
+    if w_hi < 0.0 {
+        Some(Out::Better)
+    } else if w_lo > 0.0 {
+        Some(Out::Worse)
+    } else {
+        None
+    }
+}
+
+/// `faster (small)`: decided, but the interval reaches inside the equivalence bound.
+fn small(c: &Value) -> bool {
+    let (lo, hi, bound) = (f(&c["lo"]), f(&c["hi"]), f(&c["bound"]));
+    c["exact"] != true && if hi < 0.0 { hi > -bound } else { lo < bound }
+}
+
+fn outcome(c: &Value, aa: bool) -> Out {
+    if verdict(c).is_empty() {
+        return Out::Gated;
+    }
+    let (lo, hi) = (f(&c["lo"]), f(&c["hi"]));
+    match kind(c) {
+        VerdictKind::Descriptive => Out::Desc,
+        VerdictKind::Untested => Out::Gated,
+        VerdictKind::Refused => Out::Refused,
+        VerdictKind::Same => Out::Same,
+        VerdictKind::Saturated => Out::Saturated,
+        VerdictKind::Stopped => Out::Stopped,
+        VerdictKind::NoWorse if noworse_side(c) == Some(Out::Worse) => Out::NoWorseSlower,
+        VerdictKind::NoWorse => Out::NoWorse,
+        VerdictKind::Worse if beyond_margin(c) => Out::Worse,
+        VerdictKind::Unclear | VerdictKind::Underpowered => Out::Unclear,
+        VerdictKind::Better | VerdictKind::Worse if !(hi < 0.0 || lo > 0.0) => Out::Unclear,
+        VerdictKind::Better | VerdictKind::Worse if aa => Out::AaFalse,
+        VerdictKind::Better | VerdictKind::Worse => {
             let improved = (hi < 0.0) == (better_of(c["metric"].as_str().unwrap_or("")) == Better::Lower);
             if improved { Out::Better } else { Out::Worse }
         }
@@ -401,10 +436,7 @@ fn marked(c: &Value, o: Out) -> bool {
     match o {
         Out::Better | Out::Worse | Out::AaFalse | Out::NoWorseSlower => true,
         // `no worse (≤2%, faster)`: within the margin, and the interval also clears 0 the good way.
-        Out::NoWorse => {
-            let words = model::metric(c["metric"].as_str().unwrap_or("")).map(|m| m.words.0).unwrap_or("");
-            !words.is_empty() && verdict(c).contains(&format!(", {words}"))
-        }
+        Out::NoWorse => noworse_side(c) == Some(Out::Better),
         _ => false,
     }
 }
@@ -466,9 +498,13 @@ fn code(s: &str) -> String {
     format!("`{}`", s.replace('`', "'").replace('|', "\\|"))
 }
 
-/// `refused (TailTooShort): 51 frames < 200` → (`TailTooShort`, `51 frames < 200`).
-fn refusal(v: &str) -> (String, String) {
-    let rest = v.trim_start_matches("refused").trim();
+/// A refused comparison's validator and why (`TailTooShort`, `51 frames < 200`); a result from before
+/// comparisons kept their refusal is read from its verdict, `refused (TailTooShort): 51 frames < 200`.
+fn refusal(c: &Value) -> (String, String) {
+    if let (Some(id), Some(why)) = (c["refusal"]["validator"].as_str(), c["refusal"]["summary"].as_str()) {
+        return (id.to_string(), why.to_string());
+    }
+    let rest = verdict(c).trim_start_matches("refused").trim();
     let (id, why) = rest.split_once("): ").map(|(a, b)| (a.trim_start_matches('('), b)).unwrap_or((rest.trim_matches(['(', ')']), ""));
     (id.to_string(), why.to_string())
 }
@@ -679,8 +715,7 @@ impl<'a> Doc<'a> {
             return Out::NotRun;
         }
         if s["kind"] == "leak" {
-            let v = verdict(&s["primary"]);
-            return if v.starts_with("leaks") {
+            return if kind(&s["primary"]) == VerdictKind::Worse {
                 Out::Worse
             } else if s["decided"] == true {
                 Out::Same
@@ -746,9 +781,9 @@ impl<'a> Doc<'a> {
         match o {
             Out::NotRun => format!("not run ({}).", cell(s["halt"]["message"].as_str().unwrap_or("the bench stopped first")).trim_end_matches('.')),
             _ if s["kind"] == "leak" => format!("{}.", cell(&capitalize(verdict(c))).trim_end_matches('.')),
-            Out::Better | Out::Worse if !verdict(c).starts_with("worse") => {
+            Out::Better | Out::Worse if !beyond_margin(c) => {
                 let (k, word) = if o == Out::Better { (w, "better") } else { (n - w, "worse") };
-                let small = if verdict(c).contains("(small)") { format!(", perhaps by under {}", bound.trim_start_matches('±')) } else { String::new() };
+                let small = if small(c) { format!(", perhaps by under {}", bound.trim_start_matches('±')) } else { String::new() };
                 format!("{noun} **{change}** per pair ({medians}), {word} in {k} of {n} pairs, likely {}{small}.", range(c))
             }
             Out::AaFalse => format!("identical builds differed by **{change}** in {}: don't trust this setup yet.", lc(&noun)),
@@ -759,7 +794,7 @@ impl<'a> Doc<'a> {
             Out::NoWorseSlower => format!("{noun} **{change}** per pair ({medians}), worse but within the {margin} allowed."),
             Out::Worse => format!("{noun} **{change}** per pair ({medians}), more than the {margin} allowed."),
             Out::Refused => {
-                let (id, why) = refusal(verdict(c));
+                let (id, why) = refusal(c);
                 format!("{noun} not measured: {}.", plain_refusal(&id, &why))
             }
             Out::Saturated => format!("{noun} at the ceiling in both builds ({medians}): choose another main metric."),
@@ -830,7 +865,7 @@ impl<'a> Doc<'a> {
     /// same metric in several series said once (`19–23% less CPU time`), at most three. A single win
     /// from one series makes room for one tested metric of another kind that also won there.
     fn win_phrases(&self) -> (Vec<String>, Option<(&'a Value, &'a Value)>) {
-        let celebrates = |s: &Value| !self.aa && s["kind"] != "leak" && s["not_run"] != true && self.primary_out(s) == Out::Better && !verdict(&s["primary"]).starts_with("worse");
+        let celebrates = |s: &Value| !self.aa && s["kind"] != "leak" && s["not_run"] != true && self.primary_out(s) == Out::Better && !beyond_margin(&s["primary"]);
         let mut groups: Vec<(String, Vec<&'a Value>)> = Vec::new();
         for s in self.series.iter().copied().filter(|s| celebrates(s)) {
             let c = &s["primary"];
@@ -861,7 +896,7 @@ impl<'a> Doc<'a> {
             let extra = tested(s)
                 .into_iter()
                 .skip(1)
-                .filter(|c| outcome(c, self.aa) == Out::Better && !verdict(c).starts_with("worse") && family(c["metric"].as_str().unwrap_or("")) != main)
+                .filter(|c| outcome(c, self.aa) == Out::Better && !beyond_margin(c) && family(c["metric"].as_str().unwrap_or("")) != main)
                 .max_by(|a, b| size(a).total_cmp(&size(b)).then(b["metric"].as_str().cmp(&a["metric"].as_str())));
             if let Some(c) = extra {
                 out.push(self.hero_phrase(c));
@@ -912,7 +947,7 @@ impl<'a> Doc<'a> {
     /// The heading when nothing is worth celebrating: what happened, calmly.
     fn calm(&self) -> String {
         let outs: Vec<(Out, &Value)> = self.series.iter().map(|s| (self.primary_out(s), *s)).collect();
-        if let Some((_, s)) = outs.iter().find(|(o, s)| *o == Out::Worse && !verdict(&s["primary"]).starts_with("worse")) {
+        if let Some((_, s)) = outs.iter().find(|(o, s)| *o == Out::Worse && !beyond_margin(&s["primary"])) {
             return self.hero_phrase(&s["primary"]);
         }
         if outs.iter().any(|(o, _)| *o == Out::Worse) {
@@ -1093,7 +1128,7 @@ impl<'a> Doc<'a> {
                 }
                 let (chg, rng) = change_cells(c, o);
                 let rng = if o == Out::Refused {
-                    let (id, why) = refusal(verdict(c));
+                    let (id, why) = refusal(c);
                     format!("skipped <sub>{}</sub>", plain_refusal(&id, &why))
                 } else {
                     rng
@@ -1915,14 +1950,14 @@ fn verdict_text(c: &Value, o: Out, s: &Value, aa: bool) -> String {
     let v = verdict(c);
     let sub = |x: &str| if x.is_empty() { String::new() } else { format!(" <sub>{}</sub>", cell(x)) };
     match o {
-        Out::Better | Out::Worse if !v.starts_with("worse") => format!("**{}**", cell(v.trim_end_matches(" (small)"))),
+        Out::Better | Out::Worse if !beyond_margin(c) => format!("**{}**", cell(v.trim_end_matches(" (small)"))),
         Out::AaFalse => "**false positive**".into(),
         Out::Same if aa => "same <sub>A/A passed</sub>".into(),
         Out::Same => "same".into(),
         Out::NoWorse | Out::NoWorseSlower => format!("**no worse**{}", sub(v.trim_start_matches("no worse").trim().trim_matches(['(', ')']).split(',').next().unwrap_or(""))),
         Out::Worse | Out::Better => format!("**worse**{}", sub(v.trim_start_matches("worse").trim().trim_matches(['(', ')']))),
         Out::Refused => {
-            let (id, why) = refusal(v);
+            let (id, why) = refusal(c);
             format!("skipped{}", sub(&plain_refusal(&id, &why)))
         }
         Out::Saturated => "at the ceiling".into(),

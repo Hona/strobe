@@ -286,7 +286,7 @@ Use
   record pid:<n>|proc:<name> [--probes timing|deep|stacks-unprivileged] [--for 10s]
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)
-  bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <cases>] [--pairs auto|N]
+  bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check | --blocks N] [--filter <cases>] [--pairs auto|N]
         [--why auto|always|never] [--trace lean|full] [--power high|keep] [--pin auto|none|ccdN|<cpus>]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)

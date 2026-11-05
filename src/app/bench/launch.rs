@@ -23,11 +23,11 @@ pub(super) struct Milestone {
 /// A line seen during a launch: when (epoch ms), its text, and where it came from.
 pub(super) type Line = (f64, String, String);
 
-pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize) -> Result<Block> {
+pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let key = format!("{}\n{}", s.label(), v.role);
     // The first launch of a build pays for its files being read from disk and scanned: one launch per
     // variant and series is discarded before any is measured. A warm profile fills its home in it.
-    if !ctx.check && ctx.launched.insert(key.clone()) {
+    if !x.untimed && ctx.launched.insert(key.clone()) {
         progress(format!("  {} warm-up launch (discarded)", v.role));
         once(ctx, s, v, pair, &key, false)?;
     }

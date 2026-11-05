@@ -14,7 +14,7 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe record --bench <file.bench.ts>#<case> [--head <variant>]   a bench case (clicks, keys) under the attribution probes
     strobe record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]   any running process from outside: frames from
         the OS's present events, CPU, threads, IO, GPU, memory; deep: native stacks (kernel sampled profile, PDB symbols)
-    strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check] [--filter <cases>] [--target <name>]
+    strobe bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check | --blocks N] [--filter <cases>] [--target <name>]
                  [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power high|keep]
                  [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
                  [--pixels | --pixels-only] [--reserve-cpus auto|on|off] [--noworse 2% | metric=2%,…]

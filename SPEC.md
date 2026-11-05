@@ -361,7 +361,7 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--filter <cases>] [--target <name>] [--params <k=v,...|all>]
              [--primary <metric>] [--equivalence <pct>] [--pairs auto|<n>] [--runs <n>]
-             [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check]
+             [--probes <set>] [--repeat <n>] [--pin auto|none|ccd0|ccd1|<cpus>] [--aa] [--check] [--blocks <n>]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
@@ -424,7 +424,11 @@ on a check of one case answers from that recording (with several, it lists them)
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
 a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
 and prints its recording, to profile one build before there is anything to compare.
-`--head` alone is an error that suggests `--base` or `--check`. `--runs` is the measured runs per
+`--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
+their values, with nothing compared and nothing decided; the text gives the primary per block and the
+blocks' median with a Hodges–Lehmann interval over them. It is what `track` records for a commit
+(§25.2); with `--base`, `--aa`, `--check` or `--probes memory` it is a usage error.
+`--head` alone is an error that suggests `--base`, `--blocks` or `--check`. `--runs` is the measured runs per
 block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
 described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
 
@@ -1710,7 +1714,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
-| `RunIncomplete` | a run threw, timed out, or its `until` never resolved |
+| `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
 | `BackgroundPriority` | the target runs at background priority, inherited from strobe or its own: macOS `taskpolicy -b` (`PRIO_DARWIN_PROCESS`), Windows' idle priority class, efficiency mode (EcoQoS) or background mode (very low memory priority), Linux `SCHED_IDLE` or nice 19. The OS keeps it on efficiency cores, at low clocks or behind other work: an opencode drag read 83–91% dropped frames under `taskpolicy -b` against 0.4% at normal priority. Refuses frame and input-latency metrics (`frames.*`, `interaction.*`, `scroll.*`, `canvas.*`, `input.*`, `launch.painted`, `launch.settled`): a primary among them refuses the bench before anything builds (strobe's own priority) or at the block (the target's), a secondary shows refused, and `record` prints `frames refused`. CPU, memory and counters stay, with a warning to compare them only with runs at the same priority. Attribution and memory blocks are untimed and keep running. `record pid:` measures a process as its user runs it and is not checked |
@@ -1746,7 +1750,7 @@ writes it as `Refusal`s). Schema: `schema/result.v1.json`.
 ### 10.2 Analysers (warn in the result)
 
 `MultimodalDistribution` · `HighVariance` · `Underpowered` · `StateDrift` · `Background` ·
-`Throttling` · `Drift` (trend across pairs: Spearman |ρ| > 0.6 with tied ranks averaged, over ≥ 8 pairs, and the log-ratio moving at least 1% end to end, so a near-constant difference never trends) · `CounterUnstable` · `ProbeOverhead` ·
+`Throttling` · `Drift` (trend across pairs: Spearman |ρ| > 0.6 with tied ranks averaged, over ≥ 8 pairs, on the comparison's own scale: the log ratio moving at least 1% end to end, or for a metric compared by difference (counts, and any metric with a 0 in a pair) the difference moving at least 1% of base's median, so a near-constant difference never trends and a count's trend is not dropped) · `CounterUnstable` · `ProbeOverhead` ·
 `Unresolved` (samples without a symbol above 5%) · `PowerPlan` (the user's plan was kept: `--power
 keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine` · `BackgroundPriority`
 (strobe or the target runs at background priority: the frame and input-latency metrics are refused, §10.1,
@@ -3488,10 +3492,26 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `PageDown`, `setValue` read back, clicks and drags (`input.gap.p95` 16.7 ms at 60 moves a second
   on the M4); an always-animating window's `idle` timeout said "it kept drawing … 54 frames reached
   the screen and its tree changed 0 times". `look` of a page listed the open dialog, the `h1` and a
-  level-2 `role=heading`, not an `h3` or an `opacity: 0` heading. Not done: `Driver::release_all`
-  between runs needs a call in the block loop (`bench.rs`), and a key-only fast path for tree reads
-  (a key path and visibility need the ancestors' ids and bounds, so the read stays whole; the
-  burst limit bounds its cost).
+  level-2 `role=heading`, not an `h3` or an `opacity: 0` heading. Not done: a key-only fast path
+  for tree reads (a key path and visibility need the ancestors' ids and bounds, so the read stays
+  whole; the burst limit bounds its cost). Since 2026-11-05 every page and native block lets go of
+  held keys and buttons (`release_all`) after each run and each reset, outside the run's span.
+- One block engine, typed (2026-11-05): an experiment's `Mode` (check, compare, `--blocks`, leak,
+  pixels) is fixed from its flags, and each block gets an immutable `Exec` (set, measured runs,
+  untimed, keep, snapshot folder); the pixels series and `--check --why always` no longer flip
+  bench-wide flags. Decisions read typed outcomes: a block's retries and waits take the refusal's
+  `ValidatorId` and `Hidden` (no message matching), a block's refused metrics are `Refusal`s (kept
+  as `<validator>: <why>` lines), `pr`, `card` and `track` read `verdict_kind`, `refusal` and a
+  bisect's `outcome` (`found`, `no_change`, `unclear`), and results from before those fields by their
+  words. `report experiment <exp> --format pr|md|card|badge|html` gave byte-identical files before and
+  after on 19 stored experiments (A/B, A/A, no-worse, refused, stopped, launch and leak series) and on
+  a new A/A that has the typed fields. Found while doing it: a `script()` target's `phase.<name>`
+  never had a value (its marks lacked the prefix `phase_ms` reads; a check now reads `phase.inner
+  21.8 ms`), and on Windows the first block of every bench read no display state (the callback
+  reports a moment after it registers), so pair 1 always ran twice; strobe now reads it when the bench
+  starts. `Drift` now reads differences for metrics compared by difference (it took `ln(head/base)`,
+  which dropped every pair of a count and any pair with a 0). A leak run whose growth is V8's own
+  (`no app leak`) now says `same` as its kind, not the `leaks` kind it replaced.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 
@@ -3504,7 +3524,7 @@ device itself, unattended, as Pinpoint and a perf dashboard do with a person bet
 
 | Step | Compares | Decides |
 |---|---|---|
-| point | one commit with itself: `blocks` fresh launches (default 6) as a 3-pair A/A | nothing: a value with an interval |
+| point | one commit alone: `blocks` timed blocks of fresh launches (default 6, `bench --blocks`) | nothing: a value with an interval |
 | detection | the points of one series, in commit order | a suspicion and its commit range |
 | confirmation | the commit after the change (`bad`) with the one before it (`good`): a paired A/B, `--pairs auto` (§9.1) | `confirmed`, `rejected` or `unclear` |
 | bisection | each first-parent commit in `good..bad` with `good` (§9.7) | the culprit commit |
@@ -3527,9 +3547,10 @@ strobe track <file.bench.ts> --ref <branch> --schedule commits|nightly|<period> 
 strobe track --schedules | --unschedule <sch_…> | --confirm [<ser_…|chg_…>]
 ```
 
-- A point is one `bench --aa --head git:<commit> --pairs <blocks/2> --why never`: an ordinary
+- A point is one `bench --head git:<commit> --blocks <blocks> --why never`: an ordinary
   experiment (`exp_…`), with the bench slot, the locked-session rules (§10.5), the power plan and
-  reserved CPUs (§9.4) of any bench. Each series of the file gets a point: the median of its blocks'
+  reserved CPUs (§9.4) of any bench. Its blocks share one lock and display state, as a pair's do: a
+  block in another state starts them again in it (at most 3 times). Each series of the file gets a point: the median of its blocks'
   primary values and the Hodges–Lehmann interval of those block values (in log space for ratio
   metrics; 6 blocks cover 96.9%).
 - **A point without a value** is kept with the reason: a refused metric, fewer than 4 blocks with a

@@ -436,8 +436,9 @@ strobe query <handle | a..b | exp_…> <view> [view arguments] [--top <n>] [--ma
 strobe query <handle> sql "<query>"
 ```
 
-Views in §11.1. `a..b` compares two recordings. `exp_…` reads an experiment, including one
-still running (`progress`).
+Views in §11.1. `a..b` compares two recordings, one view side by side and per run. `exp_…` reads an
+experiment, including one still running (`progress`); a two-recording view of an experiment
+(`query exp_… hotspots`) answers with each series' base..head attribution recordings.
 
 ### 5.8 `strobe report`
 
@@ -1835,7 +1836,21 @@ session.
 | `progress` | (`exp_…` only) | a running experiment's state and estimate |
 | `sql` | `"<query>"` | rows from trace_processor, row-limited |
 
-`a..b` works with `summary`, `frames`, `hotspots`, `memory`, `heap` and `gpu`.
+`a..b` works with `hotspots`, `alloc`, `layout`, `style`, `threads`, `frames`, `summary`, `memory`
+and `heap`; `query exp_… <view>` runs the same views on each series' base and head attribution
+recordings. Every row is per measured run on each side (each side's own run count), so two
+launches with different run counts compare. Two recordings are two launches, often two builds in two
+folders: rows match by name and a portable location (the last three steps of a file's path, a script
+URL without origin, query and bundler hash), never by line. The weighted views (`hotspots`, native
+samples too, `alloc`, `layout`, by `--by function|file|package`) rank rows by the size of their
+change and give, per function, the stacks where the change concentrated (each ≥ 5% of the row's
+change). Sampled views carry each change's 95% interval from the two sides' sample counts (each
+side's variance v²/n) and mark `~` a change inside it; the interval covers sampling only, not
+launch-to-launch variation, and the text says so. Traced views (`layout`, `style`) are exact counts
+over the runs. `frames`, `threads` and `summary` of attribution recordings say their timing is
+perturbed (§1 rule 3) and that one recording per side has no interval. `threads` of a trace counts
+the task loop's tasks (`RunTask`) that started in each measured run, by process type and thread
+name: a thread's other tracks hold spans that overlap its tasks (animation frames, GC sweeping).
 
 ### 11.2 Report views
 
@@ -1847,6 +1862,23 @@ heap and its base/head diff, and attribution run counts, default cap 2 MB: a rep
 stacks for its top 15 rows and the heaviest below them, frames once per side in a `frame_table`
 that stacks index, while recordings and `query` keep all);
 markdown is GitHub-flavoured.
+
+An experiment's HTML also carries, per series, the diff flame (`diff_tree`): CPU time (native
+samples when the recordings have no JavaScript profile) and allocations as one call tree of both
+sides' stacks merged by portable frame, each node with its inclusive value per run on each side;
+nodes under 0.2% of the larger side's total, and past 3,000 nodes, are left out. The viewer draws it
+as an icicle (width the mean of both sides, red where head has more, green where it has less, click
+to zoom, 33 levels at a time). It also shows the rerun ledger as a banner when other experiments
+compared the same variants (amber when the setup changed between them), the plan against what ran
+(pairs on the looks, series time, and the block time by step against the planned block), and a
+native series' memory by part, base → head.
+
+A report reads each recording's sources once: the trace's views in one trace_processor pass (one
+statement, its parts tagged), the CPU and allocation profiles parsed once into interned stacks and
+symbolized once, the heap snapshot parsed once for the summary, the base/head diff and insights. A
+series' base and head load at once; series load one after another. On adais, `report experiment` of
+a 350 MB-trace experiment went from 16–17 s, 6.8 GB peak (strobe and its trace_processor
+children, seven at once) to 6–9 s, 2.1 GB (two at once); strobe's own peak from 1.4 GB to 0.6 GB.
 
 `--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
 pull request body, pasted verbatim. Few words, two drawers:
@@ -2021,9 +2053,11 @@ As built (`query <rec> insights`, `query <exp> insights`):
 | `unresolved` / `native-time` | < 95% of script samples mapped / `(program)` ≥ 30% of busy samples | shares |
 | `leak` | a memory recording or leak run | its facts and verdict |
 
-An experiment's insights start with the largest base/head movers per series: CPU self time,
-forced layout (≥ 1 ms/run) and allocations (≥ 64 KB/run) by function, matched by name and file
-name. Core migration needs the deep helper and is not built.
+An experiment's insights start with the largest base/head movers per series, from the `a..b`
+views: CPU self time (≥ 1 ms/run, a CPU profile's pseudo-frames left out), forced layout
+(≥ 1 ms/run) and allocations (≥ 64 KB/run) by function, matched by name and portable location; a
+sampled change inside its 95% sampling interval is not a mover. Core migration needs the deep
+helper and is not built.
 
 ### 11.4 Perfetto (`strobe open`)
 
@@ -2897,7 +2931,12 @@ Query views built: `summary` (with per-run style, layout and paint), `frames`, `
 its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `style`, `shifts`, `gc`, `heap` (and
 `a..b heap`), `leaks`, `memory` (and `a..b memory`; native recordings by what holds the memory), `gpu`
 (a trace's GPU process; without a trace the OS's per-process GPU statistics), `insights`, `sql`,
-`progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`.
+`progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`, `a..b gpu` (§11.1 listed it; no
+code). `a..b` (and `query exp_… <view>` for each series' base and head) answers `hotspots`, `alloc`,
+`layout`, `style`, `threads`, `frames`, `summary`, `heap` and `memory` (§11.1); before 2026-11-05
+only `heap` and `memory`. The insights rule `long-tasks` never fired before 2026-11-05: its query's
+third column was named after a multi-line subquery, so the CSV header spanned lines and the count
+read as zero (rec_b6be22: 4 tasks over 50 ms, the longest 55.4 ms, now reported).
 
 Native recordings and launches (2026-11-04, adais, session locked): `record pid:|proc:` writes the
 views `record exe:` writes (`threads.json`, `runs.json`, `memory.json`, the OS samples for `query gpu`);

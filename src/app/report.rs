@@ -1,6 +1,7 @@
 //! `strobe report`: self-contained artifacts from views (SPEC §11.2).
 
 use super::Output;
+use super::query::{self, Rec};
 use crate::cli::Args;
 use crate::model::{Error, Result};
 use crate::store;
@@ -27,37 +28,33 @@ pub fn run(args: &Args) -> Result<Output> {
         if data["identity"].is_object() {
             data["ledger"] = store::ledger::for_experiment(data["id"].as_str().unwrap_or(""), data["created"].as_str().unwrap_or(""), &data["identity"]);
         }
-        // Insights read the same recordings: in parallel with the per-side views.
-        let snapshot = data.clone();
-        let insights = std::thread::scope(|scope| {
-            let insights = scope.spawn(|| super::query::experiment_insights(&snapshot));
-            attach_hotspots(&mut data);
-            insights.join().ok().and_then(|r| r.ok())
-        });
-        if let Some(i) = insights {
-            data["insights"] = i.json;
+        if let Some(i) = attach_series(&mut data) {
+            data["insights"] = i;
         }
-    } else if let Some(a) = attribution(&dir, data["id"].as_str().unwrap_or(handle), None) {
-        data["attribution"] = a;
-        if let Ok(i) = super::query::insights(&dir) {
-            data["insights"] = i.json;
-        }
-    } else if data["probes"] == "memory" {
-        if let Ok(i) = super::query::insights(&dir) {
-            data["insights"] = i.json;
-        }
-        if let Ok(m) = super::query::memory(&dir, "process", 30, None) {
-            data["memory"] = m.json;
-        }
-        if let Ok(m) = super::query::memory(&dir, "layer", 30, None) {
-            data["memory_layers"] = m.json;
-        }
-        // A memory recording: its live heap at the end and the objects that outlived their half.
-        if let Ok(o) = super::query::heap(&dir, 15, false) {
-            data["heap"] = o.json;
-        }
-        if let Ok(o) = super::query::leaks(&dir, 15, false) {
-            data["leaks"] = o.json;
+    } else {
+        let rec = Rec::open(&dir);
+        if let Some(a) = attribution(&rec, None) {
+            data["attribution"] = a;
+            if let Ok(i) = query::insights(&rec) {
+                data["insights"] = i.json;
+            }
+        } else if data["probes"] == "memory" {
+            if let Ok(i) = query::insights(&rec) {
+                data["insights"] = i.json;
+            }
+            if let Ok(m) = query::memory(&dir, "process", 30, None) {
+                data["memory"] = m.json;
+            }
+            if let Ok(m) = query::memory(&dir, "layer", 30, None) {
+                data["memory_layers"] = m.json;
+            }
+            // A memory recording: its live heap at the end and the objects that outlived their half.
+            if let Ok(o) = query::heap(&rec, 15, false) {
+                data["heap"] = o.json;
+            }
+            if let Ok(o) = query::leaks(&rec, 15, false) {
+                data["leaks"] = o.json;
+            }
         }
     }
     let format = args.get("format").unwrap_or("html");
@@ -132,23 +129,20 @@ pub(super) fn write_whole(path: &std::path::Path, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// The "why": each series' attribution recordings (base and head) as the report shows them, plus how
-/// the two sides' live heaps differ by class.
-fn attach_hotspots(data: &mut Value) {
+/// The "why" of each series, one series at a time: its attribution recordings (base and head) as the
+/// report shows them, how the two sides' live heaps and memory differ, the diff flame, and the series'
+/// insights. Each recording's sources load once for all of these, both sides at once; a series'
+/// recordings are dropped before the next one loads. Returns the experiment's insights.
+fn attach_series(data: &mut Value) -> Option<Value> {
     let plan_runs = data["plan"]["runs_per_block"].as_u64();
-    let Some(series) = data["series"].as_array_mut() else { return };
+    let id = data["id"].clone();
+    let series = data["series"].as_array_mut()?;
+    let mut insights = Vec::new();
     for s in series {
-        let recs: Vec<(&str, String, std::path::PathBuf)> =
-            ["base", "head"].into_iter().filter_map(|role| s["attribution"][role].as_str().and_then(|rec| Some((role, rec.to_string(), store::resolve(rec).ok()?)))).collect();
-        // Both sides and their heap diff at once: each view is its own trace_processor or file read.
-        let (sides, diff) = std::thread::scope(|scope| {
-            let sides: Vec<_> = recs.iter().map(|(role, rec, dir)| (*role, scope.spawn(move || attribution(dir, rec, plan_runs)))).collect();
-            let diff = match recs.as_slice() {
-                [(_, _, a), (_, _, b)] => Some(scope.spawn(move || super::query::heap_diff(a, b, 15, false).ok())),
-                _ => None,
-            };
-            let sides: Vec<(&str, Option<Value>)> = sides.into_iter().map(|(role, h)| (role, h.join().ok().flatten())).collect();
-            (sides, diff.and_then(|d| d.join().ok().flatten()))
+        let recs: Vec<(&str, Rec)> = ["base", "head"].into_iter().filter_map(|role| Some((role, Rec::resolve(s["attribution"][role].as_str()?).ok()?))).collect();
+        let sides: Vec<(&str, Option<Value>)> = std::thread::scope(|scope| {
+            let handles: Vec<_> = recs.iter().map(|(role, rec)| (*role, scope.spawn(move || attribution(rec, plan_runs)))).collect();
+            handles.into_iter().map(|(role, h)| (role, h.join().ok().flatten())).collect()
         });
         let mut out = json!({});
         for (role, h) in sides {
@@ -159,74 +153,70 @@ fn attach_hotspots(data: &mut Value) {
         if out.as_object().is_some_and(|o| !o.is_empty()) {
             s["hotspots"] = out;
         }
-        if let Some(d) = diff {
+        let [(_, a), (_, b)] = recs.as_slice() else { continue };
+        if let Ok(d) = query::heap_diff(a, b, 15, false) {
             s["heap_diff"] = d.json;
         }
         // A native app's two launches by what holds their memory (host, GPU mapped, private, …).
-        if let [(_, _, a), (_, _, b)] = recs.as_slice()
-            && a.join("memory.json").exists()
-            && b.join("memory.json").exists()
-            && let Ok(d) = super::query::memory_diff(a, b, 10)
+        if a.dir.join("memory.json").exists()
+            && b.dir.join("memory.json").exists()
+            && let Ok(d) = query::memory_diff(&a.dir, &b.dir, 10)
         {
             s["memory_diff"] = d.json;
         }
+        let tree = query::diff_tree(a, b, plan_runs);
+        if tree.as_object().is_some_and(|o| !o.is_empty()) {
+            s["diff_tree"] = tree;
+        }
+        if let Ok(i) = query::series_insights(a, b, plan_runs) {
+            let mut j = i.json;
+            j["series"] = s["label"].clone();
+            insights.push(j);
+        }
     }
+    (!insights.is_empty()).then(|| json!({ "experiment": id, "series": insights }))
 }
 
 /// One attribution recording for a report: CPU by function and file, allocations by function and
 /// file, forced layouts, GC, the live heap, run count and metric values.
-fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Option<Value> {
-    // The trace views each run trace_processor; the profile and snapshot views read files meanwhile.
-    let mut h = std::thread::scope(|scope| {
-        let layout = scope.spawn(|| super::query::layout(dir, 25));
-        let gc = scope.spawn(|| super::query::gc(dir));
-        let alloc = scope.spawn(|| (super::query::alloc(dir, "function", 25), super::query::alloc(dir, "file", 25)));
-        let heap = scope.spawn(|| super::query::heap(dir, 15, false));
-        // A native recording without native stacks still has its threads and memory.
-        let native = dir.join("threads.json").exists();
-        let mut h = match super::query::hotspots(dir, "function", 50) {
-            Ok(o) => o.json,
-            Err(_) if native => json!({ "rows": [] }),
-            Err(_) => return None,
-        };
-        if native && let Ok(o) = super::query::native_threads(dir, 15) {
-            h["threads"] = o.json;
+fn attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
+    // Every source this reads, at once: the trace's views in one pass, the profiles and the snapshot.
+    rec.preload(&query::ATTRIBUTION_PARTS, true, true, true);
+    // A native recording without native stacks still has its threads and memory.
+    let native = rec.dir.join("threads.json").exists();
+    let mut h = match query::hotspots_of(rec, "function", 50) {
+        Ok(o) => o.json,
+        Err(_) if native => json!({ "rows": [] }),
+        Err(_) => return None,
+    };
+    if native && let Ok(o) = query::native_threads(&rec.dir, 15) {
+        h["threads"] = o.json;
+    }
+    if let Ok(o) = query::hotspots_of(rec, "file", 25) {
+        h["files"] = o.json["rows"].clone();
+    }
+    if let Ok(o) = query::alloc(rec, "function", 25) {
+        h["alloc"] = o.json;
+        if let Ok(f) = query::alloc(rec, "file", 25) {
+            h["alloc"]["files"] = f.json["rows"].clone();
         }
-        if let Ok(o) = super::query::hotspots(dir, "file", 25) {
-            h["files"] = o.json["rows"].clone();
-        }
-        if let Ok((Ok(o), files)) = alloc.join() {
-            h["alloc"] = o.json;
-            if let Ok(f) = files {
-                h["alloc"]["files"] = f.json["rows"].clone();
-            }
-        }
-        if let Ok(Ok(o)) = layout.join() {
-            h["layout"] = o.json;
-        }
-        if let Ok(Ok(o)) = gc.join() {
-            h["gc"] = o.json;
-        }
-        if let Ok(Ok(o)) = heap.join() {
-            h["heap"] = o.json;
-        }
-        if let Ok(o) = super::query::memory(dir, "process", 30, None) {
-            h["memory"] = o.json;
-        }
-        if let Ok(o) = super::query::memory(dir, "layer", 30, None) {
-            h["memory_layers"] = o.json;
-        }
-        Some(h)
-    })?;
-    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
-    let runs = meta["runs"]
-        .as_u64()
-        .or_else(|| {
-            let dur = meta["duration_ms"].as_f64()?;
-            let one = meta["values"]["run.duration"].as_f64()?;
-            (one > 0.0).then(|| (dur / one).round().max(1.0) as u64)
-        })
-        .or(plan_runs);
+    }
+    if let Ok(o) = query::layout(rec, 25) {
+        h["layout"] = o.json;
+    }
+    if let Ok(o) = query::gc(rec) {
+        h["gc"] = o.json;
+    }
+    if let Ok(o) = query::heap(rec, 15, false) {
+        h["heap"] = o.json;
+    }
+    if let Ok(o) = query::memory(&rec.dir, "process", 30, None) {
+        h["memory"] = o.json;
+    }
+    if let Ok(o) = query::memory(&rec.dir, "layer", 30, None) {
+        h["memory_layers"] = o.json;
+    }
+    let runs = rec.runs().or(plan_runs);
     // A display may abbreviate (the recording and `query` keep everything): three stacks for the top
     // rows, the heaviest one below them, and no `url` beside `file` in frames. Frames repeat across
     // stacks (a framework's are in most of them), so each side keeps one `frame_table` and stacks list
@@ -251,12 +241,12 @@ fn attribution(dir: &std::path::Path, rec: &str, plan_runs: Option<u64>) -> Opti
         }
     }
     h["frame_table"] = json!(table);
-    h["recording"] = json!(rec);
+    h["recording"] = json!(rec.id);
     if let Some(r) = runs {
         h["runs"] = json!(r);
     }
-    if meta["values"].is_object() {
-        h["values"] = meta["values"].clone();
+    if rec.meta["values"].is_object() {
+        h["values"] = rec.meta["values"].clone();
     }
     Some(h)
 }

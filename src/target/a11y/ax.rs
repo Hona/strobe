@@ -12,7 +12,7 @@
 #![allow(non_upper_case_globals, clippy::upper_case_acronyms)]
 
 use super::{Accessibility, Action, Changes, Node, PATTERN_EXPAND, PATTERN_INVOKE, PATTERN_SCROLL, PATTERN_SCROLL_ITEM, PATTERN_SELECT, PATTERN_TOGGLE, PATTERN_VALUE, Tree};
-use crate::host::macos::{CFTypeRef, CGPoint, CGSize, Cf, cf_array, cf_f64, cf_i64, cf_string, cfstr};
+use crate::host::macos::{CFTypeRef, CGPoint, CGRect, CGSize, Cf, cf_array, cf_f64, cf_get, cf_i64, cf_rect, cf_string, cfstr};
 use crate::model::{Error, Result};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +58,14 @@ unsafe extern "C" {
     fn CFRunLoopRunInMode(mode: CFTypeRef, seconds: f64, return_after_source: u8) -> i32;
     fn CFNumberCreate(alloc: CFTypeRef, kind: isize, value: *const c_void) -> CFTypeRef;
 }
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> CFTypeRef;
+}
+
+const LIST_ON_SCREEN: u32 = 1;
+const EXCLUDE_DESKTOP: u32 = 16;
 
 const AX_VALUE_POINT: u32 = 1;
 const AX_VALUE_SIZE: u32 = 2;
@@ -127,6 +135,11 @@ struct Worker {
     /// The last snapshot's elements, by node index, and the tree they make.
     elements: Vec<Cf>,
     last: Tree,
+    /// Each window's owner, and the AX windows matched to their CoreGraphics ids: neither changes
+    /// for a window's life, so a snapshot reads the window list and the windows' frames only for a
+    /// window it has not seen.
+    owners: std::collections::HashMap<u32, u32>,
+    known: Vec<(Cf, u32)>,
 }
 
 pub struct Ax {
@@ -180,35 +193,48 @@ fn size(v: CFTypeRef) -> Option<CGSize> {
     (unsafe { CFGetTypeID(v) == AXValueGetTypeID() && AXValueGetValue(v, AX_VALUE_SIZE, &mut s as *mut _ as *mut c_void) != 0 }).then_some(s)
 }
 
-/// An app's AX windows, each with its CoreGraphics window id (matched by frame: the AX API names no
-/// window id publicly).
-fn windows_of(pid: u32) -> Vec<(Cf, Option<u32>)> {
-    let Some(app) = Cf::new(unsafe { AXUIElementCreateApplication(pid as i32) }) else { return Vec::new() };
-    unsafe { AXUIElementSetMessagingTimeout(app.0, 5.0) };
-    let Some(list) = copy(app.0, "AXWindows") else { return Vec::new() };
-    let cg: Vec<(isize, crate::host::TopWindow)> = crate::host::top_windows(&[pid]).into_iter().filter_map(|w| Some((w.0, crate::host::window_state(w.0)?))).collect();
+/// The on-screen windows of `pids` as CoreGraphics lists them: (id, owner, frame in points), from one
+/// window list read.
+fn cg_windows(pids: &[u32]) -> Vec<(u32, u32, CGRect)> {
+    let Some(list) = Cf::new(unsafe { CGWindowListCopyWindowInfo(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0) }) else { return Vec::new() };
     cf_array(list.0)
         .into_iter()
-        .map(|w| {
-            let w = Cf(unsafe { CFRetain(w) });
-            let pos = copy(w.0, "AXPosition").and_then(|v| point(v.0));
-            let sz = copy(w.0, "AXSize").and_then(|v| size(v.0));
-            let id = match (pos, sz) {
-                (Some(p), Some(s)) => cg
-                    .iter()
-                    .find(|(_, t)| (t.rect.0 - p.x as i32).abs() <= 1 && (t.rect.1 - p.y as i32).abs() <= 1 && (t.rect.2 - s.width as i32).abs() <= 1 && (t.rect.3 - s.height as i32).abs() <= 1)
-                    .map(|(id, _)| *id as u32),
-                _ => None,
-            };
-            (w, id)
+        .filter_map(|d| {
+            let pid = cf_i64(cf_get(d, "kCGWindowOwnerPID"))? as u32;
+            if !pids.contains(&pid) {
+                return None;
+            }
+            Some((cf_i64(cf_get(d, "kCGWindowNumber"))? as u32, pid, cf_rect(cf_get(d, "kCGWindowBounds"))?))
         })
         .collect()
+}
+
+/// An app's AX windows (retained), or why macOS refused to list them.
+fn ax_windows(pid: u32) -> Result<Vec<Cf>> {
+    let Some(app) = Cf::new(unsafe { AXUIElementCreateApplication(pid as i32) }) else { return Ok(Vec::new()) };
+    unsafe { AXUIElementSetMessagingTimeout(app.0, 5.0) };
+    let mut list: CFTypeRef = std::ptr::null();
+    match unsafe { AXUIElementCopyAttributeValue(app.0, cfstr("AXWindows").0, &mut list) } {
+        AX_API_DISABLED => Err(untrusted()),
+        0 => Ok(Cf::new(list).map(|l| cf_array(l.0).into_iter().map(|w| Cf(unsafe { CFRetain(w) })).collect()).unwrap_or_default()),
+        _ => Ok(Vec::new()),
+    }
+}
+
+/// The CoreGraphics window an AX window is, matched by frame (the AX API names no window id
+/// publicly): two reads of the app.
+fn match_frame(w: &Cf, cg: &[(u32, u32, CGRect)]) -> Option<u32> {
+    let p = copy(w.0, "AXPosition").and_then(|v| point(v.0))?;
+    let s = copy(w.0, "AXSize").and_then(|v| size(v.0))?;
+    let near = |a: f64, b: f64| (a as i32 - b as i32).abs() <= 1;
+    cg.iter().find(|(_, _, r)| near(r.origin.x, p.x) && near(r.origin.y, p.y) && near(r.size.width, s.width) && near(r.size.height, s.height)).map(|w| w.0)
 }
 
 /// The AX element of a CoreGraphics window, for window actions.
 pub fn window_element(id: isize) -> Option<(Cf, u32)> {
     let pid = crate::host::window_state(id)?.pid;
-    windows_of(pid).into_iter().find(|w| w.1 == Some(id as u32)).map(|w| (w.0, pid))
+    let cg = cg_windows(&[pid]);
+    ax_windows(pid).ok()?.into_iter().find(|w| match_frame(w, &cg) == Some(id as u32)).map(|w| (w, pid))
 }
 
 /// Whether the app is the active one (`AXFrontmost`).
@@ -239,17 +265,23 @@ pub fn activate(pid: u32) -> Result<()> {
     ))
 }
 
-/// The process whose element the window server hit-tests at a point, and what that element is.
-pub fn app_at(x: f64, y: f64) -> Result<(u32, String)> {
+/// The process whose element the window server hit-tests at a point, and that element (`describe`
+/// says what it is: two more reads of its app, made only for an error).
+pub fn app_at(x: f64, y: f64) -> Result<(u32, Cf)> {
     let wide = Cf(unsafe { AXUIElementCreateSystemWide() });
     let mut at: CFTypeRef = std::ptr::null();
     check(unsafe { AXUIElementCopyElementAtPosition(wide.0, x as f32, y as f32, &mut at) }, "hit test")?;
     let at = Cf::new(at).ok_or_else(|| Error::msg("hit test: nothing at that point"))?;
     let mut pid = 0;
     unsafe { AXUIElementGetPid(at.0, &mut pid) };
-    let role = copy(at.0, "AXRole").and_then(|v| cf_string(v.0)).unwrap_or_default();
-    let title = copy(at.0, "AXTitle").and_then(|v| cf_string(v.0)).unwrap_or_default();
-    Ok((pid as u32, format!("{} {title:?}", role.trim_start_matches("AX").to_lowercase())))
+    Ok((pid as u32, at))
+}
+
+/// An element as a person reads it: its role and title.
+pub fn describe(el: &Cf) -> String {
+    let role = copy(el.0, "AXRole").and_then(|v| cf_string(v.0)).unwrap_or_default();
+    let title = copy(el.0, "AXTitle").and_then(|v| cf_string(v.0)).unwrap_or_default();
+    format!("{} {title:?}", role.trim_start_matches("AX").to_lowercase())
 }
 
 /// Sets a window's or app's boolean attribute.
@@ -275,7 +307,8 @@ impl Ax {
         let stop = Arc::new(AtomicBool::new(false));
         let (sig, w, st) = (signal.clone(), watch.clone(), stop.clone());
         let observer = std::thread::Builder::new().name("strobe-a11y".into()).spawn(move || observe(&sig, &w, &st)).map_err(|e| Error::msg(format!("start the accessibility thread: {e}")))?;
-        Ok(Ax { worker: Mutex::new(Worker { pids: pids.to_vec(), elements: Vec::new(), last: Tree::default() }), signal, watch, stop, observer: Some(observer) })
+        let worker = Worker { pids: pids.to_vec(), elements: Vec::new(), last: Tree::default(), owners: Default::default(), known: Vec::new() };
+        Ok(Ax { worker: Mutex::new(worker), signal, watch, stop, observer: Some(observer) })
     }
 
     fn with<R>(&self, f: impl FnOnce(&mut Worker) -> Result<R>) -> Result<R> {
@@ -445,26 +478,36 @@ fn node(r: &Read, parent: Option<usize>, window: usize, hidden: bool) -> Node {
 }
 
 impl Worker {
-    fn snapshot(&mut self, windows: &[isize]) -> Result<Tree> {
+    /// The windows' trees in tree order, one read of the app per element, until `enough`.
+    fn snapshot(&mut self, windows: &[isize], enough: &mut dyn FnMut(&Tree, usize) -> bool) -> Result<Tree> {
         let mut tree = Tree { nodes: Vec::new(), windows: Vec::new(), at_ns: crate::host::now_ns() };
         self.elements.clear();
         let names: Vec<Cf> = ATTRS.iter().map(|a| cfstr(a)).collect();
         let ptrs: Vec<CFTypeRef> = names.iter().map(|n| n.0).collect();
         let names = Cf(unsafe { CFArrayCreate(std::ptr::null(), ptrs.as_ptr(), ptrs.len() as isize, &kCFTypeArrayCallBacks) });
-        let mut all: Vec<(Cf, Option<u32>)> = Vec::new();
-        for &pid in &self.pids {
-            let app = Cf::new(unsafe { AXUIElementCreateApplication(pid as i32) });
-            if let Some(app) = &app {
-                let mut role: CFTypeRef = std::ptr::null();
-                if unsafe { AXUIElementCopyAttributeValue(app.0, cfstr("AXRole").0, &mut role) } == AX_API_DISABLED {
-                    return Err(untrusted());
-                }
-                drop(Cf::new(role));
-            }
-            all.extend(windows_of(pid));
+        // Only the processes that own a window asked for are asked for their windows.
+        let mut cg = None;
+        if windows.iter().any(|w| !self.owners.contains_key(&(*w as u32))) {
+            let list = cg_windows(&self.pids);
+            self.owners.extend(list.iter().map(|w| (w.0, w.1)));
+            cg = Some(list);
         }
+        let mut all: Vec<(Cf, Option<u32>)> = Vec::new();
+        for &pid in self.pids.iter().filter(|p| windows.iter().any(|w| self.owners.get(&(*w as u32)) == Some(*p))) {
+            for w in ax_windows(pid)? {
+                let id = self.known.iter().find(|k| unsafe { CFEqual(k.0.0, w.0) } != 0).map(|k| k.1);
+                all.push((w, id));
+            }
+        }
+        if windows.iter().any(|w| !all.iter().any(|a| a.1 == Some(*w as u32))) {
+            let cg = cg.unwrap_or_else(|| cg_windows(&self.pids));
+            for a in all.iter_mut().filter(|a| a.1.is_none()) {
+                a.1 = match_frame(&a.0, &cg);
+            }
+        }
+        self.known = all.iter().filter_map(|(w, id)| Some((Cf(unsafe { CFRetain(w.0) }), (*id)?))).collect();
         // The windows asked for, in that order; an AX window CoreGraphics does not list is left out.
-        for &want in windows {
+        'windows: for &want in windows {
             let Some(k) = all.iter().position(|w| w.1 == Some(want as u32)) else { continue };
             let (root, _) = all.swap_remove(k);
             let w = tree.windows.len();
@@ -480,6 +523,9 @@ impl Worker {
                 let hide = n.offscreen;
                 tree.nodes.push(n);
                 self.elements.push(el);
+                if enough(&tree, i) {
+                    break 'windows;
+                }
                 for c in r.children.into_iter().rev() {
                     stack.push((c, Some(i), hide));
                 }
@@ -495,22 +541,23 @@ impl Worker {
         let mut at: CFTypeRef = std::ptr::null();
         check(unsafe { AXUIElementCopyElementAtPosition(wide.0, x as f32, y as f32, &mut at) }, "hit test")?;
         let at = Cf::new(at).ok_or_else(|| Error::msg("hit test: nothing at that point"))?;
-        // The element or one inside it.
-        let mut cur = Some(Cf(unsafe { CFRetain(at.0) }));
+        // The element or one of its ancestors, when the app hit-tests no finer: compared here, with
+        // no read of the app.
+        let mut p = Some(i);
+        while let Some(k) = p {
+            if unsafe { CFEqual(self.elements[k].0, at.0) } != 0 {
+                return Ok(Ok(()));
+            }
+            p = self.last.nodes[k].parent;
+        }
+        // One inside it: up from what was hit, a read of the app per step.
+        let mut cur = copy(at.0, "AXParent");
         for _ in 0..64 {
             let Some(c) = cur else { break };
             if unsafe { CFEqual(c.0, target.0) } != 0 {
                 return Ok(Ok(()));
             }
             cur = copy(c.0, "AXParent");
-        }
-        // One of its ancestors, when the app hit-tests no finer.
-        let mut p = self.last.nodes[i].parent;
-        while let Some(k) = p {
-            if unsafe { CFEqual(self.elements[k].0, at.0) } != 0 {
-                return Ok(Ok(()));
-            }
-            p = self.last.nodes[k].parent;
         }
         let mut pid = 0;
         unsafe { AXUIElementGetPid(at.0, &mut pid) };
@@ -602,7 +649,11 @@ impl Worker {
 
 impl Accessibility for Ax {
     fn snapshot(&self, windows: &[isize]) -> Result<Tree> {
-        self.with(|w| w.snapshot(windows))
+        self.with(|w| w.snapshot(windows, &mut |_, _| false))
+    }
+
+    fn snapshot_until(&self, windows: &[isize], enough: &mut dyn FnMut(&Tree, usize) -> bool) -> Result<Tree> {
+        self.with(|w| w.snapshot(windows, enough))
     }
 
     fn changes(&self) -> Changes {

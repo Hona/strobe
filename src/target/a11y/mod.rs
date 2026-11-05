@@ -497,6 +497,13 @@ impl Action {
 pub trait Accessibility {
     /// The trees of these top-level windows (main first). It registers for their change events once.
     fn snapshot(&self, windows: &[isize]) -> Result<Tree>;
+    /// `snapshot`, read in tree order only until `enough(tree, i)` says the tree read so far serves
+    /// (`i`: the node just read; it stays in the tree). A backend that reads the app element by
+    /// element (macOS) stops there; one that reads a window's tree in one call reads it all.
+    fn snapshot_until(&self, windows: &[isize], enough: &mut dyn FnMut(&Tree, usize) -> bool) -> Result<Tree> {
+        let _ = enough;
+        self.snapshot(windows)
+    }
     /// Changes announced so far.
     fn changes(&self) -> Changes;
     /// When each change arrived (host clock), the newest 65,536.

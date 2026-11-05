@@ -16,7 +16,7 @@
 //! - Wheel: scroll events in pixels (continuous, as a trackpad's), one per step.
 
 pub use super::keys::{Button, Key, Mods, Named, parse_chord};
-use crate::host::macos::{CFTypeRef, CGPoint, Cf};
+use crate::host::macos::{CFTypeRef, CGPoint, Cf, cf_array, cf_get, cf_i64};
 use crate::model::{Error, Result};
 use std::sync::Mutex;
 
@@ -37,7 +37,11 @@ unsafe extern "C" {
     fn CGEventPost(tap: u32, e: CFTypeRef);
     fn CGWarpMouseCursorPosition(at: CGPoint) -> i32;
     fn CGPreflightPostEventAccess() -> bool;
+    fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> CFTypeRef;
 }
+
+/// `kCGWindowListOptionIncludingWindow`: just the window named.
+const LIST_INCLUDING: u32 = 8;
 
 const MOUSE_MOVED: u32 = 5;
 const FLAGS_CHANGED: u32 = 12;
@@ -221,8 +225,9 @@ impl Poster {
     /// The window of `pids` at (x, y) in points, or why a click there would reach something else:
     /// what the window server hit-tests there (which honours click-through overlays) must be the app's.
     pub fn target(&self, pids: &[u32], x: f64, y: f64) -> Result<Target> {
-        let (pid, what) = super::ax::app_at(x, y)?;
+        let (pid, at) = super::ax::app_at(x, y)?;
         if !pids.contains(&pid) {
+            let what = super::ax::describe(&at);
             return Err(Error::refused("WindowHidden", format!("another app's window covers the point ({x:.0}, {y:.0}): {what} of process {pid}"), "keep the app's window uncovered while strobe drives it"));
         }
         let window = crate::host::macos::window_at(&[pid], x, y).ok_or_else(|| Error::msg(format!("no window of the app at ({x:.0}, {y:.0})")))?;
@@ -287,8 +292,14 @@ impl Poster {
         Ok(self.post_pointer(e))
     }
 
+    /// The process that owns window `top`, from that window's entry alone (not the whole window list
+    /// at every key).
     fn pid_of(top: isize) -> Result<u32> {
-        crate::host::window_state(top).map(|w| w.pid).ok_or_else(|| Error::msg("the app's window closed"))
+        let entry = Cf::new(unsafe { CGWindowListCopyWindowInfo(LIST_INCLUDING, top as u32) });
+        entry
+            .and_then(|l| cf_array(l.0).into_iter().find(|d| cf_i64(cf_get(*d, "kCGWindowNumber")) == Some(top as i64)).and_then(|d| cf_i64(cf_get(d, "kCGWindowOwnerPID"))))
+            .map(|p| p as u32)
+            .ok_or_else(|| Error::msg("the app's window closed"))
     }
 
     /// The key code, the modifiers it needs and the character it types. The character is set on the

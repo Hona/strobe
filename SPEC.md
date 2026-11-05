@@ -2355,6 +2355,11 @@ the share of secondary metrics that claimed a change (must stay at or below the 
 and which counters are stable. A counter is `exact` for a project and device only after an A/A
 with at least 3 pairs shows zero spread.
 
+Checking that strobe itself leaves nothing behind (a capture that ends after an early error, a
+launch closed on a stop): a CLI command exits right after the error, so nothing is left to look at.
+Drive `strobe mcp` over stdio instead (one JSON-RPC `tools/call` per line on stdin): the process stays
+alive between calls, and its threads, handles and child processes can be read after each.
+
 ### 10.5 Benches on a locked session
 
 A machine left locked for days still benches what needs no presenting window. A series runs through a

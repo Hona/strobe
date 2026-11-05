@@ -465,7 +465,7 @@ fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout:
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(Error { code: 124, message: format!("no line of the app's output matched {re} in {} s", timeout.as_secs()), hint: Some("check the pattern against what the app prints (stdout and stderr)".into()) });
+            return Err(Error::timeout(format!("no line of the app's output matched {re} in {} s", timeout.as_secs())).hint("check the pattern against what the app prints (stdout and stderr)"));
         }
         match rx.recv_timeout(left) {
             Ok((_, line)) if re.is_match(&line) => return Ok(line),

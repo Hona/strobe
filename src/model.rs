@@ -3,32 +3,193 @@
 use serde::Serialize;
 use std::fmt;
 
-/// An error with the exit code it maps to (SPEC §5.2) and an optional fix.
+/// An error with the exit code it maps to (SPEC §5.2) and an optional fix. A refusal (exit 4) also
+/// carries what refused it, typed: `refusal` is set exactly when `code` is 4 and it came from
+/// `Error::refused` or a `Refusal`.
 #[derive(Debug)]
 pub struct Error {
     pub code: i32,
     pub message: String,
     pub hint: Option<String>,
+    pub refusal: Option<Box<Refusal>>,
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Error { code, message: message.into(), hint: None, refusal: None }
+    }
     pub fn msg(message: impl Into<String>) -> Self {
-        Error { code: 1, message: message.into(), hint: None }
+        Error::new(1, message)
     }
     pub fn usage(message: impl Into<String>) -> Self {
-        Error { code: 2, message: message.into(), hint: None }
+        Error::new(2, message)
     }
+    /// Something did not happen in time (exit 124).
+    pub fn timeout(message: impl Into<String>) -> Self {
+        Error::new(124, message)
+    }
+    /// A refusal by the validator named `validator` (its SPEC §10.1 id). A name that is no validator
+    /// is strobe's own bug: it fails as an internal error instead of refusing under a made-up id.
     pub fn refused(validator: &str, message: impl Into<String>, hint: impl Into<String>) -> Self {
-        Error { code: 4, message: format!("{validator}: {}", message.into()), hint: Some(hint.into()) }
+        match ValidatorId::from_name(validator) {
+            Some(id) => Refusal::new(id, message).fix(hint).into(),
+            None => Error::msg(format!("internal: {validator} is not a validator: {}", message.into())),
+        }
     }
     pub fn unreachable(message: impl Into<String>) -> Self {
-        Error { code: 255, message: message.into(), hint: None }
+        Error::new(255, message)
     }
     pub fn hint(mut self, hint: impl Into<String>) -> Self {
         self.hint = Some(hint.into());
         self
+    }
+    /// The validator that refused, for an exit-4 error.
+    pub fn validator(&self) -> Option<ValidatorId> {
+        self.refusal.as_ref().map(|r| r.validator)
+    }
+}
+
+macro_rules! validators {
+    ($($id:ident),* $(,)?) => {
+        /// A validator (SPEC §10.1): what refuses a run, or one metric of it.
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+        pub enum ValidatorId { $($id),* }
+
+        impl ValidatorId {
+            pub const ALL: &[ValidatorId] = &[$(ValidatorId::$id),*];
+
+            /// The id as SPEC, messages and result.json write it (`WindowHidden`).
+            pub fn name(self) -> &'static str {
+                match self { $(ValidatorId::$id => stringify!($id)),* }
+            }
+        }
+    };
+}
+
+validators!(
+    SoftwareGpu,
+    DevBuild,
+    DebuggerAttached,
+    WindowHidden,
+    WrongScreen,
+    UnpacedSpin,
+    NoPresentSource,
+    AmbiguousInteraction,
+    PatternInput,
+    SessionLocked,
+    ConcurrentBench,
+    VariantMismatch,
+    RunIncomplete,
+    Throttled,
+    Background,
+    BackgroundPriority,
+    PresentsUnmatched,
+    OverheadBudget,
+    NoDisplayForBudget,
+    TailTooShort,
+    ClockUnsynced,
+    LiveChannel,
+    NoPhase,
+    NoInput,
+);
+
+impl ValidatorId {
+    pub fn from_name(name: &str) -> Option<ValidatorId> {
+        ValidatorId::ALL.iter().copied().find(|v| v.name() == name)
+    }
+
+    /// The machine's state at the moment, not the target or the bench: a locked session, a hidden
+    /// window (a display off on idle, another app in front), other work on the CPUs. It passes, so a
+    /// bench waits it out or runs the block again rather than give up.
+    pub fn is_transient_environment(self) -> bool {
+        use ValidatorId::*;
+        match self {
+            SessionLocked | WindowHidden | Background => true,
+            SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
+            | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput => false,
+        }
+    }
+}
+
+impl fmt::Display for ValidatorId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Why a validator refused: a run (in an `Error`) or one metric (in a `Comparison`).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Refusal {
+    pub validator: ValidatorId,
+    /// What was wrong.
+    pub summary: String,
+    /// What strobe saw beyond the summary, such as the busiest processes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    /// How to make the run valid.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
+}
+
+impl Refusal {
+    pub fn new(validator: ValidatorId, summary: impl Into<String>) -> Self {
+        Refusal { validator, summary: summary.into(), detail: None, fix: None }
+    }
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+    pub fn fix(mut self, fix: impl Into<String>) -> Self {
+        self.fix = Some(fix.into());
+        self
+    }
+    /// `<validator>: <summary>[; <detail>]`, as an error's message says it.
+    pub fn message(&self) -> String {
+        match &self.detail {
+            Some(d) => format!("{}: {}; {d}", self.validator, self.summary),
+            None => format!("{}: {}", self.validator, self.summary),
+        }
+    }
+}
+
+impl From<Refusal> for Error {
+    fn from(r: Refusal) -> Self {
+        Error { code: 4, message: r.message(), hint: r.fix.clone(), refusal: Some(Box::new(r)) }
+    }
+}
+
+/// What a comparison decided (SPEC §9.3), whatever words its verdict uses.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictKind {
+    /// Head is better: `faster`, `less`, `fewer`, `smoother`, … (small or exact included).
+    Better,
+    /// Head is worse: `slower`, `more`, …, or `worse (>X)` against a no-worse margin.
+    Worse,
+    /// Inside the equivalence bound: `same (±2%)`, `same (exact)`.
+    Same,
+    /// Inside a no-worse margin: `no worse (≤5%)`.
+    NoWorse,
+    Unclear,
+    /// More pairs would decide it: `underpowered: ~n pairs needed`.
+    Underpowered,
+    /// Both sides sit at the metric's ceiling, where builds cannot differ.
+    Saturated,
+    /// The bench was stopped before a verdict.
+    Stopped,
+    /// A validator refused the metric: the comparison's `refusal` says which.
+    Refused,
+    /// A secondary the gate did not test: the primary was not decided, or Holm kept it (`—`).
+    Untested,
+    /// A descriptive metric: shown, never decided (`·`).
+    Descriptive,
+}
+
+impl VerdictKind {
+    pub fn decided(self) -> bool {
+        matches!(self, VerdictKind::Better | VerdictKind::Worse | VerdictKind::Same | VerdictKind::NoWorse)
     }
 }
 

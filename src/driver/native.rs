@@ -200,11 +200,7 @@ mod imp {
                     } else {
                         format!("nothing visible matched in {} s ({} elements in its windows)", timeout.as_secs(), tree.nodes.len())
                     };
-                    return Err(Error {
-                        code: 124,
-                        message: format!("selector {:?}: {why}", sel.source),
-                        hint: Some("check the key with page.query(\"role=button\") or an accessibility inspector".into()),
-                    });
+                    return Err(Error::timeout(format!("selector {:?}: {why}", sel.source)).hint("check the key with page.query(\"role=button\") or an accessibility inspector"));
                 }
                 self.a11y.wait_change(seen, settle(&tree, deadline));
             }
@@ -273,7 +269,7 @@ mod imp {
             })?;
             let v = p.live(&self.pids.borrow(), after, t)?;
             if v.next_screen_ns == 0 {
-                return Err(Error { code: 124, message: format!("until frame: the app showed no frame in {} s", t.as_secs()), hint: None });
+                return Err(Error::timeout(format!("until frame: the app showed no frame in {} s", t.as_secs())));
             }
             Ok(v.next_screen_ns)
         }
@@ -295,7 +291,7 @@ mod imp {
                     return Ok(last);
                 }
                 if Instant::now() >= deadline {
-                    return Err(Error { code: 124, message: format!("idle: the app kept drawing or changing for {} s", t.as_secs()), hint: None });
+                    return Err(Error::timeout(format!("idle: the app kept drawing or changing for {} s", t.as_secs())));
                 }
                 let wake = Instant::now() + Duration::from_nanos(quiet_at - now);
                 self.a11y.wait_change(c.count, wake.min(deadline));
@@ -317,7 +313,7 @@ mod imp {
                 }
                 lacked = Some(tree.at_ns);
                 if Instant::now() >= deadline {
-                    return Err(Error { code: 124, message: format!("selector {:?}: nothing visible matched in {} s", sel.source, t.as_secs()), hint: None });
+                    return Err(Error::timeout(format!("selector {:?}: nothing visible matched in {} s", sel.source, t.as_secs())));
                 }
                 self.a11y.wait_change(seen, settle(&tree, deadline));
             }
@@ -497,11 +493,8 @@ mod imp {
                 if Instant::now() >= deadline {
                     let n = &tree.nodes[i];
                     let what = Some(tree.key_path(i)).filter(|p| !p.is_empty()).unwrap_or_else(|| format!("{} {:?}", n.role_text, n.name));
-                    return Err(Error {
-                        code: 124,
-                        message: format!("selector {:?}: {what} stayed disabled for {} s, and a click on a disabled element does nothing", sel.source, t.as_secs()),
-                        hint: Some("wait for what enables it, or pick an enabled element (page.query lists enabled)".into()),
-                    });
+                    return Err(Error::timeout(format!("selector {:?}: {what} stayed disabled for {} s, and a click on a disabled element does nothing", sel.source, t.as_secs()))
+                        .hint("wait for what enables it, or pick an enabled element (page.query lists enabled)"));
                 }
                 self.a11y.wait_change(seen, deadline);
             }

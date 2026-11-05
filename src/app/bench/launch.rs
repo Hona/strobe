@@ -449,7 +449,7 @@ impl Watch {
 
     /// The epoch time `until` first showed and the page it showed in.
     fn ready(&self, timeout: Duration) -> Result<(f64, chromium::Page)> {
-        let (at, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error { code: 124, message: format!("not visible in {} s", timeout.as_secs()), hint: None })?;
+        let (at, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error::timeout(format!("not visible in {} s", timeout.as_secs())))?;
         Ok((at, chromium::Page { cdp: self.cdp.clone(), session, target }))
     }
 

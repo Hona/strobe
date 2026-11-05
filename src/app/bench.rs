@@ -273,7 +273,7 @@ pub(crate) fn stop_requested() -> bool {
 }
 
 pub(crate) fn stop_error() -> Error {
-    Error { code: 130, message: "stopped (Ctrl-C, SIGTERM or strobe bench --stop)".into(), hint: Some("strobe bench --resume <exp> runs what is left".into()) }
+    Error::new(130, "stopped (Ctrl-C, SIGTERM or strobe bench --stop)").hint("strobe bench --resume <exp> runs what is left")
 }
 
 /// Sleeps for `d`, or until a stop is asked for.
@@ -808,7 +808,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
         };
         if let Some(h) = out.get("halt").filter(|h| h.is_object()) {
-            halted = Some(Error { code: h["code"].as_i64().unwrap_or(1) as i32, message: h["message"].as_str().unwrap_or("").to_string(), hint: None });
+            halted = Some(Error::new(h["code"].as_i64().unwrap_or(1) as i32, h["message"].as_str().unwrap_or("")));
         }
         if out["not_run"] == true {
             not_run.push(s.label());

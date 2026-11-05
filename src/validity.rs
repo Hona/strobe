@@ -1,7 +1,7 @@
 //! Validators (refuse, exit 4) and analysers (warn) — SPEC §10.
 
 use crate::host;
-use crate::model::{Error, Result};
+use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::target::chromium::{Browser, Page};
 use serde::Serialize;
 use serde_json::Value;
@@ -24,11 +24,9 @@ pub fn info(id: &str, text: impl Into<String>) -> Warning {
 pub fn software_gpu(browser: &Browser) -> Result<crate::target::chromium::Gpu> {
     let gpu = browser.gpu()?;
     if gpu.software {
-        return Err(Error::refused(
-            "SoftwareGpu",
-            format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing),
-            "run headed on a machine with a GPU; frame and GPU metrics from software rendering describe no real device",
-        ));
+        return Err(Refusal::new(ValidatorId::SoftwareGpu, format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing))
+            .fix("run headed on a machine with a GPU; frame and GPU metrics from software rendering describe no real device")
+            .into());
     }
     Ok(gpu)
 }
@@ -36,27 +34,23 @@ pub fn software_gpu(browser: &Browser) -> Result<crate::target::chromium::Gpu> {
 pub fn window_visible(page: &Page) -> Result<()> {
     let state = page.eval("document.visibilityState")?;
     if state.as_str() != Some("visible") {
-        return Err(Error::refused(
-            "WindowHidden",
-            format!("the page reports visibilityState={state}"),
-            "keep the window visible and unminimized while strobe measures; Chromium throttles hidden windows",
-        ));
+        return Err(Refusal::new(ValidatorId::WindowHidden, format!("the page reports visibilityState={state}"))
+            .fix("keep the window visible and unminimized while strobe measures; Chromium throttles hidden windows")
+            .into());
     }
     Ok(())
 }
 
 pub fn locked() -> Error {
-    Error::refused(
-        "SessionLocked",
-        "the session was locked while strobe measured: the lock screen covers the window, so nothing it drew reached the display",
-        "measure on an unlocked screen; bench waits for an unlock and redoes the block by itself",
-    )
+    Refusal::new(ValidatorId::SessionLocked, "the session was locked while strobe measured: the lock screen covers the window, so nothing it drew reached the display")
+        .fix("measure on an unlocked screen; bench waits for an unlock and redoes the block by itself")
+        .into()
 }
 
 pub fn dev_build(page: &Page) -> Result<()> {
     let dev = page.eval(r#"!!document.querySelector('script[src*="@vite/client"]') || typeof window.__vite_plugin_react_preamble_installed__ !== "undefined""#)?;
     if dev.as_bool() == Some(true) {
-        return Err(Error::refused("DevBuild", "the page is served by a dev server (Vite client present)", "measure a production build: set build and serve in strobe.json"));
+        return Err(Refusal::new(ValidatorId::DevBuild, "the page is served by a dev server (Vite client present)").fix("measure a production build: set build and serve in strobe.json").into());
     }
     Ok(())
 }
@@ -73,11 +67,9 @@ pub fn throttled(ms: f64, baseline: Option<f64>) -> Result<Option<f64>> {
     let Some(base) = baseline.filter(|b| *b > 0.0) else { return Ok(None) };
     let ratio = ms / base;
     if ratio > 1.5 {
-        return Err(Error::refused(
-            "Throttled",
-            format!("the speed check ran {ratio:.2}× slower than this device's calibration ({ms:.1} ms vs {base:.1} ms)"),
-            "remove CPU throttling, plug in power, leave power saving, let the machine cool down",
-        ));
+        return Err(Refusal::new(ValidatorId::Throttled, format!("the speed check ran {ratio:.2}× slower than this device's calibration ({ms:.1} ms vs {base:.1} ms)"))
+            .fix("remove CPU throttling, plug in power, leave power saving, let the machine cool down")
+            .into());
     }
     Ok(Some(ratio))
 }
@@ -256,25 +248,24 @@ pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
     {
         let who = |t: &Try| if t.others.is_empty() { "nothing outside strobe".to_string() } else { t.others.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ") };
         if last.foreign_pct > FOREIGN_PCT {
-            return Err(Error::refused(
-                "Background",
+            return Err(Refusal::new(
+                ValidatorId::Background,
                 format!(
-                    "the native speed check on the target's CPUs ran {ratio:.2}× slower than this device's reference ({ms:.1} ms vs {r:.1} ms) while other work kept those CPUs {:.0}% of a core busy for 2 minutes; busiest processes (% of a core): {}",
-                    last.foreign_pct,
-                    who(&last)
+                    "the native speed check on the target's CPUs ran {ratio:.2}× slower than this device's reference ({ms:.1} ms vs {r:.1} ms) while other work kept those CPUs {:.0}% of a core busy for 2 minutes",
+                    last.foreign_pct
                 ),
-                "let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs",
-            ));
+            )
+            .detail(format!("busiest processes (% of a core): {}", who(&last)))
+            .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
+            .into());
         }
-        return Err(Error::refused(
-            "Throttled",
-            format!(
-                "the native speed check ran {ratio:.2}× slower than this device's reference on these CPUs ({ms:.1} ms vs {r:.1} ms, best of 3 tries on quiet CPUs; other work during the last: {:.0}% of a core there; busiest processes: {})",
-                last.foreign_pct,
-                who(&last)
-            ),
-            "plug in power, leave power saving, let the machine cool down",
-        ));
+        return Err(Refusal::new(
+            ValidatorId::Throttled,
+            format!("the native speed check ran {ratio:.2}× slower than this device's reference on these CPUs ({ms:.1} ms vs {r:.1} ms, best of 3 tries on quiet CPUs)"),
+        )
+        .detail(format!("other work during the last: {:.0}% of a core there; busiest processes: {}", last.foreign_pct, who(&last)))
+        .fix("plug in power, leave power saving, let the machine cool down")
+        .into());
     }
     kept.push(ms);
     let drop = kept.len().saturating_sub(KEPT);
@@ -284,7 +275,7 @@ pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
         o.remove("ms");
     }
     saved[&key] = serde_json::json!({ "ms": kept });
-    let _ = std::fs::write(&path, saved.to_string());
+    let _ = host::paths::write_atomic(&path, saved.to_string().as_bytes());
     Ok(ratio)
 }
 

@@ -130,7 +130,7 @@ impl Host {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let line = self.lines.recv_timeout(left).map_err(|_| Error { code: 124, message: format!("the process host did not answer in {} s", timeout.as_secs()), hint: None })?;
+            let line = self.lines.recv_timeout(left).map_err(|_| Error::timeout(format!("the process host did not answer in {} s", timeout.as_secs())))?;
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             if v["id"] == json!(id) {
                 if let Some(e) = v["error"].as_str() {

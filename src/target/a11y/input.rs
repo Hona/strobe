@@ -556,7 +556,7 @@ fn settle(hwnd: isize, n: usize) -> Result<()> {
     for _ in 0..2 * n + 2 {
         let mut r = 0usize;
         if unsafe { SendMessageTimeoutW(hwnd as HWND, WM_NULL, 0, 0, SMTO_NORMAL | SMTO_ABORTIFHUNG, 2000, &mut r) } == 0 {
-            return Err(Error { code: 124, message: "the app's UI thread did not take the posted input within 2 s".into(), hint: None });
+            return Err(Error::timeout("the app's UI thread did not take the posted input within 2 s"));
         }
     }
     Ok(())

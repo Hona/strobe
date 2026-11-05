@@ -170,7 +170,7 @@ impl Uia {
             let _ = tx.send(f(w));
         });
         self.tx.as_ref().ok_or_else(|| Error::msg("the accessibility thread stopped"))?.send(job).map_err(|_| Error::msg("the accessibility thread stopped"))?;
-        rx.recv_timeout(Duration::from_secs(30)).map_err(|_| Error { code: 124, message: "the app's accessibility provider did not answer in 30 s".into(), hint: None })?
+        rx.recv_timeout(Duration::from_secs(30)).map_err(|_| Error::timeout("the app's accessibility provider did not answer in 30 s"))?
     }
 }
 

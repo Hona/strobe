@@ -67,7 +67,7 @@ impl Cdp {
             self.pending.lock().unwrap().remove(&id);
             match (e, self.closed.lock().unwrap().clone()) {
                 (RecvTimeoutError::Disconnected, Some(why)) => Error::unreachable(format!("cdp {method}: connection closed: {why}")),
-                _ => Error { code: 124, message: format!("cdp {method}: no reply in {}s", timeout.as_secs()), hint: None },
+                _ => Error::timeout(format!("cdp {method}: no reply in {}s", timeout.as_secs())),
             }
         })?;
         if let Some(err) = reply.get("error") {
@@ -157,11 +157,11 @@ pub fn wait_event(rx: &Receiver<Value>, method: &str, session: Option<&str>, tim
     loop {
         let left = deadline.saturating_duration_since(std::time::Instant::now());
         if left.is_zero() {
-            return Err(Error { code: 124, message: format!("no {method} in {}s", timeout.as_secs()), hint: None });
+            return Err(Error::timeout(format!("no {method} in {}s", timeout.as_secs())));
         }
         let ev = rx.recv_timeout(left).map_err(|e| match e {
             RecvTimeoutError::Disconnected => Error::unreachable(format!("no {method}: the DevTools connection closed")),
-            RecvTimeoutError::Timeout => Error { code: 124, message: format!("no {method} in {}s", timeout.as_secs()), hint: None },
+            RecvTimeoutError::Timeout => Error::timeout(format!("no {method} in {}s", timeout.as_secs())),
         })?;
         if ev.get("method").and_then(Value::as_str) != Some(method) {
             continue;

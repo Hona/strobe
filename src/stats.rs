@@ -1,6 +1,6 @@
 //! Paired statistics (SPEC §9.3): Wilcoxon signed-rank, Hodges–Lehmann, Holm, verdicts, mValue.
 
-use crate::model::{Better, Kind, MetricDef};
+use crate::model::{Better, Kind, MetricDef, Refusal, ValidatorId, VerdictKind};
 use serde::Serialize;
 
 /// Signed-rank null distribution: counts of rank sums for n pairs (exact as f64 up to n = 50).
@@ -191,7 +191,7 @@ pub fn mvalue(values: &[f64]) -> Option<f64> {
 }
 
 /// The comparison of one metric between base and head over pairs.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug)]
 pub struct Comparison {
     pub metric: String,
     pub n: usize,
@@ -205,16 +205,90 @@ pub struct Comparison {
     pub confidence: f64,
     pub p: f64,
     pub bound: f64,
+    /// What it decided, in words (`faster (small)`, `refused (TailTooShort): …`). `kind` and
+    /// `refusal` read it, so whoever rewrites it keeps the three in step.
     pub verdict: String,
     pub decided: bool,
     pub needed_pairs: Option<usize>,
     /// A counter that held one value on each side in every block: compared exactly (SPEC §10.1).
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
     /// Non-inferiority (SPEC §9.3): the margin by which head may be worse (a fraction for ratio metrics,
     /// the metric's unit otherwise); `p` then tests the difference against the margin.
-    #[serde(skip_serializing_if = "Option::is_none")]
     pub noworse: Option<f64>,
+}
+
+impl Comparison {
+    /// What the verdict decided.
+    pub fn kind(&self) -> VerdictKind {
+        verdict_kind(&self.verdict, crate::model::metric(&self.metric))
+    }
+
+    /// The validator that refused this metric, when one did.
+    pub fn refusal(&self) -> Option<Refusal> {
+        refusal_of(&self.verdict)
+    }
+}
+
+/// result.json's comparison: the fields above, plus `verdict_kind` and a refused metric's `refusal`.
+impl Serialize for Comparison {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        m.serialize_entry("metric", &self.metric)?;
+        m.serialize_entry("n", &self.n)?;
+        m.serialize_entry("base", &self.base)?;
+        m.serialize_entry("head", &self.head)?;
+        m.serialize_entry("estimate", &self.estimate)?;
+        m.serialize_entry("lo", &self.lo)?;
+        m.serialize_entry("hi", &self.hi)?;
+        m.serialize_entry("relative", &self.relative)?;
+        m.serialize_entry("confidence", &self.confidence)?;
+        m.serialize_entry("p", &self.p)?;
+        m.serialize_entry("bound", &self.bound)?;
+        m.serialize_entry("verdict", &self.verdict)?;
+        m.serialize_entry("verdict_kind", &self.kind())?;
+        m.serialize_entry("decided", &self.decided)?;
+        m.serialize_entry("needed_pairs", &self.needed_pairs)?;
+        if self.exact {
+            m.serialize_entry("exact", &true)?;
+        }
+        if let Some(margin) = self.noworse {
+            m.serialize_entry("noworse", &margin)?;
+        }
+        if let Some(r) = self.refusal() {
+            m.serialize_entry("refusal", &r)?;
+        }
+        m.end()
+    }
+}
+
+/// What a verdict decided, from its words: the one place that reads them. `def` is the metric's
+/// (or its family's) definition, whose words say which direction is better; result.json files from
+/// before `verdict_kind` existed classify the same way.
+pub fn verdict_kind(verdict: &str, def: Option<&MetricDef>) -> VerdictKind {
+    let v = verdict.trim();
+    let first = v.split([' ', ':', ',']).next().unwrap_or("");
+    match first {
+        "—" => VerdictKind::Untested,
+        "·" => VerdictKind::Descriptive,
+        "refused" => VerdictKind::Refused,
+        "no" if v.starts_with("no worse") => VerdictKind::NoWorse,
+        "worse" => VerdictKind::Worse,
+        "same" => VerdictKind::Same,
+        "underpowered" => VerdictKind::Underpowered,
+        "saturated" => VerdictKind::Saturated,
+        "stopped" => VerdictKind::Stopped,
+        w if def.is_some_and(|d| w == d.words.0) => VerdictKind::Better,
+        w if def.is_some_and(|d| w == d.words.1) => VerdictKind::Worse,
+        _ => VerdictKind::Unclear,
+    }
+}
+
+/// The refusal a `refused (<validator>): <why>` verdict names.
+pub fn refusal_of(verdict: &str) -> Option<Refusal> {
+    let rest = verdict.trim().strip_prefix("refused (")?;
+    let (id, why) = rest.split_once(')')?;
+    Some(Refusal::new(ValidatorId::from_name(id)?, why.trim_start_matches(':').trim()))
 }
 
 /// Per-pair differences of a metric: `ln(head / base)` when every value is positive and the metric is a

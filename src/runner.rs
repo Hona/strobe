@@ -145,7 +145,7 @@ impl Runner {
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
-                return Err(Error { code: 124, message: format!("{op} took longer than {} s", timeout.as_secs()), hint: None });
+                return Err(Error::timeout(format!("{op} took longer than {} s", timeout.as_secs())));
             }
             let line = match self.lines.recv_timeout(left) {
                 Ok(l) => l,

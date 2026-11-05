@@ -261,17 +261,21 @@ fn take(t: &mut Thread, process: HANDLE, stack: &mut [u8]) -> Option<(u64, f64, 
     }
     let ok = unsafe { GetThreadContext(t.handle, &mut ctx.0) } != 0;
     let c = &ctx.0;
-    let len = if ok { (base.saturating_sub(c.Rsp) as usize).min(stack.len()) } else { 0 };
+    #[cfg(target_arch = "x86_64")]
+    let (sp, regs) = (c.Rsp, [c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15, c.Rip]);
+    // Never sampled: `Capture::start` refuses off x64 (this unwinds x64 frames only).
+    #[cfg(not(target_arch = "x86_64"))]
+    let (sp, regs) = (c.Sp, [0u64; 17]);
+    let len = if ok { (base.saturating_sub(sp) as usize).min(stack.len()) } else { 0 };
     let mut read = 0usize;
     if len > 0 {
-        unsafe { ReadProcessMemory(process, c.Rsp as *const _, stack.as_mut_ptr() as *mut _, len, &mut read) };
+        unsafe { ReadProcessMemory(process, sp as *const _, stack.as_mut_ptr() as *mut _, len, &mut read) };
     }
     unsafe { ResumeThread(t.handle) };
     let stall = (host::now_ns() - at) as f64 / 1e3;
     if !ok {
         return None;
     }
-    let regs = [c.Rax, c.Rcx, c.Rdx, c.Rbx, c.Rsp, c.Rbp, c.Rsi, c.Rdi, c.R8, c.R9, c.R10, c.R11, c.R12, c.R13, c.R14, c.R15, c.Rip];
     Some((at, stall, regs, read))
 }
 

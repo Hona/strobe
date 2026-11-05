@@ -158,7 +158,8 @@ fn cpu(pid: u32) -> (u64, Option<u64>, u64) {
 }
 
 /// CPU ms between two readings over `wall_ms`. Cycles are exact; process times move in 15.6 ms ticks
-/// on Windows, which made a 2 ms call read 0 ms or 15.6 ms. Ticks only where cycles are unavailable.
+/// on Windows, which made a 2 ms call read 0 ms or 15.6 ms. Ticks only where cycles are unavailable;
+/// where they are not time (`host::cycles_refused`) the block refuses CPU instead.
 fn cpu_ms(a: (u64, Option<u64>, u64), b: (u64, Option<u64>, u64), wall_ms: f64) -> f64 {
     match (a.1, b.1) {
         (Some(t0), Some(t1)) if t1 > t0 && b.0 > 0 => b.0.saturating_sub(a.0) as f64 / (t1 - t0) as f64 * wall_ms,
@@ -266,6 +267,17 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             values.insert("memory.app.private".into(), private_mb);
         }
         let _ = ctx.runner.call("close", json!({}), t, &serve);
+        // CPU this machine gives strobe no time for (`host::cycles_refused`) is refused, never read
+        // from clock ticks.
+        let mut refused = uncounted;
+        for m in ["cpu.work", "cpu.app.total"] {
+            if let Some(r) = super::super::outside::not_on_this_os(m) {
+                values.remove(m);
+                if declared_metrics(s).iter().any(|d| d.as_str() == m) {
+                    refused.insert(m.to_string(), r);
+                }
+            }
+        }
         Ok(Block {
             variant: v.role.to_string(),
             pair,
@@ -281,7 +293,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
-            refused: uncounted,
+            refused,
             locked: false,
             display: None,
             screen: None,

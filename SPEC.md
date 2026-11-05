@@ -720,7 +720,7 @@ measures read 0.00 ms, not refused.
 What strobe reads from a native app (§13.7), per run:
 
 - **From outside, always:** `cpu.work` and `cpu.app.total` (the cycles of the app's processes: its
-  tree and everything launched for its home with their trees, §13.2), `cpu.wakes`
+  tree and everything launched for its home with their trees, §13.2, over the cycle clock, §13.6), `cpu.wakes`
   (context switches of the tree's threads per second: each a switch in to run, after a wait (a
   timer, an event, IO) or a preemption; at rest nearly all are waits. Driver and OS pool threads
   inside the app's processes count too, and a handoff between two of its threads counts twice. From
@@ -2844,11 +2844,11 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 
 | Signal | Windows | Linux | macOS |
 |---|---|---|---|
-| process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the TSC (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
+| process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the cycle clock (below): the TSC on x64, the performance counter times the kernel's cycle factor on Arm (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
 | process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
 | memory by what holds it (`memory.app.host`, `query memory`, §8.6) | `VirtualQueryEx` walk of committed regions (type, protection, `GetMappedFileName`), `PROCESS_MEMORY_COUNTERS_EX2` | `/proc/<pid>/smaps` | refused: another process's regions need its task port (debuggers only) |
 | threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`: any same-user process, no permission; `task_threads` would need `task_for_pid`, which is root's), no wakes: no public per-thread switch count exists (`thread_info`, `PROC_PIDTHREADINFO` and `PROC_PIDTHREADCOUNTS` carry CPU time, scheduling state, cycles and energy; `getrusage` switches are the caller's own); the kernel's scheduler trace (kdebug through `ktrace`) has them for root only, not built |
-| per-core load, frequency | busy: idle cycles against the TSC each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
+| per-core load, frequency | busy: idle cycles against the cycle clock each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
 | topology, pinning | `GetLogicalProcessorInformationEx` (L3 per CCD); process affinity | sysfs cache (`index*/level` 3, `shared_cpu_list`); `sched_setaffinity` on every thread of strobe, inherited by children | no L3 groups (Apple Silicon); P and E cores named in the CPU line (`hw.perflevel*`); no affinity API: unpinned |
 | GPU engines per process (`gpu.process.3d`) | D3DKMT process statistics for the tree's pids (matches PDH GPU Engine, whose ~860 instances cost 0.5 ms per read) | DRM client statistics (`/proc/<pid>/fdinfo` of each `/dev/dri` file: `drm-engine-*` busy ns, engines mapped to Windows' types: gfx/render → 3D); a process with a GPU device open but no statistics (NVIDIA's proprietary driver, virtual GPUs) is unreadable, not 0 | IORegistry: each GPU client (`IOAccelerator` child) has its creator pid and `AppUsage.accumulatedGPUTime`; no permission. One engine: 3D |
 | VRAM per process (`gpu.vram`) | D3DKMT committed bytes in dedicated and shared segments (PDH `Dedicated Usage` also counts allocations opened from other processes) | DRM `drm-resident-*` (else `drm-total-*`, `drm-memory-*`): vram/local dedicated, gtt/system shared | refused: unified memory, a process's GPU allocations are in its footprint |
@@ -2870,6 +2870,44 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events: keys posted to its process (`CGEventPostToPid`), pointer events to the session at the point (AppKit drops mouse events posted to a process), Accessibility permission |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So every block of a window case makes the app the active one (`AXFrontmost`), and only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block waits for them). It activates every block, not only a covered one, because the active app's key window is another state: a Rune window at rest cost 3× the CPU as the key window (920 vs 2780 ms per 10 s on an M4), and a series whose blocks were activated only when covered mixed the two (ui.cpu 206 ms in some blocks, 1250 ms in others) |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
+
+**Windows cycle clock** (`host::tsc`). Thread, process and idle cycle times are exact (charged at every
+context switch and interrupt), but they are time only over a clock in their own unit. On x64 that is
+the invariant TSC. On Arm (`aarch64-pc-windows-msvc`) the unit depends on the Windows build:
+
+```ts
+Windows on Arm, 11 24H2 and later
+├─ the kernel charges a thread the performance-counter ticks it ran × one factor
+│  (measured: Cobalt 100 VM, 25H2 26200: every step between back-to-back QueryThreadCycleTime
+│   reads is a whole number of 100 ns ticks × 339.95, its 3399 MHz, ±1 for rounding)
+└─ cycle clock = QueryPerformanceCounter × factor → cycles over it are exact time
+Windows on Arm before 24H2
+├─ the kernel charges the core's cycle counter (PMCCNTR_EL0): its rate follows the clock and it
+│  stops while a core idles (Microsoft: "non-invariant ... not correlated to real time")
+└─ no cycle clock → cpu.work, cpu.app.total, cpu.process.total refused (NotOnThisOs)
+```
+
+strobe tells the two apart once per process, at the first read of the cycle clock: on each CPU, a
+thread pinned there reads its own cycle time 1000 times, with a wait between reads that varies from 0
+to about 1000 loop turns (a few ms a CPU). The rated
+frequency (`CallNtPowerInformation`) over the counter's only says how many ticks a step holds (1 to 32);
+the factor is Σ steps over Σ ticks. It refuses unless 95% of each CPU's steps land within ±1.5 of a
+whole number of ticks (core clock cycles land there about 1% of the time), every CPU gives the same
+factor within 0.2% (cores at different rates would mix units in one process's sum), strobe may run on
+every CPU, and there are at least 50 cycles a tick. Process times are never the fallback: they move in
+15.6 ms ticks.
+
+Checked on GitHub's `windows-11-arm` runner (Cobalt 100, 4 vCPUs, 25H2), each run a fresh VM: the
+factor read 339.92 on one VM and 339.95 on others (the same on every CPU of a VM, every step
+fitting), so it is measured, never taken from the rated 3399 MHz. `strobe record pid:` of a process
+spinning one thread read `cpu.app.total` 99.6% and 99.3% (two 5 s records), two threads 196%, a thread
+busy half the time 49.6% and 49.3%, an idle shell 0.01%, and per-thread CPU (`query threads`) 4990 ms
+of a 5 s window for the spinning thread. The core's clock cycles (PMCCNTR_EL0, readable from user mode on Windows)
+between the same reads, put through the same check, fit 7 to 9 steps of 998 (the kernel's cycles: 998
+of 998); without the varying wait between reads they fit 270 of 999, as a steady loop clusters them,
+which is why the check varies it. Not checked: real Arm laptops (frequency scaling, cores of different
+rates), Windows before 24H2 (the refusal).
+
 macOS permissions are granted to the responsible app (the launchd-started ancestor). Every message
 that asks for one names the pane for the running macOS (13–26: Accessibility; 27 and later: Device
 Control and Data Access) with the URL that opens it (`?Privacy_Accessibility`,
@@ -2886,8 +2924,8 @@ gpu.vram, gpu.shared        value            value (DRM)               NotOnThis
 memory.app.host             value            value (smaps)             NotOnThisOs: another process's regions need its task port
 ui.wakes                    value            value                     NotOnThisOs: switches are counted per process only
 cpu.foreign                 value (pinned)   value (pinned)            NotOnThisOs: no CPU affinity
-cpu.work, cpu.app.total     value (x64; Arm: NotOnThisOs: ARM64 cycle counts are not converted yet, and
-                            process times move in 15.6 ms ticks; page blocks and record refuse alike)   value   value
+cpu.work, cpu.app.total     value (Arm before 11 24H2, or failing the cycle-clock check above: NotOnThisOs,
+                            with the check's reason; page, native and script blocks and record alike)   value   value
 gpu.process.3d|vram|shared  without a per-process GPU source, or with any followed process's statistics
                             unreadable (no partial sums): NotOnThisOs, naming the source (D3DKMT; DRM fdinfo,
                             which NVIDIA's proprietary driver and virtual GPUs lack; IOAccelerator) or the pids
@@ -2906,7 +2944,7 @@ launch case (native, app,   launch.ready, launch.<milestone>, launch.painted|set
                             launch.inspect: NotForTarget; pixels not read: NoPresentSource with why
                             (macOS: Screen Recording); memory.app.* of a page's launch: NotForTarget
 record (native), record pid:  the OS rows above as `refused` in meta.json, printed once per reason
-record (page)               cpu.app.total in cycles over the time stamp counter (as native targets), else refused
+record (page)               cpu.app.total in cycles over the cycle clock (as native targets), else refused
 ```
 
 ### 13.7 Native apps
@@ -3844,7 +3882,12 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   check box click without a reset refused; a Meta+A reset that selected nothing refused too, which is
   the page driver sending no editing command on macOS).
 - Page blocks no longer fall back to process times for `cpu.app.total`: a share needs cycles over the
-  time stamp counter; Windows on Arm refuses `cpu.app.total` (`NotOnThisOs`) in pages and `record` alike.
+  cycle clock (§13.6). Windows on Arm reads it from 11 24H2 on (the performance counter times the
+  kernel's cycle factor, checked once per process in `host::win::cycle_factor`); before 24H2, or when
+  the check fails, `cpu.work`, `cpu.app.total` and `cpu.process.total` are refused (`NotOnThisOs`, with
+  the check's reason) in page, native and script blocks and `record` alike (script blocks used to fall
+  back to clock ticks there). `aarch64-pc-windows-msvc` compiles and passes clippy (cross-built with
+  xwin's CRT and SDK and `rust-lld`); the suspend sampler's x64 register read is x64-only.
 - A native run's CPU is each process's own difference by pid and start time (`record::cycles_used`):
   a process that exits in a run takes its CPU with it instead of lowering the others' sum, and one that
   starts counts from zero. A clean exit (code 0) of the launched process while its set still holds

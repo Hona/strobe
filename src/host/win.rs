@@ -124,7 +124,7 @@ fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
         let cpu = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 { ft(&k) + ft(&u) } else { 0 };
-        // Cycle time in TSC units, charged at every context switch: exact where process times move in 15.6 ms ticks.
+        // Cycle time in `super::tsc` units, charged at every context switch: exact where process times move in 15.6 ms ticks.
         let mut cycles = 0u64;
         QueryProcessCycleTime(h, &mut cycles);
         let mut m: PROCESS_MEMORY_COUNTERS_EX = zeroed();
@@ -1117,7 +1117,7 @@ pub fn threads(pids: &[u32]) -> (Vec<super::ThreadInfo>, Vec<(u32, u64, u64)>) {
     (out, io)
 }
 
-/// CPU cycles charged to one thread so far (TSC units), None when it cannot be opened.
+/// CPU cycles charged to one thread so far (`super::tsc` units), None when it cannot be opened.
 pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
@@ -1286,6 +1286,101 @@ pub fn thread_cycles() -> u64 {
     let mut c = 0u64;
     unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut c) };
     c
+}
+
+/// Windows on Arm: the performance counter in cycle units (`super::tsc`), None when the kernel's cycles
+/// are not time (`cycle_factor`).
+#[cfg(target_arch = "aarch64")]
+pub fn tsc() -> Option<u64> {
+    let (cycles, ticks) = cycle_factor().ok()?;
+    let mut c = 0i64;
+    unsafe { QueryPerformanceCounter(&mut c) };
+    Some((c as u128 * cycles as u128 / ticks as u128) as u64)
+}
+
+/// Windows on Arm: what thread, process and idle cycle times count, as cycles per performance-counter
+/// tick (cycles, ticks), or why they are not time (SPEC §13.6). Since Windows 11 24H2 the kernel
+/// charges a thread the performance-counter ticks it ran times one factor (Cobalt 100 VMs on 25H2:
+/// 339.92 to 339.95 per 100 ns tick, rated 3399 MHz), so cycles over that factor are exact time, as
+/// cycles over the TSC are on x64. Before 24H2 it charged the core's cycle counter (PMCCNTR_EL0),
+/// whose rate follows the clock and which stops while the core idles: not time. Told apart once per
+/// process: a thread pinned to each CPU reads its own cycles, and each step must be a whole number of
+/// ticks times the factor (±1: the kernel rounds), the same factor on every CPU.
+#[cfg(target_arch = "aarch64")]
+pub fn cycle_factor() -> Result<(u64, u64), String> {
+    static FACTOR: OnceLock<Result<(u64, u64), String>> = OnceLock::new();
+    FACTOR.get_or_init(calibrate_cycles).clone()
+}
+
+#[cfg(target_arch = "aarch64")]
+fn calibrate_cycles() -> Result<(u64, u64), String> {
+    use windows_sys::Win32::System::Power::{CallNtPowerInformation, PROCESSOR_POWER_INFORMATION, ProcessorInformation};
+    use windows_sys::Win32::System::Threading::{GetActiveProcessorCount, GetCurrentThread, SetThreadAffinityMask};
+    let n = (unsafe { GetActiveProcessorCount(0) } as usize).clamp(1, 64);
+    let mut power: Vec<PROCESSOR_POWER_INFORMATION> = vec![unsafe { zeroed() }; n];
+    let size = (n * size_of::<PROCESSOR_POWER_INFORMATION>()) as u32;
+    if unsafe { CallNtPowerInformation(ProcessorInformation, std::ptr::null(), 0, power.as_mut_ptr() as *mut _, size) } < 0 {
+        return Err("the processors' rated frequencies (CallNtPowerInformation) could not be read".into());
+    }
+    let mut freq = 0i64;
+    unsafe { QueryPerformanceFrequency(&mut freq) };
+    let (mut allowed, mut system) = (0usize, 0usize);
+    unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut allowed, &mut system) };
+    // Per CPU: (Σ steps, Σ ticks, steps that fit, steps used).
+    let mut per_cpu = Vec::with_capacity(n);
+    for (cpu, p) in power.iter().enumerate() {
+        if allowed & (1 << cpu) == 0 {
+            return Err(format!("strobe's CPU affinity leaves out CPU {cpu}, so the unit of its cycles cannot be checked"));
+        }
+        // Rated MHz over the counter's frequency: only to tell how many ticks a step holds (≤ 32).
+        let seed = p.MaxMhz as f64 * 1e6 / freq.max(1) as f64;
+        // Below ~50 cycles a tick, steps of any size land within ±1.5 of a whole tick often enough
+        // that the check would pass the core's own cycle counter too.
+        if seed < 50.0 {
+            return Err(format!("CPU {cpu}'s rated frequency ({} MHz) over the performance counter's ({freq} Hz) is too few cycles a tick to tell its cycle times from time", p.MaxMhz));
+        }
+        let steps = std::thread::spawn(move || {
+            unsafe { SetThreadAffinityMask(GetCurrentThread(), 1 << cpu) };
+            let mut steps = Vec::with_capacity(1000);
+            let mut last = thread_cycles();
+            for i in 0..1000u32 {
+                // A wait that varies between reads spreads the steps over many lengths: the core's
+                // clock cycles then land anywhere between whole ticks, where a steady loop could
+                // put them all near one multiple.
+                for j in 0..i * 7919 % 1009 {
+                    std::hint::black_box(j);
+                }
+                let c = thread_cycles();
+                if c != last {
+                    steps.push(c - last);
+                    last = c;
+                }
+            }
+            steps
+        })
+        .join()
+        .map_err(|_| "the cycle check's thread failed".to_string())?;
+        let ticks = |s: u64, f: f64| (s as f64 / f).round() as u64;
+        let used: Vec<u64> = steps.into_iter().filter(|&s| (1..=32).contains(&ticks(s, seed))).collect();
+        let (sum, mut f) = (used.iter().sum::<u64>(), seed);
+        for _ in 0..3 {
+            f = sum as f64 / used.iter().map(|&s| ticks(s, f)).sum::<u64>().max(1) as f64;
+        }
+        let fit = used.iter().filter(|&&s| (s as f64 - ticks(s, f) as f64 * f).abs() <= 1.5).count();
+        per_cpu.push((sum, used.iter().map(|&s| ticks(s, f)).sum::<u64>(), fit, used.len()));
+    }
+    let mhz = |sum: u64, k: u64| sum as f64 / k.max(1) as f64 * freq as f64 / 1e6;
+    if let Some((cpu, (_, _, fit, used))) = per_cpu.iter().enumerate().find(|(_, (_, _, fit, used))| *used < 200 || *fit * 100 < *used * 95) {
+        return Err(format!(
+            "its cycle times are not whole performance-counter ticks ({fit} of {used} steps on CPU {cpu}): the kernel charges the cores' clock cycles (Windows before 11 24H2), whose rate follows the clock and which stop while a core idles, so they are not time"
+        ));
+    }
+    let (sum, k) = per_cpu.iter().fold((0u64, 0u64), |(s, t), c| (s + c.0, t + c.1));
+    let all = mhz(sum, k);
+    if let Some((cpu, c)) = per_cpu.iter().enumerate().find(|(_, c)| (mhz(c.0, c.1) / all - 1.0).abs() > 0.002) {
+        return Err(format!("its CPUs charge cycles at different rates (CPU {cpu}: {:.1} MHz, all: {all:.1} MHz), so a process's cycles mix units", mhz(c.0, c.1)));
+    }
+    Ok((sum, k))
 }
 
 pub fn enable_ansi() -> bool {

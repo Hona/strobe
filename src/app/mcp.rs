@@ -117,7 +117,7 @@ const TOOLS: &[Tool] = &[
             ("handle", "rec_… or exp_… (a unique prefix works); history, changes or ser_… for tracked history"),
             (
                 "view",
-                "summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress, insights)",
+                "summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress and insights, and any recording view when it is a --check of one case: its recording answers)",
             ),
             ("sql", "SQL for the sql view"),
         ],
@@ -383,59 +383,25 @@ pub fn token_path() -> std::path::PathBuf {
     paths::state_dir().join("mcp-token")
 }
 
-/// The MCP token, created on first use: 32 bytes from the OS's secure random source as hex, in a file
-/// only the user can read.
+/// The MCP token, created on first use: 32 bytes from the OS's random source as hex, in a file only
+/// the user can read (one an older strobe wrote with the umask's mode is rewritten so).
 pub fn token() -> Result<String> {
     let p = token_path();
     if let Ok(t) = std::fs::read_to_string(&p)
         && t.trim().len() >= 32
     {
-        owner_only(&p);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if std::fs::metadata(&p).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+                paths::write_owner_only(&p, t.trim().as_bytes())?;
+            }
+        }
         return Ok(t.trim().to_string());
     }
-    let out = random_hex(32)?;
-    let mut f = std::fs::OpenOptions::new();
-    f.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
-    f.open(&p)?.write_all(out.as_bytes())?;
-    owner_only(&p);
+    let out = paths::csprng_hex(32)?;
+    paths::write_owner_only(&p, out.as_bytes())?;
     Ok(out)
-}
-
-/// Owner-only permissions (0600) on a secret strobe wrote; on Windows the state folder's ACL is the
-/// user's alone already.
-pub(super) fn owner_only(p: &std::path::Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = p;
-}
-
-/// `bytes` bytes from the OS's secure random source, as hex: BCryptGenRandom on Windows,
-/// /dev/urandom elsewhere. For secrets: the MCP token and `strobe open`'s session tokens.
-pub(super) fn random_hex(bytes: usize) -> Result<String> {
-    let mut buf = vec![0u8; bytes];
-    #[cfg(windows)]
-    {
-        #[link(name = "bcrypt")]
-        unsafe extern "system" {
-            fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
-        }
-        // BCRYPT_USE_SYSTEM_PREFERRED_RNG
-        if unsafe { BCryptGenRandom(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32, 2) } != 0 {
-            return Err(Error::msg("BCryptGenRandom failed"));
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        use std::io::Read;
-        std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
-    }
-    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn port() -> u16 {

@@ -189,11 +189,13 @@ pub fn stop_error() -> Error {
 pub fn unless_halted(out: Output) -> Result<Output> {
     match out.code {
         130 => Err(stop_error()),
-        124 => Err(Error {
-            code: 124,
-            message: out.json["stopped"]["why"].as_str().unwrap_or("the bench ended before it finished").to_string(),
-            hint: out.json["id"].as_str().map(|id| format!("strobe bench --resume {id} goes on")),
-        }),
+        124 => {
+            let e = Error::timeout(out.json["stopped"]["why"].as_str().unwrap_or("the bench ended before it finished"));
+            Err(match out.json["id"].as_str() {
+                Some(id) => e.hint(format!("strobe bench --resume {id} goes on")),
+                None => e,
+            })
+        }
         _ => Ok(out),
     }
 }

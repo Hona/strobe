@@ -253,7 +253,7 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     if state["mcp_port"].as_u64().is_none() {
         let port = (mcp::DEFAULT_PORT..mcp::DEFAULT_PORT + 100).find(|p| std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()).unwrap_or(mcp::DEFAULT_PORT);
         state["mcp_port"] = json!(port);
-        std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+        paths::write_atomic(&state_path, &serde_json::to_vec_pretty(&state)?)?;
     }
     mcp::token()?;
     let daemon_exe = if dir.join(exe("strobew")).is_file() { dir.join(exe("strobew")) } else { dir.join(exe("strobe")) };
@@ -357,7 +357,7 @@ fn mcp_up(s: &mut Steps) {
     let token_file = mcp::token_path().display().to_string().replace('\\', "/");
     let config = global_config();
     let existing = std::fs::read_to_string(&config).unwrap_or_default();
-    if jsonc::entry(&existing).is_none() {
+    if !jsonc::has_entry(&existing) {
         let ok = Command::new(&oc)
             .args(["mcp", "add", "strobe", "--global", "--url", &url, "--header", &format!("Authorization=Bearer {{file:{token_file}}}")])
             .stdin(Stdio::null())
@@ -509,7 +509,7 @@ pub fn calibrate(full: bool) -> Result<Value> {
     let state_path = paths::state_dir().join("state.json");
     let mut state: Value = std::fs::read_to_string(&state_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
     state["last_calibration"] = cal.clone();
-    std::fs::write(&state_path, serde_json::to_vec_pretty(&state)?)?;
+    paths::write_atomic(&state_path, &serde_json::to_vec_pretty(&state)?)?;
     Ok(cal)
 }
 
@@ -604,137 +604,70 @@ pub(super) fn quit_daemon() -> Result<()> {
     Ok(())
 }
 
-/// strobe's entry in opencode's global config (`mcp.strobe`), found by parsing the JSONC (strings,
-/// escapes, comments and trailing commas) and edited in place: every other byte stays as the user wrote
-/// it. A `"strobe"` anywhere else (another section, a string, a comment) is not strobe's entry.
+/// strobe's entry in opencode's global config (`mcp.strobe`), found through the JSONC reader and edited
+/// in place: every other byte stays as the user wrote it. A `"strobe"` anywhere else (another section,
+/// a string, a comment) is not strobe's entry.
 mod jsonc {
-    /// After whitespace and comments from `i`.
-    fn skip(t: &[u8], mut i: usize) -> usize {
-        loop {
-            while t.get(i).is_some_and(u8::is_ascii_whitespace) {
-                i += 1;
-            }
-            if t[i.min(t.len())..].starts_with(b"//") {
-                while t.get(i).is_some_and(|c| *c != b'\n') {
-                    i += 1;
-                }
-            } else if t[i.min(t.len())..].starts_with(b"/*") {
-                i = t[i + 2..].windows(2).position(|w| w == b"*/").map_or(t.len(), |p| i + 2 + p + 2);
-            } else {
-                return i;
-            }
+    use crate::jsonc::{Seg, offset, strip, value_span};
+
+    fn path(more: &[&str]) -> Vec<Seg> {
+        ["mcp", "strobe"].iter().chain(more).map(|k| Seg::Key(k.to_string())).collect()
+    }
+
+    /// `mcp.strobe` in `json` (stripped): its key's start, and its value's start and end.
+    fn find(json: &str) -> Option<(usize, usize, usize)> {
+        let (start, end) = value_span(json, &path(&[]))?;
+        Some((offset(json, &path(&[]))?, start, end))
+    }
+
+    pub fn has_entry(text: &str) -> bool {
+        offset(&strip(text), &path(&[])).is_some()
+    }
+
+    /// Edits the text after a byte-order mark, which `strip` turns into one space (offsets would move).
+    fn edit(text: &str, f: impl Fn(&str) -> Option<String>) -> Option<String> {
+        match text.strip_prefix('\u{feff}') {
+            Some(rest) => f(rest).map(|t| format!("\u{feff}{t}")),
+            None => f(text),
         }
     }
 
-    /// The end (exclusive) of the string that opens at `i`.
-    fn string_end(t: &[u8], i: usize) -> Option<usize> {
-        let mut j = i + 1;
-        while let Some(&c) = t.get(j) {
-            match c {
-                b'\\' => j += 2,
-                b'"' => return Some(j + 1),
-                _ => j += 1,
-            }
-        }
-        None
+    pub fn set_oauth_off(text: &str) -> Option<String> {
+        edit(text, oauth_off)
     }
 
-    /// One member of an object: its key, where the key starts, and its value's span.
-    struct Member {
-        key: String,
-        key_start: usize,
-        start: usize,
-        end: usize,
-    }
-
-    /// An object's members and its end (exclusive), when an object opens at `i`.
-    fn members(t: &[u8], i: usize) -> Option<(Vec<Member>, usize)> {
-        if t.get(i) != Some(&b'{') {
-            return None;
-        }
-        let mut out = Vec::new();
-        let mut j = skip(t, i + 1);
-        loop {
-            match t.get(j)? {
-                b'}' => return Some((out, j + 1)),
-                b'"' => {
-                    let k_end = string_end(t, j)?;
-                    let key = serde_json::from_slice::<String>(&t[j..k_end]).ok()?;
-                    let colon = skip(t, k_end);
-                    (t.get(colon) == Some(&b':')).then_some(())?;
-                    let v = skip(t, colon + 1);
-                    let v_end = value_end(t, v)?;
-                    out.push(Member { key, key_start: j, start: v, end: v_end });
-                    j = skip(t, v_end);
-                    if t.get(j) == Some(&b',') {
-                        j = skip(t, j + 1);
-                    }
-                }
-                _ => return None,
-            }
-        }
-    }
-
-    /// The end (exclusive) of the value that starts at `i`.
-    fn value_end(t: &[u8], i: usize) -> Option<usize> {
-        match t.get(i)? {
-            b'"' => string_end(t, i),
-            b'{' => members(t, i).map(|m| m.1),
-            b'[' => {
-                let mut j = skip(t, i + 1);
-                loop {
-                    if t.get(j)? == &b']' {
-                        return Some(j + 1);
-                    }
-                    j = skip(t, value_end(t, j)?);
-                    if t.get(j) == Some(&b',') {
-                        j = skip(t, j + 1);
-                    }
-                }
-            }
-            _ => {
-                let n = t[i..].iter().position(|c| matches!(c, b',' | b'}' | b']' | b'/') || c.is_ascii_whitespace()).unwrap_or(t.len() - i);
-                (n > 0).then_some(i + n)
-            }
-        }
-    }
-
-    /// `mcp.strobe`: its key's start, and its value's start and end.
-    pub fn entry(text: &str) -> Option<(usize, usize, usize)> {
-        let t = text.as_bytes();
-        let (top, _) = members(t, skip(t, 0))?;
-        let mcp = top.iter().find(|m| m.key == "mcp")?;
-        let (servers, _) = members(t, mcp.start)?;
-        servers.iter().find(|m| m.key == "strobe").map(|m| (m.key_start, m.start, m.end))
+    pub fn cut_entry(text: &str) -> Option<String> {
+        edit(text, cut)
     }
 
     /// The text with `"oauth": false` added to strobe's entry, when it has no `oauth` yet.
-    pub fn set_oauth_off(text: &str) -> Option<String> {
-        let t = text.as_bytes();
-        let (_, value, _) = entry(text)?;
-        let (fields, _) = members(t, value)?;
-        if fields.iter().any(|f| f.key == "oauth") {
+    fn oauth_off(text: &str) -> Option<String> {
+        let json = strip(text);
+        let (_, start, end) = find(&json)?;
+        if !json[start..].starts_with('{') || offset(&json, &path(&["oauth"])).is_some() {
             return None;
         }
-        let at = value + 1;
-        Some(format!("{}\"oauth\": false{}{}", &text[..at], if fields.is_empty() { "" } else { ", " }, &text[at..]))
+        let at = start + 1;
+        let empty = json[at..end - 1].trim().is_empty();
+        Some(format!("{}\"oauth\": false{}{}", &text[..at], if empty { "" } else { ", " }, &text[at..]))
     }
 
     /// The text without strobe's entry (and the comma that separated it), leaving every other byte.
-    pub fn cut_entry(text: &str) -> Option<String> {
-        let t = text.as_bytes();
-        let (start, _, end) = entry(text)?;
-        let after = skip(t, end);
-        let end = if t.get(after) == Some(&b',') {
+    fn cut(text: &str) -> Option<String> {
+        let json = strip(text);
+        let (key, _, end) = find(&json)?;
+        let after = end + (json[end..].len() - json[end..].trim_start().len());
+        let end = if json.as_bytes().get(after) == Some(&b',') {
             after + 1
-        } else if let Some(b) = text[..start].trim_end().strip_suffix(',') {
-            // The last member: the comma before it goes instead, with the line break after it.
-            return Some(format!("{}{}", b, &text[end..]));
+        } else if let Some(before) = json[..key].trim_end().strip_suffix(',') {
+            // The last member: the comma before it goes instead, with what lies between.
+            return Some(format!("{}{}", &text[..before.len()], &text[end..]));
         } else {
             end
         };
-        let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-        let prefix = if text[line_start..start].trim().is_empty() { line_start } else { start };
+        let line_start = text[..key].rfind('\n').map(|i| i + 1).unwrap_or(key);
+        let prefix = if json[line_start..key].trim().is_empty() { line_start } else { key };
         Some(format!("{}{}", &text[..prefix], text[end..].trim_start_matches([' ', '\t']).trim_start_matches(['\r', '\n'])))
     }
 }
+

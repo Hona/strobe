@@ -2886,7 +2886,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
   (`<file>#<case>`) returns an `exp_…`, and its `target` names one of the bench file's targets
   (`--target`); `bench` with `stop` or `resume` (not both) takes an experiment instead of `file`.
 - The MCP token and `strobe open`'s session tokens come from the OS's secure random source
-  (BCryptGenRandom, `/dev/urandom`); the token file and each session file (the key to its trace)
+  (`host::paths::csprng_hex`); the token file and each session file (the key to its trace)
   are 0600, in folders only the user can enter, on Unix.
 - Output rules for agents: verdict first; handles instead of payloads; top-K and `max_bytes`
   (head and tail kept); provenance inline; a refusal names the validator and the fix.

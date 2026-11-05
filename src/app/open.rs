@@ -223,20 +223,15 @@ struct Session {
 /// A trace_processor for the UI on a port of its own, and a token that lets the UI fetch the trace
 /// (16 bytes from the OS's secure random source: it is the only key to the trace).
 fn start(trace: &Path, id: &str, ui_port: u16) -> Result<Session> {
-    let token = super::mcp::random_hex(16)?;
+    let token = paths::csprng_hex(16)?;
     let free = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port());
     let (rpc, note) = match free.map_err(Error::from).and_then(|p| engine::httpd(p, &format!("http://127.0.0.1:{ui_port}")).map(|_| p)) {
         Ok(p) => (Some(p), None),
         Err(e) => (None, Some(format!("{}; the UI loads the trace itself", e.message))),
     };
-    // A session file is the key to its trace: the folder and the files are the user's alone.
+    // A session file is the key to its trace: it is the user's alone, in the user-only run folder.
     let dir = paths::run().join("perfetto");
     let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
     // Sessions from earlier days are gone; the traces stay in their recordings.
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         if e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 86_400) {
@@ -244,8 +239,7 @@ fn start(trace: &Path, id: &str, ui_port: u16) -> Result<Session> {
         }
     }
     let file = dir.join(format!("{token}.json"));
-    store::write_json(&file, &json!({ "trace": trace.display().to_string(), "recording": id, "rpc_port": rpc }))?;
-    super::mcp::owner_only(&file);
+    paths::write_owner_only(&file, json!({ "trace": trace.display().to_string(), "recording": id, "rpc_port": rpc }).to_string().as_bytes())?;
     Ok(Session { token, rpc, note })
 }
 

@@ -68,6 +68,23 @@ pub fn offset(json: &str, path: &[Seg]) -> Option<usize> {
     at(json, b, &mut i, path)
 }
 
+/// The byte span (first byte, one past the last) of the value `path` names in `json`, as `offset`
+/// reads it: for editing a file in place (`strip` keeps every offset).
+pub fn value_span(json: &str, path: &[Seg]) -> Option<(usize, usize)> {
+    let b = json.as_bytes();
+    let mut i = offset(json, path)?;
+    if matches!(path.last(), Some(Seg::Key(_))) {
+        skip(b, &mut i)?;
+        ws(b, &mut i);
+        (b.get(i)? == &b':').then_some(())?;
+        i += 1;
+        ws(b, &mut i);
+    }
+    let start = i;
+    skip(b, &mut i)?;
+    Some((start, i))
+}
+
 /// 1-based line and column (in characters) of a byte offset.
 pub fn line_col(text: &str, offset: usize) -> (usize, usize) {
     let before = &text[..offset.min(text.len())];

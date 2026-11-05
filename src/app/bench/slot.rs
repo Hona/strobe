@@ -131,18 +131,7 @@ impl Registration {
     /// half written, so `daemon_benching` and the queue never miss a running bench.
     fn write(&self) {
         let e = self.0.entry.lock().unwrap().clone();
-        let tmp = self.0.path.with_extension("json.tmp");
-        if std::fs::write(&tmp, e.to_string()).is_err() {
-            return;
-        }
-        // Windows refuses the rename while a reader has the file open: try again shortly.
-        for _ in 0..20 {
-            if std::fs::rename(&tmp, &self.0.path).is_ok() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        let _ = std::fs::remove_file(&tmp);
+        let _ = paths::write_atomic(&self.0.path, e.to_string().as_bytes());
     }
 
     /// What the bench does now: `building`, `waiting` (with why), `queued`, `running`.

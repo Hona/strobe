@@ -26,17 +26,29 @@ const START_WAIT: std::time::Duration = std::time::Duration::from_secs(20);
 pub struct Capture {
     runs: Vec<(u32, Child, std::path::PathBuf)>,
     t0: u64,
+    /// Processes of the set not sampled, with why (`Deep::unsampled`).
+    unsampled: Vec<(u32, String)>,
+}
+
+/// At most this many processes are sampled (one `sample` each): the target's root first.
+const MAX_PROCESSES: usize = 16;
+
+/// A process as a person names it: its executable's file name.
+fn named(pid: u32) -> String {
+    crate::host::exe_of(pid).and_then(|e| e.file_name().map(|n| n.to_string_lossy().to_string())).map(|n| format!("{pid} ({n})")).unwrap_or_else(|| pid.to_string())
 }
 
 impl Capture {
     pub fn start(targets: Targets) -> Result<Capture> {
         use std::os::unix::process::CommandExt;
-        let pids = targets.pids();
+        let mut pids = targets.pids();
         if pids.is_empty() {
             return Err(Error::msg(format!("process {} is not running", targets.root)));
         }
+        pids.sort_by_key(|&p| p != targets.root);
+        let unsampled = pids.split_off(pids.len().min(MAX_PROCESSES)).into_iter().map(|p| (p, format!("{}: past the {MAX_PROCESSES} processes sampled", named(p)))).collect();
         let mut runs = Vec::new();
-        for pid in pids.into_iter().take(16) {
+        for pid in pids {
             let out = crate::host::paths::run().join(format!("sample-{}-{pid}.txt", std::process::id()));
             let said = std::fs::File::create(said_path(&out))?;
             let mut cmd = Command::new("/usr/bin/sample");
@@ -65,7 +77,7 @@ impl Capture {
                 std::thread::sleep(std::time::Duration::from_millis(20));
             }
         }
-        Ok(Capture { runs, t0: crate::host::now_ns() })
+        Ok(Capture { runs, t0: crate::host::now_ns(), unsampled })
     }
 
     pub fn stop(mut self) -> Result<Deep> {
@@ -81,15 +93,24 @@ impl Capture {
             unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
         }
         let mut late = 0;
+        deep.unsampled = std::mem::take(&mut self.unsampled);
         for (pid, mut child, out) in std::mem::take(&mut self.runs) {
-            let _ = std::fs::remove_file(said_path(&out));
+            let name = named(pid);
             if !wait_until(&mut child, deadline) {
                 // It never wrote its report: what it sampled is lost, but the block goes on.
                 let _ = child.kill();
                 let _ = child.wait();
                 late += 1;
             }
-            let Ok(text) = std::fs::read_to_string(&out) else { continue };
+            // What `sample` said when it wrote no report: macOS refuses it a process it may not
+            // examine (a hardened or system one, such as a system XPC service doing the app's work).
+            let said = std::fs::read_to_string(said_path(&out)).unwrap_or_default();
+            let _ = std::fs::remove_file(said_path(&out));
+            let Ok(text) = std::fs::read_to_string(&out) else {
+                let why = said.lines().map(str::trim).find(|l| !l.is_empty() && !l.starts_with("Sampling process")).unwrap_or("it wrote no report").to_string();
+                deep.unsampled.push((pid, format!("{name}: {why}")));
+                continue;
+            };
             let _ = std::fs::remove_file(&out);
             parse(&text, pid, self.t0, &mut deep, &mut index);
             deep.pids.push(pid);
@@ -98,7 +119,8 @@ impl Capture {
             if late > 0 {
                 return Err(Error::msg(format!("/usr/bin/sample did not write its report within {} s of being stopped, so it was ended", REPORT_WAIT.as_secs())));
             }
-            return Err(Error::msg("sample recorded nothing (the process may be hardened or a system process, which only Apple's tools may sample)"));
+            let said: Vec<&str> = deep.unsampled.iter().map(|(_, w)| w.as_str()).collect();
+            return Err(Error::msg(format!("sample recorded nothing (the process may be hardened or a system process, which only Apple's tools may sample): {}", said.join("; "))));
         }
         Ok(deep)
     }

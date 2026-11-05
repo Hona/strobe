@@ -1170,6 +1170,12 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
     }
     // Sampled by strobe itself without the helper: how, and what it cost the threads.
     let deep: Option<crate::probe::stacks::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
+    // Processes of the target the sampler gave no stacks of: their CPU is in no row above.
+    if let Some(d) = deep.as_ref().filter(|d| !d.unsampled.is_empty()) {
+        let list: Vec<&str> = d.unsampled.iter().map(|(_, w)| w.as_str()).collect();
+        out.text += &format!("! Unsampled: no stacks of {} of the target's processes, so their CPU is missing from these rows: {}\n", list.len(), list.join("; "));
+        out.json["unsampled"] = json!(d.unsampled);
+    }
     if let Some(d) = deep.filter(|d| d.suspend.is_some()) {
         out.text += &format!("i native stacks{}\n", crate::probe::stacks::stacks_how(&d));
         out.json["suspend"] = json!(d.suspend);

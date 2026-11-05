@@ -102,6 +102,7 @@ validators!(
     NotOnThisOs,
     NotForTarget,
     ResetIncomplete,
+    EngineUnsupported,
     NoMetric,
     NoWaits,
 );
@@ -120,7 +121,7 @@ impl ValidatorId {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
-            | NotOnThisOs | NotForTarget | ResetIncomplete | NoMetric | NoWaits => false,
+            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | NoMetric | NoWaits => false,
         }
     }
 }

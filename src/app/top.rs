@@ -34,7 +34,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let mut top = Top::new(target, limit, sort);
     if args.has("once") {
-        let sampler = target.map(Sampler::start);
+        let sampler = target.map(|p| Sampler::start(p, None));
         let t0 = host::now_ns();
         std::thread::sleep(interval);
         let frame = top.frame();

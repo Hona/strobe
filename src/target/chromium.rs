@@ -45,6 +45,9 @@ pub struct Browser {
     pub exe: PathBuf,
     pub version: String,
     pub window: Window,
+    /// The browser is a webview inside the launched app (`webview.rs`): closing it leaves the app
+    /// running, so `close` closes the app instead.
+    pub embedded: bool,
 }
 
 /// An attached page: the session id commands go to.
@@ -185,7 +188,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let (child, profile) = launching.done();
-    Ok(Browser { cdp, ws, child, pid, profile, fresh: true, exe, version, window: window.clone() })
+    Ok(Browser { cdp, ws, child, pid, profile, fresh: true, exe, version, window: window.clone(), embedded: false })
 }
 
 /// Attaches to a running endpoint: `cdp:<port>`, `cdp:ws://…` or a bare `ws://…`.
@@ -207,7 +210,7 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
     };
     let cdp = Cdp::connect(&url)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default() })
+    Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default(), embedded: false })
 }
 
 /// One GET on a debugging port. Chrome and Node keep the connection open after the reply, even with
@@ -346,9 +349,16 @@ impl Browser {
     /// Closes the browser as a person would (`Browser.close`, up to 5 s for it to exit), then ends
     /// what is left and removes the profile (an attached browser is only asked to close).
     pub fn close(mut self) {
-        let _ = self.cdp.send_timeout("Browser.close", json!({}), None, Duration::from_secs(5));
+        // A webview's app closes as a person closes it (its windows), with a short grace; `Browser.close`
+        // would end only its browser and leave the app waited on.
+        let grace = if self.embedded {
+            if super::webview::ask_close(&self.pids()) > 0 { 2 } else { 0 }
+        } else {
+            let _ = self.cdp.send_timeout("Browser.close", json!({}), None, Duration::from_secs(5));
+            5
+        };
         if let Some(c) = self.child.as_mut() {
-            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            let deadline = std::time::Instant::now() + Duration::from_secs(grace);
             while std::time::Instant::now() < deadline && c.exited().is_none() {
                 std::thread::sleep(Duration::from_millis(50));
             }

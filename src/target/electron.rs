@@ -66,6 +66,10 @@ fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
 
 /// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
 pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
+    // An app on the OS's webview opens the webview's own port, not Electron's.
+    if app.kind == isolate::AppKind::Webview {
+        return super::webview::launch_with(app, seed, window, cpus, extra);
+    }
     if isolate::interpreter(&app.exe) {
         return Err(Error::usage(format!(
             "{} is a script runtime, not a Chromium or Electron app: an exe: or app: target launches with a debugging port (--remote-debugging-port) it does not take",
@@ -129,22 +133,53 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let fresh = launching.fresh;
     let (child, profile) = launching.done();
-    Ok((Browser { cdp, ws, child, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
+    Ok((Browser { cdp, ws, child, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone(), embedded: false }, guard, Started { epoch_ms: epoch, output, main }))
 }
 
-/// The app window's page: the first page target that is not DevTools.
+/// The browser's own pages (DevTools, settings, extensions), which are never the app's.
+const BROWSER_PAGES: &[&str] = &["devtools://", "edge://", "chrome://", "chrome-extension://"];
+
+/// The app window's page: of the page targets that are not the browser's own, the visible one with the
+/// largest viewport, an `about:blank` placeholder only when nothing else is there. A page that closes
+/// while strobe attaches (a splash screen) is passed over and the pick made again.
 pub fn main_page(browser: &Browser) -> Result<super::chromium::Page> {
     let deadline = Instant::now() + Duration::from_secs(60);
+    let mut blank_since: Option<Instant> = None;
     loop {
         let targets = browser.cdp.send("Target.getTargets", json!({}), None)?;
-        let found = targets["targetInfos"]
+        let mut pages: Vec<(bool, String)> = targets["targetInfos"]
             .as_array()
-            .and_then(|a| a.iter().filter(|t| t["type"] == "page" && !t["url"].as_str().unwrap_or("").starts_with("devtools://")).map(|t| t["targetId"].as_str().unwrap_or("").to_string()).next());
-        if let Some(target) = found {
-            let attached = browser.cdp.send("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None)?;
-            let session = attached["sessionId"].as_str().ok_or_else(|| Error::msg("attach: no session"))?.to_string();
-            let page = super::chromium::Page { cdp: browser.cdp.clone(), session, target };
-            page.send("Page.enable", json!({}))?;
+            .into_iter()
+            .flatten()
+            .filter(|t| t["type"] == "page")
+            .filter_map(|t| {
+                let url = t["url"].as_str().unwrap_or("");
+                (!BROWSER_PAGES.iter().any(|p| url.starts_with(p))).then(|| (url == "about:blank", t["targetId"].as_str().unwrap_or("").to_string()))
+            })
+            .collect();
+        pages.sort_by_key(|p| p.0);
+        // A placeholder only: the app may still load its page into it, so it is taken after 2 s.
+        let only_blank = !pages.is_empty() && pages.iter().all(|p| p.0);
+        let settled = !only_blank || blank_since.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(2);
+        let mut best: Option<(f64, super::chromium::Page)> = None;
+        for (_, target) in pages.iter().filter(|_| settled) {
+            // A page gone since the list (a splash screen) fails to attach or to answer: the next one.
+            let Ok(attached) = browser.cdp.send("Target.attachToTarget", json!({ "targetId": target, "flatten": true }), None) else { continue };
+            let Some(session) = attached["sessionId"].as_str().map(str::to_string) else { continue };
+            let page = super::chromium::Page { cdp: browser.cdp.clone(), session, target: target.clone() };
+            let Ok(v) = page.eval_timeout("[document.visibilityState === 'visible', innerWidth * innerHeight]", Duration::from_secs(5)) else { continue };
+            let area = if v[0] == true { v[1].as_f64().unwrap_or(0.0) } else { -1.0 };
+            let drop = match &best {
+                Some(b) if area <= b.0 => Some(page.session.clone()),
+                _ => best.replace((area, page)).map(|(_, p)| p.session),
+            };
+            if let Some(s) = drop {
+                let _ = browser.cdp.send("Target.detachFromTarget", json!({ "sessionId": s }), None);
+            }
+        }
+        if let Some((_, page)) = best
+            && page.send("Page.enable", json!({})).is_ok()
+        {
             let deadline = Instant::now() + Duration::from_secs(5);
             while cfg!(windows) && host::raise_windows(&browser.pids()) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));

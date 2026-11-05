@@ -102,6 +102,7 @@
         "NotOnThisOs",
         "NotForTarget",
         "ResetIncomplete",
+        "EngineUnsupported",
         "NoMetric",
         "NoWaits"
       ]

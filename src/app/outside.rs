@@ -156,7 +156,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         p
     });
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
-    let sampler = probe::os::Sampler::start(root);
+    let sampler = probe::os::Sampler::start(root, None);
     let cycles = || super::record::per_process(&set());
     // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
     let snap0 = wakes::Snapshot::take(&pids_now());

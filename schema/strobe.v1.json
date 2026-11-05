@@ -77,7 +77,10 @@
       "properties": {
         "exe": { "$ref": "#/definitions/perOs", "description": "~, %VAR% and ${VAR} expand from the user's environment." },
         "extends": { "type": "string", "description": "A parent profile; objects merge per key." },
-        "kind": { "enum": ["electron", "native"] },
+        "kind": {
+          "enum": ["electron", "webview", "native"],
+          "description": "electron (default): a debugging port. webview: the app embeds the OS's webview (WebView2 on Windows). native: from outside and through the accessibility tree."
+        },
         "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "{home} is the copy's private home, {port} a free port." },
         "unset": { "type": "array", "items": { "type": "string" }, "description": "Exact names or PREFIX* families." },
         "dirs": { "type": "array", "items": { "type": "string" } },

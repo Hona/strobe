@@ -131,6 +131,6 @@ pub fn launch(spec: &Spec, home: &Path, fresh: bool, window: &Window, cpus: Opti
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let (child, profile) = launching.done();
-    let browser = Browser { cdp, ws, child, pid, profile, fresh, exe: PathBuf::from(&spec.run), version, window: window.clone() };
+    let browser = Browser { cdp, ws, child, pid, profile, fresh, exe: PathBuf::from(&spec.run), version, window: window.clone(), embedded: false };
     Ok((browser, Started { epoch_ms: epoch, output: Some(rx), main: None }))
 }

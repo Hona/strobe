@@ -297,6 +297,10 @@ pub struct Deep {
     /// Samples left out of `stacks`, by why (macOS: a thread waiting or inside the kernel).
     #[serde(default)]
     pub dropped: std::collections::BTreeMap<String, u64>,
+    /// Processes of the target's set the sampler gave no stacks of, with why (macOS `sample`: one
+    /// macOS will not let it examine, such as a system XPC service doing the app's web content).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unsampled: Vec<(u32, String)>,
     /// Sampled from strobe's own process without the helper (`probe::suspend`): what it cost.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub suspend: Option<SuspendStats>,

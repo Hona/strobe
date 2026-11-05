@@ -80,6 +80,12 @@ impl Native {
         host::process_set(self.pid, Some(&self.home))
     }
 
+    /// macOS: why this app bundle's XPC services are not in its process set, when its launch did not
+    /// make it its own responsible process (`host::spawn::Owned::unattributed`).
+    pub fn unattributed(&self) -> Option<String> {
+        self.child.as_ref()?.unattributed.clone()
+    }
+
     /// The process's exit code, once it has exited (it is not reaped before `close`).
     pub fn exited(&mut self) -> Option<i32> {
         self.child.as_mut()?.exited()

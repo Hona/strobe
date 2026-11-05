@@ -331,6 +331,13 @@ export default bench({
 - Where no driver reaches (no accessibility tree, a native Wayland window, a state only the app's CLI or files set), drive the copy through its own CLI or files:
   - `ctx.home`, `ctx.env` and `ctx.exe` name its private home, environment and executable (`Bun.spawnSync([ctx.exe, "window", "show"], { env: ctx.env })`).
 
+### Webview apps
+
+- An app that embeds the OS's webview (WebView2 on Windows) is `webview("my-app")` (a profile with `kind: "webview"`) or `webview("C:/…/app.exe")`.
+  - Launched isolated like an Electron app; strobe opens the webview's debugging port through its environment, with no change to the app.
+  - `page` and every page metric work as on `app()` targets; CPU and memory cover the app and its webview processes.
+  - Linux (WebKitGTK) and macOS (WKWebView): refused `EngineUnsupported` before anything launches; measure the app with `native("my-app")` through its accessibility tree.
+
 ### Locked sessions
 
 - A locked session: series that need no presenting window run anyway and say `session locked`; compare those only with locked runs. They are:
@@ -370,7 +377,7 @@ export default bench({
 - Builds that work on any commit (`--base` before a build profile existed, `--bisect`): use the standard release profile with settings in `build.env`, not a custom profile or feature.
   - Cargo: `--release` plus `CARGO_PROFILE_RELEASE_DEBUG=line-tables-only`, `CARGO_PROFILE_RELEASE_STRIP=false`, `CARGO_PROFILE_RELEASE_INCREMENTAL=false`.
 - GPU shader caches: a fresh home would make the GPU driver compile every shader again in every block (NVIDIA once burned 5 s of a 6 s run on a driver thread).
-  - `gpuCache: "warm"` (the default for `native()`, `app()` and `exe()` targets, or `"gpuCache"` in the app profile) gives each variant its own cache store.
+  - `gpuCache: "warm"` (the default for `native()`, `webview()`, `app()` and `exe()` targets, or `"gpuCache"` in the app profile) gives each variant its own cache store.
   - That store is filled by discarded warm-up blocks before the first pair, never shared with the other variant or yours.
   - `"cold"` measures a first launch after an install.
   - `record` and `record --bench` share one store per executable: the first recording of a build is cold, later ones warm (`--gpu-cache cold`).
@@ -379,6 +386,10 @@ export default bench({
 - What strobe launches is the target's whole process set: its tree plus everything started for its home (an app's detached service, a double-forked daemon).
   - It is counted in `cpu.*`, wakes and memory and ended with the target, also when a block fails early.
   - On Windows each launch is a job, so a strobe that dies takes its launches with it.
+  - On macOS it holds the XPC services the app is responsible for (a web view's web content, GPU and network processes), also for `record pid:` of an app opened from Finder.
+  - An app bundle's executable launches as its own responsible app, as from Finder: macOS asks the bundle's own permissions, not those of the app strobe runs under.
+  - A bare executable's XPC services are responsible to your terminal or daemon and are not counted: measure a web view app as its `.app` bundle.
+  - `! Unattributed` means a bundle's launch did not become its own responsible app: its numbers hold its own processes only.
 - A strobe that crashed or was killed may leave its isolated app or browser running (on Windows only what broke away from its job).
   - The next `bench`, `record` or `look` ends it by itself (it prints `ended <exe> (pid N): the strobe that launched it (pid M) is gone and left it running`).
   - Everything strobe launches carries `STROBE_HOME` and `STROBE_OWNER` in its environment, so it never touches a copy you started or a command that merely names a strobe folder.
@@ -452,7 +463,7 @@ Fewer than 6 pairs never gets a verdict.
 
 - Everything about the app under test lives in its repo's `strobe.json`:
   - `build` and `serve` for web targets
-  - `apps` profiles for Electron and native apps (`kind: "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`)
+  - `apps` profiles for Electron, webview and native apps (`kind: "webview" | "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`)
 - Strobe itself knows no product.
 - If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile.
 - strobe.json takes `//` comments and trailing commas.

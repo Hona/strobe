@@ -99,6 +99,10 @@ locations, not only PATH.
 | accessibility tree | what an app exposes to the OS's assistive technology (UI Automation on Windows, the AX API on macOS, AT-SPI on Linux): strobe finds and waits on a native app's elements through it (§13.7) |
 | calibration | The known-cost page every probe must recover (§10.3) |
 | A/A | An experiment with the same build on both sides (§10.4) |
+| implementation comparison | An experiment whose two sides are different targets of one bench file: two implementations of one app (§9.10) |
+| journey | A case run on both implementations |
+| parity gap | A journey one implementation cannot run: listed, never run or counted (§9.10) |
+| fixture | A process both sides talk to (a server with seeded data), started per block outside both process sets (§9.10) |
 
 ## 4. Repo and files
 
@@ -397,7 +401,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
-             [--unlock-wait <duration>] [--require-verdict] [--json]
+             [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--json]
 strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
@@ -474,6 +478,8 @@ it (rule 1): a block's refusal, `TailTooShort` when a block had too few of a per
 (`HighVariance`, `MultimodalDistribution`, `NotSteady`, `Background`, `StateDrift`, `DisplayOff`).
 A refused primary gives `track` no point. `report` draws nothing for it (no comparison to show): its
 blocks are in its `result.json`.
+`--base <target>[=<variant>] --head <target>[=<variant>]` (or `target:<name>…`) names two targets of
+the bench file: an implementation comparison (§9.10).
 `--head` alone is an error that suggests `--base`, `--blocks` or `--check`. `--runs` is the measured runs per
 block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
 described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
@@ -634,6 +640,7 @@ Each metric declares:
 | scale | `ratio` (compare log ratios) or `absolute` (compare differences); counts and scores are absolute, since 0 has no ratio |
 | minimum n | e.g. a percentile p needs `⌈10 / (1 − p)⌉` frames per block |
 | phase | which phases it covers; default the whole run |
+| across | how it compares between two implementations (§9.10): `compared` (the same instrument reads the same quantity on any implementation), `care` (only as a total, with a note saying what it sums on each side), `per_side` (one engine's own: kept per side, never compared across engines) |
 
 The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`. Families resolve
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
@@ -1557,7 +1564,11 @@ export default bench({
   where the app allows; `window: false` is an app with no window (a tray app).
   `webview(appIdOrPath, { home?, viewport?, gpuCache?, expect? })` is an app on the OS's webview
   (§13.8): launched as an app target, its page driven and measured over the webview's own
-  debugging port, whatever `kind` its profile names.
+  debugging port, whatever `kind` its profile names. `app()`, `exe()` and `native()` take `args`,
+  `env` and `files` (written into the home over the profile's), and every target `name` (what
+  reports call it as a side) and `cwd` (another project's strobe.json for it), §9.10.
+  `fixture(command, opts)` at the top level starts a process per block that both sides talk to
+  (§9.10).
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
@@ -1590,7 +1601,8 @@ export default bench({
   `{ title, heading, url, visible }`; strings match as substrings, RegExps as patterns, `visible`
   takes accessibility selectors for a native app and CSS selectors for a page; a block on another
   screen is refused `WrongScreen`, §10.1, and without it strobe still records what each block
-  showed, §10.2).
+  showed, §10.2), and for implementation comparisons `unsupported` (`{ <target>: "<why>" }`: a parity
+  gap) and `hero` (lead the report with this journey), §9.10.
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `waitForLine(match, { in, timeout })` (native targets: the first line matching a string or
@@ -1602,7 +1614,7 @@ home matching a glob `in`, tailed by a thread of its own every 10 ms; it resolve
 after `timeout`, default 30 s; the call registers its watch at once and then polls it, each poll
 answered at once, so strobe serves the hook's other calls meanwhile and `const saved =
 ctx.waitForLine(/saved/); await page.click(…); await saved` misses nothing and never deadlocks;
-output lines no watch waits for are dropped), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
+output lines no watch waits for are dropped), `fixture` (the block's fixture: `{ url, port, pid }`, or null, §9.10), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
 `playwright` and `mock(pattern, handler)`.
@@ -1871,6 +1883,114 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
   page or an app's own deterministic step. Two builds caught at different moments of an animation
   differ for reasons of their own.
 
+### 9.10 Implementation comparisons
+
+A side of an experiment is a target at a variant. In an A/B both sides share the bench file's target
+and differ in build; in an **implementation comparison** each side is a target of its own (a rewrite:
+an Electron app against a native one, one toolkit against another), and both run the same cases
+(**journeys**) in alternating A B / B A pairs. Blocks, pairs, looks, verdicts, `noworse`, Holm, the
+validators and the ledger work unchanged on the pair. Phase 1 (as built): sides, fixtures,
+comparability, outside-in pages; journeys with input, adapters and `expect.same` come next.
+
+- **Sides.** `--base <target>[=<variant>] --head <target>[=<variant>]`: a value whose name before `=`
+  is a target of the bench file picks that target, and `=<variant>` its build (any variant §9.5 takes:
+  `exe:…`, `app:…`, `git:…`, a folder). `target:<name>[=<variant>]` says so explicitly; a bare name
+  that is also a folder here or a git ref is a usage error that asks for `target:<name>` (or `./name`,
+  `git:name`). `=` and not `@`: `@<device>` is mesh's. Naming a target on one side only is a usage
+  error, and so is `--target` with two sides. Both sides naming one target (or `--head` alone, with
+  `--check` or `--blocks`) narrows the series to that target. The plan, `strobe plan` and MCP take
+  the same values. strobe prints what each side resolved to before it builds.
+- **Series** are case × params: each block runs its side's target, with that target's `expect` and
+  the case's over it. The label has no target; `result.json` gives `targets {base, head}` and
+  `target_kinds`. Every text names the sides by the target's `name` (default its key), never "base"/
+  "head", "before"/"this PR": the text output's header and columns, the pair lines, the PR block's
+  tables and method lines, the card's tiles.
+- **Another repository.** A target with `cwd` (a folder relative to the bench file) takes its `build`
+  and app profiles from that folder's strobe.json (its project root), for its side only; its default
+  variant is that project, built there with no harness copied into it. Without `cwd` a side's default
+  variant is the bench file's project. (A `command` target's `cwd` keeps its meaning: where its
+  command runs.)
+- **Parity gaps.** A case whose `targets` leave out a side's target, or whose `unsupported` names it
+  (`unsupported: { rewrite: "no find in session yet" }`), is a parity gap: the series is listed with the
+  side and why, its primary refused `ParityGap`, nothing runs on either side (half a journey measures
+  other work), and it never counts as better or worse. A bench with gaps exits 0; `--require-parity`
+  (for CI that guards a finished port) or `--require-verdict` makes any gap exit 4.
+- **Comparability** (`MetricDef.across`, §7.1). Between sides of one engine (two pages, two native
+  apps) every metric compares. Between engines (Chromium, native, script: `web`, `url`, `app`, `exe`
+  and `command` are Chromium), a `per_side` metric is one engine's own (`main.*`, `layout.*`, `js.*`,
+  `dom.*`, `net.*`, `canvas.*`, `cpu.renderer|gpu|browser`, `ui.*`, `span.*`, `launch.<milestone>`,
+  `frames.presented.p*`): as a primary it is a usage error before anything builds (exit 2,
+  `NotComparable: …`), as a declared secondary a row refused `NotComparable`; never tested, never a
+  default secondary or descriptive row. Its blocks' values are kept per side in the series'
+  `per_side {base, head}` (median and a Hodges–Lehmann interval over the blocks) and printed as
+  "per implementation, not compared". A `care` metric compares only as a total, and its note (what
+  it sums on each side) goes into the comparison (`care_note`) and the text output: `cpu.work`,
+  `cpu.app.total`, `cpu.wakes`, `memory.app.private`, `memory.app.host`, `gpu.vram`, `gpu.shared`,
+  `frames.presented.count`, `frames.discarded`. Every comparison of the series carries `across`.
+  `cpu.work` is a tested secondary on both sides.
+- **Fixture** (`fixture(command, { seed, env, ready, timeout })`, at the file's top level): a process
+  both sides talk to (a server with seeded data). For every block strobe makes it a fresh home (the
+  `seed` folder copied in, `{param}` placeholders allowed), a free port, starts the command by the
+  shell in the bench file's folder (`{port}`, `{home}` and `{<param>}` filled) in a group of its own
+  (`host::spawn_owned`, stamped with its own home: in neither side's process set), on strobe's own
+  CPUs, waits for `ready` (a URL that answers, else the port accepting, `timeout` default 60 s), and
+  ends it with the block; its output goes to the experiment's `fixture.log`. `{fixture.url}`
+  (`http://127.0.0.1:<port>`), `{fixture.port}` and `{fixture.pid}` are filled into the target's
+  `args`, `env`, `files` and `url` (a string that is exactly `{fixture.port}` or `{fixture.pid}`
+  becomes a number), and
+  hooks get `ctx.fixture { url, port, pid }`. A fixture works in any bench, of builds too.
+  - It runs on the CPUs the target is not pinned to, given to it at its spawn (not inherited: in the
+    daemon only the bench's thread moves there).
+  - `cpu.fixture` is the fixture's process tree's CPU per run (cycles where the OS has them), read at
+    each run's two ends, in every block with runs, declared or not.
+  - `FixtureMismatch` refuses a block whose target's process set held no established TCP connection
+    to the fixture's port after setup, at any run's start or end, or (a launch case) once the launch
+    was ready (Windows `GetExtendedTcpTable`; Linux `/proc/net/tcp`, `tcp6` and the processes'
+    descriptors; macOS each process's TCP sockets through `proc_pidfdinfo`, `TSI_S_ESTABLISHED`), or
+    where a process of the set runs one of the fixture's executables: an app that started its own
+    server. Shells and script runtimes (`node`, `bun`, `deno`, `python`, …) are left out of that
+    check, since a side may run one for anything: an interpreted fixture is checked by its
+    connections only.
+  - result.json's `fixture { command, seed, seed_sha256 (paths and contents of every seed folder
+    used), connected {base, head}, cpu_ms_per_run {base, head} }`.
+- **Same conditions** (`VariantMismatch`, §10.1, implementation rules): build command, env, engine
+  and GPU backend are the implementation and may differ. Before anything builds: the targets'
+  declared `viewport` (more than 2 device-independent pixels apart, or only one sets it), `scale`, and
+  `gpuCache` (the case's, else the target's, else its app profile's from the target's own project);
+  `strobe plan` refuses the same. Each side's app profile and guards are checked before anything
+  builds against its own project's strobe.json, as a single target's are. After each block: what the app drew in (more than 2 DIP
+  apart) or its scale against the other side's first block of the series: a native app's client
+  area from the OS, a page's viewport (`innerWidth` × `innerHeight`, `devicePixelRatio`). Not for a
+  native side on macOS, whose window list gives a window's frame with its title bar, not its content
+  (checked on air: a 640×480 page read 648×611 as a window, a Cocoa app 640×512); there the
+  declared viewports stand. Native sides also their GPU adapter and scale (`admit_setup`, across
+  the sides). One case means one launch `profile`, priority and CPU pinning for both. Not built yet: a
+  page side's `ctx.mock` (a mock one side has and the other cannot) and the GPU adapter of a page side.
+- **Pages from outside.** A timed block of a page or Electron side against a native or script side
+  measures it as a native app is measured (§13.6): no Chromium trace, runs and phases on strobe's host
+  clock (no `performance.mark`, no wait for the page's next frame after a run), frames from the OS's
+  present events of the browser's processes (`frames.interval.*` and `frames.dropped*` refused on
+  macOS and Linux as for native apps), and `cpu.work` over the browser's process set (now on every
+  page block: CPU time per run). `Performance.getMetrics` and the JS heap are still read at run
+  boundaries (per side), outside the CPU window, which brackets the run alone (in every page block),
+  and warmup waits for the processes' CPU to hold steady. Input latency from outside needs OS input
+  to a page, which is not built yet: a declared `interaction.*` or `scroll.latency.*` is refused
+  there, and a run that sends the page input through DevTools (`click`, `type`, `press`, `scroll`,
+  `wheel`, `drag`, `down`, `up`, `hover`, `move`) is refused `InputMismatch` (setup and reset may).
+- **macOS.** A page or Electron side's window is brought to the front (as a native block's, after a
+  minute without input) and must be the active app and uncovered at the start and end of the runs
+  (`WindowHidden`, which a bench waits out), so both sides run as the key window.
+- **result.json** (`schema/result.v1.json`): `comparison` (`builds` | `implementations`),
+  `variants[].{name, target, target_kind, engine, repo, process_set {median_count, by_program}}`,
+  `fixture`, `fairness { window {client_dip, scale, display, hz}, adapter, input, frames, gpu_cache,
+  priority, observer {base, head, reads_per_run} }`, `scoreboard` (filled by the scoreboard work),
+  and per series `hero` (the case's `hero: true`), `targets`, `target_kinds`, `adapted`,
+  `equivalence`, `per_side`, and for a gap `gap { side, name, missing, reason }`. Roles stay `base`
+  and `head`; the ledger's identity is `<target>=<build>` per side.
+- **Checked** (phase 1): vps (Linux VM) and adais (Windows, locked) with a windowless planted-work
+  app as two targets and a copy of it as the fixture; air (macOS) with two copies of a native app.
+  Numbers in §24.2.
+
 ## 10. Validity
 
 ### 10.1 Validators (refuse, exit 4)
@@ -1888,7 +2008,11 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
-| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
+| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block) |
+| `FixtureMismatch` | a block's target held no TCP connection to the bench file's fixture at any run's start or end, or one of its processes runs the fixture's executable (it started its own server), §9.10 |
+| `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10) |
+| `InputMismatch` | a run of a page measured from outside against a native implementation sends input through DevTools, where the other side would get OS input or none (§9.10) |
+| `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`): the series' primary, nothing run; the bench still exits 0 |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. A start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
@@ -2845,7 +2969,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | Signal | Windows | Linux | macOS |
 |---|---|---|---|
 | process CPU (`cpu.work`, `cpu.app.total`) | `QueryProcessCycleTime` over the cycle clock (below): the performance counter times the kernel's cycle factor from Windows 11 24H2, else the TSC on x64 (process times move in 15.6 ms ticks: an idle 5 s run read 0, 0.31% or 0.62% and nothing between) | the process's CPU clock (`clock_gettime` on `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`): ns, every thread live or exited, no permission needed; `/proc/<pid>/stat` only for names and parents | `proc_pid_rusage` user + system time (Mach time, charged at every context switch); this user's processes |
-| process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
+| process memory (`memory.app.private`) | private commit (`PagefileUsage`) | `smaps_rollup` private clean + dirty + swap (`statm` resident − shared for `top`'s every process); `memory.app.pss`: its `Pss` summed over the set, each shared page split between the processes that map it (refused `NotOnThisOs` elsewhere) | physical footprint (`ri_phys_footprint`, Activity Monitor's Memory: dirty private, compressed, GPU allocations) |
 | memory by what holds it (`memory.app.host`, `query memory`, §8.6) | `VirtualQueryEx` walk of committed regions (type, protection, `GetMappedFileName`), `PROCESS_MEMORY_COUNTERS_EX2` | `/proc/<pid>/smaps` | refused: another process's regions need its task port (debuggers only) |
 | threads (`cpu.wakes`, `query threads`) | `NtQuerySystemInformation`: context switches per thread; names by `GetThreadDescription`, CPU by `QueryThreadCycleTime` | `/proc/<pid>/task/<tid>/schedstat`: times switched in to run (the same count) and exact CPU ns; names from `comm` | per process only: `proc_taskinfo.pti_csw` (live and exited threads; one `(whole process)` row). Per thread: CPU and names (`PROC_PIDTHREADID64INFO`: any same-user process, no permission; `task_threads` would need `task_for_pid`, which is root's), no wakes: no public per-thread switch count exists (`thread_info`, `PROC_PIDTHREADINFO` and `PROC_PIDTHREADCOUNTS` carry CPU time, scheduling state, cycles and energy; `getrusage` switches are the caller's own); the kernel's scheduler trace (kdebug through `ktrace`) has them for root only, not built |
 | per-core load, frequency | busy: idle cycles against the cycle clock each tick (PDH at 100 ms is clock-tick noise); frequency (`% Processor Performance`) and utility: PDH Processor Information once a second | busy: `/proc/stat` idle + iowait (10 ms ticks, unbiased over a run); frequency: `cpuinfo_avg_freq` (APERF/MPERF average, kernel 6.13+) against the base frequency, else none (an instantaneous `scaling_cur_freq` is not an average) | busy: `host_processor_info` ticks (10 ms); frequency: none (IOReport's P-state residency is not built) |
@@ -3875,6 +3999,23 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   runner's CPUs for the bench, and the native speed check widens it for its own thread. The CLI refuses
   flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
   their types from that table (§17).
+- Implementation comparisons, phase 1 (§9.10): sides, per-target projects, fixtures, comparability,
+  pages from outside, parity gaps. Not built yet: journeys with input (OS input to pages, `ui`
+  adapters and `@name`, `expect.same`, `InputMismatch`, `NotEquivalent`, `driver.reads`,
+  `ObserverCost`), the scoreboard and its card and PR block, per-side attribution, tracking. Checked
+  with a windowless app that spins `--work` ms every 25 ms and asks the fixture (a copy of it) once a
+  tick, 1 s runs, 8 pairs each: vps (Linux VM) A/A through two targets `+0.2% [−0.3 … +0.7]` no worse
+  (≤2%); planted 2× `+97% [+96 … +98]` and its mirror `−49%` (ln ratios +0.678 and −0.673); the tick's
+  own cost (a `--work 0` side, 2.59 ms of 82 ms) makes 2× read +96.8%, as measured. adais (Windows,
+  locked) A/A `+0.2% [−1.1 … +1.5]` no worse (≤2%), planted `+99% [+95 … +104]`, mirror `−50%`;
+  `cpu.fixture` 16.4 and 16.3 ms per run, `same`. A primary `main.work` between a native and a
+  script target exits 2 (`NotComparable`). `FixtureMismatch` on all three OSes: a side pointed at
+  port 1 (no connection) and a side that starts its own copy of the fixture's executable; no fixture
+  process outlives its block. air (macOS 27, shared and loaded): two copies of a Cocoa app as two
+  targets, launch to ready A/A `+1.1% [−1.6 … +4.0]` no worse (≤5%) at 18 pairs, the mirror
+  `underpowered`; idle `cpu.work` A/A underpowered (1.3 ms a run); a viewport or `gpuCache` on one
+  side only refuses `VariantMismatch` before anything builds. `memory.app.pss` on vps 0.56 MB beside
+  `memory.app.private` 0.50 MB for the one-process app.
 - Process sets (§13.2): a launched target's metrics, wakes, windows, present events, native stacks
   (`probe::stacks::Targets`: `probe::suspend` and `probe::perf` read the set again as they sample,
   `probe::sample` once at the start, and the helper's kernel profile gets the set from the client

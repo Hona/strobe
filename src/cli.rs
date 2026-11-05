@@ -65,6 +65,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("max-time", Value, "bench"),
     ("unlock-wait", Value, "bench"),
     ("require-verdict", Switch, "bench"),
+    ("require-parity", Switch, "bench"),
     ("plan", Switch, "bench"),
     ("effect", Number, "bench plan"),
     ("pilot", Switch, "bench plan"),
@@ -332,6 +333,8 @@ Use
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
         [--unlock-wait 2h]             (a series that needs a presenting window waits at most that long for an unlock)
         --filter: case names, comma-separated; exact unless a name holds * (a glob)
+        --base <target>[=<variant>] --head <target>[=<variant>]: two targets of the file compared (two
+                                  implementations of one app); target:<name> when a folder or ref has that name
                                   run an experiment; a verdict per series
   plan <file.bench.ts> [--base <variant>] [--head <variant>] [--filter …] [--effect <pct>] [--pilot]
                                   before a bench: pairs and minutes per series from earlier runs here, builds, the slot's

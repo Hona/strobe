@@ -21,6 +21,12 @@ impl<'a> Doc<'a> {
         Doc { r, level, aa: r["plan"]["aa"] == true, id: r["id"].as_str().unwrap_or(""), series: r["series"].as_array().map(|a| a.iter().collect()).unwrap_or_default() }
     }
 
+    /// The columns' names for base and head: an implementation comparison's sides by name (SPEC
+    /// §9.10), else "Before" and "This PR".
+    pub(super) fn sides(&self) -> (String, String) {
+        side_names(self.r)
+    }
+
     /// What a reader sees: the hero line, one caution with every regression, one line per series (and
     /// a second only for untested drift or a warning about that series), at most one caveat for the
     /// report, then two drawers: Details (metrics, pairs, profiles, method under plain headings) and
@@ -467,12 +473,18 @@ impl<'a> Doc<'a> {
 
     /// Every tested metric of every series in one table.
     pub(super) fn metrics(&self) -> String {
-        let mut t = String::from("#### Metrics\n\n| Metric | Before | This PR | Change | Likely range | Verdict |\n|:---|---:|---:|---:|---:|:---|\n");
+        let (b, h) = self.sides();
+        let mut t = format!("#### Metrics\n\n| Metric | {} | {} | Change | Likely range | Verdict |\n|:---|---:|---:|---:|---:|:---|\n", cell(&b), cell(&h));
         let (mut conf_main, mut conf_rest) = (String::new(), String::new());
         let mut odd: Vec<(&Value, &Value)> = Vec::new();
         for s in &self.series {
-            if s["not_run"] == true || s["kind"] == "leak" {
-                t += &format!("{}| {} | | | | | {} |\n", self.series_cell(s, 0), if s["kind"] == "leak" { "Memory growth per run" } else { "Not run" }, cell(verdict(&s["primary"])));
+            if s["not_run"] == true || s["kind"] == "leak" || s["kind"] == "gap" {
+                let what = match s["kind"].as_str() {
+                    Some("leak") => "Memory growth per run",
+                    Some("gap") => "Not compared",
+                    _ => "Not run",
+                };
+                t += &format!("{}| {what} | | | | | {} |\n", self.series_cell(s, 0), cell(verdict(&s["primary"])));
                 continue;
             }
             for (i, c) in tested(s).into_iter().enumerate() {
@@ -504,7 +516,8 @@ impl<'a> Doc<'a> {
 
     /// The metrics measured but not tested, last: what moved in a table, what held still in a line.
     pub(super) fn also_measured(&self) -> String {
-        let mut t = String::from("| Metric | Before | This PR | Change | Likely range |\n|:---|---:|---:|---:|---:|\n");
+        let (b, h) = self.sides();
+        let mut t = format!("| Metric | {} | {} | Change | Likely range |\n|:---|---:|---:|---:|---:|\n", cell(&b), cell(&h));
         let (mut any, mut zeros, mut held) = (false, Vec::<String>::new(), Vec::<(String, String)>::new());
         let mut odd: Vec<(&Value, &Value)> = Vec::new();
         for s in &self.series {
@@ -588,7 +601,11 @@ impl<'a> Doc<'a> {
         let foreign = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "cpu.foreign.max").is_finite()));
         let frames = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "frames.n") > 0.0 && bv(p.base, "frames.interval.max").is_finite()));
         let metric = if self.multi() { "Main metric".to_string() } else { noun(all[0].0["primary"]["metric"].as_str().unwrap_or("")) };
-        let mut t = format!("#### Pairs\n\n| Pair | {}, before → this PR | Change |", cell(&metric));
+        let (b, h) = match self.r["comparison"] == "implementations" {
+            true => self.sides(),
+            false => ("before".to_string(), "this PR".to_string()),
+        };
+        let mut t = format!("#### Pairs\n\n| Pair | {}, {} → {} | Change |", cell(&metric), cell(&b), cell(&h));
         let mut sep = String::from("|:---|---:|---:|");
         if frames {
             t += " Longest frame gap |";
@@ -937,10 +954,21 @@ impl<'a> Doc<'a> {
         let (b, h) = variants(r);
         let subj = |v: &Value| v["subject"].as_str().map(|s| format!(", *{}*", cell(&no_refs(s)))).unwrap_or_default();
         let mut t = String::from("#### How it was measured\n\n");
+        let (bn, hn) = self.sides();
         if !b.is_null() {
-            t += &format!("- **Before:** {}{}\n", code(&tag(&b)), subj(&b));
+            t += &format!("- **{bn}:** {}{}\n", code(&tag(&b)), subj(&b));
         }
-        t += &format!("- **This PR:** {}{}\n", code(&tag(&h)), subj(&h));
+        t += &format!("- **{hn}:** {}{}\n", code(&tag(&h)), subj(&h));
+        if let Some(f) = r["fixture"].as_object() {
+            t += &format!(
+                "- Fixture: {}, one per block outside both process sets{}.\n",
+                code(f.get("command").and_then(Value::as_str).unwrap_or("")),
+                f.get("seed_sha256")
+                    .and_then(Value::as_str)
+                    .map(|h| format!(", seeded from {} (sha256 {})", code(f.get("seed").and_then(Value::as_str).unwrap_or("")), &h[..12.min(h.len())]))
+                    .unwrap_or_default()
+            );
+        }
         let mut hw = vec![r["env"]["os"].as_str().unwrap_or("").to_string(), short_cpu(r["env"]["cpu"].as_str().unwrap_or(""))];
         hw.push(r["gpu"]["devices"][0].as_str().unwrap_or("").to_string());
         hw.push(r["env"]["power_plan"].as_str().map(|p| format!("{p} power plan")).unwrap_or_default());

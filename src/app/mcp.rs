@@ -74,8 +74,8 @@ const TOOLS: &[Tool] = &[
         description: "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress. stop asks a running experiment to stop (at once while it waits, else after its block); resume goes on with a stopped one.",
         args: &[("file", "path to the .bench.ts file (not with stop or resume)")],
         flags: &[
-            ("head", "variant under test: a directory (default .), a git ref, url:<href>"),
-            ("base", "baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"),
+            ("head", "variant under test: a directory (default .), a git ref, url:<href>; or a target of the file, target[=variant] (target:name to disambiguate), for an implementation comparison"),
+            ("base", "baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>; or a target of the file, target[=variant]: base and head naming two targets compare two implementations"),
             ("aa", "same build on both sides (checks the method)"),
             ("check", "validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
             ("headless", "with check: page cases in a headless browser, no display needed; frame and input-latency metrics refused"),
@@ -106,6 +106,7 @@ const TOOLS: &[Tool] = &[
             ("max-time", "stop starting pairs after this long, e.g. 30m"),
             ("unlock-wait", "a series that needs a presenting window waits at most this long for an unlock (default: until unlocked), e.g. 2h"),
             ("require-verdict", "exit 5 when a series has no verdict"),
+            ("require-parity", "implementation comparisons: exit 4 when a journey is a parity gap (one side cannot run it)"),
             ("stop", "exp_… (a unique prefix works): ask that running experiment to stop; it keeps what finished"),
             ("resume", "exp_…: go on with a stopped experiment from its finished pairs"),
         ],

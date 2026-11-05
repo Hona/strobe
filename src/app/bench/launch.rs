@@ -226,6 +226,12 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         let pixels = sampler.map(joined).unwrap_or_default();
         lap("milestones", &mut steps);
+        // The launch's processes once it was ready (what its numbers summed), and whether they talk to
+        // the block's fixture by then.
+        let procs = browser.processes();
+        if let Some(f) = &ctx.fixture_running {
+            f.check(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+        }
         let mut values = BTreeMap::new();
         let ready_ms = ready_at - started_ms;
         values.insert("launch.ready".to_string(), ready_ms);
@@ -302,6 +308,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             screen: None,
             reserve: None,
             overhead: None,
+            process_set: Some(programs(&procs)),
+            fixture_connected: None,
+            client: None,
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may

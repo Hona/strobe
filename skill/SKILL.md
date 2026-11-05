@@ -41,7 +41,7 @@ strobe bench <file.bench.ts> --head <variant>
     [--pixels | --pixels-only] [--reserve-cpus auto|on|off] [--noworse 2% | metric=2%,…]
 ```
 
-- variant: a directory, a git ref, `app:<id>`, `exe:<path>`.
+- variant: a directory, a git ref, `app:<id>`, `exe:<path>`; or a target of the file, `<target>[=<variant>]`, on both sides: an implementation comparison.
   - Every variant builds and serves with head's harness (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works.
 - `--filter`: case names, comma-separated, exact unless they hold `*` (`"window-closed*"` also runs `window-closed-memory`).
   - strobe prints what runs and what it skips before building.
@@ -507,6 +507,14 @@ Fewer than 6 pairs never gets a verdict.
   - Perfetto shows a long task beside the presents it delayed, a driver thread compiling while the UI waits, and lets a person browse stacks (drag over a Callstacks track for the flame graph).
   - Numbers and verdicts still come from strobe's views (`hotspots`, `threads`, `frames`); Perfetto is for seeing and browsing.
 - **Writing the PR?** `report experiment <exp> --format pr --update-pr <n>` puts the experiment's block in the PR body, led by its result card (or paste stdout, text only).
+- **Is the rewrite faster?** One bench file, one target per implementation, the same cases (journeys) on both:
+  - `bench <file> --base original --head rewrite` (`<target>[=<variant>]`: `rewrite=git:main`, `original=exe:/path`; `target:<name>` when a folder has the name).
+  - Each target has a `name` (what every report calls it); `cwd: "../other-repo"` takes that repo's strobe.json for its builds and app profiles.
+  - Both talk to one `fixture("<server> --port {port}", { seed })`: strobe starts it per block outside both apps; pass `{fixture.url}` in the targets' `args`, `env` or `files`.
+  - Pick a primary both sides measure the same way: `cpu.work`, `run.duration`, `launch.ready`, `memory.app.private`; `main.work` or `ui.cpu` against another engine exits 2 (`NotComparable`).
+  - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case (a parity gap: listed, never run).
+  - Give the app under test its own bundle id (macOS) through its build's own config overrides, so strobe may launch it beside your installed copy (`LiveChannel`).
+  - `--noworse 5%` asks "no worse anywhere"; `--check --head <target>` runs one side's cases once.
 
 ## Every performance claim in a PR comes from strobe
 

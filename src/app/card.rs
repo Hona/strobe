@@ -438,6 +438,8 @@ struct Card {
     alt: String,
     /// One badge per series: (series label, noun, value, tone).
     badges: Vec<(String, String, String, Tone)>,
+    /// What the tiles call base and head: "before" and "this PR", or an implementation comparison's names.
+    sides: (String, String),
 }
 
 /// The same results as `--format pr`'s hero line and caution (`pr::hero`): the wins in its order and
@@ -528,7 +530,11 @@ fn build(r: &Value) -> Card {
         (Body::Tiles(tiles), parts.join("; "))
     };
     let alt = if more.is_empty() { format!("{alt}.") } else { format!("{alt}; {more}.") };
-    Card { id, subject, body, footer, more, alt, badges }
+    let sides = match super::pr::side_names(r) {
+        (b, h) if r["comparison"] == "implementations" => (b, h),
+        _ => ("before".to_string(), "this PR".to_string()),
+    };
+    Card { id, subject, body, footer, more, alt, badges, sides }
 }
 
 /// Under the calm heading (`pr::hero`'s, which it follows in order): the line on why, and the series
@@ -829,7 +835,7 @@ fn card_svg(card: &Card, theme: Theme) -> String {
             svg.text(PAD - 5.0, top + 196.0, (big, true), tone_ink(t.tone), "start", &t.amount);
             let ws = fit(&t.words, width, 52.0, false);
             svg.text(PAD, top + 292.0, (ws, false), Ink::Fg, "start", &t.words);
-            before_after(&mut svg, PAD, top + 346.0, 26.0, t, width);
+            before_after(&mut svg, PAD, top + 346.0, 26.0, t, width, &card.sides);
             strip(&mut svg, PAD, top + 378.0, width * 0.62, t, 8.0, t.tone != Tone::Plain);
             let note = if t.tally.is_empty() { String::new() } else { format!("each dot is one pair · {}", t.tally) };
             svg.text(W - PAD, top + 408.0, (20.0, false), Ink::Muted, "end", &note);
@@ -861,7 +867,7 @@ fn card_svg(card: &Card, theme: Theme) -> String {
                     svg.text(x, y, (ws, false), Ink::Fg, "start", line);
                 }
                 let y = bottom - 150.0;
-                before_after(&mut svg, x, y, if tiles.len() == 2 { 24.0 } else { 20.0 }, t, w);
+                before_after(&mut svg, x, y, if tiles.len() == 2 { 24.0 } else { 20.0 }, t, w, &card.sides);
                 strip(&mut svg, x, y + 26.0, w, t, 6.0, t.tone != Tone::Plain);
                 svg.text(x, bottom - 40.0, (18.0, false), Ink::Muted, "start", &t.tally);
             }
@@ -891,9 +897,10 @@ fn card_svg(card: &Card, theme: Theme) -> String {
     svg.end()
 }
 
-/// `before 71.4/s → this PR 7.06/s`, each part placed after the last (SVG drops edge spaces).
-fn before_after(svg: &mut Svg, x: f32, y: f32, size: f32, t: &Tile, width: f32) {
-    let parts = [("before", Ink::Muted, false), (t.before.as_str(), Ink::Fg, false), ("→", Ink::Muted, false), ("this PR", Ink::Muted, false), (t.after.as_str(), Ink::Fg, true)];
+/// `before 71.4/s → this PR 7.06/s` (or the sides' names), each part placed after the last (SVG drops
+/// edge spaces).
+fn before_after(svg: &mut Svg, x: f32, y: f32, size: f32, t: &Tile, width: f32, sides: &(String, String)) {
+    let parts = [(sides.0.as_str(), Ink::Muted, false), (t.before.as_str(), Ink::Fg, false), ("→", Ink::Muted, false), (sides.1.as_str(), Ink::Muted, false), (t.after.as_str(), Ink::Fg, true)];
     let gaps = [0.3, 0.6, 0.6, 0.3, 0.0];
     // The advance, not the ink: the glyphs' box between two visible stand-ins.
     let advance = |text: &str, size: f32, bold: bool| measure(&format!("|{text}|"), size, bold) - measure("||", size, bold);

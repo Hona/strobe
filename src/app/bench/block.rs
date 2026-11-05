@@ -66,27 +66,61 @@ impl Warmup {
     }
 }
 
+/// A run's count that is the fixture's CPU (ms), not the bench file's: `cpu.fixture`.
+pub(super) const FIXTURE_CPU: &str = "\u{1}cpu.fixture";
+
 /// The bench file's `ctx.count` and `ctx.phase` during a block: they count only inside a run, whose
-/// key (`run:<i>`) names its phase marks.
+/// key (`run:<i>`) names its phase marks. With a fixture, its CPU over each run, and whether the
+/// target's processes hold a connection to it at each run's start and end (outside the run).
 #[derive(Default)]
-pub(super) struct Hooks {
+pub(super) struct Hooks<'a> {
     run: RefCell<String>,
     counts: RefCell<BTreeMap<String, f64>>,
     /// Phase edges on the host clock, for targets strobe times itself (native, script).
     marks: RefCell<Vec<(String, u64)>>,
+    fixture: Option<FixtureHook<'a>>,
+    /// The fixture's CPU at the run's start.
+    fixture_at: Cell<Option<CpuAt>>,
 }
 
-impl Hooks {
+/// The block's fixture, and how to list the target's processes now.
+type FixtureHook<'a> = (std::rc::Rc<super::fixture::Running>, Box<dyn Fn() -> Vec<u32> + 'a>);
+
+/// A tree's CPU reading (`script::cpu`) and when it was taken.
+type CpuAt = ((u64, Option<u64>), Instant);
+
+impl<'a> Hooks<'a> {
+    /// A block's hooks; `pids` lists the target's processes for the fixture's connection check.
+    pub(super) fn new(ctx: &Ctx, pids: impl Fn() -> Vec<u32> + 'a) -> Hooks<'a> {
+        Hooks { fixture: ctx.fixture_running.clone().map(|f| (f, Box::new(pids) as Box<dyn Fn() -> Vec<u32> + 'a>)), ..Hooks::default() }
+    }
+
+    /// Reads whether the target holds a connection to the block's fixture (after setup).
+    pub(super) fn check_fixture(&self) {
+        if let Some((f, pids)) = &self.fixture {
+            f.check(&pids());
+        }
+    }
+
     /// A run starts: what it counts and marks starts empty.
     pub(super) fn begin(&self, key: &str) {
         *self.run.borrow_mut() = key.to_string();
         self.counts.borrow_mut().clear();
         self.marks.borrow_mut().clear();
+        if let Some((f, pids)) = &self.fixture {
+            f.check(&pids());
+            self.fixture_at.set(Some((f.cpu(), Instant::now())));
+        }
     }
 
     /// The run ended: from here nothing counts.
     pub(super) fn end(&self) {
         self.run.borrow_mut().clear();
+        if let (Some((f, pids)), Some((a, at))) = (&self.fixture, self.fixture_at.take()) {
+            let ms = super::script::cpu_ms(a, f.cpu(), at.elapsed().as_secs_f64() * 1e3);
+            self.counts.borrow_mut().insert(FIXTURE_CPU.into(), ms);
+            f.check(&pids());
+        }
     }
 
     pub(super) fn in_run(&self) -> bool {
@@ -95,7 +129,7 @@ impl Hooks {
 
     /// `ctx.count(name, n)`; outside a run it counts nothing.
     pub(super) fn count(&self, a: &Value) {
-        if self.in_run() {
+        if self.in_run() && a["name"] != FIXTURE_CPU {
             self.add(&BTreeMap::from([(a["name"].as_str().unwrap_or("").to_string(), a["n"].as_f64().unwrap_or(1.0))]));
         }
     }
@@ -142,6 +176,10 @@ pub(super) type Hooked<'a> = (&'a BTreeMap<String, f64>, &'a [(String, u64)]);
 /// run's counts and host-clock phase marks (`phase_ms`).
 pub(super) fn per_run_hooks(s: &Series, key: &dyn Fn(usize) -> String, runs: &[Hooked]) -> BTreeMap<String, BTreeMap<String, f64>> {
     let mut extra = BTreeMap::new();
+    // The fixture's CPU per run, whether declared or not: result.json's fixture says it per side.
+    if runs.iter().any(|(c, _)| c.contains_key(FIXTURE_CPU)) {
+        extra.insert("cpu.fixture".to_string(), runs.iter().enumerate().filter_map(|(j, (c, _))| Some((key(j), *c.get(FIXTURE_CPU)?))).collect());
+    }
     for m in declared_metrics(s) {
         if let Some(name) = m.strip_prefix("count.") {
             extra.insert(m.clone(), runs.iter().enumerate().map(|(j, (c, _))| (key(j), c.get(name).copied().unwrap_or(0.0))).collect());

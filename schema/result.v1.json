@@ -24,19 +24,72 @@
     "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache." },
     "identity": { "type": ["object", "null"], "description": "What makes two experiments the same comparison (SPEC 14.2)." },
     "ledger": { "type": ["object", "null"], "description": "The other experiments on the same variants (SPEC 14.2)." },
+    "comparison": {
+      "enum": ["builds", "implementations"],
+      "description": "builds: both sides are builds of one target (an A/B). implementations: each side is a target of its own (SPEC 9.10); every text names the sides by variants[].name, never before/after."
+    },
     "variants": {
       "type": "array",
       "items": {
         "type": "object",
         "properties": {
           "role": { "enum": ["base", "head"] },
+          "name": { "type": "string", "description": "What reports call this side: the target's name (implementations), else the variant's label." },
+          "target": { "type": ["string", "null"], "description": "implementations: the bench file's target this side runs." },
+          "target_kind": { "type": ["string", "null"], "description": "web, url, app, exe, command, script or native." },
+          "engine": { "enum": ["chromium", "native", "script", null], "description": "What the target runs on: metrics of class per_side compare only between sides of one engine." },
+          "repo": { "type": ["string", "null"], "description": "The target's own project (its cwd's strobe.json root), when it is not the bench file's." },
           "spec": { "type": "string" },
           "label": { "type": "string" },
           "subject": {},
           "kind": { "enum": ["dir", "git", "url", "app", "exe"] },
           "commit": { "type": ["string", "null"] },
-          "dirty": {}
+          "dirty": {},
+          "process_set": {
+            "type": ["object", "null"],
+            "description": "The processes the side's metrics summed over, at the last timed block's end: the median count over its blocks and the count per program name.",
+            "properties": { "median_count": { "type": "number" }, "by_program": { "type": "object", "additionalProperties": { "type": "integer" } } }
+          }
         }
+      }
+    },
+    "fixture": {
+      "type": ["object", "null"],
+      "description": "The bench file's fixture(): one process per block that both sides talk to, outside both process sets (SPEC 9.10).",
+      "properties": {
+        "command": { "type": "string" },
+        "seed": { "type": ["string", "null"] },
+        "seed_sha256": { "type": ["string", "null"], "description": "A hash of the seed folder's paths and contents." },
+        "connected": { "type": "object", "description": "Per role: every block's process set held a TCP connection to the fixture's port.", "properties": { "base": { "type": ["boolean", "null"] }, "head": { "type": ["boolean", "null"] } } },
+        "cpu_ms_per_run": { "type": "object", "description": "Per role: the fixture's CPU per measured run, median over blocks (cpu.fixture).", "properties": { "base": { "type": ["number", "null"] }, "head": { "type": ["number", "null"] } } }
+      }
+    },
+    "fairness": {
+      "type": ["object", "null"],
+      "description": "implementations: what both sides shared, as measured.",
+      "properties": {
+        "window": { "type": ["object", "null"], "properties": { "client_dip": { "type": "array", "items": { "type": "number" } }, "scale": { "type": ["number", "null"] }, "display": { "type": ["string", "null"] }, "hz": { "type": ["number", "null"] } } },
+        "adapter": { "type": ["string", "null"] },
+        "input": { "enum": ["os", "none"], "description": "os: both sides got OS input; none: the runs sent no input." },
+        "frames": { "type": ["string", "null"], "description": "Where frames came from on both sides (the OS present source), or null without frames." },
+        "gpu_cache": { "enum": ["warm", "cold", "os", null], "description": "os: the OS keeps the GPU shader caches per app where no launch can move them (macOS), shared by both sides." },
+        "priority": { "type": ["string", "null"] },
+        "observer": { "type": ["object", "null"], "properties": { "base": { "type": "string" }, "head": { "type": "string" }, "reads_per_run": { "type": "object" } } }
+      }
+    },
+    "scoreboard": {
+      "type": ["object", "null"],
+      "description": "implementations: the journeys' primaries as a family (SPEC 9.10).",
+      "properties": {
+        "journeys": { "type": "integer" },
+        "compared": { "type": "integer" },
+        "better": { "type": "integer" },
+        "same": { "type": "integer" },
+        "worse": { "type": "integer" },
+        "unclear": { "type": "integer" },
+        "gaps": { "type": "integer" },
+        "family": { "type": "string", "description": "How the count is corrected across journeys (holm)." },
+        "all_no_worse": { "type": ["boolean", "null"], "description": "--noworse: every compared journey no worse (intersection-union)." }
       }
     },
     "series": {
@@ -102,7 +155,11 @@
         "NotOnThisOs",
         "NotForTarget",
         "ResetIncomplete",
-        "EngineUnsupported"
+        "EngineUnsupported",
+        "FixtureMismatch",
+        "NotComparable",
+        "ParityGap",
+        "InputMismatch"
       ]
     },
     "verdictKind": {
@@ -144,7 +201,20 @@
         "needed_pairs": { "type": ["integer", "null"] },
         "exact": { "const": true, "description": "A stable counter, compared exactly." },
         "noworse": { "type": "number", "description": "The no-worse margin." },
-        "refusal": { "$ref": "#/definitions/refusal", "description": "When verdict_kind is refused: the validator and why." }
+        "refusal": { "$ref": "#/definitions/refusal", "description": "When verdict_kind is refused: the validator and why." },
+        "across": { "enum": ["compared", "care", "per_side"], "description": "implementations: the metric's comparability class (SPEC 7.1); per_side never reaches a comparison (refused NotComparable when declared)." },
+        "care_note": { "type": "string", "description": "across care: what the number sums on each side, printed wherever it is." },
+        "p_repeated": { "type": ["number", "null"], "description": "implementations, primary: the p-value adjusted for the series' sequential looks." },
+        "holm_decided": { "type": ["boolean", "null"], "description": "implementations, primary: still decided after Holm across the journeys." }
+      }
+    },
+    "perSide": {
+      "description": "implementations: a per_side metric's blocks on one side: their median and a Hodges-Lehmann interval over them. Never compared.",
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["median", "unit"],
+        "properties": { "median": { "type": "number" }, "lo": { "type": ["number", "null"] }, "hi": { "type": ["number", "null"] }, "unit": { "type": "string" }, "n": { "type": "integer" } }
       }
     },
     "leakPrimary": {
@@ -273,7 +343,22 @@
         "log": { "type": "array", "items": { "type": "string" } },
         "log_path": { "type": "string" },
         "session_locked": { "type": "boolean" },
-        "screen": { "type": ["object", "null"] }
+        "screen": { "type": ["object", "null"] },
+        "hero": { "type": "boolean", "description": "implementations: the case says hero: true." },
+        "targets": { "type": ["object", "null"], "description": "implementations: the target each side ran (base, head)." },
+        "target_kinds": { "type": ["object", "null"], "description": "implementations: each side's target kind (base, head)." },
+        "adapted": { "enum": ["selectors", "steps", null], "description": "implementations: how the journey maps onto each side (phase 2)." },
+        "equivalence": { "type": "array", "description": "implementations: expect.same checks (phase 2): selector, base, head, ok, pairs." },
+        "per_side": {
+          "type": ["object", "null"],
+          "description": "implementations: per_side metrics per role, never compared.",
+          "properties": { "base": { "$ref": "#/definitions/perSide" }, "head": { "$ref": "#/definitions/perSide" } }
+        },
+        "gap": {
+          "type": ["object", "null"],
+          "description": "implementations: a journey one side cannot run (a parity gap): nothing ran, its primary is refused ParityGap.",
+          "properties": { "side": { "enum": ["base", "head"] }, "name": { "type": "string", "description": "That side's name." }, "missing": { "type": ["string", "null"] }, "reason": { "type": "string" } }
+        }
       }
     }
   }

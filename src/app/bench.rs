@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod block;
+mod fixture;
 mod launch;
 mod native;
 pub mod plan;
@@ -127,6 +128,25 @@ struct Series {
     expect: Value,
     /// The case's `gpuCache` (`warm` or `cold`), over its target's and its app profile's.
     gpu_cache: Option<String>,
+    /// The case's own `expect`, which each side's target's adds to (`expect` is the merge for `target`).
+    case_expect: Value,
+    /// An implementation comparison (SPEC §9.10): the base's and the head's targets. The series is
+    /// case × params; each block runs its side's target (`side_series`).
+    sides: Option<(String, String)>,
+    /// A parity gap: the side that cannot run this journey (its role) and why. Nothing runs.
+    gap: Option<(&'static str, String)>,
+    /// The case says `hero: true`: reports lead with it when it is decided.
+    hero: bool,
+    /// The sides run on different engines: metrics of one engine (`Across::PerSide`) are kept per side
+    /// and never compared.
+    cross_engine: bool,
+}
+
+impl Series {
+    /// A metric this series keeps per side instead of comparing (SPEC §9.10).
+    fn per_side(&self, metric: &str) -> bool {
+        self.cross_engine && model::metric(metric).is_some_and(|d| d.across == model::Across::PerSide)
+    }
 }
 
 impl Series {
@@ -141,7 +161,8 @@ impl Series {
     }
 
     fn label(&self) -> String {
-        let mut s = format!("{} · {}", self.case, self.target);
+        // An implementation comparison's series is the journey: its sides name the targets.
+        let mut s = if self.sides.is_some() { self.case.clone() } else { format!("{} · {}", self.case, self.target) };
         for (k, v) in &self.params {
             s += &format!(" · {k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
         }
@@ -176,6 +197,27 @@ struct Variant {
     state: Option<String>,
     /// When a build found the directory changed since then (`VariantChanged`).
     changed: Vec<String>,
+    /// An implementation comparison's side: the bench file's target it runs (`--base <target>[=<variant>]`).
+    target: Option<String>,
+    /// What every text calls this side: its target's `name`, else the target's key; the label otherwise.
+    name: String,
+}
+
+impl Variant {
+    /// The target this variant's blocks run: its side's own, else the series'.
+    fn target_of<'a>(&'a self, s: &'a Series) -> &'a str {
+        self.target.as_deref().unwrap_or(&s.target)
+    }
+}
+
+/// What a target runs on. Metrics that are a browser engine's own (`Across::PerSide`) compare only
+/// between sides of one engine.
+fn engine(kind: &str) -> &'static str {
+    match kind {
+        "native" => "native",
+        "script" => "script",
+        _ => "chromium",
+    }
 }
 
 /// A checkout's commit and a hash of its uncommitted changes to tracked files: what a build of it reads.
@@ -242,7 +284,8 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
     }
     const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan"];
     let flags: serde_json::Map<String, Value> = args.to_json()["flags"].as_object().into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
-    let mut ids: Vec<String> = variants.iter().map(|v| variant_identity(v, project, config)).collect();
+    // An implementation comparison's side is its target at a build: both are its identity.
+    let mut ids: Vec<String> = variants.iter().map(|v| format!("{}{}", v.target.as_deref().map(|t| format!("{t}=")).unwrap_or_default(), variant_identity(v, project, config))).collect();
     if ids.len() == 1 {
         ids.insert(0, ids[0].clone());
     }
@@ -374,6 +417,97 @@ struct Block {
     /// What strobe itself cost over the runs.
     #[serde(skip_serializing_if = "Option::is_none")]
     overhead: Option<Overhead>,
+    /// The target's processes at the end of the runs, by program name: what its metrics summed over.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    process_set: Option<BTreeMap<String, u32>>,
+    /// With a fixture: whether the target's processes held a connection to it (None: not read).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    fixture_connected: Option<bool>,
+    /// The main window's client area after the runs, in device-independent pixels, and its scale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client: Option<[f64; 3]>,
+}
+
+/// A window's client area in device-independent pixels, and its scale.
+fn client_of(w: &host::TopWindow) -> [f64; 3] {
+    let sc = w.scale();
+    [(w.client.0 as f64 / sc).round(), (w.client.1 as f64 / sc).round(), sc]
+}
+
+/// `VariantMismatch` when the two sides of an implementation comparison showed different windows: a
+/// client area more than 2 device-independent pixels apart, or another scale (SPEC §9.10). A
+/// difference there is not the implementation.
+fn admit_window(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()> {
+    let Some(mine) = b.client.filter(|_| ctx.implementations) else { return Ok(()) };
+    let other = if v.role == "base" { "head" } else { "base" };
+    if let Some(theirs) = ctx.windows.get(&format!("{}\n{other}", s.label())).copied()
+        && ((mine[0] - theirs[0]).abs() > 2.0 || (mine[1] - theirs[1]).abs() > 2.0 || (mine[2] - theirs[2]).abs() > 0.01)
+    {
+        return Err(Error::refused(
+            "VariantMismatch",
+            format!("{}'s window showed {}×{} at scale {}, the other side's {}×{} at scale {}", v.name, mine[0], mine[1], mine[2], theirs[0], theirs[1], theirs[2]),
+            "give both targets the same viewport (and let both apps take it): an implementation comparison varies the app, not its window",
+        ));
+    }
+    ctx.windows.insert(format!("{}\n{}", s.label(), v.role), mine);
+    Ok(())
+}
+
+/// Program names and counts of a target's processes.
+fn programs(procs: &[host::ProcTimes]) -> BTreeMap<String, u32> {
+    let mut by = BTreeMap::new();
+    for p in procs {
+        *by.entry(p.name.clone()).or_insert(0) += 1;
+    }
+    by
+}
+
+/// A side's process set over its timed blocks: the median count and the last block's programs.
+fn process_set_of(series: &[Value], role: &str) -> Value {
+    let sets: Vec<BTreeMap<String, u32>> = series
+        .iter()
+        .flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default())
+        .filter(|b| b["variant"] == role)
+        .filter_map(|b| serde_json::from_value(b["process_set"].clone()).ok())
+        .collect();
+    match sets.last() {
+        Some(last) => json!({ "median_count": metrics::median(&sets.iter().map(|s| s.values().sum::<u32>() as f64).collect::<Vec<_>>()), "by_program": last }),
+        None => Value::Null,
+    }
+}
+
+/// What both sides of an implementation comparison shared, as measured (SPEC §9.10).
+fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
+    let w = ctx.used.as_ref().unwrap_or(&ctx.window);
+    let frames = series.iter().flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default()).any(|b| b["values"]["frames.presented.count"].is_number());
+    let source = if cfg!(windows) {
+        "ETW present events"
+    } else if cfg!(target_os = "macos") {
+        "ScreenCaptureKit screen times"
+    } else {
+        "X11 Present"
+    };
+    let observer = |v: Option<&Variant>| match v.and_then(|v| v.target.as_deref()).map(|t| engine(ctx.describe["targets"][t]["kind"].as_str().unwrap_or(""))) {
+        Some("chromium") => "devtools",
+        Some("native") => "accessibility",
+        _ => "none",
+    };
+    // What the sides drew in, as measured (`Block.client`), else the window strobe asked for.
+    let measured = series.iter().flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default()).find_map(|b| serde_json::from_value::<[f64; 3]>(b["client"].clone()).ok());
+    let (client, scale) = match measured {
+        Some(c) => (json!([c[0], c[1]]), json!(c[2])),
+        None => (json!([w.width, w.height]), json!(w.scale)),
+    };
+    let gpu_cache = ctx.gpu_cache.values().next().map(|n| n.split(':').next().unwrap_or("").to_string());
+    json!({
+        "window": { "client_dip": client, "scale": scale, "display": Value::Null, "hz": host::refresh_at(w.x + 20, w.y + 20) },
+        "adapter": ctx.gpu["devices"].as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
+        "input": "none",
+        "frames": frames.then_some(source),
+        "gpu_cache": gpu_cache,
+        "priority": ctx.qos.clone().unwrap_or_else(|| "normal".into()),
+        "observer": { "base": observer(variants.iter().find(|v| v.role == "base")), "head": observer(variants.iter().find(|v| v.role == "head")), "reads_per_run": {} },
+    })
 }
 
 /// What an experiment does, decided from its flags before anything runs and never changed.
@@ -566,6 +700,22 @@ struct Ctx<'a> {
     /// Per series, variant and moment, the first block's screen and hash: a thumbnail is kept for it
     /// and for blocks that showed something else (`shown`).
     shown_seen: BTreeMap<String, (String, Option<u64>)>,
+    /// Base and head run different targets of the bench file (SPEC §9.10).
+    implementations: bool,
+    /// ... and on different engines: one engine's own metrics are not compared, and Chromium sides are
+    /// measured from outside as a native app is (`outside_in`).
+    cross_engine: bool,
+    /// The bench file's `fixture()`: started for every block, outside the target's process set.
+    fixture: Option<fixture::Spec>,
+    /// Targets with a `cwd` of their own: that project's root and strobe.json, for their builds and app
+    /// profiles (`as_side`).
+    projects: BTreeMap<String, (PathBuf, Value)>,
+    /// The fixture of the block that runs now (`any_block`), for its hooks.
+    fixture_running: Option<std::rc::Rc<fixture::Running>>,
+    /// Per series and side, the window its first block showed (`admit_window`).
+    windows: BTreeMap<String, [f64; 3]>,
+    /// The CPUs the target is not pinned to (the runner's): a fixture runs there.
+    runner_pin: Option<u64>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -933,6 +1083,13 @@ pub fn run(args: &Args) -> Result<Output> {
         saved: RESUMED.with(|r| r.borrow_mut().take()).unwrap_or_else(|| json!({ "args": args.to_json(), "series": {} })),
         eta_after: BTreeMap::new(),
         shown_seen: BTreeMap::new(),
+        implementations: false,
+        cross_engine: false,
+        fixture: None,
+        projects: BTreeMap::new(),
+        fixture_running: None,
+        windows: BTreeMap::new(),
+        runner_pin,
     };
     // What `--resume` needs from another folder: the bench file and directory variants as full paths.
     ctx.saved["args"]["pos"] = json!([file]);
@@ -951,10 +1108,24 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         progress(text);
     }
-    let series = expand(&ctx.describe, args)?;
+    let (series, mut variants) = series_and_sides(&ctx.describe, args, base_spec.as_deref(), &head_spec, &project, &config)?;
     if series.is_empty() {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
+    ctx.projects = target_projects(&ctx.describe)?;
+    ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
+    if ctx.implementations {
+        for v in &variants {
+            let t = v.target.as_deref().unwrap_or("");
+            progress(format!("{:<5} {}: target {t} ({}) at {}", v.role, v.name, ctx.describe["targets"][t]["kind"].as_str().unwrap_or("?"), v.label));
+        }
+        implementation_preflight(&ctx.describe, &series, &variants, &config, &ctx.projects)?;
+        ctx.cross_engine = {
+            let kinds: Vec<&str> = variants.iter().filter_map(|v| v.target.as_deref()).map(|t| engine(ctx.describe["targets"][t]["kind"].as_str().unwrap_or(""))).collect();
+            kinds[0] != kinds[1]
+        };
+    }
+    ctx.fixture = fixture::Spec::from(&ctx.describe)?;
     if busy > 0.10 {
         ctx.warnings.push(validity::warn("Background", format!("{:.0}% of all CPUs were busy before the run; close heavy apps for tighter intervals", busy * 100.0)));
     }
@@ -992,11 +1163,7 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         Some(_) => {}
     }
-    let mut variants = match &base_spec {
-        Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
-        None => vec![resolve_variant("head", &head_spec, &project, &config)?],
-    };
-    preflight(&series, &ctx.describe, &variants, &config, ctx.headless)?;
+    preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
@@ -1050,15 +1217,18 @@ pub fn run(args: &Args) -> Result<Output> {
             series_out.push(done);
             continue;
         }
+        if s.gap.is_some() {
+            let g = gap_series(s, &variants);
+            progress(format!("\n{}  not compared: {}", s.label(), g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
+            series_out.push(g);
+            continue;
+        }
         let r = match mode {
             Mode::Check => check_series(&mut ctx, s, &mut variants, &config),
             Mode::Pixels => (|| -> Result<Value> {
-                let target = ctx.describe["targets"][&s.target].clone();
                 release_machine(&mut ctx);
                 ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-                for v in variants.iter_mut() {
-                    prepare_variant(v, &target, &config, &ctx.harness, &ctx.project)?;
-                }
+                prepare_all(&mut ctx, s, &mut variants, &config)?;
                 let pixels = pixels_series(&mut ctx, s, &variants)?;
                 Ok(json!({ "label": s.label(), "case": s.case, "kind": "pixels", "pixels": pixels, "decided": pixels.as_array().is_some_and(|a| a.iter().all(|p| p["state"] == "same")) }))
             })(),
@@ -1141,6 +1311,7 @@ pub fn run(args: &Args) -> Result<Output> {
         return Ok(out);
     }
     let refresh = host::refresh_at(ctx.window.x + 20, ctx.window.y + 20);
+    let series_out_gaps = series_out.iter().filter(|s| s["kind"] == "gap").count();
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
         "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
@@ -1151,10 +1322,20 @@ pub fn run(args: &Args) -> Result<Output> {
             "estimate": estimate,
         },
         "file_repo": super::pr::repo_relative(&file.display().to_string()), "identity": ident, "ledger": ledger,
-        "variants": variants.iter().map(|v| json!({
-            "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
-            "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
-        })).collect::<Vec<_>>(),
+        "comparison": if ctx.implementations { "implementations" } else { "builds" },
+        "variants": variants.iter().map(|v| {
+            let kind = v.target.as_deref().map(|t| ctx.describe["targets"][t]["kind"].clone()).unwrap_or(Value::Null);
+            json!({
+                "role": v.role, "name": v.name, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
+                "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
+                "target": v.target, "engine": kind.as_str().map(engine), "target_kind": kind,
+                "repo": v.target.as_deref().and_then(|t| ctx.projects.get(t)).map(|(p, _)| p.display().to_string()),
+                "process_set": process_set_of(&series_out, v.role),
+            })
+        }).collect::<Vec<_>>(),
+        "fixture": ctx.fixture.as_ref().map(|f| f.summary(&series_out)),
+        "fairness": if ctx.implementations { fairness(&ctx, &variants, &series_out) } else { Value::Null },
+        "scoreboard": Value::Null,
         // The command line, for the rerun line under a PR table.
         "args": ctx.saved["args"],
         "series": series_out, "warnings": ctx.warnings, "decided": all_decided && halted.is_none(),
@@ -1182,6 +1363,10 @@ pub fn run(args: &Args) -> Result<Output> {
     if args.has("require-verdict") && !all_decided {
         out.code = 5;
     }
+    // A parity gap is listed and exits 0, unless the bench guards a finished port.
+    if (args.has("require-parity") || args.has("require-verdict")) && series_out_gaps > 0 {
+        out.code = 4;
+    }
     if let Some(h) = &halted {
         out.code = h.code;
     }
@@ -1194,9 +1379,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-    for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
-    }
+    prepare_all(ctx, s, variants, config)?;
     let started = Instant::now();
     let log_from = std::fs::metadata(&ctx.runner.log).map(|m| m.len()).unwrap_or(0);
     // Kept, so its views (`query <rec> threads`, …) can follow up on what the check showed. A Linux
@@ -1235,7 +1418,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         // profiler, and one measured run is too few to read per-run numbers from.
         let runs = ctx.args.num("runs")?.unwrap_or(5.0).max(1.0) as usize;
         let attributed = if s.launch.is_object() {
-            in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v))
+            in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| as_side(ctx, s, v, |ctx, s| launch::attribution(ctx, s, v)))
         } else {
             block_on_screen(ctx, s, v, usize::MAX, &Exec::timed(Set::Attribution, runs, true))
         };
@@ -1354,12 +1537,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
 /// A leak run (`--probes memory`, SPEC §8.6): one memory block per variant, nothing paired. Each gets
 /// growth verdicts for its post-GC JS heap and DOM nodes, and its suspects.
 fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
-    let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-    for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
-    }
+    prepare_all(ctx, s, variants, config)?;
     let n = ctx.runs;
     progress(format!("\n{}  leak run · warmup, then S0 · {n} runs · S1 · {n} runs · S2, a post-GC census after every run", s.label()));
     let series_started = Instant::now();
@@ -1405,7 +1585,7 @@ fn secondary_names(s: &Series, script: bool, rate_context: bool) -> Vec<String> 
         }
     }
     for m in DEFAULT_SECONDARIES.iter().copied().chain(script.then_some("cpu.work")) {
-        let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context);
+        let skip = names.iter().any(|n| n == m) || m == s.primary || (s.primary == "cpu.process.total" && m == "cpu.app.total") || (m == "cpu.app.total" && rate_context) || s.per_side(m);
         if !skip {
             names.push(m.to_string());
         }
@@ -1416,7 +1596,7 @@ fn secondary_names(s: &Series, script: bool, rate_context: bool) -> Vec<String> 
 /// The secondaries that will be tested after these pairs: those every block has a value of.
 fn tested_names(s: &Series, script: bool, blocks: &[Block], pairs: &[(usize, usize)], bound: f64) -> Vec<String> {
     let rate_context = !same(blocks, pairs, "run.duration", bound);
-    secondary_names(s, script, rate_context).into_iter().filter(|n| model::metric(n).is_some() && blocks.iter().all(|b| b.values.get(n).is_some_and(|v| v.is_finite()))).collect()
+    secondary_names(s, script, rate_context).into_iter().filter(|n| model::metric(n).is_some() && !s.per_side(n) && blocks.iter().all(|b| b.values.get(n).is_some_and(|v| v.is_finite()))).collect()
 }
 
 /// The fewest pairs whose exact signed-rank test can clear Holm's first step across `tests` secondaries.
@@ -1448,13 +1628,15 @@ fn checkpoint(ctx: &mut Ctx, label: &str, entry: Value) {
 /// longer than a block (NVIDIA's Vulkan cache took two 40 s launches to fill), so they repeat
 /// while the store still grew by 5% (at most 3). A launch case's discarded first launch warms too.
 /// Returns the discarded blocks and their wall time; a stop sets `halted`.
-fn warm_gpu(ctx: &mut Ctx, s: &Series, variants: &[Variant], target: &Value, halted: &mut Option<Error>) -> Result<(usize, f64)> {
+fn warm_gpu(ctx: &mut Ctx, s: &Series, variants: &[Variant], halted: &mut Option<Error>) -> Result<(usize, f64)> {
     let (mut blocks, mut ms) = (0usize, 0.0f64);
-    if !gpu_warming(ctx, s, target)? {
-        return Ok((blocks, ms));
-    }
     for v in variants.iter() {
-        if !ctx.launched.insert(format!("{}\n{}\ngpu", s.label(), v.role)) {
+        // Each side's own target (an implementation comparison's two warm separately).
+        let warming = as_side(ctx, s, v, |ctx, s| {
+            let t = ctx.describe["targets"][&s.target].clone();
+            gpu_warming(ctx, s, &t)
+        })?;
+        if !warming || !ctx.launched.insert(format!("{}\n{}\ngpu", s.label(), v.role)) {
             continue;
         }
         let store = gpu_store(&ctx.exp, v);
@@ -1521,10 +1703,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-    for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
-    }
-    unbuilt(&target, variants, &s.label())?;
+    prepare_all(ctx, s, variants, config)?;
     progress(format!("\n{}  primary {} · {n} blocks of head alone", s.label(), s.primary));
     let series_started = Instant::now();
     let waited_before = ctx.waited_ms;
@@ -1533,7 +1712,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         progress(format!("  resumed with the {} blocks it had finished", blocks.len()));
     }
     let mut halted: Option<Error> = None;
-    let (warmup_blocks, warmup_ms) = if blocks.is_empty() { warm_gpu(ctx, s, variants, &target, &mut halted)? } else { (0, 0.0) };
+    let (warmup_blocks, warmup_ms) = if blocks.is_empty() { warm_gpu(ctx, s, variants, &mut halted)? } else { (0, 0.0) };
     let unit = model::metric(&s.primary).map_or("", |d| d.unit);
     // Counter blocks (SPEC §7.5): N of them for a series of counters (or one whose primary is
     // counted apart), and for a series of both, N of the other kind whose metrics join block i.
@@ -1625,10 +1804,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
-    for v in variants.iter_mut() {
-        prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
-    }
-    unbuilt(&target, variants, &s.label())?;
+    prepare_all(ctx, s, variants, config)?;
     let bound =
         ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
     // Verdicts only at planned looks, each at a Pocock level, so looking more than once keeps the
@@ -1662,7 +1838,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if !pairs.is_empty() {
         progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
     }
-    let script = target["kind"] == "script" || is_native(&target);
+    // Outside-in CPU (`cpu.work`) is a tested secondary where the target is measured from outside: a
+    // script, a native app, and both sides of an implementation comparison.
+    let script = target["kind"] == "script" || is_native(&target) || s.sides.is_some();
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
     // Why the series ended early (a stop, or an error after some pairs), as the error to report.
@@ -1670,7 +1848,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // The primary's verdict at the look that decided it, kept while pairs continue for the secondaries.
     let mut decided_at: Option<Comparison> = None;
     // Discarded warm-up blocks and their wall time, for `plan` (SPEC §9.1).
-    let (warmup_blocks, warmup_ms) = if pairs.is_empty() { warm_gpu(ctx, s, variants, &target, &mut halted)? } else { (0, 0.0) };
+    let (warmup_blocks, warmup_ms) = if pairs.is_empty() { warm_gpu(ctx, s, variants, &mut halted)? } else { (0, 0.0) };
     // Linux's perf events never run in a timing block (SPEC §7.5): the paired loop runs on counter
     // blocks for a series of counters, or one whose primary is counted apart.
     let split = counting(s);
@@ -1761,10 +1939,13 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             looks.iter().copied().find(|&l| l >= at).unwrap_or(max_pairs)
         };
         let eta = eta(ctx, s, &blocks, &pairs, target);
+        let side = |i: usize| if ctx.implementations { variants[i].name.clone() } else { variants[i].role.to_string() };
         progress(format!(
-            "  pair {:>2}  base {:>10}  head {:>10}  {}  [{} … {}]  {} · {eta}",
+            "  pair {:>2}  {} {:>10}  {} {:>10}  {}  [{} … {}]  {} · {eta}",
             n,
+            side(0),
             fmt::value(val(&blocks[idx[0]], &s.primary), def.unit),
+            side(1),
             fmt::value(val(&blocks[idx[1]], &s.primary), def.unit),
             change(&cmp),
             bound_text(cmp.lo, &cmp, def),
@@ -1880,6 +2061,12 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut secondaries: Vec<Comparison> = Vec::new();
     for name in &names {
         let Some(d) = model::metric(name) else { continue };
+        // One engine's own measure, declared in an implementation comparison: a row that says why
+        // it is not compared (its values are in per_side).
+        if s.per_side(name) {
+            secondaries.push(refused(name, d, &not_comparable(name, d)));
+            continue;
+        }
         let (blocks, pairs) = source(name);
         if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
             // A metric the series declared that a block refused shows as refused, not as missing.
@@ -1920,7 +2107,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
-        if name == s.primary || names.iter().any(|n| n == name) {
+        if name == s.primary || names.iter().any(|n| n == name) || s.per_side(name) {
             continue;
         }
         let Some(d) = model::metric(name) else { continue };
@@ -1993,7 +2180,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         for v in variants.iter() {
             // A launch's attribution is a launch of its own, profiled from the first statement.
             let attributed = if s.launch.is_object() {
-                in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| launch::attribution(ctx, s, v))
+                in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| as_side(ctx, s, v, |ctx, s| launch::attribution(ctx, s, v)))
             } else {
                 block_on_screen(ctx, s, v, usize::MAX, &Exec::timed(Set::Attribution, ctx.runs, true))
             };
@@ -2033,7 +2220,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if pixels.as_array().is_some_and(|a| a.iter().any(|p| p["state"] != "same")) {
         warnings.push(validity::warn("PixelsDiffer", "base and head drew different pixels at a snapshot: see pixels"));
     }
-    Ok(json!({
+    let mut out = json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
@@ -2044,7 +2231,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
         "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
-    }))
+    });
+    if ctx.implementations {
+        implementation_series(ctx, s, variants, &mut out);
+    }
+    Ok(out)
 }
 
 /// Blocks and their pairs (indexes into the blocks: base, head).
@@ -2218,6 +2409,85 @@ fn refused(name: &str, def: &MetricDef, why: &Refusal) -> Comparison {
     let mut c = stats::compare(name, def, &[], 0.0, 0.95);
     c.refuse(why.clone());
     c
+}
+
+/// Why one engine's own measure is not compared between two implementations.
+fn not_comparable(name: &str, def: &MetricDef) -> Refusal {
+    Refusal::new(ValidatorId::NotComparable, format!("{name}: one engine's own measure ({}), and the sides run on different engines: kept per side, never compared", def.about))
+        .fix("compare a measure both sides take the same way (cpu.work, run.duration, launch.ready, frames from the OS)")
+}
+
+/// What an implementation comparison adds to a series (SPEC §9.10): the sides' targets, each
+/// comparison's class across implementations (with its note), and the measures kept per side.
+fn implementation_series(ctx: &Ctx, s: &Series, variants: &[Variant], out: &mut Value) {
+    let (Some(b), Some(h)) = (variants.first().and_then(|v| v.target.as_deref()), variants.get(1).and_then(|v| v.target.as_deref())) else { return };
+    out["targets"] = json!({ "base": b, "head": h });
+    out["target_kinds"] = json!({ "base": ctx.describe["targets"][b]["kind"], "head": ctx.describe["targets"][h]["kind"] });
+    out["hero"] = json!(s.hero);
+    out["adapted"] = Value::Null;
+    out["equivalence"] = json!([]);
+    let mark = |c: &mut Value| {
+        if let Some(d) = c["metric"].as_str().and_then(model::metric) {
+            c["across"] = json!(d.across.name());
+            if let Some(n) = d.across.note() {
+                c["care_note"] = json!(n);
+            }
+        }
+    };
+    mark(&mut out["primary"]);
+    for k in ["secondaries", "descriptive"] {
+        for c in out[k].as_array_mut().into_iter().flatten() {
+            mark(c);
+        }
+    }
+    if !s.cross_engine {
+        return;
+    }
+    // Per side: each per-side measure's block values, their median and a Hodges–Lehmann interval
+    // over the blocks (on a log scale when all are positive), as `--blocks` gives one build's.
+    let blocks: Vec<Block> = serde_json::from_value(out["blocks"].clone()).unwrap_or_default();
+    let mut per = json!({ "base": {}, "head": {} });
+    for role in ["base", "head"] {
+        let mine: Vec<&Block> = blocks.iter().filter(|b| b.variant == role).collect();
+        let names: std::collections::BTreeSet<&String> = mine.iter().flat_map(|b| b.values.keys()).filter(|k| s.per_side(k)).collect();
+        for name in names {
+            let xs: Vec<f64> = mine.iter().filter_map(|b| b.values.get(name).copied()).filter(|x| x.is_finite()).collect();
+            if xs.is_empty() {
+                continue;
+            }
+            let unit = model::metric(name).map_or("", |d| d.unit);
+            let (lo, hi) = match xs.len() {
+                1 => (Value::Null, Value::Null),
+                _ if xs.iter().all(|x| *x > 0.0) => {
+                    let (_, lo, hi, _) = stats::hodges_lehmann(&xs.iter().map(|x| x.ln()).collect::<Vec<_>>(), 0.95);
+                    (json!(lo.exp()), json!(hi.exp()))
+                }
+                _ => {
+                    let (_, lo, hi, _) = stats::hodges_lehmann(&xs, 0.95);
+                    (json!(lo), json!(hi))
+                }
+            };
+            per[role][name] = json!({ "median": metrics::median(&xs), "lo": lo, "hi": hi, "unit": unit, "n": xs.len() });
+        }
+    }
+    out["per_side"] = per;
+}
+
+/// A journey one side cannot run (SPEC §9.10 parity gap): listed with the side and why, never run on
+/// either side and never counted as better or worse.
+fn gap_series(s: &Series, variants: &[Variant]) -> Value {
+    let (role, why) = s.gap.clone().unwrap_or(("head", String::new()));
+    let side = variants.iter().find(|v| v.role == role);
+    let name = side.map_or(role.to_string(), |v| v.name.clone());
+    let r = Refusal::new(ValidatorId::ParityGap, format!("{name} cannot run {}: {why}", s.case)).fix("give that target the journey (or drop it from both)");
+    let mut primary = json!({ "metric": s.primary, "verdict": format!("refused (ParityGap): {}", r.summary), "verdict_kind": VerdictKind::Refused, "decided": false });
+    primary["refusal"] = json!(r);
+    let (b, h) = s.sides.clone().unwrap_or_default();
+    json!({
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "gap",
+        "targets": { "base": b, "head": h }, "hero": s.hero, "primary": primary, "decided": false, "pairs": 0, "launches": 0,
+        "gap": { "side": role, "name": name, "missing": Value::Null, "reason": why },
+    })
 }
 
 /// A block's refused metrics as result.json keeps them: `"<metric>": "<validator>: <why>"`.
@@ -2498,6 +2768,24 @@ const HIDDEN_RETRIES: u32 = 5;
 /// that keeps the CPUs busy (`Background`) for up to about an hour. The block's own checks still refuse
 /// anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    as_side(ctx, s, v, |ctx, s| on_screen(ctx, s, v, pair, x))
+}
+
+/// The series as one side runs it (SPEC §9.10): its own target, that target's `expect` with the
+/// case's over it, and the strobe.json of the target's own project (`cwd`) as `ctx.config` while `f`
+/// runs. A series of builds runs as it is, with its target's project.
+fn as_side<T>(ctx: &mut Ctx, s: &Series, v: &Variant, f: impl FnOnce(&mut Ctx, &Series) -> Result<T>) -> Result<T> {
+    let side = v.target.as_deref().filter(|t| *t != s.target).map(|t| Series { target: t.to_string(), expect: merged_expect(&ctx.describe["targets"][t], &s.case_expect), ..s.clone() });
+    let s = side.as_ref().unwrap_or(s);
+    let saved = ctx.projects.get(&s.target).map(|(_, c)| c.clone()).map(|c| std::mem::replace(&mut ctx.config, c));
+    let r = f(ctx, s);
+    if let Some(c) = saved {
+        ctx.config = c;
+    }
+    r
+}
+
+fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     // The validator that refused the block, if one did.
     let refused_by = |r: &Result<Block>| r.as_ref().err().and_then(Error::validator);
     // macOS: the app's window was covered, or the app not the active one.
@@ -2778,8 +3066,37 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
     }
 }
 
-/// One block of whatever kind the target and case are.
+/// One block, with the bench file's fixture when it has one (SPEC §9.10): started before the target
+/// launches, in its own group and home (outside the target's process set), its `{fixture.url}`,
+/// `{fixture.port}` and `{fixture.pid}` filled into the target's options and given to the hooks as
+/// `ctx.fixture`, and ended with the block. The block is refused `FixtureMismatch` when the target
+/// never held a connection to it or ran its executable.
 fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    let b = fixture_block(ctx, s, v, pair, x)?;
+    admit_window(ctx, s, v, &b)?;
+    Ok(b)
+}
+
+fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    let Some(spec) = &ctx.fixture else { return kind_block(ctx, s, v, pair, x) };
+    let running = spec.start(&s.params, &store::experiment_dir(&ctx.exp)?.join("fixture.log"), ctx.runner_pin)?;
+    let unfilled = ctx.describe["targets"][&s.target].clone();
+    ctx.describe["targets"][&s.target] = running.fill(&unfilled);
+    ctx.fixture_running = Some(running.clone());
+    let info = json!({ "url": running.url(), "port": running.port, "pid": running.pid });
+    let r = ctx.runner.call("fixture", info, Duration::from_secs(10), launch::no_page).and_then(|_| kind_block(ctx, s, v, pair, x));
+    ctx.describe["targets"][&s.target] = unfilled;
+    ctx.fixture_running = None;
+    let r = r.and_then(|mut b| {
+        b.fixture_connected = running.verdict(&v.name)?;
+        Ok(b)
+    });
+    drop(running);
+    r
+}
+
+/// One block of whatever kind the target and case are.
+fn kind_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let native = is_native(&ctx.describe["targets"][&s.target]);
     if s.launch.is_object() && native {
         native::launch(ctx, s, v, pair, x)
@@ -2988,6 +3305,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let gc = declared.iter().any(|m| *m == "main.gc");
     let gpu_compile = declared.iter().any(|m| *m == "gpu.compile");
     let canvas = declared.iter().any(|m| m.starts_with("canvas."));
+    // Against a native implementation (SPEC §9.10) a timed block measures the page from outside, as
+    // the other side is: no trace, frames from the OS's present events, runs and phases stamped on
+    // the host clock. The engine's own counters are read at run boundaries, kept per side.
+    let outside = s.cross_engine && x.measures_time() && !x.counters;
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -3067,7 +3388,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         driver.pixels = x.pixels.clone();
         // This run's `count.<name>` values (the bench file's `ctx.count` and the page's counter global)
         // and the run's key, which names its phase marks.
-        let hooks = block::Hooks::default();
+        let hooks = block::Hooks::new(ctx, || browser.processes().iter().map(|p| p.pid).collect());
         // TaskDuration (ms), then WORK_PARTS: cumulative per document (`Performance.enable` comes before the runs).
         let counters = || -> [f64; 6] {
             let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
@@ -3101,6 +3422,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 "driver" => {
                     let call = a["call"].as_str().unwrap_or("");
                     let args = a["args"].as_array().cloned().unwrap_or_default();
+                    // From outside, the other side gets OS input or none: a run's DevTools input would
+                    // reach this side by another path (SPEC §9.10). OS input to pages comes with journeys.
+                    if outside && hooks.in_run() && matches!(call, "click" | "type" | "press" | "scroll" | "wheel" | "drag" | "down" | "up" | "hover" | "move") {
+                        return Err(Refusal::new(
+                            ValidatorId::InputMismatch,
+                            format!("page.{call}() in a run of a page measured against a native implementation: it would reach the page through DevTools, the other side through the OS"),
+                        )
+                        .fix("keep input out of runs (setup and reset may use it) until OS input to pages lands; or compare two pages")
+                        .into());
+                    }
                     if call == "goto" && hooks.in_run() {
                         let before = counters();
                         let mut c = carried.borrow_mut();
@@ -3127,9 +3458,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     hooks.count(a);
                     Ok(Value::Bool(true))
                 }
-                // A page's phases are marks in its own trace, read from there with the run's frames.
+                // A page's phases are marks in its own trace, read from there with the run's frames; from
+                // outside, strobe's own marks on the host clock.
                 "phase" => {
-                    if let Some(key) = hooks.phase_key(a) {
+                    if outside {
+                        hooks.phase(a);
+                    } else if let Some(key) = hooks.phase_key(a) {
                         driver.mark(&key)?;
                     }
                     Ok(Value::Bool(true))
@@ -3181,9 +3515,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let hidden_ok = set == Set::Memory && host::session_locked();
         if !hidden_ok {
             validity::window_visible(&page)?;
+            front_page(s, &browser)?;
         }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        hooks.check_fixture();
         let start = shown::page(ctx, s, v, pair, "start", &page);
         shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
         lap("setup");
@@ -3205,7 +3541,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         .collect();
         // A counter block traces nothing: its times are dropped, and tracing would add the browser's
         // own instructions to what the counters count.
-        let tracing = if set == Set::Memory || x.counters { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
+        let tracing = if set == Set::Memory || x.counters || outside { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
+        // From outside: what reached the screen, from the OS's present events of the browser's processes.
+        let presents = outside.then(|| {
+            probe::present::PresentCapture::start().map(|mut c| {
+                c.track(&browser.processes().iter().map(|p| p.pid).collect::<Vec<_>>());
+                c
+            })
+        });
+        let run_marks: RefCell<Vec<Vec<(String, u64)>>> = RefCell::new(Vec::new());
         // A kept recording is claimed for this block alone and discarded on any error before its meta.json.
         let mut draft: Option<store::Draft> = None;
         let mem_dir = if set == Set::Memory { Some(draft.insert(store::claim_recording(&id)?).dir().to_path_buf()) } else { None };
@@ -3233,6 +3577,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
+            // As a native app is before each run (`front_page`).
+            if cfg!(target_os = "macos") && s.sides.is_some() {
+                host::raise_windows(&browser.pids());
+            }
             hooks.begin(key);
             // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
             // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between. One read of the
@@ -3253,9 +3601,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 out
             };
             let mut roles = process_roles(&browser);
-            let listed = probe::wakes::wall_us();
-            let (procs_start, cyc0, tsc0, _) = read();
-            let k0 = probe::wakes::Counters::take(listed, &procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+            // Strobe's own calls into the page (resetting its counters, its marks, the Performance
+            // domain's counters) stay outside the CPU window, which brackets the run alone: their
+            // round trips are not the run's work.
             *carried.borrow_mut() = [0.0; 6];
             if !counted.is_empty() {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
@@ -3269,21 +3617,32 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             let c0 = counters();
             driver.drags.borrow_mut().clear();
-            // strobe's own cost over the run as its trace marks bound it, from its start mark to its end mark.
+            // From outside the run is strobe's own span on the host clock, as a native app's: no page
+            // mark, and no wait for the page's next frame.
+            if !outside {
+                driver.mark(&format!("{key}:start"))?;
+            }
+            let listed = probe::wakes::wall_us();
+            let (procs_start, cyc0, tsc0, _) = read();
+            let k0 = probe::wakes::Counters::take(listed, &procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+            // strobe's own cost over the run.
             cost.start();
-            driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
-            driver.dispatch("frame", &[])?;
+            if !outside {
+                driver.dispatch("frame", &[])?;
+            }
             let t1 = host::now_ns();
-            let input = crate::driver::input_pacing(&driver.drags.take());
-            let c1 = counters();
-            driver.mark(&format!("{key}:end"))?;
             cost.end();
             let (procs_end, cyc1, tsc1, cpu1) = read();
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+            let input = crate::driver::input_pacing(&driver.drags.take());
+            let c1 = counters();
+            if !outside {
+                driver.mark(&format!("{key}:end"))?;
+            }
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
@@ -3291,12 +3650,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             take_canvas();
             run_canvas.borrow_mut().push(canvas_docs.take());
+            // The run ends before its counts are kept: a fixture's CPU over the run is one of them.
+            hooks.end();
+            run_marks.borrow_mut().push(hooks.take_marks());
             let index = run_counts.borrow().len();
             run_counts.borrow_mut().push(hooks.counts());
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
-            hooks.end();
             // A key or button the run left held would be down in the next one: let go, outside its span.
             driver.release_all()?;
             if s.reset {
@@ -3363,7 +3724,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             // The work that must hold steady is the renderer's main-thread time. `--check` measures the
             // first run: it asks whether a case works, not what it costs.
-            if warmup.after(&runs.iter().map(|r| r.task).collect::<Vec<_>>()) && !x.untimed {
+            // From outside, the work is the processes' CPU, as a native app's.
+            let work: Vec<f64> = runs.iter().map(|r| if outside { r.cpu * r.ms / 100.0 } else { r.task }).collect();
+            if warmup.after(&work) && !x.untimed {
                 if set == Set::Attribution {
                     probe::cpu::start(&page)?;
                     probe::alloc::start(&page)?;
@@ -3420,8 +3783,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // The window must have stayed visible for the whole block.
         if !hidden_ok {
             validity::window_visible(&page)?;
+            front_page(s, &browser)?;
         }
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        let pss = host::pss_bytes(&browser.processes().iter().map(|p| p.pid).collect::<Vec<_>>());
+        // What the page had to draw in: its viewport in CSS pixels (device-independent at zoom 1) and
+        // its scale, compared with the other side's content area (`admit_window`).
+        let content = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
         let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
         let dir = match (&draft, keep) {
@@ -3484,7 +3852,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         {
             ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
         }
-        let mut data = if set == Set::Memory || x.counters { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
+        let mut data = if set == Set::Memory || x.counters || outside { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
         lap("analyse");
         let mut extra = BTreeMap::new();
@@ -3492,8 +3860,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         for name in &counted {
             extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
         }
-        // `phase.<name>`: the run's phase windows from the trace's marks.
-        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")) {
+        let fixture_cpu: BTreeMap<String, f64> = (0..measured.len()).filter_map(|j| Some((key(j), *run_counts.get(first + j)?.get(block::FIXTURE_CPU)?))).collect();
+        if !fixture_cpu.is_empty() {
+            extra.insert("cpu.fixture".to_string(), fixture_cpu);
+        }
+        // `phase.<name>`: the run's phase windows from the trace's marks; from outside, strobe's own.
+        let run_marks = run_marks.into_inner();
+        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")).filter(|_| outside) {
+            let per: BTreeMap<String, f64> = (0..measured.len()).filter_map(|j| Some((key(j), phase_ms(run_marks.get(first + j)?, name))).filter(|(_, x)| x.is_finite())).collect();
+            extra.insert(format!("phase.{name}"), per);
+        }
+        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")).filter(|_| !outside) {
             let per: BTreeMap<String, f64> = (0..measured.len())
                 .filter_map(|j| {
                     let suffix = format!(":run:{}:phase:{name}", first + j);
@@ -3527,6 +3904,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
+        // The same CPU as time per run, as a native or script target's: what an implementation
+        // comparison compares on both sides.
+        extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
         let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
@@ -3570,6 +3950,35 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             canvas_gaps.sort_by(f64::total_cmp);
         }
         let mut values = metrics::block_values(&data, "run", &extra);
+        // From outside: the frames the browser's processes put on the screen during the runs, read as a
+        // native app's are (SPEC §7.4), refused with the reason where this OS cannot tell.
+        let mut outside_refused: BTreeMap<String, Refusal> = BTreeMap::new();
+        if let Some(capture) = presents {
+            let pids: Vec<u32> = browser.processes().iter().map(|p| p.pid).collect();
+            let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
+            let host_spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
+            let frame = |m: &str| ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| m.starts_with(p));
+            match capture.and_then(|c| c.stop()) {
+                Ok(p) => {
+                    let f = probe::present::frames::native_values(&p, &pids, &host_spans, display.as_ref());
+                    match &f.refused {
+                        Some(why) => outside_refused.extend(declared.iter().filter(|m| frame(m.as_str())).map(|m| (m.to_string(), native::line(why)))),
+                        None => {
+                            values.extend(f.values.clone());
+                            outside_refused.extend(declared.iter().filter_map(|m| Some((m.to_string(), native::line(f.partial.get(m.as_str())?)))));
+                        }
+                    }
+                }
+                Err(e) => outside_refused
+                    .extend(declared.iter().filter(|m| frame(m.as_str())).map(|m| (m.to_string(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {}", e.message))))),
+            }
+            // No input in the runs reached the page from the OS yet: input latency from outside is phase 2.
+            for m in declared.iter().filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
+                outside_refused.entry(m.to_string()).or_insert_with(|| {
+                    Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page is measured from outside here (against a native implementation), and OS input to a page is not built yet"))
+                });
+            }
+        }
         if canvas {
             values.insert("canvas.n".into(), canvas_gaps.len() as f64);
             if !canvas_gaps.is_empty() {
@@ -3589,6 +3998,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);
         }
+        if let Some(b) = pss {
+            values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+        }
         if let Some(v) = vram {
             values.insert("gpu.vram".into(), v);
         }
@@ -3604,10 +4016,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         let mut refused = uncounted;
         refuse_not_on_this_os(s, &mut values, &mut refused);
+        for (m, r) in outside_refused {
+            values.remove(&m);
+            refused.insert(m, r);
+        }
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         let intervals = metrics::run_intervals(&data);
-        let recording = if keep || set == Set::Memory {
+        // From outside there is no trace to keep: the block's numbers are in result.json.
+        let recording = if (keep && !outside) || set == Set::Memory {
             let mut meta = json!({
                 "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
@@ -3652,6 +4069,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             reserve: None,
             shown: Some(shown::Shown { start, end }),
             overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, ..Overhead::default() }),
+            process_set: Some(programs(&browser.processes())),
+            fixture_connected: None,
+            client: content,
         })
     })();
     lapped.set(Instant::now());
@@ -3664,6 +4084,34 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         g.check("after a block")?;
     }
     result
+}
+
+/// macOS, an implementation comparison: a page's window is measured as a native app's is (SPEC §9.10,
+/// §13.6): strobe makes its app the active one (once nobody has used the Mac for a minute) and refuses
+/// `WindowHidden` when other apps' windows cover it or it is not the active app, which a bench waits
+/// out as for a native block. A key window can cost several times an inactive one, so both sides run
+/// in that one state. Elsewhere, and for builds of one target, nothing.
+fn front_page(s: &Series, browser: &chromium::Browser) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    if s.sides.is_some() {
+        use crate::target::native::{COVERED, NOT_ACTIVE};
+        let pids = browser.pids();
+        host::raise_windows(&pids);
+        let Some(w) = host::main_window(&pids) else { return Ok(()) };
+        let why = if w.cloaked {
+            Some((Hidden::Covered, COVERED))
+        } else if !crate::target::a11y::ax::is_front(w.pid) {
+            Some((Hidden::NotActive, NOT_ACTIVE))
+        } else {
+            None
+        };
+        if let Some((hidden, why)) = why {
+            return Err(Refusal::window_hidden(hidden, format!("the browser's {why}")).fix("keep the window in front and uncovered while strobe measures").into());
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = (s, browser);
+    Ok(())
 }
 
 /// Keeps strobe itself (the driver relay, samplers, CDP) off the measured CPUs for the bench (SPEC rule
@@ -3839,32 +4287,60 @@ fn profile_of(target: &Value) -> Option<&str> {
 
 /// What a bench can tell is wrong before it waits for the slot or builds anything: an app profile that
 /// does not resolve, a guarded file strobe may not read, a `gpuCache` that is neither warm nor cold.
-fn preflight(series: &[Series], describe: &Value, variants: &[Variant], config: &Value, headless: bool) -> Result<()> {
-    for s in series {
-        let target = &describe["targets"][&s.target];
-        if headless && !matches!(target["kind"].as_str(), Some("web" | "url")) {
-            return Err(Error::usage(format!("{}: --headless runs pages in a headless browser; this target is a {} target, which opens its own window", s.label(), target["kind"].as_str().unwrap_or("?"))));
-        }
-        let apps = profile_of(target).into_iter().chain(variants.iter().filter_map(|v| if let Kind::App(id) = &v.kind { Some(id.as_str()) } else { None }));
-        let mut profiles = Vec::new();
-        for id in apps {
-            let app = isolate::app(id, config).map_err(|e| Error { message: format!("{}: {}", s.label(), e.message), ..e })?;
-            isolate::Guard::take(&app).unreadable()?;
-            profiles.push(app);
-        }
-        for app in profiles.iter().map(Some).chain(std::iter::once(None)) {
-            let mode = gpu_cache_mode(s, target, app);
-            if !matches!(mode, "warm" | "cold") {
-                return Err(Error::usage(format!("{}: gpuCache is warm or cold, not {mode}", s.label())));
+/// Each side's own target with its own project's strobe.json (an implementation comparison's two).
+fn preflight(series: &[Series], describe: &Value, variants: &[Variant], config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>, headless: bool) -> Result<()> {
+    for s in series.iter().filter(|s| s.gap.is_none()) {
+        for v in variants {
+            let name = v.target_of(s);
+            let target = &describe["targets"][name];
+            let config = projects.get(name).map_or(config, |(_, c)| c);
+            if headless && !matches!(target["kind"].as_str(), Some("web" | "url")) {
+                return Err(Error::usage(format!(
+                    "{}: --headless runs pages in a headless browser; this target is a {} target, which opens its own window",
+                    s.label(),
+                    target["kind"].as_str().unwrap_or("?")
+                )));
+            }
+            let apps = profile_of(target).into_iter().chain(if let Kind::App(id) = &v.kind { Some(id.as_str()) } else { None });
+            let mut profiles = Vec::new();
+            for id in apps {
+                let app = isolate::app(id, config).map_err(|e| Error { message: format!("{}: {}", s.label(), e.message), ..e })?;
+                isolate::Guard::take(&app).unreadable()?;
+                profiles.push(app);
+            }
+            for app in profiles.iter().map(Some).chain(std::iter::once(None)) {
+                let mode = gpu_cache_mode(s, target, app);
+                if !matches!(mode, "warm" | "cold") {
+                    return Err(Error::usage(format!("{}: gpuCache is warm or cold, not {mode}", s.label())));
+                }
             }
         }
     }
     Ok(())
 }
 
+/// The `gpuCache` a side's launches take for a series: the case's, its target's, else its app profile's
+/// (from the target's own project), default warm.
+fn side_gpu_cache(s: &Series, describe: &Value, name: &str, config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> String {
+    let target = &describe["targets"][name];
+    let config = projects.get(name).map_or(config, |(_, c)| c);
+    let profile = profile_of(target).and_then(|id| isolate::app(id, config).ok());
+    gpu_cache_mode(s, target, profile.as_ref()).to_string()
+}
+
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
 /// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
 fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
+    // The target's own `args`, `env` and `files` over the profile's.
+    let extra = |a: isolate::App| {
+        let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
+        let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
+        a.with_extra(&args, &env).with_files(&target["files"].as_object().cloned().unwrap_or_default())
+    };
+    variant_profile(v, target, config).map(extra)
+}
+
+fn variant_profile(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
     // `webview(…)` reaches the app through its webview whatever kind its profile names.
     let webview = |a: isolate::App| if target["kind"] == "webview" { a.as_kind(isolate::AppKind::Webview) } else { a };
     if let Kind::App(id) = &v.kind {
@@ -3919,9 +4395,113 @@ fn join_url(base: &str, path: &str) -> String {
     format!("{}/{}", base.trim_end_matches('/'), path.trim_start_matches('/'))
 }
 
-fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
+/// The series and the variants of a bench (or plan): `--base`/`--head` as builds of every target, or
+/// as sides that name targets (SPEC §9.10). Both sides naming different targets make an implementation
+/// comparison; one target named (by both sides, or by `--head` alone) narrows the series to it.
+fn series_and_sides(describe: &Value, args: &Args, base: Option<&str>, head: &str, project: &Path, config: &Value) -> Result<(Vec<Series>, Vec<Variant>)> {
+    let base_side = base.map(|b| side_spec(b, describe, project)).transpose()?.flatten();
+    let head_side = side_spec(head, describe, project)?;
+    if base.is_some() && base_side.is_some() != head_side.is_some() {
+        return Err(Error::usage(format!(
+            "--base {} and --head {head}: name a target of the bench file on both sides (an implementation comparison: --base <target>[=<variant>] --head <target>[=<variant>]) or on neither (builds of every target)",
+            base.unwrap_or("")
+        )));
+    }
+    let sides = match (base_side, head_side) {
+        (Some((b, _)), Some((h, _))) if b != h => Some((b, h)),
+        _ => None,
+    };
+    if sides.is_some() && args.get("target").is_some() {
+        return Err(Error::usage("--target picks targets of builds; an implementation comparison's sides name its two targets already: drop --target"));
+    }
+    let only = if sides.is_none() { head_side.map(|(t, _)| t) } else { None };
+    let series = expand(describe, args, sides, only)?;
+    let resolve = |role: &'static str, spec: &str, side: Option<(&str, Option<&str>)>| match side {
+        Some((t, v)) => resolve_side(role, t, v, describe, project, config),
+        None => resolve_variant(role, spec, project, config),
+    };
+    let mut variants = Vec::new();
+    if let Some(b) = base {
+        variants.push(resolve("base", b, base_side)?);
+    }
+    variants.push(resolve("head", head, head_side)?);
+    Ok((series, variants))
+}
+
+/// What an implementation comparison refuses before anything builds (SPEC §9.10): a primary that is
+/// one engine's own (`NotComparable`, exit 2), and sides set up unlike each other (`VariantMismatch`):
+/// another viewport or scale, another GPU shader cache mode.
+fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Variant], config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> Result<()> {
+    let (Some(b), Some(h)) = (variants[0].target.as_deref(), variants.get(1).and_then(|v| v.target.as_deref())) else { return Ok(()) };
+    let (tb, th) = (&describe["targets"][b], &describe["targets"][h]);
+    let kind = |t: &Value| t["kind"].as_str().unwrap_or("").to_string();
+    let cross = engine(&kind(tb)) != engine(&kind(th));
+    for s in series.iter().filter(|s| s.gap.is_none() && cross) {
+        if let Some(d) = model::metric(&s.primary).filter(|d| d.across == model::Across::PerSide) {
+            return Err(Error::usage(format!(
+                "NotComparable: {}'s primary {} is one engine's own measure ({}), and {} runs on {} while {} runs on {}: pick a primary both sides measure the same way, such as cpu.work, run.duration or launch.ready",
+                s.case,
+                d.name,
+                d.about,
+                variants[0].name,
+                engine(&kind(tb)),
+                variants[1].name,
+                engine(&kind(th)),
+            )));
+        }
+    }
+    let size = |t: &Value| t["viewport"].is_object().then(|| (t["viewport"]["width"].as_f64().unwrap_or(0.0), t["viewport"]["height"].as_f64().unwrap_or(0.0)));
+    let mismatch = |what: String| {
+        Error::refused(
+            "VariantMismatch",
+            format!("{} and {} {what}", variants[0].name, variants[1].name),
+            "give both targets the same window and GPU cache setup: an implementation comparison varies the app, not its window or caches",
+        )
+    };
+    match (size(tb), size(th)) {
+        (Some(x), Some(y)) if (x.0 - y.0).abs() > 2.0 || (x.1 - y.1).abs() > 2.0 => {
+            return Err(mismatch(format!("ask for different viewports ({}×{} and {}×{} device-independent pixels)", x.0, x.1, y.0, y.1)));
+        }
+        (Some(_), None) | (None, Some(_)) => return Err(mismatch(format!("do not both set a viewport (only {} does)", if size(tb).is_some() { &variants[0].name } else { &variants[1].name }))),
+        _ => {}
+    }
+    if tb["scale"].as_f64() != th["scale"].as_f64() {
+        return Err(mismatch(format!("ask for different scales ({} and {})", tb["scale"], th["scale"])));
+    }
+    for s in series.iter().filter(|s| s.gap.is_none()) {
+        let (cb, ch) = (side_gpu_cache(s, describe, b, config, projects), side_gpu_cache(s, describe, h, config, projects));
+        if cb != ch {
+            return Err(mismatch(format!("launch with different GPU shader caches for {} (gpuCache {cb} and {ch})", s.case)));
+        }
+    }
+    Ok(())
+}
+
+/// A target's `expect` with the case's keys over it.
+fn merged_expect(target: &Value, case: &Value) -> Value {
+    let mut expect = target["expect"].clone();
+    if let (Some(t), Some(c)) = (expect.as_object_mut(), case.as_object()) {
+        t.extend(c.clone());
+    } else if case.is_object() {
+        expect = case.clone();
+    }
+    expect
+}
+
+/// Why a side cannot run a case: the case runs only on other targets, or says it is `unsupported` there.
+fn side_gap(c: &Value, target: &str) -> Option<String> {
+    if let Some(why) = c["unsupported"][target].as_str() {
+        return Some(why.to_string());
+    }
+    let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
+    on.filter(|on| !on.contains(&target)).map(|on| format!("the case runs only on {}", on.join(", ")))
+}
+
+/// The series: case × target × params, or in an implementation comparison (`sides`: the base's and the
+/// head's targets) case × params, each block on its side's target. `only`: the one target a side names.
+fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Option<&str>) -> Result<Vec<Series>> {
     let filter = args.get("filter");
-    let only_target = args.get("target");
+    let only_target = only.or(args.get("target"));
     let fixed: BTreeMap<String, String> =
         args.get("params").map(|p| p.split(',').filter_map(|kv| kv.split_once('=').map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))).collect()).unwrap_or_default();
     // `--params all`: every value, the `more` ones too.
@@ -3966,26 +4546,34 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
         }
         // A case may name the targets it runs on; by default it runs on every target.
         let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
-        for target in targets.keys() {
+        // An implementation comparison runs each journey once, on both sides' targets.
+        let names: Vec<String> = match sides {
+            Some((_, head)) => vec![head.to_string()],
+            None => targets.keys().cloned().collect(),
+        };
+        for target in &names {
             // `--target`: target names as `--filter` takes cases (comma-separated, globs with *).
-            if only_target.is_some_and(|t| !case_matches(t, target)) || on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) {
+            let excluded = on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) || c["unsupported"][target].is_string();
+            if sides.is_none() && (only_target.is_some_and(|t| !case_matches(t, target)) || excluded) {
                 continue;
             }
+            // A side that cannot run the journey: a parity gap, shown and never run on either side.
+            let gap = sides.and_then(|(base, head)| side_gap(&c, base).map(|w| ("base", w)).or_else(|| side_gap(&c, head).map(|w| ("head", w))));
             let primary = args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string());
             // The case's margins, then `--noworse` over them (a bare margin is the primary's).
             let mut noworse = margins(&c["noworse"], &primary).map_err(|e| Error::usage(format!("{case}: noworse: {e}")))?;
             if let Some(flag) = args.get("noworse") {
                 noworse.extend(margins(&json!(flag), &primary).map_err(|e| Error::usage(format!("--noworse: {e}")))?);
             }
-            let mut expect = targets[target]["expect"].clone();
-            if let (Some(t), Some(c)) = (expect.as_object_mut(), c["expect"].as_object()) {
-                t.extend(c.clone());
-            } else if c["expect"].is_object() {
-                expect = c["expect"].clone();
-            }
+            let expect = merged_expect(&targets[target], &c["expect"]);
             for p in &combos {
                 out.push(Series {
                     expect: expect.clone(),
+                    case_expect: c["expect"].clone(),
+                    sides: sides.map(|(b, h)| (b.to_string(), h.to_string())),
+                    gap: gap.clone(),
+                    hero: c["hero"] == true,
+                    cross_engine: sides.is_some_and(|(b, h)| engine(targets[b]["kind"].as_str().unwrap_or("")) != engine(targets[h]["kind"].as_str().unwrap_or(""))),
                     case: case.clone(),
                     target: target.clone(),
                     params: p.clone(),
@@ -4212,20 +4800,106 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
                 dirty,
                 state: tree_state(&root),
                 changed: Vec::new(),
+                target: None,
+                name: String::new(),
             };
             v.commit = (!sha.is_empty()).then_some(sha);
+            v.name = v.label.clone();
             return Ok(v);
         } else {
             (Kind::Git(spec.to_string()), spec.to_string(), None)
         }
     };
-    let mut v = Variant { role, spec: spec.to_string(), kind, label, root, base_url: None, server: None, exe: None, commit: None, dirty: false, state: None, changed: Vec::new() };
+    let mut v = Variant {
+        role,
+        spec: spec.to_string(),
+        kind,
+        label,
+        root,
+        base_url: None,
+        server: None,
+        exe: None,
+        commit: None,
+        dirty: false,
+        state: None,
+        changed: Vec::new(),
+        target: None,
+        name: String::new(),
+    };
     if let Kind::Git(r) = &v.kind {
         let sha = git::out(project, &["rev-parse", "--short=10", r])
             .ok_or_else(|| Error::usage(format!("{spec} is neither a directory nor a git ref in {}", project.display())))?;
         v.label = format!("{r}@{sha}");
         v.commit = Some(sha);
     }
+    v.name = v.label.clone();
+    Ok(v)
+}
+
+/// A side of an implementation comparison in `--base`/`--head`: `target:<name>[=<variant>]`, or
+/// `<name>[=<variant>]` where `<name>` is a target of the bench file. A bare name that is also a
+/// folder or a git ref is a usage error that asks for `target:<name>`. None: a variant as before.
+fn side_spec<'a>(spec: &'a str, describe: &Value, project: &Path) -> Result<Option<(&'a str, Option<&'a str>)>> {
+    let targets = &describe["targets"];
+    let known = || targets.as_object().map(|o| o.keys().cloned().collect::<Vec<_>>().join(", ")).unwrap_or_default();
+    if let Some(rest) = spec.strip_prefix("target:") {
+        let (name, variant) = rest.split_once('=').map_or((rest, None), |(n, v)| (n, Some(v)));
+        if !targets[name].is_object() {
+            return Err(Error::usage(format!("{spec}: the bench file has no target {name} (its targets: {})", known())));
+        }
+        return Ok(Some((name, variant)));
+    }
+    let (name, variant) = spec.split_once('=').map_or((spec, None), |(n, v)| (n, Some(v)));
+    if !targets[name].is_object() {
+        return Ok(None);
+    }
+    if variant.is_none() {
+        let dir = Path::new(name).is_dir();
+        let commit = git::out(project, &["rev-parse", "--verify", "--quiet", &format!("{name}^{{commit}}")]).is_some();
+        if dir || commit {
+            return Err(Error::usage(format!(
+                "{name} is the bench file's target {name} and also a {}: say target:{name} for the target, or {} for the variant",
+                if dir { "folder here" } else { "git ref" },
+                if dir { format!("./{name}") } else { format!("git:{name}") }
+            )));
+        }
+    }
+    Ok(Some((name, variant)))
+}
+
+/// The project a target's builds and app profiles come from: its `cwd`'s strobe.json root (another
+/// repository), else none (the bench file's own).
+fn target_project(describe: &Value, name: &str) -> Result<Option<(PathBuf, Value)>> {
+    let Some(cwd) = describe["targets"][name]["cwd"].as_str().filter(|_| describe["targets"][name]["kind"] != "command") else { return Ok(None) };
+    let file = Path::new(describe["file"].as_str().unwrap_or("."));
+    let dir = file.parent().unwrap_or(Path::new(".")).join(cwd);
+    let dir = std::fs::canonicalize(&dir).map_err(|_| Error::usage(format!("target {name}: cwd {cwd} is no folder ({})", dir.display())))?;
+    let project = config::project_root(&dir);
+    let config = config::load(&project)?;
+    Ok(Some((project, config)))
+}
+
+/// Every target's own project, for those with a `cwd`.
+fn target_projects(describe: &Value) -> Result<BTreeMap<String, (PathBuf, Value)>> {
+    let mut out = BTreeMap::new();
+    for name in describe["targets"].as_object().map(|o| o.keys().cloned().collect::<Vec<_>>()).unwrap_or_default() {
+        if let Some(p) = target_project(describe, &name)? {
+            out.insert(name, p);
+        }
+    }
+    Ok(out)
+}
+
+/// A side: the target `name` at `variant` (default: the target's `cwd` folder, else the bench file's
+/// project), resolved in the target's own project.
+fn resolve_side(role: &'static str, name: &str, variant: Option<&str>, describe: &Value, project: &Path, config: &Value) -> Result<Variant> {
+    let own = target_project(describe, name)?;
+    let (project, config) = own.as_ref().map_or((project, config), |(p, c)| (p.as_path(), c));
+    // The checkout strobe.json's builds run in: the target's own project, or the bench file's.
+    let default = project.display().to_string();
+    let mut v = resolve_variant(role, variant.unwrap_or(&default), project, config)?;
+    v.target = Some(name.to_string());
+    v.name = describe["targets"][name]["name"].as_str().unwrap_or(name).to_string();
     Ok(v)
 }
 
@@ -4321,6 +4995,24 @@ pub(crate) fn build_native(dir: &Path) -> Result<PathBuf> {
     let root = v.root.clone().ok_or_else(|| Error::usage(format!("{} is not a folder to build", dir.display())))?;
     prepare_variant(&mut v, &json!({ "kind": "native" }), &config, &Harness { from: root, paths: Vec::new() }, &project)?;
     v.exe.take().ok_or_else(|| Error::usage(format!("strobe.json has no build.command for {} in {}: nothing to build", isolate::os(), project.display())))
+}
+
+/// Builds and serves the variants for a series: each for the target its side runs, in that target's
+/// own project (its `cwd`'s strobe.json, with no harness copied into it) or the bench file's.
+fn prepare_all(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<()> {
+    for v in variants.iter_mut() {
+        let name = v.target_of(s).to_string();
+        let target = ctx.describe["targets"][&name].clone();
+        match ctx.projects.get(&name) {
+            Some((project, own)) => prepare_variant(v, &target, own, &Harness { from: project.clone(), paths: Vec::new() }, project)?,
+            None => prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?,
+        }
+    }
+    // Builds of one target, or each side on its own target.
+    match &s.sides {
+        None => unbuilt(&ctx.describe["targets"][&s.target], variants, &s.label()),
+        Some(_) => variants.iter().try_for_each(|v| unbuilt(&ctx.describe["targets"][v.target_of(s)], std::slice::from_ref(v), &s.label())),
+    }
 }
 
 /// Builds and serves a variant for `web` targets (once per experiment).
@@ -4769,7 +5461,18 @@ fn render(r: &Value) -> String {
             out += &blocks_text(r, &s, &file);
             continue;
         }
-        out += &format!("strobe bench {file} · {}   base {}   head {}\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
+        // An implementation comparison names its sides; builds name their variants.
+        let sides = r["comparison"] == "implementations";
+        let (bn, hn) = if sides { (base["name"].as_str().unwrap_or("base"), head["name"].as_str().unwrap_or("head")) } else { ("base", "head") };
+        if s["kind"] == "gap" {
+            out += &format!("strobe bench {file} · {}   {bn} vs {hn}\n  not compared: {}\n\n", s["label"].as_str().unwrap_or(""), s["primary"]["refusal"]["summary"].as_str().unwrap_or(""));
+            continue;
+        }
+        if sides {
+            out += &format!("strobe bench {file} · {}   {bn} ({})   vs   {hn} ({})\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
+        } else {
+            out += &format!("strobe bench {file} · {}   base {}   head {}\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
+        }
         let cpus = env["logical_cpus"].as_u64().map(|n| format!("{n} logical CPUs")).unwrap_or_default();
         out += &format!("env    {}\n", fmt::fields([env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), &cpus]));
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
@@ -4803,8 +5506,23 @@ fn render(r: &Value) -> String {
         if let Some(line) = shown_line(&s) {
             out += &format!("shown  {line}{}\n", if s["shown"]["changed"] == true { "  ! different screens (ScreenChanged)" } else { "" });
         }
+        let f = &r["fixture"];
+        if f.is_object() {
+            let yes = |x: &Value| x.as_bool().map_or("not read", |c| if c { "connected" } else { "not connected" });
+            let cpu = |x: &Value| x.as_f64().map_or("—".to_string(), |ms| fmt::value(ms, "ms"));
+            out += &format!(
+                "fixture {}{} · {bn} {} ({} CPU per run) · {hn} {} ({})\n",
+                f["command"].as_str().unwrap_or(""),
+                f["seed_sha256"].as_str().map(|h| format!(" · seed {} (sha256 {})", f["seed"].as_str().unwrap_or(""), &h[..12.min(h.len())])).unwrap_or_default(),
+                yes(&f["connected"]["base"]),
+                cpu(&f["cpu_ms_per_run"]["base"]),
+                yes(&f["connected"]["head"]),
+                cpu(&f["cpu_ms_per_run"]["head"]),
+            );
+        }
         out.push('\n');
-        out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad("base", 11), fmt::pad("head", 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
+        let column = |n: &str| n.chars().take(10).collect::<String>();
+        out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad(&column(bn), 11), fmt::pad(&column(hn), 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
         let mut rows = vec![(true, s["primary"].clone())];
         rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));
         let descriptive = s["descriptive"].as_array().cloned().unwrap_or_default();
@@ -4827,6 +5545,27 @@ fn render(r: &Value) -> String {
                 fmt::pad(&ci, 18),
                 c["verdict"].as_str().unwrap_or("")
             );
+        }
+        if let Some(per) = s["per_side"].as_object().filter(|_| sides) {
+            let names: std::collections::BTreeSet<&String> = per.values().filter_map(Value::as_object).flat_map(|o| o.keys()).collect();
+            if !names.is_empty() {
+                out += &format!("\n{}{}{}  per implementation, not compared (one engine's own)\n", fmt::pad("", 28), fmt::pad(&column(bn), 11), fmt::pad(&column(hn), 11));
+                for name in names {
+                    let cell = |role: &str| {
+                        let m = &per[role][name.as_str()];
+                        m["median"].as_f64().map_or("—".to_string(), |x| fmt::value(x, m["unit"].as_str().unwrap_or("")))
+                    };
+                    out += &format!("{}{}{}\n", fmt::pad(&format!("  {name}"), 28), fmt::pad(&cell("base"), 11), fmt::pad(&cell("head"), 11));
+                }
+            }
+        }
+        if sides {
+            out += &format!("\n{hn} against {bn}: Δ and verdicts say how {hn} differs from {bn}\n");
+            for c in std::iter::once(&s["primary"]).chain(s["secondaries"].as_array().into_iter().flatten()) {
+                if let Some(n) = c["care_note"].as_str() {
+                    out += &format!("  {}: {n}\n", c["metric"].as_str().unwrap_or(""));
+                }
+            }
         }
         out += "\n★ primary, declared before the run · secondaries gated on the primary, Holm-corrected\n";
         out += "  intervals over pairs of fresh launches (Wilcoxon signed-rank, Hodges–Lehmann)\n";

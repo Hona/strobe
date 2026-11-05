@@ -43,17 +43,16 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         notes.push(text);
     }
-    let series = super::expand(&describe, args)?;
+    let head = args.get("head").unwrap_or(".");
+    let base = args.get("base").or(args.has("aa").then_some(head));
+    let (series, variants) = super::series_and_sides(&describe, args, base, head, &project, &config)?;
     if series.is_empty() {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
-    let head = super::resolve_variant("head", args.get("head").unwrap_or("."), &project, &config)?;
-    let base = match args.get("base") {
-        Some(b) => Some(super::resolve_variant("base", b, &project, &config)?),
-        None if args.has("aa") => Some(super::resolve_variant("base", args.get("head").unwrap_or("."), &project, &config)?),
-        None => None,
-    };
-    let variants: Vec<Variant> = base.into_iter().chain(std::iter::once(head)).collect();
+    // What a bench would refuse before anything builds, the plan refuses too.
+    if variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2 {
+        super::implementation_preflight(&describe, &series, &variants, &config, &super::target_projects(&describe)?)?;
+    }
     let mut plan = estimate(&series, &describe, &file, args, &config, &project, &variants, None);
     let text = text(&file, &variants, &plan, &notes);
     plan["text"] = json!(text);
@@ -155,9 +154,12 @@ impl History {
             .filter_map(|l| l["id"].as_str().map(str::to_string))
             .collect();
         let mut out = Vec::new();
+        // An implementation comparison's series is its journey on its two targets: the same sides.
+        let sides = s.sides.as_ref().map(|(b, h)| json!({ "base": b, "head": h }));
         for id in ids {
             let Some(r) = self.result(&id) else { continue };
-            if let Some(p) = r["series"].as_array().into_iter().flatten().find(|x| x["label"] == label.as_str()).and_then(|x| past(&id, x)) {
+            let same = |x: &&Value| x["label"] == label.as_str() && sides.as_ref().is_none_or(|t| x["targets"] == *t);
+            if let Some(p) = r["series"].as_array().into_iter().flatten().find(same).and_then(|x| past(&id, x)) {
                 out.push(p);
             }
             if out.len() == 5 {
@@ -454,7 +456,12 @@ fn total_line(plan: &Value) -> String {
 
 fn text(file: &Path, variants: &[Variant], plan: &Value, notes: &[String]) -> String {
     let name = file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
-    let mut t = format!("strobe plan {name} · {}\n", variants.iter().map(|v| format!("{} {}", v.role, v.label)).collect::<Vec<_>>().join(" · "));
+    // A side of an implementation comparison by its name and target, a variant by its label.
+    let side = |v: &Variant| match &v.target {
+        Some(t) => format!("{} {} ({t} at {})", v.role, v.name, v.label),
+        None => format!("{} {}", v.role, v.label),
+    };
+    let mut t = format!("strobe plan {name} · {}\n", variants.iter().map(side).collect::<Vec<_>>().join(" · "));
     for n in notes {
         t += &format!("{}\n", n.trim_end());
     }

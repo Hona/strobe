@@ -26,8 +26,11 @@ pub fn not_on_this_os(metric: &str) -> Option<Refusal> {
         "memory.app.host" if mac => "macOS: memory by what holds it reads another process's regions, which takes its task port (debuggers only); memory.app.private is its physical footprint",
         "ui.wakes" if mac => "macOS counts context switches per process, not per thread (no public per-thread count): cpu.wakes has the process's",
         "cpu.foreign" | "cpu.foreign.max" if mac => "macOS has no CPU affinity, so no CPUs are the target's own to measure other work on",
+        "memory.app.pss" if !cfg!(target_os = "linux") => {
+            "the proportional set size (each shared page split between the processes that map it) is Linux's (smaps_rollup); memory.app.private is this OS's private memory"
+        }
         // Every metric made of cycles over the cycle clock (`host::tsc`).
-        "cpu.work" | "cpu.app.total" | "cpu.process.total" | "ui.cpu" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" | "cpu.foreign" | "cpu.foreign.max" => {
+        "cpu.work" | "cpu.app.total" | "cpu.process.total" | "ui.cpu" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" | "cpu.foreign" | "cpu.foreign.max" | "cpu.fixture" => {
             return host::cycles_refused().map(|why| Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why} (process and thread times move in 15.6 ms ticks, too coarse to use)")));
         }
         _ => return None,

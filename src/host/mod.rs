@@ -7,6 +7,7 @@ pub mod paths;
 pub mod power;
 pub mod reserve;
 pub mod spawn;
+pub mod tcp;
 #[cfg(windows)]
 pub mod cycle_clock;
 #[cfg(windows)]
@@ -407,6 +408,27 @@ impl TopWindow {
 
     pub fn scale(&self) -> f64 {
         self.dpi as f64 / 96.0
+    }
+}
+
+/// Linux: the proportional set size of these processes summed (`/proc/<pid>/smaps_rollup` `Pss`: a
+/// page shared by n processes counts 1/n), so memory an app's processes share counts once
+/// (`memory.app.pss`). None elsewhere, or when a process's could not be read (no partial sums).
+pub fn pss_bytes(pids: &[u32]) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut total = 0u64;
+        for pid in pids {
+            let text = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup")).ok()?;
+            let kb: u64 = text.lines().find_map(|l| l.strip_prefix("Pss:")).and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())?;
+            total += kb * 1024;
+        }
+        (!pids.is_empty()).then_some(total)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pids;
+        None
     }
 }
 

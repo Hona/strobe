@@ -72,7 +72,8 @@ const state: {
   prepared: unknown
   mocks: { pattern: string; test: RegExp; handler: Function }[]
   session: any
-} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null }
+  fixture: { url: string; port: number; pid: number } | null
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null }
 
 const context = () => ({
   page,
@@ -86,6 +87,7 @@ const context = () => ({
   env: state.env,
   exe: state.exe,
   prepared: state.prepared,
+  fixture: state.fixture,
   async phase<T>(name: string, fn: () => T | Promise<T>) {
     await request("phase", { name, edge: "start" })
     try {
@@ -150,6 +152,8 @@ function describe() {
         timeout: c.timeout,
         noworse: c.noworse,
         gpuCache: c.gpuCache,
+        hero: c.hero === true,
+        unsupported: c.unsupported,
         expect: c.expect && plain(c.expect),
         launch: c.launch && {
           ...plain(c.launch),
@@ -163,7 +167,7 @@ function describe() {
       },
     ]),
   )
-  return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup, teardown: !!spec.teardown }
+  return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup, teardown: !!spec.teardown, fixture: spec.fixture && plain(spec.fixture) }
 }
 
 async function playwright(endpoint: string, target: string) {
@@ -239,6 +243,10 @@ async function handle(op: string, args: any) {
   switch (op) {
     case "describe":
       return describe()
+    // The block's fixture, before its `block`: hooks reach it as `ctx.fixture`.
+    case "fixture":
+      state.fixture = { url: args.url, port: args.port, pid: args.pid }
+      return true
     case "block":
       Object.assign(state, {
         case: args.case ?? "",
@@ -265,6 +273,7 @@ async function handle(op: string, args: any) {
         home: state.home,
         env: state.env,
         exe: state.exe,
+        fixture: state.fixture,
       })
       return true
     case "prepare": {

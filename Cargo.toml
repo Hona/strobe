@@ -112,6 +112,7 @@ windows-sys = { version = "0.59", features = [
   "Win32_System_IO",
   "Win32_UI_Shell",
   "Win32_NetworkManagement_NetManagement",
+  "Win32_NetworkManagement_IpHelper",
   # Native app snapshots: a window's own rendering of itself (PrintWindow).
   "Win32_Storage_Xps",
   # Native stacks without the helper: a thread's registers (CONTEXT) and the target's stack and

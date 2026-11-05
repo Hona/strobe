@@ -36,7 +36,7 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
     let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
     let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
     let unset: Vec<String> = target["unset"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
-    Ok(base.with_extra(&args, &env).with_unset(&unset))
+    Ok(base.with_extra(&args, &env).with_unset(&unset).with_files(&target["files"].as_object().cloned().unwrap_or_default()))
 }
 
 /// The driving session for one launch, opened when a page call first needs it: the app has then
@@ -186,11 +186,13 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
 /// difference there is not the change.
 fn admit_setup(ctx: &mut Ctx, s: &Series, v: &Variant, adapter: Option<&str>, scale: Option<f64>) -> Result<()> {
     let setup = format!("{} at scale {}", adapter.unwrap_or("no GPU work"), scale.map_or("?".into(), |s| s.to_string()));
-    let mine = format!("{}\n{}", s.target, v.role);
-    if let Some((key, other)) = ctx.native_setup.iter().find(|(k, o)| k.split('\n').next() == Some(s.target.as_str()) && **k != mine && **o != setup) {
+    // Builds of one target compare within it; the two sides of an implementation comparison with each other.
+    let group = if s.sides.is_some() { s.label() } else { s.target.clone() };
+    let mine = format!("{group}\n{}", v.role);
+    if let Some((key, other)) = ctx.native_setup.iter().find(|(k, o)| k.split('\n').next() == Some(group.as_str()) && **k != mine && **o != setup) {
         return Err(Error::refused(
             "VariantMismatch",
-            format!("{} drew on {other}, {} on {setup}", key.split('\n').nth(1).unwrap_or(""), v.role),
+            format!("{} drew on {other}, {} on {setup}", key.split('\n').nth(1).unwrap_or(""), v.name),
             "compare builds on the same adapter and scale; a difference there is not the change",
         ));
     }
@@ -253,7 +255,8 @@ fn runs(
         }
     }
     let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
-    let hooks = super::block::Hooks::default();
+    let (root, dir) = (n.pid, home.dir.clone());
+    let hooks = super::block::Hooks::new(ctx, move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect());
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
     let output = n.output.take();
@@ -304,6 +307,7 @@ fn runs(
     let setup = ctx.runner.call("setup", json!({}), t, &serve);
     super::super::record::app_gone(n, "before the runs", |_| last())?;
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+    hooks.check_fixture();
     lap("setup", steps);
     // What the window shows before the runs: its titles and pixels, and its tree only when setup
     // already drove the app (reading it now would connect strobe to the app for the runs).
@@ -651,6 +655,9 @@ fn runs(
     if private_mb > 0.0 {
         values.insert("memory.app.private".into(), private_mb);
     }
+    if let Some(b) = host::pss_bytes(&n.pids()) {
+        values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+    }
     // What holds that memory (host, GPU, files, images), read after the runs; a leak run read it
     // between them.
     if !leak {
@@ -783,6 +790,10 @@ fn runs(
         screen: Some(screen),
         shown,
         overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
+        process_set: Some(programs(&n.processes())),
+        // macOS's window list gives a window's frame, title bar included, not its content area: no
+        // content size to compare there.
+        client: n.window.as_ref().filter(|_| !cfg!(target_os = "macos")).map(client_of),
         ..Block::default()
     })
 }
@@ -841,6 +852,8 @@ fn missing(metric: &str, have: &Have) -> Refusal {
         _ => match metric {
             "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
             "gpu.process.3d" | "gpu.vram" | "gpu.shared" if have.gpu.is_some() => super::super::outside::gpu_unread(metric, have.gpu.as_deref().unwrap_or(&[])),
+            "cpu.fixture" => refuse(ValidatorId::NotForTarget, " is a fixture's CPU, and the bench file starts no fixture()".into()),
+            "memory.app.pss" => refuse(ValidatorId::RunIncomplete, ": a process's smaps_rollup could not be read".into()),
             "cpu.foreign" | "cpu.foreign.max" if !have.pinned => refuse(ValidatorId::NotForTarget, " is other work on the CPUs the target is pinned to, and this bench pins it to none (--pin none)".into()),
             "cpu.work" | "cpu.app.total" | "cpu.process.total" | "cpu.wakes" | "io.read" | "io.write" | "memory.app.private" | "memory.app.host" | "gpu.process.3d" | "gpu.vram" | "gpu.shared"
             | "cpu.foreign" | "cpu.foreign.max" => refuse(ValidatorId::RunIncomplete, ": the app's processes could not be read in every run (they exited, or strobe may not open them)".into()),
@@ -851,7 +864,7 @@ fn missing(metric: &str, have: &Have) -> Refusal {
 
 /// A refusal line (`<validator>: <why>`) from the frame readers and `missing`, typed. Every line
 /// they write names a validator; one that did not would be strobe's bug, refused as unseen frames.
-fn line(why: &str) -> Refusal {
+pub(super) fn line(why: &str) -> Refusal {
     Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why))
 }
 
@@ -1197,6 +1210,11 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         let mut values = BTreeMap::new();
         let ready_ms = ready.0 - n.epoch_ms;
         values.insert("launch.ready".to_string(), ready_ms);
+        // The launch's processes once it was ready, and whether they talk to the block's fixture by then.
+        let procs = n.processes();
+        if let Some(f) = &ctx.fixture_running {
+            f.check(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
+        }
         if cpu_ms.is_finite() {
             values.insert("cpu.work".to_string(), cpu_ms);
         }
@@ -1271,7 +1289,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         } else {
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, ..Block::default() })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, process_set: Some(programs(&procs)), ..Block::default() })
     })();
     // A launch that failed before its recording still ends the helper's session.
     if let Some(Ok(c)) = stacks.take() {

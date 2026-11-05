@@ -129,6 +129,16 @@ export interface Context<P> {
   exe: string | null
   /** What the target's `prepare` returned for this block. */
   prepared: any
+  /** The bench file's {@link fixture}, running for this block: talk to it with `fetch(ctx.fixture.url + "/…")`. Null without one. */
+  fixture: FixtureInfo | null
+}
+
+/** A block's running fixture. */
+export interface FixtureInfo {
+  /** `http://127.0.0.1:<port>`. */
+  url: string
+  port: number
+  pid: number
 }
 
 /** A request a `mock` handler answers. */
@@ -186,6 +196,8 @@ export interface LaunchContext<P> {
   env: Record<string, string> | null
   /** App and exe targets: the executable this variant launches. */
   exe: string | null
+  /** The bench file's {@link fixture}, already running (it starts before the app). */
+  fixture: FixtureInfo | null
 }
 
 /** A point in a launch: the first line matching `match` in `in`, timed from process spawn. */
@@ -228,8 +240,12 @@ interface CaseBase {
   primary: string
   /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `phase.<name>`, `span.<name>` (a page's `performance.measure` spans), `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
   metrics?: string[]
-  /** The targets this case runs on. Default: every target. */
+  /** The targets this case runs on. Default: every target. In an implementation comparison a side whose target is not listed is a parity gap: the journey is shown, never run. */
   targets?: string[]
+  /** Implementation comparisons: targets that cannot run this journey, with why (`{ rewrite: "no find in session yet" }`): a parity gap, listed in every report and never run on either side. */
+  unsupported?: Record<string, string>
+  /** Implementation comparisons: lead the report with this journey when it is decided. */
+  hero?: boolean
   /** Non-inferiority: "is head at most this much worse?" instead of "did it change?". `"2%"` for the primary, or margins per metric (`{ "cpu.wakes": "5%" }`). Verdicts `no worse (≤2%)`, `worse (>2%)`, `unclear`. `--noworse` overrides. */
   noworse?: string | number | Record<string, string | number>
   /** What each block must show (over its target's `expect`); a block on another screen is refused `WrongScreen` instead of timed. */
@@ -292,15 +308,43 @@ interface Hooks<P> {
   expect?: Expect
 }
 
-export type Target<P> =
-  | ({ kind: "web"; url: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P>)
-  | ({ kind: "url"; href: string; viewport?: Viewport; scale?: number } & Hooks<P>)
-  | { kind: "app"; id: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect }
-  | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect }
-  | ({ kind: "command" } & CommandOptions)
-  | ({ kind: "script" } & ScriptOptions)
-  | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
-  | ({ kind: "webview"; app?: string; path?: string } & WebviewOptions)
+export type Target<P> = Side &
+  (
+    | ({ kind: "web"; url: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P>)
+    | ({ kind: "url"; href: string; viewport?: Viewport; scale?: number } & Hooks<P>)
+    | ({ kind: "app"; id: string } & AppOptions)
+    | ({ kind: "exe"; path: string; app?: string } & AppOptions)
+    | ({ kind: "command" } & CommandOptions)
+    | ({ kind: "script" } & ScriptOptions)
+    | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
+    | ({ kind: "webview"; app?: string; path?: string } & WebviewOptions)
+  )
+
+/**
+ * What a target is as one side of an implementation comparison (`--base <target> --head <target>`):
+ * its name in every report, and the project its builds and app profiles come from.
+ */
+export interface Side {
+  /** What reports call this side ("Rewrite"); default the target's key. */
+  name?: string
+  /** A folder (relative to the bench file) whose strobe.json gives this target's `build` and app profiles: another repository's implementation. Its default variant is that project. (A `command` target's `cwd` is where its command runs.) */
+  cwd?: string
+}
+
+/** Options of app and exe targets (Electron apps by profile or path). */
+export interface AppOptions {
+  /** A seed folder copied into each launch's fresh private home (`{param}` placeholders allowed), relative to the bench file. */
+  home?: string
+  viewport?: Viewport
+  gpuCache?: GpuCache
+  expect?: Expect
+  /** Extra arguments after the profile's; `{home}`, `{port}` and `{fixture.url}`, `{fixture.port}`, `{fixture.pid}` are filled in. */
+  args?: string[]
+  /** Extra environment after the profile's; placeholders as in `args`. */
+  env?: Record<string, string>
+  /** Files written into the home before the launch, over the profile's (JSON or text; placeholders as in `args`; a string that is exactly `{fixture.port}` or `{fixture.pid}` becomes a number). */
+  files?: Record<string, unknown>
+}
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
 export type GpuCache = "warm" | "cold"
@@ -347,10 +391,12 @@ export interface NativeOptions {
   home?: string
   /** The main window's client area in device-independent pixels, where the app lets strobe size it. */
   viewport?: Viewport
-  /** Extra arguments after the profile's; `{home}` and `{port}` are filled in. */
+  /** Extra arguments after the profile's; `{home}`, `{port}` and the fixture's `{fixture.url}`, `{fixture.port}`, `{fixture.pid}` are filled in. */
   args?: string[]
-  /** Extra environment after the profile's; `{home}` and `{port}` are filled in. */
+  /** Extra environment after the profile's; placeholders as in `args`. */
   env?: Record<string, string>
+  /** Files written into the home before the launch, over the profile's (JSON or text; placeholders as in `args`). */
+  files?: Record<string, unknown>
   /** Variables the launch removes, after the profile's (`PREFIX_*` for a family): `["WAYLAND_DISPLAY"]` for an X11 run. */
   unset?: string[]
   /**
@@ -403,6 +449,8 @@ export interface Bench<Params extends Record<string, ParamValues>> {
   targets: Record<string, Target<Values<Params>>>
   /** Every combination is its own series. */
   params?: Params
+  /** A process every block talks to (a server with seeded data): see {@link fixture}. */
+  fixture?: Fixture
   /** Once per block, after load. Never measured. */
   setup?(ctx: Context<Values<Params>>): unknown
   /** Once per block, when it closes. Never measured. */
@@ -416,22 +464,22 @@ export interface Bench<Params extends Record<string, ParamValues>> {
  * page's own caches) whose warmup runs fill Chromium's GPU caches before the measured runs, and the GPU
  * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
  */
-export function web<P = any>(opts: { url?: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P> = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect }
+export function web<P = any>(opts: { url?: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P> & Side = {}): Target<P> {
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */
-export function url<P = any>(href: string, opts: { viewport?: Viewport; scale?: number } & Hooks<P> = {}): Target<P> {
+export function url<P = any>(href: string, opts: { viewport?: Viewport; scale?: number } & Hooks<P> & Side = {}): Target<P> {
   return { kind: "url", href, ...opts }
 }
 
 /** An installed Electron app, by its profile in strobe.json `apps`, in a fresh isolated home seeded from `home`. */
-export function app<P = any>(id: string, opts: { home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect } = {}): Target<P> {
+export function app<P = any>(id: string, opts: AppOptions & Side = {}): Target<P> {
   return { kind: "app", id, ...opts }
 }
 
 /** A packaged Electron app by path; `app` borrows a profile from strobe.json `apps` for it. */
-export function exe<P = any>(path: string, opts: { app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect } = {}): Target<P> {
+export function exe<P = any>(path: string, opts: { app?: string } & AppOptions & Side = {}): Target<P> {
   return { kind: "exe", path, ...opts }
 }
 
@@ -441,7 +489,7 @@ export function command<P = any>(run: string, opts: Omit<CommandOptions, "run"> 
 }
 
 /** A Bun or Node module of the variant, loaded in a fresh process per block; cases call its exports with `ctx.call`. */
-export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"> = {}): Target<P> {
+export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"> & Side = {}): Target<P> {
   return { kind: "script", entry, ...opts }
 }
 
@@ -452,7 +500,7 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
  * for launch cases its window. `page` drives it through its accessibility tree. A directory or git-ref variant runs
  * strobe.json's `build` and launches its `output`.
  */
-export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Target<P> {
+export function native<P = any>(appOrPath: string, opts: NativeOptions & Side = {}): Target<P> {
   const path = /[\\/]|\.exe$/i.test(appOrPath)
   return { kind: "native", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
 }
@@ -464,9 +512,34 @@ export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Ta
  * processes). Windows (WebView2) only for now; elsewhere it is refused `EngineUnsupported`, and `native()` measures the app through its
  * accessibility tree. A directory or git-ref variant runs strobe.json's `build` and launches its `output`.
  */
-export function webview<P = any>(appOrPath: string, opts: WebviewOptions = {}): Target<P> {
+export function webview<P = any>(appOrPath: string, opts: WebviewOptions & Side = {}): Target<P> {
   const path = /[\\/]|\.exe$/i.test(appOrPath)
   return { kind: "webview", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
+}
+
+/** A fixture: the command and how strobe starts it. */
+export interface Fixture {
+  /** Run by the shell in the bench file's folder; `{port}` (a free port, required), `{home}` (its own folder) and `{<param>}` are filled in. */
+  command: string
+  /** A folder (relative to the bench file, `{param}` placeholders allowed) copied into the fixture's home for every block; its content hash is in result.json. */
+  seed?: string
+  /** Extra environment; placeholders as in `command`. */
+  env?: Record<string, string>
+  /** A URL that answers once it is ready (`http://127.0.0.1:{port}/health`); default: its port accepts a connection. */
+  ready?: string
+  /** Milliseconds it may take to be ready. Default 60000. */
+  timeout?: number
+}
+
+/**
+ * A process both sides of a comparison talk to, such as a server with seeded data. strobe starts it
+ * for every block before the target, in a group and home of its own (so its CPU is in neither side's
+ * numbers: it is `cpu.fixture`), fills `{fixture.url}`, `{fixture.port}` and `{fixture.pid}` into the
+ * targets' `args`, `env` and `files`, gives hooks `ctx.fixture`, and ends it with the block. A block
+ * whose app never connects to it, or runs its executable itself, is refused `FixtureMismatch`.
+ */
+export function fixture(command: string, opts: Omit<Fixture, "command"> = {}): Fixture {
+  return { command, ...opts }
 }
 
 export function bench<const Params extends Record<string, ParamValues> = {}>(spec: Bench<Params>): Bench<Params> {

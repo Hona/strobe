@@ -152,14 +152,14 @@ impl Host {
 }
 
 /// The host process tree's CPU so far: its cycles and the cycle clock (`host::tsc`).
-fn cpu(pid: u32) -> (u64, Option<u64>) {
+pub(super) fn cpu(pid: u32) -> (u64, Option<u64>) {
     (host::process_tree(pid).iter().map(|p| p.cycles).sum(), host::tsc())
 }
 
 /// CPU ms between two readings over `wall_ms`, from cycles (exact). Never from process times, which
 /// move in 15.6 ms ticks on Windows (a 2 ms call read 0 ms or 15.6 ms): unknown (NaN) without cycles,
 /// and where they are not time (`host::cycles_refused`) the block refuses CPU.
-fn cpu_ms(a: (u64, Option<u64>), b: (u64, Option<u64>), wall_ms: f64) -> f64 {
+pub(super) fn cpu_ms(a: (u64, Option<u64>), b: (u64, Option<u64>), wall_ms: f64) -> f64 {
     match (a.1, b.1) {
         (Some(t0), Some(t1)) if t1 > t0 && b.0 > 0 => b.0.saturating_sub(a.0) as f64 / (t1 - t0) as f64 * wall_ms,
         _ => f64::NAN,
@@ -189,7 +189,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let heap_mb = || -> Result<f64> { Ok(host.borrow_mut().request(json!({ "op": "heap" }), Duration::from_secs(120))?.as_f64().unwrap_or(f64::NAN) / (1024.0 * 1024.0)) };
     steps.push(("launch".into(), launched.elapsed().as_secs_f64() * 1e3));
     let pid = host.borrow().pid();
-    let hooks = super::block::Hooks::default();
+    let hooks = super::block::Hooks::new(ctx, move || host::tree_pids(pid));
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "call" => host.borrow_mut().request(json!({ "name": a["name"], "args": a["args"] }), Duration::from_secs(600)),
@@ -212,6 +212,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root_text }), t, &serve)?;
         let mut lapped = Instant::now();
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+        hooks.check_fixture();
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
         let mut runs: Vec<ScriptRun> = Vec::new();
@@ -268,6 +269,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);
         }
+        if let Some(b) = host::pss_bytes(&host::tree_pids(pid)) {
+            values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+        }
         let _ = ctx.runner.call("close", json!({}), t, &serve);
         let mut refused = uncounted;
         refuse_not_on_this_os(s, &mut values, &mut refused);
@@ -293,6 +297,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             reserve: None,
             shown: None,
             overhead: Some(Overhead { strobe_pct, runner_pct, ..Overhead::default() }),
+            process_set: Some(programs(&host::process_tree(pid))),
+            fixture_connected: None,
+            client: None,
         })
     })();
     host.into_inner().exit();

@@ -21,6 +21,13 @@ use crate::store;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+/// What a report calls base and head: an implementation comparison's sides by name (SPEC §9.10),
+/// else "Before" and "This PR".
+pub(crate) fn side_names(r: &Value) -> (String, String) {
+    let name = |i: usize, other: &str| r["variants"][i]["name"].as_str().filter(|_| r["comparison"] == "implementations").unwrap_or(other).to_string();
+    (name(0, "Before"), name(1, "This PR"))
+}
+
 /// GitHub refuses a body over 65,536 characters (UTF-16 units); the block leaves most of it to the author.
 pub const CAP: usize = 24_000;
 /// How much a long report sheds, in order, until it fits `CAP` (`body` documents each step).

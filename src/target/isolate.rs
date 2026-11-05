@@ -109,6 +109,15 @@ impl App {
         self
     }
 
+    /// Files written into the home over the profile's (a bench target's own `files`).
+    pub fn with_files(mut self, files: &serde_json::Map<String, Value>) -> App {
+        for (k, v) in files {
+            self.files.retain(|(f, _)| f != k);
+            self.files.push((k.clone(), v.clone()));
+        }
+        self
+    }
+
     /// Variables (or `PREFIX_*` families) the launch removes, after the profile's.
     pub fn with_unset(mut self, unset: &[String]) -> App {
         self.unset.extend(unset.iter().cloned());

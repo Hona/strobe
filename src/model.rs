@@ -103,6 +103,10 @@ validators!(
     NotForTarget,
     ResetIncomplete,
     EngineUnsupported,
+    FixtureMismatch,
+    NotComparable,
+    ParityGap,
+    InputMismatch,
 );
 
 impl ValidatorId {
@@ -119,7 +123,7 @@ impl ValidatorId {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
-            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported => false,
+            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch => false,
         }
     }
 }
@@ -301,8 +305,49 @@ pub struct MetricDef {
     pub words: (&'static str, &'static str),
     /// Frames needed per block, for percentiles; 0 when not a percentile.
     pub min_n: usize,
+    /// Whether it compares between two implementations (SPEC 7.1, 9.10).
+    #[serde(skip)]
+    pub across: Across,
     pub about: &'static str,
 }
+
+/// How a metric compares when base and head are different implementations (SPEC 9.10). Between
+/// two sides of one engine (two pages, two native apps) every metric compares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Across {
+    /// The same instrument reads the same quantity on any implementation.
+    Compared,
+    /// Comparable only as a total: the note says what it sums on each side, wherever the number is.
+    Care(&'static str),
+    /// Engine-internal, or a thread whose work differs by toolkit: shown per side, never compared.
+    PerSide,
+}
+
+impl Across {
+    /// As result.json writes it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Across::Compared => "compared",
+            Across::Care(_) => "care",
+            Across::PerSide => "per_side",
+        }
+    }
+
+    pub fn note(self) -> Option<&'static str> {
+        match self {
+            Across::Care(n) => Some(n),
+            Across::Compared | Across::PerSide => None,
+        }
+    }
+}
+
+const CARE_CPU: &str = "every process of each app's process set, per run; the fixture not included";
+const CARE_CPU_SHARE: &str = "every process of each app, as a share of one core over the run: compare it only where run.duration is the same";
+const CARE_WAKES: &str = "all threads of all processes of each app: more threads and processes wake more by design";
+const CARE_PRIVATE: &str = "the OS's private memory of every process of each app (Windows commit, macOS footprint, Linux private pages); memory shared between an app's processes is in neither";
+const CARE_HOST: &str = "what every process of each app allocated in its own address space, without GPU memory";
+const CARE_GPU_MEMORY: &str = "GPU memory of every process of each app";
+const CARE_FRAMES: &str = "descriptive: more frames can mean smoother or wasteful";
 
 const TIME: (&str, &str) = ("faster", "slower");
 const COUNT: (&str, &str) = ("fewer", "more");
@@ -317,15 +362,43 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 20,
+        across: Across::PerSide,
         about: "median frame latency (begin of frame to presentation) of presented frames",
     },
-    MetricDef { name: "frames.presented.p90", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 100, about: "90th percentile frame cost" },
-    MetricDef { name: "frames.presented.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 200, about: "95th percentile frame cost" },
-    MetricDef { name: "frames.presented.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1000, about: "99th percentile frame cost" },
-    MetricDef { name: "frames.presented.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1, about: "worst presented frame cost" },
-    MetricDef { name: "frames.presented.count", unit: "count", better: Better::Higher, kind: Kind::Timed, words: ("more", "fewer"), min_n: 0, about: "presented frames per run" },
-    MetricDef { name: "canvas.frames", unit: "count", better: Better::Higher, kind: Kind::Timed, words: ("more", "fewer"), min_n: 0, about: "frames the page drew into a WebGPU canvas, per run" },
-    MetricDef { name: "canvas.interval.p50", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 20, about: "median gap between the page's own canvas frames" },
+    MetricDef { name: "frames.presented.p90", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 100, across: Across::PerSide, about: "90th percentile frame cost" },
+    MetricDef { name: "frames.presented.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 200, across: Across::PerSide, about: "95th percentile frame cost" },
+    MetricDef { name: "frames.presented.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1000, across: Across::PerSide, about: "99th percentile frame cost" },
+    MetricDef { name: "frames.presented.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1, across: Across::PerSide, about: "worst presented frame cost" },
+    MetricDef {
+        name: "frames.presented.count",
+        unit: "count",
+        better: Better::Higher,
+        kind: Kind::Timed,
+        words: ("more", "fewer"),
+        min_n: 0,
+        across: Across::Care(CARE_FRAMES),
+        about: "presented frames per run",
+    },
+    MetricDef {
+        name: "canvas.frames",
+        unit: "count",
+        better: Better::Higher,
+        kind: Kind::Timed,
+        words: ("more", "fewer"),
+        min_n: 0,
+        across: Across::PerSide,
+        about: "frames the page drew into a WebGPU canvas, per run",
+    },
+    MetricDef {
+        name: "canvas.interval.p50",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 20,
+        across: Across::PerSide,
+        about: "median gap between the page's own canvas frames",
+    },
     MetricDef {
         name: "canvas.interval.p95",
         unit: "ms",
@@ -333,10 +406,29 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: SMOOTH,
         min_n: 200,
+        across: Across::PerSide,
         about: "95th percentile gap between the page's own canvas frames (its stutter, at its own frame rate)",
     },
-    MetricDef { name: "canvas.interval.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1000, about: "99th percentile gap between the page's own canvas frames" },
-    MetricDef { name: "canvas.interval.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1, about: "longest gap between the page's own canvas frames" },
+    MetricDef {
+        name: "canvas.interval.p99",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 1000,
+        across: Across::PerSide,
+        about: "99th percentile gap between the page's own canvas frames",
+    },
+    MetricDef {
+        name: "canvas.interval.max",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 1,
+        across: Across::PerSide,
+        about: "longest gap between the page's own canvas frames",
+    },
     MetricDef {
         name: "frames.interval.p50",
         unit: "ms",
@@ -344,12 +436,40 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: SMOOTH,
         min_n: 20,
+        across: Across::Compared,
         about: "median gap between presented frames while the page wanted updates",
     },
-    MetricDef { name: "frames.interval.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 200, about: "95th percentile gap between presented frames (stutter)" },
-    MetricDef { name: "frames.interval.p99", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1000, about: "99th percentile gap between presented frames" },
-    MetricDef { name: "frames.interval.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1, about: "longest gap between presented frames" },
-    MetricDef { name: "frames.dropped.pct", unit: "%", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 0, about: "share of vsyncs with pending work that presented nothing" },
+    MetricDef {
+        name: "frames.interval.p95",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 200,
+        across: Across::Compared,
+        about: "95th percentile gap between presented frames (stutter)",
+    },
+    MetricDef {
+        name: "frames.interval.p99",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 1000,
+        across: Across::Compared,
+        about: "99th percentile gap between presented frames",
+    },
+    MetricDef { name: "frames.interval.max", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: SMOOTH, min_n: 1, across: Across::Compared, about: "longest gap between presented frames" },
+    MetricDef {
+        name: "frames.dropped.pct",
+        unit: "%",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: SMOOTH,
+        min_n: 0,
+        across: Across::Compared,
+        about: "share of vsyncs with pending work that presented nothing",
+    },
     MetricDef {
         name: "frames.dropped",
         unit: "count",
@@ -357,11 +477,30 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "vsyncs Chromium reported as dropped, per run; native and outside-in: missed refreshes while drawing plus discarded presents (OS present events)",
     },
-    MetricDef { name: "frames.discarded", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "presents the OS replaced before they reached the screen, per run" },
-    MetricDef { name: "frames.partial", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "frames presented without all updates, per run" },
-    MetricDef { name: "main.busy", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "renderer main thread busy share during runs" },
+    MetricDef {
+        name: "frames.discarded",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        across: Across::Care(CARE_FRAMES),
+        about: "presents the OS replaced before they reached the screen, per run",
+    },
+    MetricDef {
+        name: "frames.partial",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "frames presented without all updates, per run",
+    },
+    MetricDef { name: "main.busy", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, across: Across::PerSide, about: "renderer main thread busy share during runs" },
     MetricDef {
         name: "main.work",
         unit: "ms",
@@ -369,9 +508,19 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "renderer main-thread task time per run: the work an interaction costs, not quantized to frames like its duration",
     },
-    MetricDef { name: "main.script", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "JavaScript time on the renderer main thread per run" },
+    MetricDef {
+        name: "main.script",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "JavaScript time on the renderer main thread per run",
+    },
     MetricDef {
         name: "main.gc",
         unit: "ms",
@@ -379,13 +528,23 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "garbage collection on the renderer main thread per run (V8's top-level GC slices); traced only for series that declare it",
     },
-    MetricDef { name: "main.layout", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "layout time on the renderer main thread per run" },
-    MetricDef { name: "main.style", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "style recalculation time on the renderer main thread per run" },
-    MetricDef { name: "layout.count", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "layouts per run" },
-    MetricDef { name: "style.count", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "style recalculations per run" },
-    MetricDef { name: "main.tasks.long", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "main-thread tasks over 50 ms, per run" },
+    MetricDef { name: "main.layout", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, across: Across::PerSide, about: "layout time on the renderer main thread per run" },
+    MetricDef {
+        name: "main.style",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "style recalculation time on the renderer main thread per run",
+    },
+    MetricDef { name: "layout.count", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "layouts per run" },
+    MetricDef { name: "style.count", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "style recalculations per run" },
+    MetricDef { name: "main.tasks.long", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "main-thread tasks over 50 ms, per run" },
     MetricDef {
         name: "interaction.p50",
         unit: "ms",
@@ -393,9 +552,19 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 1,
+        across: Across::Compared,
         about: "input to presentation, median of discrete inputs (native apps: SPEC §7.4)",
     },
-    MetricDef { name: "interaction.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 1, about: "input to presentation, 95th percentile of discrete inputs" },
+    MetricDef {
+        name: "interaction.p95",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 1,
+        across: Across::Compared,
+        about: "input to presentation, 95th percentile of discrete inputs",
+    },
     MetricDef {
         name: "input.rate",
         unit: "/s",
@@ -403,6 +572,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: ("more", "fewer"),
         min_n: 0,
+        across: Across::Compared,
         about: "pointer moves strobe sent per second while a button was held (page.drag, moves after page.down(\"Mouse\")): a driver that starved shows here, not as dropped frames",
     },
     MetricDef {
@@ -412,6 +582,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: SMOOTH,
         min_n: 0,
+        across: Across::Compared,
         about: "95th percentile gap between consecutive pointer moves of a drag, as strobe sent them",
     },
     MetricDef {
@@ -421,11 +592,30 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 1,
+        across: Across::Compared,
         about: "scroll update input to presentation, median (native apps: the first wheel step of each scroll)",
     },
-    MetricDef { name: "scroll.latency.p95", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 20, about: "scroll update input to presentation, 95th percentile" },
-    MetricDef { name: "run.duration", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "wall time of one run" },
-    MetricDef { name: "cpu.app.total", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "CPU of every process of the target, % of one core, during runs" },
+    MetricDef {
+        name: "scroll.latency.p95",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 20,
+        across: Across::Compared,
+        about: "scroll update input to presentation, 95th percentile",
+    },
+    MetricDef { name: "run.duration", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, across: Across::Compared, about: "wall time of one run" },
+    MetricDef {
+        name: "cpu.app.total",
+        unit: "%",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Care(CARE_CPU_SHARE),
+        about: "CPU of every process of the target, % of one core, during runs",
+    },
     MetricDef {
         name: "cpu.foreign",
         unit: "%",
@@ -433,10 +623,20 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "other processes' work on the CPUs the target is pinned to during runs, % of one core: a validity signal, not the target's cost",
     },
-    MetricDef { name: "cpu.process.total", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "alias of cpu.app.total" },
-    MetricDef { name: "cpu.renderer", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "CPU of the browser's renderer processes, % of one core, during runs" },
+    MetricDef { name: "cpu.process.total", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, across: Across::Care(CARE_CPU_SHARE), about: "alias of cpu.app.total" },
+    MetricDef {
+        name: "cpu.renderer",
+        unit: "%",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "CPU of the browser's renderer processes, % of one core, during runs",
+    },
     MetricDef {
         name: "cpu.gpu",
         unit: "%",
@@ -444,9 +644,19 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "CPU of the browser's GPU process (compositing, GPU commands), % of one core, during runs",
     },
-    MetricDef { name: "cpu.browser", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "CPU of the browser process itself, % of one core, during runs" },
+    MetricDef {
+        name: "cpu.browser",
+        unit: "%",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "CPU of the browser process itself, % of one core, during runs",
+    },
     MetricDef {
         name: "memory.app.private",
         unit: "MB",
@@ -454,6 +664,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Care(CARE_PRIVATE),
         about: "private bytes of every target process after the measured runs (Windows: the commit charge, which includes commit held for the processes' GPU allocations; macOS: the physical footprint)",
     },
     MetricDef {
@@ -463,7 +674,28 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Care(CARE_HOST),
         about: "native targets: memory the processes allocated in their own address space after the measured runs (heap, stacks, anonymous memory), without GPU memory mapped into them or held for them (Windows, Linux)",
+    },
+    MetricDef {
+        name: "memory.app.pss",
+        unit: "MB",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "Linux: the proportional set size of every target process after the measured runs (each page shared by n processes counts 1/n), summed: memory an app's processes share counts once",
+    },
+    MetricDef {
+        name: "cpu.fixture",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "CPU time of the bench file's fixture (a server both sides talk to, outside their process sets) per run: the work each side made it do",
     },
     MetricDef {
         name: "gpu.compile",
@@ -472,6 +704,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::PerSide,
         about: "time the browser's GPU process spent creating pipelines and compiling shaders per run (Dawn), on any of its threads",
     },
     MetricDef {
@@ -481,9 +714,19 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "GPU 3D engine use by the target's processes during runs, summed over every adapter they used (% of one engine)",
     },
-    MetricDef { name: "gpu.vram", unit: "MB", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "dedicated VRAM of the target's processes after the measured runs" },
+    MetricDef {
+        name: "gpu.vram",
+        unit: "MB",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Care(CARE_GPU_MEMORY),
+        about: "dedicated VRAM of the target's processes after the measured runs",
+    },
     MetricDef {
         name: "gpu.shared",
         unit: "MB",
@@ -491,12 +734,40 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Care(CARE_GPU_MEMORY),
         about: "GPU memory of the target's processes in system memory after the measured runs: all of an integrated GPU's, and a discrete one's staging",
     },
-    MetricDef { name: "js.heap.used", unit: "MB", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "renderer JS heap in use after the measured runs" },
-    MetricDef { name: "dom.nodes", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, about: "DOM nodes after the measured runs" },
-    MetricDef { name: "js.heap.growth", unit: "MB/min", better: Better::Lower, kind: Kind::Sampled, words: AMOUNT, min_n: 0, about: "post-GC JS heap growth per minute over a memory recording" },
-    MetricDef { name: "dom.nodes.growth", unit: "count/min", better: Better::Lower, kind: Kind::Sampled, words: COUNT, min_n: 0, about: "DOM node growth per minute over a memory recording" },
+    MetricDef {
+        name: "js.heap.used",
+        unit: "MB",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "renderer JS heap in use after the measured runs",
+    },
+    MetricDef { name: "dom.nodes", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "DOM nodes after the measured runs" },
+    MetricDef {
+        name: "js.heap.growth",
+        unit: "MB/min",
+        better: Better::Lower,
+        kind: Kind::Sampled,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "post-GC JS heap growth per minute over a memory recording",
+    },
+    MetricDef {
+        name: "dom.nodes.growth",
+        unit: "count/min",
+        better: Better::Lower,
+        kind: Kind::Sampled,
+        words: COUNT,
+        min_n: 0,
+        across: Across::PerSide,
+        about: "DOM node growth per minute over a memory recording",
+    },
     MetricDef {
         name: "leak.suspects.retained",
         unit: "MB",
@@ -504,6 +775,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Sampled,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "memory retained by objects allocated in a memory recording's first half and still alive at its end",
     },
     MetricDef {
@@ -513,6 +785,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Care(CARE_CPU),
         about: "CPU time of the target's processes per run (all threads): a script target's main.work, a launch's total",
     },
     MetricDef {
@@ -522,6 +795,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "native apps: CPU time per run of the thread that owns the main window (the UI thread), from its cycle counter: the UI work an interaction costs, from outside",
     },
     MetricDef {
@@ -531,6 +805,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "native apps: context switches of the UI thread (the main window's) per second during runs",
     },
     MetricDef {
@@ -540,6 +815,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
+        across: Across::Care(CARE_WAKES),
         about: "context switches of the target's threads per second during runs: each time one of its threads was switched in, after a wait (a timer, an event, IO) or a preemption; most are waits at rest. Driver and OS pool threads inside its processes count too (Windows; `query <rec> threads` names the threads and the module each started in)",
     },
     MetricDef {
@@ -549,6 +825,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "energy of the CPU cores (performance and efficiency, user and kernel mode) the target's processes used per run, as the OS measures it per process (macOS on Apple silicon, from the cores' energy counters); not the GPU, Neural Engine, display or IO; refused where no OS measures it per process (Linux, Windows, Intel Macs), never estimated from CPU time",
     },
     MetricDef {
@@ -558,6 +835,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "instructions the target's processes retired per run, from the CPU's counters (macOS: user and kernel mode, always; Linux: user mode, perf events in counter blocks of their own, never in a timing block); tighter run to run than CPU time, which moves with frequency and caches",
     },
     MetricDef {
@@ -567,10 +845,29 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "times per second the target's processes woke the CPU package from idle during runs (macOS: what Activity Monitor's Energy Impact weighs); refused where the OS does not count them per process",
     },
-    MetricDef { name: "io.read", unit: "bytes", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "bytes the target's processes read per run (files, devices, pipes)" },
-    MetricDef { name: "io.write", unit: "bytes", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "bytes the target's processes wrote per run (files, devices, pipes)" },
+    MetricDef {
+        name: "io.read",
+        unit: "bytes",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "bytes the target's processes read per run (files, devices, pipes)",
+    },
+    MetricDef {
+        name: "io.write",
+        unit: "bytes",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "bytes the target's processes wrote per run (files, devices, pipes)",
+    },
     MetricDef {
         name: "js.heap.retained",
         unit: "MB",
@@ -578,6 +875,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "script targets: the JS heap a run leaves behind, after a full collection before and after it",
     },
     MetricDef {
@@ -587,6 +885,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: ("steadier", "jumpier"),
         min_n: 0,
+        across: Across::PerSide,
         about: "summed layout-shift score per run, shifts right after the run's input included",
     },
     MetricDef {
@@ -596,6 +895,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Exact,
         words: COUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "requests the page started per run; `net.requests{<url glob>}` counts the matching ones",
     },
     MetricDef {
@@ -605,6 +905,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Exact,
         words: AMOUNT,
         min_n: 0,
+        across: Across::PerSide,
         about: "bytes received over the network per run (as encoded on the wire); `net.bytes{<url glob>}` for matching requests",
     },
     MetricDef {
@@ -614,6 +915,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Exact,
         words: COUNT,
         min_n: 0,
+        across: Across::Compared,
         about: "`count.<name>`: what the bench file (`ctx.count`) or the page (`strobe.count`) counted per run",
     },
     MetricDef {
@@ -623,6 +925,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::Compared,
         about: "`phase.<name>`: wall time of the run's `phase(name, fn)` spans, from strobe's own marks (summed when a run has several)",
     },
     MetricDef {
@@ -632,9 +935,19 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::PerSide,
         about: "`span.<name>`: the page's own `performance.measure(name)` spans that ended in the run, summed (pages and Electron apps; the browser timestamps them)",
     },
-    MetricDef { name: "launch.ready", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "a launch case: from process spawn until its `until` selector is visible" },
+    MetricDef {
+        name: "launch.ready",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        across: Across::Compared,
+        about: "a launch case: from process spawn until its `until` selector is visible",
+    },
     MetricDef {
         name: "launch.painted",
         unit: "ms",
@@ -642,6 +955,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::Compared,
         about: "a launch case: from process spawn until the window's pixels first differ from its first frame (Windows)",
     },
     MetricDef {
@@ -651,6 +965,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::Compared,
         about: "a launch case: from process spawn until the window's pixels last changed before ready (Windows)",
     },
     MetricDef {
@@ -660,6 +975,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: TIME,
         min_n: 0,
+        across: Across::PerSide,
         about: "`launch.<name>`: from process spawn until a milestone (a log line, Node bootstrap)",
     },
 ];

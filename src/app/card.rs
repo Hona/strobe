@@ -223,6 +223,9 @@ fn short(m: &str) -> (String, Option<(&'static str, &'static str)>) {
         "launch.ready" => "time until ready",
         "io.read" => "reads",
         "io.write" => "writes",
+        "energy.cpu" => "CPU energy",
+        "cpu.instructions" => return ("instructions".into(), fewer),
+        "cpu.idle_wakes" => return ("idle wake-ups".into(), fewer),
         "frames.dropped.pct" | "frames.dropped" => return ("dropped frames".into(), fewer),
         "frames.presented.count" => return ("frames shown".into(), Some(("more", "fewer"))),
         "frames.interval.p50" => "frame gaps (p50)",
@@ -247,6 +250,9 @@ fn short(m: &str) -> (String, Option<(&'static str, &'static str)>) {
     }
     if let Some(rest) = m.strip_prefix("phase.") {
         return (format!("time in {rest}"), None);
+    }
+    if let Some(rest) = m.strip_prefix("span.") {
+        return (format!("time in {rest} spans"), None);
     }
     if let Some(rest) = m.strip_prefix("count.") {
         return (format!("{} count", rest.replace(['-', '_'], " ")), Some(("lower", "higher")));

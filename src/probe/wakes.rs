@@ -1,8 +1,11 @@
 //! Thread wakes and IO of a process tree (SPEC §13.6): two system snapshots around a run give each
 //! thread's context switches (each one the thread being switched in to run: a wake), its CPU cycles,
 //! and each process's IO bytes. Nothing is opened per sample except the threads, for their cycles.
+//! Beside them, what the OS counts per process beyond time (SPEC §7.4 `energy.cpu`,
+//! `cpu.instructions`, `cpu.idle_wakes`), or why it cannot.
 
 use crate::host;
+use crate::model::{Refusal, ValidatorId};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -15,11 +18,17 @@ pub struct Snapshot {
     threads: BTreeMap<(u32, u32), (u32, Option<u64>)>,
     /// pid → (read, written) bytes.
     io: BTreeMap<u32, (u64, u64)>,
+    counters: Counters,
 }
 
 impl Snapshot {
     /// The threads and IO of `pids` now.
     pub fn take(pids: &[u32]) -> Snapshot {
+        Snapshot::take_with(pids, false)
+    }
+
+    /// The same, with the counters: `perf` opens Linux's perf events (`wants_perf`).
+    pub fn take_with(pids: &[u32], perf: bool) -> Snapshot {
         let mut sorted = pids.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -29,12 +38,13 @@ impl Snapshot {
             tsc: host::tsc(),
             threads: threads.into_iter().map(|t| ((t.pid, t.tid), (t.switches, host::thread_cycles_of(t.tid)))).collect(),
             io: io.into_iter().map(|(p, r, w)| (p, (r, w))).collect(),
+            counters: Counters::take(&sorted, perf),
         }
     }
 
     /// Nothing yet, at `at_ns` (a tree about to start): a span from it counts every thread from zero.
     pub fn empty(at_ns: u64, tsc: Option<u64>) -> Snapshot {
-        Snapshot { at_ns, tsc, ..Snapshot::default() }
+        Snapshot { at_ns, tsc, counters: Counters { at_ns, ..Counters::default() }, ..Snapshot::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -50,6 +60,8 @@ pub struct Span {
     pub io_read: u64,
     pub io_write: u64,
     pub threads: Vec<ThreadSpan>,
+    #[serde(skip)]
+    pub counted: Counted,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -76,7 +88,7 @@ pub fn span(a: &Snapshot, b: &Snapshot) -> Span {
         (Some(x), Some(y)) if y > x && ms > 0.0 => Some((y - x) as f64 / ms),
         _ => None,
     };
-    let mut out = Span { ms, ..Span::default() };
+    let mut out = Span { ms, counted: counted(&a.counters, &b.counters), ..Span::default() };
     for (&(pid, tid), &(switches, cycles)) in &b.threads {
         let (s0, c0) = a.threads.get(&(pid, tid)).copied().unwrap_or((0, Some(0)));
         let n = switches.wrapping_sub(s0) as u64;
@@ -213,15 +225,31 @@ impl Timeline {
     }
 }
 
-/// Who a thread belongs to, by the module it started in: `driver` (a device driver's user-mode part,
-/// from the driver store, such as a GPU driver's worker threads), `os` (the OS's own: its thread pool,
-/// audio, RPC; a pool thread may run the app's callbacks), else `app`. Unknown without a module.
+/// Who a thread belongs to, by the module it started in (on macOS, a process row: its executable):
+/// `driver` (a device driver's user-mode part, such as a GPU driver's worker threads), `os` (the
+/// OS's own: its thread pool, audio, RPC, IPC; a pool thread may run the app's callbacks), else
+/// `app`. Unknown without a module.
+///
+/// - driver: Windows' driver store; macOS's kernel extension bundles (`/System/Library/Extensions`,
+///   where the GPU drivers' user-mode parts live, and `/Library/Extensions`); Linux's DRI drivers
+///   (`*_dri.so`, a `dri/` folder), Vulkan drivers and loader (`libvulkan*`), Mesa's (`libgallium*`,
+///   `libEGL_mesa`, `libGLX_mesa`), NVIDIA's (`libnvidia*`, `libcuda*`, `lib*_nvidia`) and `libdrm*`.
+/// - os: the Windows folder; macOS's `/System`, `/usr/lib` libraries and `/usr/libexec`; Linux's C
+///   runtime and the session's service clients (GLib's and D-Bus's workers, PulseAudio, PipeWire,
+///   ALSA, JACK, systemd).
 pub fn origin(module: &str) -> &'static str {
-    let m = module.to_lowercase().replace('/', "\\");
-    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()).to_lowercase();
-    if m.contains("\\driverstore\\") {
+    let m = module.to_lowercase().replace('\\', "/");
+    let file = m.rsplit('/').next().unwrap_or(&m);
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into()).to_lowercase().replace('\\', "/");
+    let linux_driver = file.contains("_dri.so")
+        || m.contains("/dri/")
+        || ["libvulkan", "libgallium", "libegl_mesa", "libglx_mesa", "libnvidia", "libcuda", "libegl_nvidia", "libglx_nvidia", "libdrm"].iter().any(|p| file.starts_with(p));
+    let linux_os = ["libc.so", "libc-", "ld-linux", "ld-musl", "libpthread", "libglib-2.0", "libgio-2.0", "libgthread", "libdbus-1", "libpulse", "libpipewire", "libasound", "libjack", "libsystemd"]
+        .iter()
+        .any(|p| file.starts_with(p));
+    if m.contains("/driverstore/") || m.starts_with("/system/library/extensions/") || m.starts_with("/library/extensions/") || linux_driver {
         "driver"
-    } else if m.starts_with(&windows) {
+    } else if m.starts_with(&windows) || m.starts_with("/system/") || m.starts_with("/usr/libexec/") || (m.starts_with("/usr/lib/") && file.ends_with(".dylib")) || linux_os {
         "os"
     } else {
         "app"
@@ -254,7 +282,9 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeM
     let mut rows: Vec<serde_json::Value> = acc
         .into_iter()
         .map(|((pid, tid), (n, cpu, known))| {
-            let module = modules.get(&tid);
+            // macOS's per-process row (tid 0) is its process: its executable says whose it is.
+            let exe = (tid == 0).then(|| host::exe_of(pid).map(|p| p.display().to_string())).flatten();
+            let module = exe.as_ref().or_else(|| modules.get(&tid));
             // macOS counts wakes per process (the tid 0 row): its threads' own wakes are unknown, not 0.
             let unknown = cfg!(target_os = "macos") && tid != 0;
             serde_json::json!({
@@ -267,4 +297,233 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeM
         .collect();
     rows.sort_by(|a, b| b["wakes_per_s"].as_f64().unwrap_or(0.0).total_cmp(&a["wakes_per_s"].as_f64().unwrap_or(0.0)));
     rows
+}
+
+/// The counter metrics (SPEC §7.4), in `Counted::counts` order: instructions per run, CPU energy per
+/// run (mJ), package idle wakeups per second.
+pub const COUNTER_METRICS: [&str; 3] = ["cpu.instructions", "energy.cpu", "cpu.idle_wakes"];
+
+/// Why a counter metric has no value: typed, so its refusal (`NoCounter`) names the cause.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Uncounted {
+    /// This OS or CPU keeps no such count per process.
+    NoSource(String),
+    /// The count exists, but strobe may not read it here.
+    Denied { why: String, fix: String },
+    /// Part of the run went uncounted: a process that joined or left the set during it, counters
+    /// the CPU shared with another user of them.
+    Partial(String),
+    /// Not opened: Linux opens perf events only for a series that declares `cpu.instructions`.
+    NotOpened,
+}
+
+impl Uncounted {
+    /// The refusal of a metric (its name is the refusal's key, so metrics refused for one cause read
+    /// as one line).
+    fn refusal(&self) -> Refusal {
+        let r = |why: &str| Refusal::new(ValidatorId::NoCounter, why);
+        match self {
+            Uncounted::NoSource(why) => r(why).fix("compare it on an OS that counts it per process (SPEC §7.4), or pick cpu.work"),
+            Uncounted::Denied { why, fix } => r(why).fix(fix.clone()),
+            Uncounted::Partial(why) => r(why).fix("keep the set of the app's processes the same through a run (warm up what it starts)"),
+            Uncounted::NotOpened => r("not counted: declare it in the series' metrics").fix("add it to the case's metrics"),
+        }
+    }
+}
+
+/// One counting source at a snapshot: a process (macOS), or a perf counting group (Linux: a process
+/// and every thread and process its threads started after strobe opened them).
+#[derive(Clone, Debug)]
+struct Source {
+    id: u64,
+    pid: u32,
+    name: String,
+    /// Instructions, CPU energy (nJ), package idle wakeups, and (Linux) the ns the counters were
+    /// enabled and running: a gap between the two is the CPU sharing them (multiplexing).
+    counts: [u64; 5],
+    /// macOS: when the process started (µs since the epoch), from which the kernel counts it.
+    born_us: Option<u64>,
+    #[cfg(target_os = "linux")]
+    group: std::sync::Arc<super::perf::Group>,
+}
+
+/// The counts of a process set at one moment, or why a metric is not counted at all.
+#[derive(Clone, Debug, Default)]
+pub struct Counters {
+    at_ns: u64,
+    wall_us: u64,
+    sources: Vec<Source>,
+    missing: [Option<Uncounted>; 3],
+}
+
+/// What a span counted, per `COUNTER_METRICS`, over `ms`.
+#[derive(Clone, Debug)]
+pub struct Counted {
+    pub ms: f64,
+    pub counts: [Result<u64, Uncounted>; 3],
+}
+
+impl Default for Counted {
+    fn default() -> Self {
+        Counted { ms: 0.0, counts: std::array::from_fn(|_| Err(Uncounted::NotOpened)) }
+    }
+}
+
+#[cfg(windows)]
+const WINDOWS_NONE: &str = "Windows counts no instructions, CPU energy or package idle wakeups per process that a user's process can read: the kernel trace's PMC counters on context switches would give instructions (strobe does not collect them yet), and its energy figures (E3) are a model's estimates, not measurements";
+
+impl Counters {
+    /// The counts of `pids` now. `perf` opens Linux's per-thread perf events (`wants_perf`).
+    pub fn take(pids: &[u32], perf: bool) -> Counters {
+        let wall_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
+        let mut c = Counters { at_ns: host::now_ns(), wall_us, ..Counters::default() };
+        #[cfg(windows)]
+        {
+            let _ = (pids, perf);
+            c.missing = std::array::from_fn(|_| Some(Uncounted::NoSource(WINDOWS_NONE.into())));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let _ = perf;
+            if !host::macos::energy_counters() {
+                c.missing[1] = Some(Uncounted::NoSource("this Mac's CPU has no energy counters: macOS measures a process's CPU energy only on Apple silicon".into()));
+            }
+            for &pid in pids {
+                match host::macos::counts(pid) {
+                    Ok(k) => c.sources.push(Source {
+                        id: (pid as u64) << 32 | (k.start_us & 0xffff_ffff),
+                        pid,
+                        name: k.name,
+                        counts: [k.instructions, k.energy_nj, k.idle_wakes, 0, 0],
+                        born_us: Some(k.start_us),
+                    }),
+                    // Gone: a span that held it says so.
+                    Err(libc::ESRCH) => {}
+                    Err(libc::EINVAL) => c.missing = std::array::from_fn(|_| Some(Uncounted::NoSource("this macOS gives no rusage v6 (macOS 13 or later does)".into()))),
+                    Err(e) => {
+                        let why = format!("proc_pid_rusage refused process {pid}: {}", std::io::Error::from_raw_os_error(e));
+                        c.missing = std::array::from_fn(|_| Some(Uncounted::Denied { why: why.clone(), fix: "measure an app that runs as your user".into() }));
+                    }
+                }
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            c.missing[1] = Some(Uncounted::NoSource(
+                "Linux gives no per-process CPU energy: RAPL counts a whole package (every process on it, and strobe), so no share of it is the app's, and strobe never estimates one from CPU time".into(),
+            ));
+            c.missing[2] = Some(Uncounted::NoSource("Linux counts no package idle wakeups per process".into()));
+            if !perf {
+                c.missing[0] = Some(Uncounted::NotOpened);
+            } else {
+                match super::perf::groups(pids) {
+                    Ok(groups) => {
+                        for g in groups {
+                            match g.read() {
+                                Some((n, enabled, running)) => {
+                                    c.sources.push(Source { id: std::sync::Arc::as_ptr(&g) as u64, pid: g.pid, name: g.name.clone(), counts: [n, 0, 0, enabled, running], born_us: None, group: g })
+                                }
+                                None => c.missing[0] = Some(Uncounted::Partial(format!("the counters of process {} ({}) could not be read", g.pid, g.name))),
+                            }
+                        }
+                    }
+                    Err(u) => c.missing[0] = Some(u),
+                }
+            }
+        }
+        c
+    }
+}
+
+/// What the sources counted from `a` to `b`. A source new in `b` counts from zero only when the OS
+/// counts it from its start and it started after `a` (macOS); one that left the set is read once
+/// more where its counters stay open (Linux). Any other is part of the run uncounted, and so is a
+/// counter the CPU multiplexed: refused, never scaled or left short.
+pub fn counted(a: &Counters, b: &Counters) -> Counted {
+    let ms = b.at_ns.saturating_sub(a.at_ns) as f64 / 1e6;
+    let mut sum = [0u64; 5];
+    let mut partial: Option<String> = None;
+    let add = |sum: &mut [u64; 5], to: &[u64; 5], from: &[u64; 5]| {
+        for ((s, t), f) in sum.iter_mut().zip(to).zip(from) {
+            *s += t.saturating_sub(*f);
+        }
+    };
+    let before: std::collections::HashMap<u64, &Source> = a.sources.iter().map(|s| (s.id, s)).collect();
+    for s in &b.sources {
+        match before.get(&s.id) {
+            Some(s0) => add(&mut sum, &s.counts, &s0.counts),
+            None if s.born_us.is_some_and(|t| t >= a.wall_us) => add(&mut sum, &s.counts, &[0; 5]),
+            None => partial = Some(format!("process {} ({}) joined the target's processes during the run, uncounted before", s.pid, s.name)),
+        }
+    }
+    let after: std::collections::HashSet<u64> = b.sources.iter().map(|s| s.id).collect();
+    for s0 in a.sources.iter().filter(|s| !after.contains(&s.id)) {
+        #[cfg(target_os = "linux")]
+        if let Some((n, enabled, running)) = s0.group.read() {
+            add(&mut sum, &[n, 0, 0, enabled, running], &s0.counts);
+            continue;
+        }
+        partial = Some(format!("process {} ({}) exited during the run, and its last counts went with it", s0.pid, s0.name));
+    }
+    if sum[3] > sum[4] {
+        partial = Some(format!("the CPU's counters were shared with another perf user for {:.1}% of the time (multiplexed): the count missed part of the run", 100.0 * (sum[3] - sum[4]) as f64 / sum[3] as f64));
+    }
+    Counted {
+        ms,
+        counts: std::array::from_fn(|i| match (&b.missing[i], &a.missing[i], &partial) {
+            (Some(u), _, _) | (None, Some(u), _) => Err(u.clone()),
+            (None, None, Some(why)) => Err(Uncounted::Partial(why.clone())),
+            (None, None, None) => Ok(sum[i]),
+        }),
+    }
+}
+
+/// Whether a series' metrics need Linux's perf events: they cost the target a little at each of its
+/// context switches, so only a series that declares `cpu.instructions` opens them (macOS counts
+/// always, at no cost to the target).
+pub fn wants_perf<'a>(metrics: impl IntoIterator<Item = &'a String>) -> bool {
+    metrics.into_iter().any(|m| m == "cpu.instructions")
+}
+
+/// The counter metrics one span counted, in their units (instructions, mJ, per second).
+pub fn counter_values(c: &Counted) -> Vec<(&'static str, f64)> {
+    COUNTER_METRICS
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| {
+            let n = *c.counts[i].as_ref().ok()? as f64;
+            let v = match i {
+                0 => n,
+                1 => n / 1e6,
+                _ if c.ms > 0.0 => n / (c.ms / 1e3),
+                _ => return None,
+            };
+            Some((*m, v))
+        })
+        .collect()
+}
+
+/// The counter metrics of a block's measured runs: a metric every run counted gets its values per
+/// run; one the OS cannot count here, or that some run counted only in part, is refused
+/// (`NoCounter`) when the series declares it, and otherwise left out.
+pub fn counter_metrics<'a>(runs: &[(String, &Counted)], declared: impl IntoIterator<Item = &'a String>) -> (BTreeMap<String, BTreeMap<String, f64>>, BTreeMap<String, Refusal>) {
+    let declared: Vec<&String> = declared.into_iter().collect();
+    let (mut values, mut refused) = (BTreeMap::new(), BTreeMap::new());
+    if runs.is_empty() {
+        return (values, refused);
+    }
+    for (i, metric) in COUNTER_METRICS.iter().enumerate() {
+        match runs.iter().find_map(|(_, c)| c.counts[i].as_ref().err()) {
+            Some(u) => {
+                if declared.iter().any(|m| m == metric) {
+                    refused.insert(metric.to_string(), u.refusal());
+                }
+            }
+            None => {
+                let per: BTreeMap<String, f64> = runs.iter().filter_map(|(k, c)| Some((k.clone(), counter_values(c).into_iter().find(|(m, _)| m == metric)?.1))).collect();
+                values.insert(metric.to_string(), per);
+            }
+        }
+    }
+    (values, refused)
 }

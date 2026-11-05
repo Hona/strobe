@@ -449,6 +449,9 @@ pub(super) fn noun(metric: &str) -> String {
         "launch.ready" => "Time until ready",
         "io.read" => "File and pipe reads per run",
         "io.write" => "File and pipe writes per run",
+        "energy.cpu" => "CPU energy per run",
+        "cpu.instructions" => "Instructions per run",
+        "cpu.idle_wakes" => "Idle wake-ups",
         "frames.dropped.pct" => "Dropped frames",
         "frames.dropped" => "Dropped frames per run",
         "frames.presented.count" => "Frames shown per run",
@@ -479,6 +482,9 @@ pub(super) fn noun(metric: &str) -> String {
     }
     if let Some(rest) = metric.strip_prefix("phase.") {
         return format!("Time in {rest} per run");
+    }
+    if let Some(rest) = metric.strip_prefix("span.") {
+        return format!("Time in the page's {rest} spans per run");
     }
     if let Some(rest) = metric.strip_prefix("count.") {
         return capitalize(&format!("{rest} count per run"));

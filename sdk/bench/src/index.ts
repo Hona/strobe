@@ -226,7 +226,7 @@ export interface Launch<P> {
 interface CaseBase {
   /** The metric this case is about, declared before the run. */
   primary: string
-  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `phase.<name>`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
+  /** Extra secondary metrics to report: any catalog metric, `count.<name>`, `phase.<name>`, `span.<name>` (a page's `performance.measure` spans), `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.requests{<url glob>}`, `layout.shift`, `launch.<milestone>`, `js.heap.retained` (scripts). */
   metrics?: string[]
   /** The targets this case runs on. Default: every target. */
   targets?: string[]

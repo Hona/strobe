@@ -415,6 +415,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             values.insert("io.read", span.io_read as f64);
             values.insert("io.write", span.io_write as f64);
         }
+        values.extend(wakes::counter_values(&span.counted));
         if let Some(p) = os.gpu_3d_pct {
             values.insert("gpu.process.3d", p);
         }
@@ -696,6 +697,7 @@ fn native_summary(meta: &Value) -> String {
     if get("io.read").is_finite() {
         s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
     }
+    s += &fmt::counters(get);
     s += &memory_lines(v);
     if get("ui.cpu").is_finite() {
         s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));

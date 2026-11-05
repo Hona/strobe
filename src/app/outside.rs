@@ -119,6 +119,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         values.insert("io.read".into(), span.io_read as f64);
         values.insert("io.write".into(), span.io_write as f64);
     }
+    values.extend(wakes::counter_values(&span.counted).into_iter().map(|(m, v)| (m.to_string(), v)));
     // The UI thread: the thread that owns the tree's main window, when it has one.
     let ui_tid = host::main_window(&pids).and_then(|w| host::window_thread(w.hwnd));
     if let Some(t) = ui_tid.and_then(|tid| span.threads.iter().find(|t| t.tid == tid)) {
@@ -236,6 +237,7 @@ pub fn text(meta: &Value) -> String {
         s += &format!("wakes    {} context switches of its threads\n", fmt::value(get("cpu.wakes"), "/s"));
         s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
     }
+    s += &fmt::counters(get);
     if get("ui.cpu").is_finite() {
         s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
     }

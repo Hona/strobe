@@ -166,8 +166,9 @@ fn cpu_ms(a: (u64, Option<u64>, u64), b: (u64, Option<u64>, u64), wall_ms: f64) 
     }
 }
 
-/// One run: wall ms, CPU ms, its counters, the heap it retained (MB), and its phase marks.
-type ScriptRun = (f64, f64, BTreeMap<String, f64>, f64, Vec<(String, u64)>);
+/// One run: wall ms, CPU ms, its counters, the heap it retained (MB), its phase marks, and what the
+/// OS counted for the host's processes.
+type ScriptRun = (f64, f64, BTreeMap<String, f64>, f64, Vec<(String, u64)>, probe::wakes::Counted);
 
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let (set, keep) = (x.set, x.keep);
@@ -217,9 +218,11 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         let mut cost = SelfCost::new(ctx.runner.pid());
         // Steady once two runs cost the same CPU (SPEC §9.2).
         let mut warmup = super::block::Warmup::new(x);
+        let perf = probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
         while warmup.more(runs.len()) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
             hooks.begin(&format!("run:{}", runs.len()));
+            let k0 = probe::wakes::Counters::take(&host::tree_pids(pid), perf);
             let c0 = cpu(pid);
             cost.start();
             let t0 = Instant::now();
@@ -227,9 +230,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             let wall = t0.elapsed().as_secs_f64() * 1e3;
             cost.end();
             let used = cpu_ms(c0, cpu(pid), wall);
+            let counted = probe::wakes::counted(&k0, &probe::wakes::Counters::take(&host::tree_pids(pid), perf));
             hooks.end();
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
-            runs.push((wall, used, hooks.counts(), retained, hooks.take_marks()));
+            runs.push((wall, used, hooks.counts(), retained, hooks.take_marks(), counted));
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
@@ -249,6 +253,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         }
         let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.2, r.4.as_slice())).collect();
         extra.extend(super::block::per_run_hooks(s, &key, &hooked));
+        let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.5)).collect();
+        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+        extra.extend(counts);
         let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
         if warmup.unsteady() {
             values.insert("warmup.unsteady".into(), 1.0);
@@ -273,7 +280,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
-            refused: BTreeMap::new(),
+            refused: uncounted,
             locked: false,
             display: None,
             screen: None,

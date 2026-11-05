@@ -249,6 +249,64 @@ pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     schedstat(&format!("/proc/{tid}/schedstat")).map(|s| s.0)
 }
 
+/// The module each thread started in, per tid. Linux keeps no start address: a thread's oldest
+/// frames are at the top of its stack (with the C runtime's thread descriptor, which holds the
+/// start routine, above them on glibc), so the first code address read down from the top that is
+/// not in the C or C++ runtime's thread entry names its module. A process's main thread is its
+/// executable's. Needs the thread's stack pointer (`/proc/<pid>/task/<tid>/syscall`) and
+/// `process_vm_readv`: ptrace's access rule allows both for processes strobe started (and any of
+/// this user's where `ptrace_scope` is 0); others are left unknown, as is a thread on a CPU now.
+pub fn thread_modules(threads: &[(u32, u32)]) -> HashMap<u32, String> {
+    const TOP: u64 = 32 * 1024;
+    let runtime = |file: &str| ["libc.so", "libc-", "ld-linux", "ld-musl", "libpthread", "libstdc++", "libc++", "libgcc_s"].iter().any(|p| file.starts_with(p));
+    let mut out = HashMap::new();
+    let mut maps: HashMap<u32, Vec<(u64, u64, bool, String)>> = HashMap::new();
+    for &(pid, tid) in threads {
+        if tid == pid {
+            if let Some(exe) = exe_of(pid) {
+                out.insert(tid, exe.display().to_string());
+            }
+            continue;
+        }
+        let Some(sp) = read(format!("/proc/{pid}/task/{tid}/syscall")).and_then(|s| {
+            let f: Vec<&str> = s.split_whitespace().collect();
+            (f.len() >= 3).then(|| u64::from_str_radix(f[f.len() - 2].trim_start_matches("0x"), 16).ok()).flatten()
+        }) else {
+            continue;
+        };
+        let list = maps.entry(pid).or_insert_with(|| {
+            read(format!("/proc/{pid}/maps"))
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|l| {
+                    let mut f = l.split_whitespace();
+                    let (range, perms) = (f.next()?, f.next()?);
+                    let path = f.nth(3).unwrap_or("").to_string();
+                    let (s, e) = range.split_once('-')?;
+                    Some((u64::from_str_radix(s, 16).ok()?, u64::from_str_radix(e, 16).ok()?, perms.contains('x') && path.starts_with('/'), path))
+                })
+                .collect()
+        });
+        let Some(&(_, end, _, _)) = list.iter().find(|m| sp >= m.0 && sp < m.1) else { continue };
+        let from = sp.max(end.saturating_sub(TOP)) & !7;
+        let mut buf = vec![0u8; (end - from) as usize];
+        let local = libc::iovec { iov_base: buf.as_mut_ptr() as *mut libc::c_void, iov_len: buf.len() };
+        let remote = libc::iovec { iov_base: from as *mut libc::c_void, iov_len: buf.len() };
+        if unsafe { libc::process_vm_readv(pid as libc::pid_t, &local, 1, &remote, 1, 0) } != buf.len() as isize {
+            continue;
+        }
+        let module = buf.as_chunks::<8>().0.iter().rev().find_map(|w| {
+            let v = u64::from_ne_bytes(*w);
+            let m = list.iter().find(|m| m.2 && v >= m.0 && v < m.1)?;
+            (!runtime(m.3.rsplit('/').next().unwrap_or(&m.3))).then(|| m.3.clone())
+        });
+        if let Some(m) = module {
+            out.insert(tid, m);
+        }
+    }
+    out
+}
+
 pub fn thread_name(tid: u32) -> Option<String> {
     read(format!("/proc/{tid}/comm")).map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
@@ -324,7 +382,29 @@ pub fn topology() -> Topology {
     Topology { logical, groups }
 }
 
-fn affinity_of(tid: libc::pid_t) -> Option<u64> {
+/// (parent, start ticks, name) of a live process.
+pub(super) fn parent_start_name(pid: u32) -> Option<(u32, u64, String)> {
+    stat(pid).filter(|s| !s.gone).map(|s| (s.ppid, s.start, s.comm))
+}
+
+/// Whether `affinity_of`/`set_affinity_of` may act on the process: it runs as this user (its real
+/// or effective uid is strobe's effective one), as `sched_setaffinity` requires without CAP_SYS_NICE.
+pub(super) fn same_user(pid: u32) -> bool {
+    let me = unsafe { libc::geteuid() };
+    read(format!("/proc/{pid}/status")).and_then(|s| s.lines().find_map(|l| l.strip_prefix("Uid:")).map(|u| u.split_whitespace().take(2).any(|x| x.parse::<u32>().ok() == Some(me)))).unwrap_or(false)
+}
+
+/// The thread ids of a process.
+pub(super) fn tids(pid: u32) -> Vec<u32> {
+    std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+}
+
+/// Every pid in `/proc` (no other read).
+pub(super) fn all_pids() -> Vec<u32> {
+    pids()
+}
+
+pub(super) fn affinity_of(tid: libc::pid_t) -> Option<u64> {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     if unsafe { libc::sched_getaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
         return None;
@@ -332,7 +412,7 @@ fn affinity_of(tid: libc::pid_t) -> Option<u64> {
     Some((0..64).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).fold(0u64, |m, c| m | 1 << c))
 }
 
-fn set_affinity_of(tid: libc::pid_t, mask: u64) -> bool {
+pub(super) fn set_affinity_of(tid: libc::pid_t, mask: u64) -> bool {
     let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
     for c in 0..64 {
         if mask & (1 << c) != 0 {

@@ -314,6 +314,8 @@ struct Run {
     total: f64,
     /// Drags in the run: moves strobe sent per second and the 95th percentile gap (ms).
     input: Option<(f64, f64)>,
+    /// What the OS counted for the target's processes (`energy.cpu`, `cpu.instructions`, …).
+    counted: probe::wakes::Counted,
 }
 
 /// Chromium process types (`SystemInfo.getProcessInfo`) and the metric each one's CPU goes to.
@@ -1482,6 +1484,10 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         .or_else(|| {
             let phase = s.primary.strip_prefix("phase.")?;
             (!blocks.iter().all(|b| b.values.get(&s.primary).is_some_and(|v| v.is_finite()))).then(|| Refusal::new(ValidatorId::NoPhase, format!("{}: no measured run of some block entered phase(\"{phase}\")", s.primary)))
+        })
+        .or_else(|| {
+            let span = s.primary.strip_prefix("span.")?;
+            (!blocks.iter().all(|b| b.values.get(&s.primary).is_some_and(|v| v.is_finite()))).then(|| Refusal::new(ValidatorId::NoSpan, format!("{}: no measured run of some block called performance.measure(\"{span}\")", s.primary)))
         });
     if let Some(r) = refusal {
         primary["verdict"] = json!(format!("refused ({}): {}", r.validator, r.summary));
@@ -2531,7 +2537,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(s, b)).inspect(|b| restate_recording(ctx, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, b)).inspect(|b| restate_recording(ctx, b));
         let r = match reserve.map(host::reserve::Reserve::finish) {
             Some(report) => {
                 ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
@@ -2626,7 +2632,7 @@ fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
 fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
     let t = &ctx.describe["targets"][&s.target];
     let offscreen = |m: &str| {
-        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase."].iter().any(|p| m.starts_with(p))
+        ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase.", "energy."].iter().any(|p| m.starts_with(p))
             || m == "run.duration"
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
@@ -2703,16 +2709,53 @@ fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
 
 /// A declared `phase.<name>` that a block which measured its runs has no value for: no measured run
 /// entered the phase, so it is refused `NoPhase` rather than left without a value (native blocks say
-/// so themselves; page and script blocks did not).
-fn phase_state(s: &Series, mut b: Block) -> Block {
+/// so themselves; page and script blocks did not). Likewise a declared `span.<name>` (`NoSpan`): no
+/// measured run's page called `performance.measure(name)`, or the target has no page.
+fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     if b.values.is_empty() {
         return b;
     }
-    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("phase.")) {
-        if !b.values.get(m).is_some_and(|v| v.is_finite()) && !b.refused.contains_key(m) {
-            b.values.remove(m);
-            b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPhase, format!("{m}: no measured run entered phase(\"{}\")", &m["phase.".len()..])));
+    let page = !is_native(&ctx.describe["targets"][&s.target]) && ctx.describe["targets"][&s.target]["kind"] != "script";
+    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+        if b.values.get(m).is_some_and(|v| v.is_finite()) || b.refused.contains_key(m) {
+            continue;
         }
+        let refusal = if let Some(phase) = m.strip_prefix("phase.") {
+            Refusal::new(ValidatorId::NoPhase, format!("{m}: no measured run entered phase(\"{phase}\")"))
+        } else if let Some(span) = m.strip_prefix("span.") {
+            let why = if page { format!("no measured run's page called performance.measure(\"{span}\")") } else { "spans are a page's performance.measure() calls; this target has no page".into() };
+            Refusal::new(ValidatorId::NoSpan, format!("{m}: {why}"))
+        } else {
+            continue;
+        };
+        b.values.remove(m);
+        b.refused.insert(m.clone(), refusal);
+    }
+    b
+}
+
+/// Linux's per-thread perf events (opened for a series that declares `cpu.instructions`) cost the
+/// target at each of its context switches: 4.4 µs a switch in a VM, which made a run of 2000 short
+/// sleeps cost 36.8 ms of CPU instead of 19.3 ms. That series' times describe a disturbed run, so its
+/// time metrics (ms, CPU shares, frames, input latency) are dropped, and refused `OverheadBudget`
+/// where declared (rule 3). The instruction count itself is user mode only: the switches' cost is
+/// not in it. macOS counts always, at no cost to the target.
+fn counter_state(s: &Series, mut b: Block) -> Block {
+    if !cfg!(target_os = "linux") || !probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics)) {
+        return b;
+    }
+    let timed = |m: &str| {
+        let def = crate::model::metric(m);
+        !probe::wakes::COUNTER_METRICS.contains(&m)
+            && !m.starts_with("cpu.foreign")
+            && (def.is_some_and(|d| d.unit == "ms" || d.unit == "%") || ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)))
+    };
+    b.values.retain(|m, _| !timed(m));
+    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| timed(m)) {
+        b.refused.entry(m.clone()).or_insert_with(|| {
+            Refusal::new(ValidatorId::OverheadBudget, "this series counts cpu.instructions with per-thread perf events, which cost the target at each context switch: its times describe a disturbed run")
+                .fix("measure cpu.instructions in a case of its own")
+        });
     }
     b
 }
@@ -2985,6 +3028,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
 
         let run_timeout = s.run_timeout();
+        let perf = probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
         let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
@@ -3009,6 +3053,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             };
             let mut roles = process_roles(&browser);
             let (procs_start, cyc0, tsc0, cpu0) = read();
+            let k0 = probe::wakes::Counters::take(&procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
             *carried.borrow_mut() = [0.0; 6];
             if !counted.is_empty() {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
@@ -3036,6 +3081,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             driver.mark(&format!("{key}:end"))?;
             cost.end();
             let (procs_end, cyc1, tsc1, cpu1) = read();
+            let k1 = probe::wakes::Counters::take(&procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
@@ -3073,7 +3119,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 (Some(a), Some(b)) if b > a && !roles.is_empty() => 100.0 * role1[i].saturating_sub(role0[i]) as f64 / (b - a) as f64,
                 _ => f64::NAN,
             });
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input })
+            let counted = probe::wakes::counted(&k0, &k1);
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -3242,6 +3289,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 .collect();
             extra.insert(format!("phase.{name}"), per);
         }
+        // `span.<name>`: the page's own performance.measure() spans per run, from the trace.
+        for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("span.")) {
+            if let Some(per) = data.span_per_run("run", name) {
+                extra.insert(format!("span.{name}"), per);
+            }
+        }
         if let Some(n) = net {
             let mut n = n.into_inner();
             n.settle();
@@ -3260,6 +3313,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
+        let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
+        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+        extra.extend(counts);
         // Drags: the input strobe gave, beside the frames it drew (a starved driver shows here).
         if measured.iter().any(|r| r.input.is_some()) {
             extra.insert("input.rate".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.0))).collect());
@@ -3370,7 +3426,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             steps: steps.borrow().clone(),
             background,
             leak,
-            refused: BTreeMap::new(),
+            refused: uncounted,
             locked: false,
             display: None,
             screen: Some(screen),

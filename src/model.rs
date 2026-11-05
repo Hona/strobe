@@ -97,6 +97,8 @@ validators!(
     LiveChannel,
     NoPhase,
     NoInput,
+    NoSpan,
+    NoCounter,
 );
 
 impl ValidatorId {
@@ -112,7 +114,7 @@ impl ValidatorId {
         match self {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
-            | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput => false,
+            | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter => false,
         }
     }
 }
@@ -535,6 +537,33 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         about: "context switches of the target's threads per second during runs: each time one of its threads was switched in, after a wait (a timer, an event, IO) or a preemption; most are waits at rest. Driver and OS pool threads inside its processes count too (Windows; `query <rec> threads` names the threads and the module each started in)",
     },
+    MetricDef {
+        name: "energy.cpu",
+        unit: "mJ",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        about: "CPU energy of the target's processes per run, as the OS measures it per process (macOS on Apple silicon: the kernel's per-process energy from the CPU's energy counters); refused where no OS measures it per process (Linux, Windows, Intel Macs), never estimated from CPU time",
+    },
+    MetricDef {
+        name: "cpu.instructions",
+        unit: "instructions",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        about: "instructions the target's processes retired per run, from the CPU's counters (macOS: user and kernel mode, always; Linux: user mode, perf events opened only for a series that declares it); tighter run to run than CPU time, which moves with frequency and caches",
+    },
+    MetricDef {
+        name: "cpu.idle_wakes",
+        unit: "/s",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        about: "times per second the target's processes woke the CPU package from idle during runs (macOS: what Activity Monitor's Energy Impact weighs); refused where the OS does not count them per process",
+    },
     MetricDef { name: "io.read", unit: "bytes", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "bytes the target's processes read per run (files, devices, pipes)" },
     MetricDef { name: "io.write", unit: "bytes", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, about: "bytes the target's processes wrote per run (files, devices, pipes)" },
     MetricDef {
@@ -591,6 +620,15 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         about: "`phase.<name>`: wall time of the run's `phase(name, fn)` spans, from strobe's own marks (summed when a run has several)",
     },
+    MetricDef {
+        name: "span",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        about: "`span.<name>`: the page's own `performance.measure(name)` spans that ended in the run, summed (pages and Electron apps; the browser timestamps them)",
+    },
     MetricDef { name: "launch.ready", unit: "ms", better: Better::Lower, kind: Kind::Timed, words: TIME, min_n: 0, about: "a launch case: from process spawn until its `until` selector is visible" },
     MetricDef {
         name: "launch.painted",
@@ -622,13 +660,15 @@ pub const METRICS: &[MetricDef] = &[
 ];
 
 /// A metric's definition. Families resolve by their base: `net.requests{<glob>}` → `net.requests`,
-/// `count.<name>` → `count`, `phase.<name>` → `phase`, `launch.<milestone>` → `launch.milestone`.
+/// `count.<name>` → `count`, `phase.<name>` → `phase`, `span.<name>` → `span`, `launch.<milestone>`
+/// → `launch.milestone`.
 pub fn metric(name: &str) -> Option<&'static MetricDef> {
     let base = name.split_once('{').map_or(name, |(b, _)| b);
     let find = |n: &str| METRICS.iter().find(|m| m.name == n);
     find(base).or_else(|| match base.split_once('.') {
         Some(("count", rest)) if !rest.is_empty() => find("count"),
         Some(("phase", rest)) if !rest.is_empty() => find("phase"),
+        Some(("span", rest)) if !rest.is_empty() => find("span"),
         Some(("launch", rest)) if !rest.is_empty() => find("launch.milestone"),
         _ => None,
     })

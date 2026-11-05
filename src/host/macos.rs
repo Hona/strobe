@@ -302,6 +302,50 @@ fn rusage(pid: u32) -> Option<(u64, u64, u64, u64, u64)> {
     Some((mach_ns(ri.ri_user_time + ri.ri_system_time), ri.ri_phys_footprint, ri.ri_resident_size, ri.ri_diskio_bytesread, ri.ri_diskio_byteswritten))
 }
 
+/// `struct rusage_info_v6` (macOS 13+): v4's fields, `ri_runnable_time`, v5's `ri_flags`, then v6's.
+/// The libc crate stops at v4. The tail is longer than the kernel's (its reserved words became
+/// fields in later releases): the kernel writes its own size, never past this one.
+#[repr(C)]
+struct RusageV6 {
+    v4: libc::rusage_info_v4,
+    /// `ri_flags` (v5), `ri_user_ptime`, `ri_system_ptime`, `ri_pinstructions`, `ri_pcycles`.
+    _before: [u64; 5],
+    ri_energy_nj: u64,
+    /// `ri_penergy_nj` and what follows.
+    _after: [u64; 40],
+}
+
+const RUSAGE_INFO_V6: i32 = 6;
+
+/// What the kernel counts for a process from its start, beyond time (SPEC §7.4): instructions
+/// retired (user and kernel mode), CPU energy in nJ (Apple silicon's per-core energy counters,
+/// charged at every context switch; 0 on a Mac without them), and package idle wakeups.
+#[derive(Clone, Debug)]
+pub struct Counts {
+    pub name: String,
+    /// When the process started (µs since the epoch): it counts from there.
+    pub start_us: u64,
+    pub instructions: u64,
+    pub energy_nj: u64,
+    pub idle_wakes: u64,
+}
+
+/// A process's `Counts` (this user's processes); Err with `errno` when `proc_pid_rusage` refuses v6
+/// (`EINVAL` before macOS 13) or the process is gone or another user's.
+pub fn counts(pid: u32) -> Result<Counts, i32> {
+    let mut ri: RusageV6 = unsafe { std::mem::zeroed() };
+    if unsafe { libc::proc_pid_rusage(pid as i32, RUSAGE_INFO_V6, &mut ri as *mut _ as *mut libc::rusage_info_t) } != 0 {
+        return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
+    }
+    let b = bsd(pid).ok_or(libc::ESRCH)?;
+    Ok(Counts { name: b.name, start_us: b.start, instructions: ri.v4.ri_instructions, energy_nj: ri.ri_energy_nj, idle_wakes: ri.v4.ri_pkg_idle_wkups })
+}
+
+/// Apple silicon: its cores have the energy counters `ri_energy_nj` reads.
+pub fn energy_counters() -> bool {
+    sysctl_i64("hw.optional.arm64") == Some(1)
+}
+
 /// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
 /// children that started no earlier than their parent (a reused pid). A zombie is in no tree: it
 /// runs nothing, and its children have left it.

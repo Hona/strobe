@@ -96,7 +96,7 @@ const TOOLS: &[Tool] = &[
             ("bisect", "good..bad: find the commit on the first-parent line that moved the primary (one series)"),
             ("pin", "auto (V-Cache CCD), none, ccdN, or a CPU list"),
             ("power", "high (default: the fastest plan for the run, restored after) or keep"),
-            ("reserve-cpus", "auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows), on (every block, check too) or off"),
+            ("reserve-cpus", "auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows and Linux), on (every block, check too) or off"),
             ("why", "attribution blocks: auto (default, only when the primary differs), always, never"),
             ("trace", "timing-block trace: lean (default) or full"),
             ("keep", "keep every block's recording"),

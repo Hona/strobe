@@ -311,6 +311,7 @@ fn runs(
     // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
     // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
     let mut warmup = super::block::Warmup::new(x);
+    let perf = wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
     let leak = set == Set::Memory;
     let mut readings: Vec<memory::Reading> = Vec::new();
     while warmup.more(runs.len()) {
@@ -327,7 +328,7 @@ fn runs(
             se.take_log();
         }
         hooks.begin(&format!("run:{i}"));
-        let snap0 = Snapshot::take(&pids);
+        let snap0 = Snapshot::take_with(&pids, perf);
         let c0 = cycles(n);
         cost.start();
         let t0 = host::now_ns();
@@ -338,7 +339,7 @@ fn runs(
         cost.end();
         let procs1 = n.processes();
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
-        let snap1 = Snapshot::take(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>());
+        let snap1 = Snapshot::take_with(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
         hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
@@ -477,7 +478,9 @@ fn runs(
         extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
         extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
     }
-    let mut refused: BTreeMap<String, Refusal> = BTreeMap::new();
+    let counted: Vec<(String, &wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.span.counted)).collect();
+    let (counts, mut refused) = wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+    extra.extend(counts);
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
     let foreign: Vec<f64> = gpu_runs

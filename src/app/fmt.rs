@@ -27,8 +27,23 @@ pub fn value(v: f64, unit: &str) -> String {
         "pp" => format!("{v:.digits$} pp"),
         "MB" => format!("{v:.0} MB"),
         "/s" => format!("{v:.digits$}/s"),
+        // Counts in the billions: 4.12 G instr.
+        "instructions" => match v.abs() {
+            a if a >= 1e9 => format!("{:.2} G instr", v / 1e9),
+            a if a >= 1e6 => format!("{:.1} M instr", v / 1e6),
+            a if a >= 1e3 => format!("{:.0} k instr", v / 1e3),
+            _ => format!("{v:.0} instr"),
+        },
         _ => format!("{v:.digits$} {unit}"),
     }
+}
+
+/// `energy   12 mJ CPU · 4.12 G instr · 3.0/s package idle wakeups` for what the OS counted
+/// (SPEC §7.4), or nothing when it counted none of them.
+pub fn counters(get: impl Fn(&str) -> f64) -> String {
+    let parts = [("energy.cpu", "mJ", " CPU"), ("cpu.instructions", "instructions", ""), ("cpu.idle_wakes", "/s", " package idle wakeups")];
+    let shown: Vec<String> = parts.iter().filter(|(m, _, _)| get(m).is_finite()).map(|(m, unit, what)| format!("{}{what}", value(get(m), unit))).collect();
+    if shown.is_empty() { String::new() } else { format!("energy   {}\n", shown.join(" · ")) }
 }
 
 pub use crate::fmt::bytes;

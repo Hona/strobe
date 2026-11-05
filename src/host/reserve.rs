@@ -4,12 +4,20 @@
 //! own back after the block. A sweep every 200 ms catches processes started during the block (a
 //! build spawning compilers): CPU sets are not inherited.
 //!
-//! Windows only. Process default CPU sets (not affinity masks): they need only
+//! Windows: process default CPU sets (not affinity masks): they need only
 //! `PROCESS_SET_LIMITED_INFORMATION`, restore exactly (affinity changes overwrite every thread's own
 //! mask, which nothing can put back), are never inherited, and on the machines checked hold as hard as
 //! affinity (24 busy threads on a 16-CPU set stayed off the other CPUs). Threads that selected CPU
-//! sets themselves, or set an affinity mask, keep theirs. What changes is journaled in
-//! `<state>/reserve.json` first, so a strobe killed mid-block is undone by the next strobe that starts.
+//! sets themselves, or set an affinity mask, keep theirs.
+//!
+//! Linux: thread affinity (`sched_setaffinity`, allowed on this user's processes without root): each
+//! thread of a process gets its own mask without the target's CPUs, and its own mask back after the
+//! block. Threads and processes a moved thread starts inherit the narrowed mask, so the sweep only
+//! has to find processes started from elsewhere; what a moved process started during the block gets
+//! its parent's mask back. A thread whose mask changed since (the process set its own) keeps it.
+//!
+//! What changes is journaled in `<state>/reserve.json` first, so a strobe killed mid-block is undone
+//! by the next strobe that starts. macOS has no CPU affinity: nothing to reserve.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -43,47 +51,261 @@ impl Report {
     }
 }
 
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 fn journal() -> std::path::PathBuf {
     super::paths::state_dir().join("reserve.json")
 }
 
 /// Undoes the reservation of a strobe that died mid-block (killed, crashed, power cut).
 pub fn restore_stale() {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     imp::restore_stale();
 }
 
 /// A reservation in force; `finish` ends it.
 pub struct Reserve {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     inner: imp::Reserve,
 }
 
 impl Reserve {
     /// Moves this user's other processes off `cpus` until `finish`. Err says why nothing moved.
     pub fn start(cpus: u64) -> Result<Reserve, String> {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             imp::Reserve::start(cpus).map(|inner| Reserve { inner })
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             let _ = cpus;
-            Err("not built on this OS yet".into())
+            Err("macOS has no CPU affinity: no CPU can be kept for the target".into())
         }
     }
 
     /// Puts every moved process back and says what happened.
     pub fn finish(self) -> Report {
-        #[cfg(windows)]
+        #[cfg(any(windows, target_os = "linux"))]
         {
             self.inner.finish()
         }
-        #[cfg(not(windows))]
+        #[cfg(not(any(windows, target_os = "linux")))]
         {
             Report::default()
         }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod imp {
+    use super::super::linux as os;
+    use super::{Report, journal};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    const SWEEP: Duration = Duration::from_millis(200);
+
+    /// A process strobe narrowed: each thread's own mask and the one strobe gave it; `main` is its
+    /// main thread's, which threads started during the block get back.
+    #[derive(Clone, Serialize, Deserialize)]
+    struct Moved {
+        pid: u32,
+        start: u64,
+        threads: Vec<(u32, u64, u64)>,
+        main: (u64, u64),
+    }
+
+    pub struct Reserve {
+        stop: Arc<AtomicBool>,
+        worker: Option<std::thread::JoinHandle<Report>>,
+    }
+
+    impl Reserve {
+        pub fn start(cpus: u64) -> Result<Reserve, String> {
+            let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+            if logical > 64 {
+                return Err(format!("this machine has {logical} CPUs; strobe's masks cover the first 64, so it would not put the rest back"));
+            }
+            let all = (0..logical).fold(0u64, |m, c| m | 1 << c);
+            if all & !cpus == 0 {
+                return Err("no CPU outside the target's to move other processes to".into());
+            }
+            let stop = Arc::new(AtomicBool::new(false));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let flag = stop.clone();
+            let worker = std::thread::Builder::new().name("strobe-reserve".into()).spawn(move || run(cpus, flag, tx)).map_err(|e| e.to_string())?;
+            let _ = rx.recv_timeout(Duration::from_secs(10));
+            Ok(Reserve { stop, worker: Some(worker) })
+        }
+
+        pub fn finish(mut self) -> Report {
+            self.stop.store(true, Ordering::Relaxed);
+            let w = self.worker.take();
+            if let Some(w) = &w {
+                w.thread().unpark();
+            }
+            w.and_then(|w| w.join().ok()).unwrap_or_default()
+        }
+    }
+
+    impl Drop for Reserve {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(w) = self.worker.take() {
+                w.thread().unpark();
+                let _ = w.join();
+            }
+        }
+    }
+
+    /// What to change in `pid`: every thread that runs on the target's CPUs and elsewhere gets its
+    /// mask without them. A thread kept on them only (pinned there) or already off them is left
+    /// alone. `inherit`: a moved parent's threads' (mask, narrowed mask); a thread that started with
+    /// one of the narrowed masks gets that thread's own back. None when nothing is to change.
+    fn plan(pid: u32, start: u64, cpus: u64, inherit: &[(u64, u64)]) -> Option<Moved> {
+        let mut m = Moved { pid, start, threads: Vec::new(), main: (0, 0) };
+        for tid in os::tids(pid) {
+            let Some(mask) = os::affinity_of(tid as libc::pid_t) else { continue };
+            let change = match inherit.iter().find(|i| i.1 == mask) {
+                Some(&i) => i,
+                None if mask & cpus == 0 || mask & !cpus == 0 => continue,
+                None => (mask, mask & !cpus),
+            };
+            m.threads.push((tid, change.0, change.1));
+            if tid == pid {
+                m.main = change;
+            }
+        }
+        (!m.threads.is_empty()).then_some(m)
+    }
+
+    /// Narrows the planned threads; keeps those the OS let change (and the inherited ones, already
+    /// narrow). Err with why when none could.
+    fn apply(mut m: Moved) -> Result<Moved, String> {
+        let mut why = String::new();
+        m.threads.retain(|&(tid, original, set)| {
+            let now = os::affinity_of(tid as libc::pid_t);
+            let ok = now == Some(set) || (now == Some(original) && os::set_affinity_of(tid as libc::pid_t, set));
+            if !ok && now.is_some() {
+                why = format!("the OS refused its affinity: {}", std::io::Error::last_os_error());
+            }
+            ok
+        });
+        if m.threads.is_empty() { Err(why) } else { Ok(m) }
+    }
+
+    fn write_journal(moved: &[Moved]) {
+        let _ = std::fs::write(journal(), serde_json::json!({ "pid": std::process::id(), "linux": moved }).to_string());
+    }
+
+    /// Puts a process's threads back where they still have strobe's mask: their own, else (started
+    /// during the block from a narrowed thread) the main thread's, or the one whose narrowed mask
+    /// they have. Returns whether any thread was put back.
+    fn restore(m: &Moved) -> bool {
+        if os::parent_start_name(m.pid).is_none_or(|(_, s, _)| s != m.start) {
+            return false;
+        }
+        let known: HashMap<u32, (u64, u64)> = m.threads.iter().map(|&(t, o, s)| (t, (o, s))).collect();
+        let mut any = false;
+        for tid in os::tids(m.pid) {
+            let Some(now) = os::affinity_of(tid as libc::pid_t) else { continue };
+            let back = match known.get(&tid) {
+                Some(&(original, set)) => (now == set).then_some(original),
+                None => std::iter::once(m.main).chain(m.threads.iter().map(|t| (t.1, t.2))).find(|i| i.1 != 0 && i.1 == now).map(|i| i.0),
+            };
+            if let Some(original) = back {
+                any |= os::set_affinity_of(tid as libc::pid_t, original);
+            }
+        }
+        any
+    }
+
+    fn run(cpus: u64, stop: Arc<AtomicBool>, ready: std::sync::mpsc::Sender<()>) -> Report {
+        let started = Instant::now();
+        let (mut c0, mut t0) = (0, 0);
+        let mut report = Report { cpus, ..Report::default() };
+        let own = std::process::id();
+        let mut seen: HashSet<u32> = HashSet::new();
+        // strobe's own tree (the target pinned to these CPUs, the runner, servers): never moved.
+        let mut tree: HashSet<u32> = HashSet::from([own]);
+        let mut moved: Vec<Moved> = Vec::new();
+        let mut first = true;
+        loop {
+            let mut fresh: Vec<(u32, u32, u64, String)> = os::all_pids().into_iter().filter(|p| seen.insert(*p)).filter_map(|p| os::parent_start_name(p).map(|(pp, s, n)| (p, pp, s, n))).collect();
+            if !fresh.is_empty() {
+                // Parents first, so a child knows whether its parent is strobe's or was moved.
+                fresh.sort_by_key(|p| p.2);
+                let mut batch: Vec<(Moved, String)> = Vec::new();
+                for (pid, ppid, start, name) in fresh {
+                    // Kernel threads (kthreadd's children) and strobe's tree are left alone.
+                    if tree.contains(&ppid) || name.starts_with("strobe") {
+                        tree.insert(pid);
+                        continue;
+                    }
+                    if pid <= 2 || ppid == 2 || !os::same_user(pid) {
+                        continue;
+                    }
+                    let inherit: Vec<(u64, u64)> = moved.iter().find(|m| m.pid == ppid).map(|m| m.threads.iter().map(|t| (t.1, t.2)).collect()).unwrap_or_default();
+                    if let Some(m) = plan(pid, start, cpus, &inherit) {
+                        batch.push((m, name));
+                    }
+                }
+                if !batch.is_empty() {
+                    // Journal first: a strobe killed while it changes them still has them put back.
+                    write_journal(&moved.iter().cloned().chain(batch.iter().map(|b| b.0.clone())).collect::<Vec<_>>());
+                    for (m, name) in batch {
+                        match apply(m) {
+                            Ok(m) => {
+                                moved.push(m);
+                                *report.moved.entry(name).or_default() += 1;
+                                if !first {
+                                    report.started += 1;
+                                }
+                            }
+                            Err(why) if !why.is_empty() => {
+                                report.failed.insert(name, why);
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+            }
+            report.sweeps += 1;
+            if first {
+                report.setup_ms = started.elapsed().as_secs_f64() * 1e3;
+                (c0, t0) = (crate::host::thread_cycles(), crate::host::now_ns());
+                let _ = ready.send(());
+                first = false;
+            }
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            std::thread::park_timeout(SWEEP);
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+        }
+        let (c1, t1) = (crate::host::thread_cycles(), crate::host::now_ns());
+        report.overhead_pct = if t1 > t0 { 100.0 * c1.saturating_sub(c0) as f64 / (t1 - t0) as f64 } else { 0.0 };
+        report.restored = moved.iter().filter(|m| restore(m)).count() as u32;
+        let _ = std::fs::remove_file(journal());
+        report.wall_ms = started.elapsed().as_secs_f64() * 1e3;
+        report
+    }
+
+    pub fn restore_stale() {
+        let Some(v) = std::fs::read_to_string(journal()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { return };
+        let pid = v["pid"].as_u64().unwrap_or(0) as u32;
+        // Still in force: that strobe runs and puts them back itself.
+        if pid == std::process::id() || crate::host::exe_of(pid).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n.starts_with("strobe")) {
+            return;
+        }
+        for m in serde_json::from_value::<Vec<Moved>>(v["linux"].clone()).unwrap_or_default() {
+            restore(&m);
+        }
+        let _ = std::fs::remove_file(journal());
     }
 }
 

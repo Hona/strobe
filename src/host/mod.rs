@@ -778,13 +778,14 @@ pub fn device_name() -> String {
     name.split('.').next().unwrap_or("").to_lowercase()
 }
 
-/// The module each thread started in (its path), per tid, for `(pid, tid)` pairs (Windows only).
+/// The module each thread started in (its path), per tid, for `(pid, tid)` pairs (Windows: its start
+/// address; Linux: read from the top of its stack; macOS keeps no per-thread start a user can read).
 pub fn thread_modules(threads: &[(u32, u32)]) -> std::collections::HashMap<u32, String> {
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     {
-        win::thread_modules(threads)
+        os::thread_modules(threads)
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     {
         let _ = threads;
         Default::default()

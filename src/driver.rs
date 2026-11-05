@@ -620,7 +620,7 @@ impl Driver {
                 let shot = self.page.send_long("Page.captureScreenshot", json!({ "format": "png" }))?;
                 let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap_or("")).map_err(|e| Error::msg(format!("snapshot {name}: {e}")))?;
                 std::fs::create_dir_all(dir)?;
-                std::fs::write(dir.join(format!("{name}.png")), png)?;
+                crate::store::write_atomic(&dir.join(format!("{name}.png")), &png)?;
                 Ok(Value::Bool(true))
             }
             other => Err(Error::msg(format!("unknown page call {other}"))),

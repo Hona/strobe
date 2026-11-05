@@ -8,7 +8,7 @@ use crate::probe::symbols::{Frame, Symbolizer};
 use crate::store;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 
 /// strobe's own times are the host's monotonic clock (QPC on Windows, where Chrome's MONOTONIC and
@@ -132,12 +132,7 @@ pub fn build(dir: &Path, out: &Path) -> Result<Built> {
         packet(&mut file, &p);
     }
     file.extend_from_slice(&b.out);
-    let tmp = out.with_extension("pftrace.tmp");
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(&file)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, out)?;
+    store::write_atomic(out, &file)?;
     b.built.bytes = file.len() as u64;
     Ok(b.built)
 }

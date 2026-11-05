@@ -82,10 +82,9 @@ pub fn store_maps(page: &Page, scripts: &BTreeSet<String>, dir: &Path, served: O
 }
 
 fn write_gz(path: &Path, bytes: &[u8]) -> Result<()> {
-    let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(path)?, flate2::Compression::fast());
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     gz.write_all(bytes)?;
-    gz.finish()?;
-    Ok(())
+    crate::store::write_atomic(path, &gz.finish()?)
 }
 
 struct Fetched {

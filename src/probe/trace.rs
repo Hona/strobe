@@ -72,7 +72,7 @@ impl Tracing {
             eprintln!("strobe: warning: the trace buffer overflowed; the recording is incomplete");
         }
         let stream = done["stream"].as_str().ok_or_else(|| Error::msg("tracing: no stream"))?;
-        let mut file = std::io::BufWriter::new(std::fs::File::create(path)?);
+        let mut file = std::io::BufWriter::new(crate::store::create(path)?);
         let mut total = 0u64;
         loop {
             let r = self.cdp.send("IO.read", json!({ "handle": stream, "size": 4 << 20 }), None)?;
@@ -88,8 +88,8 @@ impl Tracing {
                 break;
             }
         }
-        file.flush()?;
         let _ = self.cdp.send("IO.close", json!({ "handle": stream }), None);
+        file.into_inner().map_err(|e| e.into_error())?.commit()?;
         Ok(total)
     }
 }

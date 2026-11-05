@@ -153,7 +153,7 @@ pub fn run(args: &Args) -> Result<Output> {
     if set == Set::Memory {
         let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
-            let _ = std::fs::remove_dir_all(&dir);
+            store::discard(&dir);
             return Err(validity::locked());
         }
         if !attach {
@@ -186,7 +186,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let tree = host::tree_pids(browser.pid);
     let os_frames = os_frames.map(|r| r.and_then(|c| c.stop()));
     if on_screen && (awake.locks() > 0 || host::session_locked()) {
-        let _ = std::fs::remove_dir_all(&dir);
+        store::discard(&dir);
         return Err(validity::locked());
     }
     if set == Set::Attribution {
@@ -365,7 +365,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
         let session_locked = awake.locks() > 0 || host::session_locked();
         if session_locked && !windowless {
-            let _ = std::fs::remove_dir_all(&dir);
+            store::discard(&dir);
             return Err(validity::locked());
         }
         if !windowless {

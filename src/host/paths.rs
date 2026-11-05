@@ -85,10 +85,28 @@ pub fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 /// `mode` is the Unix permission bits of the new file; Windows has none to set.
 fn replace(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
-    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-    let tmp = dir.join(format!(".{name}.{}-{}.tmp", std::process::id(), csprng_hex(4)?));
-    let written = (|| {
+    let mut f = Atomic::create(path, mode)?;
+    f.write_all(bytes)?;
+    f.commit()
+}
+
+/// A file written in pieces (a trace streamed from the target, a heap snapshot), whole or not at
+/// all, as `write_atomic` writes one at once: into a temporary file beside `path` until `commit`
+/// flushes it to disk and renames it over `path`. Dropped without `commit` (an error midway), the
+/// temporary file is removed and `path` stays as it was.
+pub struct Atomic {
+    file: Option<std::fs::File>,
+    tmp: PathBuf,
+    path: PathBuf,
+}
+
+impl Atomic {
+    /// `mode` is the Unix permission bits of the new file (`0o644`, or `0o600` for what only its
+    /// owner may read); Windows has none to set.
+    pub fn create(path: &Path, mode: u32) -> std::io::Result<Atomic> {
+        let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let tmp = dir.join(format!(".{name}.{}-{}.tmp", std::process::id(), csprng_hex(4)?));
         let mut o = std::fs::OpenOptions::new();
         o.write(true).create_new(true);
         #[cfg(unix)]
@@ -98,29 +116,53 @@ fn replace(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
         }
         #[cfg(not(unix))]
         let _ = mode;
-        let mut f = o.open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()
-    })();
-    if let Err(e) = written {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(e);
+        let file = o.open(&tmp)?;
+        Ok(Atomic { file: Some(file), tmp, path: path.to_path_buf() })
     }
-    let mut wait = std::time::Duration::from_millis(10);
-    let mut tries = 0;
-    loop {
-        match std::fs::rename(&tmp, path) {
-            Ok(()) => return Ok(()),
-            // Sharing violations and access denied: another process holds the file (an antivirus).
-            Err(e) if cfg!(windows) && tries < 8 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
-                tries += 1;
-                std::thread::sleep(wait);
-                wait *= 2;
+
+    pub fn commit(mut self) -> std::io::Result<()> {
+        if let Some(f) = self.file.take() {
+            f.sync_all()?;
+        }
+        let mut wait = std::time::Duration::from_millis(10);
+        let mut tries = 0;
+        loop {
+            match std::fs::rename(&self.tmp, &self.path) {
+                Ok(()) => {
+                    self.tmp = PathBuf::new();
+                    return Ok(());
+                }
+                // Sharing violations and access denied: another process holds the file (an antivirus).
+                Err(e) if cfg!(windows) && tries < 8 && matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+                    tries += 1;
+                    std::thread::sleep(wait);
+                    wait *= 2;
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e);
-            }
+        }
+    }
+
+    fn file(&mut self) -> std::io::Result<&mut std::fs::File> {
+        self.file.as_mut().ok_or_else(|| std::io::Error::other("the file was committed"))
+    }
+}
+
+impl Write for Atomic {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file()?.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file()?.flush()
+    }
+}
+
+impl Drop for Atomic {
+    fn drop(&mut self) {
+        self.file.take();
+        if !self.tmp.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.tmp);
         }
     }
 }

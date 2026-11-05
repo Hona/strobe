@@ -866,7 +866,7 @@ mod imp {
                     let w = self.windows(opts(1)["window"].as_str())?[0];
                     let img = host::window_image(w).ok_or_else(|| Error::msg(format!("snapshot {name}: the window did not draw itself (PrintWindow)")))?;
                     std::fs::create_dir_all(dir)?;
-                    std::fs::write(dir.join(format!("{name}.png")), crate::png::write(&img)?)?;
+                    crate::store::write_atomic(&dir.join(format!("{name}.png")), &crate::png::write(&img)?)?;
                 }
                 "goto" | "eval" => {
                     return Err(Error::usage(format!(

@@ -27,7 +27,7 @@ pub fn snapshot(page: &Page, path: &Path) -> Result<u64> {
         let params = json!({ "reportProgress": false, "captureNumericValue": false, "exposeInternals": false });
         let _ = done_tx.send(p.cdp.send_timeout("HeapProfiler.takeHeapSnapshot", params, Some(&p.session), Duration::from_secs(1800)));
     });
-    let mut out = GzEncoder::new(std::io::BufWriter::with_capacity(1 << 20, create_private(path)?), Compression::fast());
+    let mut out = GzEncoder::new(std::io::BufWriter::with_capacity(1 << 20, crate::store::create_owner_only(path)?), Compression::fast());
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
             Ok(ev) => chunk(&mut out, &ev, &page.session)?,
@@ -43,7 +43,7 @@ pub fn snapshot(page: &Page, path: &Path) -> Result<u64> {
             break;
         }
     }
-    out.finish()?.flush()?;
+    out.finish()?.into_inner().map_err(|e| e.into_error())?.commit()?;
     Ok(std::fs::metadata(path)?.len())
 }
 
@@ -58,11 +58,3 @@ fn chunk(out: &mut impl Write, ev: &Value, session: &str) -> Result<()> {
     Ok(())
 }
 
-/// Heap snapshots hold page data (SPEC rule 9): only the owner may read them.
-fn create_private(path: &Path) -> Result<std::fs::File> {
-    let mut o = std::fs::OpenOptions::new();
-    o.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
-    Ok(o.open(path)?)
-}

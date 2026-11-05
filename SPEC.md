@@ -127,7 +127,9 @@ State dir: `~/.local/share/strobe/` (respect `XDG_DATA_HOME`) on Linux and macOS
 written `0600` from their creation (`host::paths::write_owner_only`). Every file strobe keeps is
 written whole or not at all: into a temporary file beside it, flushed to disk, then renamed over it
 (`host::paths::write_atomic`; on Windows a rename that a scanner holds up is tried again for about
-2.5 s). Random ids and tokens come from the OS's random source (`host::paths::csprng_hex`).
+2.5 s). A file written in pieces (a trace streamed from the target, a heap snapshot) goes the same
+way (`host::paths::Atomic`, through `store::create`): an error midway leaves no file. Random ids and
+tokens come from the OS's random source (`host::paths::csprng_hex`).
 
 ```
 state.json          { "mcp_port", "helper", "engine", "last_calibration" }
@@ -136,6 +138,7 @@ experiments/<exp>/  result.json per experiment; index.jsonl lists them (§14.2)
 recordings/<rec>/   §14.1
 history/            tracked series per device, schedules (§25.6)
 builds/<key>/       variant build cache (§9.5)
+sdk/<build>/        the bench SDK the runner imports, one folder per strobe build (`STROBE_BUILD_ID`)
 symbols/            source maps by debug ID, PDB cache
 engine/<version>/   trace_processor (§15), sha256-checked
 run/  log/          temp files; daemon.log, helper.log (rotated at 1 MB)
@@ -207,9 +210,15 @@ host/           paths, processes, sockets, autostart, opencode registration, mes
 ui/             embedded viewer and calibration assets
 ```
 
-- `cli`, `mcp` → `app` → everything else. Backends (`target`, `probe`, `engine`, `store`,
-  `symbol`) depend only on `model` (and `host` for paths), never on `app`/`cli` or on each
-  other's internals. They return `model` types.
+- `cli`, `mcp` → `app` → everything else. Nothing outside `app/`, `cli` and `main` names `app` or
+  `cli` (shared helpers such as `fmt.rs` live below `app`, which re-exports them). Backends
+  (`target`, `probe`, `engine`, `store`, `symbol`) use each other only through their public entry
+  points, never their internals: a probe drives the page through `target`'s CDP, writes through
+  `store`, and reads the trace it just took through `engine::query` while the page is still open (a
+  census's allocators, a layout shift's moved elements: the rows name nodes only the live page can
+  resolve). Only `engine` runs trace_processor; only `store` writes `experiments/` and
+  `recordings/` (`store::write_atomic`, `write_json`, `create` for streamed files, `discard`). They
+  return `model` types.
 - One backend each until a second exists. No traits or plugin layers ahead of need.
 - Idiomatic Rust: `pub(crate)` by default, `cargo fmt`, `cargo clippy` clean.
 
@@ -2507,6 +2516,9 @@ As built (Linux and macOS): no helper process. Native stacks run in strobe's own
   prompts for it. Each thread's ring buffer is mapped; without CAP_IPC_LOCK the per-user
   `perf_event_mlock_kb` budget may force small buffers, and the kernel's lost-sample records go to
   `events_lost`. An inherited event cannot be mapped, so new threads are found every 50 ms instead.
+  One reader thread owns every ring: `stop` waits for it at most 60 s, and a capture dropped without
+  a stop (a failed block, an early error in a long-lived daemon) tells it to end and waits at most
+  2 s, so no sampling or perf event outlives the capture.
 - **macOS**: the only sampler a user may run on their own processes without root or an entitlement
   is `/usr/bin/sample` (reading another task's threads takes a task port, which `task_for_pid` gives
   only to root, to entitled debuggers, and with Developer Mode enabled). Its samples are wall-clock
@@ -2538,16 +2550,26 @@ As built (Windows):
   this user, administrators or SYSTEM (`GetSecurityInfo` owner: an elevated token's default owner is
   administrators). Another account that created a pipe of that name first owns it itself, even when
   it runs a copy of the helper; a server whose image cannot be read is refused too.
-  Operations, one JSON line each way: `presents.start`/`presents.stop` (every present and vertical
-  blank, as JSON) and `stacks.start {root}`/`stacks.stop` (only for a process tree running as the
-  same user). A client that disconnects stops its sessions.
+  Operations, one JSON line each way: `hello`, `presents.start`/`presents.stop` (every present and
+  vertical blank, as JSON) and `stacks.start {root}`/`stacks.stop` (only for a process tree running
+  as the same user). A client that disconnects stops its sessions.
+- **Which helper.** Each build carries two ids from `build.rs`: `STROBE_BUILD_ID` (every source file)
+  and `STROBE_HELPER_PROTOCOL` (the sources of the helper's operations and what they return,
+  `src/etw/`). The client's first request is `hello`, and it refuses a helper whose protocol id is
+  not its own ("the installed deep-mode helper is another build … run strobe up"): `strobe update`
+  or a build of another commit of the same version may have left an older copy installed. Builds
+  that changed other files keep using the installed helper. `up` replaces the installed copy when its
+  build id is not this build's, and `status` says when it is another build's.
 - **Native stacks**: a system logger session with the profile source at 200 µs (5 kHz, the
-  system-wide interval restored afterwards), a stack walk on every sample, image loads with the
-  rundown of loaded images, and process starts, so children of the target count from their first
-  sample. Samples of other processes are dropped as they arrive; kernel and user parts of a stack
+  system-wide interval put back when the capture stops or is dropped, on any error), a stack walk on
+  every sample, image loads with the rundown of loaded images, and process starts, so children of
+  the target count from their first sample. Samples of other processes are dropped as they arrive; kernel and user parts of a stack
   merge by timestamp and thread. The user's strobe adds thread names (`GetThreadDescription`) and
   module lists the rundown missed. Recordings keep `deep.json.gz` (modules, unique stacks,
-  samples), symbolized on read (§12.2).
+  samples), symbolized on read (§12.2). A helper that dies while sampling (strobe aborts on a panic,
+  or `up` ends the task) leaves its session and the raised interval: the next session that starts
+  stops sessions of dead strobe processes, and after stopping a `strobe-stacks-<pid>` one puts the
+  interval back to Windows' own 1 ms when it is still strobe's 200 µs.
 - **Why ETW first, not suspending threads from outside**: a non-elevated sampler stops each thread
   for tens of microseconds per sample (5 kHz across a dozen threads perturbs the target far more
   than an interrupt-time stack walk), can only sample threads it knows ran (biased toward threads
@@ -3361,7 +3383,9 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   Variants also take `url:<href>` (an already running origin).
 - macOS completion handlers (ScreenCaptureKit) are blocks with copy and dispose helpers, so the
   framework's copy keeps their context alive after strobe stops waiting; frame callbacks drain on
-  their serial queue before a stream's sink is freed.
+  their serial queue before a stream's sink is freed. A stream that does not confirm its start in
+  5 s is stopped and drained like any other (it may still start later), and the capture releases the
+  queue once every stream is gone, on `stop` or on a drop.
 - `top` on Linux and macOS reads every process's GPU time through the per-process collectors (DRM
   client statistics, IORegistry GPU time), which have no every-process counter as PDH is; a
   process's VRAM shows `-` on macOS (shared memory).

@@ -61,6 +61,13 @@ pub fn recording_dir(id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
+/// Removes a recording that was refused (a locked session): none of it is kept.
+pub fn discard(dir: &Path) {
+    if dir.parent().is_some_and(|p| p == paths::recordings() || p == paths::experiments()) {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
 pub fn experiment_dir(id: &str) -> Result<PathBuf> {
     let dir = paths::experiments().join(id);
     std::fs::create_dir_all(&dir)?;
@@ -71,6 +78,18 @@ pub fn experiment_dir(id: &str) -> Result<PathBuf> {
 /// result.json, and a crash keeps the last complete one.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     paths::write_atomic(path, bytes).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
+}
+
+/// A file of a recording written in pieces (a trace streamed from the target), whole or not at all:
+/// it appears at `path` only on `commit` (`host::paths::Atomic`).
+pub fn create(path: &Path) -> Result<paths::Atomic> {
+    paths::Atomic::create(path, 0o644).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
+}
+
+/// `create` for what holds the target's data verbatim (a heap snapshot, SPEC rule 9): only its owner
+/// may read it, from its creation.
+pub fn create_owner_only(path: &Path) -> Result<paths::Atomic> {
+    paths::Atomic::create(path, 0o600).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
 }
 
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {

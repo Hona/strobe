@@ -146,7 +146,8 @@ experiments/<exp>/  result.json per experiment; index.jsonl lists them (§14.2)
 recordings/<rec>/   §14.1
 history/            tracked series per device, schedules (§25.6)
 builds/<key>/       variant build cache (§9.5)
-sdk/<build>/        the bench SDK the runner imports, one folder per strobe build (`STROBE_BUILD_ID`)
+sdk/<build>/        the bench SDK the runner imports, one folder per strobe build (`STROBE_BUILD_ID`);
+                    each use touches its `.used`, and other builds' folders unused for 30 days go
 symbols/            source maps by debug ID, PDB cache
 engine/<version>/   trace_processor (§15), sha256-checked
 run/  log/          temp files; daemon.log, helper.log (rotated at 1 MB)

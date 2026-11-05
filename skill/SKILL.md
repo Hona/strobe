@@ -35,8 +35,12 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         runs and phases, inputs, OS presents, threads' CPU and wakes, memory, validity; --no-browser prints the URL
     strobe report experiment|recording <handle> [--format html|md|pr]    writes a file; show it in the Review pane; pr: the experiment as one
         delimited block for a PR body, printed to stdout (the file's path on stderr)
-    strobe report experiment <exp> --format pr --update-pr <n> [-R owner/repo] [--force]    replaces that experiment's block in PR n's body
-        (or appends it) through gh; the author's text stays; a hand-edited block is refused unless --force
+    strobe report experiment <exp> --format pr --update-pr <n> [-R owner/repo] [--force] [--no-card]    replaces that experiment's block in
+        PR n's body (or appends it) through gh; the author's text stays; a hand-edited block is refused unless --force; the result card
+        leads the block (an SVG gh attaches, light or dark with the reader's theme; text only with an older gh or --no-card)
+    strobe report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]    the result
+        as an image: card 1200×630 (decided wins as large numbers with before → this PR and one dot per pair; otherwise what happened),
+        badge one line (`run time −84%`); same bytes every run; --badge-url prints a shields.io URL (sends the label to shields.io)
     strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]   a native app from the line it prints when ready (to the next line), not a fixed settle
     strobe run [--pin auto] [--reserve-cpus on|off] -- <command>   your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs
     strobe track <file.bench.ts> [--ref <rev> | --range a..b [--every N]] [--filter <case>] [--alert-command '<cmd>'] [--alert-webhook <url>]
@@ -129,7 +133,7 @@ Where does the GPU process spend time (a frozen first frame, a slow canvas)? `qu
 What does a launch do before it is ready? `record --bench <file>#<launch case>`: its milestones, and `query <rec> threads` for each thread's wakes and CPU from the spawn until ready (no trace needed).
 Does a native app wake up while idle? `record app:<id> --for 10s` (or `exe:<path> --native`), then `query <rec> threads` (wakes/s and CPU per named thread, the module each started in, and whose: app, driver such as `nvwgf2umx.dll`, or os) and `query <rec> insights`. `cpu.wakes` is context switches/s (waits and preemptions, driver threads included); the insight counts the app's own threads apart.
 When did it happen, and what ran beside it? `strobe open <rec>` (or `<exp>/head`): Perfetto shows a long task beside the presents it delayed, a driver thread compiling while the UI waits, and lets a person browse stacks (drag over a Callstacks track for the flame graph). Numbers and verdicts still come from strobe's views (`hotspots`, `threads`, `frames`); Perfetto is for seeing and browsing.
-Writing the PR? `report experiment <exp> --format pr --update-pr <n>` puts the experiment's block in the PR body (or paste stdout).
+Writing the PR? `report experiment <exp> --format pr --update-pr <n>` puts the experiment's block in the PR body, led by its result card (or paste stdout, text only).
 
 ## Every performance claim in a PR comes from strobe
 
@@ -149,6 +153,12 @@ body carries strobe's evidence, and nothing else stands in for it:
    numbers, round them, drop rows, the setup line or the alert, or rewrite verdicts. Write your own
    summary and reading of the numbers outside it, above or below; if a metric was refused or
    `unclear`, say so there too. One block per experiment when a PR has several.
+   The card `--update-pr` attaches is the block's only colour and the first thing a reader sees: it
+   shows the same results as the headings (wins, what got worse beside them, or a calm "No
+   measurable change" / "Not decided yet"), never more. It helps a PR whose change is the point
+   (a win to see at a glance, a regression to notice); it never replaces the numbers, and never
+   put a card or badge in a PR without the block. `--format card` writes one for elsewhere (a
+   release note, a chat message); `--format badge` a one-line badge.
 4. **The bench**: the case's code, or a link to the bench file and case when it already exists. A new
    bench case ships in the same PR as the first change it measures.
 

@@ -84,4 +84,6 @@ The block starts and ends with a quiet "strobe · <exp> · generated" line, betw
 
 Anything decidedly worse (a metric, or late frames) sits in one caution alert right under the hero line.
 
+Above the headings, `--update-pr` attaches a result card through `gh --attach`: the same wins as large numbers with before → this PR and one dot per pair, light or dark with the reader's theme. `--format card` writes it as PNG or SVG for anywhere else, and `--format badge` a one-line badge (`run time −84%`).
+
 Built like [mesh](https://github.com/Hona/mesh): one small native binary, a per-user daemon, CLI and MCP with the same names and JSON, and a built-in skill for opencode.

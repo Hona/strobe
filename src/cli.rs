@@ -39,6 +39,8 @@ const SWITCHES: &[&str] = &[
     "again",
     "headed",
     "full",
+    "badge-url",
+    "no-card",
 ];
 
 #[derive(Clone)]
@@ -175,6 +177,11 @@ Use
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body
                                   (md and pr print the markdown; the file's path goes to stderr)
+  report experiment <exp> --format pr --update-pr <n> [-R owner/repo] [--force] [--no-card]
+                                  put the block in PR n's body, with the result card and badges attached through gh
+  report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]
+                                  the result as an image: card 1200×630 (decided wins large, else what happened), badge one
+                                  line; SVG follows the reader's colour scheme (auto); --badge-url prints a shields.io URL
   open <rec_…|exp_…[/head|base|<block>|<case>]> [--perfetto] [--no-browser]
                                   the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
                                   and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory

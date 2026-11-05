@@ -39,6 +39,9 @@ pdb-addr2line = "0.12"
 rustc-demangle = "0.1"
 # C++ symbol names in Microsoft's public PDBs (`?Present@CDXGISwapChain@@…`); pure Rust.
 msvc-demangler = "0.11"
+# Result cards and badges (`report --format card|badge`): SVG text set in the embedded font, outlined, and
+# rasterized to PNG; pure Rust (usvg, rustybuzz, tiny-skia), no system fonts.
+resvg = { version = "0.49", default-features = false, features = ["text"] }
 
 [target.'cfg(unix)'.dependencies]
 # Linux and macOS system calls (affinity, CPU clocks, sysctl, proc_pidinfo, perf_event_open, dlopen); bindings only, no C build.

@@ -50,10 +50,12 @@ fn end_marker(id: &str) -> String {
     format!("<!-- strobe:report {id} end -->")
 }
 
-/// The first 16 hex digits of the SHA-256 of the content between the markers, trimmed, with LF line ends.
+/// The first 16 hex digits of the SHA-256 of the content between the markers, trimmed, with LF line
+/// ends and without image addresses: gh replaces `./card.svg` with the uploaded image's.
 fn digest(content: &str) -> String {
     use sha2::Digest;
     let norm = content.replace("\r\n", "\n");
+    let norm = regex_lite::Regex::new(r"(!\[[^\]]*\])\([^)\s]*\)").expect("pattern").replace_all(&norm, "$1()");
     sha2::Sha256::digest(norm.trim().as_bytes()).iter().take(8).map(|b| format!("{b:02x}")).collect()
 }
 
@@ -77,10 +79,21 @@ pub fn version() -> String {
     if commit.is_empty() { format!("strobe {}", env!("CARGO_PKG_VERSION")) } else { format!("strobe {}+{commit}", env!("CARGO_PKG_VERSION")) }
 }
 
+/// What `update_pr` did.
+pub struct Updated {
+    pub url: String,
+    /// Images gh attached (0: the block went in as text).
+    pub images: usize,
+    /// The same report was there already, so the body was left alone.
+    pub unchanged: bool,
+}
+
 /// Replaces this experiment's block in pull request `n`'s body, or appends it, through `gh`. The
 /// author's text outside the markers is untouched. A block edited by hand (its content no longer
-/// matches the marker's hash) is refused unless `force`.
-pub fn update_pr(n: &str, repo: Option<&str>, id: &str, block: &str, force: bool) -> Result<String> {
+/// matches the marker's hash) is refused unless `force`. `attach` are the images the block names as
+/// `./<file name>`: `gh pr edit --attach` uploads them and puts each one's address in its place. When
+/// gh cannot (a gh without `--attach`, a failed upload), `plain`, the block without images, goes in.
+pub fn update_pr(n: &str, repo: Option<&str>, id: &str, block: &str, force: bool, attach: &[std::path::PathBuf], plain: Option<&str>) -> Result<Updated> {
     let gh = |extra: &[&str]| {
         let mut c = std::process::Command::new("gh");
         c.args(["pr"]).args(extra);
@@ -95,20 +108,57 @@ pub fn update_pr(n: &str, repo: Option<&str>, id: &str, block: &str, force: bool
     }
     let pr: Value = serde_json::from_slice(&out.stdout).map_err(|_| Error::msg("gh pr view: unexpected output"))?;
     let url = pr["url"].as_str().unwrap_or("").to_string();
-    let body = splice(pr["body"].as_str().unwrap_or(""), id, block, force)?;
-    if utf16(&body) > 65_536 {
-        return Err(Error::usage(format!("the body would be {} characters, over GitHub's 65,536: shorten the author's text or the report", utf16(&body))));
+    let current = pr["body"].as_str().unwrap_or("").replace("\r\n", "\n");
+    // Image addresses aside, the same report: keep the body and the images already uploaded.
+    let hash = |text: &str, id: &str| {
+        let re = regex_lite::Regex::new(&format!(r"<!-- strobe:report {} v1 begin sha256:([0-9a-f]+) -->", regex_lite::escape(id))).ok()?;
+        re.captures(text).and_then(|m| m.get(1)).map(|g| g.as_str().to_string())
+    };
+    if !force
+        && let (Some(a), Some(b)) = (hash(&current, id), hash(block, id))
+        && a == b
+    {
+        // Unless someone edited the block by hand: splice refuses that.
+        splice(&current, id, block, false)?;
+        return Ok(Updated { url, images: 0, unchanged: true });
     }
-    let tmp = std::env::temp_dir().join(format!("strobe-pr-{id}-{}.md", std::process::id()));
-    std::fs::write(&tmp, &body)?;
-    let path = tmp.display().to_string();
-    let edit = gh(&["edit", n, "--body-file", &path]).output();
-    let _ = std::fs::remove_file(&tmp);
-    let edit = edit.map_err(|e| Error::msg(format!("gh pr edit: {e}")))?;
-    if !edit.status.success() {
-        return Err(Error::msg(format!("gh pr edit {n} failed: {}", String::from_utf8_lossy(&edit.stderr).trim())));
+    let edit = |text: &str, files: &[std::path::PathBuf]| -> Result<bool> {
+        let body = splice(&current, id, text, force)?;
+        if utf16(&body) > 65_536 {
+            return Err(Error::usage(format!("the body would be {} characters, over GitHub's 65,536: shorten the author's text or the report", utf16(&body))));
+        }
+        // gh finds `./name` beside the body file.
+        let dir = files.first().and_then(|p| p.parent()).map(std::path::Path::to_path_buf).unwrap_or_else(std::env::temp_dir);
+        let tmp = dir.join(format!("strobe-pr-{id}-{}.md", std::process::id()));
+        std::fs::write(&tmp, &body)?;
+        let path = tmp.display().to_string();
+        let mut args = vec!["edit".to_string(), n.to_string(), "--body-file".to_string(), path];
+        for f in files {
+            args.push("--attach".into());
+            args.push(f.display().to_string());
+        }
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let done = gh(&refs).output();
+        let _ = std::fs::remove_file(&tmp);
+        let done = done.map_err(|e| Error::msg(format!("gh pr edit: {e}")))?;
+        if !done.status.success() && files.is_empty() {
+            return Err(Error::msg(format!("gh pr edit {n} failed: {}", String::from_utf8_lossy(&done.stderr).trim())));
+        }
+        if !done.status.success() {
+            crate::app::progress(format!("strobe: gh could not attach the images ({}); the report goes in as text", String::from_utf8_lossy(&done.stderr).trim()));
+        }
+        Ok(done.status.success())
+    };
+    if !attach.is_empty() {
+        let help = gh(&["edit", "--help"]).output().map(|o| String::from_utf8_lossy(&o.stdout).contains("--attach")).unwrap_or(false);
+        if !help {
+            crate::app::progress("strobe: this gh cannot attach images (gh pr edit --attach); the report goes in as text");
+        } else if edit(block, attach)? {
+            return Ok(Updated { url, images: attach.len(), unchanged: false });
+        }
     }
-    Ok(url)
+    edit(if attach.is_empty() { block } else { plain.unwrap_or(block) }, &[])?;
+    Ok(Updated { url, images: 0, unchanged: false })
 }
 
 /// `body` with experiment `id`'s block replaced by `block` (or `block` appended after a blank line).
@@ -146,6 +196,59 @@ pub fn repo_relative(file: &str) -> String {
         }
     }
     clean.rsplit('/').next().unwrap_or(&clean).to_string()
+}
+
+/// What the hero line and the caution say, for the card (`card.rs`) to draw the same: each a
+/// (series, comparison).
+pub struct Hero<'a> {
+    /// The hero's wins: each celebrated series' main metric (a metric that won in several series is
+    /// one phrase in the line and one row per series here), then the one extra tested metric.
+    pub wins: Vec<(&'a Value, &'a Value)>,
+    /// Everything decidedly worse: main and tested metrics.
+    pub worse: Vec<(&'a Value, &'a Value)>,
+    /// Late frames up by a point or more: (series, base share, head share, pairs worse, pairs).
+    pub late: Vec<(&'a Value, f64, f64, usize, usize)>,
+    /// The heading without a win or a regression.
+    pub calm: String,
+}
+
+pub fn hero(r: &Value) -> Hero<'_> {
+    let d = Doc::new(r, 0);
+    let second = d.win_phrases().1;
+    let mut keys: Vec<String> = Vec::new();
+    let mut wins = Vec::new();
+    for s in d.series.iter().copied() {
+        let c = &s["primary"];
+        if d.aa || s["kind"] == "leak" || s["not_run"] == true || d.primary_out(s) != Out::Better || verdict(c).starts_with("worse") {
+            continue;
+        }
+        // The same groups as `win_phrases`, at most three.
+        let key = format!("{}|{}", c["metric"].as_str().unwrap_or(""), d.hero_parts(c).1);
+        if !keys.contains(&key) {
+            if keys.len() == 3 {
+                continue;
+            }
+            keys.push(key);
+        }
+        wins.push((s, c));
+    }
+    wins.extend(second);
+    let (mut worse, mut late) = (Vec::new(), Vec::new());
+    for s in d.series.iter().copied() {
+        if d.aa || s["kind"] == "leak" || s["not_run"] == true {
+            continue;
+        }
+        if d.primary_out(s) == Out::Worse {
+            worse.push((s, &s["primary"]));
+        }
+        worse.extend(tested(s).into_iter().skip(1).filter(|c| outcome(c, d.aa) == Out::Worse).map(|c| (s, c)));
+        if let Some((b, h, k, n)) = late_frames(s, r)
+            && h - b >= 0.01
+        {
+            late.push((s, b, h, k, n));
+        }
+    }
+    Hero { wins, worse, late, calm: d.calm() }
 }
 
 // ---------- outcome of one comparison ----------
@@ -369,7 +472,11 @@ impl<'a> Doc<'a> {
         // A card image (`--format card`, attached by `--update-pr`) leads when there is one; the
         // heading stays, so the result reads without images.
         if let Some(url) = self.r["card"]["url"].as_str() {
-            out += &format!("![{}]({url})\n\n", hero.replace('\u{a0}', " ").replace(['[', ']'], ""));
+            let alt = self.r["card"]["alt"].as_str().map(str::to_string).unwrap_or_else(|| hero.replace('\u{a0}', " "));
+            // The images' digest: the block's hash leaves image addresses out, so new pictures of the
+            // same numbers (a newer strobe draws them) still count as a change.
+            let digest = self.r["card"]["digest"].as_str().map(|d| format!(" <!-- strobe:card {d} -->")).unwrap_or_default();
+            out += &format!("![{}]({url}){digest}\n\n", alt.replace(['[', ']'], ""));
         }
         out += &format!("# {hero}\n\n");
         // What got decidedly worse: as hard to miss, but never in a win's typography.

@@ -109,6 +109,7 @@ Cargo.toml  build.rs
 src/            one package: lib + bins strobe, strobew (Windows windowless); §4.3
 viewer/         self-contained HTML report viewer (`viewer/report.html`), embedded
 calibration/    the known-cost page (static), embedded
+assets/fonts/   Inter Regular and SemiBold (Latin subset, SIL OFL 1.1, OFL.txt) for result cards, embedded
 sdk/            TypeScript: @hona/strobe (the CLI launcher and bench SDK), @hona/strobe-web, @hona/strobe-electron, @hona/strobe-playwright
                 (one Bun workspace)
 skill/SKILL.md  the built-in skill, embedded (include_str!)
@@ -437,7 +438,8 @@ still running (`progress`).
 
 ```
 strobe report <view> <handle | exp_…>… [--format md|html|pr] [--out <path>] [--open] [--json]
-strobe report experiment <exp_…> --format pr --update-pr <n> [-R owner/repo] [--force]
+strobe report experiment <exp_…> --format pr --update-pr <n> [-R owner/repo] [--force] [--no-card]
+strobe report experiment <exp_…> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]
 ```
 
 Writes a self-contained artifact from a view in the catalog (§11.2) and prints its path.
@@ -1805,9 +1807,11 @@ pull request body, pasted verbatim. Few words, two drawers:
   a main metric that got decidedly worse is the hero (`# Regression: 120 fewer frames shown`), else
   one calm line says what happened (`# No measurable change`, `# Not decided yet: needs ~50
   pairs`, `# Not measured`). Spaces between words break; only a number and its unit are held
-  together. When a card image is attached (`result.card.url`, from `--format card`), it leads, its
-  alt text the hero's words; the heading stays so the block reads without images, and a series
-  badge (`result.card.badges[<label>]`) stands in for that series' bold change.
+  together. With `--update-pr` the result card leads (`result.card.url`, below), its
+  alt text the result in words (`result.card.alt`); the heading stays so the block reads without
+  images (screen readers, raw Markdown, a failed upload), and a series badge
+  (`result.card.badges[<label>]`) stands in for that series' bold change. The images are strobe's
+  only colour in the block.
 - **Regressions:** everything decidedly worse in one `> [!CAUTION]` alert right under the hero, one
   `**Regression:**` line each: a main metric that got worse beside a win, a tested metric decided
   worse, late frames up by a point or more (`late frames rose from 0.0% to 10.3% (4 of 8 pairs)`:
@@ -1869,11 +1873,53 @@ The formatting strobe's version is Cargo.toml's with the commit of the build (`b
 outside a checkout), so a build from main after a release does not pass for the release.
 
 The hash is the first 16 hex digits of the SHA-256 of the content between the markers (trimmed,
-LF line ends). Authors write their summary, discovery and change outside the block; a PR may carry
-one block per experiment. `--update-pr <n>` (through `gh`, `-R owner/repo` for another repository)
-replaces that experiment's block in pull request `n`'s body, or appends it, and leaves the rest of
-the body as it was; a block whose content no longer matches its hash was edited by hand and is
-refused unless `--force`. A body over 65,536 characters is refused. The setup line and the rerun
+LF line ends, image addresses left out: `![alt](…)` counts as `![alt]()`, since gh replaces the
+local name with the upload's address; a `<!-- strobe:card <digest> -->` after the card holds the
+images' digest, so new pictures of the same numbers still count as a change). Authors write their summary, discovery and change outside
+the block; a PR may carry one block per experiment. `--update-pr <n>` (through `gh`, `-R
+owner/repo` for another repository) replaces that experiment's block in pull request `n`'s body, or
+appends it, and leaves the rest of the body as it was; a block whose content no longer matches its
+hash was edited by hand and is refused unless `--force`. A block already there with the same hash
+is left alone (no edit, no new uploads). A body over 65,536 characters is refused.
+
+Images in the block: GitHub has no API that uploads an image into a pull request body; `gh pr
+create|edit --attach <file>` (gh 2.100+) does it headlessly, and replaces a body's `![alt](./file)`
+with the uploaded image's `https://github.com/user-attachments/assets/…` address (private
+repositories serve it to readers with access only). So `--update-pr` writes the card and the
+series badges (the change alone on its tone, since the series' line names the metric) as SVG files
+to the experiment's `pr-card/` folder, names them `./strobe-card-<exp>.svg`
+and `./strobe-badge-<exp>-<n>.svg` in the block, writes the body beside them and runs `gh pr edit
+--body-file … --attach …` with only the files the block names (gh appends any other attachment to
+the end of the body). When gh has no `--attach` or an upload fails, the block goes in again without
+images; `--no-card` skips them. GitHub serves the SVG as it was uploaded (`image/svg+xml`), so its
+colour-scheme stylesheet follows the reader's light or dark theme. No commits, gists or release
+assets: they would write to the user's repository.
+
+`--format card` (`app/card.rs`) draws an experiment's result as one 1200×630 image (the Open Graph
+size), from the same rows as the hero line and its caution (`pr::hero`): up to three tiles in the
+hero's order (a metric that won in several series gets a tile per series), each the
+change as a very large number in the direction's colour (`90%`, `219 MB`), the metric in words for
+that direction (`fewer wake-ups`), `before 71.4/s → this PR 7.06/s`, a strip with one dot per pair
+(green past the bound the good way, red the bad way, grey inside the shaded bound, around a `no
+change` tick) and `better in 8 of 8 pairs`; the series above each tile when they differ. What got
+decidedly worse beside a win takes up to two tiles (in red), and results without room are counted
+(`2 more in the report`). Without a win, the hero's calm heading (`No measurable change`, `Not
+decided yet: needs ~445 pairs`, `Not measured`, `Identical builds matched`) with a line on why and
+the pairs in grey. The header names the case (or two) and the experiment; the footer `measured with
+strobe · 8 pairs · Ryzen 9 9950X3D · Windows 11`. Style: neutral greys, the one blue accent
+(`#009fff`) for strobe's mark, green and red only for a decided direction, square corners, 1px
+rules, no gradients, shadows or emoji. Text is set in Inter (SIL OFL 1.1, a Latin subset embedded
+in the binary, `assets/fonts`) by usvg and written with every glyph as a path, so the image looks
+the same in any viewer; `.png` is rasterized by resvg (tiny-skia, pure Rust), so the same strobe
+writes the same bytes on every machine. `--out <file.png|file.svg>` (default `card.png` in the
+experiment's folder); `--theme light|dark`, and for SVG `auto` (its default), a stylesheet with a
+`prefers-color-scheme: dark` rule. `--format badge` draws the headline as a 20px, shields-style
+badge (`run time | −84%`, the value on green, red or grey: `same`, `unclear`, `not measured`;
+SVG by default, PNG at twice the size); `--badge-url` prints a `https://img.shields.io/badge/…`
+URL instead of writing a file. That sends the label and value to shields.io, and GitHub fetches it
+through its image proxy: fine for a public repository; the local file is the default. The JSON
+gives each series' badge and URL. A card never stands in for the numbers: the block's headings and
+tables carry them. The setup line and the rerun
 command keep every flag that chose what ran and how (`--filter`, `--primary`, `--pairs`, `--runs`,
 `--probes`, `--params`, `--aa`, …; the experiment stores its command line); a bench stores its file's
 path in its repository as `file_repo`.
@@ -2896,6 +2942,19 @@ headings, console messages and an uncaught error with where; the PR line and the
 an injected result. Not run: macOS and Linux reads (titles from CoreGraphics need Screen Recording;
 the tree reads through AX and AT-SPI), a live A/B with `ScreenChanged`, the daemon's restart after
 an update.
+
+Result cards (2026-11-05, adais, session locked; §11.2): `report --format card|badge` and the card
+and badges in `--update-pr`. Checked: cards for a native experiment of two series with three wins,
+one of two series of the same case, a page with frame metrics, a win beside two regressions
+(`2 more in the report`), a regression alone, undecided, identical builds, and a refused main metric
+(an edited copy in a throwaway state folder), light and dark PNG and auto SVG, byte-identical on a
+second run; `--badge-url`; `--update-pr` on a draft pull request in this repository: gh 2.103
+uploaded the SVG card, the body named it at its `user-attachments` address, GitHub served the same
+bytes as `image/svg+xml`, and headless Edge drew it light or dark from the reader's preference; a
+second update left the body alone, a hand edit inside the block was refused, and a gh without
+`--attach` put the block in as text. GitHub moves only a plain image's address to its signed image
+host; `<picture>` sources and `#gh-dark-mode-only` addresses keep the bare one (not checked for a
+private repository's readers), so the block uses plain `![alt](…)` and the SVG's own stylesheet.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

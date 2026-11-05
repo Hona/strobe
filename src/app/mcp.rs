@@ -53,7 +53,7 @@ fn tools() -> Value {
             "reveal": b("heap: show string values (redacted by default; snapshots can hold user content)"), "at": s("memory: which census (0 the first, -1 the last, default the last)") } } },
         { "name": "report", "description": "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
           "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_…, exp_… or ser_… (a tracked series)"), "view": s("experiment, recording or history (default from the handle)"), "format": s("html (default) or md") } } },
+            "handle": s("rec_…, exp_… or ser_… (a tracked series)"), "view": s("experiment, recording or history (default from the handle)"), "format": s("html (default), md, pr (an experiment's pull request block), card (its result as a 1200×630 PNG) or badge (an SVG badge)") } } },
     ])
 }
 

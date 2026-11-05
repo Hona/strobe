@@ -15,6 +15,13 @@ pub fn run(args: &Args) -> Result<Output> {
     let dir = store::resolve(handle)?;
     let experiment = store::is_experiment(&dir);
     let mut data: Value = if experiment { store::read_json(&dir.join("result.json"))? } else { store::read_json(&dir.join("meta.json"))? };
+    // A card or badge needs only the result: no views, no insights.
+    if let Some(format @ ("card" | "badge")) = args.get("format") {
+        if !experiment {
+            return Err(Error::usage(format!("--format {format} draws an experiment's result: give an exp_… handle")));
+        }
+        return super::card::report(args, &dir, &data, format);
+    }
     if experiment {
         // The rerun ledger as of now: experiments on the same variants since this one ran count too.
         if data["identity"].is_object() {
@@ -64,18 +71,39 @@ pub fn run(args: &Args) -> Result<Output> {
     if args.get("update-pr").is_some() && format != "pr" {
         return Err(Error::usage("--update-pr replaces an experiment's block in a pull request body: add --format pr"));
     }
+    // A pull request gets the result card and per-series badges as images gh attaches; the block's
+    // headings say the same in words, so a body without them (an older gh, a failed upload) still reads.
+    let mut images = Vec::new();
+    let mut plain = None;
+    if args.get("update-pr").is_some() && !args.has("no-card") {
+        plain = Some(super::pr::block(&data));
+        let (card, files) = super::card::for_pr(&data, &dir)?;
+        data["card"] = card;
+        images = files;
+    }
     let body = match format {
         "md" => markdown(&data),
         "pr" => super::pr::block(&data),
         _ => html(view, &data),
     };
-    write_whole(&out, &body)?;
+    write_whole(&out, body.as_bytes())?;
     // The block between its markers in a pull request's body, the author's text around it untouched.
     if let Some(n) = args.get("update-pr") {
-        let url = super::pr::update_pr(n, args.get("repo"), data["id"].as_str().unwrap_or(handle), &body, args.has("force"))?;
+        // Only images the block names: gh appends any other attachment to the end of the body.
+        let attach: Vec<std::path::PathBuf> = images.into_iter().filter(|p| p.file_name().and_then(|f| f.to_str()).is_some_and(|f| body.contains(&format!("./{f}")))).collect();
+        let id = data["id"].as_str().unwrap_or(handle);
+        let done = super::pr::update_pr(n, args.get("repo"), id, &body, args.has("force"), &attach, plain.as_deref())?;
         let path = out.display().to_string();
-        let text = format!("updated {url} with {} ({}); the report is also in {path}\n", data["id"].as_str().unwrap_or(handle), super::fmt::bytes(body.len() as f64));
-        return Ok(Output::new(text, json!({ "path": path, "bytes": body.len(), "pr": url })));
+        let how = match done.images {
+            0 => "as text".to_string(),
+            k => format!("with {k} image{}", if k == 1 { "" } else { "s" }),
+        };
+        let text = if done.unchanged {
+            format!("left {} as it was: it already holds this report of {id}; the report is also in {path}\n", done.url)
+        } else {
+            format!("updated {} with {id} ({how}, {}); the report is also in {path}\n", done.url, super::fmt::bytes(body.len() as f64))
+        };
+        return Ok(Output::new(text, json!({ "path": path, "bytes": body.len(), "pr": done.url, "images": done.images, "unchanged": done.unchanged })));
     }
     if args.has("open") {
         open(&out.display().to_string());
@@ -93,11 +121,11 @@ pub fn run(args: &Args) -> Result<Output> {
 }
 
 /// Writes beside the target and renames over it once flushed, so a reader never sees half a report.
-fn write_whole(path: &std::path::Path, body: &str) -> Result<()> {
+pub(super) fn write_whole(path: &std::path::Path, body: &[u8]) -> Result<()> {
     use std::io::Write;
     let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
     let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(body.as_bytes())?;
+    f.write_all(body)?;
     f.sync_all()?;
     drop(f);
     std::fs::rename(&tmp, path)?;

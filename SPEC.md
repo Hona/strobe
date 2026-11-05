@@ -687,7 +687,8 @@ On a locked session it is an offscreen metric, like `run.duration`.
 
 What strobe reads from a native app (§13.7), per run:
 
-- **From outside, always:** `cpu.work` and `cpu.app.total` (the process tree's cycles), `cpu.wakes`
+- **From outside, always:** `cpu.work` and `cpu.app.total` (the cycles of the app's processes: its
+  tree and everything launched for its home with their trees, §13.2), `cpu.wakes`
   (context switches of the tree's threads per second: each a switch in to run, after a wait (a
   timer, an event, IO) or a preemption; at rest nearly all are waits. Driver and OS pool threads
   inside the app's processes count too, and a handoff between two of its threads counts twice. From
@@ -2352,8 +2353,26 @@ Strobe launches any Electron app the same way, with no change to the app:
   strobe's and its home was already released: strobe ends it and launches. When its strobe still
   holds it, the refusal names that strobe ("in the isolated home of another strobe (pid N)").
   Otherwise the refusal names the running pids and the command that closes them.
-- On close, every process running from the home is killed (detached children outlive the tree),
-  then the home is deleted.
+- **Process ownership.** Each launch (an isolated app, a browser, a command target, the bench
+  runner, a script host) starts in a group of its own: a job object on Windows (killed on close,
+  breakaway allowed so no app fails for it), its own process group on Unix. On Windows the child is
+  created suspended, put in its job and given its CPUs, then resumed (`NtResumeProcess`, microseconds);
+  on Linux the CPUs are set between fork and exec. strobe's own affinity never moves for a launch
+  (`host::spawn_owned`). The app's processes, for every metric and every window or wake it reads,
+  are its tree, every process stamped with its home or profile (`STROBE_HOME`), and on Windows every
+  process in its job, each with its tree, from one system snapshot; a child is followed only when it
+  started no earlier than its parent (a reused parent pid is an older, unrelated process). An app's
+  detached service or a double-forked daemon is outside the tree but counts. A process's stamp is
+  read once per pid and start time, so a scan reads only the processes that started since the last.
+- On close, and when strobe drops a launched target without closing it (an early return, an error,
+  a panic), it ends the tree (read first: ending the group orphans it), the group (`TerminateJobObject`;
+  `SIGKILL` to the group, unless its leader's pid now names a newer process) and everything stamped
+  with the home, restores URL schemes, returns lent GPU caches, unlinks shared seeds and deletes the
+  home. A dropped target deletes only a home made for that launch; a warm home stays for its caller.
+  Windows ends a job when its last handle closes, so a strobe that dies takes its launches with it,
+  except what broke away from the job, which the next strobe ends by its stamp. A strobe counts as
+  gone once its process has exited, even while another process holds a handle to it (Windows) or has
+  not reaped it (a zombie).
 - **GPU shader caches** (`gpuCache`, a case option over a native or app target option, else the
   app profile's; default `warm`; anything but `warm` or `cold` is a usage error before the bench
   takes the slot or builds). A GPU driver keeps the shaders it compiled under the per-user folders the home
@@ -2668,8 +2687,9 @@ An app with no browser engine (a Rust app on its own UI toolkit, any Win32 app) 
 `native(appIdOrPath)` in a bench file, `app:<id>` with a profile of `kind: "native"`, or
 `exe:<path> --native` for `record`. strobe launches it exactly as an Electron app (§13.2): a fresh
 private home with its environment redirects, the profile's `env` (with `{home}` and `{port}`),
-`unset`, `dirs`, `files`, `args`, `guard` and `protocols`, `LiveChannel`, and on close the whole tree
-and everything running from the home killed and the home deleted. There is no debugging port.
+`unset`, `dirs`, `files`, `args`, `guard` and `protocols`, `LiveChannel`, its own job or process
+group, and on close the whole tree, the group and everything launched for the home ended and the
+home deleted. There is no debugging port.
 
 **From outside** (no change to the app): the metrics in §7.4. The main window is the tree's largest
 visible top-level window. Each block moves it to the block's place, sizes its client area to the
@@ -3377,6 +3397,36 @@ snapshot and Perfetto trace with no temporary file left, `stacks-unprivileged` s
 bench's runner ran from `sdk/<build>/`. Not checked: the helper's `hello` refusal and the restored
 interval after a forced error (need the helper, one UAC prompt), a ScreenCaptureKit start timeout.
 
+Process ownership (7.4, 13.2, 13.7; 2026-11-05): every launch (isolated apps, browsers, command
+targets, the bench runner, script hosts) starts in its own group through `host::spawn_owned`: a job
+object on Windows (`KILL_ON_JOB_CLOSE | BREAKAWAY_OK`, the child created suspended, assigned, pinned,
+then resumed with `NtResumeProcess`), its own process group on Unix; none of them moves strobe's
+affinity any more. A target's process set is its tree, every process stamped with its home and, on
+Windows, its job's processes, each with its tree, from one snapshot (the stamp read once per pid and
+start time); the old match on executable paths under the home is gone, and it had missed every
+detached service whose executable lives elsewhere (that is, nearly every real one). `Browser`,
+`Native`, the runner and the script host end what they launched when dropped, so an early return no
+longer leaves a target running; `close` stays the graceful path with bounded waits. Windows trees
+check creation times as Linux and macOS did, and tree kills call `TerminateProcess` instead of
+starting `taskkill`. A strobe whose process exited counts as gone even while a handle (Windows) or a
+missing wait (a zombie) keeps its pid: an agent's shell that held the handle of a killed strobe had
+kept its leftovers from being reaped. Sleep prevention follows every live `Awake` in the process
+(macOS and Linux hold one assertion per process: a short command that ended in the daemon released
+it under a bench), macOS thread ids stay known per process across samplers that run at once, and
+the timer-coalescing check runs once per process. Checked with a target whose root starts a middle
+process that starts a CPU burner detached (Windows: a new process group out of the job; Unix: its
+own session) and exits, on adais (Windows, locked), air (macOS 27) and vps (Linux): `record` read
+0.00% of a core before and 99.3%, 99.4% and 99.9% after; with the burner's environment cleared
+(no stamp, in the job) adais read 99.4% from the job alone. Nothing was left after `record`, `look
+--timeout 5s` on a window that never opens, `record --until-line` that timed out, and `bench --check`
+with a case that throws (the other case read `cpu.work` 1,000 ms for a 1 s wait). A `strobe record`
+killed by force took an unstamped burner with it at once (the job); a breakaway or Unix burner was
+ended by the next `look` or `record`. One process-set read on adais (405 processes) took
+6.9 ms (15.6 ms cold), where the executable-path scan took 22.5 ms. On air, with two `Awake`s in one
+process and one dropped, `pmset -g assertions` listed strobe's 2 assertions (before: 0); the first
+of two samplers still read its thread's CPU after the second sampled (before: none); the
+timer-coalescing check took 43 ms once, then nothing (before: 42 ms each call).
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).
@@ -3395,9 +3445,9 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   launchd or systemd; `status` checks the registration (§16). `strobe run` pins only its child
   (`host::spawn_pinned`: created suspended on Windows with the caller's creation flags kept,
   `sched_setaffinity` before exec on Linux over every configured CPU, not strobe's own set; macOS has
-  no affinity). The runner, Chromium, command, script and isolated launches still move strobe's
-  process for a spawn (outside the daemon only: inside it a bench pins its own thread); they move to
-  `spawn_pinned` with the process ownership work. The CLI refuses
+  no affinity), and so do the runner, Chromium, command, script and isolated launches
+  (`host::spawn_owned`, §13.2). A bench outside the daemon still moves strobe's own process to the
+  runner's CPUs for the bench, and the native speed check widens it for its own thread. The CLI refuses
   flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
   their types from that table (§17).
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.

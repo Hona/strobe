@@ -283,7 +283,7 @@ fn majority(v: &[&str]) -> String {
 fn bound(args: &Args, s: &history::Series) -> f64 {
     let root = PathBuf::from(s.meta["root"].as_str().unwrap_or("."));
     args.num("equivalence").ok().flatten().map(|b| b / 100.0).unwrap_or_else(|| {
-        config::load(&root)["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0
+        config::load(&root).unwrap_or_default()["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0
     })
 }
 

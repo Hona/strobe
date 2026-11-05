@@ -90,7 +90,7 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     let attach = target.starts_with("cdp:") || target.starts_with("ws://");
     chromium::reap_orphans();
-    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
+    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?))?;
     // `exe:<path> --app <id>` borrows an app profile for another build of that app.
     let app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
         (Some(id), _, _) => Some(isolate::app(id, &config)?),

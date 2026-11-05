@@ -28,7 +28,7 @@ pub fn run(args: &Args) -> Result<Output> {
         pilot(args, &file)?;
     }
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
-    let config = config::load(&project);
+    let config = config::load(&project)?;
     let log = host::paths::run().join(format!("plan-{}.log", std::process::id()));
     let mut runner = Runner::spawn(&file, log.clone(), None)?;
     let describe = runner.describe();

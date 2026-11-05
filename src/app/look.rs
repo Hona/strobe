@@ -57,7 +57,7 @@ fn console_text(args: &Value) -> String {
 /// before the next unlock.
 fn native(args: &Args, target: &str) -> Result<Output> {
     use crate::target::{isolate, native as nt};
-    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
+    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?))?;
     let mut app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
         (Some(id), _, _) => isolate::app(id, &config)?,
         (_, Some(path), Some(id)) => isolate::app(id, &config)?.with_exe(Path::new(path)),

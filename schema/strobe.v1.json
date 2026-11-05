@@ -1,0 +1,113 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "strobe.v1.json",
+  "title": "strobe.json",
+  "description": "A project's strobe configuration (SPEC 9.5). JSON with // and /* */ comments and trailing commas. strobe refuses a key it does not read (exit 2, with the file, line and column).",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": { "type": "string" },
+    "build": {
+      "description": "What a directory or git variant runs before it is measured. build.windows, build.macos and build.linux overlay the rest on that OS (env merged key by key, other keys replaced).",
+      "allOf": [{ "$ref": "#/definitions/buildStep" }],
+      "properties": {
+        "command": true,
+        "cwd": true,
+        "output": true,
+        "env": true,
+        "windows": { "$ref": "#/definitions/buildStep" },
+        "macos": { "$ref": "#/definitions/buildStep" },
+        "linux": { "$ref": "#/definitions/buildStep" }
+      },
+      "additionalProperties": false
+    },
+    "serve": {
+      "description": "How a web() target serves a variant's build; {port} is a free port per variant.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "command": { "type": "string" },
+        "cwd": { "type": "string" },
+        "ready": { "type": "string", "description": "A URL that answers once the server is up." },
+        "dir": { "type": "string", "description": "The folder the origin serves, for source maps (else build.output)." }
+      }
+    },
+    "apps": {
+      "description": "App profiles by id: app:<id> targets and native(<id>) bench targets (SPEC 13.2, 13.7).",
+      "type": "object",
+      "additionalProperties": { "$ref": "#/definitions/app" }
+    },
+    "benches": { "type": "array", "items": { "type": "string" }, "description": "Globs of the project's bench files." },
+    "metrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "equivalence": { "type": "string", "pattern": "^[0-9.]+%$", "description": "The equivalence bound for same, such as 2%." } }
+    },
+    "packages": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "groups": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Owner groups by package glob." } }
+    },
+    "harness": { "type": "array", "items": { "type": "string" }, "description": "Repository-relative paths copied into every variant before it builds (SPEC 9.5)." },
+    "symbols": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": { "servers": { "type": "array", "items": { "type": "string" }, "description": "Symbol servers tried after Microsoft's." } }
+    }
+  },
+  "definitions": {
+    "perOs": {
+      "description": "One path, or one per OS.",
+      "oneOf": [
+        { "type": "string" },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": { "windows": { "type": "string" }, "macos": { "type": "string" }, "linux": { "type": "string" } }
+        }
+      ]
+    },
+    "buildStep": {
+      "type": "object",
+      "properties": {
+        "command": { "type": "string", "description": "{cache} is a folder shared by every worktree of the repository." },
+        "cwd": { "type": "string" },
+        "output": { "$ref": "#/definitions/perOs" },
+        "env": { "type": "object", "additionalProperties": { "type": "string" } }
+      }
+    },
+    "app": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "exe": { "$ref": "#/definitions/perOs", "description": "~, %VAR% and ${VAR} expand from the user's environment." },
+        "extends": { "type": "string", "description": "A parent profile; objects merge per key." },
+        "kind": { "enum": ["electron", "native"] },
+        "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "{home} is the copy's private home, {port} a free port." },
+        "unset": { "type": "array", "items": { "type": "string" }, "description": "Exact names or PREFIX* families." },
+        "dirs": { "type": "array", "items": { "type": "string" } },
+        "files": { "type": "object", "description": "Files written into the home: JSON or text; a string that is exactly {port} becomes a number." },
+        "guard": {
+          "type": "array",
+          "description": "The user's own state, which must not change while a copy runs.",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["file"],
+            "properties": {
+              "file": { "type": "string" },
+              "pid": { "type": "string", "description": "The key in the file's JSON naming a process that must stay alive." },
+              "url": { "type": "string", "description": "The key in the file's JSON naming a URL that must keep answering." },
+              "os": { "enum": ["windows", "macos", "linux"] }
+            }
+          }
+        },
+        "protocols": { "type": "array", "items": { "type": "string" }, "description": "URL schemes the app registers (Windows)." },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "window": { "type": "boolean", "description": "false: the app opens no window (a tray app)." },
+        "moved": { "type": "array", "items": { "type": "string" }, "description": "The user's folders the profile's env moves into the home (macOS)." },
+        "gpuCache": { "enum": ["warm", "cold"] }
+      }
+    }
+  }
+}

@@ -112,7 +112,7 @@ More in a bench file:
 
 Primary metric: `main.work` for "does this cost less" (continuous; durations move in whole vsyncs; a native app's is `ui.cpu` or `cpu.work`, and `cpu.wakes` when idle), `main.busy` for scrolling and streaming, `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop, `launch.ready` for launches, `cpu.work` for scripts. Fewer than 6 pairs never gets a verdict. Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 
-Everything about the app under test lives in its repo's `strobe.json`: `build` and `serve` for web targets, and `apps` profiles for Electron and native apps (`kind: "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`). Strobe itself knows no product. If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile.
+Everything about the app under test lives in its repo's `strobe.json`: `build` and `serve` for web targets, and `apps` profiles for Electron and native apps (`kind: "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`). Strobe itself knows no product. If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile. strobe.json takes `//` comments and trailing commas; a key strobe does not read fails (exit 2) with its line and the key it meant. `"$schema": "./node_modules/@hona/strobe/schema/strobe.v1.json"` gives an editor the keys.
 
 ## Recipes
 

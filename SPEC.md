@@ -1178,9 +1178,17 @@ validity verdict, strobe version.
 
 ### 9.5 Variants and builds
 
-Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`). It is the
-consumer's file, in the consumer's repo (rule 15). A user's own `<state>/strobe.json` sits under
-it, for app profiles they use from anywhere; `apps` merge per app.
+Project config `strobe.json` at the project root (schema `schema/strobe.v1.json`, shipped in
+`@hona/strobe` as `node_modules/@hona/strobe/schema/strobe.v1.json`). It is the consumer's file, in
+the consumer's repo (rule 15). A user's own `<state>/strobe.json` sits under it, for app profiles
+they use from anywhere; `apps` merge per app.
+
+strobe.json is JSON with comments: `//` and `/* */` comments and trailing commas, outside strings.
+It is read strictly. A file that does not parse fails with its path, line and column (exit 2). So
+does a key strobe does not read, at the top level, in `build` (and its per-OS overlays), `serve`,
+`metrics`, `packages`, `symbols`, an app profile or one of its `guard` entries: a typo
+(`"gaurd"`) would otherwise drop the user's guard without a word. The message names the closest
+known key (`did you mean "guard"?`) and lists the keys there.
 
 ```jsonc
 {

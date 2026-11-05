@@ -167,7 +167,7 @@ pub fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>>
             }
         }
     }
-    let servers: Vec<String> = crate::config::load(&crate::config::project_root(&std::env::current_dir().unwrap_or_default()))["symbols"]["servers"]
+    let servers: Vec<String> = crate::config::load(&crate::config::project_root(&std::env::current_dir().unwrap_or_default()))?["symbols"]["servers"]
         .as_array()
         .into_iter()
         .flatten()

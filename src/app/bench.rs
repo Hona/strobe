@@ -605,7 +605,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let reg = slot::Registration::new(&exp, &file.display().to_string());
     chromium::reap_orphans();
     let project = config::project_root(file.parent().unwrap_or(Path::new(".")));
-    let config = config::load(&project);
+    let config = config::load(&project)?;
     // The plan switches before the first block, not now: builds and waits run on the user's own.
     power_keep(args)?;
     let mut env = host::env();

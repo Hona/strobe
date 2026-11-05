@@ -8,6 +8,8 @@ pub mod power;
 pub mod reserve;
 pub mod spawn;
 #[cfg(windows)]
+pub mod cycle_clock;
+#[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]
 pub mod dbus;
@@ -187,14 +189,14 @@ pub struct ProcTimes {
     pub parent: u32,
     pub name: String,
     pub cpu_ns: u64,
-    /// CPU cycles charged so far (TSC units on x64): exact, where `cpu_ns` moves in clock ticks.
+    /// CPU cycles charged so far (`tsc` units): exact, where `cpu_ns` moves in clock ticks.
     pub cycles: u64,
     pub private_bytes: u64,
     pub working_set: u64,
 }
 
 /// Every process in the tree rooted at `root`, with CPU times.
-/// One process's CPU so far in `ProcTimes::cycles` units (TSC cycles on Windows x64, CPU ns
+/// One process's CPU so far in `ProcTimes::cycles` units (`tsc` units: cycles on Windows, CPU ns
 /// elsewhere), read without listing the system's processes: cheap enough at a run's two ends.
 pub fn process_cycles(pid: u32) -> Option<u64> {
     os::process_cycles(pid)
@@ -331,7 +333,7 @@ pub struct ProcInfo {
     pub name: String,
     /// Kernel + user time, in ns; the OS updates it per clock tick (15.6 ms on Windows).
     pub cpu_ns: u64,
-    /// CPU cycles charged at context switches (TSC units on x64), exact where `cpu_ns` is coarse.
+    /// CPU cycles charged at context switches (`tsc` units), exact where `cpu_ns` is coarse.
     pub cycles: u64,
     pub private_bytes: u64,
     pub threads: u32,
@@ -361,7 +363,7 @@ pub fn threads(pids: &[u32]) -> (Vec<ThreadInfo>, Vec<(u32, u64, u64)>) {
     }
 }
 
-/// CPU cycles charged to a thread so far (TSC units), or its name, when it can be opened.
+/// CPU cycles charged to a thread so far (`tsc` units), or its name, when it can be opened.
 pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     #[cfg(windows)]
     {
@@ -531,7 +533,7 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
     }
 }
 
-/// Idle cycles (TSC units) so far per logical CPU; a CPU's busy share over an interval is
+/// Idle cycles (`tsc` units) so far per logical CPU; a CPU's busy share over an interval is
 /// `1 - Δidle / Δtsc`. False when unavailable.
 pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     #[cfg(windows)]
@@ -544,16 +546,13 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     }
 }
 
-/// The time stamp counter (x64), the unit of `ProcInfo::cycles`; None on other architectures.
+/// A clock in the unit of `ProcInfo::cycles`. Windows: the performance counter times the kernel's
+/// cycle factor, or the time stamp counter where the kernel charges raw TSC cycles (x64); None where
+/// its cycles are not time (`cycles_refused`, `cycle_clock`). ns elsewhere.
 pub fn tsc() -> Option<u64> {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(windows)]
     {
-        #[allow(unused_unsafe)]
-        Some(unsafe { std::arch::x86_64::_rdtsc() })
-    }
-    #[cfg(all(windows, not(target_arch = "x86_64")))]
-    {
-        None
+        cycle_clock::read()
     }
     #[cfg(not(windows))]
     {
@@ -561,7 +560,44 @@ pub fn tsc() -> Option<u64> {
     }
 }
 
-/// CPU cycles charged so far to the calling thread (TSC units on x64; see `tsc`). Exact, where
+/// Settles the cycle clock (`cycle_clock`) now: before strobe moves its own CPU affinity and before
+/// any measured window opens, since its check pins a thread to every CPU (once per boot, then cached).
+pub fn warm_cycle_clock() {
+    #[cfg(windows)]
+    cycle_clock::clock();
+}
+
+/// Why this machine's process and thread cycles cannot be read as time (`tsc` is None), so every
+/// metric made of them is refused rather than read from 15.6 ms clock ticks. None where they can.
+pub fn cycles_refused() -> Option<String> {
+    #[cfg(windows)]
+    {
+        let os = if cfg!(target_arch = "aarch64") { "Windows on Arm" } else { "Windows" };
+        cycle_clock::clock().unit.as_ref().err().map(|why| format!("{os}: {why}"))
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// The cycle clock in words, for `status`.
+pub fn cycle_clock_text() -> String {
+    #[cfg(windows)]
+    {
+        cycle_clock::describe()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ns: the processes' and threads' CPU clocks".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "ns: Mach time charged at every context switch".into()
+    }
+}
+
+/// CPU cycles charged so far to the calling thread (`tsc` units). Exact, where
 /// thread times move in 15.6 ms clock ticks.
 pub fn thread_cycles() -> u64 {
     #[cfg(windows)]

@@ -473,6 +473,22 @@ fn declared_metrics(s: &Series) -> Vec<&String> {
     out
 }
 
+/// Takes out of a block's `values` every metric this machine cannot read (`outside::not_on_this_os`:
+/// cycles that are not time, what the OS has no source for) and refuses the declared ones, before
+/// anything (meta.json, the result) is written: no number made from a clock strobe does not have.
+fn refuse_not_on_this_os(s: &Series, values: &mut BTreeMap<String, f64>, refused: &mut BTreeMap<String, Refusal>) {
+    let declared = declared_metrics(s);
+    let names: Vec<String> = values.keys().cloned().chain(declared.iter().map(|m| m.to_string())).collect();
+    for m in names {
+        if let Some(r) = super::outside::not_on_this_os(&m) {
+            values.remove(&m);
+            if declared.iter().any(|d| **d == m) {
+                refused.insert(m, r);
+            }
+        }
+    }
+}
+
 /// A metric that perf events disturb: wall and CPU time, CPU shares, frames and input latency.
 fn time_metric(m: &str) -> bool {
     !probe::wakes::COUNTER_METRICS.contains(&m)
@@ -3317,8 +3333,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // No process readings (an OS without a process sampler yet): unknown, never 0%.
                 _ if cyc1 == 0 && cpu1 == 0 => f64::NAN,
                 (Some(a), Some(b)) if b > a && cyc0 > 0 => 100.0 * cyc1.saturating_sub(cyc0) as f64 / (b - a) as f64,
-                // Never from process times, which move in 15.6 ms ticks on Windows (Windows on Arm, whose
-                // cycle counters strobe does not convert yet, is refused instead).
+                // Never from process times, which move in 15.6 ms ticks on Windows (where cycles are not
+                // time, as on Windows on Arm before 11 24H2, the metric is refused instead).
                 _ => f64::NAN,
             };
             let carry = *carried.borrow();
@@ -3609,6 +3625,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             values.insert("cpu.foreign".into(), metrics::median(&foreign));
             values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
         }
+        let mut refused = uncounted;
+        refuse_not_on_this_os(s, &mut values, &mut refused);
+        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
+            refused.insert(m.clone(), metrics::split_refusal(m, &values));
+        }
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         let intervals = metrics::run_intervals(&data);
@@ -3635,17 +3656,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
-        // CPU this OS gives strobe no time for (Windows on Arm) is refused, as `record` refuses it.
-        let mut refused = uncounted;
-        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
-            refused.insert(m.clone(), metrics::split_refusal(m, &values));
-        }
-        for m in ["cpu.app.total", "cpu.process.total"] {
-            if let Some(r) = super::outside::not_on_this_os(m).filter(|_| declared_metrics(s).iter().any(|d| d.as_str() == m)) {
-                values.remove(m);
-                refused.insert(m.to_string(), r);
-            }
-        }
         Ok(Block {
             variant: v.role.to_string(),
             pair,

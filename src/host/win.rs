@@ -124,7 +124,7 @@ fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
         let cpu = if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 { ft(&k) + ft(&u) } else { 0 };
-        // Cycle time in TSC units, charged at every context switch: exact where process times move in 15.6 ms ticks.
+        // Cycle time in `super::tsc` units, charged at every context switch: exact where process times move in 15.6 ms ticks.
         let mut cycles = 0u64;
         QueryProcessCycleTime(h, &mut cycles);
         let mut m: PROCESS_MEMORY_COUNTERS_EX = zeroed();
@@ -1117,7 +1117,7 @@ pub fn threads(pids: &[u32]) -> (Vec<super::ThreadInfo>, Vec<(u32, u64, u64)>) {
     (out, io)
 }
 
-/// CPU cycles charged to one thread so far (TSC units), None when it cannot be opened.
+/// CPU cycles charged to one thread so far (`super::tsc` units), None when it cannot be opened.
 pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     use windows_sys::Win32::System::Threading::{OpenThread, THREAD_QUERY_LIMITED_INFORMATION};
     use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;

@@ -24,7 +24,7 @@ pub mod present;
 pub mod sample;
 pub mod shifts;
 pub mod stacks;
-#[cfg(windows)]
+#[cfg(all(windows, target_arch = "x86_64"))]
 pub mod suspend;
 pub mod symbols;
 pub mod trace;

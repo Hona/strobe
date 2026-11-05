@@ -860,6 +860,11 @@ pub fn native_threads(dir: &Path, top: usize) -> Result<Output> {
     let runs = store::read_json(&dir.join("runs.json")).unwrap_or(Value::Null);
     let per_run: Vec<f64> = runs.as_array().into_iter().flatten().filter_map(|r| r["cpu_ms"].as_f64()).collect();
     let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+    // Where cycles are not time, no thread has CPU: say why rather than show blanks.
+    let cpu_refused = meta["refused"]["ui.cpu"].as_str().or(meta["refused"]["cpu.work"].as_str()).filter(|r| r.starts_with("NotOnThisOs")).map(str::to_string);
+    if let Some(why) = &cpu_refused {
+        text += &format!("cpu ms/run refused: {why}\n");
+    }
     let total = if per_run.is_empty() { meta["values"]["cpu.work"].as_f64().unwrap_or(f64::NAN) } else { metrics::median(&per_run) };
     let listed: f64 = all.iter().filter_map(|r| r["cpu_ms_per_run"].as_f64()).sum();
     let gone = total - listed;
@@ -903,7 +908,7 @@ pub fn native_threads(dir: &Path, top: usize) -> Result<Output> {
         "wakes: context switches of the thread, each a switch in to run after a wait or a preemption; whose: app (started in the app's own code), driver (a device driver's user-mode part, such as GPU driver workers), os (the OS's thread pool and services; a pool thread may run the app's callbacks).{}\n",
         if dir.join("timeline.json.gz").exists() { " When each ran: --timeline" } else { " A thread that exited during a run is not listed" }
     );
-    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>(), "cpu_ms_per_run": total, "exited_ms_per_run": gone.is_finite().then_some(gone.max(0.0)), "exited": exited_json })))
+    Ok(Output::new(text, json!({ "threads": all.into_iter().take(top).collect::<Vec<_>>(), "cpu_ms_per_run": total, "cpu_refused": cpu_refused, "exited_ms_per_run": gone.is_finite().then_some(gone.max(0.0)), "exited": exited_json })))
 }
 
 fn read_timeline(dir: &Path) -> Option<crate::probe::wakes::TimelineData> {

@@ -26,8 +26,9 @@ pub fn not_on_this_os(metric: &str) -> Option<Refusal> {
         "memory.app.host" if mac => "macOS: memory by what holds it reads another process's regions, which takes its task port (debuggers only); memory.app.private is its physical footprint",
         "ui.wakes" if mac => "macOS counts context switches per process, not per thread (no public per-thread count): cpu.wakes has the process's",
         "cpu.foreign" | "cpu.foreign.max" if mac => "macOS has no CPU affinity, so no CPUs are the target's own to measure other work on",
-        "cpu.work" | "cpu.app.total" | "cpu.process.total" if cfg!(all(windows, not(target_arch = "x86_64"))) => {
-            "Windows on Arm: strobe reads process CPU as cycles there and does not yet convert ARM64 cycle counts into time (process times move in 15.6 ms ticks, too coarse to use)"
+        // Every metric made of cycles over the cycle clock (`host::tsc`).
+        "cpu.work" | "cpu.app.total" | "cpu.process.total" | "ui.cpu" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" | "cpu.foreign" | "cpu.foreign.max" => {
+            return host::cycles_refused().map(|why| Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why} (process and thread times move in 15.6 ms ticks, too coarse to use)")));
         }
         _ => return None,
     };
@@ -62,7 +63,7 @@ pub fn gpu_unread(metric: &str, unreadable: &[u32]) -> Refusal {
 /// sampler read every process's GPU, else the processes it could not read.
 pub fn os_refusals(has: &dyn Fn(&str) -> bool, gpu: Option<&[u32]>) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
-    for m in ["cpu.work", "cpu.app.total", "gpu.process.3d", "gpu.vram", "gpu.shared", "memory.app.host", "ui.wakes"] {
+    for m in ["cpu.work", "cpu.app.total", "ui.cpu", "gpu.process.3d", "gpu.vram", "gpu.shared", "memory.app.host", "ui.wakes"] {
         // A UI thread's wakes are missing only beside its CPU: without a window it has neither.
         if has(m) || (m == "ui.wakes" && !has("ui.cpu")) {
             continue;

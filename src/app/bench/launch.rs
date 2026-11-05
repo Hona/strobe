@@ -149,8 +149,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         };
         // CPU of the target's processes in cycles (exact; process times move in 15.6 ms ticks), from
         // spawn, or from navigation for a web target whose browser was already up.
-        let cpu_now = || -> (u64, u64) { browser.processes().iter().fold((0, 0), |(c, n), p| (c + p.cycles, n + p.cpu_ns)) };
-        let mut cpu0 = (0, 0);
+        let cpu_now = || -> u64 { browser.processes().iter().map(|p| p.cycles).sum() };
+        let mut cpu0 = 0;
         let started_ms = if web {
             let page = browser.page()?;
             let first = if target["prepare"].as_bool() == Some(true) {
@@ -177,9 +177,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             }
         };
         let cpu1 = cpu_now();
+        // Never from process times (15.6 ms ticks): without cycles over the cycle clock, unknown, and
+        // `refusals` says why.
         let cpu_ms = match (clock.0, host::tsc()) {
-            (Some(a), Some(b)) if b > a && cpu1.0 > 0 => cpu1.0.saturating_sub(cpu0.0) as f64 / ((b - a) as f64 / (clock.1.elapsed().as_secs_f64() * 1e3)),
-            _ => cpu1.1.saturating_sub(cpu0.1) as f64 / 1e6,
+            (Some(a), Some(b)) if b > a && cpu1 > 0 => cpu1.saturating_sub(cpu0) as f64 / ((b - a) as f64 / (clock.1.elapsed().as_secs_f64() * 1e3)),
+            _ => f64::NAN,
         };
         lap("ready", &mut steps);
         if watch.late.load(Ordering::Relaxed) {
@@ -227,7 +229,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let mut values = BTreeMap::new();
         let ready_ms = ready_at - started_ms;
         values.insert("launch.ready".to_string(), ready_ms);
-        values.insert("cpu.work".to_string(), cpu_ms);
+        if cpu_ms.is_finite() {
+            values.insert("cpu.work".to_string(), cpu_ms);
+        }
         for m in &milestones {
             // A capture named `at` holding epoch ms (a mark the app wrote into its log) is the time;
             // otherwise the time strobe read the line.

@@ -81,7 +81,7 @@ pub enum StackCapture {
     #[cfg(windows)]
     Helper(helper::Client),
     /// With why there are no waits: only the helper's kernel session sees context switches.
-    #[cfg(windows)]
+    #[cfg(all(windows, target_arch = "x86_64"))]
     Suspend(super::suspend::Capture, crate::model::Refusal),
     /// With the off-CPU waits capture, or why there is none.
     #[cfg(target_os = "linux")]
@@ -89,6 +89,18 @@ pub enum StackCapture {
     /// With whether waits were asked for (macOS has no source for them).
     #[cfg(target_os = "macos")]
     Sample(super::sample::Capture, bool),
+}
+
+/// strobe's own sampler (Windows x64: it unwinds x64 frames only), with why there are no waits.
+#[cfg(windows)]
+fn suspend(targets: Targets, why: crate::model::Refusal) -> crate::model::Result<StackCapture> {
+    #[cfg(target_arch = "x86_64")]
+    return Ok(StackCapture::Suspend(super::suspend::Capture::start(targets)?, why));
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        let _ = (targets, why);
+        Err(crate::model::Error::msg(no_stacks()))
+    }
 }
 
 /// Why a capture that did not ask for waits has none.
@@ -120,7 +132,7 @@ impl StackCapture {
                     (true, true) => no_waits("off-CPU waits need the deep helper's kernel session (context switches and wake-ups); this capture asked for strobe's own sampler", fix),
                     (true, false) => no_waits("off-CPU waits need the deep helper's kernel session (context switches and wake-ups), and it is not installed", fix),
                 };
-                return Ok(StackCapture::Suspend(super::suspend::Capture::start(targets.clone())?, why));
+                return suspend(targets, why);
             }
             // The helper runs elevated in a process of its own, which holds no job of this strobe's
             // and reads no stamps for it: it gets the set as it is now, and follows its children.
@@ -130,7 +142,7 @@ impl StackCapture {
                 // own sampler, and waits refused until `strobe up` installs this build's.
                 Err(e) if !helper::helper_current() => {
                     let why = if waits { no_waits(format!("off-CPU waits need this build's deep helper: {}", e.message), fix) } else { not_asked() };
-                    return Ok(StackCapture::Suspend(super::suspend::Capture::start(targets)?, why));
+                    return suspend(targets, why);
                 }
                 Err(e) => return Err(e),
             };
@@ -160,7 +172,7 @@ impl StackCapture {
                 fill_from_processes(&mut deep);
                 Ok(deep)
             }
-            #[cfg(windows)]
+            #[cfg(all(windows, target_arch = "x86_64"))]
             StackCapture::Suspend(s, why) => {
                 let mut deep = s.stop()?;
                 deep.waits_refused = Some(why);

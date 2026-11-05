@@ -412,7 +412,7 @@ export default bench({
 ### Refused, never "no value"
 
 - A declared metric gets a value or a typed refusal:
-  - `NotOnThisOs`: the OS cannot read it (macOS: `gpu.vram`, `gpu.shared`, `memory.app.host`, `ui.wakes`; a GPU whose per-process statistics did not open or left a process unread).
+  - `NotOnThisOs`: the OS cannot read it (macOS: `gpu.vram`, `gpu.shared`, `memory.app.host`, `ui.wakes`; a GPU whose per-process statistics did not open or left a process unread; Windows where cycle times are not time, as on Arm before 11 24H2 (core clock cycles) or CPUs that disagree: every metric made of cycles, `cpu.work`, `cpu.app.total`, `cpu.process.total`, `ui.cpu`, `cpu.renderer`, `cpu.gpu`, `cpu.browser`, `cpu.foreign`, `cpu.foreign.max`; `strobe status` prints the cycle clock on its `cycles` line, checked once per boot and cached).
   - `NotForTarget`: the target or case has none (a run's metric on a launch case, `ui.*` without a window).
   - `NoMetric`: a declared `metric.<name>` a run's command did not print; `NoWaits`: `query waits` on a capture without waits, saying why.
 - A native app that exits is refused `RunIncomplete` with its exit code and, with `output: true` on the target, its last output lines.

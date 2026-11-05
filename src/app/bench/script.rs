@@ -151,18 +151,18 @@ impl Host {
     }
 }
 
-/// The host process tree's CPU so far: cycles with the time stamp counter, and clock-tick time (ns).
-fn cpu(pid: u32) -> (u64, Option<u64>, u64) {
-    let tree = host::process_tree(pid);
-    (tree.iter().map(|p| p.cycles).sum(), host::tsc(), tree.iter().map(|p| p.cpu_ns).sum())
+/// The host process tree's CPU so far: its cycles and the cycle clock (`host::tsc`).
+fn cpu(pid: u32) -> (u64, Option<u64>) {
+    (host::process_tree(pid).iter().map(|p| p.cycles).sum(), host::tsc())
 }
 
-/// CPU ms between two readings over `wall_ms`. Cycles are exact; process times move in 15.6 ms ticks
-/// on Windows, which made a 2 ms call read 0 ms or 15.6 ms. Ticks only where cycles are unavailable.
-fn cpu_ms(a: (u64, Option<u64>, u64), b: (u64, Option<u64>, u64), wall_ms: f64) -> f64 {
+/// CPU ms between two readings over `wall_ms`, from cycles (exact). Never from process times, which
+/// move in 15.6 ms ticks on Windows (a 2 ms call read 0 ms or 15.6 ms): unknown (NaN) without cycles,
+/// and where they are not time (`host::cycles_refused`) the block refuses CPU.
+fn cpu_ms(a: (u64, Option<u64>), b: (u64, Option<u64>), wall_ms: f64) -> f64 {
     match (a.1, b.1) {
         (Some(t0), Some(t1)) if t1 > t0 && b.0 > 0 => b.0.saturating_sub(a.0) as f64 / (t1 - t0) as f64 * wall_ms,
-        _ => b.2.saturating_sub(a.2) as f64 / 1e6,
+        _ => f64::NAN,
     }
 }
 
@@ -238,7 +238,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
-            warmup.after(&runs.iter().map(|r| r.1).collect::<Vec<_>>());
+            // Without CPU (cycles that are not time), steady by wall time.
+            warmup.after(&runs.iter().map(|r| if r.1.is_finite() { r.1 } else { r.0 }).collect::<Vec<_>>());
         }
         let first = warmup.first().unwrap_or(0);
         let (strobe_pct, runner_pct) = cost.share(first);
@@ -247,8 +248,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         let key = |j: usize| format!("run:{}", first + j);
         let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
         extra.insert("run.duration".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.0)).collect());
-        extra.insert("cpu.work".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.1)).collect());
-        extra.insert("cpu.app.total".into(), measured.iter().enumerate().filter(|(_, r)| r.0 > 0.0).map(|(j, r)| (key(j), 100.0 * r.1 / r.0)).collect());
+        if measured.iter().all(|r| r.1.is_finite()) {
+            extra.insert("cpu.work".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.1)).collect());
+            extra.insert("cpu.app.total".into(), measured.iter().enumerate().filter(|(_, r)| r.0 > 0.0).map(|(j, r)| (key(j), 100.0 * r.1 / r.0)).collect());
+        }
         if heap {
             extra.insert("js.heap.retained".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.3)).collect());
         }
@@ -266,6 +269,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             values.insert("memory.app.private".into(), private_mb);
         }
         let _ = ctx.runner.call("close", json!({}), t, &serve);
+        let mut refused = uncounted;
+        refuse_not_on_this_os(s, &mut values, &mut refused);
         Ok(Block {
             variant: v.role.to_string(),
             pair,
@@ -281,7 +286,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
-            refused: uncounted,
+            refused,
             locked: false,
             display: None,
             screen: None,

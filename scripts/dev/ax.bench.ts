@@ -14,7 +14,8 @@ export default bench({
   },
   cases: {
     query: { primary: "cpu.work", run: async ({ page }) => void (await page.query("role=button")) },
-    click: { primary: "cpu.work", metrics: ["ui.cpu", "interaction.p95"], run: ({ page }) => page.click("add", { until: { selector: "count", text: "rows: 1" } }) },
+    // Each click adds a row (the app has no way back), so its runs build on each other: no reset check.
+    click: { primary: "cpu.work", metrics: ["ui.cpu", "interaction.p95"], resetCheck: false, run: ({ page }) => page.click("add", { until: { selector: "count", text: "rows: 1" } }) },
     type: {
       primary: "cpu.work",
       metrics: ["interaction.p95"],
@@ -32,9 +33,9 @@ export default bench({
         await page.press("Backspace", { selector: "field", until: { selector: "echo", text: "echo: ", exact: true } })
       },
     },
-    toggle: { primary: "cpu.work", run: ({ page }) => page.act("check", "toggle", { until: "idle" }) },
+    toggle: { primary: "cpu.work", run: ({ page }) => page.act("check", "toggle", { until: "idle" }), reset: ({ page }) => page.act("check", "toggle", { until: "idle" }) },
     scroll: { primary: "cpu.work", metrics: ["scroll.latency.p95"], run: ({ page }) => page.scroll("scroll", { by: 600 }, { until: "idle" }) },
     wheel: { primary: "cpu.work", run: ({ page }) => page.wheel("scroll", { dy: -300 }, { until: "idle" }) },
-    frames: { primary: "cpu.work", metrics: ["frames.presented.count", "interaction.p95"], run: ({ page }) => page.click("add", { until: "frame" }) },
+    frames: { primary: "cpu.work", metrics: ["frames.presented.count", "interaction.p95"], resetCheck: false, run: ({ page }) => page.click("add", { until: "frame" }) },
   },
 })

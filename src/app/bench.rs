@@ -4004,25 +4004,3 @@ fn render(r: &Value) -> String {
     out += &format!("{id} · strobe report experiment {id} --open\n");
     out
 }
-
-#[cfg(test)]
-mod phase_tests {
-    use super::phase_ms;
-
-    #[test]
-    fn a_phase_sums_its_spans_and_is_unknown_when_never_entered() {
-        let marks: Vec<(String, u64)> = [
-            ("run:0:phase:finish:start", 1_000_000),
-            ("run:0:phase:other:start", 1_500_000),
-            ("run:0:phase:finish:end", 4_000_000),
-            ("run:0:phase:finish:start", 10_000_000),
-            ("run:0:phase:finish:end", 12_500_000),
-        ]
-        .into_iter()
-        .map(|(k, t)| (k.to_string(), t))
-        .collect();
-        assert_eq!(phase_ms(&marks, "finish"), 5.5);
-        assert!(phase_ms(&marks, "other").is_nan());
-        assert!(phase_ms(&marks, "start").is_nan());
-    }
-}

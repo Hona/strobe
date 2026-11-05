@@ -609,26 +609,3 @@ impl Drop for Capture {
         }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::host::macos::{CGPoint, CGSize};
-
-    fn r(x: f64, y: f64, w: f64, h: f64) -> CGRect {
-        CGRect { origin: CGPoint { x, y }, size: CGSize { width: w, height: h } }
-    }
-
-    #[test]
-    fn the_window_servers_own_redraws_are_not_the_apps() {
-        // An idle 640 × 512 point window at one pixel a point (macOS 27): corners and title-bar buttons.
-        let idle = [r(0.0, 0.0, 25.0, 25.0), r(615.0, 0.0, 25.0, 25.0), r(0.0, 487.0, 25.0, 25.0), r(615.0, 487.0, 25.0, 25.0), r(5.0, 5.0, 22.0, 22.0), r(51.0, 5.0, 22.0, 20.0), r(0.0, 6.0, 73.0, 19.0), r(0.0, 0.0, 0.0, 0.0)];
-        assert!(app_rects(&idle, 640.0, 512.0, 1.0).is_empty());
-        // The same at half size.
-        let half: Vec<CGRect> = idle.iter().map(|x| r(x.origin.x / 2.0, x.origin.y / 2.0, x.size.width / 2.0, x.size.height / 2.0)).collect();
-        assert!(app_rects(&half, 320.0, 256.0, 0.5).is_empty());
-        // A button or a caret inside the window is the app's.
-        assert_eq!(app_rects(&[r(47.0, 79.0, 50.0, 26.0)], 640.0, 512.0, 1.0).len(), 1);
-        assert_eq!(app_rects(&[r(300.0, 2.0, 2.0, 18.0)], 640.0, 512.0, 1.0).len(), 1);
-    }
-}

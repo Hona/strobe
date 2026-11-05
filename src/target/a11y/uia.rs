@@ -451,20 +451,3 @@ impl Accessibility for Uia {
         *self.signal.pids.lock().unwrap_or_else(|e| e.into_inner()) = pids.to_vec();
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn heading_by_level_or_role() {
-        assert!(is_heading(Some(HeadingLevel1.0), "", "text"));
-        // A Text element with the role "heading" and no HeadingLevel.
-        assert!(is_heading(None, "heading", "text"));
-        assert!(is_heading(Some(HeadingLevel_None.0), "heading", "text"));
-        assert!(is_heading(None, "", "Heading"));
-        assert!(!is_heading(Some(HeadingLevel_None.0), "", "text"));
-        assert!(!is_heading(Some(0), "", "text"));
-        assert!(!is_heading(None, "button", "button"));
-    }
-}

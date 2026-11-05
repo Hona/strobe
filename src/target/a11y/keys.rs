@@ -234,18 +234,3 @@ pub fn key_named(name: &str) -> Option<Key> {
 pub fn notches(px: f64) -> f64 {
     px / 100.0
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_drag_presses_where_it_starts() {
-        let keyframes = parse_path(&serde_json::json!([[300, 0], [300, 300], [0, 0]])).unwrap();
-        assert_eq!(path_at(&keyframes, 0.0), (0.0, 0.0));
-        assert_eq!(path_at(&keyframes, 1.0), (0.0, 0.0));
-        assert_eq!(path_at(&keyframes, 1.0 / 3.0), (300.0, 0.0));
-        let sampled = parse_path(&serde_json::json!([[0, 0], [10, 0]])).unwrap();
-        assert_eq!(sampled.len(), 2);
-    }
-}

@@ -3,17 +3,53 @@
 use crate::host::{self, paths};
 use crate::model::{Error, Result};
 use serde_json::Value;
+use std::collections::HashSet;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 pub mod ledger;
 
-/// A short random-looking id: `<prefix>_` + 6 hex.
+/// A short random id, `<prefix>_` + 6 hex from the OS's random source, that names no recording or
+/// experiment yet and that this process never handed out before (two ids in one clock tick were
+/// once the same, and the second recording wrote into the first's folder).
 pub fn new_id(prefix: &str) -> String {
-    let seed = host::now_ns() ^ (std::process::id() as u64).rotate_left(32);
-    let mut x = seed.wrapping_mul(0x9E3779B97F4A7C15);
-    x ^= x >> 29;
-    format!("{prefix}_{:06x}", x & 0xFFFFFF)
+    static ISSUED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+    let mut issued = ISSUED.lock().unwrap_or_else(|e| e.into_inner());
+    let issued = issued.get_or_insert_with(HashSet::new);
+    let roots = [paths::recordings(), paths::experiments()];
+    loop {
+        // A counter stands in should the OS's random source ever fail: still unique in this process.
+        let hex = paths::csprng_hex(3).unwrap_or_else(|_| format!("{:06x}", (host::now_ns() as usize + issued.len()) & 0xFF_FFFF));
+        let id = format!("{prefix}_{hex}");
+        if !roots.iter().any(|r| r.join(&id).exists()) && issued.insert(id.clone()) {
+            return id;
+        }
+    }
+}
+
+/// A new recording's id and its folder, made by this call alone: a folder that already exists
+/// (another process took the id) draws another.
+pub fn new_recording() -> Result<(String, PathBuf)> {
+    claim("rec", &paths::recordings())
+}
+
+/// `new_recording` for an experiment.
+pub fn new_experiment() -> Result<(String, PathBuf)> {
+    claim("exp", &paths::experiments())
+}
+
+fn claim(prefix: &str, root: &Path) -> Result<(String, PathBuf)> {
+    for _ in 0..100 {
+        let id = new_id(prefix);
+        let dir = root.join(&id);
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok((id, dir)),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::msg(format!("create {}: {e}", dir.display()))),
+        }
+    }
+    Err(Error::msg(format!("no free {prefix}_ id in {}", root.display())))
 }
 
 pub fn recording_dir(id: &str) -> Result<PathBuf> {
@@ -28,9 +64,14 @@ pub fn experiment_dir(id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-pub fn write_json(path: &std::path::Path, value: &Value) -> Result<()> {
-    std::fs::write(path, serde_json::to_vec_pretty(value)?)?;
-    Ok(())
+/// Writes a file whole or not at all (`host::paths::write_atomic`): a reader never sees half a
+/// result.json, and a crash keeps the last complete one.
+pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    paths::write_atomic(path, bytes).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
+}
+
+pub fn write_json(path: &Path, value: &Value) -> Result<()> {
+    write_atomic(path, &serde_json::to_vec_pretty(value)?)
 }
 
 pub fn append_index(line: &Value) -> Result<()> {

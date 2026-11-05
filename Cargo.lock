@@ -854,6 +854,7 @@ dependencies = [
  "base64 0.22.1",
  "flate2",
  "framehop",
+ "getrandom",
  "gimli",
  "libc",
  "msvc-demangler",

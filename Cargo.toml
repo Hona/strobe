@@ -25,6 +25,8 @@ serde_json = { version = "1", features = ["unbounded_depth"] }
 # WebSocket client for the Chrome DevTools Protocol; plain ws:// to 127.0.0.1, no TLS.
 # 0.24: its getrandom 0.2 links bcrypt normally; newer ones need dlltool's raw-dylib on windows-gnu.
 tungstenite = { version = "0.24", default-features = false, features = ["handshake"] }
+# Ids, temporary names and tokens from the OS's random source; already in the tree through tungstenite.
+getrandom = "0.2"
 # IO.read returns trace chunks base64-encoded.
 base64 = "0.22"
 # gzip for stored traces and heap snapshots; pure-Rust backend (no C compiler).

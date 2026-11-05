@@ -6,7 +6,7 @@ pub mod http;
 pub mod paths;
 pub mod power;
 pub mod reserve;
-mod spawn;
+pub mod spawn;
 #[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]
@@ -18,7 +18,7 @@ pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
-pub use spawn::spawn_pinned;
+pub use spawn::{spawn_owned, spawn_pinned};
 
 #[cfg(target_os = "linux")]
 use linux as os;
@@ -115,7 +115,8 @@ impl Awake {
         let unlocked = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
         let (s, h, l, u) = (stop.clone(), held.clone(), locked.clone(), unlocked.clone());
         std::thread::spawn(move || {
-            let mut was: Option<(bool, bool)> = None;
+            // What this `Awake` asks for now: (machine awake, display on).
+            let mut asked = (false, false);
             while !s.load(Ordering::Relaxed) {
                 let locked = session_locked();
                 if locked {
@@ -124,15 +125,36 @@ impl Awake {
                     u.fetch_add(1, Ordering::Relaxed);
                 }
                 let hold = h.load(Ordering::Relaxed);
-                if was != Some((hold, locked)) {
-                    os::keep_awake(hold, hold && !locked);
-                    was = Some((hold, locked));
+                let now = (hold, hold && !locked);
+                if now != asked {
+                    Awake::ask(asked, now);
+                    asked = now;
                 }
                 std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            os::keep_awake(false, false);
+            Awake::ask(asked, (false, false));
         });
         Awake { stop, held, locked, unlocked }
+    }
+
+    /// One `Awake` changes what it asks for. Windows keeps an execution state per thread, so each
+    /// `Awake` thread holds its own. macOS's power assertions and Linux's inhibitors are one per
+    /// process: they follow every live `Awake`'s asks together, so a short command that ends in the
+    /// daemon never lets the machine sleep under a bench that still holds it.
+    fn ask(old: (bool, bool), new: (bool, bool)) {
+        #[cfg(windows)]
+        {
+            let _ = old;
+            os::keep_awake(new.0, new.1);
+        }
+        #[cfg(not(windows))]
+        {
+            static ASKING: std::sync::Mutex<(u32, u32)> = std::sync::Mutex::new((0, 0));
+            let mut n = ASKING.lock().unwrap_or_else(|e| e.into_inner());
+            n.0 = n.0 + new.0 as u32 - old.0 as u32;
+            n.1 = n.1 + new.1 as u32 - old.1 as u32;
+            os::keep_awake(n.0 > 0, n.1 > 0);
+        }
     }
 
     /// Keeps the machine awake (and the display on while unlocked) or lets it sleep as the user's
@@ -179,13 +201,59 @@ pub fn process_cycles(pid: u32) -> Option<u64> {
 }
 
 pub fn process_tree(root: u32) -> Vec<ProcTimes> {
+    process_trees(&[root])
+}
+
+/// Every process in the trees rooted at `roots` (each once), with CPU times, from one system
+/// snapshot. A child is followed only when it started no earlier than its parent: a parent pid that
+/// was reused names an older, unrelated process. Pid 0 roots nothing (the kernel's own).
+pub fn process_trees(roots: &[u32]) -> Vec<ProcTimes> {
+    trees(roots, &|_| Vec::new())
+}
+
+/// Picks root pids from a snapshot's process list (pid, parent, start time).
+pub(crate) type PickRoots<'a> = dyn Fn(&[(u32, u32, u64)]) -> Vec<u32> + 'a;
+
+/// `process_trees` of `roots` and of the roots `more` picks from the same snapshot.
+fn trees(roots: &[u32], more: &PickRoots) -> Vec<ProcTimes> {
+    let more = |list: &[(u32, u32, u64)]| -> Vec<u32> { roots.iter().copied().chain(more(list)).filter(|&r| r != 0).collect() };
     #[cfg(windows)]
     {
-        win::process_tree(root)
+        win::process_trees(&more)
     }
     #[cfg(not(windows))]
     {
-        os::process_tree(root)
+        os::process_trees(&more)
+    }
+}
+
+/// Every process now: (pid, parent, start time in `start_time`'s units), the cheapest snapshot.
+pub fn process_list() -> Vec<(u32, u32, u64)> {
+    #[cfg(windows)]
+    {
+        win::process_list()
+    }
+    #[cfg(not(windows))]
+    {
+        os::process_list()
+    }
+}
+
+/// Ends a process and every process of its tree now: Windows terminates each, Unix sends SIGKILL to
+/// the process group it leads (when it leads one) and to each process of the tree, children first.
+pub fn kill_tree(pid: u32) {
+    if pid == 0 {
+        return;
+    }
+    #[cfg(windows)]
+    win::kill_tree(pid);
+    #[cfg(unix)]
+    {
+        let tree = tree_pids(pid);
+        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        for p in tree.iter().rev() {
+            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
+        }
     }
 }
 
@@ -429,7 +497,7 @@ pub fn all_processes() -> Vec<ProcInfo> {
     }
 }
 
-/// PIDs of the tree rooted at `root` (root first), from one system snapshot. Children created
+/// PIDs of the tree rooted at `root` (root first), from one system snapshot. Children that started
 /// before their parent (a reused parent PID) are not followed.
 pub fn tree_pids(root: u32) -> Vec<u32> {
     #[cfg(windows)]
@@ -507,19 +575,15 @@ pub fn ctrl_c() -> &'static std::sync::atomic::AtomicBool {
     &FLAG
 }
 
-/// The tree rooted at `root` plus every process running from `home` (an Electron app's detached
-/// background service lives outside the tree but belongs to the target).
+/// The tree rooted at `root` plus everything launched for `home` and their trees: every process
+/// stamped with it (an app's detached background service, a double-forked daemon: outside the tree,
+/// but the target's) and, on Windows, every process in its launch's job. Sorted by pid.
 pub fn process_set(root: u32, home: Option<&Path>) -> Vec<ProcTimes> {
-    let mut set = process_tree(root);
-    if let Some(h) = home {
-        for pid in running_under(h) {
-            if !set.iter().any(|p| p.pid == pid) {
-                set.extend(process_tree(pid));
-            }
-        }
-    }
+    let mut set = trees(&[root], &|list| match home {
+        Some(h) => spawn::pids_in(list, h).into_iter().chain(spawn::group_pids(h)).collect(),
+        None => Vec::new(),
+    });
     set.sort_by_key(|p| p.pid);
-    set.dedup_by_key(|p| p.pid);
     set
 }
 
@@ -807,11 +871,6 @@ pub fn env_of(pid: u32) -> Option<Vec<String>> {
 /// one process, since a reused pid starts later.
 pub fn start_time(pid: u32) -> Option<u64> {
     os::start_time(pid)
-}
-
-/// PIDs of running processes whose executable lives under `dir` (on Linux also: whose working folder does).
-pub fn running_under(dir: &Path) -> Vec<u32> {
-    os::running_under(dir)
 }
 
 /// SIGINT and SIGTERM set `flag` instead of ending strobe; a second one while the flag is still set

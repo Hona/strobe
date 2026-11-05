@@ -4,7 +4,7 @@
 use super::cdp::Cdp;
 use super::chromium::{Browser, Window};
 use super::electron::Started;
-use super::isolate::{epoch_ms, lines};
+use super::isolate::{Launching, epoch_ms, lines};
 use crate::host;
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
@@ -71,12 +71,6 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     let port = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port();
     let fill = |s: &str| s.replace("{home}", &home.display().to_string()).replace("{port}", &port.to_string());
     let mut cmd = shell(&fill(&spec.run));
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // Its own group, so the dev server, the app and everything they spawn end together.
-        cmd.process_group(0);
-    }
     for (k, _) in std::env::vars() {
         if super::isolate::env_unset(&spec.unset, &k) {
             cmd.env_remove(&k);
@@ -87,15 +81,14 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     }
     cmd.envs(super::isolate::launch_env(home));
     cmd.current_dir(&spec.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let previous = cpus.and_then(host::set_affinity);
     let epoch = epoch_ms();
-    let spawned = cmd.spawn();
-    if previous.is_some() {
-        host::set_affinity(previous.unwrap_or(0));
-    }
-    let mut child = spawned.map_err(|e| Error::msg(format!("start `{}`: {e}", spec.run)))?;
+    // Its own group, so the dev server, the app and everything they spawn end together.
+    let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, Some(home)).map_err(|e| Error::msg(format!("start `{}`: {e}", spec.run)))?;
     let pid = child.id();
     let output = lines(&mut child);
+    // A start that fails from here ends the command's processes and what runs for its home; the
+    // folder is the caller's.
+    let launching = Launching { pid, child: Some(child), group: Some(group), home: Some(home.to_path_buf()), fresh: false };
     // The lines read while waiting, replayed to the caller (milestones before the endpoint count too).
     let (tx, rx) = std::sync::mpsc::channel();
     let deadline = Instant::now() + spec.timeout;
@@ -110,12 +103,10 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                super::isolate::kill_tree(pid);
                 return Err(Error::msg(format!("`{}` exited before it printed \"{} ws://…\"", spec.run, spec.attach)));
             }
         }
         if Instant::now() > deadline {
-            super::isolate::kill_tree(pid);
             return Err(Error::unreachable(format!("`{}` printed no \"{} ws://…\" in {} s", spec.run, spec.attach, spec.timeout.as_secs())));
         }
     };
@@ -129,6 +120,8 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     });
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    let browser = Browser { cdp, ws, child: Some(child), pid, profile: Some(home.to_path_buf()), exe: PathBuf::from(&spec.run), version, window: window.clone() };
+    let (child, group, profile) = launching.done();
+    // The home is a fresh folder per launch (a caller that keeps it takes `profile`): it goes with the browser.
+    let browser = Browser { cdp, ws, child, group, pid, profile, fresh: true, exe: PathBuf::from(&spec.run), version, window: window.clone() };
     Ok((browser, Started { epoch_ms: epoch, output: Some(rx), main: None }))
 }

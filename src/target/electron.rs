@@ -85,9 +85,19 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         args.push(format!("--inspect-brk={port}"));
     }
     args.push("--remote-debugging-port=0".into());
-    let spawned = isolate::spawn(app, &prepared, &args, &[], extra.output, cpus)?;
-    let (mut child, pid, epoch, output) = (spawned.child, spawned.pid, spawned.epoch_ms, spawned.output);
-    let mut launching = Launching { pid, home: Some(home.clone()) };
+    // A launch that fails from here ends what it started; its home goes when the launch made it.
+    let spawned = match isolate::spawn(app, &prepared, &args, &[], extra.output, cpus) {
+        Ok(s) => s,
+        Err(e) => {
+            isolate::release_home(&home);
+            if prepared.fresh {
+                isolate::remove_home(&home);
+            }
+            return Err(e);
+        }
+    };
+    let (pid, epoch, output) = (spawned.pid, spawned.epoch_ms, spawned.output);
+    let mut launching = Launching { pid, child: Some(spawned.child), group: Some(spawned.group), home: Some(home.clone()), fresh: prepared.fresh };
     let main = match extra.profile_main {
         Some(port) => Some(profile_from_start(port)?),
         None => None,
@@ -101,7 +111,7 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         }
         // A program that is not Chromium-based rejects the flag and fails: say so now, not in 60 s. A launcher
         // stub that starts the real app and exits succeeds, so a clean exit keeps waiting for the port.
-        if let Ok(Some(status)) = child.try_wait()
+        if let Some(Ok(Some(status))) = launching.child.as_mut().map(|c| c.try_wait())
             && !status.success()
         {
             return Err(Error::unreachable(format!("{} exited ({status}) before it opened a debugging port", app.exe.display()))
@@ -117,9 +127,9 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     let ws = format!("ws://127.0.0.1:{debug_port}{path}");
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    launching.home = None;
-    std::mem::forget(launching);
-    Ok((Browser { cdp, ws, child: Some(child), pid, profile: Some(home), exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
+    let fresh = launching.fresh;
+    let (child, group, profile) = launching.done();
+    Ok((Browser { cdp, ws, child, group, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
 }
 
 /// The app window's page: the first page target that is not DevTools.

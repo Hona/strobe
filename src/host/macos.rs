@@ -276,6 +276,8 @@ struct Bsd {
     name: String,
     /// Start time in µs since the epoch: a parent's children start no earlier.
     start: u64,
+    /// `SZOMB`: exited, not yet reaped.
+    zombie: bool,
 }
 
 fn bsd(pid: u32) -> Option<Bsd> {
@@ -286,7 +288,7 @@ fn bsd(pid: u32) -> Option<Bsd> {
     }
     let text = |b: &[c_char]| unsafe { std::ffi::CStr::from_ptr(b.as_ptr()) }.to_string_lossy().to_string();
     let name = Some(text(&info.pbi_name)).filter(|n| !n.is_empty()).unwrap_or_else(|| text(&info.pbi_comm));
-    Some(Bsd { pid, ppid: info.pbi_ppid, name, start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec })
+    Some(Bsd { pid, ppid: info.pbi_ppid, name, start: info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec, zombie: info.pbi_status == 5 })
 }
 
 /// (CPU ns, physical footprint, resident, disk bytes read, written), from `proc_pid_rusage` (this
@@ -300,21 +302,30 @@ fn rusage(pid: u32) -> Option<(u64, u64, u64, u64, u64)> {
     Some((mach_ns(ri.ri_user_time + ri.ri_system_time), ri.ri_phys_footprint, ri.ri_resident_size, ri.ri_diskio_bytesread, ri.ri_diskio_byteswritten))
 }
 
-fn tree_of(all: &[Bsd], root: u32) -> Vec<usize> {
-    let Some(r) = all.iter().position(|p| p.pid == root) else { return Vec::new() };
+/// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
+/// children that started no earlier than their parent (a reused pid).
+fn tree_of(all: &[Bsd], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
         if p.ppid != p.pid {
             children.entry(p.ppid).or_default().push(i);
         }
     }
-    let mut out = vec![r];
-    let mut stack = vec![r];
-    while let Some(i) = stack.pop() {
-        for &j in children.get(&all[i].pid).map(Vec::as_slice).unwrap_or(&[]) {
-            if all[j].start >= all[i].start && out.len() <= all.len() {
-                out.push(j);
-                stack.push(j);
+    let mut seen = vec![false; all.len()];
+    let mut out = Vec::new();
+    for &root in roots {
+        let Some(r) = all.iter().position(|p| p.pid == root) else { continue };
+        if std::mem::replace(&mut seen[r], true) {
+            continue;
+        }
+        out.push(r);
+        let mut stack = vec![r];
+        while let Some(i) = stack.pop() {
+            for &j in children.get(&all[i].pid).map(Vec::as_slice).unwrap_or(&[]) {
+                if all[j].start >= all[i].start && !std::mem::replace(&mut seen[j], true) {
+                    out.push(j);
+                    stack.push(j);
+                }
             }
         }
     }
@@ -330,9 +341,14 @@ pub fn process_cycles(pid: u32) -> Option<u64> {
     rusage(pid).map(|r| r.0)
 }
 
-pub fn process_tree(root: u32) -> Vec<ProcTimes> {
+pub fn process_list() -> Vec<(u32, u32, u64)> {
+    all_bsd().into_iter().map(|b| (b.pid, b.ppid, b.start)).collect()
+}
+
+pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
     let all = all_bsd();
-    tree_of(&all, root)
+    let roots = roots(&all.iter().map(|b| (b.pid, b.ppid, b.start)).collect::<Vec<_>>());
+    tree_of(&all, &roots)
         .into_iter()
         .map(|i| {
             let b = &all[i];
@@ -344,7 +360,7 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = all_bsd();
-    tree_of(&all, root).into_iter().map(|i| all[i].pid).collect()
+    tree_of(&all, &[root]).into_iter().map(|i| all[i].pid).collect()
 }
 
 pub fn all_processes() -> Vec<ProcInfo> {
@@ -388,8 +404,9 @@ fn thread_info(pid: u32, tid: u64) -> Option<libc::proc_threadinfo> {
     (unsafe { libc::proc_pidinfo(pid as i32, PROC_PIDTHREADID64INFO, tid, &mut t as *mut _ as *mut c_void, size) } == size).then_some(t)
 }
 
-/// Thread ids are 64-bit on macOS and need their process: the last `threads` call's map, for
-/// `thread_cycles_of` and `thread_name`.
+/// Thread ids are 64-bit on macOS and need their process: the threads `threads` listed, for
+/// `thread_cycles_of` and `thread_name`. Each call replaces only the processes it read and drops
+/// those that exited, so samplers that run at once (in the daemon) keep each other's threads.
 static THREADS: Mutex<Option<HashMap<u32, (u32, u64)>>> = Mutex::new(None);
 
 /// Per process: one row with its context switches (`tid` 0, the only wake count macOS gives), then
@@ -410,7 +427,16 @@ pub fn threads(pids: &[u32]) -> (Vec<ThreadInfo>, Vec<(u32, u64, u64)>) {
             out.push(ThreadInfo { pid, tid: id as u32, switches: 0, cpu_ns: t.pth_user_time + t.pth_system_time });
         }
     }
-    *THREADS.lock().unwrap_or_else(|e| e.into_inner()) = Some(map);
+    {
+        let mut known = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+        let known = known.get_or_insert_with(HashMap::new);
+        let mut others: Vec<u32> = known.values().map(|(p, _)| *p).filter(|p| !pids.contains(p)).collect();
+        others.sort_unstable();
+        others.dedup();
+        let gone: Vec<u32> = others.into_iter().filter(|&p| bsd(p).is_none()).collect();
+        known.retain(|_, (p, _)| !pids.contains(p) && !gone.contains(p));
+        known.extend(map);
+    }
     out.sort_by_key(|t| (t.pid, t.tid));
     (out, io)
 }
@@ -631,20 +657,15 @@ fn procargs_env(b: &[u8]) -> Vec<String> {
     env
 }
 
-/// When a process started (µs since the epoch), which with its pid names it uniquely: a reused pid
-/// starts later.
+/// When a running process started (µs since the epoch), which with its pid names it uniquely: a
+/// reused pid starts later. None for a zombie (exited, its pid kept only for its parent's wait).
 pub fn start_time(pid: u32) -> Option<u64> {
-    bsd(pid).map(|b| b.start)
+    bsd(pid).filter(|b| !b.zombie).map(|b| b.start)
 }
 
 pub fn running(exe: &Path) -> Vec<u32> {
     let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     all_pids().into_iter().filter(|&p| exe_of(p).is_some_and(|e| e == want)).collect()
-}
-
-pub fn running_under(dir: &Path) -> Vec<u32> {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    all_pids().into_iter().filter(|&p| p != std::process::id() && exe_of(p).is_some_and(|e| e.starts_with(&dir))).collect()
 }
 
 /// The console session shows the lock screen (`CGSSessionScreenIsLocked`).
@@ -888,17 +909,23 @@ pub fn background_qos(pid: u32) -> Option<String> {
 /// wake from a 16 ms sleep 20 to 60 ms late (air, macOS 27; ProcessType Interactive: 1 to 4 ms), with
 /// no thread QoS, role or activity that strobe may set changing it. What strobe launches inherits
 /// it. Returns the median wake delay (ms) of a few short sleeps and the job's program, when late.
+/// Measured once per process (35 ms of sleeps, 0.4 s when late): a process's launchd job does not
+/// change while it runs.
 pub fn timer_coalescing() -> Option<(f64, String)> {
-    let mut late: Vec<f64> = (0..7)
-        .map(|_| {
-            let t = std::time::Instant::now();
-            std::thread::sleep(std::time::Duration::from_millis(5));
-            t.elapsed().as_secs_f64() * 1e3 - 5.0
-        })
-        .collect();
-    late.sort_by(f64::total_cmp);
-    let median = late[late.len() / 2];
-    (median > 5.0).then(|| (median, responsible_app()))
+    static LATE: std::sync::OnceLock<Option<(f64, String)>> = std::sync::OnceLock::new();
+    LATE.get_or_init(|| {
+        let mut late: Vec<f64> = (0..7)
+            .map(|_| {
+                let t = std::time::Instant::now();
+                std::thread::sleep(std::time::Duration::from_millis(5));
+                t.elapsed().as_secs_f64() * 1e3 - 5.0
+            })
+            .collect();
+        late.sort_by(f64::total_cmp);
+        let median = late[late.len() / 2];
+        (median > 5.0).then(|| (median, responsible_app()))
+    })
+    .clone()
 }
 
 fn major_version() -> u32 {

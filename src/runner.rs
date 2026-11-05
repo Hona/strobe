@@ -51,8 +51,11 @@ pub fn incomplete(what: &str, op: &str, e: Error, extra: &str, fix: &str) -> Err
     }
 }
 
+/// The runner process, in a group of its own with everything its hooks start: dropped (after `exit`
+/// or without it), the group ends.
 pub struct Runner {
     child: Child,
+    group: Option<host::spawn::Group>,
     conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
@@ -73,9 +76,8 @@ impl Runner {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let out = std::fs::File::create(&log)?;
         let err = out.try_clone()?;
-        let previous = cpus.and_then(host::set_affinity);
-        let spawned = Command::new(bun)
-            .arg("--preload")
+        let mut cmd = Command::new(bun);
+        cmd.arg("--preload")
             .arg(sdk.join("preload.ts"))
             .arg(sdk.join("runner.ts"))
             .arg(file)
@@ -84,12 +86,9 @@ impl Runner {
             .current_dir(file.parent().unwrap_or(Path::new(".")))
             .stdin(Stdio::null())
             .stdout(out)
-            .stderr(err)
-            .spawn();
-        if previous.is_some() {
-            host::set_affinity(previous.unwrap_or(0));
-        }
-        let mut child = spawned.map_err(|e| Error::msg(format!("spawn bun: {e}")))?;
+            .stderr(err);
+        // An early return from here drops the group, which ends the runner and what it started.
+        let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("spawn bun: {e}")))?;
         listener.set_nonblocking(true)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let conn = loop {
@@ -100,6 +99,7 @@ impl Runner {
             }
             if std::time::Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
                 let _ = child.kill();
+                let _ = child.wait();
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
                 let tail: Vec<&str> = text.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
                 return Err(Error::msg(format!("the bench runner did not start\n{}", tail.join("\n"))));
@@ -117,7 +117,7 @@ impl Runner {
                 }
             }
         });
-        let mut runner = Runner { child, conn, lines: rx, next: 1, log };
+        let mut runner = Runner { child, group: Some(group), conn, lines: rx, next: 1, log };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -207,15 +207,33 @@ impl Runner {
         self.call("describe", json!({}), Duration::from_secs(60), |_, _| Err(Error::msg("no driver during describe")))
     }
 
+    /// Asks the runner to exit (its `close` hooks have run), up to 3 s, then ends its group.
     pub fn exit(&mut self) {
+        if self.group.is_none() {
+            return;
+        }
         let _ = self.write(&json!({ "id": 0, "op": "exit" }));
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while std::time::Instant::now() < deadline {
             if let Ok(Some(_)) = self.child.try_wait() {
-                return;
+                break;
             }
             std::thread::sleep(Duration::from_millis(30));
         }
-        let _ = self.child.kill();
+        self.end();
+    }
+
+    fn end(&mut self) {
+        if let Some(group) = self.group.take() {
+            drop(group);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+}
+
+impl Drop for Runner {
+    fn drop(&mut self) {
+        self.end();
     }
 }

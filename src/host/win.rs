@@ -40,43 +40,46 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub fn process_tree(root: u32) -> Vec<ProcTimes> {
-    let mut all: Vec<(u32, u32, String)> = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return Vec::new();
-        }
-        let mut e: PROCESSENTRY32W = zeroed();
-        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snap, &mut e) != 0 {
-            loop {
-                all.push((e.th32ProcessID, e.th32ParentProcessID, wide_to_string(&e.szExeFile)));
-                if Process32NextW(snap, &mut e) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-    }
+/// The trees of the roots `roots` picks from one system snapshot's list (pid, parent, creation
+/// time), each process with its own CPU times and memory.
+pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
+    let all = system_processes(true);
+    let roots = roots(&all.iter().map(|p| (p.info.pid, p.info.parent, p.create as u64)).collect::<Vec<_>>());
+    tree_of(&all, &roots)
+        .into_iter()
+        .map(|i| {
+            let p = &all[i].info;
+            let (cpu_ns, cycles, private_bytes, working_set) = proc_times(p.pid);
+            ProcTimes { pid: p.pid, parent: p.parent, name: p.name.clone(), cpu_ns, cycles, private_bytes, working_set }
+        })
+        .collect()
+}
+
+/// Indexes into `all` of the trees of `roots` (each root first), each process once, following a child
+/// only when it was created no earlier than its parent: a reused parent pid names an older process.
+fn tree_of(all: &[SysProc], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
-        children.entry(p.1).or_default().push(i);
+        if p.info.parent != p.info.pid {
+            children.entry(p.info.parent).or_default().push(i);
+        }
     }
+    let mut seen = vec![false; all.len()];
     let mut out = Vec::new();
-    let mut stack: Vec<u32> = vec![root];
-    let mut seen = std::collections::HashSet::new();
-    while let Some(pid) = stack.pop() {
-        if !seen.insert(pid) {
+    for &root in roots {
+        let Some(r) = all.iter().position(|p| p.info.pid == root) else { continue };
+        if std::mem::replace(&mut seen[r], true) {
             continue;
         }
-        if let Some(p) = all.iter().find(|p| p.0 == pid) {
-            let (cpu_ns, cycles, private_bytes, working_set) = proc_times(pid);
-            out.push(ProcTimes { pid, parent: p.1, name: p.2.clone(), cpu_ns, cycles, private_bytes, working_set });
-        }
-        for &i in children.get(&pid).map(Vec::as_slice).unwrap_or(&[]) {
-            // A reused parent pid can point at an older, unrelated process; children are always newer.
-            stack.push(all[i].0);
+        out.push(r);
+        let mut stack = vec![r];
+        while let Some(i) = stack.pop() {
+            for &j in children.get(&all[i].info.pid).map(Vec::as_slice).unwrap_or(&[]) {
+                if all[j].create >= all[i].create && !std::mem::replace(&mut seen[j], true) {
+                    out.push(j);
+                    stack.push(j);
+                }
+            }
         }
     }
     out
@@ -85,6 +88,31 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
 /// One process's CPU cycles (`super::process_cycles`).
 pub fn process_cycles(pid: u32) -> Option<u64> {
     Some(proc_times(pid).1).filter(|c| *c > 0)
+}
+
+/// Every process: (pid, parent, creation time), from one system snapshot.
+pub fn process_list() -> Vec<(u32, u32, u64)> {
+    system_processes(false).into_iter().map(|p| (p.info.pid, p.info.parent, p.create as u64)).collect()
+}
+
+/// Terminates a process and every process of its tree, children first: each only when the process
+/// the handle opens was created when the snapshot said (a pid reused since is another process).
+pub fn kill_tree(pid: u32) {
+    use windows_sys::Win32::System::Threading::{PROCESS_TERMINATE, TerminateProcess};
+    let all = system_processes(false);
+    for i in tree_of(&all, &[pid]).into_iter().rev() {
+        unsafe {
+            let h = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, 0, all[i].info.pid);
+            if h.is_null() {
+                continue;
+            }
+            let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
+            if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 && ((c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64) == all[i].create as u64 {
+                TerminateProcess(h, 1);
+            }
+            CloseHandle(h);
+        }
+    }
 }
 
 /// CPU time (ns), CPU cycles, private bytes and working set of one process.
@@ -450,32 +478,6 @@ pub fn running(exe: &std::path::Path) -> Vec<u32> {
     out
 }
 
-/// PIDs of running processes whose executable lives under `dir`.
-pub fn running_under(dir: &std::path::Path) -> Vec<u32> {
-    let prefix = dir.to_string_lossy().to_lowercase();
-    let mut out = Vec::new();
-    unsafe {
-        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if snap == INVALID_HANDLE_VALUE {
-            return out;
-        }
-        let mut e: PROCESSENTRY32W = zeroed();
-        e.dwSize = size_of::<PROCESSENTRY32W>() as u32;
-        if Process32FirstW(snap, &mut e) != 0 {
-            loop {
-                if exe_of(e.th32ProcessID).is_some_and(|p| p.to_string_lossy().to_lowercase().starts_with(&prefix)) {
-                    out.push(e.th32ProcessID);
-                }
-                if Process32NextW(snap, &mut e) == 0 {
-                    break;
-                }
-            }
-        }
-        CloseHandle(snap);
-    }
-    out
-}
-
 trait PathEq {
     fn eq_ignore_ascii_case_path(&self, other: &std::path::Path) -> bool;
 }
@@ -561,15 +563,19 @@ pub fn env_of(pid: u32) -> Option<Vec<String>> {
     out
 }
 
-/// When a process started (its creation time, 100 ns units), which with its pid names it uniquely.
+/// When a running process started (its creation time, 100 ns units), which with its pid names it
+/// uniquely. None once it has exited: a handle someone still holds (the shell that started it) keeps
+/// an exited process's pid and times readable.
 pub fn start_time(pid: u32) -> Option<u64> {
+    use windows_sys::Win32::Foundation::WAIT_TIMEOUT;
+    use windows_sys::Win32::System::Threading::{PROCESS_SYNCHRONIZE, WaitForSingleObject};
     unsafe {
-        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE, 0, pid);
         if h.is_null() {
             return None;
         }
         let (mut c, mut e, mut k, mut u): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
-        let ok = GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
+        let ok = WaitForSingleObject(h, 0) == WAIT_TIMEOUT && GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0;
         CloseHandle(h);
         ok.then_some((c.dwHighDateTime as u64) << 32 | c.dwLowDateTime as u64)
     }
@@ -1260,25 +1266,7 @@ pub fn all_processes() -> Vec<super::ProcInfo> {
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = system_processes(false);
-    let Some(r) = all.iter().position(|p| p.info.pid == root) else { return Vec::new() };
-    let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
-    for (i, p) in all.iter().enumerate() {
-        if p.info.parent != p.info.pid {
-            children.entry(p.info.parent).or_default().push(i);
-        }
-    }
-    let mut out = vec![root];
-    let mut stack = vec![r];
-    while let Some(i) = stack.pop() {
-        let parent = &all[i];
-        for &j in children.get(&parent.info.pid).map(Vec::as_slice).unwrap_or(&[]) {
-            if all[j].create >= parent.create && out.len() <= all.len() {
-                out.push(all[j].info.pid);
-                stack.push(j);
-            }
-        }
-    }
-    out
+    tree_of(&all, &[root]).into_iter().map(|i| all[i].info.pid).collect()
 }
 
 /// Idle cycles per logical CPU of processor group 0 (SystemProcessorIdleCycleTimeInformation).

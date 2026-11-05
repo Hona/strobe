@@ -136,22 +136,30 @@ pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
     Some(out)
 }
 
-/// Children by parent, following only children that started no earlier than their parent (a reused pid).
-fn tree_of(all: &[Stat], root: u32) -> Vec<usize> {
-    let Some(r) = all.iter().position(|p| p.pid == root) else { return Vec::new() };
+/// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
+/// children that started no earlier than their parent (a reused pid).
+fn tree_of(all: &[Stat], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
         if p.ppid != p.pid {
             children.entry(p.ppid).or_default().push(i);
         }
     }
-    let mut out = vec![r];
-    let mut stack = vec![r];
-    while let Some(i) = stack.pop() {
-        for &j in children.get(&all[i].pid).map(Vec::as_slice).unwrap_or(&[]) {
-            if all[j].start >= all[i].start && out.len() <= all.len() {
-                out.push(j);
-                stack.push(j);
+    let mut seen = vec![false; all.len()];
+    let mut out = Vec::new();
+    for &root in roots {
+        let Some(r) = all.iter().position(|p| p.pid == root) else { continue };
+        if std::mem::replace(&mut seen[r], true) {
+            continue;
+        }
+        out.push(r);
+        let mut stack = vec![r];
+        while let Some(i) = stack.pop() {
+            for &j in children.get(&all[i].pid).map(Vec::as_slice).unwrap_or(&[]) {
+                if all[j].start >= all[i].start && !std::mem::replace(&mut seen[j], true) {
+                    out.push(j);
+                    stack.push(j);
+                }
             }
         }
     }
@@ -162,9 +170,14 @@ fn all_stats() -> Vec<Stat> {
     pids().into_iter().filter_map(stat).collect()
 }
 
-pub fn process_tree(root: u32) -> Vec<ProcTimes> {
+pub fn process_list() -> Vec<(u32, u32, u64)> {
+    all_stats().into_iter().map(|s| (s.pid, s.ppid, s.start)).collect()
+}
+
+pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
     let all = all_stats();
-    tree_of(&all, root)
+    let roots = roots(&all.iter().map(|s| (s.pid, s.ppid, s.start)).collect::<Vec<_>>());
+    tree_of(&all, &roots)
         .into_iter()
         .map(|i| {
             let s = &all[i];
@@ -175,7 +188,7 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = all_stats();
-    tree_of(&all, root).into_iter().map(|i| all[i].pid).collect()
+    tree_of(&all, &[root]).into_iter().map(|i| all[i].pid).collect()
 }
 
 pub fn all_processes() -> Vec<ProcInfo> {
@@ -374,21 +387,21 @@ pub fn env_of(pid: u32) -> Option<Vec<String>> {
     Some(bytes.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).to_string()).collect())
 }
 
-/// When a process started (clock ticks after boot), which with its pid names it uniquely.
+/// When a running process started (clock ticks after boot), which with its pid names it uniquely.
+/// None for a zombie: it has exited, and only its parent's wait keeps the pid.
 pub fn start_time(pid: u32) -> Option<u64> {
-    stat(pid).map(|s| s.start)
+    let text = read(format!("/proc/{pid}/stat"))?;
+    let f: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
+    if f.first() == Some(&"Z") {
+        return None;
+    }
+    f.get(19)?.parse().ok()
 }
 
 /// PIDs of running processes whose executable is exactly `exe`.
 pub fn running(exe: &Path) -> Vec<u32> {
     let want = std::fs::canonicalize(exe).unwrap_or_else(|_| exe.to_path_buf());
     pids().into_iter().filter(|&p| exe_of(p).is_some_and(|e| e == want)).collect()
-}
-
-/// PIDs of running processes whose executable or working folder lives under `dir`.
-pub fn running_under(dir: &Path) -> Vec<u32> {
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    pids().into_iter().filter(|&p| p != std::process::id() && (exe_of(p).is_some_and(|e| e.starts_with(&dir)) || std::fs::read_link(format!("/proc/{p}/cwd")).is_ok_and(|c| c.starts_with(&dir)))).collect()
 }
 
 pub fn os_name() -> String {

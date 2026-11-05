@@ -3,6 +3,7 @@
 
 use super::chromium::Window;
 use super::isolate::{self, App, Guard, Home};
+use crate::host::spawn::Group;
 use crate::host::{self, TopWindow};
 use crate::model::{Error, Hidden, Refusal, Result};
 use std::path::PathBuf;
@@ -30,10 +31,16 @@ fn inactive(pid: u32) -> bool {
     }
 }
 
+/// A launched native app. Dropped without `close`, it still ends everything it launched, releases
+/// its home and removes the home when `prepare_home` made it for this launch.
 pub struct Native {
     pub child: Child,
+    group: Option<Group>,
     pub pid: u32,
     pub home: PathBuf,
+    fresh: bool,
+    /// `close` ran (or the drop did).
+    ended: bool,
     pub exe: PathBuf,
     /// When it was spawned: Unix epoch ms and the host clock (ns).
     pub epoch_ms: f64,
@@ -50,11 +57,24 @@ pub fn launch(app: &App, home: &Home, env: &[(String, String)], output: bool, cp
     guard.shared = home.shared.clone();
     isolate::live(app, &guard)?;
     let s = isolate::spawn(app, home, &[], env, output, cpus)?;
-    Ok((Native { child: s.child, pid: s.pid, home: home.dir.clone(), exe: app.exe.clone(), epoch_ms: s.epoch_ms, at_ns: s.at_ns, output: s.output, window: None }, guard))
+    let n = Native {
+        child: s.child,
+        group: Some(s.group),
+        pid: s.pid,
+        home: home.dir.clone(),
+        fresh: home.fresh,
+        ended: false,
+        exe: app.exe.clone(),
+        epoch_ms: s.epoch_ms,
+        at_ns: s.at_ns,
+        output: s.output,
+        window: None,
+    };
+    Ok((n, guard))
 }
 
 impl Native {
-    /// The app's processes, sorted: its tree, and whatever runs from its home.
+    /// The app's processes, sorted: its tree, and whatever was launched for its home.
     pub fn pids(&self) -> Vec<u32> {
         let mut p: Vec<u32> = self.processes().iter().map(|p| p.pid).collect();
         p.sort_unstable();
@@ -92,7 +112,8 @@ impl Native {
                 self.window = Some(w.clone());
                 return Ok(w);
             }
-            if let Some(code) = self.exited().filter(|_| host::process_tree(self.pid).is_empty()) {
+            // A launcher that started the app and exited leaves it stamped with the home.
+            if let Some(code) = self.exited().filter(|_| self.processes().is_empty()) {
                 return Err(Error::msg(format!(
                     "{} exited (code {code}) before it opened a window: an app that hands its window to another process (a launcher, a single-instance app already running) cannot be measured this way",
                     self.exe.display()
@@ -169,15 +190,23 @@ impl Native {
         }
     }
 
-    /// Ends the app's tree and what runs from its home, restores its URL schemes, and with `remove`
-    /// deletes the home (a warm one is kept).
+    /// Ends the app's tree, its group and what was launched for its home, restores its URL schemes,
+    /// and with `remove` deletes the home (a warm one is kept).
     pub fn close(mut self, remove: bool) {
-        isolate::kill_tree(self.pid);
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-        isolate::release_home(&self.home);
-        if remove {
-            isolate::remove_home(&self.home);
+        self.end(remove);
+    }
+
+    fn end(&mut self, remove: bool) {
+        if std::mem::replace(&mut self.ended, true) {
+            return;
         }
+        isolate::end_launch(self.pid, self.group.take(), Some(&mut self.child), Some(self.home.as_path()), remove);
+    }
+}
+
+impl Drop for Native {
+    fn drop(&mut self) {
+        let remove = self.fresh;
+        self.end(remove);
     }
 }

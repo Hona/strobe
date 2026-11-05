@@ -11,6 +11,8 @@ use std::sync::mpsc::Receiver;
 /// The host process and its line protocol, over a loopback connection.
 struct Host {
     child: Child,
+    /// Its process group: dropped, the host and what it started end.
+    group: Option<host::spawn::Group>,
     conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
@@ -75,12 +77,8 @@ impl Host {
         cmd.env("STROBE_HOST_PORT", listener.local_addr()?.port().to_string());
         let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
-        let previous = cpus.and_then(host::set_affinity);
-        let spawned = cmd.stdin(Stdio::null()).stdout(out).stderr(err).spawn();
-        if previous.is_some() {
-            host::set_affinity(previous.unwrap_or(0));
-        }
-        let mut child = spawned.map_err(|e| Error::msg(format!("start the script host: {e}")))?;
+        cmd.stdin(Stdio::null()).stdout(out).stderr(err);
+        let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("start the script host: {e}")))?;
         let failed = |log: &Path| {
             let tail: Vec<String> = std::fs::read_to_string(log).unwrap_or_default().lines().rev().take(12).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect();
             Error::msg(format!("the script host did not load {}:\n{}", entry.display(), tail.join("\n")))
@@ -111,7 +109,7 @@ impl Host {
                 }
             }
         });
-        let host = Host { child, conn, lines, next: 1 };
+        let host = Host { child, group: Some(group), conn, lines, next: 1 };
         loop {
             let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| failed(log))?;
             if serde_json::from_str::<Value>(&line).ok().is_some_and(|v| v["ready"] == true) {
@@ -156,6 +154,16 @@ impl Host {
             std::thread::sleep(Duration::from_millis(50));
         }
         isolate::kill_tree(self.child.id());
+    }
+}
+
+impl Drop for Host {
+    fn drop(&mut self) {
+        if let Some(group) = self.group.take() {
+            drop(group);
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
     }
 }
 

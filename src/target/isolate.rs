@@ -6,6 +6,8 @@
 //! (`native.rs`) both launch through this.
 
 use crate::host;
+pub use crate::host::kill_tree;
+use crate::host::spawn::{Group, HOME_VAR, OWNER_VAR, Stamp, home_key as key, owner_stamp, parse_owner, stamp_of, stamped};
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::net::{SocketAddr, TcpStream};
@@ -444,28 +446,8 @@ pub fn new_home() -> PathBuf {
     host::paths::run().join(format!("home-{}-{}", std::process::id(), host::now_ns()))
 }
 
-/// Every process strobe launches (an isolated app, a browser, a command target) carries the folder it
-/// was launched for (its home or browser profile) in this variable, and whatever it starts inherits
-/// it. Read from the environment only, never the command line: a person's shell or search whose
-/// arguments name a strobe folder is not strobe's.
-pub const HOME_VAR: &str = "STROBE_HOME";
-/// And the strobe that launched it: `<pid>:<start time>`, so a reused pid is not that strobe.
-pub const OWNER_VAR: &str = "STROBE_OWNER";
-
-/// The file in a home or profile that names its strobe the way `OWNER_VAR` does.
+/// The file in a home or profile that names its strobe the way `host::spawn::OWNER_VAR` does.
 const OWNER_FILE: &str = ".strobe-owner";
-
-/// This strobe as `OWNER_VAR` names it.
-pub fn owner_stamp() -> &'static str {
-    static STAMP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    STAMP.get_or_init(|| format!("{}:{}", std::process::id(), host::start_time(std::process::id()).unwrap_or(0)))
-}
-
-/// A folder as a key: case and separators folded on Windows.
-fn key(p: &Path) -> String {
-    let s = p.display().to_string();
-    if cfg!(windows) { s.to_lowercase().replace('/', "\\") } else { s }
-}
 
 /// Homes and profiles this strobe launched into and has not released.
 static HELD: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
@@ -474,8 +456,8 @@ fn held(dir: &str) -> bool {
     HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|h| h == dir)
 }
 
-/// The variables a launch for `dir` carries (`HOME_VAR`, `OWNER_VAR`); `dir` is held until it is
-/// released, and names this strobe in its owner file.
+/// The variables a launch for `dir` carries (`host::spawn::HOME_VAR`, `OWNER_VAR`); `dir` is held
+/// until it is released, and names this strobe in its owner file.
 pub fn launch_env(dir: &Path) -> [(String, String); 2] {
     let _ = std::fs::write(dir.join(OWNER_FILE), owner_stamp());
     let k = key(dir);
@@ -491,26 +473,6 @@ fn let_go(dir: &Path) {
     HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != k);
 }
 
-/// A process's stamp: the folder it was launched for, and its strobe's pid and start time.
-#[derive(Clone, Debug, PartialEq)]
-struct Stamp {
-    home: String,
-    pid: u32,
-    start: u64,
-}
-
-fn parse_owner(s: &str) -> Option<(u32, u64)> {
-    let (p, t) = s.trim().split_once(':')?;
-    Some((p.parse().ok()?, t.parse().ok()?))
-}
-
-fn stamp_of(pid: u32) -> Option<Stamp> {
-    let env = host::env_of(pid)?;
-    let var = |name: &str| env.iter().find_map(|e| e.split_once('=').filter(|(k, _)| env_name_is(k, name)).map(|(_, v)| v.to_string()));
-    let (owner, start) = parse_owner(&var(OWNER_VAR)?)?;
-    Some(Stamp { home: key(Path::new(&var(HOME_VAR)?)), pid: owner, start })
-}
-
 /// Whether the strobe a stamp names runs: that pid, started at that time.
 fn owner_alive(pid: u32, start: u64) -> bool {
     host::start_time(pid) == Some(start)
@@ -520,12 +482,6 @@ fn owner_alive(pid: u32, start: u64) -> bool {
 /// folder it was launched for was released (a detached child that outlived its launch).
 fn leftover(s: &Stamp) -> bool {
     if s.pid == std::process::id() { !held(&s.home) } else { !owner_alive(s.pid, s.start) }
-}
-
-/// Every running process strobe stamped, but strobe itself: (pid, parent, stamp).
-fn stamped() -> Vec<(u32, u32, Stamp)> {
-    let me = std::process::id();
-    host::all_processes().into_iter().filter(|p| p.pid != 0 && p.pid != me).filter_map(|p| Some((p.pid, p.parent, stamp_of(p.pid)?))).collect()
 }
 
 /// Ends the trees of `procs` from their roots (a process whose parent is not among them), each
@@ -547,12 +503,6 @@ fn end_roots(procs: &[(u32, u32, Stamp)]) -> Vec<(u32, String, Stamp)> {
             same
         })
         .collect()
-}
-
-/// The processes launched for `dir` (stamped with it), whoever launched them.
-pub fn pids_in_home(dir: &Path) -> Vec<u32> {
-    let k = key(dir);
-    stamped().into_iter().filter(|(_, _, s)| s.home == k).map(|(p, _, _)| p).collect()
 }
 
 /// Ends what dead strobes left behind, and the folders they left: every stamped process whose
@@ -600,6 +550,28 @@ pub fn release_home(home: &Path) {
     end_roots(&left);
     restore_protocols(home);
     let_go(home);
+}
+
+/// Ends what a launch started, whatever state it is in: its tree (read before its group ends, which
+/// orphans it; not once the child has exited, when its pid may name another process), its group, the
+/// child (reaped), then everything stamped with its folder; releases the folder and, with `remove`,
+/// deletes it.
+pub fn end_launch(pid: u32, group: Option<Group>, mut child: Option<&mut Child>, home: Option<&Path>, remove: bool) {
+    let exited = child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
+    if !exited {
+        kill_tree(pid);
+    }
+    drop(group);
+    if let Some(c) = child {
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    if let Some(h) = home {
+        release_home(h);
+        if remove {
+            remove_home(h);
+        }
+    }
 }
 
 /// Where GPU drivers keep compiled shaders, relative to a home whose per-user folders the launch
@@ -803,6 +775,9 @@ pub struct Home {
     pub shared: Vec<Shared>,
     /// With `App::gpu_cache`: whether the launch found GPU shader caches from earlier launches.
     pub gpu_warm: Option<bool>,
+    /// `prepare_home` made it now (not a warm home launched before): a launch that ends without
+    /// being closed removes it, and keeps a warm one for the caller.
+    pub fresh: bool,
 }
 
 impl Home {
@@ -901,13 +876,14 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     // Last, so no profile replaces them: what tells strobe's launches (and what they start) apart.
     env.extend(launch_env(&home));
     let gpu_warm = app.gpu_cache.as_deref().map(|store| lend_gpu_caches(&home, store));
-    Ok(Home { dir: home, port, env, shared, gpu_warm })
+    Ok(Home { dir: home, port, env, shared, gpu_warm, fresh })
 }
 
-/// A spawned app: the child, when it was spawned (epoch ms and the host clock), and its output lines
-/// when asked for.
+/// A spawned app: the child and its group, when it was spawned (epoch ms and the host clock), and its
+/// output lines when asked for.
 pub struct Spawned {
     pub child: Child,
+    pub group: Group,
     pub pid: u32,
     pub epoch_ms: f64,
     pub at_ns: u64,
@@ -915,7 +891,8 @@ pub struct Spawned {
 }
 
 /// Starts `app` in `home`: strobe's environment less the profile's `unset`, then the home's, then
-/// `env`; the profile's `args`, then `args`; pinned to `cpus` when given (children inherit it).
+/// `env`; the profile's `args`, then `args`; pinned to `cpus` when given (children inherit it); in a
+/// group of its own (`host::spawn_owned`).
 pub fn spawn(app: &App, home: &Home, args: &[String], env: &[(String, String)], output: bool, cpus: Option<u64>) -> Result<Spawned> {
     installed(app)?;
     let mut cmd = Command::new(&app.exe);
@@ -932,15 +909,10 @@ pub fn spawn(app: &App, home: &Home, args: &[String], env: &[(String, String)], 
     }
     let piped = || if output { Stdio::piped() } else { Stdio::null() };
     cmd.stdin(Stdio::null()).stdout(piped()).stderr(piped());
-    let previous = cpus.and_then(host::set_affinity);
     let (epoch, at_ns) = (epoch_ms(), host::now_ns());
-    let spawned = cmd.spawn();
-    if previous.is_some() {
-        host::set_affinity(previous.unwrap_or(0));
-    }
-    let mut child = spawned.map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
+    let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, Some(&home.dir)).map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
     let output = output.then(|| lines(&mut child));
-    Ok(Spawned { pid: child.id(), child, epoch_ms: epoch, at_ns, output })
+    Ok(Spawned { pid: child.id(), child, group, epoch_ms: epoch, at_ns, output })
 }
 
 /// A JSON seed file with placeholders filled; a string that is exactly `{port}` becomes a number.
@@ -1047,18 +1019,29 @@ pub fn live(app: &App, guard: &Guard) -> Result<()> {
     Ok(())
 }
 
-/// Kills a half-started launch when the caller returns early: the tree, then the home.
+/// A launch until its target takes it (`done`): dropped before (a failed start, an early return), it
+/// ends what the launch started (`end_launch`) and releases its folder, removing it when `fresh`.
 pub struct Launching {
     pub pid: u32,
+    pub child: Option<Child>,
+    pub group: Option<Group>,
     pub home: Option<PathBuf>,
+    /// The launch made the folder: it goes with a failed launch.
+    pub fresh: bool,
+}
+
+impl Launching {
+    /// The launch started: its target owns the child, the group and the folder from here.
+    pub fn done(mut self) -> (Option<Child>, Option<Group>, Option<PathBuf>) {
+        self.pid = 0;
+        (self.child.take(), self.group.take(), self.home.take())
+    }
 }
 
 impl Drop for Launching {
     fn drop(&mut self) {
-        kill_tree(self.pid);
-        if let Some(h) = self.home.take() {
-            release_home(&h);
-            remove_home(&h);
+        if self.pid != 0 {
+            end_launch(self.pid, self.group.take(), self.child.as_mut(), self.home.take().as_deref(), self.fresh);
         }
     }
 }
@@ -1104,21 +1087,6 @@ pub fn restore_protocols(home: &Path) {
         }
     }
     let _ = home;
-}
-
-pub fn kill_tree(pid: u32) {
-    #[cfg(windows)]
-    let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    #[cfg(unix)]
-    {
-        // A command target leads its own process group: end the group, then every process of the
-        // tree, children first (a child outside the group would outlive its parent otherwise).
-        let tree = host::tree_pids(pid);
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-        for p in tree.iter().rev() {
-            unsafe { libc::kill(*p as i32, libc::SIGKILL) };
-        }
-    }
 }
 
 /// macOS keeps an app's data where no environment variable reaches: Cocoa resolves the home from the

@@ -1669,8 +1669,8 @@ prints it under each case (`screen  display on · session locked · dwm.exe 3.1%
 `query <rec> summary` beside the variant's commit (`variant_git`: commit, uncommitted changes and
 their diff hash, kept in every block recording) and whether the launch found GPU shader caches.
 
-`report --format pr` keeps every warning: at most one alert or note at the top says what changes
-how to read the result, **How was it measured?** lists each note in full, and the per-block
+`report --format pr` keeps every warning: a series' warning sits under its line, at most one caveat line
+says what changes how to read the report, How it was measured lists each note, and the per-block
 foreign CPU is in the per-pair tables.
 
 `Background` (built): per measured run, the busy time of the CPUs the target is pinned to (the OS
@@ -1793,64 +1793,67 @@ that stacks index, while recordings and `query` keep all);
 markdown is GitHub-flavoured.
 
 `--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
-pull request body, pasted verbatim. It is written for a reader who is not a performance engineer,
-in levels of detail, each answering the next question:
+pull request body, pasted verbatim. Few words, two drawers:
 
-- **Level 0, visible:** per series a headline and a caption, always the same shape. The headline says
-  what changed and by how much in everyday words, from the metric's name ("CPU time per run went
-  from 7.05 ms to 3.90 ms, **44% less**."; "Run time did not change meaningfully (103 ms to 103 ms).";
-  "Slow frame gaps (95th percentile) was not measured."). The caption says how sure strobe is or why
-  there is no answer ("Strobe is confident: head was better in 8 of 8 pairs."; "The difference is
-  within ±2%, which strobe counts as no change."; "about 50 pairs would settle it"; the refusal's
-  reason). Then at most one alert, only when it changes how to read the result (a stopped bench, an
-  A/A false positive, a mixed lock state, a case whose state grows), else at most one note on what
-  the numbers compare with (screen locked and display off; other apps busy in most blocks; other
-  experiments on the same builds). No intervals, metric names, rig or commands at this level.
-- **Level 1, drawers named as questions:** per series **Is it real?** (each pair, its order and the
-  other apps' CPU, with a Mermaid `xychart-beta` of base and head per pair, or a `gantt` of a
-  launch's milestones when they lie apart), **How big?** (every tested metric: plain name with its
-  id, base, head, change, the likely range and the verdict; frame pacing; the context metrics in
-  a nested drawer), **Where did it come from?** (the profiled launches: for a native app thread
-  wake-ups by owner, the threads that changed most and memory by what holds it; for a page
-  main-thread phases, garbage collection, the functions that moved most, the live heap and head's
-  insights). With several series, each series' three drawers sit in one drawer of its own. Then,
-  once, **How was it measured?** (bench file, builds with subjects, machine, isolation, other
-  load, method, stopping rule, time taken, every note strobe made, other experiments on the same
-  builds, the strobe that recorded it) and **How do I rerun it?** (the `strobe bench` command, the
-  full report, the profiled launches' views, the Perfetto line, kept recordings).
+- **Hero:** each decided win as a `#` heading, the biggest text GitHub draws and bigger than the
+  `##` sections an author writes above the block, in the metric's words for its better direction
+  (`# 44% less CPU time`, `# 24% fewer thread wake-ups`, `# Time until ready: 15% faster`), with a
+  `<sub>` caption (the series when there are several, medians, pairs, likely range). At most three,
+  biggest first: every series' main metric that won, then tested metrics that won in such a series,
+  each metric once. A series whose main metric did not win celebrates nothing. Beside the wins,
+  what got decidedly worse is just as big (`# But late frames rose from 0.0% to 10.3%`, a main
+  metric that got worse). Without a win, one calm heading says what happened (`# No measurable
+  change`, `# Not decided yet: needs ~50 pairs`, `# Not measured`, `# 120 fewer frames shown`).
+  When a card image is attached (`result.card.url`, from `--format card`), it leads, its alt text
+  stating the wins; the headings stay so the block reads without images, and a series badge
+  (`result.card.badges[<label>]`) stands in for that series' bold change.
+- **Visible:** one line per series whose main result no hero states, its title in sentence case (the target only when the series do
+  not share one): the main metric's paired change, bold when decided, then the medians labelled as
+  such and how sure (`CPU time per 8 s run **−44%** per pair (medians 7.05 → 3.90 ms), better in
+  8 of 8.`; `Run time unchanged, within ±2% (…)`; `no clear change in 12 pairs (…); ~50 pairs would
+  settle it`; `not measured: too few frames, 51 of 200`). A second line only for what got worse
+  (`**But** late frames rose from 0.0% to 10.3% (in 2 of 8 pairs, not tested).`: tested metrics
+  decided worse, untested metrics whose whole likely range lies past the bound on the worse side,
+  late frames up by a point or more) and a warning that changes how to read that series
+  (`**Unsteady case:**`, `**Mixed lock state:**`). Then at most one caveat line for the report
+  (stopped early, screen locked and display off, other apps busy in most blocks, other experiments
+  on the same builds).
+- **Details** (one drawer, plain `####` headings, one table per kind across series): Metrics (every
+  tested metric: before, this PR, change, likely range, verdict in a few words: the metric's word,
+  same, inconclusive, skipped), the untested ones, Pairs (each pair with its order, the longest frame
+  gap and other apps' CPU), Frame pacing, Where it came from (the profiled launches: threads and
+  memory by what holds it for a native app; main-thread phases, GC and the functions that moved for
+  a page), How it was measured (builds with subjects, machine, method, each note in plain words, the
+  strobe that recorded it and the one that formatted it).
+- **Rerun** (one drawer): the `strobe bench` command, one flag per line, the full report, the
+  Perfetto line, kept recordings.
 
-Rules: one idea per line; each drawer opens with one sentence on what it holds. Decided changes in
-the tables are coloured (`$\color{…}`, dollar-backtick math so `\%` survives) by the metric's better
-direction; at level 0 the change is bold, since math swaps the font mid-sentence. Undecided, `same`,
-not judged and context rows stay plain. Verdicts keep strobe's words where they read plainly and
-say why otherwise: `not judged (main metric undecided)`, `not confirmed (needs N pairs)`,
-`unclear (~N pairs)`, `not measured (<reason>)`. Frame-gap percentiles use one definition everywhere,
-each launch's percentile and the median across launches (`frames.interval.*`); shares of late frames
-count every gap. No alert inside a drawer, no footnotes, no emoji; commit subjects lose `(#123)`
-references, which would link to the PR's repository. Variants are named by commit (`1982f5313f`,
-`origin/x@7bf4e2d566`, `(dirty)`), the bench file by its path in its repository, never a local
-folder. The output is deterministic for a strobe build and at most 24,000 characters (UTF-16, as
-GitHub counts; its limit is 65,536): a long report sheds, in order, attribution rows past 3, context
-rows that read 0 on both sides, quiet pairs of series without a direction, the middle pairs of a
-series with more than 16, the context and attribution drawers, then per-pair tables and charts; never
-a series' sentence, its tested metrics, a refusal, the alert or the rerun command. Mermaid charts sit
-in closed drawers and draw when opened (checked in Chromium on github.com).
+Rules: "before" and "this PR", never base and head; metric names in words with one scheme per family
+(`Frame gap, p95`, `Frame latency, p99`); three significant figures and a non-breaking space
+between number and unit; decided changes bold, no colour; no charts (GitHub draws Mermaid blank
+inside a closed drawer and covers it with pan controls); no nested drawers, alerts, footnotes or
+emoji. Frame-gap percentiles use one definition everywhere, each launch's percentile and the median
+across launches (`frames.interval.*`); shares of late frames count every gap. Commit subjects lose
+`(#123)` references, which would link to the PR's repository. Variants are named by commit
+(`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), the bench file by its path in its repository, never
+a local folder. The output is deterministic for a strobe build and at most 24,000 characters (UTF-16,
+as GitHub counts; its limit is 65,536): a long report sheds, in order, attribution rows past 3, quiet
+pairs of series without a direction, the middle pairs of a series with more than 16, the untested
+metrics and attribution, then the pairs; never a series' line, its tested metrics, a refusal, the
+caveat or the rerun command.
 
 The block is delimited so a reader and a tool can tell strobe's evidence from the author's text:
 
 ```
 <!-- strobe:report exp_9b3b26 v1 begin sha256:78fbde6b6f53f8b4 -->
-<sub>Generated by <code>strobe 0.6.0+f10afc0ccd</code> from experiment <code>exp_9b3b26</code>. Do not edit by hand: strobe replaces this block.</sub>
----
+<sub>Strobe report <code>exp_9b3b26</code> · generated, do not edit by hand</sub>
 … the report …
----
-<sub>End of the strobe report for <code>exp_9b3b26</code>.</sub>
+<sub>End of strobe report <code>exp_9b3b26</code></sub>
 <!-- strobe:report exp_9b3b26 end -->
 ```
 
-The version is Cargo.toml's with the commit of the build (`build.rs`, empty outside a checkout), so a
-build from main after a release does not pass for the release; the strobe that recorded the
-experiment is named in **How was it measured?**.
+The formatting strobe's version is Cargo.toml's with the commit of the build (`build.rs`, empty
+outside a checkout), so a build from main after a release does not pass for the release.
 
 The hash is the first 16 hex digits of the SHA-256 of the content between the markers (trimmed,
 LF line ends). Authors write their summary, discovery and change outside the block; a PR may carry

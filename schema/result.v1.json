@@ -96,8 +96,9 @@
         "ClockUnsynced",
         "LiveChannel",
         "NoPhase",
-
-
+        "NoInput",
+        "NoSpan",
+        "NoCounter"
       ]
     },
     "verdictKind": {

@@ -217,7 +217,8 @@ pub fn insights(rec: &Rec) -> Result<Output> {
     // a short timer) costs power and CPU all day; the threads that wake most are named.
     let wakes = v["cpu.wakes"].as_f64().unwrap_or(0.0);
     if meta["native"] == true && meta["kind"] == "record" && wakes >= 50.0 {
-        let threads = store::read_json(&dir.join("threads.json")).ok().and_then(|t| t.as_array().cloned()).unwrap_or_default();
+        // Rows with a wake count: macOS counts wakes per process, and its thread rows carry none.
+        let threads: Vec<Value> = store::read_json(&dir.join("threads.json")).ok().and_then(|t| t.as_array().cloned()).unwrap_or_default().into_iter().filter(|t| t["wakes_per_s"].is_number()).collect();
         let line = |t: &Value| {
             let module = t["module"].as_str().map(|m| format!(" ({m})")).unwrap_or_default();
             format!("{}{module} {}", t["name"].as_str().unwrap_or("(unnamed)"), fmt::value(t["wakes_per_s"].as_f64().unwrap_or(0.0), "/s"))

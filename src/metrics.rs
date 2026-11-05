@@ -120,8 +120,9 @@ pub struct BlockData {
     /// The GPU process's outermost shader and pipeline compile slices per window key (ns), on any of its
     /// threads. Only in traces with the Dawn categories.
     pub gpu_compile: BTreeMap<String, Vec<i64>>,
-    /// The page's own `performance.measure()` spans that ended in each window: (name, ns).
-    pub spans: BTreeMap<String, Vec<(String, i64)>>,
+    /// The page's own `performance.measure()` spans inside each window: (name, start, ns). Marks are
+    /// instants on the thread's own track; a measure is an async slice, of any length (0 too).
+    pub spans: BTreeMap<String, Vec<(String, i64, i64)>>,
 }
 
 impl BlockData {
@@ -145,15 +146,28 @@ impl BlockData {
         self.spans = std::mem::take(&mut self.spans).into_iter().map(|(k, v)| (demote(&k), v)).collect();
     }
 
-    /// `span.<name>` of each run window (ms): its spans summed, 0 for a run without one. None when no
-    /// run had one: the span never fired (`NoSpan`).
+    /// `span.<name>` of each run window (ms): the time its spans covered, overlapping ones merged (two
+    /// overlapping measures of one name are one stretch of time, as nested GC slices count once), 0
+    /// for a run without one. None when no run had one: the span never fired (`NoSpan`).
     pub fn span_per_run(&self, prefix: &str, name: &str) -> Option<BTreeMap<String, f64>> {
         let runs: Vec<&Window> = self.windows.iter().filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:")).collect();
-        let sum = |w: &Window| self.spans.get(&w.key).map(|s| s.iter().filter(|(n, _)| n == name).map(|(_, d)| *d).collect::<Vec<_>>()).unwrap_or_default();
-        if runs.iter().all(|w| sum(w).is_empty()) {
+        let spans = |w: &Window| -> Vec<(i64, i64)> { self.spans.get(&w.key).map(|s| s.iter().filter(|(n, _, _)| n == name).map(|&(_, ts, d)| (ts, ts + d)).collect()).unwrap_or_default() };
+        if runs.iter().all(|w| spans(w).is_empty()) {
             return None;
         }
-        Some(runs.iter().map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), sum(w).iter().sum::<i64>() as f64 / 1e6)).collect())
+        let covered = |mut v: Vec<(i64, i64)>| -> i64 {
+            v.sort_unstable();
+            let (mut total, mut end) = (0i64, i64::MIN);
+            for (a, b) in v {
+                let a = a.max(end);
+                if b > a {
+                    total += b - a;
+                }
+                end = end.max(b);
+            }
+            total
+        };
+        Some(runs.iter().map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), covered(spans(w)) as f64 / 1e6)).collect())
     }
 
     /// GPU-process compile time of each run window (ms), 0 for a run that compiled nothing.
@@ -237,9 +251,9 @@ union all
 select 'span', w.k, s.ts, s.dur, null, s.name
   from slice s join track tr on s.track_id = tr.id
   left join thread_track tt on tt.id = s.track_id left join thread t on t.utid = tt.utid
-  join _w w on coalesce(t.upid, extract_arg(tr.dimension_arg_set_id, 'upid')) = w.upid and s.ts + s.dur > w.t0 and s.ts + s.dur <= w.t1
+  join _w w on coalesce(t.upid, extract_arg(tr.dimension_arg_set_id, 'upid')) = w.upid and s.ts >= w.t0 and s.ts + s.dur <= w.t1
   where s.category glob '*blink.user_timing*' and s.dur >= 0 and s.name not glob 'strobe:*'
-    and (s.dur > 0 or tr.name = 'performance.measure');
+    and not (s.dur = 0 and tr.type = 'thread_track_event');
 "#
     );
     let table = engine::query(trace, &sql)?;
@@ -259,7 +273,7 @@ select 'span', w.k, s.ts, s.dur, null, s.name
             "shift" => data.shifts.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))),
             "gc" => data.gc.entry(key).or_default().push(num(&row[3])),
             "gpuc" => data.gpu_compile.entry(key).or_default().push(num(&row[3])),
-            "span" => data.spans.entry(key).or_default().push((row[5].clone().unwrap_or_default(), num(&row[3]))),
+            "span" => data.spans.entry(key).or_default().push((row[5].clone().unwrap_or_default(), num(&row[2]), num(&row[3]))),
             _ => {}
         }
     }

@@ -544,7 +544,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: AMOUNT,
         min_n: 0,
-        about: "CPU energy of the target's processes per run, as the OS measures it per process (macOS on Apple silicon: the kernel's per-process energy from the CPU's energy counters); refused where no OS measures it per process (Linux, Windows, Intel Macs), never estimated from CPU time",
+        about: "energy of the CPU cores (performance and efficiency, user and kernel mode) the target's processes used per run, as the OS measures it per process (macOS on Apple silicon, from the cores' energy counters); not the GPU, Neural Engine, display or IO; refused where no OS measures it per process (Linux, Windows, Intel Macs), never estimated from CPU time",
     },
     MetricDef {
         name: "cpu.instructions",
@@ -553,7 +553,7 @@ pub const METRICS: &[MetricDef] = &[
         kind: Kind::Timed,
         words: COUNT,
         min_n: 0,
-        about: "instructions the target's processes retired per run, from the CPU's counters (macOS: user and kernel mode, always; Linux: user mode, perf events opened only for a series that declares it); tighter run to run than CPU time, which moves with frequency and caches",
+        about: "instructions the target's processes retired per run, from the CPU's counters (macOS: user and kernel mode, always; Linux: user mode, perf events in counter blocks of their own, never in a timing block); tighter run to run than CPU time, which moves with frequency and caches",
     },
     MetricDef {
         name: "cpu.idle_wakes",

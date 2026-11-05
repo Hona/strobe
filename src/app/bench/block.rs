@@ -142,7 +142,7 @@ pub(super) type Hooked<'a> = (&'a BTreeMap<String, f64>, &'a [(String, u64)]);
 /// run's counts and host-clock phase marks (`phase_ms`).
 pub(super) fn per_run_hooks(s: &Series, key: &dyn Fn(usize) -> String, runs: &[Hooked]) -> BTreeMap<String, BTreeMap<String, f64>> {
     let mut extra = BTreeMap::new();
-    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+    for m in declared_metrics(s) {
         if let Some(name) = m.strip_prefix("count.") {
             extra.insert(m.clone(), runs.iter().enumerate().map(|(j, (c, _))| (key(j), c.get(name).copied().unwrap_or(0.0))).collect());
         } else if let Some(name) = m.strip_prefix("phase.") {

@@ -510,7 +510,7 @@ impl Drop for Capture {
     }
 }
 
-// Counting (SPEC §7.4 `cpu.instructions`): no samples, no interrupts, one counter per thread.
+// Counting (SPEC §7.5 `cpu.instructions`): no samples, no interrupts, one counter per thread.
 
 use crate::probe::wakes::Uncounted;
 use std::sync::Mutex;
@@ -559,33 +559,25 @@ enum Counting {
 struct Registered {
     /// Start time (clock ticks after boot), which with the pid names the process.
     start: u64,
-    /// The ticks between which its own events opened: a child started after `opened.1` inherited
-    /// them, one started before `opened.0` did not.
-    opened: (u64, u64),
+    /// The processes (pid, start) alive before the call that registered it opened its groups, and
+    /// once they had. For a process with its own events: a child in the first did not inherit
+    /// them, one in neither did, and one only in the second started while they opened, so nobody
+    /// can tell.
+    before: Arc<HashSet<(u32, u64)>>,
+    after: Arc<HashSet<(u32, u64)>>,
     counting: Counting,
 }
 
-/// Every process strobe counts, by pid: snapshots of one process set share its groups, so a thread
-/// is never counted twice and a group keeps counting between runs.
-static GROUPS: Mutex<Option<HashMap<u32, Registered>>> = Mutex::new(None);
+/// The perf events of one block or recording (SPEC §7.5): every process it counts, by pid, so the
+/// snapshots of its runs share one group per process (never a thread twice) and a group keeps
+/// counting between runs. Dropped with the block: every event it opened closes once no snapshot
+/// holds its group, and nothing stays open on a target after strobe is done with it.
+#[derive(Default)]
+pub struct Groups(Mutex<HashMap<u32, Registered>>);
 
-/// (ppid, start ticks, comm) of a live process.
-fn proc_stat(pid: u32) -> Option<(u32, u64, String)> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    let (open, close) = (text.find('(')?, text.rfind(')')?);
-    let f: Vec<&str> = text[close + 1..].split_whitespace().collect();
-    if matches!(f.first(), Some(&"Z" | &"X" | &"x")) {
-        return None;
-    }
-    Some((f.get(1)?.parse().ok()?, f.get(19)?.parse().ok()?, text[open + 1..close].to_string()))
-}
-
-/// Now, in the clock ticks of `/proc/<pid>/stat`'s start time (boot time).
-fn boot_ticks() -> u64 {
-    let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
-    unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) };
-    let hz = (unsafe { libc::sysconf(libc::_SC_CLK_TCK) }).max(1) as u64;
-    (ts.tv_sec as u64 * 1_000_000_000 + ts.tv_nsec as u64) / (1_000_000_000 / hz)
+/// Every live process now, as (pid, start).
+fn alive() -> HashSet<(u32, u64)> {
+    crate::host::linux::process_list().into_iter().map(|(pid, _, start)| (pid, start)).collect()
 }
 
 /// A counting event on one thread: PERF_TYPE_HARDWARE, PERF_COUNT_HW_INSTRUCTIONS, read with the
@@ -610,88 +602,121 @@ fn raise_fd_limit() {
     });
 }
 
-/// Opens a group on every thread of `pid`. Err when the machine has no hardware counter at all; a
-/// process strobe may not count is `Ok(Failed)`.
+fn tids(pid: u32) -> HashSet<u32> {
+    std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect()
+}
+
+/// Opens a group on every thread of `pid`. A thread that started while they opened may have
+/// inherited an event already (from a thread opened before it) or not: the threads are listed
+/// before and after, and the group opens again (at most 3 times) until none started meanwhile.
+/// Err when the machine has no hardware counter at all; a process strobe may not count is
+/// `Ok(Failed)`.
 fn open_group(pid: u32, name: &str) -> std::result::Result<Counting, Uncounted> {
     raise_fd_limit();
-    let mut fds = Vec::new();
-    let fail = |fds: &[i32], u: Uncounted| {
+    let close = |fds: &[i32]| {
         for &fd in fds {
             unsafe { libc::close(fd) };
         }
-        u
     };
-    for e in std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten() {
-        let Some(tid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
-        match open_counter(tid) {
-            Ok(fd) => fds.push(fd),
-            Err(e) => match e.raw_os_error() {
-                Some(libc::ESRCH) => {}
-                Some(libc::ENOENT | libc::EOPNOTSUPP | libc::ENODEV) => {
-                    return Err(fail(&fds, Uncounted::NoSource(format!("this CPU gives the OS no hardware instruction counter ({e}): a virtual machine without a virtual PMU counts none"))));
-                }
-                Some(libc::EACCES | libc::EPERM) => {
-                    let why = format!("process {pid} ({name}) refuses perf events: it is not dumpable (a sandboxed process) or runs as another user");
-                    return Ok(Counting::Failed(fail(&fds, Uncounted::Denied { why, fix: "count a process strobe may trace (your user's, dumpable), or give strobe CAP_PERFMON".into() })));
-                }
-                _ => return Ok(Counting::Failed(fail(&fds, Uncounted::Denied { why: format!("perf_event_open on process {pid} ({name}): {e}"), fix: "raise the open file limit (ulimit -n)".into() }))),
-            },
+    for _ in 0..3 {
+        let listed = tids(pid);
+        let mut fds = Vec::new();
+        for &tid in &listed {
+            match open_counter(tid) {
+                Ok(fd) => fds.push(fd),
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::ESRCH) => {}
+                    Some(libc::ENOENT | libc::EOPNOTSUPP | libc::ENODEV) => {
+                        close(&fds);
+                        return Err(Uncounted::NoSource(format!("this CPU gives the OS no hardware instruction counter ({e}): a virtual machine without a virtual PMU counts none")));
+                    }
+                    Some(libc::EACCES | libc::EPERM) => {
+                        close(&fds);
+                        let why = format!("process {pid} ({name}) refuses perf events: it is not dumpable (a sandboxed process) or runs as another user");
+                        return Ok(Counting::Failed(Uncounted::Denied { why, fix: "count a process strobe may trace (your user's, dumpable), or give strobe CAP_PERFMON".into() }));
+                    }
+                    _ => {
+                        close(&fds);
+                        return Ok(Counting::Failed(Uncounted::Denied { why: format!("perf_event_open on process {pid} ({name}): {e}"), fix: "raise the open file limit (ulimit -n)".into() }));
+                    }
+                },
+            }
         }
+        if tids(pid).is_subset(&listed) {
+            return Ok(Counting::Own(Arc::new(Group { pid, name: name.to_string(), fds })));
+        }
+        close(&fds);
     }
-    Ok(Counting::Own(Arc::new(Group { pid, name: name.to_string(), fds })))
+    Ok(Counting::Failed(Uncounted::Partial(format!("process {pid} ({name}) kept starting threads while strobe opened its counters: some might count twice or not at all"))))
 }
 
-/// The groups that count `pids`, each once, opening what is new: a process started by a counted
-/// thread after its events opened counts in that group, any other gets its own. Err when one of
-/// them cannot be counted, with why.
-pub fn groups(pids: &[u32]) -> std::result::Result<Vec<Arc<Group>>, Uncounted> {
-    if !access().0 {
-        return Err(Uncounted::Denied {
-            why: "perf events for your processes are off (kernel.perf_event_paranoid is above 2)".into(),
-            fix: "sudo sysctl kernel.perf_event_paranoid=2 (Debian and Ubuntu ship 3), or give strobe CAP_PERFMON once: sudo setcap cap_perfmon+ep $(command -v strobe)".into(),
-        });
-    }
-    let mut lock = GROUPS.lock().unwrap_or_else(|e| e.into_inner());
-    let reg = lock.get_or_insert_with(HashMap::new);
-    reg.retain(|pid, r| proc_stat(*pid).is_some_and(|(_, start, _)| start == r.start));
-    let mut live: Vec<(u32, u32, u64, String)> = pids.iter().filter_map(|&p| proc_stat(p).map(|(pp, start, name)| (p, pp, start, name))).collect();
-    // Parents first: whether a child inherited depends on its parent's registration.
-    live.sort_by_key(|p| p.2);
-    let mut out: Vec<Arc<Group>> = Vec::new();
-    for (pid, ppid, start, name) in live {
-        if reg.get(&pid).is_none_or(|r| r.start != start) {
-            let parent = reg.get(&ppid).filter(|r| proc_stat(ppid).is_some_and(|(_, s, _)| s == r.start));
-            let inherited = |counting| Registered { start, opened: (0, 0), counting };
-            let r = match parent.map(|r| (&r.counting, r.opened)) {
-                Some((Counting::In(g), _)) => inherited(Counting::In(g.clone())),
-                Some((Counting::Own(g), (_, end))) if start > end => inherited(Counting::In(g.clone())),
-                Some((Counting::Own(_), (begin, _))) if start >= begin => inherited(Counting::Failed(Uncounted::Partial(format!(
-                    "process {pid} ({name}) started while strobe opened its parent's counters: strobe cannot tell whether they count it"
-                )))),
-                // Its parent's counters may count it, or may not: neither can be told apart.
-                Some((Counting::Failed(u), _)) => inherited(Counting::Failed(u.clone())),
-                _ => {
-                    let begin = boot_ticks();
-                    let counting = open_group(pid, &name)?;
-                    Registered { start, opened: (begin, boot_ticks()), counting }
+impl Groups {
+    /// The groups that count `pids`, each once, opening what is new. The first call gives every
+    /// process its own group. Later, a new process counts in its parent's group when it started
+    /// after that group opened; one whose parent is not counted (reparented to an init, or started
+    /// outside the counted processes) may already count in a group strobe holds, or in none: it
+    /// refuses. Err when one of them cannot be counted, with why.
+    pub fn read(&self, pids: &[u32]) -> std::result::Result<Vec<Arc<Group>>, Uncounted> {
+        if !access().0 {
+            return Err(Uncounted::Denied {
+                why: "perf events for your processes are off (kernel.perf_event_paranoid is above 2)".into(),
+                fix: "sudo sysctl kernel.perf_event_paranoid=2 (Debian and Ubuntu ship 3), or give strobe CAP_PERFMON once: sudo setcap cap_perfmon+ep $(command -v strobe)".into(),
+            });
+        }
+        let mut reg = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        let first = reg.is_empty();
+        let stat = crate::host::linux::parent_start_name;
+        reg.retain(|pid, r| stat(*pid).is_some_and(|(_, start, _)| start == r.start));
+        let mut live: Vec<(u32, u32, u64, String)> = pids.iter().filter_map(|&p| stat(p).map(|(pp, start, name)| (p, pp, start, name))).collect();
+        // Parents first: whether a child inherited depends on its parent's registration.
+        live.sort_by_key(|p| p.2);
+        let fresh: Vec<(u32, u32, u64, String)> = live.iter().filter(|(pid, _, start, _)| reg.get(pid).is_none_or(|r| r.start != *start)).cloned().collect();
+        if !fresh.is_empty() {
+            let before = Arc::new(alive());
+            let mut opened: Vec<u32> = Vec::new();
+            for (pid, ppid, start, name) in fresh {
+                let parent = reg.get(&ppid).filter(|r| stat(ppid).is_some_and(|(_, s, _)| s == r.start));
+                let counting = match parent.map(|r| (&r.counting, &r.before, &r.after)) {
+                    Some((Counting::In(g), _, _)) => Counting::In(g.clone()),
+                    Some((Counting::Own(g), b, a)) if !b.contains(&(pid, start)) && !a.contains(&(pid, start)) => Counting::In(g.clone()),
+                    Some((Counting::Own(_), b, _)) if !b.contains(&(pid, start)) => {
+                        Counting::Failed(Uncounted::Partial(format!("process {pid} ({name}) started while strobe opened its parent's counters: strobe cannot tell whether they count it")))
+                    }
+                    // Its parent's counters may count it, or may not.
+                    Some((Counting::Failed(u), _, _)) => Counting::Failed(u.clone()),
+                    // Started before its parent's group opened, or the first look: a group of its own.
+                    Some((Counting::Own(_), _, _)) => open_group(pid, &name)?,
+                    None if first => open_group(pid, &name)?,
+                    None => Counting::Failed(Uncounted::Partial(format!(
+                        "process {pid} ({name}) joined the target's processes from outside the counted ones (its parent {ppid} is not counted): it may count in a group strobe holds, or in none"
+                    ))),
+                };
+                if matches!(counting, Counting::Own(_)) {
+                    opened.push(pid);
                 }
+                reg.insert(pid, Registered { start, before: before.clone(), after: before.clone(), counting });
+            }
+            if !opened.is_empty() {
+                let after = Arc::new(alive());
+                for pid in opened {
+                    if let Some(r) = reg.get_mut(&pid) {
+                        r.after = after.clone();
+                    }
+                }
+            }
+        }
+        let mut out: Vec<Arc<Group>> = Vec::new();
+        for (pid, ..) in &live {
+            let g = match reg.get(pid).map(|r| &r.counting) {
+                Some(Counting::Own(g) | Counting::In(g)) => g,
+                Some(Counting::Failed(u)) => return Err(u.clone()),
+                None => continue,
             };
-            reg.insert(pid, r);
+            if !out.iter().any(|o| Arc::ptr_eq(o, g)) {
+                out.push(g.clone());
+            }
         }
-        add_group(reg, pid, &mut out)?;
+        Ok(out)
     }
-    Ok(out)
 }
 
-/// Adds `pid`'s group to `out` once, or fails with why it is not counted.
-fn add_group(reg: &HashMap<u32, Registered>, pid: u32, out: &mut Vec<Arc<Group>>) -> std::result::Result<(), Uncounted> {
-    let g = match reg.get(&pid).map(|r| &r.counting) {
-        Some(Counting::Own(g) | Counting::In(g)) => g,
-        Some(Counting::Failed(u)) => return Err(u.clone()),
-        None => return Ok(()),
-    };
-    if !out.iter().any(|o| Arc::ptr_eq(o, g)) {
-        out.push(g.clone());
-    }
-    Ok(())
-}

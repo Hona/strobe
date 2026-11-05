@@ -218,11 +218,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         let mut cost = SelfCost::new(ctx.runner.pid());
         // Steady once two runs cost the same CPU (SPEC §9.2).
         let mut warmup = super::block::Warmup::new(x);
-        let perf = probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
+        let perf = x.counters.then(probe::wakes::Perf::new);
         while warmup.more(runs.len()) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
             hooks.begin(&format!("run:{}", runs.len()));
-            let k0 = probe::wakes::Counters::take(&host::tree_pids(pid), perf);
+            let listed = probe::wakes::wall_us();
+            let k0 = probe::wakes::Counters::take(listed, &host::tree_pids(pid), perf.as_ref());
             let c0 = cpu(pid);
             cost.start();
             let t0 = Instant::now();
@@ -230,7 +231,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             let wall = t0.elapsed().as_secs_f64() * 1e3;
             cost.end();
             let used = cpu_ms(c0, cpu(pid), wall);
-            let counted = probe::wakes::counted(&k0, &probe::wakes::Counters::take(&host::tree_pids(pid), perf));
+            let counted = probe::wakes::counted(&k0, &probe::wakes::Counters::take(probe::wakes::wall_us(), &host::tree_pids(pid), perf.as_ref()));
             hooks.end();
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
             runs.push((wall, used, hooks.counts(), retained, hooks.take_marks(), counted));
@@ -254,7 +255,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.2, r.4.as_slice())).collect();
         extra.extend(super::block::per_run_hooks(s, &key, &hooked));
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.5)).collect();
-        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
         let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
         if warmup.unsteady() {

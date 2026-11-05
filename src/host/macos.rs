@@ -317,7 +317,11 @@ struct RusageV6 {
 
 const RUSAGE_INFO_V6: i32 = 6;
 
-/// What the kernel counts for a process from its start, beyond time (SPEC §7.4): instructions
+// `ri_energy_nj`'s offset in the SDK's `struct rusage_info_v6` (macOS 26 SDK: 16-byte uuid, 40
+// u64 fields before it).
+const _: () = assert!(std::mem::offset_of!(RusageV6, ri_energy_nj) == 336);
+
+/// What the kernel counts for a process from its start, beyond time (SPEC §7.5): instructions
 /// retired (user and kernel mode), CPU energy in nJ (Apple silicon's per-core energy counters,
 /// charged at every context switch; 0 on a Mac without them), and package idle wakeups.
 #[derive(Clone, Debug)]

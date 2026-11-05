@@ -124,11 +124,16 @@ mod imp {
 
     impl Reserve {
         pub fn start(cpus: u64) -> Result<Reserve, String> {
-            let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
-            if logical > 64 {
-                return Err(format!("this machine has {logical} CPUs; strobe's masks cover the first 64, so it would not put the rest back"));
+            // As root every process is "this user's": strobe would narrow system daemons too.
+            if unsafe { libc::geteuid() } == 0 {
+                return Err("strobe runs as root, where every system daemon is this user's process: it moves nothing (run benches as a normal user)".into());
             }
-            let all = (0..logical).fold(0u64, |m, c| m | 1 << c);
+            let online = std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
+            let highest = online.trim().split([',', '-']).filter_map(|c| c.parse::<u32>().ok()).max().unwrap_or(0);
+            if highest >= 64 {
+                return Err(format!("this machine has CPUs numbered up to {highest}; strobe's masks cover the first 64, so it would not put the rest back"));
+            }
+            let all = os::cpu_list(&online);
             if all & !cpus == 0 {
                 return Err("no CPU outside the target's to move other processes to".into());
             }
@@ -167,6 +172,11 @@ mod imp {
     fn plan(pid: u32, start: u64, cpus: u64, inherit: &[(u64, u64)]) -> Option<Moved> {
         let mut m = Moved { pid, start, threads: Vec::new(), main: (0, 0) };
         for tid in os::tids(pid) {
+            // A realtime thread (an audio callback, a compositor's) keeps its CPUs: moving it could
+            // cost the user a glitch, and it rarely competes with a benchmark.
+            if matches!(unsafe { libc::sched_getscheduler(tid as libc::pid_t) }, libc::SCHED_FIFO | libc::SCHED_RR | 6) {
+                continue;
+            }
             let Some(mask) = os::affinity_of(tid as libc::pid_t) else { continue };
             let change = match inherit.iter().find(|i| i.1 == mask) {
                 Some(&i) => i,
@@ -196,8 +206,41 @@ mod imp {
         if m.threads.is_empty() { Err(why) } else { Ok(m) }
     }
 
-    fn write_journal(moved: &[Moved]) {
-        let _ = std::fs::write(journal(), serde_json::json!({ "pid": std::process::id(), "linux": moved }).to_string());
+    /// What `restore_stale` needs: strobe's pid with its start (a reused pid is another process), when
+    /// the block began (boot ticks), and what it moved; written whole or not at all.
+    fn write_journal(since: u64, moved: &[Moved]) {
+        let own = std::process::id();
+        let body = serde_json::json!({ "pid": own, "start": os::start_time(own), "since": since, "linux": moved }).to_string();
+        let _ = crate::host::paths::write_atomic(&journal(), body.as_bytes());
+    }
+
+    /// Processes started since `since` (boot ticks) that strobe never swept (started in the block's
+    /// last 200 ms, or reparented away from a moved parent before a sweep saw them): a thread with
+    /// one of the narrowed masks it inherited gets the mask that thread came from. Returns how many
+    /// processes it put back.
+    fn strays(since: u64, moved: &[Moved]) -> u32 {
+        let mut back: HashMap<u64, u64> = HashMap::new();
+        for m in moved {
+            for &(_, original, set) in m.threads.iter().chain(std::iter::once(&(0, m.main.0, m.main.1))).filter(|t| t.2 != 0) {
+                back.entry(set).or_insert(original);
+            }
+        }
+        let known: HashSet<(u32, u64)> = moved.iter().map(|m| (m.pid, m.start)).collect();
+        let mut n = 0;
+        for pid in os::all_pids() {
+            let Some((_, start, _)) = os::parent_start_name(pid) else { continue };
+            if start < since || known.contains(&(pid, start)) || !os::same_user(pid) {
+                continue;
+            }
+            let mut any = false;
+            for tid in os::tids(pid) {
+                if let Some(original) = os::affinity_of(tid as libc::pid_t).and_then(|now| back.get(&now)) {
+                    any |= os::set_affinity_of(tid as libc::pid_t, *original);
+                }
+            }
+            n += u32::from(any);
+        }
+        n
     }
 
     /// Puts a process's threads back where they still have strobe's mask: their own, else (started
@@ -232,6 +275,7 @@ mod imp {
         let mut tree: HashSet<u32> = HashSet::from([own]);
         let mut moved: Vec<Moved> = Vec::new();
         let mut first = true;
+        let since = os::boot_ticks();
         loop {
             let mut fresh: Vec<(u32, u32, u64, String)> = os::all_pids().into_iter().filter(|p| seen.insert(*p)).filter_map(|p| os::parent_start_name(p).map(|(pp, s, n)| (p, pp, s, n))).collect();
             if !fresh.is_empty() {
@@ -254,7 +298,7 @@ mod imp {
                 }
                 if !batch.is_empty() {
                     // Journal first: a strobe killed while it changes them still has them put back.
-                    write_journal(&moved.iter().cloned().chain(batch.iter().map(|b| b.0.clone())).collect::<Vec<_>>());
+                    write_journal(since, &moved.iter().cloned().chain(batch.iter().map(|b| b.0.clone())).collect::<Vec<_>>());
                     for (m, name) in batch {
                         match apply(m) {
                             Ok(m) => {
@@ -289,7 +333,7 @@ mod imp {
         }
         let (c1, t1) = (crate::host::thread_cycles(), crate::host::now_ns());
         report.overhead_pct = if t1 > t0 { 100.0 * c1.saturating_sub(c0) as f64 / (t1 - t0) as f64 } else { 0.0 };
-        report.restored = moved.iter().filter(|m| restore(m)).count() as u32;
+        report.restored = moved.iter().filter(|m| restore(m)).count() as u32 + strays(since, &moved);
         let _ = std::fs::remove_file(journal());
         report.wall_ms = started.elapsed().as_secs_f64() * 1e3;
         report
@@ -298,13 +342,15 @@ mod imp {
     pub fn restore_stale() {
         let Some(v) = std::fs::read_to_string(journal()).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()) else { return };
         let pid = v["pid"].as_u64().unwrap_or(0) as u32;
-        // Still in force: that strobe runs and puts them back itself.
-        if pid == std::process::id() || crate::host::exe_of(pid).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n.starts_with("strobe")) {
+        // Still in force: that strobe (the same pid and start) runs and puts them back itself.
+        if pid == std::process::id() || (os::start_time(pid).is_some() && os::start_time(pid) == v["start"].as_u64()) {
             return;
         }
-        for m in serde_json::from_value::<Vec<Moved>>(v["linux"].clone()).unwrap_or_default() {
-            restore(&m);
+        let moved = serde_json::from_value::<Vec<Moved>>(v["linux"].clone()).unwrap_or_default();
+        for m in &moved {
+            restore(m);
         }
+        strays(v["since"].as_u64().unwrap_or(u64::MAX), &moved);
         let _ = std::fs::remove_file(journal());
     }
 }

@@ -1476,6 +1476,9 @@ const LABELS = {
   "gpu.vram": "GPU VRAM",
   "gpu.process.3d": "GPU 3D engine",
   "dom.nodes": "DOM nodes",
+  "energy.cpu": "CPU energy per run",
+  "cpu.instructions": "Instructions per run",
+  "cpu.idle_wakes": "Idle wake-ups",
 };
 
 const labelOf = (m) => LABELS[m] || m;
@@ -1483,6 +1486,9 @@ const labelOf = (m) => LABELS[m] || m;
 function unitOf(name) {
   const cat = CATALOG.get(name)?.unit;
   if (cat) return cat;
+  // Families resolve by their base, as model::metric does.
+  if (/^(span|phase|launch)\../.test(name)) return "ms";
+  if (/^count\../.test(name)) return "count";
   if (name === "display.hz") return "Hz";
   if (name === "run.duration" || name === "main.work" || name === "main.script" || name === "main.layout" || name === "main.style") return "ms";
   if (/^(frames|interaction|scroll)\./.test(name) && /\.(p50|p90|p95|p99|max)$/.test(name)) return "ms";
@@ -1507,6 +1513,14 @@ function fmtVal(v, u) {
   if (u === "count/min") return (Math.abs(v) >= 10 ? Math.round(v).toLocaleString("en-US") : v.toFixed(1)) + " /min";
   if (u === "Hz") return v.toFixed(0) + " Hz";
   if (u === "count") return Math.abs(v - Math.round(v)) < 1e-9 ? String(Math.round(v)) : v.toFixed(1);
+  if (u === "instructions") {
+    const a = Math.abs(v);
+    if (a >= 1e9) return (v / 1e9).toFixed(2) + " G instr";
+    if (a >= 1e7) return (v / 1e6).toFixed(1) + " M instr";
+    if (a >= 1e6) return (v / 1e6).toFixed(2) + " M instr";
+    if (a >= 1e3) return (v / 1e3).toFixed(0) + " k instr";
+    return v.toFixed(0) + " instr";
+  }
   return v.toFixed(d) + (u ? " " + u : "");
 }
 

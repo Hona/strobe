@@ -233,7 +233,7 @@ fn runs(
     // in attribution blocks, through the helper.
     let presents: RefCell<Option<PresentCapture>> = RefCell::new(None);
     let mut presents_err: Option<String> = None;
-    if !windowless && set != Set::Attribution && set != Set::Memory {
+    if !windowless && set != Set::Attribution && set != Set::Memory && !x.counters {
         match PresentCapture::start() {
             Ok(mut c) => {
                 c.track(&n.pids());
@@ -311,7 +311,7 @@ fn runs(
     // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
     // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
     let mut warmup = super::block::Warmup::new(x);
-    let perf = wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
+    let perf = x.counters.then(wakes::Perf::new);
     let leak = set == Set::Memory;
     let mut readings: Vec<memory::Reading> = Vec::new();
     while warmup.more(runs.len()) {
@@ -322,13 +322,14 @@ fn runs(
         }
         // One read of the app's processes per end of a run: what the session follows, what the
         // snapshot covers, and (at the end) the cycles.
+        let listed = wakes::wall_us();
         let pids = n.pids();
         if let Some(se) = drive.session.get() {
             se.set_pids(&pids);
             se.take_log();
         }
         hooks.begin(&format!("run:{i}"));
-        let snap0 = Snapshot::take_with(&pids, perf);
+        let snap0 = Snapshot::take_since(listed, &pids, perf.as_ref());
         let c0 = cycles(n);
         cost.start();
         let t0 = host::now_ns();
@@ -339,7 +340,7 @@ fn runs(
         cost.end();
         let procs1 = n.processes();
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
-        let snap1 = Snapshot::take_with(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
+        let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
         hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
@@ -479,7 +480,7 @@ fn runs(
         extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
     }
     let counted: Vec<(String, &wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.span.counted)).collect();
-    let (counts, mut refused) = wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+    let (counts, mut refused) = wakes::counter_metrics(&counted, declared_metrics(s));
     extra.extend(counts);
     // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
     let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
@@ -641,7 +642,7 @@ fn runs(
         values.remove(m);
     }
     if let Some(why) = refused.get(&s.primary) {
-        return Err(Refusal { summary: format!("{}: {}", s.primary, why.summary), ..why.clone() }.fix("pick a primary this target can measure").into());
+        return Err(Refusal { summary: format!("{}: {}", s.primary, why.summary), fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into());
     }
     if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
         ctx.warnings.push(validity::warn(

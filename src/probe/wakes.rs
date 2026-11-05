@@ -1,7 +1,7 @@
 //! Thread wakes and IO of a process tree (SPEC §13.6): two system snapshots around a run give each
 //! thread's context switches (each one the thread being switched in to run: a wake), its CPU cycles,
 //! and each process's IO bytes. Nothing is opened per sample except the threads, for their cycles.
-//! Beside them, what the OS counts per process beyond time (SPEC §7.4 `energy.cpu`,
+//! Beside them, what the OS counts per process beyond time (SPEC §7.5 `energy.cpu`,
 //! `cpu.instructions`, `cpu.idle_wakes`), or why it cannot.
 
 use crate::host;
@@ -24,11 +24,13 @@ pub struct Snapshot {
 impl Snapshot {
     /// The threads and IO of `pids` now.
     pub fn take(pids: &[u32]) -> Snapshot {
-        Snapshot::take_with(pids, false)
+        Snapshot::take_since(wall_us(), pids, None)
     }
 
-    /// The same, with the counters: `perf` opens Linux's perf events (`wants_perf`).
-    pub fn take_with(pids: &[u32], perf: bool) -> Snapshot {
+    /// The same, with the counters of `pids`, which were listed at `listed_us` (`wall_us`, read before
+    /// listing them: a process started after it was not listed and counts from its start); `perf`
+    /// counts instructions on Linux.
+    pub fn take_since(listed_us: u64, pids: &[u32], perf: Option<&Perf>) -> Snapshot {
         let mut sorted = pids.to_vec();
         sorted.sort_unstable();
         sorted.dedup();
@@ -38,7 +40,7 @@ impl Snapshot {
             tsc: host::tsc(),
             threads: threads.into_iter().map(|t| ((t.pid, t.tid), (t.switches, host::thread_cycles_of(t.tid)))).collect(),
             io: io.into_iter().map(|(p, r, w)| (p, (r, w))).collect(),
-            counters: Counters::take(&sorted, perf),
+            counters: Counters::take(listed_us, &sorted, perf),
         }
     }
 
@@ -299,7 +301,7 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeM
     rows
 }
 
-/// The counter metrics (SPEC §7.4), in `Counted::counts` order: instructions per run, CPU energy per
+/// The counter metrics (SPEC §7.5), in `Counted::counts` order: instructions per run, CPU energy per
 /// run (mJ), package idle wakeups per second.
 pub const COUNTER_METRICS: [&str; 3] = ["cpu.instructions", "energy.cpu", "cpu.idle_wakes"];
 
@@ -313,7 +315,7 @@ pub enum Uncounted {
     /// Part of the run went uncounted: a process that joined or left the set during it, counters
     /// the CPU shared with another user of them.
     Partial(String),
-    /// Not opened: Linux opens perf events only for a series that declares `cpu.instructions`.
+    /// Not opened: Linux opens perf events only in counter blocks (SPEC §7.5).
     NotOpened,
 }
 
@@ -323,10 +325,10 @@ impl Uncounted {
     fn refusal(&self) -> Refusal {
         let r = |why: &str| Refusal::new(ValidatorId::NoCounter, why);
         match self {
-            Uncounted::NoSource(why) => r(why).fix("compare it on an OS that counts it per process (SPEC §7.4), or pick cpu.work"),
+            Uncounted::NoSource(why) => r(why).fix("compare it on an OS that counts it per process (SPEC §7.5), or pick cpu.work"),
             Uncounted::Denied { why, fix } => r(why).fix(fix.clone()),
             Uncounted::Partial(why) => r(why).fix("keep the set of the app's processes the same through a run (warm up what it starts)"),
-            Uncounted::NotOpened => r("not counted: declare it in the series' metrics").fix("add it to the case's metrics"),
+            Uncounted::NotOpened => r("not counted in this block: Linux counts instructions in counter blocks").fix("declare it in a bench case"),
         }
     }
 }
@@ -372,11 +374,31 @@ impl Default for Counted {
 #[cfg(windows)]
 const WINDOWS_NONE: &str = "Windows counts no instructions, CPU energy or package idle wakeups per process that a user's process can read: the kernel trace's PMC counters on context switches would give instructions (strobe does not collect them yet), and its energy figures (E3) are a model's estimates, not measurements";
 
+/// Now on the wall clock (µs since the epoch), as macOS dates a process's start: read it before
+/// listing the processes a snapshot counts (`Snapshot::take_since`, `Counters::take`).
+pub fn wall_us() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64)
+}
+
+/// The perf events of one block or recording (Linux, SPEC §7.5), closed when it is dropped. Only a
+/// counter block holds one: timing blocks never open them. Elsewhere nothing to hold.
+#[derive(Default)]
+pub struct Perf {
+    #[cfg(target_os = "linux")]
+    groups: super::perf::Groups,
+}
+
+impl Perf {
+    pub fn new() -> Perf {
+        Perf::default()
+    }
+}
+
 impl Counters {
-    /// The counts of `pids` now. `perf` opens Linux's per-thread perf events (`wants_perf`).
-    pub fn take(pids: &[u32], perf: bool) -> Counters {
-        let wall_us = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_micros() as u64);
-        let mut c = Counters { at_ns: host::now_ns(), wall_us, ..Counters::default() };
+    /// The counts of `pids` now, listed at `listed_us` (`wall_us`). `perf` counts instructions on
+    /// Linux; without it they are not opened.
+    pub fn take(listed_us: u64, pids: &[u32], perf: Option<&Perf>) -> Counters {
+        let mut c = Counters { at_ns: host::now_ns(), wall_us: listed_us, ..Counters::default() };
         #[cfg(windows)]
         {
             let _ = (pids, perf);
@@ -413,10 +435,8 @@ impl Counters {
                 "Linux gives no per-process CPU energy: RAPL counts a whole package (every process on it, and strobe), so no share of it is the app's, and strobe never estimates one from CPU time".into(),
             ));
             c.missing[2] = Some(Uncounted::NoSource("Linux counts no package idle wakeups per process".into()));
-            if !perf {
-                c.missing[0] = Some(Uncounted::NotOpened);
-            } else {
-                match super::perf::groups(pids) {
+            if let Some(perf) = perf {
+                match perf.groups.read(pids) {
                     Ok(groups) => {
                         for g in groups {
                             match g.read() {
@@ -429,6 +449,8 @@ impl Counters {
                     }
                     Err(u) => c.missing[0] = Some(u),
                 }
+            } else {
+                c.missing[0] = Some(Uncounted::NotOpened);
             }
         }
         c
@@ -478,9 +500,9 @@ pub fn counted(a: &Counters, b: &Counters) -> Counted {
     }
 }
 
-/// Whether a series' metrics need Linux's perf events: they cost the target a little at each of its
-/// context switches, so only a series that declares `cpu.instructions` opens them (macOS counts
-/// always, at no cost to the target).
+/// Whether a series' declared metrics (its no-worse ones included) need Linux's perf events: they
+/// cost the target at each of its context switches, so they open only in counter blocks of a series
+/// that declares `cpu.instructions` (macOS counts always, at no cost to the target).
 pub fn wants_perf<'a>(metrics: impl IntoIterator<Item = &'a String>) -> bool {
     metrics.into_iter().any(|m| m == "cpu.instructions")
 }
@@ -514,6 +536,8 @@ pub fn counter_metrics<'a>(runs: &[(String, &Counted)], declared: impl IntoItera
     }
     for (i, metric) in COUNTER_METRICS.iter().enumerate() {
         match runs.iter().find_map(|(_, c)| c.counts[i].as_ref().err()) {
+            // A timing block on Linux: the series' counter blocks count it.
+            Some(Uncounted::NotOpened) => {}
             Some(u) => {
                 if declared.iter().any(|m| m == metric) {
                     refused.insert(metric.to_string(), u.refusal());

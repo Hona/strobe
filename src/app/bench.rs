@@ -404,21 +404,86 @@ struct Exec {
     keep: bool,
     /// `--pixels`: the folder its `page.snapshot()`s go to.
     pixels: Option<PathBuf>,
+    /// A counter block (Linux, SPEC §7.5): perf events open on the target's threads, no trace or
+    /// present capture, and its time metrics dropped: the events slow every context switch.
+    counters: bool,
 }
 
 impl Exec {
     fn timed(set: Set, runs: usize, keep: bool) -> Exec {
-        Exec { set, runs, untimed: false, keep, pixels: None }
+        Exec { set, runs, untimed: false, keep, pixels: None, counters: false }
     }
 
     fn untimed(keep: bool, pixels: Option<PathBuf>) -> Exec {
-        Exec { set: Set::Lean, runs: 1, untimed: true, keep, pixels }
+        Exec { set: Set::Lean, runs: 1, untimed: true, keep, pixels, counters: false }
+    }
+
+    /// This block as a counter block, or as it is.
+    fn counting(self, counters: bool) -> Exec {
+        Exec { counters, ..self }
     }
 
     /// A timing block whose numbers become a verdict: what `--reserve-cpus auto` reserves for.
     fn measures_time(&self) -> bool {
         !self.untimed && matches!(self.set, Set::Lean | Set::Timing)
     }
+}
+
+/// Where a series' counter metrics come from (SPEC §7.5). Timing blocks never open Linux's perf
+/// events; a series that declares `cpu.instructions` there gets counter blocks of its own.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Counting {
+    /// No perf events: macOS and Windows (rusage is free; Windows refuses), or no `cpu.instructions`.
+    InTiming,
+    /// Only counter metrics (and untimed ones) declared: every block is a counter block.
+    Only,
+    /// Counter and time metrics declared: timing blocks stay clean and a counter pass follows (or,
+    /// with `cpu.instructions` the primary, comes first and a timing pass follows).
+    Separate,
+}
+
+/// The series' declared metrics: its primary, its metrics and those it gives a no-worse margin.
+fn declared_metrics(s: &Series) -> Vec<&String> {
+    let mut out: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
+    for m in s.noworse.keys() {
+        if !out.contains(&m) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+/// A metric that perf events disturb: wall and CPU time, CPU shares, frames and input latency.
+fn time_metric(m: &str) -> bool {
+    !probe::wakes::COUNTER_METRICS.contains(&m)
+        && !m.starts_with("cpu.foreign")
+        && (model::metric(m).is_some_and(|d| d.unit == "ms" || d.unit == "%") || ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)))
+}
+
+fn counting(s: &Series) -> Counting {
+    let declared = declared_metrics(s);
+    // A launch reads no counters (`counter_state` says so).
+    if !cfg!(target_os = "linux") || s.launch.is_object() || !probe::wakes::wants_perf(declared.iter().copied()) {
+        Counting::InTiming
+    } else if declared.iter().any(|m| time_metric(m)) {
+        Counting::Separate
+    } else {
+        Counting::Only
+    }
+}
+
+/// Copies what `from` measured of the metrics `pick` names (values and refusals) into `into`: a
+/// counter block's counts into its timing block, or the other way round.
+fn take_metrics(into: &mut Block, from: &Block, pick: impl Fn(&str) -> bool) {
+    into.values.retain(|k, _| !pick(k));
+    into.refused.retain(|k, _| !pick(k));
+    into.values.extend(from.values.iter().filter(|(k, _)| pick(k)).map(|(k, v)| (k.clone(), *v)));
+    into.refused.extend(from.refused.iter().filter(|(k, _)| pick(k)).map(|(k, r)| (k.clone(), r.clone())));
+}
+
+/// A counter metric that only a counter block measures on this OS.
+fn counted_apart(m: &str) -> bool {
+    cfg!(target_os = "linux") && m == "cpu.instructions"
 }
 
 struct Ctx<'a> {
@@ -1116,8 +1181,17 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     }
     let started = Instant::now();
     let log_from = std::fs::metadata(&ctx.runner.log).map(|m| m.len()).unwrap_or(0);
-    // Kept, so its views (`query <rec> threads`, …) can follow up on what the check showed.
-    let r = block_on_screen(ctx, s, &variants[0], 0, &Exec::untimed(true, None));
+    // Kept, so its views (`query <rec> threads`, …) can follow up on what the check showed. A Linux
+    // series that counts instructions checks them in an untimed counter block (SPEC §7.5).
+    let split = counting(s);
+    let main_counters = split == Counting::Only || (split == Counting::Separate && counted_apart(&s.primary));
+    let r = block_on_screen(ctx, s, &variants[0], 0, &Exec::untimed(true, None).counting(main_counters)).and_then(|mut b| {
+        if split == Counting::Separate {
+            let other = block_on_screen(ctx, s, &variants[0], 0, &Exec::untimed(false, None).counting(!main_counters))?;
+            take_metrics(&mut b, &other, |m| counted_apart(m) != main_counters);
+        }
+        Ok(b)
+    });
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
     // What the bench file's hooks printed during this case (console.log/error go to runner.log).
     let log: Vec<String> = std::fs::read(&ctx.runner.log)
@@ -1442,6 +1516,13 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let mut halted: Option<Error> = None;
     let (warmup_blocks, warmup_ms) = if blocks.is_empty() { warm_gpu(ctx, s, variants, &target, &mut halted)? } else { (0, 0.0) };
     let unit = model::metric(&s.primary).map_or("", |d| d.unit);
+    // Counter blocks (SPEC §7.5): N of them for a series of counters (or one whose primary is
+    // counted apart), and for a series of both, N of the other kind whose metrics join block i.
+    let split = counting(s);
+    let main_counters = split == Counting::Only || (split == Counting::Separate && counted_apart(&s.primary));
+    if split == Counting::Separate {
+        progress(format!("  counters: {} blocks of each kind (cpu.instructions in counter blocks, times in timing blocks)", n));
+    }
     // The blocks of a point share one lock and display state, as a pair's do: a block in another state
     // starts the point again from it (a locked session's display goes to sleep once, early).
     let mut restarts = 0;
@@ -1452,7 +1533,15 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         }
         let i = blocks.len();
         let keep = ctx.keep_all || i == 0;
-        match block_on_screen(ctx, s, &variants[0], i, &Exec::timed(timed_set(ctx), ctx.runs, keep)) {
+        let both = |ctx: &mut Ctx| -> Result<Block> {
+            let mut b = block_on_screen(ctx, s, &variants[0], i, &Exec::timed(timed_set(ctx), ctx.runs, keep).counting(main_counters))?;
+            if split == Counting::Separate {
+                let other = block_on_screen(ctx, s, &variants[0], i, &Exec::timed(timed_set(ctx), ctx.runs, false).counting(!main_counters))?;
+                take_metrics(&mut b, &other, |m| counted_apart(m) != main_counters);
+            }
+            Ok(b)
+        };
+        match both(ctx) {
             Ok(b) => {
                 progress(format!("  block {:>2}  {:>10}  {}{}", i + 1, fmt::value(val(&b, &s.primary), unit), steps_text(&b.steps), if b.locked { " · session locked" } else { "" }));
                 if blocks.first().is_some_and(|f| (f.locked, f.display) != (b.locked, b.display)) && restarts < 3 {
@@ -1477,18 +1566,9 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     // The primary, refused as a paired comparison would refuse it (rule 1): a block refused it, a
     // percentile's tail is too short, or no measured run entered its phase.
     let mut primary = json!({ "metric": s.primary });
-    let refusal = blocks
-        .iter()
-        .find_map(|b| b.refused.get(&s.primary).cloned())
-        .or_else(|| tail_refusal(def, &blocks))
-        .or_else(|| {
-            let phase = s.primary.strip_prefix("phase.")?;
-            (!blocks.iter().all(|b| b.values.get(&s.primary).is_some_and(|v| v.is_finite()))).then(|| Refusal::new(ValidatorId::NoPhase, format!("{}: no measured run of some block entered phase(\"{phase}\")", s.primary)))
-        })
-        .or_else(|| {
-            let span = s.primary.strip_prefix("span.")?;
-            (!blocks.iter().all(|b| b.values.get(&s.primary).is_some_and(|v| v.is_finite()))).then(|| Refusal::new(ValidatorId::NoSpan, format!("{}: no measured run of some block called performance.measure(\"{span}\")", s.primary)))
-        });
+    // (A block with no value of a declared phase or span refused it in `phase_state`, and a block that
+    // refused its primary failed: a refusal here is one from a block's lock state.)
+    let refusal = blocks.iter().find_map(|b| b.refused.get(&s.primary).cloned()).or_else(|| tail_refusal(def, &blocks));
     if let Some(r) = refusal {
         primary["verdict"] = json!(format!("refused ({}): {}", r.validator, r.summary));
         primary["verdict_kind"] = json!(VerdictKind::Refused);
@@ -1571,6 +1651,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut decided_at: Option<Comparison> = None;
     // Discarded warm-up blocks and their wall time, for `plan` (SPEC §9.1).
     let (warmup_blocks, warmup_ms) = if pairs.is_empty() { warm_gpu(ctx, s, variants, &target, &mut halted)? } else { (0, 0.0) };
+    // Linux's perf events never run in a timing block (SPEC §7.5): the paired loop runs on counter
+    // blocks for a series of counters, or one whose primary is counted apart.
+    let split = counting(s);
+    let main_counters = split == Counting::Only || (split == Counting::Separate && counted_apart(&s.primary));
     let from = if halted.is_some() { max_pairs } else { pairs.len() };
     'pairs: for pair in from..max_pairs {
         if stop_requested() {
@@ -1584,7 +1668,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             let start = blocks.len();
             for &v in &order {
                 let keep = ctx.keep_all || pair == 0;
-                let b = match block_on_screen(ctx, s, &variants[v], pair, &Exec::timed(timed_set(ctx), ctx.runs, keep)) {
+                let b = match block_on_screen(ctx, s, &variants[v], pair, &Exec::timed(timed_set(ctx), ctx.runs, keep).counting(main_counters)) {
                     Ok(b) => b,
                     // A stop, or an error once pairs are done: the half pair goes, the finished ones stay.
                     Err(e) if e.code == 130 || stop_requested() || !pairs.is_empty() => {
@@ -1746,12 +1830,37 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     }
     // Tail percentiles need enough frames in every block.
     let primary = tail_check(def, &blocks, primary);
+    // A series of both counters and times (SPEC §7.5): K pairs of the other kind of block, the
+    // fewest that let its secondaries clear Holm (at least the first look), never more than the
+    // series ran: counter blocks after timing pairs, or timing blocks after counter pairs.
+    let mut pass: Option<Pass> = None;
+    let mut counters_note: Option<String> = None;
+    if split == Counting::Separate && halted.is_none() && !pairs.is_empty() {
+        let other = secondary_names(s, script, false).into_iter().filter(|m| counted_apart(m) != main_counters).count();
+        let k = holm_pairs(other).max(min_pairs).min(pairs.len());
+        counters_note = Some(format!("separate blocks: cpu.instructions in counter blocks (perf events), times in timing blocks; {} → {k} pairs", if main_counters { "times" } else { "cpu.instructions" }));
+        progress(format!("  {} blocks: {k} pairs (Linux perf events never run in a timing block)", if main_counters { "timing" } else { "counter" }));
+        match pass_pairs(ctx, s, variants, !main_counters, k) {
+            Ok(p) => pass = Some(p),
+            Err(e) if e.code == 130 || stop_requested() => halted = Some(stop_error()),
+            Err(e) => counters_note = Some(format!("the {} blocks failed: {}", if main_counters { "timing" } else { "counter" }, e.message)),
+        }
+    }
+    // Which blocks measure a metric: the pass's for what the paired loop's kind does not.
+    let source = |name: &str| -> (&[Block], &[(usize, usize)]) {
+        match &pass {
+            Some((pb, pp)) if counted_apart(name) != main_counters => (pb, pp),
+            _ => (&blocks, &pairs),
+        }
+    };
     // Secondaries: gated on the primary, Holm-corrected.
-    let rate_context = !same(&blocks, &pairs, "run.duration", bound);
+    let (tb, tp) = source("run.duration");
+    let rate_context = !same(tb, tp, "run.duration", bound);
     let names = secondary_names(s, script, rate_context);
     let mut secondaries: Vec<Comparison> = Vec::new();
     for name in &names {
         let Some(d) = model::metric(name) else { continue };
+        let (blocks, pairs) = source(name);
         if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
             // A metric the series declared that a block refused shows as refused, not as missing.
             if let Some(why) = blocks.iter().find_map(|b| b.refused.get(name)) {
@@ -1764,7 +1873,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             Some(&m) => stats::compare_noworse(name, d, &pp, m, 0.95),
             None => stats::compare(name, d, &pp, bound, 0.95),
         };
-        secondaries.push(tail_check(d, &blocks, c));
+        secondaries.push(tail_check(d, blocks, c));
     }
     // An exact comparison (a stable counter) is a fact, not a test: it skips Holm and the primary's gate.
     let tested: Vec<usize> = (0..secondaries.len()).filter(|&i| !secondaries[i].exact).collect();
@@ -1807,6 +1916,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         descriptive.push(c);
     }
     let mut warnings: Vec<Warning> = Vec::new();
+    if let Some(note) = counters_note {
+        warnings.push(validity::info("Counters", note));
+    }
     analyse(s, def, &blocks, &pairs, primary.relative, &mut warnings);
     let (shown, screen_warnings) = shown::summarize(&blocks);
     warnings.extend(screen_warnings);
@@ -1815,6 +1927,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let (session, locked_pairs, _) = session_of(pairs.iter().map(|&(a, _)| &blocks[a]));
     let mut primary = primary;
     let mut primary_decided = primary_decided;
+    // A block that refused the primary (its lock state, after the block): refused, as for `--blocks`.
+    if let Some(why) = blocks.iter().find_map(|b| b.refused.get(&s.primary)) {
+        primary.refuse(why.clone());
+        primary_decided = false;
+    }
     if session == "mixed" {
         let why = Refusal::new(ValidatorId::SessionLocked, format!("{locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len()));
         primary.refuse(why.clone());
@@ -1905,8 +2022,51 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "overhead": mean_overhead(&blocks),
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
+        "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
+}
+
+/// Blocks and their pairs (indexes into the blocks: base, head).
+type Pass = (Vec<Block>, Vec<(usize, usize)>);
+
+/// `k` pairs of the other kind of block for a series of both counters and times (SPEC §7.5):
+/// counter blocks (`counters`) or timing blocks, base and head alternating as the series' own pairs,
+/// both blocks of a pair in one lock and display state.
+fn pass_pairs(ctx: &mut Ctx, s: &Series, variants: &[Variant], counters: bool, k: usize) -> Result<Pass> {
+    let (mut blocks, mut pairs): (Vec<Block>, Vec<(usize, usize)>) = (Vec::new(), Vec::new());
+    for pair in 0..k {
+        if stop_requested() {
+            return Err(stop_error());
+        }
+        let order: [usize; 2] = if pair % 2 == 0 { [0, 1] } else { [1, 0] };
+        let mut redone = 0;
+        loop {
+            let start = blocks.len();
+            let mut idx = [0usize; 2];
+            for &v in &order {
+                let x = Exec::timed(timed_set(ctx), ctx.runs, ctx.keep_all).counting(counters);
+                let b = block_on_screen(ctx, s, &variants[v], pair, &x)?;
+                idx[v] = blocks.len();
+                blocks.push(b);
+            }
+            if blocks[start].locked == blocks[start + 1].locked && blocks[start].display == blocks[start + 1].display {
+                pairs.push((idx[0], idx[1]));
+                break;
+            }
+            for b in blocks.drain(start..) {
+                if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+                    let _ = std::fs::remove_dir_all(dir);
+                }
+            }
+            redone += 1;
+            if redone >= 5 {
+                return Err(Error::refused("SessionLocked", "the session kept locking and unlocking between a pair's blocks", "bench while the session stays locked or stays unlocked"));
+            }
+        }
+        progress(format!("  {} pair {:>2}", if counters { "counter" } else { "timing" }, pair + 1));
+    }
+    Ok((blocks, pairs))
 }
 
 /// `--pixels`: untimed blocks run the case once each with `page.snapshot(name)` capturing the page: base twice,
@@ -2537,7 +2697,15 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, b)).inspect(|b| restate_recording(ctx, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).inspect(|b| restate_recording(ctx, b));
+        // A timed or check block that refused its primary refuses the block, as a native one does:
+        // pairs of nothing would end `unclear` instead of saying why.
+        let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
+            Some(why) => Err(Refusal {
+                summary: if why.summary.starts_with(&format!("{}:", s.primary)) { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) },
+                fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into()),
+            None => Ok(b),
+        });
         let r = match reserve.map(host::reserve::Reserve::finish) {
             Some(report) => {
                 ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
@@ -2716,7 +2884,7 @@ fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
         return b;
     }
     let page = !is_native(&ctx.describe["targets"][&s.target]) && ctx.describe["targets"][&s.target]["kind"] != "script";
-    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+    for m in declared_metrics(s) {
         if b.values.get(m).is_some_and(|v| v.is_finite()) || b.refused.contains_key(m) {
             continue;
         }
@@ -2740,22 +2908,23 @@ fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
 /// time metrics (ms, CPU shares, frames, input latency) are dropped, and refused `OverheadBudget`
 /// where declared (rule 3). The instruction count itself is user mode only: the switches' cost is
 /// not in it. macOS counts always, at no cost to the target.
-fn counter_state(s: &Series, mut b: Block) -> Block {
-    if !cfg!(target_os = "linux") || !probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics)) {
+fn counter_state(s: &Series, x: &Exec, mut b: Block) -> Block {
+    if x.counters {
+        // A counter block's times describe a run whose every context switch the events slowed: its
+        // timing blocks hold them.
+        b.values.retain(|m, _| !time_metric(m));
+        b.refused.retain(|m, _| !time_metric(m));
         return b;
     }
-    let timed = |m: &str| {
-        let def = crate::model::metric(m);
-        !probe::wakes::COUNTER_METRICS.contains(&m)
-            && !m.starts_with("cpu.foreign")
-            && (def.is_some_and(|d| d.unit == "ms" || d.unit == "%") || ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)))
-    };
-    b.values.retain(|m, _| !timed(m));
-    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| timed(m)) {
-        b.refused.entry(m.clone()).or_insert_with(|| {
-            Refusal::new(ValidatorId::OverheadBudget, "this series counts cpu.instructions with per-thread perf events, which cost the target at each context switch: its times describe a disturbed run")
-                .fix("measure cpu.instructions in a case of its own")
-        });
+    // A launch block (and a leak or pixels block) reads no counters: said, not left blank. A clean
+    // timing block of a series counted apart leaves them to its counter blocks.
+    let apart = counting(s) != Counting::InTiming;
+    for m in declared_metrics(s).into_iter().filter(|m| probe::wakes::COUNTER_METRICS.contains(&m.as_str())) {
+        if b.values.contains_key(m) || b.refused.contains_key(m) || (apart && counted_apart(m)) || b.values.is_empty() {
+            continue;
+        }
+        let what = if s.launch.is_object() { "a launch case" } else { "this kind of block" };
+        b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoCounter, format!("{what} reads no counters: they are read around a case's runs")).fix("count in a case with runs"));
     }
     b
 }
@@ -3006,7 +3175,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         .filter(|c| c.0)
         .map(|c| c.1)
         .collect();
-        let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
+        // A counter block traces nothing: its times are dropped, and tracing would add the browser's
+        // own instructions to what the counters count.
+        let tracing = if set == Set::Memory || x.counters { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
         // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
@@ -3028,7 +3199,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
 
         let run_timeout = s.run_timeout();
-        let perf = probe::wakes::wants_perf(std::iter::once(&s.primary).chain(&s.metrics));
+        let perf = x.counters.then(probe::wakes::Perf::new);
         let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
@@ -3052,8 +3223,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 out
             };
             let mut roles = process_roles(&browser);
+            let listed = probe::wakes::wall_us();
             let (procs_start, cyc0, tsc0, cpu0) = read();
-            let k0 = probe::wakes::Counters::take(&procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
+            let k0 = probe::wakes::Counters::take(listed, &procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
             *carried.borrow_mut() = [0.0; 6];
             if !counted.is_empty() {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
@@ -3081,7 +3253,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             driver.mark(&format!("{key}:end"))?;
             cost.end();
             let (procs_end, cyc1, tsc1, cpu1) = read();
-            let k1 = probe::wakes::Counters::take(&procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf);
+            let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
@@ -3270,7 +3442,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         {
             ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
         }
-        let mut data = if set == Set::Memory { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
+        let mut data = if set == Set::Memory || x.counters { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
         lap("analyse");
         let mut extra = BTreeMap::new();
@@ -3279,7 +3451,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
         }
         // `phase.<name>`: the run's phase windows from the trace's marks.
-        for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("phase.")) {
+        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")) {
             let per: BTreeMap<String, f64> = (0..measured.len())
                 .filter_map(|j| {
                     let suffix = format!(":run:{}:phase:{name}", first + j);
@@ -3290,7 +3462,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             extra.insert(format!("phase.{name}"), per);
         }
         // `span.<name>`: the page's own performance.measure() spans per run, from the trace.
-        for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("span.")) {
+        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("span.")) {
             if let Some(per) = data.span_per_run("run", name) {
                 extra.insert(format!("span.{name}"), per);
             }
@@ -3314,7 +3486,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         extra.insert("run.duration".to_string(), walls);
         extra.insert("cpu.app.total".to_string(), cpu);
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
-        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, std::iter::once(&s.primary).chain(&s.metrics));
+        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
         // Drags: the input strobe gave, beside the frames it drew (a starved driver shows here).
         if measured.iter().any(|r| r.input.is_some()) {

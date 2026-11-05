@@ -279,9 +279,10 @@ pub fn thread_modules(threads: &[(u32, u32)]) -> HashMap<u32, String> {
                 .unwrap_or_default()
                 .lines()
                 .filter_map(|l| {
-                    let mut f = l.split_whitespace();
+                    // `range perms offset dev inode<padding>path`: the path may hold spaces.
+                    let mut f = l.splitn(6, ' ');
                     let (range, perms) = (f.next()?, f.next()?);
-                    let path = f.nth(3).unwrap_or("").to_string();
+                    let path = f.nth(3).unwrap_or("").trim_start().to_string();
                     let (s, e) = range.split_once('-')?;
                     Some((u64::from_str_radix(s, 16).ok()?, u64::from_str_radix(e, 16).ok()?, perms.contains('x') && path.starts_with('/'), path))
                 })
@@ -346,8 +347,13 @@ pub fn system_busy(ms: u64) -> f64 {
     if total <= 0.0 { 0.0 } else { 1.0 - i1.saturating_sub(i0) as f64 / total }
 }
 
+/// Now in the clock ticks of `/proc/<pid>/stat`'s start time (since boot).
+pub(super) fn boot_ticks() -> u64 {
+    clock(libc::CLOCK_BOOTTIME).unwrap_or(0) / (1_000_000_000 / tck())
+}
+
 /// `0-7,16-23` or a hex mask `ff,000000ff` → a mask of the first 64 CPUs.
-fn cpu_list(s: &str) -> u64 {
+pub(super) fn cpu_list(s: &str) -> u64 {
     let mut mask = 0u64;
     for part in s.trim().split(',').filter(|p| !p.is_empty()) {
         let (a, b) = part.split_once('-').unwrap_or((part, part));
@@ -383,7 +389,7 @@ pub fn topology() -> Topology {
 }
 
 /// (parent, start ticks, name) of a live process.
-pub(super) fn parent_start_name(pid: u32) -> Option<(u32, u64, String)> {
+pub fn parent_start_name(pid: u32) -> Option<(u32, u64, String)> {
     stat(pid).filter(|s| !s.gone).map(|s| (s.ppid, s.start, s.comm))
 }
 

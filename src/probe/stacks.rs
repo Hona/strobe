@@ -80,7 +80,7 @@ impl Targets {
 pub enum StackCapture {
     #[cfg(windows)]
     Helper(helper::Client),
-    #[cfg(windows)]
+    #[cfg(all(windows, target_arch = "x86_64"))]
     Suspend(super::suspend::Capture),
     #[cfg(target_os = "linux")]
     Perf(super::perf::Capture),
@@ -101,7 +101,11 @@ impl StackCapture {
         #[cfg(windows)]
         {
             if unprivileged || !helper::access().helper {
+                // strobe's own sampler unwinds x64 frames only.
+                #[cfg(target_arch = "x86_64")]
                 return Ok(StackCapture::Suspend(super::suspend::Capture::start(targets)?));
+                #[cfg(not(target_arch = "x86_64"))]
+                return Err(crate::model::Error::msg(no_stacks()));
             }
             // The helper runs elevated in a process of its own, which holds no job of this strobe's
             // and reads no stamps for it: it gets the set as it is now, and follows its children.
@@ -124,7 +128,7 @@ impl StackCapture {
                 fill_from_processes(&mut deep);
                 Ok(deep)
             }
-            #[cfg(windows)]
+            #[cfg(all(windows, target_arch = "x86_64"))]
             StackCapture::Suspend(s) => {
                 let mut deep = s.stop()?;
                 fill_from_processes(&mut deep);

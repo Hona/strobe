@@ -89,6 +89,11 @@ pub fn dispatch(args: &Args) -> Result<Output> {
     crate::host::power::restore_stale();
     // And the CPU sets of processes it moved off a timed block's CPUs (`--reserve-cpus`).
     crate::host::reserve::restore_stale();
+    // The cycle clock's check pins a thread to every CPU: before a bench narrows strobe's affinity
+    // and before any measured window opens.
+    if matches!(args.command.as_str(), "record" | "bench" | "run" | "status" | "top" | "track" | "mcp" | "daemon") {
+        crate::host::warm_cycle_clock();
+    }
     match args.command.as_str() {
         "record" => record::run(args),
         "bench" => bench::run(args),

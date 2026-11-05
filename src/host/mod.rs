@@ -8,6 +8,8 @@ pub mod power;
 pub mod reserve;
 pub mod spawn;
 #[cfg(windows)]
+pub mod cycle_clock;
+#[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]
 pub mod dbus;
@@ -544,18 +546,13 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     }
 }
 
-/// A clock in the unit of `ProcInfo::cycles`: the time stamp counter on Windows x64, the performance
-/// counter times the kernel's cycle factor on Windows on Arm (None where its cycles are not time:
-/// `cycles_refused`), ns elsewhere.
+/// A clock in the unit of `ProcInfo::cycles`. Windows: the performance counter times the kernel's
+/// cycle factor, or the time stamp counter where the kernel charges raw TSC cycles (x64); None where
+/// its cycles are not time (`cycles_refused`, `cycle_clock`). ns elsewhere.
 pub fn tsc() -> Option<u64> {
-    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[cfg(windows)]
     {
-        #[allow(unused_unsafe)]
-        Some(unsafe { std::arch::x86_64::_rdtsc() })
-    }
-    #[cfg(all(windows, target_arch = "aarch64"))]
-    {
-        win::tsc()
+        cycle_clock::read()
     }
     #[cfg(not(windows))]
     {
@@ -563,16 +560,40 @@ pub fn tsc() -> Option<u64> {
     }
 }
 
-/// Why this machine's process and thread cycles cannot be read as time (`tsc` is None), so CPU time
-/// is refused rather than read from 15.6 ms clock ticks. None where they can.
+/// Settles the cycle clock (`cycle_clock`) now: before strobe moves its own CPU affinity and before
+/// any measured window opens, since its check pins a thread to every CPU (once per boot, then cached).
+pub fn warm_cycle_clock() {
+    #[cfg(windows)]
+    cycle_clock::clock();
+}
+
+/// Why this machine's process and thread cycles cannot be read as time (`tsc` is None), so every
+/// metric made of them is refused rather than read from 15.6 ms clock ticks. None where they can.
 pub fn cycles_refused() -> Option<String> {
-    #[cfg(all(windows, target_arch = "aarch64"))]
+    #[cfg(windows)]
     {
-        win::cycle_factor().err().map(|why| format!("Windows on Arm: {why}"))
+        let os = if cfg!(target_arch = "aarch64") { "Windows on Arm" } else { "Windows" };
+        cycle_clock::clock().unit.as_ref().err().map(|why| format!("{os}: {why}"))
     }
-    #[cfg(not(all(windows, target_arch = "aarch64")))]
+    #[cfg(not(windows))]
     {
         None
+    }
+}
+
+/// The cycle clock in words, for `status`.
+pub fn cycle_clock_text() -> String {
+    #[cfg(windows)]
+    {
+        cycle_clock::describe()
+    }
+    #[cfg(target_os = "linux")]
+    {
+        "ns: the processes' and threads' CPU clocks".into()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        "ns: Mach time charged at every context switch".into()
     }
 }
 

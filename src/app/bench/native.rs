@@ -403,7 +403,8 @@ fn runs(
         if let (true, Some(f)) = (leak, warmup.first()) {
             readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - f)));
         }
-        if warmup.after(&runs.iter().map(|r| r.cpu).collect::<Vec<_>>()) && leak {
+        // Without CPU (cycles that are not time, `host::cycles_refused`), steady by wall time.
+        if warmup.after(&runs.iter().map(|r| if r.cpu.is_finite() { r.cpu } else { r.ms }).collect::<Vec<_>>()) && leak {
             readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
         }
     }

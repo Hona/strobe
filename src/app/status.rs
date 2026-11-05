@@ -78,6 +78,11 @@ pub fn run(args: &Args) -> Result<Output> {
     if !native_ok && cfg!(target_os = "macos") {
         problems.push(format!("native apps: {native_text}"));
     }
+    let cycles_refused = host::cycles_refused();
+    if let Some(why) = &cycles_refused {
+        problems.push(format!("CPU time metrics are refused: {why}"));
+    }
+    let cycle_clock = host::cycle_clock_text();
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
         problems.push("no calibration yet (strobe up)".into());
@@ -91,6 +96,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "daemon": { "running": daemon, "port": super::mcp::port(), "autostart": { "registered": autostart.0, "detail": autostart.1 } }, "skill": skill, "benches": benches,
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
         "native": { "ready": native_ok, "detail": native_text },
+        "cycle_clock": { "detail": cycle_clock, "refused": cycles_refused },
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
     let mut t = String::new();
@@ -98,6 +104,7 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} cpu        {} · {} logical{}\n", mark(true), env.cpu, env.logical_cpus, if groups.is_empty() { String::new() } else { format!(" · {}", groups.join(", ")) });
     t += &format!("  {} power      {}{}\n", mark(!env.on_battery), env.power_plan, if env.on_battery { " · on battery" } else { "" });
     t += &format!("  {} load       {:.0}% of all CPUs busy\n", mark(busy <= 0.10), busy * 100.0);
+    t += &format!("  {} cycles     {cycle_clock}\n", mark(cycles_refused.is_none()));
     t += &format!("  {} priority   {}\n", mark(qos.is_none()), qos.as_ref().map(|w| format!("{w}: frame and input-latency metrics are refused (run strobe at normal priority)")).unwrap_or_else(|| "normal".into()));
     if let Some(why) = &timers {
         t += &format!("  ! timers     {why}: its waits and the app's timers fire late, and the app's wakes are not a terminal's (run strobe from a terminal, or give that job ProcessType Interactive in its launchd plist)\n");

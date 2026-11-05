@@ -1164,7 +1164,20 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
-    if n.samples == 0 {
+    let deep: Option<crate::probe::stacks::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
+    if let (0, Some(t), Some(d)) = (n.samples, thread, deep.as_ref())
+        && !d.samples.is_empty()
+    {
+        // The thread matched none of the sampled ones: name those, busiest first.
+        let mut by: BTreeMap<u32, u64> = BTreeMap::new();
+        for s in &d.samples {
+            *by.entry(s.2).or_default() += 1;
+        }
+        let mut list: Vec<(u32, u64)> = by.into_iter().collect();
+        list.sort_by(|a, b| b.1.cmp(&a.1));
+        let names: Vec<String> = list.iter().take(8).map(|(tid, k)| format!("{} ({k})", d.threads.get(tid).cloned().unwrap_or_else(|| format!("thread {tid}")))).collect();
+        out.text += &format!("! no samples of a thread named or numbered {t:?}; the sampled threads (samples): {}\n", names.join(", "));
+    } else if n.samples == 0 {
         // Nothing sampled is not the same as nothing resolved: say what the sampler gave.
         let why = if cfg!(target_os = "macos") {
             "/usr/bin/sample gave no stacks for these runs (the app exited or was not sampled in the measured runs' span; macOS samples carry no times, so a span with no sample stays empty)"
@@ -1180,7 +1193,6 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
         out.text += &format!("! Unresolved: {:.1}% of samples have no symbol ({what}): {}\n", 100.0 - share, missing.join(", "));
     }
     // Sampled by strobe itself without the helper: how, and what it cost the threads.
-    let deep: Option<crate::probe::stacks::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
     // Processes of the target the sampler gave no stacks of: their CPU is in no row above.
     if let Some(d) = deep.as_ref().filter(|d| !d.unsampled.is_empty()) {
         let list: Vec<&str> = d.unsampled.iter().map(|(_, w)| w.as_str()).collect();

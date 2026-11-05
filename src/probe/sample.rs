@@ -182,7 +182,7 @@ fn line(l: &str) -> Option<Line> {
     let count: u64 = count.parse().ok()?;
     let rest = rest.trim_start();
     if rest.starts_with("Thread_") {
-        return Some(Line { depth: start, count, name: rest.split_whitespace().next()?.to_string(), module: String::new(), addr: None, file: String::new(), line: 0 });
+        return Some(Line { depth: start, count, name: rest.trim_end().to_string(), module: String::new(), addr: None, file: String::new(), line: 0 });
     }
     let (name, after) = rest.split_once("  (in ")?;
     let (module, after) = after.split_once(')')?;
@@ -190,6 +190,24 @@ fn line(l: &str) -> Option<Line> {
     let loc = after.rsplit(']').next().unwrap_or("").trim();
     let (file, ln) = loc.rsplit_once(':').map(|(f, n)| (f.to_string(), n.parse().unwrap_or(0))).unwrap_or_default();
     Some(Line { depth: start, count, name: name.trim().to_string(), module: module.to_string(), addr, file, line: ln })
+}
+
+/// A sampled thread's name, for `query hotspots --thread`: the one it gave itself, which `query
+/// threads` lists, else what `sample` said after its id (`worker`, or the queue it ran:
+/// `com.apple.main-thread`).
+fn thread_name(pid: u32, id: u64, label: &str) -> Option<String> {
+    if let Some(n) = crate::host::macos::thread_name_of(pid, id) {
+        return Some(n);
+    }
+    let label = label.trim().trim_start_matches(':').trim();
+    // `name   DispatchQueue_1: queue`: the thread's own name first; only a queue, the queue's.
+    let label = match label.find("DispatchQueue_") {
+        Some(0) => label.split_once(": ").map_or("", |(_, q)| q),
+        Some(i) => label[..i].trim(),
+        None => label,
+    };
+    let label = label.split("  (").next().unwrap_or(label).trim();
+    (!label.is_empty()).then(|| label.to_string())
 }
 
 /// A leaf in the kernel's system call library: the thread was waiting, or working inside the kernel.
@@ -206,8 +224,14 @@ fn parse(text: &str, pid: u32, t0: u64, deep: &mut Deep, index: &mut HashMap<Vec
     let mut named: BTreeMap<u64, (String, String, u32)> = BTreeMap::new();
     for (i, l) in lines.iter().enumerate() {
         if l.addr.is_none() {
-            // A thread: `Thread_282959` (its id, as Activity Monitor numbers threads).
-            tid = l.name.trim_start_matches("Thread_").trim_end_matches(':').parse::<u64>().map(|t| t as u32).unwrap_or(0);
+            // A thread: `Thread_282959` (its id, as Activity Monitor numbers threads), then its name
+            // (`Thread_282960: worker`) or the queue it runs (`DispatchQueue_1: com.apple.main-thread  (serial)`).
+            let (id, label) = l.name.split_once(|c: char| c == ':' || c.is_whitespace()).unwrap_or((&l.name, ""));
+            let id = id.trim_start_matches("Thread_").parse::<u64>().unwrap_or(0);
+            tid = id as u32;
+            if let Some(name) = thread_name(pid, id, label) {
+                deep.threads.insert(tid, name);
+            }
             path.clear();
             continue;
         }

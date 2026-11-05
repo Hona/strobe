@@ -708,6 +708,14 @@ pub fn thread_cycles_of(tid: u32) -> Option<u64> {
     thread_info(pid, id).map(|t| t.pth_user_time + t.pth_system_time)
 }
 
+/// The name a thread gave itself (`pthread_setname_np`), by its process and 64-bit thread id (the id
+/// `sample` prints as `Thread_<id>`).
+pub fn thread_name_of(pid: u32, id: u64) -> Option<String> {
+    let t = thread_info(pid, id)?;
+    let name = unsafe { std::ffi::CStr::from_ptr(t.pth_name.as_ptr()) }.to_string_lossy().to_string();
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn thread_name(tid: u32) -> Option<String> {
     if tid == 0 {
         return Some("(whole process: macOS counts wakes per process)".into());

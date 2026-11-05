@@ -5,7 +5,8 @@ use crate::model::{Error, Result};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::time::Duration;
 
 pub const VERSION: &str = "v59.1";
 
@@ -66,12 +67,20 @@ pub fn ensure() -> Result<PathBuf> {
     let archive = download(name, sha)?;
     let bytes = std::fs::read(&archive)?;
     let body = unzip_one(&bytes, |n| n.ends_with(exe_name()))?.ok_or_else(|| Error::msg(format!("{name} has no {}", exe_name())))?;
-    std::fs::write(&exe, body)?;
+    // Whole or not at all: `installed` takes any file at this path for the engine.
+    let tmp = exe.with_extension("part");
+    {
+        use std::io::Write;
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&body)?;
+        f.sync_all()?;
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755))?;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
     }
+    std::fs::rename(&tmp, &exe)?;
     let _ = std::fs::remove_file(&archive);
     Ok(exe)
 }
@@ -207,7 +216,15 @@ impl Table {
     }
 }
 
-/// Runs SQL against a trace and returns the last statement's result.
+/// How long one query may take: two minutes, plus a second per 4 MB of trace to load. trace_processor
+/// loads well over that rate, so only a hung one meets it.
+fn deadline(trace: &Path) -> Duration {
+    let mb = std::fs::metadata(trace).map(|m| m.len() / 1_000_000).unwrap_or(0);
+    Duration::from_secs(120 + mb / 4)
+}
+
+/// Runs SQL against a trace and returns the last statement's result. A query that outlives its
+/// deadline is killed and fails (exit 124) instead of holding its caller (a report, the daemon).
 pub fn query(trace: &Path, sql: &str) -> Result<Table> {
     let exe = ensure()?;
     // A counter beside the time: a report's views query in parallel, and two of them once took the same
@@ -216,8 +233,12 @@ pub fn query(trace: &Path, sql: &str) -> Result<Table> {
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let file = host::paths::run().join(format!("q-{}-{}-{n}.sql", std::process::id(), host::now_ns()));
     std::fs::write(&file, sql)?;
-    let out = Command::new(exe).arg("-q").arg(&file).arg(trace).output()?;
+    let out = run_within(Command::new(exe).arg("-q").arg(&file).arg(trace), deadline(trace));
     let _ = std::fs::remove_file(&file);
+    let out = out?.ok_or_else(|| {
+        Error::timeout(format!("trace_processor did not finish a query on {} in {} s: strobe stopped it", trace.display(), deadline(trace).as_secs()))
+            .hint("run it again; a query that hangs twice on one trace points at a damaged trace: record it again")
+    })?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     if !out.status.success() {
@@ -225,6 +246,35 @@ pub fn query(trace: &Path, sql: &str) -> Result<Table> {
         return Err(Error::msg(format!("trace_processor: {}", why.trim())));
     }
     Ok(parse_csv(&stdout))
+}
+
+/// Runs `cmd` to its end and returns its output, or kills it at `limit` and returns `None`. Its
+/// stdout and stderr are read on their own threads, so neither pipe fills while it runs.
+fn run_within(cmd: &mut Command, limit: Duration) -> Result<Option<Output>> {
+    let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
+    let (mut out, mut err) = (child.stdout.take(), child.stderr.take());
+    let err = std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = err.as_mut().map(|p| p.read_to_end(&mut v));
+        v
+    });
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut v = Vec::new();
+        let _ = out.as_mut().map(|p| p.read_to_end(&mut v));
+        let _ = tx.send(v);
+    });
+    // Its stdout closes when it exits.
+    let stdout = match rx.recv_timeout(limit) {
+        Ok(v) => v,
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Ok(None);
+        }
+    };
+    let status = child.wait()?;
+    Ok(Some(Output { status, stdout, stderr: err.join().unwrap_or_default() }))
 }
 
 fn parse_csv(text: &str) -> Table {

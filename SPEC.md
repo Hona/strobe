@@ -2674,7 +2674,10 @@ experiments/
   same build (matching versions: the UI shows no version dialog), §11.4.
 - One `trace_processor_shell server http` per `strobe open`, on `127.0.0.1` and a free port, with
   no trace loaded (the UI streams it in), ending itself after an hour without requests. Queries
-  (`query`, metrics) run one `trace_processor -q` each.
+  (`query`, metrics) run one `trace_processor -q` each, with a deadline of two minutes plus a second
+  per 4 MB of trace: a query that outlives it is killed and fails (exit 124) with the trace's path,
+  so a hung trace_processor never holds a report or the daemon. The executable is unpacked whole or
+  not at all (a `.part` file renamed into place), since any file at its path counts as installed.
 - Ingest: Chrome's proto trace (`Tracing.start` with `streamFormat: "proto"`) with strobe's own
   packets (OS and GPU counters, census, phases when not in the trace) appended as counter and
   slice tracks with a `ClockSnapshot`. JSON for sources that only give JSON.

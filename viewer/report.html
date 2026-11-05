@@ -4277,7 +4277,9 @@ function renderDiffFlameSection(s, aa) {
     const weight = Math.min(1, Math.abs(d) / (0.02 * total));
     const pct = Math.round(Math.min(1, Math.abs(d) / big) * weight * 70);
     if (pct < 3) return "var(--surface-subtle)";
-    return `color-mix(in srgb, ${d > 0 ? "var(--loss)" : "var(--win)"} ${pct}%, var(--surface-subtle))`;
+    // A/A: both sides ran one build, so a difference is variation, never a win or a loss.
+    const ink = aa ? "var(--ink-4)" : d > 0 ? "var(--loss)" : "var(--win)";
+    return `color-mix(in srgb, ${ink} ${pct}%, var(--surface-subtle))`;
   };
 
   const rowH = 18;
@@ -4308,8 +4310,8 @@ function renderDiffFlameSection(s, aa) {
       }, width > 3 ? label(n) : "");
       el.addEventListener("pointerenter", (e) => showTip(e, label(n), [
         file(n) ? ["File", file(n)] : null,
-        ["Base", `${fmtV(n.b)} / run`],
-        ["Head", `${fmtV(n.h)} / run`],
+        ["Base", `${fmtV(n.b)}${tree.per_run ? " / run" : ""}`],
+        ["Head", `${fmtV(n.h)}${tree.per_run ? " / run" : ""}`],
         ["Δ", fmtD(n.h - n.b)],
         ["Share", `${((100 * mean(n)) / ((root.b + root.h) / 2 || 1)).toFixed(1)}% of all`],
       ].filter(Boolean)));
@@ -4330,7 +4332,7 @@ function renderDiffFlameSection(s, aa) {
     h("div", { class: "card-hd" },
       h("div", { class: "card-hd-left" },
         h("h2", { class: "sec-title" }, "Diff flame"),
-        h("span", { class: "sec-sub" }, `${tree.what} · base and head call trees merged · ${tree.per_run ? `per run (${runs.join(" and ")} runs)` : "per recording"} · click to zoom`)
+        h("span", { class: "sec-sub" }, `${tree.what} · base and head call trees merged · ${tree.per_run ? `per run (${runs.join(" and ")} runs)` : tree.untimed ? "whole capture: these samples carry no times (launch and warmup included)" : "per recording (a run count is unknown)"} · click to zoom`)
       ),
       h("div", { class: "card-hd-right" }, toggle)
     ),
@@ -4340,8 +4342,12 @@ function renderDiffFlameSection(s, aa) {
       : null,
     flame,
     h("div", { class: "flame-legend" },
-      h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--loss) 60%, var(--surface-subtle))" }), "More in head"),
-      h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--win) 60%, var(--surface-subtle))" }), "Less in head"),
+      aa
+        ? h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--ink-4) 60%, var(--surface-subtle))" }), "Differs between the two launches")
+        : [
+            h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--loss) 60%, var(--surface-subtle))" }), "More in head"),
+            h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--win) 60%, var(--surface-subtle))" }), "Less in head"),
+          ],
       h("span", {}, `Width: the mean of both sides · ${fmtV(root.b)} → ${fmtV(root.h)} in all (${fmtD(root.h - root.b)})`),
       h("span", {}, `Nodes under ${isBytes ? fmtBytes(tree.floor) : fmtVal(tree.floor, "ms")} left out (${tree.nodes.length} of ${tree.nodes_total}) · ${depth >= maxDepth ? `${maxDepth + 1} levels shown: zoom in for deeper frames` : `${depth + 1} levels`}`)
     )

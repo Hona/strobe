@@ -5,7 +5,7 @@
 //! portable location (the last steps of a file's path, a script URL without its origin, query and
 //! bundler hash), never by line, which moves between builds.
 
-use super::{Output, Part, Rec, Stacks, fmt};
+use super::{NativeStacks, Output, Part, Rec, Stacks, fmt};
 use crate::cli::Args;
 use crate::model::{Error, Result};
 use crate::probe::symbols::Frame;
@@ -26,17 +26,32 @@ fn run_with(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize, plan_runs: Op
     match view {
         "hotspots" | "alloc" | "layout" => {
             let by = if view == "layout" { "function" } else { super::by_arg(args)? };
+            let (thread, phase) = (args.get("thread"), args.get("phase"));
+            if view != "hotspots" && (thread.is_some() || phase.is_some()) {
+                return Err(Error::usage("--thread and --phase select native samples: a..b hotspots takes them"));
+            }
             let kind = match view {
                 "alloc" => Kind::Alloc,
                 "layout" => Kind::Layout,
-                _ => Kind::hotspots(a, b, args.has("native")),
+                _ => Kind::hotspots(a, b, args.has("native") || thread.is_some() || phase.is_some()),
             };
+            // A thread or a phase: each side's native samples for that question alone.
+            let filtered = if thread.is_some() || phase.is_some() {
+                let one = |r: &Rec| super::native_filtered(&r.dir, thread, phase)?.ok_or_else(|| Error::usage(format!("{} has no native samples; record with --probes deep", r.id)));
+                Some([one(a)?, one(b)?])
+            } else {
+                None
+            };
+            let over = |i: usize| filtered.as_ref().map(|f| &f[i]);
             // Both sides' sources load at once.
             std::thread::scope(|s| {
-                s.spawn(|| side(a, kind, plan_runs).is_ok());
-                let _ = side(b, kind, plan_runs);
+                s.spawn(|| side(a, kind, plan_runs, over(0)).is_ok());
+                let _ = side(b, kind, plan_runs, over(1));
             });
-            weighted(a, b, kind, by, plan_runs).map(|d| d.output(a, b, top))
+            let sides = [side(a, kind, plan_runs, over(0))?, side(b, kind, plan_runs, over(1))?];
+            let mut d = weighted(sides, kind, by);
+            d.selection = [thread.map(|t| format!("thread {t}")), phase.map(|p| format!("phase {p}"))].into_iter().flatten().collect::<Vec<_>>().join(", ");
+            Ok(d.output(a, b, top))
         }
         "style" => style(a, b, top),
         "threads" => threads(a, b, top),
@@ -141,37 +156,79 @@ impl Kind {
     }
 }
 
-/// One side of a weighted view: its stacks and the measured runs they cover.
+/// One side of a weighted view: its stacks and the measured runs they cover. `untimed`: native samples
+/// without times (macOS `sample`) that cover the whole capture, so no run count divides them.
 struct Side<'a> {
     stacks: &'a Stacks,
-    runs: f64,
-    runs_known: bool,
+    runs: Option<u64>,
+    untimed: bool,
 }
 
-fn side(rec: &Rec, kind: Kind, plan_runs: Option<u64>) -> Result<Side<'_>> {
-    let missing = || Error::usage("this recording has no native samples; record with --probes deep");
-    let stacks = match kind {
-        Kind::Cpu => rec.cpu()?,
-        Kind::Native => &rec.native()?.ok_or_else(missing)?.stacks,
-        Kind::Alloc => rec.alloc()?,
+/// A side's stacks; `over` stands in for its native samples (one thread's or one phase's).
+fn side<'a>(rec: &'a Rec, kind: Kind, plan_runs: Option<u64>, over: Option<&'a NativeStacks>) -> Result<Side<'a>> {
+    let missing = || Error::usage(format!("{} has no native samples; record with --probes deep", rec.id));
+    let runs = rec.runs().or(plan_runs);
+    match kind {
+        Kind::Cpu => Ok(Side { stacks: rec.cpu()?, runs, untimed: false }),
+        Kind::Native => {
+            let n = match over {
+                Some(n) => n,
+                None => rec.native()?.ok_or_else(missing)?,
+            };
+            Ok(Side { stacks: &n.stacks, runs: (!n.untimed).then_some(runs).flatten(), untimed: n.untimed })
+        }
+        Kind::Alloc => Ok(Side { stacks: rec.alloc()?, runs, untimed: false }),
         Kind::Layout => {
             let f = super::forced(rec)?;
-            return Ok(Side { stacks: &f.stacks, runs: f.runs.max(1) as f64, runs_known: f.runs > 0 });
+            Ok(Side { stacks: &f.stacks, runs: (f.runs > 0).then_some(f.runs as u64), untimed: false })
         }
-    };
-    let runs = rec.runs().or(plan_runs);
-    Ok(Side { stacks, runs: runs.unwrap_or(1).max(1) as f64, runs_known: runs.is_some() })
+    }
 }
 
-/// Where a frame is, as two builds share it: the last three steps of its file's path (two builds live
-/// in different folders), or a script URL without its origin, query and bundler hash.
+/// Where a frame is, as two checkouts and two builds share it: its path from the first step a checkout
+/// does not name (a monorepo's `packages/`, `crates/`, `apps/`, a toolchain's `library/`, else the
+/// last `src/` or `lib/`), a dependency's from its package (`node_modules/…`, a cargo crate without
+/// its version or hash), or a script URL without origin, query and bundler hash. The checkout's own
+/// folder (a worktree named after a branch or a commit) never takes part.
 fn portable_file(f: &Frame) -> String {
     if f.file.is_empty() && f.url.is_empty() {
         return "(native)".into();
     }
-    let p = if !f.mapped && !f.url.is_empty() { crate::heapsnap::portable_url(&f.url) } else { f.file.replace('\\', "/") };
+    if !f.mapped && !f.url.is_empty() {
+        return portable_path(&crate::heapsnap::portable_url(&f.url));
+    }
+    portable_path(&f.file.replace('\\', "/"))
+}
+
+fn portable_path(p: &str) -> String {
     let parts: Vec<&str> = p.split('/').filter(|s| !s.is_empty()).collect();
-    parts[parts.len().saturating_sub(3)..].join("/")
+    let from = |i: usize| parts[i..].join("/");
+    // A JavaScript dependency: its package path (bun's `.bun/<pkg>@<version>/node_modules/` too).
+    if let Some(i) = parts.iter().rposition(|s| *s == "node_modules") {
+        return from(i + 1);
+    }
+    // A cargo dependency: `registry/src/<index>/<crate>-<version>/…`, `git/checkouts/<repo>-<hash>/<rev>/…`.
+    let unversioned = |s: &str| s.rsplit_once('-').filter(|(_, v)| v.starts_with(|c: char| c.is_ascii_digit())).map_or(s.to_string(), |(n, _)| n.to_string());
+    if let Some(i) = parts.windows(2).rposition(|w| w == ["registry", "src"]).filter(|i| parts.len() > i + 3) {
+        return format!("{}/{}", unversioned(parts[i + 3]), parts[i + 4..].join("/"));
+    }
+    let rest: &[&str] = match parts.windows(2).rposition(|w| w == ["git", "checkouts"]) {
+        Some(i) if parts.len() > i + 4 => &parts[i + 4..],
+        _ => &parts,
+    };
+    // A build script's output: `<crate>-<16 hex>/out/…` keeps the crate.
+    let hashless = |s: &str| match s.rsplit_once('-') {
+        Some((n, h)) if h.len() == 16 && h.chars().all(|c| c.is_ascii_hexdigit()) => n.to_string(),
+        _ => s.to_string(),
+    };
+    let tail = |i: usize| rest[i..].iter().map(|s| hashless(s)).collect::<Vec<_>>().join("/");
+    if let Some(i) = rest.iter().rposition(|s| matches!(*s, "packages" | "crates" | "apps" | "library")) {
+        return tail(i);
+    }
+    if let Some(i) = rest.iter().rposition(|s| matches!(*s, "src" | "lib")) {
+        return tail(i);
+    }
+    tail(rest.len().saturating_sub(2))
 }
 
 /// Frames of both sides as one table of portable (name, file) pairs: each side's frame index → id.
@@ -205,8 +262,11 @@ fn skipped(name: &str) -> bool {
 struct Row {
     name: String,
     at: String,
+    /// Per side: the value per run in the view's unit, the samples, and the sampling variance of the
+    /// raw weight (µs² or bytes², before scaling and dividing by runs).
     v: [f64; 2],
     n: [u64; 2],
+    var: [f64; 2],
     /// Per stack (portable ids, root first): per-run value on each side.
     stacks: HashMap<Vec<u32>, [f64; 2]>,
 }
@@ -215,15 +275,10 @@ impl Row {
     fn delta(&self) -> f64 {
         self.v[1] - self.v[0]
     }
-
-    /// The 95% interval of the change from sampling alone: each side's value has the variance of its
-    /// sample count (Poisson), v²/n. One launch per side: launch-to-launch variation is not in it.
-    fn ci(&self, sampled: bool) -> Option<f64> {
-        sampled.then(|| 1.96 * (0..2).map(|s| if self.n[s] > 0 { self.v[s] * self.v[s] / self.n[s] as f64 } else { 0.0 }).sum::<f64>().sqrt())
-    }
 }
 
-/// A weighted view of two recordings: rows by function, file or package, per run on each side.
+/// A weighted view of two recordings: rows by function, file or package, per run on each side when
+/// both sides know their runs, else per recording on both.
 pub struct Weighted {
     kind: Kind,
     by: String,
@@ -231,54 +286,69 @@ pub struct Weighted {
     frames: Vec<(String, String)>,
     total: [f64; 2],
     samples: [u64; 2],
+    /// What divides each side (1 when not per run).
     runs: [f64; 2],
-    runs_known: bool,
+    per_run: bool,
+    untimed: bool,
+    /// A thread or phase the native samples were narrowed to (said in the header).
+    selection: String,
 }
 
-fn weighted(a: &Rec, b: &Rec, kind: Kind, by: &str, plan_runs: Option<u64>) -> Result<Weighted> {
-    let sides = [side(a, kind, plan_runs)?, side(b, kind, plan_runs)?];
+fn weighted(sides: [Side; 2], kind: Kind, by: &str) -> Weighted {
+    // Per run only when both sides know their runs: dividing one side alone compares unlike things.
+    let per_run = sides.iter().all(|s| s.runs.is_some());
+    let runs = sides.each_ref().map(|s| if per_run { s.runs.unwrap_or(1).max(1) as f64 } else { 1.0 });
     let mut portable = Portable::default();
     let mut rows: BTreeMap<(String, String), Row> = BTreeMap::new();
     let (mut total, mut samples) = ([0.0; 2], [0u64; 2]);
     for (s, side) in sides.iter().enumerate() {
         let ids = portable.ids(side.stacks);
         let mut packages = BTreeMap::new();
-        for (stack, w, hits) in &side.stacks.weights {
-            let Some(f) = stack.last().map(|&i| &side.stacks.frames[i as usize]) else { continue };
+        for wt in &side.stacks.weights {
+            let Some(f) = wt.stack.last().map(|&i| &side.stacks.frames[i as usize]) else { continue };
             if skipped(&f.name) {
                 continue;
             }
-            let per = w * kind.scale() / side.runs;
+            let per = wt.w * kind.scale() / runs[s];
             let (name, at) = match by {
                 "function" => (f.name.clone(), portable_file(f)),
                 "file" if !f.file.is_empty() || !f.url.is_empty() => (portable_file(f), String::new()),
                 _ => (super::row_key(f, by, &mut packages), String::new()),
             };
-            let row = rows.entry((name.clone(), at.clone())).or_insert_with(|| Row { name, at, v: [0.0; 2], n: [0; 2], stacks: HashMap::new() });
+            let row = rows.entry((name.clone(), at.clone())).or_insert_with(|| Row { name, at, v: [0.0; 2], n: [0; 2], var: [0.0; 2], stacks: HashMap::new() });
             row.v[s] += per;
-            row.n[s] += hits;
+            row.n[s] += wt.n;
+            row.var[s] += wt.var;
             if by == "function" {
-                row.stacks.entry(stack.iter().map(|&i| ids[i as usize]).collect()).or_insert([0.0; 2])[s] += per;
+                row.stacks.entry(wt.stack.iter().map(|&i| ids[i as usize]).collect()).or_insert([0.0; 2])[s] += per;
             }
             total[s] += per;
-            samples[s] += hits;
+            samples[s] += wt.n;
         }
     }
     let mut rows: Vec<Row> = rows.into_values().collect();
     rows.sort_by(|x, y| y.delta().abs().total_cmp(&x.delta().abs()));
-    Ok(Weighted {
-        kind,
-        by: by.to_string(),
-        rows,
-        frames: portable.frames,
-        total,
-        samples,
-        runs: [sides[0].runs, sides[1].runs],
-        runs_known: sides[0].runs_known && sides[1].runs_known,
-    })
+    Weighted { kind, by: by.to_string(), rows, frames: portable.frames, total, samples, runs, per_run, untimed: sides.iter().any(|s| s.untimed), selection: String::new() }
 }
 
 impl Weighted {
+    /// The 95% interval of a row's change from sampling alone: each side's variance from its own
+    /// sampler (`Weight`), in the view's unit per run. A side with no sample is not certain to be
+    /// zero: it counts two samples' variance of the other side, which puts the line where an exact
+    /// binomial test does for equal samples (0 against 5 samples, p ≈ 0.06, reads as noise; 0 against
+    /// 6, p ≈ 0.03, does not). One launch per side: launch-to-launch variation is not in it.
+    fn ci(&self, row: &Row) -> Option<f64> {
+        if !self.kind.sampled() {
+            return None;
+        }
+        let scale = self.kind.scale();
+        let var = |s: usize, o: usize| {
+            let raw = if row.n[s] > 0 { row.var[s] } else if row.n[o] > 0 { 2.0 * row.var[o] / row.n[o] as f64 } else { 0.0 };
+            raw * scale * scale / (self.runs[s] * self.runs[s])
+        };
+        Some(1.96 * (var(0, 1) + var(1, 0)).sqrt())
+    }
+
     /// A row's stacks where its change concentrated: the largest changes in the row's direction, each
     /// at least 5% of the row's change.
     fn concentrated<'r>(&self, row: &'r Row, n: usize) -> Vec<(f64, [f64; 2], &'r [u32])> {
@@ -291,21 +361,30 @@ impl Weighted {
     }
 
     fn noise(&self, row: &Row) -> bool {
-        row.ci(self.kind.sampled()).is_some_and(|ci| row.delta().abs() <= ci)
+        self.ci(row).is_some_and(|ci| row.delta().abs() <= ci)
     }
 
     fn output(&self, a: &Rec, b: &Rec, top: usize) -> Output {
         let k = self.kind;
         let runs = |s: usize| format!("{:.0}", self.runs[s]);
-        let per = if self.runs_known { format!("per run ({} and {} measured runs)", runs(0), runs(1)) } else { "per recording (runs unknown)".to_string() };
-        let mut text = format!("{} by {} · base {} → head {} · {per}", k.what(), self.by, a.id, b.id);
+        let per = if self.untimed {
+            "per recording: these native samples carry no times and cover the whole capture (launch, warmup runs and resets included), so no run count divides them".to_string()
+        } else if self.per_run {
+            format!("per run ({} and {} measured runs)", runs(0), runs(1))
+        } else {
+            "per recording (one side's run count is unknown, so neither is divided)".to_string()
+        };
+        let mut text = format!("{} by {} · base {} → head {}", k.what(), self.by, a.id, b.id);
+        if !self.selection.is_empty() {
+            text += &format!(" · {}", self.selection);
+        }
         if k.sampled() {
             text += &format!(" · {} and {} samples", self.samples[0], self.samples[1]);
         }
-        text += &format!("\n  {:>10}  {:>10}  {:>11}  {:>9}  {}\n", "base", "head", "Δ", if k.sampled() { "±95%" } else { "" }, self.by);
+        text += &format!(" · {per}\n  {:>10}  {:>10}  {:>11}  {:>9}  {}\n", "base", "head", "Δ", if k.sampled() { "±95%" } else { "" }, self.by);
         let mut rows_json = Vec::new();
         for row in self.rows.iter().take(top) {
-            let ci = row.ci(k.sampled());
+            let ci = self.ci(row);
             let noise = self.noise(row);
             text += &format!(
                 "{} {:>10}  {:>10}  {:>11}  {:>9}  {}{}\n",
@@ -348,13 +427,14 @@ impl Weighted {
             text += &format!("… {} more rows (--top)\n", self.rows.len() - top);
         }
         text += &format!("total     {} → {} ({}){}\n", k.show(self.total[0]), k.show(self.total[1]), k.signed(self.total[1] - self.total[0]), if k == Kind::Cpu { ", idle left out" } else { "" });
-        text += if k.sampled() {
-            "~ within sampling noise: the change is inside its 95% interval from the two sides' sample counts. One profiled launch per side: the interval covers sampling only, not launch-to-launch variation\n"
-        } else {
-            "traced: every forced layout and recalc in the measured runs counted, one launch per side (no interval across launches)\n"
+        text += match k {
+            Kind::Cpu => "~ within sampling noise: the change is inside its 95% interval from sampling (each sample weighs the time to the next). One profiled launch per side: the interval covers sampling only, not launch-to-launch variation\n",
+            Kind::Native => "~ within sampling noise: the change is inside its 95% interval from sampling (one interval per sample). One profiled launch per side: the interval covers sampling only, not launch-to-launch variation\n",
+            Kind::Alloc => "~ within sampling noise: the change is inside its 95% interval from V8's allocation sampling (a large allocation is always sampled, a small one stands for the sampling interval). One profiled launch per side: the interval covers sampling only, not launch-to-launch variation\n",
+            Kind::Layout => "traced: every forced layout and recalc in the measured runs counted, one launch per side (no interval across launches)\n",
         };
         let json = json!({
-            "view": k.view(), "what": k.what(), "by": self.by, "unit": k.unit(), "sampled": k.sampled(), "per_run": self.runs_known,
+            "view": k.view(), "what": k.what(), "by": self.by, "unit": k.unit(), "sampled": k.sampled(), "per_run": self.per_run, "untimed": self.untimed, "selection": self.selection,
             "base": { "recording": a.id, "runs": self.runs[0], "samples": self.samples[0], "total": self.total[0] },
             "head": { "recording": b.id, "runs": self.runs[1], "samples": self.samples[1], "total": self.total[1] },
             "total_delta": self.total[1] - self.total[0], "rows_total": self.rows.len(), "rows": rows_json,
@@ -365,7 +445,8 @@ impl Weighted {
 
 /// An experiment series' insights: what moved most between the base and head profiled launches (CPU
 /// self time, forced layout and allocations by function, per run, outside sampling noise), then the
-/// head recording's own insights. Each side's sources load once, both sides at once.
+/// head recording's own insights. Each side's sources load once, both sides at once. A view that is
+/// not per run on both sides (untimed native samples, an unknown run count) names no mover.
 pub fn series_insights(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Result<Output> {
     std::thread::scope(|s| {
         s.spawn(|| base.preload(&ATTRIBUTION_PARTS, true, true, false));
@@ -374,7 +455,11 @@ pub fn series_insights(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Result
     let mut text = String::new();
     let mut movers = Vec::new();
     for kind in [Kind::hotspots(base, head, false), Kind::Layout, Kind::Alloc] {
-        let Ok(d) = weighted(base, head, kind, "function", plan_runs) else { continue };
+        let (Ok(a), Ok(b)) = (side(base, kind, plan_runs, None), side(head, kind, plan_runs, None)) else { continue };
+        let d = weighted([a, b], kind, "function");
+        if !d.per_run {
+            continue;
+        }
         let floor = if kind == Kind::Alloc { 64.0 * 1024.0 } else { 1.0 };
         // A CPU profile's pseudo-frames, `(program)` and `(garbage collector)`, name no function to change.
         let pseudo = |r: &Row| kind == Kind::Cpu && r.at == "(native)" && r.name.starts_with('(');
@@ -384,7 +469,7 @@ pub fn series_insights(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Result
             text += &format!("i {line}\n");
             movers.push(json!({
                 "kind": kind.what(), "function": format!("{} {at}", row.name), "base_per_run": row.v[0], "head_per_run": row.v[1], "unit": kind.unit(), "title": line,
-                "ci95": row.ci(kind.sampled()),
+                "ci95": d.ci(row),
                 "handles": [format!("strobe query {}..{} {}", base.id, head.id, kind.view()), format!("strobe query {} {}", head.id, kind.view())],
             }));
         }
@@ -402,7 +487,7 @@ pub fn series_insights(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Result
 pub fn diff_tree(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Value {
     let mut out = json!({});
     for (name, kind) in [("cpu", Kind::hotspots(base, head, false)), ("alloc", Kind::Alloc)] {
-        if let (Ok(a), Ok(b)) = (side(base, kind, plan_runs), side(head, kind, plan_runs)) {
+        if let (Ok(a), Ok(b)) = (side(base, kind, plan_runs, None), side(head, kind, plan_runs, None)) {
             out[name] = tree([a, b], kind);
         }
     }
@@ -418,18 +503,21 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
         v: [f64; 2],
         kids: HashMap<u32, usize>,
     }
+    // Per run only when both sides know their runs (untimed native samples never do).
+    let per_run = sides.iter().all(|s| s.runs.is_some());
+    let runs = sides.each_ref().map(|s| if per_run { s.runs.unwrap_or(1).max(1) as f64 } else { 1.0 });
     let mut portable = Portable::default();
     let mut nodes = vec![Node { frame: u32::MAX, parent: usize::MAX, v: [0.0; 2], kids: HashMap::new() }];
     for (s, side) in sides.iter().enumerate() {
         let ids = portable.ids(side.stacks);
-        for (stack, w, _) in &side.stacks.weights {
-            if stack.last().is_none_or(|&i| skipped(&side.stacks.frames[i as usize].name)) {
+        for wt in &side.stacks.weights {
+            if wt.stack.last().is_none_or(|&i| skipped(&side.stacks.frames[i as usize].name)) {
                 continue;
             }
-            let per = w * kind.scale() / side.runs;
+            let per = wt.w * kind.scale() / runs[s];
             let mut at = 0;
             nodes[0].v[s] += per;
-            for &i in stack {
+            for &i in &wt.stack {
                 let f = ids[i as usize];
                 at = match nodes[at].kids.get(&f) {
                     Some(&k) => k,
@@ -477,7 +565,7 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
         kept.push(json!([f, if i == 0 { -1 } else { index[n.parent] as i64 }, round(n.v[0]), round(n.v[1])]));
     }
     json!({
-        "what": kind.what(), "unit": kind.unit(), "runs": [sides[0].runs, sides[1].runs], "per_run": sides[0].runs_known && sides[1].runs_known,
+        "what": kind.what(), "unit": kind.unit(), "runs": runs, "per_run": per_run, "untimed": sides.iter().any(|s| s.untimed),
         "floor": floor, "nodes_total": nodes.len(),
         "frames": frames.iter().map(|&f| json!(portable.frames[f as usize])).collect::<Vec<_>>(),
         "nodes": kept,
@@ -562,13 +650,21 @@ fn threads(a: &Rec, b: &Rec, top: usize) -> Result<Output> {
     let native = |r: &Rec| r.dir.join("threads.json").is_file();
     let (mut text, mut json);
     if native(a) && native(b) {
+        // Wakes only where the OS counts them per thread (macOS counts them per process: `—`). The
+        // CPU of threads that exited during a run is a row of its own, as in `query <rec> threads`.
+        const EXITED: &str = "(threads that exited during a run)";
         let read = |r: &Rec| -> Result<(ByName, ByName)> {
             let (mut cpu, mut wakes) = (BTreeMap::new(), BTreeMap::new());
             for t in crate::store::read_json(&r.dir.join("threads.json"))?.as_array().into_iter().flatten() {
                 let module = t["module"].as_str().map(|m| format!(" ({})", m.rsplit(['\\', '/']).next().unwrap_or(m))).unwrap_or_default();
                 let key = format!("{}{module} [{}]", t["name"].as_str().unwrap_or("(unnamed)"), t["origin"].as_str().unwrap_or("?"));
                 *cpu.entry(key.clone()).or_default() += t["cpu_ms_per_run"].as_f64().unwrap_or(0.0);
-                *wakes.entry(key).or_default() += t["wakes_per_s"].as_f64().unwrap_or(0.0);
+                if let Some(w) = t["wakes_per_s"].as_f64() {
+                    *wakes.entry(key).or_default() += w;
+                }
+            }
+            if let Some(gone) = super::native_threads(&r.dir, usize::MAX)?.json["exited_ms_per_run"].as_f64() {
+                cpu.insert(EXITED.into(), gone);
             }
             Ok((cpu, wakes))
         };
@@ -578,9 +674,11 @@ fn threads(a: &Rec, b: &Rec, top: usize) -> Result<Output> {
         text += &format!("  {:>10}  {:>10}  {:>11}  {:>17}  thread (started in) [whose]\n", "base", "head", "Δ", "wakes/s");
         let mut rows_json = Vec::new();
         for (k, x, y) in rows.iter().take(top) {
-            let (u, v) = (wa.get(k).copied().unwrap_or(0.0), wb.get(k).copied().unwrap_or(0.0));
+            let (u, v) = (wa.get(k).copied(), wb.get(k).copied());
             let ms = |v: f64| fmt::value(v, "ms");
-            text += &format!("  {:>10}  {:>10}  {:>11}  {:>17}  {k}\n", ms(*x), ms(*y), signed(y - x, &ms), format!("{} → {}", fmt::value(u, "count"), fmt::value(v, "count")));
+            let w = |x: Option<f64>| x.map_or("—".to_string(), |x| fmt::value(x, "count"));
+            let wakes = if k == EXITED { String::new() } else { format!("{} → {}", w(u), w(v)) };
+            text += &format!("  {:>10}  {:>10}  {:>11}  {:>17}  {k}\n", ms(*x), ms(*y), signed(y - x, &ms), wakes);
             rows_json.push(json!({ "thread": k, "base_cpu_ms_per_run": x, "head_cpu_ms_per_run": y, "delta_cpu_ms": y - x, "base_wakes_per_s": u, "head_wakes_per_s": v }));
         }
         json = json!({ "native": true, "rows": rows_json });

@@ -84,7 +84,7 @@ pub fn totals(r: &Value) -> Vec<(String, f64)> {
 /// `query <rec> memory` of a native recording: one stored reading by process (default) or by part,
 /// with the GPU memory the sampler read (`gpu.vram`, `gpu.shared`) beside it.
 pub fn view(r: &Value, label: &str, by: &str, top: usize, values: &Value) -> (String, Value) {
-    let b = crate::app::fmt::bytes;
+    let b = crate::fmt::bytes;
     let mut text = format!("memory by {by} · {label}{}\n", r["label"].as_str().map(|l| format!(" · {l}")).unwrap_or_default());
     let procs = r["processes"].as_array().cloned().unwrap_or_default();
     if procs.is_empty() {

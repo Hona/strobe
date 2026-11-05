@@ -684,7 +684,10 @@ pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, re
             Some((hr - br, hs - bs, hc - bc, row))
         })
         .collect();
-    rows.sort_by(|a, b| b.0.abs().cmp(&a.0.abs()).then(b.1.abs().cmp(&a.1.abs())).then(b.2.abs().cmp(&a.2.abs())));
+    // Equal changes in class order: the classes come from a hash map, whose order changes per run.
+    rows.sort_by(|a, b| {
+        b.0.abs().cmp(&a.0.abs()).then(b.1.abs().cmp(&a.1.abs())).then(b.2.abs().cmp(&a.2.abs())).then_with(|| a.3["class"].as_str().cmp(&b.3["class"].as_str())).then_with(|| a.3["location"].to_string().cmp(&b.3["location"].to_string()))
+    });
     let changed = rows.len();
     let totals = |s: &Snapshot| (s.ntype.len() as i64, s.size.iter().map(|&x| x as i64).sum::<i64>());
     let ((bn, bs), (hn, hs)) = (totals(base), totals(head));

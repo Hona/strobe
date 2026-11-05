@@ -6098,8 +6098,8 @@ fn render(r: &Value) -> String {
             );
         }
         out.push('\n');
-        let column = |n: &str| n.chars().take(10).collect::<String>();
-        out += &format!("{}{}{}{}{}{}\n", fmt::pad("metric", 28), fmt::pad(&column(bn), 11), fmt::pad(&column(hn), 11), fmt::pad("Δ", 9), fmt::pad("CI", 18), "verdict");
+        // Columns as wide as their widest cell: a long value (`480.3 M instr`) or side name keeps the rest in line.
+        let mut table: Vec<Vec<String>> = vec![vec!["metric".into(), bn.to_string(), hn.to_string(), "Δ".into(), "CI".into(), "verdict".into()]];
         let mut rows = vec![(true, s["primary"].clone())];
         rows.extend(s["secondaries"].as_array().cloned().unwrap_or_default().into_iter().map(|c| (false, c)));
         let descriptive = s["descriptive"].as_array().cloned().unwrap_or_default();
@@ -6107,33 +6107,27 @@ fn render(r: &Value) -> String {
         rows.extend(descriptive.into_iter().map(|c| (false, c)));
         for (i, (primary, c)) in rows.into_iter().enumerate() {
             if i == tested {
-                out += &fmt::pad("  · descriptive (not tested)", 28);
-                out.push('\n');
+                table.push(vec!["  · descriptive (not tested)".into()]);
             }
             let name = c["metric"].as_str().unwrap_or("");
             // A percentage compared as a difference is in percentage points (`cells`).
             let (b, h, delta, ci) = cells(&c);
-            out += &format!(
-                "{}{}{}{}{}{}\n",
-                fmt::pad(&format!("{} {name}", if primary { "★" } else { " " }), 28),
-                fmt::pad(&b, 11),
-                fmt::pad(&h, 11),
-                fmt::pad(&delta, 9),
-                fmt::pad(&ci, 18),
-                c["verdict"].as_str().unwrap_or("")
-            );
+            table.push(vec![format!("{} {name}", if primary { "★" } else { " " }), b, h, delta, ci, c["verdict"].as_str().unwrap_or("").to_string()]);
         }
+        out += &fmt::table(&table, &[false, true, true, true, false, false], "", 2);
         if let Some(per) = s["per_side"].as_object().filter(|_| sides) {
             let names: std::collections::BTreeSet<&String> = per.values().filter_map(Value::as_object).flat_map(|o| o.keys()).collect();
             if !names.is_empty() {
-                out += &format!("\n{}{}{}  per implementation, not compared (one engine's own)\n", fmt::pad("", 28), fmt::pad(&column(bn), 11), fmt::pad(&column(hn), 11));
+                let mut per_table: Vec<Vec<String>> = vec![vec![String::new(), bn.to_string(), hn.to_string(), "per implementation, not compared (one engine's own)".into()]];
                 for name in names {
                     let cell = |role: &str| {
                         let m = &per[role][name.as_str()];
-                        m["median"].as_f64().map_or("—".to_string(), |x| fmt::value(x, m["unit"].as_str().unwrap_or("")))
+                        m["median"].as_f64().map_or("-".to_string(), |x| fmt::value(x, m["unit"].as_str().unwrap_or("")))
                     };
-                    out += &format!("{}{}{}\n", fmt::pad(&format!("  {name}"), 28), fmt::pad(&cell("base"), 11), fmt::pad(&cell("head"), 11));
+                    per_table.push(vec![format!("  {name}"), cell("base"), cell("head"), String::new()]);
                 }
+                out.push('\n');
+                out += &fmt::table(&per_table, &[false, true, true, false], "", 2);
             }
         }
         if sides {

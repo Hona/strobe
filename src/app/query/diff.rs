@@ -755,14 +755,16 @@ fn frame_values(r: &Rec) -> Result<Vec<(&'static str, f64, &'static str)>> {
 
 fn frames(a: &Rec, b: &Rec) -> Result<Output> {
     let (x, y) = (frame_values(a)?, frame_values(b)?);
-    let mut text = format!("frames · base {} → head {}\n  {:>10}  {:>10}  {:>11}\n", a.id, b.id, "base", "head", "Δ");
+    let mut text = format!("frames · base {} → head {}\n", a.id, b.id);
+    let mut table: Vec<Vec<String>> = vec![["base", "head", "Δ", ""].map(String::from).to_vec()];
     let mut rows = Vec::new();
     for ((name, u, unit), (_, v, _)) in x.iter().zip(&y) {
         let show = |x: f64| fmt::value(x, unit);
         let change = |x: f64| fmt::value(x, if *unit == "%" { "pp" } else { unit });
-        text += &format!("  {:>10}  {:>10}  {:>11}  {name}\n", show(*u), show(*v), if u.is_finite() && v.is_finite() { signed(v - u, &change) } else { "—".into() });
+        table.push(vec![show(*u), show(*v), if u.is_finite() && v.is_finite() { signed(v - u, &change) } else { "—".into() }, name.to_string()]);
         rows.push(json!({ "name": name, "unit": unit, "base": u, "head": v, "delta": v - u }));
     }
+    text += &fmt::table(&table, &[true, true, true, false], "  ", 2);
     text += &perturbed_note(a, b);
     text += "one recording per side, no interval: a verdict needs strobe bench\n";
     Ok(Output::new(text, json!({ "base": a.id, "head": b.id, "rows": rows })))
@@ -779,7 +781,8 @@ fn summary(a: &Rec, b: &Rec) -> Result<Output> {
     keys.sort();
     keys.dedup();
     let side = |r: &Rec| format!("{} ({}, {} runs)", r.id, r.meta["probes"].as_str().unwrap_or("?"), r.runs().map_or("?".to_string(), |n| n.to_string()));
-    let mut text = format!("summary · base {} → head {}\n  {:>12}  {:>12}  {:>12}  {:>8}\n", side(a), side(b), "base", "head", "Δ", "Δ%");
+    let mut text = format!("summary · base {} → head {}\n", side(a), side(b));
+    let mut table: Vec<Vec<String>> = vec![["base", "head", "Δ", "Δ%", ""].map(String::from).to_vec()];
     let mut rows = Vec::new();
     for k in keys {
         let unit = crate::model::metric(k).map(|m| m.unit).unwrap_or("");
@@ -788,9 +791,10 @@ fn summary(a: &Rec, b: &Rec) -> Result<Output> {
         // A percentage changes by percentage points.
         let change = |x: f64| fmt::value(x, if unit == "%" { "pp" } else if unit.is_empty() { "count" } else { unit });
         let rel = if u.is_finite() && v.is_finite() && u != 0.0 { v / u - 1.0 } else { f64::NAN };
-        text += &format!("  {:>12}  {:>12}  {:>12}  {:>8}  {k}\n", show(u), show(v), if u.is_finite() && v.is_finite() { signed(v - u, &change) } else { "—".into() }, fmt::pct(rel));
+        table.push(vec![show(u), show(v), if u.is_finite() && v.is_finite() { signed(v - u, &change) } else { "—".into() }, fmt::pct(rel), k.clone()]);
         rows.push(json!({ "metric": k, "unit": unit, "base": u, "head": v, "delta": v - u, "relative": rel }));
     }
+    text += &fmt::table(&table, &[true, true, true, true, false], "  ", 2);
     text += &perturbed_note(a, b);
     text += "one recording per side, no interval: a verdict needs strobe bench\n";
     Ok(Output::new(text, json!({ "base": a.id, "head": b.id, "rows": rows })))

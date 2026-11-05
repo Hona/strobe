@@ -3141,7 +3141,10 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   files) loads, and the schemas accept them and every local result.json (296); 20,000 ids in one
   process were distinct; a reader racing 1,500 rewrites of a 200 KB result.json read 273 torn files
   with `std::fs::write` and none through `store::write_json`; a query whose deadline was cut to
-  300 ms for the check was killed and left no trace_processor running.
+  300 ms for the check was killed and left no trace_processor running. On vps (Linux) and air
+  (macOS 27): the state folder is `0700` (and `run/` on air), a mistyped key fails with its line,
+  and a planted hot function's native stacks resolve 100% with its line (vps: from zlib-compressed
+  DWARF sections, which the context now owns instead of leaking; air: from its dSYM).
 - The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or
   `score`, the kind is `exact`, or a value is at most 0 (then differences, with the bound
   max(bound × base, 0.5)). Stable exact counters skip the test entirely (§9.3).

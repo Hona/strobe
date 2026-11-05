@@ -373,8 +373,9 @@ pub fn energy_counters() -> bool {
 /// joins it with its own tree (an XPC service launchd started for an app in it), when it started no
 /// earlier than that process; one responsible for itself or to anything outside the trees (another
 /// app, a shared system daemon, the terminal both were run from) never joins. `zombie_roots`: a
-/// root that exited and is not reaped yet still roots its tree (to end what it left: its children
-/// went to launchd, its services stay responsible to its pid), for `kill_set` alone.
+/// root that exited and is not reaped yet still roots its tree, joined by its children that went to
+/// launchd and its services by their remembered responsible process (`responsible_pids`), for
+/// `kill_set` alone.
 fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
@@ -407,7 +408,7 @@ fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
     if out.is_empty() {
         return out;
     }
-    let responsible = responsible_pids(all);
+    let responsible = responsible_pids(all, zombie_roots);
     // Until no process joins: one that joined may hold a process responsible for itself (a
     // disclaimed launch), whose services join after it.
     loop {
@@ -436,9 +437,12 @@ fn responsible_for() -> Option<unsafe extern "C" fn(libc::pid_t) -> libc::pid_t>
 /// launchd is, or the call fails. macOS fixes it when a process starts, but the start time is the
 /// fork's, and a process may still change it at its exec (a disclaimed launch between fork and
 /// exec): so it is read again during a process's first 2 s, and a failed read is never kept.
-fn responsible_pids(all: &[Bsd]) -> Vec<Option<u32>> {
+/// macOS answers a process's own pid once its responsible process has exited, reaped or not, so
+/// `remembered` (for `kill_set`) gives a process's last other answer: what an exited app left.
+fn responsible_pids(all: &[Bsd], remembered: bool) -> Vec<Option<u32>> {
     use std::time::{Duration, Instant};
-    type Seen = HashMap<(u32, u64), (Option<u32>, Instant)>;
+    /// (answer, first seen, last answer naming another process).
+    type Seen = HashMap<(u32, u64), (Option<u32>, Instant, Option<u32>)>;
     static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
     let Some(f) = responsible_for() else { return vec![None; all.len()] };
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -447,21 +451,26 @@ fn responsible_pids(all: &[Bsd]) -> Vec<Option<u32>> {
     let out = all
         .iter()
         .map(|p| {
-            let first = match old.get(&(p.pid, p.start)) {
-                Some(&(r, first)) if first.elapsed() >= Duration::from_secs(2) => {
-                    now.insert((p.pid, p.start), (r, first));
-                    return r;
+            let key = (p.pid, p.start);
+            let (first, last) = match old.get(&key) {
+                Some(&e) if e.1.elapsed() >= Duration::from_secs(2) => {
+                    now.insert(key, e);
+                    return if remembered { e.0.or(e.2) } else { e.0 };
                 }
-                Some(&(_, first)) => first,
-                None => Instant::now(),
+                Some(&(_, first, last)) => (first, last),
+                None => (Instant::now(), None),
             };
             let r = unsafe { f(p.pid as libc::pid_t) };
             if r < 0 {
-                return None;
+                if let Some(&e) = old.get(&key) {
+                    now.insert(key, e);
+                }
+                return if remembered { last } else { None };
             }
             let r = (r > 1 && r as u32 != p.pid).then_some(r as u32);
-            now.insert((p.pid, p.start), (r, first));
-            r
+            let last = r.or(last);
+            now.insert(key, (r, first, last));
+            if remembered { r.or(last) } else { r }
         })
         .collect();
     *seen = Some(now);
@@ -598,7 +607,9 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
 /// What `host::kill_tree` ends: `tree_pids`, and when `root` has exited but is not reaped (a launch
 /// strobe still owns), what it left running: processes responsible to it (its XPC services, its
 /// children that went to launchd) that started no earlier than it. Its pid cannot name another
-/// process while it is unreaped.
+/// process while it is unreaped. macOS answers such a process's own pid once the root has exited, so
+/// this goes by the last answer strobe read while the root ran: a process the root started and left
+/// between two reads of the set is not found.
 pub fn kill_set(root: u32) -> Vec<u32> {
     let all = all_bsd();
     tree_of(&all, &[root], true).into_iter().map(|i| all[i].pid).collect()

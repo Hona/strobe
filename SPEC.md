@@ -2522,7 +2522,9 @@ Strobe launches any Electron app the same way, with no change to the app:
   until strobe ends it, so its pid still roots what it left running (the processes responsible to
   it that started no earlier, its children that went to launchd), which are ended before it is
   reaped; otherwise its web content process could outlive it and write the app's Library folders
-  again after strobe removed them. A process set never holds an exited process. A bare executable keeps
+  again after strobe removed them. macOS answers such a process's own pid once the app has exited,
+  reaped or not, so strobe goes by the last answer it read while the app ran: a process the app
+  started and left between two reads of its set is not found this way (a stamped one still is). A process set never holds an exited process. A bare executable keeps
   strobe's responsible process, as when a person runs it from a terminal: its XPC services are
   responsible to that process, shared with everything else run from there, so no set can tell them
   apart and they are not counted. A process's stamp is read once per pid and start time; one that shows none is read

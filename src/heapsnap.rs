@@ -710,9 +710,12 @@ pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, re
 }
 
 /// A class name as two launches share it: origins (`Window (global*) / http://127.0.0.1:61610`) become
-/// `<origin>`, and an element's attributes (`Detached <button id="menu-cl-1048" …>`, ids that differ per
-/// run) are dropped down to its tag.
+/// `<origin>`, an element's attributes (`Detached <button id="menu-cl-1048" …>`, ids that differ per
+/// run) are dropped down to its tag, and a node id V8 puts in a name (`system / Context / scope @228831`)
+/// goes.
 fn portable_name(name: &str) -> String {
+    let name = without_node_ids(name);
+    let name = name.as_str();
     if let Some(tag) = name.strip_prefix("Detached <").or_else(|| name.strip_prefix('<')) {
         let tag: String = tag.chars().take_while(|c| !c.is_whitespace() && *c != '>').collect();
         return format!("{}<{tag}>", if name.starts_with("Detached") { "Detached " } else { "" });
@@ -724,6 +727,24 @@ fn portable_name(name: &str) -> String {
         out.push_str("<origin>");
         let after = &rest[i + 3..];
         rest = &after[after.find(|c: char| c == '/' || c.is_whitespace() || c == ')').unwrap_or(after.len())..];
+    }
+    out + rest
+}
+
+/// `name` without ` @<digits>` words: heap node ids, which differ per launch.
+fn without_node_ids(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(i) = rest.find(" @") {
+        let digits = rest[i + 2..].bytes().take_while(u8::is_ascii_digit).count();
+        let end = i + 2 + digits;
+        // A whole word of digits only: `@228831`, not `@scope` or `@12px`.
+        if digits > 0 && rest[end..].chars().next().is_none_or(|c| c.is_whitespace() || c == ')' || c == ',') {
+            out.push_str(&rest[..i]);
+        } else {
+            out.push_str(&rest[..end]);
+        }
+        rest = &rest[end..];
     }
     out + rest
 }

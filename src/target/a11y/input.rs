@@ -43,33 +43,9 @@ fn vks(m: Mods) -> Vec<u16> {
     m.keys().into_iter().map(named_vk).collect()
 }
 
-/// The virtual key of a named key.
+/// The virtual key of a named key: the key table's, which a page's `keyCode` shares.
 fn named_vk(n: Named) -> u16 {
-    match n {
-        Named::Enter => VK_RETURN,
-        Named::Tab => VK_TAB,
-        Named::Escape => VK_ESCAPE,
-        Named::Backspace => VK_BACK,
-        Named::Delete => VK_DELETE,
-        Named::Insert => VK_INSERT,
-        Named::Home => VK_HOME,
-        Named::End => VK_END,
-        Named::PageUp => VK_PRIOR,
-        Named::PageDown => VK_NEXT,
-        Named::ArrowUp => VK_UP,
-        Named::ArrowDown => VK_DOWN,
-        Named::ArrowLeft => VK_LEFT,
-        Named::ArrowRight => VK_RIGHT,
-        Named::Space => VK_SPACE,
-        Named::Shift => VK_SHIFT,
-        Named::Control => VK_CONTROL,
-        Named::Alt => VK_MENU,
-        Named::Meta => VK_LWIN,
-        Named::ContextMenu => VK_APPS,
-        Named::CapsLock => VK_CAPITAL,
-        Named::F(n) => VK_F1 + n as u16 - 1,
-        Named::Letter(c) | Named::Digit(c) => c as u16,
-    }
+    super::keys::dom(n).vk
 }
 
 /// Keys whose scan code has the 0xE0 prefix (the lParam's extended bit).

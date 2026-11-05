@@ -1,13 +1,24 @@
 // @hona/strobe: write benchmarks as small TypeScript files (SPEC §9.6).
 
 /**
- * A visible element: a selector, or one whose text contains `text` (or is exactly it, trimmed). `index` (native apps)
- * takes that match, 0-based in tree order, among identical ones (six check boxes all named "checkbutton").
+ * A visible element, in one grammar for pages and native apps: a base (on a page a CSS selector, `>>>` crossing
+ * shadow roots; on a native app an element key or key path, `"nav-history"`, `"slider/knob"`), then filters:
+ * `role=<role>` (ARIA's role names), `text=<text>` (a substring of its text, label or value; quoted,
+ * `text="General"`, all of it, trimmed), `index=<n>` (that match, 0-based in tree order, among identical ones: six
+ * check boxes all named "checkbutton") and a `:focus` suffix. `"role=heading text=\"General\""`,
+ * `".row text=Draft index=1"`. The object form says the same, its `selector` in the string grammar.
  */
-export type Selector = string | { selector: string; text?: string; exact?: boolean; index?: number }
+export type Selector = string | { selector?: string; role?: string; text?: string; exact?: boolean; index?: number; focus?: boolean }
 
-/** A page's CSS selector; on native apps a {@link Selector} object too. */
+/** An element a call acts on: a {@link Selector}. */
 export type Element = Selector
+
+/** How a click presses: the button, the modifiers held around it (`"Shift"`, `"ControlOrMeta"`), and 2 for a double click, 3 for a triple. */
+export interface ClickOptions extends Options {
+  button?: "left" | "right" | "middle"
+  modifiers?: ("Control" | "Shift" | "Alt" | "Meta" | "ControlOrMeta")[]
+  count?: 1 | 2 | 3
+}
 
 /** When an input call resolves: `"idle"` (no DOM change or long frame for 300 ms), `"frame"` (after next paint), or a visible element. */
 export type Until = "idle" | "frame" | Selector
@@ -23,21 +34,22 @@ export interface Options {
 /**
  * Drives the target. On a native target strobe drives the app through the OS's accessibility tree (UI Automation,
  * macOS AX, Linux AT-SPI) and input of the OS's own (Windows: posted messages, the app never takes focus; macOS:
- * Quartz events posted to the app, which comes to the front for keys; Linux: XTest): selectors are accessibility ids (an element key,
- * `"nav-history"`, or a key path, `"slider/knob"`), `role=button`, `text=General`, with a `:focus` suffix.
- * `goto` and `eval` are page-only; `act` and `query` are native-only.
+ * Quartz events posted to the app, which comes to the front for keys; Linux: XTest). Selectors are one grammar on
+ * both ({@link Selector}): their base is CSS on a page, an accessibility id on a native app. Keys are Playwright's
+ * names from one table on every target (`"F9"`, `"PageUp"`, `"Delete"`, `"Control+Shift+P"`): a named key is that
+ * key, never its name typed as text. `goto` and `eval` are page-only; `act` and `query` are native-only.
  */
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
   goto(url: string, opts?: Options): Promise<void>
-  click(selector: Element, opts?: Options): Promise<void>
+  click(selector: Element, opts?: ClickOptions): Promise<void>
   /** Moves the pointer onto `selector` without a click: reveals hover-only controls, or parks the pointer. */
   hover(selector: Element, opts?: Options): Promise<void>
   /** Moves the pointer to a point in the viewport (CSS pixels), such as away from anything that reacts to hover. */
   move(x: number, y: number, opts?: Options): Promise<void>
-  /** Focuses `selector` (clicking it if focus is elsewhere), then sends one key event per character. */
+  /** Focuses `selector` (clicking it if focus is elsewhere; `""` types where focus is), then sends one key event per character. */
   type(selector: Element, text: string, opts?: Options & { delay?: number }): Promise<void>
-  /** A key or chord: `"Enter"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. Native targets: `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
+  /** A key or chord: `"Enter"`, `"F9"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
   press(key: string, opts?: Options & { selector?: Element }): Promise<void>
   /**
    * Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys).
@@ -62,19 +74,20 @@ export interface Page {
    */
   snapshot(name: string): Promise<void>
   scroll(selector: Element, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
-  /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`. */
+  /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`, with the keys `down` holds (`down("Control")` first: a zoom). */
   wheel(selector: Element, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
   /** Native targets: shows, hides, minimizes, focuses or closes a window (`opts.window`, default the main one). `close` is the title bar's close (the app's own close path). */
   window(action: "show" | "hide" | "minimize" | "focus" | "close", opts?: Options): Promise<void>
   /**
    * Native targets: an accessibility action on an element (UI Automation's patterns): `invoke`, `toggle`, `setValue`
    * (`opts.value`), `expand`, `collapse`, `select`, `scrollIntoView`, `focus`. It skips hit testing and pointer
-   * handling, so it is never an input latency (`interaction.*` refuses a run that only acted).
+   * handling, so it is never an input latency (`interaction.*` refuses a run that only acted). `setValue` reads the value
+   * back and fails when the app did not take it within a second.
    */
-  act(selector: Element, action: string, opts?: Options & { value?: string }): Promise<void>
+  act(selector: Element, action: "invoke" | "toggle" | "setValue" | "expand" | "collapse" | "select" | "scrollIntoView" | "focus", opts?: Options & { value?: string | number }): Promise<void>
   /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled, checked (a switch, check box, radio or toggle button's state; null for others). */
   query(selector: Element, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean; checked: boolean | null }[]>
-  /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM and focus change, so `:focus` works. */
+  /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM, tree and focus change, so `:focus` works. */
   waitFor(selector: Element, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */
   idle(opts?: { timeout?: number }): Promise<void>

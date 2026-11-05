@@ -61,6 +61,7 @@ mod imp {
         /// `down` or `drag` holds with the window it pressed in.
         pointer: Cell<Option<(f64, f64, Target)>>,
         pressed: Cell<Option<(Button, isize)>>,
+        pacer: crate::driver::Pacer,
     }
 
     impl Session {
@@ -76,6 +77,7 @@ mod imp {
                 parked: Cell::new(None),
                 pointer: Cell::new(None),
                 pressed: Cell::new(None),
+                pacer: crate::driver::Pacer::default(),
             })
         }
 
@@ -247,7 +249,7 @@ mod imp {
             match u.as_str() {
                 Some("idle") => self.idle(after, t, presents).map(|_| ()),
                 Some("frame") => self.frame(after, t, presents).map(|_| ()),
-                _ => self.find(&Selector::parse(u)?, opts["window"].as_str(), t).map(|_| ()),
+                _ => self.find(&parse_sel(u)?, opts["window"].as_str(), t).map(|_| ()),
             }
         }
 
@@ -301,7 +303,7 @@ mod imp {
         /// A launch's `until` selector: when strobe began the last read of the app's tree that lacked
         /// it (None when the first read had it) and when it finished the first that had it.
         pub fn appeared(&self, sel: &Value, t: Duration) -> Result<(Option<u64>, u64)> {
-            let sel = Selector::parse(sel)?;
+            let sel = parse_sel(sel)?;
             let deadline = Instant::now() + t;
             let mut lacked = None;
             loop {
@@ -382,7 +384,7 @@ mod imp {
 
         /// Whether a selector matches a visible element within `t`.
         pub fn shows(&self, sel: &Value, t: Duration) -> Result<bool> {
-            match self.find(&Selector::parse(sel)?, None, t) {
+            match self.find(&parse_sel(sel)?, None, t) {
                 Ok(_) => Ok(true),
                 Err(e) if e.code == 124 => Ok(false),
                 Err(e) => Err(e),
@@ -422,7 +424,7 @@ mod imp {
             if no_selector(sel) {
                 return Ok((self.main.get(), None));
             }
-            let (tree, i) = self.find(&Selector::parse(sel)?, o["window"].as_str(), timeout(o))?;
+            let (tree, i) = self.find(&parse_sel(sel)?, o["window"].as_str(), timeout(o))?;
             let top = tree.windows[tree.nodes[i].window];
             let own = tree.nodes[i].hwnd;
             let to = (own != 0 && own != top).then_some(own);
@@ -442,7 +444,7 @@ mod imp {
             let (x0, y0, t0) = if no_selector(sel) {
                 self.pointer.get().ok_or_else(|| Error::usage("page.drag(\"\", …) starts where the pointer is: move it first, or name an element"))?
             } else {
-                let (tree, i) = self.find(&Selector::parse(sel)?, o["window"].as_str(), timeout(o))?;
+                let (tree, i) = self.find(&parse_sel(sel)?, o["window"].as_str(), timeout(o))?;
                 self.aim(&tree, i)?
             };
             let b = Button::parse(o["button"].as_str())?;
@@ -468,10 +470,8 @@ mod imp {
             let steps = (duration / frame).ceil().max(1.0) as u32;
             let start = Instant::now();
             let mut last = 0;
-            let mut late = Duration::ZERO;
             for k in 1..=steps {
-                let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
-                crate::driver::pace(due, &mut late);
+                self.pacer.wait(start + Duration::from_secs_f64(frame * k as f64 / 1e3), Duration::from_secs_f64(frame / 1e3));
                 let (x, y) = point(k as f64 / steps as f64);
                 last = self.pointer_to(x, y, t0.moved(x, y))?;
             }
@@ -501,7 +501,7 @@ mod imp {
         }
 
         fn click(&self, sel: &Value, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
-            let (tree, i) = self.find_enabled(&Selector::parse(sel)?, opts["window"].as_str(), timeout(opts))?;
+            let (tree, i) = self.find_enabled(&parse_sel(sel)?, opts["window"].as_str(), timeout(opts))?;
             let (x, y, t) = self.aim(&tree, i)?;
             let b = Button::parse(opts["button"].as_str())?;
             let mods = Mods::parse_list(&opts["modifiers"])?;
@@ -543,6 +543,10 @@ mod imp {
         opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::from_secs(30))
     }
 
+    fn parse_sel(v: &Value) -> Result<Selector> {
+        Selector::parse(v, a11y::Dialect::Native)
+    }
+
     /// No selector given: `""`, or none at all.
     fn no_selector(sel: &Value) -> bool {
         sel.is_null() || sel.as_str() == Some("")
@@ -560,7 +564,7 @@ mod imp {
                 "click" => self.click(&sel(0), &opts(1), presents, "discrete")?,
                 "hover" => {
                     let o = opts(1);
-                    let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                    let (tree, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     let (x, y, t) = self.aim(&tree, i)?;
                     let at = self.pointer_to(x, y, t)?;
                     self.until(&o, at, presents)?;
@@ -612,7 +616,7 @@ mod imp {
                     // `at`: an element to move onto first, or a point in the main window's client area.
                     match o.get("at") {
                         Some(at @ (Value::String(_) | Value::Object(_))) => {
-                            let (tree, i) = self.find(&Selector::parse(at)?, o["window"].as_str(), timeout(&o))?;
+                            let (tree, i) = self.find(&parse_sel(at)?, o["window"].as_str(), timeout(&o))?;
                             let (x, y, t) = self.aim(&tree, i)?;
                             self.pointer_to(x, y, t)?;
                         }
@@ -638,7 +642,7 @@ mod imp {
                 "scroll" => {
                     let d = opts(1);
                     let o = opts(2);
-                    let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                    let (tree, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     let (x, y, t) = self.aim(&tree, i)?;
                     self.park(x, y)?;
                     self.input(self.poster.move_to(t, 0)?, "pointer", false);
@@ -675,7 +679,7 @@ mod imp {
                         let (x, y) = self.poster.client_point(main, w.client.0 as f64 / w.scale() / 2.0, w.client.1 as f64 / w.scale() / 2.0)?;
                         (x, y, self.poster.target(&self.pids.borrow(), x, y)?)
                     } else {
-                        let (tree, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                        let (tree, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                         self.aim(&tree, i)?
                     };
                     self.park(x, y)?;
@@ -691,7 +695,7 @@ mod imp {
                 }
                 "act" => {
                     let o = opts(2);
-                    let (_, i) = self.find(&Selector::parse(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                    let (_, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
                     // `{ value: 0.2 }` is as good as `{ value: "0.2" }` (a number was dropped as "").
                     let value = match &o["value"] {
                         Value::Number(n) => Some(n.to_string()),
@@ -705,22 +709,13 @@ mod imp {
                 "query" => {
                     let o = opts(1);
                     let tree = self.snapshot(o["window"].as_str())?;
-                    let sel = Selector::parse(&sel(0))?;
+                    let sel = parse_sel(&sel(0))?;
                     let found: Vec<Value> = tree.find(&sel).into_iter().map(|i| tree.describe(i)).collect();
                     return Ok(Value::Array(found));
                 }
                 "waitFor" => {
                     let o = opts(1);
-                    let mut sel = match sel(0) {
-                        o @ Value::Object(_) => o,
-                        _ => json!({ "selector": s(0) }),
-                    };
-                    for k in ["text", "exact"] {
-                        if let Some(v) = o.get(k) {
-                            sel[k] = v.clone();
-                        }
-                    }
-                    self.find(&Selector::parse(&sel)?, o["window"].as_str(), timeout(&o))?;
+                    self.find(&parse_sel(&crate::driver::with_text(&sel(0), &o))?, o["window"].as_str(), timeout(&o))?;
                 }
                 "idle" => {
                     self.idle(host::now_ns(), timeout(&opts(0)), presents)?;

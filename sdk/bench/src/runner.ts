@@ -33,26 +33,26 @@ const driver = (call: string, ...args: unknown[]) => request("driver", { call, a
 
 const page = {
   goto: (url: string, o = {}) => driver("goto", url, o),
-  click: (selector: string, o = {}) => driver("click", selector, o),
-  hover: (selector: string, o = {}) => driver("hover", selector, o),
+  click: (selector: unknown, o = {}) => driver("click", selector, o),
+  hover: (selector: unknown, o = {}) => driver("hover", selector, o),
   move: (x: number, y: number, o = {}) => driver("move", x, y, o),
-  type: (selector: string, text: string, o = {}) => driver("type", selector, text, o),
+  type: (selector: unknown, text: string, o = {}) => driver("type", selector, text, o),
   press: (key: string, o = {}) => driver("press", key, o),
   down: (key: string, o = {}) => driver("down", key, o),
   // A path function is sampled every 4 ms of the drag's duration; strobe moves along the samples.
-  drag: (selector: string, path: [number, number][] | ((t: number) => [number, number]), o: { duration?: number } = {}) => {
+  drag: (selector: unknown, path: [number, number][] | ((t: number) => [number, number]), o: { duration?: number } = {}) => {
     if (typeof path !== "function") return driver("drag", selector, path, o)
     const n = Math.max(2, Math.ceil((o.duration ?? 1000) / 4) + 1)
     return driver("drag", selector, Array.from({ length: n }, (_, i) => path(i / (n - 1))), o)
   },
   up: (key: string, o = {}) => driver("up", key, o),
   snapshot: (name: string) => driver("snapshot", name),
-  scroll: (selector: string, delta: object, o = {}) => driver("scroll", selector, delta, o),
-  wheel: (selector: string, delta: object, o = {}) => driver("wheel", selector, delta, o),
+  scroll: (selector: unknown, delta: object, o = {}) => driver("scroll", selector, delta, o),
+  wheel: (selector: unknown, delta: object, o = {}) => driver("wheel", selector, delta, o),
   window: (action: string, o = {}) => driver("window", action, o),
-  act: (selector: string, action: string, o = {}) => driver("act", selector, action, o),
-  query: (selector: string, o = {}) => driver("query", selector, o),
-  waitFor: (selector: string, o = {}) => driver("waitFor", selector, o),
+  act: (selector: unknown, action: string, o = {}) => driver("act", selector, action, o),
+  query: (selector: unknown, o = {}) => driver("query", selector, o),
+  waitFor: (selector: unknown, o = {}) => driver("waitFor", selector, o),
   idle: (o = {}) => driver("idle", o),
   wait: (ms: number) => driver("wait", ms),
   eval: (fn: Function, ...args: unknown[]) => driver("eval", fn.toString(), ...args),

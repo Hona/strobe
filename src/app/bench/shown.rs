@@ -219,7 +219,7 @@ pub(super) fn native(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &s
 /// What a page shows now: its title, address, open dialogs and top headings, and a screenshot.
 pub(super) fn page(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &str, page: &Page) -> Screen {
     let mut screen = Screen::default();
-    match page.eval_timeout(PAGE_SCREEN, Duration::from_secs(5)).ok().and_then(|v| v.as_str().and_then(|t| serde_json::from_str::<Value>(t).ok())) {
+    match crate::driver::screen(page, 6, 0, Duration::from_secs(5)).ok() {
         Some(p) => {
             screen.titles = p["title"].as_str().filter(|t| !t.trim().is_empty()).map(|t| vec![t.trim().to_string()]).unwrap_or_default();
             screen.url = p["url"].as_str().map(str::to_string);
@@ -239,32 +239,11 @@ pub(super) fn page(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &str
     finish(ctx, s, v, pair, at, screen, img)
 }
 
-/// The page's side of `page`: what a person sees at the top of it.
-const PAGE_SCREEN: &str = r#"(() => {
-  const shown = (e) => { const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== "hidden" }
-  const text = (e) => (e.getAttribute("aria-label") || e.innerText || e.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80)
-  const out = []
-  for (const d of document.querySelectorAll("dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]"))
-    if (shown(d)) out.push(text(d.querySelector("h1, h2, h3, [role=heading]") || d))
-  for (const h of document.querySelectorAll("h1, h2, [role=heading][aria-level='1'], [role=heading][aria-level='2']"))
-    if (shown(h)) out.push(text(h))
-  return JSON.stringify({ title: document.title, url: location.href, headings: [...new Set(out.filter(Boolean))].slice(0, 6) })
-})()"#;
-
-/// Whether a CSS selector matches a visible element of the page, within 5 s.
+/// Whether a selector matches a visible element of the page within 5 s, by the driver's own probe
+/// (what a `page.waitFor` would see).
 pub(super) fn page_shows(page: &Page, sel: &Value) -> Result<bool> {
-    let sel = sel.as_str().ok_or_else(|| Error::usage(format!("expect.visible on a page is a CSS selector string, not {sel}")))?;
-    let expr = format!("(() => {{ const e = document.querySelector({}); if (!e) return false; const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 }})()", json!(sel));
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if page.eval_timeout(&expr, Duration::from_secs(5)).map_err(|e| Error::usage(format!("expect.visible {sel:?}: {}", e.message)))? == Value::Bool(true) {
-            return Ok(true);
-        }
-        if Instant::now() >= deadline {
-            return Ok(false);
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
+    let sel = crate::target::a11y::Selector::parse(sel, crate::target::a11y::Dialect::Page)?;
+    crate::driver::shows(page, &sel, Duration::from_secs(5)).map_err(|e| Error::usage(format!("expect.visible {:?}: {}", sel.source, e.message)))
 }
 
 /// A string (a substring) or a RegExp (`{ regex: { source, flags } }`) from the bench file.

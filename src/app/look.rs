@@ -6,24 +6,11 @@
 use super::{Output, fmt, progress};
 use crate::cli::{Args, duration_ms};
 use crate::model::{Error, Result};
+use crate::target::a11y::{Dialect, Selector};
 use crate::target::chromium::{self, Window};
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-
-/// What the page shows: title, address, headings and its visible text, at most `chars` of it.
-fn read_page(chars: usize) -> String {
-    format!(
-        r#"(() => {{
-  const shown = (e) => {{ const r = e.getBoundingClientRect(); return r.width > 0 && r.height > 0 && getComputedStyle(e).visibility !== "hidden" }}
-  const headings = [...document.querySelectorAll("h1, h2, h3, [role=heading], dialog[open], [role=dialog]")].filter(shown)
-    .map((e) => ({{ tag: e.getAttribute("role") || e.tagName.toLowerCase(), text: (e.getAttribute("aria-label") || e.innerText || "").trim().replace(/\s+/g, " ").slice(0, 120) }}))
-    .filter((h) => h.text).slice(0, 30)
-  const text = (document.body?.innerText ?? "").replace(/\n{{3,}}/g, "\n\n").trim()
-  return JSON.stringify({{ title: document.title, url: location.href, headings, text: text.slice(0, {chars}), chars: text.length, ready: document.readyState }})
-}})()"#
-    )
-}
 
 /// A local file is a `file://` address; anything else goes as given.
 fn address(target: &str) -> String {
@@ -50,6 +37,25 @@ fn console_text(args: &Value) -> String {
         .join(" ")
 }
 
+/// The app's executable is not there: says so, and names the newest build of it a bench made (a
+/// directory or git-ref variant's build output, kept in strobe's `builds/out`), to look at instead.
+fn missing(app: &crate::target::isolate::App, profile: Option<&str>) -> Error {
+    let name = app.exe.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    let newest = std::fs::read_dir(crate::host::paths::state_dir().join("builds").join("out"))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|d| d.path().join(&name))
+        .filter_map(|p| Some((std::fs::metadata(&p).ok()?.modified().ok()?, p)))
+        .max();
+    let e = Error::usage(format!("{} does not exist, so there is no {} to look at", app.exe.display(), app.id));
+    let with = profile.map(|id| format!(" --app {id}")).unwrap_or_default();
+    match newest {
+        Some((_, p)) => e.hint(format!("the newest build of it a bench made is {}: strobe look exe:{}{with}", p.display(), p.display())),
+        None => e.hint("install the app, or build it (a bench of a directory or git ref builds it with strobe.json's build), then look at exe:<path> --app <id>"),
+    }
+}
+
 /// `strobe look app:<id> | exe:<path>`: the native app launched in an isolated home as a bench
 /// launches it, nothing measured, then closed: its windows' titles and what its accessibility tree
 /// shows (the window names, open dialogs and headings a case's `expect` checks, and the keyed
@@ -65,6 +71,9 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         _ => return Err(Error::usage("look app:<id> or exe:<path>")),
     };
     app.kind = "native".into();
+    if !app.exe.is_file() {
+        return Err(missing(&app, target.strip_prefix("app:").or(args.get("app"))));
+    }
     let wait = Duration::from_millis(args.get("wait").map(duration_ms).transpose()?.unwrap_or(2000));
     let timeout = Duration::from_millis(args.get("timeout").map(duration_ms).transpose()?.unwrap_or(60_000));
     let keys = args.num("keys")?.unwrap_or(40.0).max(0.0) as usize;
@@ -188,18 +197,15 @@ pub fn run(args: &Args) -> Result<Output> {
             Err(e) => problems.push(format!("the load event never came: {}", e.message)),
             Ok(()) => {}
         }
+        // The same selectors and probe as a bench's page calls and `expect`, so what look says is what they see.
         if let Some(sel) = args.get("until") {
-            let expr = format!(
-                "(async () => {{ const end = Date.now() + {}; while (Date.now() < end) {{ const e = document.querySelector({}); if (e) {{ const r = e.getBoundingClientRect(); if (r.width > 0 && r.height > 0) return true }} await new Promise((r) => setTimeout(r, 50)) }} return false }})()",
-                timeout.as_millis(),
-                json!(sel)
-            );
-            if page.eval_timeout(&expr, timeout + Duration::from_secs(5))? != Value::Bool(true) {
-                problems.push(format!("{sel:?} never showed in {} s", timeout.as_secs()));
+            let sel = Selector::parse(&Value::String(sel.to_string()), Dialect::Page)?;
+            if !crate::driver::shows(&page, &sel, timeout)? {
+                problems.push(format!("{:?} never showed in {} s", sel.source, timeout.as_secs()));
             }
         }
         std::thread::sleep(Duration::from_millis(wait));
-        let info: Value = page.eval_timeout(&read_page(chars), Duration::from_secs(10))?.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+        let info = crate::driver::screen(&page, 6, chars, Duration::from_secs(10))?;
         // Everything the page said while it loaded and settled.
         let mut console: Vec<Value> = Vec::new();
         for ev in events.try_iter().filter(|e| e["sessionId"].as_str() == Some(page.session.as_str())) {
@@ -232,9 +238,12 @@ pub fn run(args: &Args) -> Result<Output> {
         for p in &problems {
             text += &format!("!        {p}\n");
         }
-        let headings: Vec<String> = info["headings"].as_array().into_iter().flatten().map(|h| format!("{} {}", h["tag"].as_str().unwrap_or(""), h["text"].as_str().unwrap_or(""))).collect();
+        let headings: Vec<&str> = info["headings"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         for (i, h) in headings.iter().enumerate() {
             text += &format!("{}{h}\n", if i == 0 { "headings " } else { "         " });
+        }
+        if headings.is_empty() {
+            text += "headings none: the page shows no open dialog, h1, h2 or level 1-2 role=heading, so an `expect.heading` would refuse it\n";
         }
         text += &format!("console  {} messages, {errors} errors\n", console.len());
         for c in console.iter().take(20) {
@@ -251,6 +260,7 @@ pub fn run(args: &Args) -> Result<Output> {
             text += &format!("  {l}\n");
         }
         text += &format!("shot     {}\n", out.display());
+        text += "expect   a case's `expect: { title, heading }` matches the title, and one of the headings\n";
         let json = json!({ "url": info["url"], "title": info["title"], "load_ms": load_ms, "ready": info["ready"], "problems": problems, "headings": info["headings"], "console": console, "errors": errors, "text": body, "chars": total, "screenshot": out });
         let mut o = Output::new(text, json);
         // The page never loaded, or never showed `--until`: a timeout. Its own console errors are the

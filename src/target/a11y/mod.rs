@@ -2,13 +2,13 @@
 //! by the OS's own client API (Windows UI Automation, macOS's AX API, Linux AT-SPI), so strobe finds
 //! elements by the selectors bench files use without the app knowing strobe.
 //!
-//! Selectors: an element key or a key path (`"slider/knob"`: the last segment is the element's key,
-//! earlier ones the keys of its nearest ancestors that have one), `role=<x>`, `text=<x>` (name or
-//! value, substring unless exact), each with an optional `:focus` suffix. The key is the element's
-//! AutomationId (Windows), AXIdentifier (macOS) or AccessibleId (AT-SPI): where toolkits put an
-//! author's id. Roles are ARIA's names, mapped from each OS's own roles. Only elements a person could
-//! see match: non-empty bounds inside their clipping ancestors, not offscreen. The first match in tree
-//! order wins.
+//! Selectors (`Selector`, one grammar with pages): an element key or a key path (`"slider/knob"`:
+//! the last segment is the element's key, earlier ones the keys of its nearest ancestors that have
+//! one), then `role=<x>`, `text=<x>` (name or value, substring unless quoted or exact), `index=<n>`,
+//! and an optional `:focus` suffix. The key is the element's AutomationId (Windows), AXIdentifier
+//! (macOS) or AccessibleId (AT-SPI): where toolkits put an author's id. Roles are ARIA's names,
+//! mapped from each OS's own roles. Only elements a person could see match: non-empty bounds inside
+//! their clipping ancestors, not offscreen. The first match in tree order wins.
 
 pub mod keys;
 
@@ -78,72 +78,161 @@ pub struct Tree {
     pub at_ns: u64,
 }
 
+/// Where a selector's elements live, which decides what its base is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Dialect {
+    /// A native app's accessibility tree: the base is an element key or key path.
+    Native,
+    /// A page: the base is a CSS selector (`>>>` crosses shadow roots).
+    Page,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Base {
     Key(Vec<String>),
-    Role(String),
-    Text(String),
-    /// `{ text }` alone: any element holding that text.
+    Css(String),
+    /// No base: every element, narrowed by the filters.
     Any,
 }
 
-/// A parsed selector: a base, then the optional `{ text, exact }` filter and `:focus`.
+/// A parsed selector, one grammar for pages and native apps: a base (an element key or key path on
+/// a native app, CSS on a page), then filters: `role=<role>`, `text=<text>` (a substring of its name
+/// or value; quoted, `text="General"`, the whole of it, trimmed), `index=<n>` (the nth match in tree
+/// order, from 0) and a `:focus` suffix. `role=heading text="General"`. The object form
+/// `{ selector, role, text, exact, index, focus }` says the same, its `selector` in the string
+/// grammar.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Selector {
     base: Base,
+    role: Option<String>,
     exact: bool,
     focus: bool,
     text: Option<String>,
-    /// `{ index }`: the match to take, 0-based in tree order, among identical ones.
     index: usize,
     pub source: String,
 }
 
-impl Selector {
-    /// A selector string, or `{ selector, text?, exact?, index? }`.
-    pub fn parse(v: &Value) -> Result<Selector> {
-        let (s, text, exact) = match v {
-            Value::String(s) => (s.clone(), None, false),
-            Value::Object(o) => {
-                (o.get("selector").and_then(Value::as_str).unwrap_or("").to_string(), o.get("text").and_then(Value::as_str).map(str::to_string), o.get("exact") == Some(&Value::Bool(true)))
+/// The selector grammar, for errors.
+const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav-history\", \"slider/knob\"; CSS on a page), then role=<role>, text=<text> (text=\"<text>\" for the whole text), index=<n>, and an optional :focus suffix; or { selector, role, text, exact, index, focus }";
+
+/// Splits a selector string at whitespace outside quotes, brackets and parentheses. A quote opens a
+/// quoted value only at a value's start (after `=` or a space), so `text=don't` is one word.
+fn tokens(s: &str) -> Result<Vec<String>> {
+    let (mut out, mut cur, mut depth, mut quote) = (Vec::new(), String::new(), 0i32, None::<char>);
+    for c in s.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), _) => {}
+            (None, '"' | '\'') if cur.is_empty() || cur.ends_with(['=', '(', '[']) => quote = Some(c),
+            (None, '[' | '(') => depth += 1,
+            (None, ']' | ')') => depth -= 1,
+            (None, c) if c.is_whitespace() && depth == 0 => {
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                continue;
             }
-            _ => return Err(Error::usage(format!("a native selector is a string or {{ selector, text, exact, index }}, not {v}"))),
-        };
-        let index = v.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
-        let source = s.clone();
-        let (s, focus) = match s.strip_suffix(":focus") {
-            Some(rest) => (rest.to_string(), true),
-            None => (s, false),
-        };
-        let s = s.trim();
-        if s.starts_with('[') || s.contains(">>>") || s.contains(char::is_whitespace) && !s.starts_with("text=") {
-            return Err(Error::usage(format!(
-                "selector {source:?}: a native app's elements are found through its accessibility tree: an element key or key path (\"nav-history\", \"slider/knob\"), role=<role>, text=<text>, with an optional :focus"
-            )));
+            _ => {}
         }
-        let base = if let Some(r) = s.strip_prefix("role=") {
-            if role_id(r).is_none() {
-                return Err(Error::usage(format!("selector {source:?}: unknown role {r:?}; roles: {}", ROLES.iter().map(|r| r.0).collect::<Vec<_>>().join(", "))));
+        cur.push(c);
+    }
+    if quote.is_some() || depth != 0 {
+        return Err(Error::usage(format!("selector {s:?}: an unclosed quote or bracket")));
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    Ok(out)
+}
+
+impl Selector {
+    /// A selector string, or the object form, for `dialect`.
+    pub fn parse(v: &Value, dialect: Dialect) -> Result<Selector> {
+        let (s, o) = match v {
+            Value::String(s) => (s.as_str(), None),
+            Value::Object(o) => {
+                if let Some(k) = o.keys().find(|k| !matches!(k.as_str(), "selector" | "role" | "text" | "exact" | "index" | "focus")) {
+                    return Err(Error::usage(format!("selector {v}: no field {k:?}; a selector is {GRAMMAR}")));
+                }
+                (o.get("selector").and_then(Value::as_str).unwrap_or(""), Some(o))
             }
-            Base::Role(r.to_ascii_lowercase())
-        } else if let Some(t) = s.strip_prefix("text=") {
-            Base::Text(t.to_string())
-        } else if s.is_empty() {
-            if text.is_none() && !focus {
-                return Err(Error::usage("an empty selector matches nothing"));
-            }
-            Base::Any
-        } else {
-            Base::Key(s.split('/').map(str::to_string).collect())
+            _ => return Err(Error::usage(format!("a selector is a string or an object, not {v}: {GRAMMAR}"))),
         };
-        Ok(Selector { base, exact, focus, text, index, source })
+        let source = match v {
+            Value::String(s) => s.clone(),
+            _ => v.to_string(),
+        };
+        let bad = |why: String| Error::usage(format!("selector {source:?}: {why}; a selector is {GRAMMAR}"));
+        let (s, mut focus) = match s.trim().strip_suffix(":focus") {
+            Some(rest) => (rest, true),
+            None => (s.trim(), false),
+        };
+        let (mut base, mut role, mut text, mut exact, mut index) = (Vec::new(), None, None, false, None);
+        for t in tokens(s)? {
+            let term = t.split_once('=').filter(|(k, _)| !k.is_empty() && k.chars().all(|c| c.is_ascii_alphabetic()));
+            match term {
+                None if role.is_some() || text.is_some() || index.is_some() => return Err(bad(format!("{t:?} after a filter: the base comes first"))),
+                None => base.push(t),
+                Some(("role", r)) if role.is_none() => role = Some(r.to_ascii_lowercase()),
+                Some(("text", x)) if text.is_none() => {
+                    let quoted = x.len() >= 2 && (x.starts_with('"') && x.ends_with('"') || x.starts_with('\'') && x.ends_with('\''));
+                    exact = quoted;
+                    text = Some(if quoted { x[1..x.len() - 1].to_string() } else { x.to_string() });
+                }
+                Some(("index", n)) if index.is_none() => index = Some(n.parse::<usize>().map_err(|_| bad(format!("index={n} is not a whole number")))?),
+                Some((k @ ("role" | "text" | "index"), _)) => return Err(bad(format!("{k} given twice"))),
+                Some(("nth", _)) => return Err(bad("nth= is index= here".into())),
+                Some((k, _)) => return Err(bad(format!("{k}= is no filter"))),
+            }
+        }
+        if let Some(o) = o {
+            let twice = |k: &str| bad(format!("{k} given twice (in the object and in its selector)"));
+            if let Some(r) = o.get("role").and_then(Value::as_str) {
+                role = Some(role.map_or(Ok(r.to_ascii_lowercase()), |_| Err(twice("role")))?);
+            }
+            if let Some(x) = o.get("text").and_then(Value::as_str) {
+                text = Some(text.map_or(Ok(x.to_string()), |_| Err(twice("text")))?);
+            }
+            if let Some(n) = o.get("index") {
+                let n = n.as_u64().ok_or_else(|| bad(format!("index {n} is not a whole number")))?;
+                index = Some(index.map_or(Ok(n as usize), |_| Err(twice("index")))?);
+            }
+            exact |= o.get("exact") == Some(&Value::Bool(true));
+            focus |= o.get("focus") == Some(&Value::Bool(true));
+        }
+        if let (Dialect::Native, Some(r)) = (dialect, &role)
+            && role_id(r).is_none()
+        {
+            return Err(bad(format!("unknown role {r:?} (roles: {})", ROLES.iter().map(|r| r.0).collect::<Vec<_>>().join(", "))));
+        }
+        let base = match (dialect, base.len()) {
+            (_, 0) => Base::Any,
+            (Dialect::Page, _) => Base::Css(base.join(" ")),
+            (Dialect::Native, 1) if !base[0].starts_with(['[', '.', '#']) && !base[0].contains(">>>") => Base::Key(base[0].split('/').map(str::to_string).collect()),
+            (Dialect::Native, _) => {
+                return Err(bad("a native app's elements are found through its accessibility tree, not CSS: the base is one element key or key path".into()));
+            }
+        };
+        if base == Base::Any && role.is_none() && text.is_none() && !focus {
+            return Err(bad("an empty selector matches nothing".into()));
+        }
+        Ok(Selector { base, role, exact, focus, text, index: index.unwrap_or(0), source })
+    }
+
+    /// What a page's helper (`__strobe.find`) takes.
+    pub fn page_spec(&self) -> Value {
+        let css = match &self.base {
+            Base::Css(c) => Some(c.as_str()),
+            _ => None,
+        };
+        json!({ "css": css, "role": self.role, "text": self.text, "exact": self.exact, "index": self.index, "focus": self.focus })
     }
 
     /// When the selector carries a text filter and only that missed: what the visible elements it
     /// would match without the filter hold (up to three), for a timeout's message.
     pub fn text_misses(&self, t: &Tree) -> Option<String> {
         let want = self.text.as_ref()?;
-        let bare = Selector { text: None, focus: self.focus, ..self.clone() };
+        let bare = Selector { text: None, index: 0, ..self.clone() };
         let seen: Vec<String> = t.find(&bare).into_iter().take(3).map(|i| format!("{:?}", t.nodes[i].value.as_deref().filter(|v| !v.is_empty()).unwrap_or(&t.nodes[i].name))).collect();
         (!seen.is_empty()).then(|| format!("matched holding {}, never {}{want:?}", seen.join(", "), if self.exact { "exactly " } else { "" }))
     }
@@ -151,13 +240,12 @@ impl Selector {
     /// Whether node `i` of `t` matches, visibility aside.
     pub fn matches(&self, t: &Tree, i: usize) -> bool {
         let n = &t.nodes[i];
-        let ok = match &self.base {
+        let base = match &self.base {
             Base::Key(path) => key_matches(t, i, path),
-            Base::Role(r) => role_matches(n, r),
-            Base::Text(s) => text_matches(n, s, self.exact),
+            Base::Css(_) => false,
             Base::Any => true,
         };
-        ok && (!self.focus || n.focused) && self.text.as_ref().is_none_or(|s| text_matches(n, s, self.exact))
+        base && self.role.as_deref().is_none_or(|r| role_matches(n, r)) && (!self.focus || n.focused) && self.text.as_ref().is_none_or(|s| text_matches(n, s, self.exact))
     }
 }
 

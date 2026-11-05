@@ -127,18 +127,11 @@ fn ascii_code(c: u8) -> Option<(u16, bool)> {
         (b']', 30), (b'o', 31), (b'u', 32), (b'[', 33), (b'i', 34), (b'p', 35), (b'l', 37), (b'j', 38), (b'\'', 39), (b'k', 40), (b';', 41), (b'\\', 42), (b',', 43), (b'/', 44),
         (b'n', 45), (b'm', 46), (b'.', 47), (b' ', 49), (b'`', 50), (b'\t', 48), (b'\n', 36),
     ];
-    const SHIFTED: &[(u8, u8)] = &[
-        (b'!', b'1'), (b'@', b'2'), (b'#', b'3'), (b'$', b'4'), (b'%', b'5'), (b'^', b'6'), (b'&', b'7'), (b'*', b'8'), (b'(', b'9'), (b')', b'0'), (b'_', b'-'), (b'+', b'='),
-        (b'{', b'['), (b'}', b']'), (b'|', b'\\'), (b':', b';'), (b'"', b'\''), (b'<', b','), (b'>', b'.'), (b'?', b'/'), (b'~', b'`'),
-    ];
     let find = |c: u8| PLAIN.iter().find(|p| p.0 == c).map(|p| p.1);
-    if c.is_ascii_uppercase() {
-        return find(c.to_ascii_lowercase()).map(|k| (k, true));
+    match super::keys::us_key(c as char) {
+        Some((base, shift)) => find(base as u8).map(|k| (k, shift)),
+        None => find(c).map(|k| (k, false)),
     }
-    if let Some(&(_, base)) = SHIFTED.iter().find(|s| s.0 == c) {
-        return find(base).map(|k| (k, true));
-    }
-    find(c).map(|k| (k, false))
 }
 
 fn flag(n: Named) -> u64 {

@@ -3,16 +3,21 @@
 pub mod native;
 
 use crate::model::{Error, Result};
+use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
+use crate::target::a11y::{Dialect, Selector};
 use crate::target::chromium::Page;
 use serde_json::{Value, json};
-use std::time::Duration;
+use std::cell::{Cell, RefCell};
+use std::time::{Duration, Instant};
 
 /// Installed in every document before its scripts run: the browser's own rAF, which a page may replace (a game
 /// frame pacer does) and so delay the driver's waits on its own schedule.
 pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFrame.bind(window)";
 
-/// Installed lazily in the page (it disappears on navigation). Observers only: nothing polls, except a check per
-/// frame while a CSS animation or transition runs, since those change what is visible without a mutation.
+/// Installed lazily in the page (it disappears on navigation): the one DOM probe every page reader uses (the
+/// driver's selectors and waits, `look`, a block's screen and `expect`), so they agree on what is visible, what a
+/// selector matches and what the headings are. Observers only: nothing polls, except a check per frame while a CSS
+/// animation or transition runs, since those change what is visible without a mutation.
 const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
   const raf = window.__strobeRaf ?? window.requestAnimationFrame.bind(window)
@@ -43,12 +48,62 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
     const found = [...root.querySelectorAll(first)]
     return rest.length ? found.flatMap((host) => (host.shadowRoot ? query(host.shadowRoot, rest) : [])) : found
   }
-  // `text` matches a substring of the element's text, or all of it (trimmed) when `exact`.
-  const has = (el, text, exact) => text == null || (exact ? (el.textContent ?? "").trim() === text : (el.textContent ?? "").includes(text))
-  s.find = (sel, text, exact) => query(document, sel.split(">>>").map((part) => part.trim())).find((el) => visible(el) && has(el, text, exact)) ?? null
-  s.focused = (sel) => { const el = s.find(sel); return !!el && el.contains(document.activeElement) }
-  s.box = (sel) => {
-    const el = s.find(sel)
+  // An element's ARIA role: its own `role`, else the one its HTML implies.
+  const implicit = (el) => {
+    const type = (el.getAttribute("type") ?? "").toLowerCase()
+    switch (el.localName) {
+      case "a": case "area": return el.hasAttribute("href") ? "link" : ""
+      case "button": case "summary": return "button"
+      case "input": return { button: "button", submit: "button", reset: "button", image: "button", checkbox: "checkbox", radio: "radio", range: "slider", number: "spinbutton", search: "searchbox" }[type]
+        ?? (["hidden", "file", "color", "date", "datetime-local", "month", "time", "week"].includes(type) ? "" : "textbox")
+      case "textarea": return "textbox"
+      case "select": return el.multiple || el.size > 1 ? "listbox" : "combobox"
+      case "option": return "option"
+      case "h1": case "h2": case "h3": case "h4": case "h5": case "h6": return "heading"
+      case "img": return el.getAttribute("alt") === "" ? "presentation" : "img"
+      case "ul": case "ol": case "menu": return "list"
+      case "li": return "listitem"
+      case "nav": return "navigation"
+      case "main": return "main"
+      case "aside": return "complementary"
+      case "header": return "banner"
+      case "footer": return "contentinfo"
+      case "dialog": return "dialog"
+      case "table": return "table"
+      case "tr": return "row"
+      case "td": return "cell"
+      case "th": return "columnheader"
+      case "progress": return "progressbar"
+      case "hr": return "separator"
+      case "form": return "form"
+      case "article": return "article"
+      case "output": return "status"
+    }
+    return ""
+  }
+  const roleOf = (el) => (el.getAttribute("role") ?? "").trim().split(/\s+/)[0].toLowerCase() || implicit(el)
+  // The roles a native app's tree names otherwise.
+  const alias = { image: "img", edit: "textbox" }
+  const isRole = (el, want) => { const r = roleOf(el), w = alias[want] ?? want; return r === w || (w === "textbox" && r === "searchbox") }
+  // `text` matches a substring of the element's text, label or value, or all of one (trimmed) when `exact`.
+  const has = (el, text, exact) => text == null || [el.textContent ?? "", el.getAttribute("aria-label") ?? "", typeof el.value === "string" ? el.value : ""].some((t) => (exact ? t.trim() === text.trim() : t.includes(text)))
+  const up = (el) => el.parentElement ?? el.getRootNode().host ?? null
+  // A selector as strobe parsed it (`{ css, role, text, exact, index, focus }`): CSS (every element without), then
+  // its filters. With a text, only the innermost matches count: every ancestor's text holds it too.
+  s.all = (q) => {
+    let found = query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
+      .filter((el) => (q.role == null || isRole(el, q.role)) && has(el, q.text, q.exact) && (!q.focus || el.matches(":focus")))
+    if (q.text != null) {
+      const outer = new Set()
+      for (const el of found) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
+      found = found.filter((el) => !outer.has(el))
+    }
+    return found.filter(visible)
+  }
+  s.find = (q) => s.all(q)[q.index ?? 0] ?? null
+  s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
+  s.box = (q) => {
+    const el = s.find(q)
     if (!el) return null
     let r = el.getBoundingClientRect()
     if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) { el.scrollIntoView({ block: "nearest", inline: "nearest" }); r = el.getBoundingClientRect() }
@@ -56,10 +111,10 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   }
   // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
   // `:focus` selector would otherwise never resolve.
-  s.waitFor = (sel, timeout, text, exact) => new Promise((resolve, reject) => {
-    if (s.find(sel, text, exact)) return resolve(true)
+  s.waitFor = (q, timeout, label) => new Promise((resolve, reject) => {
+    if (s.find(q)) return resolve(true)
     let done = false
-    const check = () => { if (!done && s.find(sel, text, exact)) { stop(); clearTimeout(t); resolve(true) } }
+    const check = () => { if (!done && s.find(q)) { stop(); clearTimeout(t); resolve(true) } }
     // A fade in (opacity from 0) makes an element visible on a frame, not on a mutation: while any animation or
     // transition runs, check each frame.
     let ticking = false
@@ -69,7 +124,7 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
       else ticking = false
     }
     const animating = () => { if (!ticking && !done) { ticking = true; raf(tick) } }
-    const unwatch = observe(() => { check(); animating() }, { subtree: true, childList: true, attributes: true, characterData: text != null })
+    const unwatch = observe(() => { check(); animating() }, { subtree: true, childList: true, attributes: true, characterData: q.text != null })
     const events = ["focusin", "focusout", "animationstart", "transitionrun"]
     for (const e of events) document.addEventListener(e, e.startsWith("focus") ? check : animating, true)
     const stop = () => {
@@ -78,8 +133,21 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
       for (const e of events) document.removeEventListener(e, e.startsWith("focus") ? check : animating, true)
     }
     animating()
-    const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + sel + (text == null ? "" : (exact ? " with exactly " : " containing ") + JSON.stringify(text)))) }, timeout)
+    const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + label)) }, timeout)
   })
+  // What a person sees at the top of the page: its title and address, its open dialogs (by their heading), then
+  // its top headings (h1, h2, and role=heading at aria-level 1 or 2, its default), at most `max`; and its visible
+  // text, at most `chars` of it (none read when 0).
+  s.screen = (max, chars) => {
+    const text = (e) => (e.getAttribute("aria-label") || e.innerText || e.textContent || "").trim().replace(/\s+/g, " ").slice(0, 80)
+    const out = []
+    for (const d of document.querySelectorAll("dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]"))
+      if (visible(d)) out.push(text(d.querySelector("h1, h2, h3, [role=heading]") ?? d))
+    for (const h of document.querySelectorAll("h1, h2, [role=heading]"))
+      if (Number(h.getAttribute("aria-level") ?? (h.localName === "h1" ? 1 : 2)) <= 2 && visible(h)) out.push(text(h))
+    const body = chars > 0 ? (document.body?.innerText ?? "").replace(/\n{3,}/g, "\n\n").trim() : ""
+    return JSON.stringify({ title: document.title, url: location.href, headings: [...new Set(out.filter(Boolean))].slice(0, max), text: body.slice(0, chars), chars: body.length, ready: document.readyState })
+  }
   // `tag#id.class`: a node as a person finds it in DevTools.
   const name = (n) => {
     const el = n && n.nodeType === 1 ? n : n?.parentElement
@@ -130,23 +198,82 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   return s
 })(), true"#;
 
+/// Installs the page's helper (`HELPER`) if this document lacks it.
+pub fn helper(page: &Page) -> Result<()> {
+    page.eval(HELPER).map(|_| ())
+}
+
+/// What the page shows (`__strobe.screen`): its title, address, open dialogs and top headings (at most
+/// `max`), and its visible text (at most `chars` of it).
+pub fn screen(page: &Page, max: usize, chars: usize, timeout: Duration) -> Result<Value> {
+    page.eval_timeout(HELPER, timeout)?;
+    let v = page.eval_timeout(&format!("__strobe.screen({max}, {chars})"), timeout)?;
+    v.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(|| Error::msg("the page's screen did not read"))
+}
+
+/// Whether a visible element matches `sel` within `timeout`, re-checked on each DOM and focus change
+/// as `waitFor` does.
+pub fn shows(page: &Page, sel: &Selector, timeout: Duration) -> Result<bool> {
+    page.eval_timeout(HELPER, timeout)?;
+    let expr = format!("__strobe.waitFor({}, {}, {}).then(() => true, () => false)", sel.page_spec(), timeout.as_millis(), json!(sel.source));
+    Ok(page.eval_timeout(&expr, timeout + Duration::from_secs(5))? == Value::Bool(true))
+}
+
+/// A selector argument with a call's `{ text, exact }` options added (`waitFor(sel, { text })`).
+pub(crate) fn with_text(sel: &Value, o: &Value) -> Value {
+    if o.get("text").is_none() && o.get("exact").is_none() {
+        return sel.clone();
+    }
+    let mut sel = match sel {
+        Value::Object(_) => sel.clone(),
+        s => json!({ "selector": s.as_str().unwrap_or("") }),
+    };
+    for k in ["text", "exact"] {
+        if let Some(v) = o.get(k) {
+            sel[k] = v.clone();
+        }
+    }
+    sel
+}
+
+/// CDP's modifier bits (Alt 1, Control 2, Meta 4, Shift 8).
+fn cdp_mods(m: Mods) -> i64 {
+    m.alt as i64 | (m.ctrl as i64) << 1 | (m.meta as i64) << 2 | (m.shift as i64) << 3
+}
+
+/// CDP's name and `buttons` bit for a mouse button.
+fn cdp_button(b: Button) -> (&'static str, i64) {
+    match b {
+        Button::Left => ("left", 1),
+        Button::Right => ("right", 2),
+        Button::Middle => ("middle", 4),
+    }
+}
+
+/// No selector given: `""`, or none at all.
+fn no_selector(sel: &Value) -> bool {
+    sel.is_null() || sel.as_str() == Some("")
+}
+
 pub struct Driver {
     pub page: Page,
     pub token: String,
     pub op_timeout: Duration,
     /// A pixels block's folder: `snapshot(name)` writes `<name>.png` there. Elsewhere a snapshot does nothing.
     pub pixels: Option<std::path::PathBuf>,
-    /// Modifiers held down by `down` (CDP's bits: Alt 1, Control 2, Meta 4, Shift 8).
-    held: std::cell::Cell<i64>,
+    /// Keys held down by `down`, and the modifier bits they set (CDP's).
+    held: RefCell<Vec<Key>>,
+    mods: Cell<i64>,
     /// Where the pointer is (CSS pixels), and the mouse buttons held (`buttons` bits: left 1, right 2,
-    /// middle 4) with the name of the last one pressed.
-    pointer: std::cell::Cell<(f64, f64)>,
-    buttons: std::cell::Cell<(i64, &'static str)>,
+    /// middle 4) with the last one pressed.
+    pointer: Cell<(f64, f64)>,
+    buttons: Cell<(i64, Option<Button>)>,
     /// The display's frame period as the page's rAF sees it (ms), measured at the first drag.
-    frame_ms: std::cell::Cell<Option<f64>>,
+    frame_ms: Cell<Option<f64>>,
+    pacer: Pacer,
     /// Each drag's move times on the host clock (a button held by `down` or `drag`), for
     /// `input.rate` and `input.gap.p95`; the block takes them per run.
-    pub drags: std::cell::RefCell<Vec<Vec<u64>>>,
+    pub drags: RefCell<Vec<Vec<u64>>>,
 }
 
 impl Driver {
@@ -156,38 +283,53 @@ impl Driver {
             token,
             op_timeout: Duration::from_secs(30),
             pixels: None,
-            held: std::cell::Cell::new(0),
-            pointer: std::cell::Cell::new((0.0, 0.0)),
-            buttons: std::cell::Cell::new((0, "none")),
-            frame_ms: std::cell::Cell::new(None),
-            drags: std::cell::RefCell::new(Vec::new()),
+            held: RefCell::new(Vec::new()),
+            mods: Cell::new(0),
+            pointer: Cell::new((0.0, 0.0)),
+            buttons: Cell::new((0, None)),
+            frame_ms: Cell::new(None),
+            pacer: Pacer::default(),
+            drags: RefCell::new(Vec::new()),
         }
+    }
+
+    fn sel(v: &Value) -> Result<Selector> {
+        Selector::parse(v, Dialect::Page)
+    }
+
+    /// A mouse event at (x, y) carrying the held buttons and modifiers.
+    fn mouse(&self, kind: &str, (x, y): (f64, f64), button: Option<Button>, mask: i64, count: u64, extra: i64) -> Result<()> {
+        let name = button.map_or("none", |b| cdp_button(b).0);
+        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": count, "modifiers": self.mods.get() | extra })).map(|_| ())
     }
 
     /// A pointer move to (x, y) carrying the held buttons. While one is held it is a drag's move: sent
     /// without waiting for the renderer to handle it (`paced`), and its time is kept for `input.rate`.
     fn pointer_move(&self, x: f64, y: f64, paced: bool) -> Result<()> {
-        let (mask, name) = self.buttons.get();
+        let (mask, last) = self.buttons.get();
         self.pointer.set((x, y));
-        let p = json!({ "type": "mouseMoved", "x": x, "y": y, "button": name, "buttons": mask, "modifiers": self.held.get() });
         if mask != 0
             && let Some(d) = self.drags.borrow_mut().last_mut()
         {
             d.push(crate::host::now_ns());
         }
-        if paced { self.page.post("Input.dispatchMouseEvent", p) } else { self.page.send("Input.dispatchMouseEvent", p).map(|_| ()) }
+        if !paced {
+            return self.mouse("mouseMoved", (x, y), last.filter(|_| mask != 0), mask, 0, 0);
+        }
+        let p = json!({ "type": "mouseMoved", "x": x, "y": y, "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() });
+        self.page.post("Input.dispatchMouseEvent", p)
     }
 
     /// A mouse button going down or up where the pointer is.
-    fn pointer_button(&self, name: &'static str, bit: i64, down: bool) -> Result<()> {
+    fn pointer_button(&self, b: Button, down: bool) -> Result<()> {
         let (x, y) = self.pointer.get();
+        let bit = cdp_button(b).1;
         let mask = if down { self.buttons.get().0 | bit } else { self.buttons.get().0 & !bit };
-        self.buttons.set((mask, if mask == 0 { "none" } else { name }));
+        self.buttons.set((mask, Some(b)));
         if down {
             self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
         }
-        let kind = if down { "mousePressed" } else { "mouseReleased" };
-        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": 1, "modifiers": self.held.get() })).map(|_| ())
+        self.mouse(if down { "mousePressed" } else { "mouseReleased" }, (x, y), Some(b), mask, 1, 0)
     }
 
     /// The display's frame period (ms) from ten of the page's animation frames, once per block.
@@ -208,53 +350,41 @@ impl Driver {
     /// is, with `""`), moves along `path` (offsets in CSS pixels, spread evenly over `duration`) one move
     /// per display frame on strobe's clock without waiting for each to be handled, and releases. A button
     /// already held by `down` stays held.
-    fn drag(&self, sel: &str, path: &Value, o: &Value) -> Result<Value> {
-        use crate::target::a11y::keys::{parse_path, path_at};
-        let path = parse_path(path)?;
-        let (x0, y0) = if sel.is_empty() { self.pointer.get() } else { self.locate(sel, o)? };
-        let (name, bit) = cdp_button(match o.get("button").and_then(Value::as_str).unwrap_or("left") {
-            "right" => "MouseRight",
-            "middle" => "MouseMiddle",
-            _ => "Mouse",
-        })
-        .unwrap_or(("left", 1));
+    fn drag(&self, sel: &Value, path: &Value, o: &Value) -> Result<Value> {
+        let path = keys::parse_path(path)?;
+        let (x0, y0) = if no_selector(sel) { self.pointer.get() } else { self.locate(&Self::sel(sel)?, o)? };
+        let b = Button::parse(o["button"].as_str())?;
         let duration = o.get("duration").and_then(Value::as_f64).unwrap_or(1000.0).max(1.0);
         let frame = self.frame_period()?;
-        let (dx, dy) = path_at(&path, 0.0);
+        let (dx, dy) = keys::path_at(&path, 0.0);
         self.pointer_move(x0 + dx, y0 + dy, false)?;
-        let held = self.buttons.get().0 & bit != 0;
+        let held = self.buttons.get().0 & cdp_button(b).1 != 0;
         if held {
             self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
         } else {
-            self.pointer_button(name, bit, true)?;
+            self.pointer_button(b, true)?;
         }
         let steps = (duration / frame).ceil().max(1.0) as u32;
-        let start = std::time::Instant::now();
-        let mut late = Duration::ZERO;
+        let start = Instant::now();
         for k in 1..=steps {
-            let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
-            pace(due, &mut late);
-            let (dx, dy) = path_at(&path, k as f64 / steps as f64);
+            self.pacer.wait(start + Duration::from_secs_f64(frame * k as f64 / 1e3), Duration::from_secs_f64(frame / 1e3));
+            let (dx, dy) = keys::path_at(&path, k as f64 / steps as f64);
             self.pointer_move(x0 + dx, y0 + dy, true)?;
         }
         if !held {
-            self.pointer_button(name, bit, false)?;
+            self.pointer_button(b, false)?;
         }
         self.until(o)
     }
 
-    fn helper(&self) -> Result<()> {
-        self.page.eval(HELPER).map(|_| ())
-    }
-
     fn call(&self, expr: &str) -> Result<Value> {
-        self.helper()?;
+        helper(&self.page)?;
         self.page.eval(expr)
     }
 
     /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
     fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
-        self.helper()?;
+        helper(&self.page)?;
         // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
         // a destroyed context, which says nothing about what happened to the page.
         self.page.eval_timeout(expr, timeout + Duration::from_secs(10)).map_err(|e| {
@@ -264,6 +394,11 @@ impl Driver {
                 e
             }
         })
+    }
+
+    /// Waits for a visible element `sel` matches.
+    fn wait_for(&self, sel: &Selector, t: Duration) -> Result<Value> {
+        self.wait(&format!("__strobe.waitFor({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)
     }
 
     /// Writes a `performance.mark` that the trace records on its own clock.
@@ -276,16 +411,42 @@ impl Driver {
         Ok(self.call("__strobe.nodes()")?.as_u64().unwrap_or(0))
     }
 
+    /// Lets go of every key and mouse button `down` (or a drag) left held, so the next run starts with none.
+    pub fn release_all(&self) -> Result<()> {
+        let (mask, _) = self.buttons.get();
+        for b in [Button::Left, Button::Right, Button::Middle] {
+            if mask & cdp_button(b).1 != 0 {
+                self.pointer_button(b, false)?;
+            }
+        }
+        let held: Vec<Key> = self.held.borrow().clone();
+        for k in held.into_iter().rev() {
+            self.key(k, false)?;
+        }
+        Ok(())
+    }
+
+    /// Clicks into the element unless focus is already in it, so a second call keeps typing where the caret is.
+    fn focus(&self, sel: &Value, o: &Value) -> Result<()> {
+        if no_selector(sel) {
+            return Ok(());
+        }
+        let sel = Self::sel(sel)?;
+        let (x, y) = self.locate(&sel, o)?;
+        if self.page.eval(&format!("__strobe.focused({})", sel.page_spec()))?.as_bool() != Some(true) {
+            for kind in ["mousePressed", "mouseReleased"] {
+                self.mouse(kind, (x, y), Some(Button::Left), if kind == "mousePressed" { 1 } else { 0 }, 1, 0)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Dispatches one driver call from the runner: `{ call, args }`.
     pub fn dispatch(&self, call: &str, args: &[Value]) -> Result<Value> {
         let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
         let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
-        // `idle(opts)` is the one call whose first argument is its options.
-        if args.first().is_some_and(Value::is_object) && call != "eval" && call != "idle" {
-            return Err(Error::usage(format!(
-                "page.{call}(): a page's selector is a CSS string (a `>>>` crosses shadow roots); {{ selector, text, exact, index }} selects a native app's elements, and `until` and waitFor take text on pages"
-            )));
-        }
+        // A selector as the bench gave it: a string, or `{ selector, role, text, exact, index, focus }`.
+        let sel = |i: usize| args.get(i).cloned().unwrap_or(Value::String(String::new()));
         match call {
             "goto" => {
                 let to = s(0);
@@ -296,45 +457,49 @@ impl Driver {
                 self.until(&opts(1))
             }
             "click" => {
-                let (x, y) = self.locate(&s(0), &opts(1))?;
+                let o = opts(1);
+                let (x, y) = self.locate(&Self::sel(&sel(0))?, &o)?;
+                let b = Button::parse(o["button"].as_str())?;
+                let mods = cdp_mods(Mods::parse_list(&o["modifiers"])?);
+                let count = o["count"].as_u64().unwrap_or(1).clamp(1, 3);
+                let (held, bit) = (self.buttons.get().0, cdp_button(b).1);
                 self.pointer.set((x, y));
-                for (kind, extra) in [("mouseMoved", json!({})), ("mousePressed", json!({ "button": "left", "clickCount": 1 })), ("mouseReleased", json!({ "button": "left", "clickCount": 1 }))] {
-                    let mut p = json!({ "type": kind, "x": x, "y": y });
-                    merge(&mut p, extra);
-                    self.page.send("Input.dispatchMouseEvent", p)?;
+                self.mouse("mouseMoved", (x, y), None, held, 0, mods)?;
+                // Each press of a double or triple click carries its count, as a mouse's do.
+                for k in 1..=count {
+                    self.mouse("mousePressed", (x, y), Some(b), held | bit, k, mods)?;
+                    self.mouse("mouseReleased", (x, y), Some(b), held, k, mods)?;
                 }
-                self.until(&opts(1))
+                self.until(&o)
             }
             "type" => {
                 let o = opts(2);
-                let (x, y) = self.locate(&s(0), &o)?;
-                // Click only when focus is elsewhere, so a second call keeps typing where the caret is.
-                if self.page.eval(&format!("__strobe.focused({})", json!(s(0))))?.as_bool() != Some(true) {
-                    for kind in ["mousePressed", "mouseReleased"] {
-                        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": "left", "clickCount": 1 }))?;
-                    }
-                }
+                self.focus(&sel(0), &o)?;
                 // One key event per character, like a person typing, so each keystroke is an interaction.
                 let delay = Duration::from_millis(o.get("delay").and_then(Value::as_u64).unwrap_or(0));
                 for (i, c) in s(1).chars().enumerate() {
                     if i > 0 && !delay.is_zero() {
                         std::thread::sleep(delay);
                     }
-                    match c {
-                        '\n' => self.press("Enter")?,
-                        '\t' => self.press("Tab")?,
-                        c => self.press(&c.to_string())?,
-                    }
+                    let k = match c {
+                        '\n' => Key::Named(Named::Enter),
+                        '\t' => Key::Named(Named::Tab),
+                        c => Key::Char(c),
+                    };
+                    self.stroke(k, 0)?;
                 }
                 self.until(&o)
             }
             "press" => {
-                self.press(&s(0))?;
-                self.until(&opts(1))
+                let o = opts(1);
+                self.focus(&o["selector"], &o)?;
+                let (mods, key) = keys::parse_chord(&s(0))?;
+                self.stroke(key, cdp_mods(mods))?;
+                self.until(&o)
             }
             // The pointer over an element, without a click: reveals hover-only controls, or parks the pointer.
             "hover" => {
-                let (x, y) = self.locate(&s(0), &opts(1))?;
+                let (x, y) = self.locate(&Self::sel(&sel(0))?, &opts(1))?;
                 self.pointer_move(x, y, false)?;
                 self.until(&opts(1))
             }
@@ -343,10 +508,10 @@ impl Driver {
                 self.pointer_move(at(0), at(1), false)?;
                 self.until(&opts(2))
             }
-            "drag" => self.drag(&s(0), &opts(1), &opts(2)),
+            "drag" => self.drag(&sel(0), &opts(1), &opts(2)),
             "scroll" => {
                 let o = opts(1);
-                let (x, y) = self.locate(&s(0), &opts(2))?;
+                let (x, y) = self.locate(&Self::sel(&sel(0))?, &opts(2))?;
                 let by = o.get("by").and_then(Value::as_f64).unwrap_or(0.0);
                 let by_x = o.get("byX").and_then(Value::as_f64).unwrap_or(0.0);
                 let speed = o.get("speed").and_then(Value::as_f64).unwrap_or(2000.0);
@@ -354,27 +519,29 @@ impl Driver {
                     .send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
                 self.until(&opts(2))
             }
-            // One wheel event at the element's centre (the viewport's without a selector), as a mouse wheel sends.
+            // One wheel event at the element's centre (the viewport's without a selector), as a mouse wheel
+            // sends, with the keys and buttons `down` holds (Control and the wheel zoom).
             "wheel" => {
                 let d = opts(1);
-                let (x, y) = if s(0).is_empty() {
+                let (x, y) = if no_selector(&sel(0)) {
                     let c = self.page.eval("[innerWidth / 2, innerHeight / 2]")?;
                     (c[0].as_f64().unwrap_or(0.0), c[1].as_f64().unwrap_or(0.0))
                 } else {
-                    self.locate(&s(0), &opts(2))?
+                    self.locate(&Self::sel(&sel(0))?, &opts(2))?
                 };
                 let delta = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
-                self.page.send("Input.dispatchMouseEvent", json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy") }))?;
+                let (mask, last) = self.buttons.get();
+                self.page.send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy"), "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() }),
+                )?;
                 self.until(&opts(2))
             }
             "window" => Err(Error::usage("page.window() shows, hides, focuses or closes a native app's windows; a page has none of its own")),
             "act" | "query" => Err(Error::usage(format!("page.{call}() reads a native app's accessibility tree; on a page use eval or Playwright in prepare"))),
             "waitFor" => {
                 let o = opts(1);
-                let t = self.timeout(&o);
-                let text = o.get("text").cloned().unwrap_or(Value::Null);
-                let exact = o.get("exact").and_then(Value::as_bool).unwrap_or(false);
-                self.wait(&format!("__strobe.waitFor({}, {}, {text}, {exact})", json!(s(0)), t.as_millis()), t)?;
+                self.wait_for(&Self::sel(&with_text(&sel(0), &o))?, self.timeout(&o))?;
                 Ok(Value::Bool(true))
             }
             "idle" => {
@@ -394,19 +561,23 @@ impl Driver {
             // A key held across other calls (a game's WASD, a held shortcut): `down` presses it, `up` lets go.
             "down" | "up" => {
                 let o = opts(1);
-                if let Some((name, bit)) = cdp_button(&s(0)) {
+                if let Some(b) = keys::mouse_button(&s(0)) {
                     // `at`: a selector or [x, y] to move to first, as a person moves before pressing.
                     match o.get("at") {
-                        Some(Value::String(sel)) => {
-                            let (x, y) = self.locate(sel, &o)?;
+                        Some(at @ (Value::String(_) | Value::Object(_))) => {
+                            let (x, y) = self.locate(&Self::sel(at)?, &o)?;
                             self.pointer_move(x, y, false)?;
                         }
                         Some(Value::Array(p)) => self.pointer_move(p.first().and_then(Value::as_f64).unwrap_or(0.0), p.get(1).and_then(Value::as_f64).unwrap_or(0.0), false)?,
                         _ => {}
                     }
-                    self.pointer_button(name, bit, call == "down")?;
+                    self.pointer_button(b, call == "down")?;
                 } else {
-                    self.key(&s(0), call == "down")?;
+                    let (mods, key) = keys::parse_chord(&s(0))?;
+                    if mods.any() {
+                        return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
+                    }
+                    self.key(key, call == "down")?;
                 }
                 self.until(&o)
             }
@@ -429,139 +600,83 @@ impl Driver {
     }
 
     /// Waits for the element, then returns the point to send input at.
-    fn locate(&self, selector: &str, opts: &Value) -> Result<(f64, f64)> {
-        let t = self.timeout(opts);
-        let sel = json!(selector);
-        self.wait(&format!("__strobe.waitFor({sel}, {})", t.as_millis()), t)?;
-        let b = self.page.eval(&format!("__strobe.box({sel})"))?;
+    fn locate(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64)> {
+        self.wait_for(sel, self.timeout(opts))?;
+        let b = self.page.eval(&format!("__strobe.box({})", sel.page_spec()))?;
         if b.is_null() {
-            return Err(Error::msg(format!("no visible element matches {selector}")));
+            return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
         Ok((b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0)))
     }
 
     fn until(&self, opts: &Value) -> Result<Value> {
         let t = self.timeout(opts);
-        // `{ selector, text?, exact? }`: a selector whose element holds that text.
-        if let Some(u) = opts.get("until").filter(|u| u.is_object()) {
-            let text = u.get("text").cloned().unwrap_or(Value::Null);
-            let exact = u.get("exact").and_then(Value::as_bool).unwrap_or(false);
-            let sel = json!(u["selector"].as_str().unwrap_or(""));
-            return self.wait(&format!("__strobe.waitFor({sel}, {}, {text}, {exact})", t.as_millis()), t);
-        }
-        let Some(until) = opts.get("until").and_then(Value::as_str) else { return Ok(Value::Bool(true)) };
-        match until {
-            "idle" => self.wait(&format!("__strobe.idle(300, {})", t.as_millis()), t),
-            "frame" => self.call("__strobe.frame()"),
-            sel => self.wait(&format!("__strobe.waitFor({}, {})", json!(sel), t.as_millis()), t),
+        match opts.get("until") {
+            None | Some(Value::Null) => Ok(Value::Bool(true)),
+            Some(Value::String(u)) if u == "idle" => self.wait(&format!("__strobe.idle(300, {})", t.as_millis()), t),
+            Some(Value::String(u)) if u == "frame" => self.call("__strobe.frame()"),
+            Some(u) => self.wait_for(&Self::sel(u)?, t),
         }
     }
 
-    fn press(&self, chord: &str) -> Result<()> {
-        // "+" alone, or as the last key of a chord ("Control++"), is the plus key.
-        let (mods, key) = match chord.strip_suffix("++") {
-            Some(rest) => (rest, "+"),
-            None if chord == "+" => ("", "+"),
-            None => chord.rsplit_once('+').unwrap_or(("", chord)),
+    /// A key pressed and released with `extra` modifiers on top of the held ones. Modifiers mark the
+    /// events, as CDP takes them; they are not keys of their own.
+    fn stroke(&self, key: Key, extra: i64) -> Result<()> {
+        let m = self.mods.get() | extra;
+        self.key_event(key, true, m)?;
+        self.key_event(key, false, m)
+    }
+
+    /// One key going down or up, from the key table: its `key`, `code` and virtual key, and its text only
+    /// while no Control, Alt or Meta is down (Shift makes a letter's capital).
+    fn key_event(&self, key: Key, down: bool, modifiers: i64) -> Result<()> {
+        let mut d = match key {
+            Key::Named(n) => keys::dom(n),
+            Key::Char(c) => keys::dom_char(c),
         };
-        let mut modifiers = 0;
-        for m in mods.split('+').filter(|m| !m.is_empty()) {
-            modifiers |= match m.to_ascii_lowercase().as_str() {
-                "alt" => 1,
-                "control" | "ctrl" => 2,
-                "meta" | "cmd" => 4,
-                "shift" => 8,
-                "controlormeta" | "mod" => {
-                    if cfg!(target_os = "macos") {
-                        4
-                    } else {
-                        2
-                    }
-                }
-                _ => 0,
-            };
+        if modifiers & 8 != 0 && d.key.len() == 1 && d.key.as_bytes()[0].is_ascii_lowercase() {
+            d.key = d.key.to_ascii_uppercase();
+            d.text = Some(d.key.clone());
         }
-        let modifiers = modifiers | self.held.get();
-        let (code, key_code, text) = key_info(key);
-        let down_text = if modifiers & 0b0111 == 0 { text.clone() } else { None };
-        let mut down = json!({ "type": if down_text.is_some() { "keyDown" } else { "rawKeyDown" }, "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": modifiers });
-        if let Some(t) = &down_text {
-            down["text"] = json!(t);
+        let text = d.text.filter(|_| down && modifiers & 0b0111 == 0);
+        let kind = match (down, &text) {
+            (false, _) => "keyUp",
+            (true, Some(_)) => "keyDown",
+            (true, None) => "rawKeyDown",
+        };
+        let mut e = json!({ "type": kind, "key": d.key, "code": d.code, "windowsVirtualKeyCode": d.vk, "modifiers": modifiers });
+        if let Some(t) = text {
+            e["text"] = json!(t);
         }
-        self.page.send("Input.dispatchKeyEvent", down)?;
-        self.page.send("Input.dispatchKeyEvent", json!({ "type": "keyUp", "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": modifiers }))?;
-        Ok(())
+        self.page.send("Input.dispatchKeyEvent", e).map(|_| ())
     }
 
     /// One key, pressed (`down`) or let go: a held key stays down across other calls until its `up`. A held
-    /// modifier (Shift, Control, Alt, Meta) also marks the key events sent while it is down. Chromium sends no
-    /// auto-repeat, as a game reading key state does not need.
-    fn key(&self, key: &str, down: bool) -> Result<()> {
+    /// modifier (Shift, Control, Alt, Meta) also marks the key events and mouse events sent while it is down.
+    /// Chromium sends no auto-repeat, as a game reading key state does not need.
+    fn key(&self, key: Key, down: bool) -> Result<()> {
         let bit = match key {
-            "Alt" => 1,
-            "Control" => 2,
-            "Meta" => 4,
-            "Shift" => 8,
+            Key::Named(Named::Alt) => 1,
+            Key::Named(Named::Control) => 2,
+            Key::Named(Named::Meta) => 4,
+            Key::Named(Named::Shift) => 8,
             _ => 0,
         };
-        let held = if down { self.held.get() | bit } else { self.held.get() & !bit };
-        self.held.set(held);
-        let (code, key_code, text) = key_info(key);
-        let mut e = json!({ "key": key, "code": code, "windowsVirtualKeyCode": key_code, "modifiers": held });
-        if down {
-            let text = text.filter(|_| held & 0b0111 == 0);
-            e["type"] = json!(if text.is_some() { "keyDown" } else { "rawKeyDown" });
-            if let Some(t) = text {
-                e["text"] = json!(t);
+        {
+            let mut held = self.held.borrow_mut();
+            let at = held.iter().position(|k| *k == key);
+            match (down, at) {
+                (true, None) => held.push(key),
+                (false, Some(i)) => {
+                    held.remove(i);
+                }
+                // Already down, or not held: nothing to send.
+                _ => return Ok(()),
             }
-        } else {
-            e["type"] = json!("keyUp");
         }
-        self.page.send("Input.dispatchKeyEvent", e)?;
-        Ok(())
+        self.mods.set(if down { self.mods.get() | bit } else { self.mods.get() & !bit });
+        self.key_event(key, down, self.mods.get())
     }
-}
-
-fn merge(a: &mut Value, b: Value) {
-    if let (Some(a), Value::Object(b)) = (a.as_object_mut(), b) {
-        a.extend(b);
-    }
-}
-
-fn key_info(key: &str) -> (String, u32, Option<String>) {
-    let named: &[(&str, &str, u32, Option<&str>)] = &[
-        ("Enter", "Enter", 13, Some("\r")),
-        ("Escape", "Escape", 27, None),
-        ("Tab", "Tab", 9, None),
-        ("Backspace", "Backspace", 8, None),
-        ("Delete", "Delete", 46, None),
-        ("ArrowUp", "ArrowUp", 38, None),
-        ("ArrowDown", "ArrowDown", 40, None),
-        ("ArrowLeft", "ArrowLeft", 37, None),
-        ("ArrowRight", "ArrowRight", 39, None),
-        ("PageUp", "PageUp", 33, None),
-        ("PageDown", "PageDown", 34, None),
-        ("Home", "Home", 36, None),
-        ("End", "End", 35, None),
-        ("Space", "Space", 32, Some(" ")),
-        (" ", "Space", 32, Some(" ")),
-        ("Shift", "ShiftLeft", 16, None),
-        ("Control", "ControlLeft", 17, None),
-        ("Alt", "AltLeft", 18, None),
-        ("Meta", "MetaLeft", 91, None),
-    ];
-    if let Some(n) = named.iter().find(|n| n.0 == key) {
-        return (n.1.to_string(), n.2, n.3.map(str::to_string));
-    }
-    let c = key.chars().next().unwrap_or(' ');
-    if c.is_ascii_alphabetic() {
-        let up = c.to_ascii_uppercase();
-        return (format!("Key{up}"), up as u32, Some(key.to_string()));
-    }
-    if c.is_ascii_digit() {
-        return (format!("Digit{c}"), c as u32, Some(key.to_string()));
-    }
-    (String::new(), 0, Some(key.to_string()))
 }
 
 impl Page {
@@ -576,37 +691,35 @@ impl Page {
     }
 }
 
-/// CDP's name and `buttons` bit for a mouse button `page.down` names (`Mouse`, `MouseRight`, `MouseMiddle`).
-fn cdp_button(name: &str) -> Option<(&'static str, i64)> {
-    use crate::target::a11y::keys::{Button, mouse_button};
-    mouse_button(name).map(|b| match b {
-        Button::Left => ("left", 1),
-        Button::Right => ("right", 2),
-        Button::Middle => ("middle", 4),
-    })
+/// Paces a drag's moves on strobe's clock: sleeps while the OS's timers wake strobe in time and
+/// spins the rest. Each driver keeps its own: how late its sleeps woke is the lead it spins before
+/// each move, which grows to the latest wake, shrinks by an eighth with each wake in time and a
+/// sixteenth with each frame it spun whole, and never passes a frame (then the whole frame is spun).
+/// A process whose timers macOS coalesces (a launchd job of ProcessType Standard, such as a remote
+/// shell's daemon, and what it starts) woke 20 to 60 ms late from a 16 ms sleep, so its moves came in
+/// bursts; one late wake no longer makes every later drag of the process spin.
+#[derive(Default)]
+pub(crate) struct Pacer {
+    late: Cell<Duration>,
 }
 
-/// Waits until `due` for a drag's next move: sleeps while the OS's timers can be trusted to wake strobe
-/// in time and spins the rest. `late` is how late this drag's sleeps have woken so far: a process
-/// whose timers macOS coalesces (a launchd job of ProcessType Standard, such as a remote shell's
-/// daemon, and what it starts) woke 20 to 60 ms late from a 16 ms sleep, so its moves came in
-/// bursts; there the whole frame is spun.
-pub(crate) fn pace(due: std::time::Instant, late: &mut Duration) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
-    // The worst wake of every drag so far in this process, so a later drag starts from it.
-    static WORST_NS: AtomicU64 = AtomicU64::new(0);
-    *late = (*late).max(Duration::from_nanos(WORST_NS.load(Ordering::Relaxed)));
-    let margin = *late + Duration::from_millis(1);
-    if let Some(w) = due.checked_duration_since(Instant::now() + margin) {
-        let asked = Instant::now() + w;
-        std::thread::sleep(w);
-        // Remembers the worst wake so far: one late wake makes every later frame spin longer.
-        *late = (*late).max(Instant::now().saturating_duration_since(asked));
-        WORST_NS.fetch_max(late.as_nanos() as u64, Ordering::Relaxed);
-    }
-    while Instant::now() < due {
-        std::thread::yield_now();
+impl Pacer {
+    /// Waits until `due`, the next move of a drag whose frames are `frame` long.
+    pub fn wait(&self, due: Instant, frame: Duration) {
+        let late = self.late.get();
+        let lead = (late + Duration::from_millis(1)).min(frame);
+        match due.checked_duration_since(Instant::now() + lead) {
+            Some(w) => {
+                let asked = Instant::now() + w;
+                std::thread::sleep(w);
+                let woke = Instant::now().saturating_duration_since(asked);
+                self.late.set(if woke >= late { woke } else { late - (late - woke) / 8 });
+            }
+            None => self.late.set(late - late / 16),
+        }
+        while Instant::now() < due {
+            std::thread::yield_now();
+        }
     }
 }
 

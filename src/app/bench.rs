@@ -1,6 +1,6 @@
 //! `strobe bench`: experiments with verdicts (SPEC §9). Blocks of fresh launches, alternating A B, B A.
 
-use super::{Output, fmt, progress};
+use super::{Output, fmt, progress, stop_error, stop_requested};
 use crate::cli::{Args, duration_ms};
 use crate::config;
 use crate::driver::Driver;
@@ -261,19 +261,6 @@ impl Drop for Variant {
 thread_local! {
     /// The saved state `--resume` hands to the bench it starts.
     static RESUMED: RefCell<Option<Value>> = const { RefCell::new(None) };
-}
-
-/// Where `strobe bench --stop <exp>` asks the running bench to stop (its experiment's `stop` file).
-static STOP_FILE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
-
-/// Whether the bench should stop once the block that runs ends: Ctrl-C, SIGINT, SIGTERM, or
-/// `strobe bench --stop <exp>`. Waits (a locked session, the slot, busy CPUs) end at once.
-pub(crate) fn stop_requested() -> bool {
-    host::ctrl_c().load(std::sync::atomic::Ordering::SeqCst) || STOP_FILE.lock().unwrap().as_ref().is_some_and(|p| p.exists())
-}
-
-pub(crate) fn stop_error() -> Error {
-    Error::new(130, "stopped (Ctrl-C, SIGTERM or strobe bench --stop)").hint("strobe bench --resume <exp> runs what is left")
 }
 
 /// Sleeps for `d`, or until a stop is asked for.
@@ -544,23 +531,19 @@ fn cpu_list(mask: u64) -> String {
 pub fn run(args: &Args) -> Result<Output> {
     // `--stop <exp>`: ask a running bench to stop once its block ends; it keeps its finished pairs.
     if let Some(exp) = args.get("stop") {
-        let dir = host::paths::experiments().join(exp);
-        if !dir.is_dir() {
-            return Err(Error::usage(format!("no experiment {exp}")));
-        }
-        std::fs::write(dir.join("stop"), b"")?;
-        let text = format!("asked {exp} to stop once its current block ends; it writes what it finished (strobe report experiment {exp}), and strobe bench --resume {exp} goes on\n");
-        return Ok(Output::new(text, json!({ "id": exp, "stop": true })));
+        return slot::stop(exp);
     }
     // `--resume <exp>`: the same command line, from the pairs and series it had finished.
-    if let Some(exp) = args.get("resume") {
-        let dir = host::paths::experiments().join(exp);
+    if let Some(handle) = args.get("resume") {
+        let (dir, exp) = slot::experiment(handle)?;
         let saved = store::read_json(&dir.join("state.json"))
             .map_err(|_| Error::usage(format!("{exp} has no saved state to resume (state.json): only experiments started by this strobe or later can resume")))?;
+        if let Some(b) = slot::list().into_iter().find(|b| b["exp"] == exp.as_str()) {
+            return Err(Error::usage(format!("{exp} is still running (pid {}, {}): strobe bench --stop {exp} first", b["pid"], b["state"].as_str().unwrap_or(""))));
+        }
         let mut resumed = Args::from_json(&saved["args"]).ok_or_else(|| Error::usage(format!("{exp}: state.json holds no command line")))?;
-        resumed.set("id", exp);
+        resumed.set("id", &exp);
         resumed.remove("resume");
-        let _ = std::fs::remove_file(dir.join("stop"));
         RESUMED.with(|r| *r.borrow_mut() = Some(saved));
         return run(&resumed);
     }
@@ -594,7 +577,11 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
-    super::progress_to(Some(dir.join("progress.log")));
+    // Before it registers: a `--stop` that sees the registration must find its stop file kept.
+    let _scope = super::experiment_scope(&dir);
+    if let Some(d) = args.get("unlock-wait") {
+        duration_ms(d)?;
+    }
     let reserve = match args.get("reserve-cpus").unwrap_or("auto") {
         "auto" => "auto",
         "on" => "on",
@@ -662,10 +649,6 @@ pub fn run(args: &Args) -> Result<Output> {
         eta_after: BTreeMap::new(),
         shown_seen: BTreeMap::new(),
     };
-    // A stop asked of an earlier run of this experiment (or a Ctrl-C a daemon saw for another) is not this one's.
-    let _ = std::fs::remove_file(dir.join("stop"));
-    *STOP_FILE.lock().unwrap() = Some(dir.join("stop"));
-    host::ctrl_c().store(false, std::sync::atomic::Ordering::SeqCst);
     // What `--resume` needs from another folder: the bench file and directory variants as full paths.
     ctx.saved["args"]["pos"] = json!([file]);
     for k in ["head", "base"] {
@@ -2021,7 +2004,14 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set
             release_machine(ctx);
             ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window", s.label(), v.role));
             let waiting = Instant::now();
+            // `--unlock-wait`: how long one wait may last before the bench ends with what it finished.
+            let limit = ctx.args.get("unlock-wait").map(duration_ms).transpose()?.map(Duration::from_millis);
             while host::session_locked() {
+                if let Some(l) = limit.filter(|l| waiting.elapsed() >= *l) {
+                    ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+                    return Err(Error::timeout(format!("the session stayed locked for {} (--unlock-wait), and the series needs a presenting window", fmt::ms_duration(l.as_millis() as u64)))
+                        .hint(format!("strobe bench --resume {} once the session is unlocked", ctx.exp)));
+                }
                 nap(Duration::from_secs(2))?;
             }
             // The desktop and the GPU settle after an unlock.

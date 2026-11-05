@@ -28,8 +28,8 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     let (mut good, mut bad) = (rev_parse(&root, good)?, rev_parse(&root, bad)?);
     let id = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&id)?;
-    let log = dir.join("progress.log");
-    super::progress_to(Some(log.clone()));
+    // Its steps' own scopes stack on it: `bench --stop <bisect>` stops the step that runs.
+    let _scope = super::experiment_scope(&dir);
     let mut candidates = git(&root, &["rev-list", "--first-parent", "--reverse", &format!("{good}..{bad}")])?.lines().map(str::to_string).collect::<Vec<_>>();
     if candidates.is_empty() {
         return Err(Error::usage(format!("{range}: no commits from good to bad on the first-parent line")));
@@ -39,7 +39,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     let first_good = good.clone();
     let first = match first {
         Some(out) => step_json(out, &root, 0, &good, &bad)?,
-        None => step(args, &id, &log, &root, 0, &good, &bad)?,
+        None => step(args, &id, &root, 0, &good, &bad)?,
     };
     let direction = moved(&first);
     let mut steps = vec![first];
@@ -50,7 +50,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
             // The middle commit, never `bad` itself: `bad` is already known to have moved.
             let at = (candidates.len() - 1) / 2;
             let mid = candidates[at].clone();
-            let s = step(args, &id, &log, &root, steps.len(), &good, &mid)?;
+            let s = step(args, &id, &root, steps.len(), &good, &mid)?;
             if moved(&s) == Some(sign) {
                 bad = mid;
                 candidates.truncate(at + 1);
@@ -99,7 +99,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
 }
 
 /// One bisect step: a full experiment of `head` against `base` with the bisect's own settings.
-fn step(args: &Args, id: &str, log: &Path, root: &Path, k: usize, base: &str, head: &str) -> Result<Value> {
+fn step(args: &Args, id: &str, root: &Path, k: usize, base: &str, head: &str) -> Result<Value> {
     let mut a = args.clone();
     a.remove("bisect");
     a.set("base", &format!("git:{base}"));
@@ -110,8 +110,7 @@ fn step(args: &Args, id: &str, log: &Path, root: &Path, k: usize, base: &str, he
         a.set("why", "never");
     }
     progress(format!("\nstep {k}  {} against {}", short(head), short(base)));
-    let out = super::bench::run(&a)?;
-    super::progress_to(Some(log.to_path_buf()));
+    let out = super::bench::run(&a).and_then(super::unless_stopped)?;
     step_json(&out, root, k, base, head)
 }
 

@@ -22,8 +22,10 @@ pub mod up;
 pub mod update;
 
 use crate::cli::{Args, HELP};
+use crate::host;
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
+use std::path::{Path, PathBuf};
 
 /// What a command produced: text for people and models, JSON for `--json` and MCP.
 pub struct Output {
@@ -116,11 +118,71 @@ fn fail(e: &Error, json: bool) -> i32 {
     e.code
 }
 
-static PROGRESS_FILE: std::sync::Mutex<Option<std::path::PathBuf>> = std::sync::Mutex::new(None);
+/// One invocation's progress log and stop requests. The daemon runs several invocations at once, each
+/// on its own thread (an MCP call), so neither is process-wide. Invocations nest (a bisect's steps, a
+/// track's benches, `record --bench`): the innermost one's log gets the progress lines, and a stop asked
+/// of any enclosing one stops it too.
+#[derive(Clone, Default)]
+struct RunScope {
+    progress: Option<PathBuf>,
+    stops: Vec<PathBuf>,
+}
 
-/// Also appends progress lines to a file (a running experiment's progress.log).
-pub fn progress_to(path: Option<std::path::PathBuf>) {
-    *PROGRESS_FILE.lock().unwrap() = path;
+thread_local! {
+    static SCOPE: std::cell::RefCell<RunScope> = std::cell::RefCell::new(RunScope::default());
+}
+
+/// An entered scope; dropping it puts the enclosing one back.
+pub struct Scope(Option<RunScope>);
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        if let Some(prev) = self.0.take() {
+            SCOPE.with(|s| *s.borrow_mut() = prev);
+        }
+    }
+}
+
+/// Enters an experiment's scope on this thread: progress lines also go to `<dir>/progress.log`, and
+/// `<dir>/stop` (`strobe bench --stop`) stops it. A stop file an earlier run of it left is removed first.
+pub fn experiment_scope(dir: &Path) -> Scope {
+    let _ = std::fs::remove_file(dir.join("stop"));
+    // Outside the daemon, from here a Ctrl-C stops the experiment instead of ending strobe.
+    if !in_daemon() {
+        host::ctrl_c();
+    }
+    SCOPE.with(|s| {
+        let mut s = s.borrow_mut();
+        let prev = s.clone();
+        s.progress = Some(dir.join("progress.log"));
+        s.stops.push(dir.join("stop"));
+        Scope(Some(prev))
+    })
+}
+
+static DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether this process is the daemon (`strobe daemon`), which runs MCP calls' benches.
+pub fn in_daemon() -> bool {
+    DAEMON.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Whether this invocation should stop once the block that runs ends: `strobe bench --stop` of it or
+/// of an enclosing experiment, or (outside the daemon, where one process is one invocation) Ctrl-C,
+/// SIGINT or SIGTERM. Waits (a locked session, the slot, busy CPUs) end at once. The daemon never
+/// installs a signal handler: a SIGTERM ends it as the signal would.
+pub fn stop_requested() -> bool {
+    (!in_daemon() && host::ctrl_c().load(std::sync::atomic::Ordering::SeqCst)) || SCOPE.with(|s| s.borrow().stops.iter().any(|p| p.exists()))
+}
+
+pub fn stop_error() -> Error {
+    Error::new(130, "stopped (Ctrl-C, SIGTERM or strobe bench --stop)").hint("strobe bench --resume <exp> runs what is left")
+}
+
+/// A bench that a stop ended (exit 130, what it finished written) as the stop error, for callers that
+/// run several (track, bisect): a stop ends them too.
+pub fn unless_stopped(out: Output) -> Result<Output> {
+    if out.code == 130 { Err(stop_error()) } else { Ok(out) }
 }
 
 /// Where progress lines go (`--progress`, else `STROBE_PROGRESS`): `stderr` (default), `stdout` or `off`.
@@ -150,7 +212,7 @@ pub fn progress(msg: impl AsRef<str>) {
         "stdout" => println!("{}", msg.as_ref()),
         _ => eprintln!("{}", msg.as_ref()),
     }
-    if let Some(p) = PROGRESS_FILE.lock().unwrap().as_ref()
+    if let Some(p) = SCOPE.with(|s| s.borrow().progress.clone())
         && let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(p)
     {
         use std::io::Write;

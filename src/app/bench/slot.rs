@@ -3,12 +3,14 @@
 //! waits for an unlock, so a bench waiting for a person never blocks one that can run. Waiting benches
 //! take turns in the order they asked: a holder hands the slot over after its block once one queues.
 //!
-//! Every running bench registers itself in `<run>/benches/<pid>.json` with what it is doing, which
-//! `strobe status` lists. The slot is an exclusive lock on `<run>/bench.slot`, which the OS releases
+//! Every running bench registers itself in `<run>/benches/<pid>-<exp>.json` (the daemon runs several
+//! under one pid) with what it is doing and whether the daemon runs it, which `strobe status` lists. The slot is an exclusive lock on `<run>/bench.slot`, which the OS releases
 //! when its holder dies.
 
+use super::super::Output;
 use crate::host::{self, paths};
-use crate::model::Result;
+use crate::model::{Error, Result};
+use crate::store;
 use serde_json::{Value, json};
 use std::fs::File;
 use std::path::PathBuf;
@@ -30,9 +32,70 @@ fn alive(pid: u32) -> bool {
     pid == std::process::id() || host::exe_of(pid).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n.starts_with("strobe"))
 }
 
-/// Whether a bench of this device runs inside the daemon (benches started over MCP do).
+/// Whether a bench of this device runs inside the daemon (benches started over MCP do): restarting the
+/// daemon would end it. A daemon's benches register with `daemon: true`; a Windows daemon of a build
+/// before that field is told by its executable (strobew).
 pub fn daemon_benching() -> bool {
-    list().iter().any(|b| b["pid"].as_u64().and_then(|p| host::exe_of(p as u32)).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n.starts_with("strobew")))
+    list().iter().any(|b| {
+        b["daemon"] == true || b["pid"].as_u64().and_then(|p| host::exe_of(p as u32)).and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_lowercase())).is_some_and(|n| n.starts_with("strobew"))
+    })
+}
+
+/// An experiment by handle or unique prefix: its folder and id.
+pub fn experiment(handle: &str) -> Result<(PathBuf, String)> {
+    let dir = store::resolve(handle)?;
+    if !store::is_experiment(&dir) {
+        return Err(Error::usage(format!("{handle} is a recording, not an experiment")));
+    }
+    let id = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+    Ok((dir, id))
+}
+
+/// `strobe bench --stop <exp>`: asks the bench running `exp` (or a bisect's step of it) to stop, from
+/// any shell or for a bench the daemon runs. A bench waiting (for an unlock, the slot, quiet CPUs)
+/// stops at once, which this waits a few seconds to see; one running a block stops once it ends.
+pub fn stop(handle: &str) -> Result<Output> {
+    let (dir, exp) = experiment(handle)?;
+    let mine = |b: &Value| b["exp"].as_str().is_some_and(|e| e == exp || e.strip_prefix(exp.as_str()).is_some_and(|r| r.starts_with("_s")));
+    let Some(b) = list().into_iter().find(mine) else {
+        let result = store::read_json(&dir.join("result.json")).ok();
+        let why = if let Some(stopped) = result.as_ref().map(|r| &r["stopped"]).filter(|s| s.is_object()) {
+            format!("it already ended (exit {}, {}); strobe bench --resume {exp} goes on", stopped["code"], stopped["why"].as_str().unwrap_or("").lines().next().unwrap_or(""))
+        } else if result.is_some() {
+            format!("it finished (strobe report experiment {exp})")
+        } else if dir.join("state.json").is_file() {
+            format!("no bench runs it (it was stopped or ended); strobe bench --resume {exp} goes on")
+        } else {
+            "no bench runs it".to_string()
+        };
+        return Err(Error::usage(format!("{exp} is not running: {why}")));
+    };
+    std::fs::write(dir.join("stop"), b"")?;
+    let (state, why) = (b["state"].as_str().unwrap_or("").to_string(), b["why"].as_str().unwrap_or("").to_string());
+    let doing = if why.is_empty() { state.clone() } else { format!("{state}: {why}") };
+    let same = |x: &Value| x["pid"] == b["pid"] && x["exp"] == b["exp"];
+    let waits = matches!(state.as_str(), "queued" | "waiting" | "idle");
+    if waits {
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until && list().iter().any(same) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+    let now = list().into_iter().find(same);
+    let (text, stopped) = match &now {
+        None => (format!("stopped {exp} (it was {doing}); it wrote what it finished (strobe report experiment {exp}), and strobe bench --resume {exp} goes on\n"), true),
+        Some(n) => {
+            let when = if n["state"] == "running" {
+                "once its current block ends"
+            } else if waits {
+                "within seconds"
+            } else {
+                "once its current step ends"
+            };
+            (format!("asked {exp} to stop {when} (it is {}); it writes what it finished, and strobe bench --resume {exp} goes on\n", n["state"].as_str().unwrap_or("")), false)
+        }
+    };
+    Ok(Output::new(text, json!({ "id": exp, "stop": true, "stopped": stopped, "was": { "state": state, "why": why, "pid": b["pid"] } })))
 }
 
 /// This bench's entry in the registry; dropping the last clone removes it.
@@ -55,7 +118,7 @@ impl Drop for Inner {
 impl Registration {
     pub fn new(exp: &str, file: &str) -> Registration {
         let pid = std::process::id();
-        let entry = json!({ "pid": pid, "exp": exp, "file": file, "state": "starting", "why": "", "since": super::super::record::now_iso() });
+        let entry = json!({ "pid": pid, "exp": exp, "file": file, "daemon": super::super::in_daemon(), "state": "starting", "why": "", "since": super::super::record::now_iso() });
         let path = dir().join(format!("{pid}-{exp}.json"));
         let r = Registration(Arc::new(Inner { path, exp: exp.to_string(), entry: Mutex::new(entry) }));
         r.write();

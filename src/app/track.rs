@@ -180,8 +180,7 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
     let depth: u64 = git(root, &["rev-list", "--count", commit]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     progress(format!("\n{} {subject} · {exp}", short(commit)));
     let a = point_args(args, file, commit, blocks, &exp)?;
-    let result = super::bench::run(&a);
-    super::progress_to(None);
+    let result = super::bench::run(&a).and_then(super::unless_stopped);
     let out = match result {
         Ok(o) => o,
         Err(e) => {
@@ -408,8 +407,7 @@ fn confirm(args: &Args, s: &history::Series, c: &Value) -> Result<(String, Value
     let mut a = series_args(args, s, &exp)?;
     a.set("base", &format!("git:{good}"));
     a.set("head", &format!("git:{bad}"));
-    let res = super::bench::run(&a);
-    super::progress_to(None);
+    let res = super::bench::run(&a).and_then(super::unless_stopped);
     let out = match res {
         Ok(o) => o,
         Err(e) => {
@@ -468,7 +466,6 @@ fn confirm(args: &Args, s: &history::Series, c: &Value) -> Result<(String, Value
             Err(e) if e.code == 130 => return Err(e),
             Err(e) => bisect = json!({ "exp": bid, "error": e.message }),
         }
-        super::progress_to(None);
     }
     history::append(&s.id, &json!({ "t": "change", "id": cid, "culprit": culprit, "bisect": bisect }))?;
     text += &match (&culprit, &bisect) {

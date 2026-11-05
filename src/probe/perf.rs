@@ -12,7 +12,7 @@
 //! - Needs `perf_event_paranoid` ≤ 2 for the user's own processes (Debian ships 3), or CAP_PERFMON;
 //!   kernel frames need ≤ 1 or CAP_PERFMON. `strobe status` names the one setting to change.
 
-use crate::probe::stacks::{Deep, Module};
+use crate::probe::stacks::{Deep, Module, Targets};
 use crate::model::{Error, Result};
 use framehop::{ExplicitModuleSectionInfo, Unwinder};
 use object::{Object, ObjectSection, ObjectSegment};
@@ -370,9 +370,9 @@ impl Unwind {
     }
 }
 
-/// Opens a sampling event on every thread of the tree under `root` that has none yet.
-fn follow(root: u32, kernel: bool, rings: &mut Vec<Ring>, opened: &mut HashSet<u32>) -> std::io::Result<()> {
-    for pid in crate::host::tree_pids(root) {
+/// Opens a sampling event on every thread of the target's process set that has none yet.
+fn follow(targets: &Targets, kernel: bool, rings: &mut Vec<Ring>, opened: &mut HashSet<u32>) -> std::io::Result<()> {
+    for pid in targets.pids() {
         for e in std::fs::read_dir(format!("/proc/{pid}/task")).into_iter().flatten().flatten() {
             let Some(tid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
             if !opened.insert(tid) {
@@ -404,18 +404,17 @@ const STOP: u8 = 1;
 const DROP: u8 = 2;
 
 impl Capture {
-    pub fn start(root: u32) -> Result<Capture> {
+    pub fn start(targets: Targets) -> Result<Capture> {
         if let Some(why) = refusal() {
             return Err(Error::msg(why));
         }
         let (_, kernel) = access();
-        let pids = crate::host::tree_pids(root);
-        if pids.is_empty() {
-            return Err(Error::msg(format!("process {root} is not running")));
+        if targets.pids().is_empty() {
+            return Err(Error::msg(format!("process {} is not running", targets.root)));
         }
         let mut rings: Vec<Ring> = Vec::new();
         let mut opened: HashSet<u32> = HashSet::new();
-        if let Err(e) = follow(root, kernel, &mut rings, &mut opened) {
+        if let Err(e) = follow(&targets, kernel, &mut rings, &mut opened) {
             return Err(Error::msg(format!("perf_event_open: {e}")));
         }
         let state = Arc::new(AtomicU8::new(RUN));
@@ -438,7 +437,7 @@ impl Capture {
                         _ => return Err(Error::msg("the capture was dropped")),
                     };
                     if followed.elapsed().as_millis() >= 50 {
-                        let _ = follow(root, kernel, &mut rings, &mut opened);
+                        let _ = follow(&targets, kernel, &mut rings, &mut opened);
                         followed = std::time::Instant::now();
                     }
                     let mut poll: Vec<libc::pollfd> = rings.iter().map(|r| libc::pollfd { fd: r.fd, events: libc::POLLIN, revents: 0 }).collect();

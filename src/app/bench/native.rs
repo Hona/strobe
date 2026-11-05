@@ -242,7 +242,7 @@ fn runs(
             Err(e) => presents_err = Some(e.message),
         }
     }
-    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
+    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
     let hooks = super::block::Hooks::default();
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
@@ -275,19 +275,25 @@ fn runs(
     };
     let t = s.hook_timeout();
     let env = home.environment(app);
+    // An app that exited is refused, never measured as a gone process (a windowless one has no window
+    // whose loss would say so): its exit code and last output lines, when its output is read.
+    let last = || lines.borrow_mut().last(output.as_ref());
     ctx.runner.call(
         "block",
         json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": v.root, "home": home.dir, "env": env, "exe": app.exe }),
         t,
         &serve,
     )?;
+    super::super::record::app_gone(n, "before the case's setup", |_| last())?;
     if !windowless {
         n.raise();
         n.check_visible()?;
         drive.follow(n);
     }
     lap("checks", steps);
-    ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+    let setup = ctx.runner.call("setup", json!({}), t, &serve);
+    super::super::record::app_gone(n, "before the runs", |_| last())?;
+    setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     lap("setup", steps);
     // What the window shows before the runs: its titles and pixels, and its tree only when setup
     // already drove the app (reading it now would connect strobe to the app for the runs).
@@ -314,6 +320,7 @@ fn runs(
     let perf = x.counters.then(wakes::Perf::new);
     let leak = set == Set::Memory;
     let mut readings: Vec<memory::Reading> = Vec::new();
+    let mut starts = shown::Starts::new(set);
     while warmup.more(runs.len()) {
         let i = runs.len();
         let began = Instant::now();
@@ -328,19 +335,27 @@ fn runs(
             se.set_pids(&pids);
             se.take_log();
         }
+        // Every run starts from the same screen, read through the session the case drives the app
+        // with (none yet: nothing read, so strobe connects to no app the case did not drive).
+        starts.check(i + 1, false, &|| drive.session.get().and_then(shown::native_start))?;
         hooks.begin(&format!("run:{i}"));
+        // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
+        let running = n.exited().is_none();
         let snap0 = Snapshot::take_since(listed, &pids, perf.as_ref());
         let c0 = cycles(n);
         cost.start();
         let t0 = host::now_ns();
-        ctx.runner
-            .call("run", json!({ "case": s.case }), run_timeout, &serve)
-            .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
+        let ran = ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve);
         let t1 = host::now_ns();
         cost.end();
         let procs1 = n.processes();
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
         let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+        match n.exited() {
+            Some(code) if running => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), &last())),
+            _ => super::super::record::app_gone(n, &format!("before run {}", i + 1), |_| last())?,
+        }
+        ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
         hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
@@ -367,6 +382,7 @@ fn runs(
             readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
         }
     }
+    starts.check(runs.len() + 1, true, &|| drive.session.get().and_then(shown::native_start))?;
     let unsteady = warmup.unsteady();
     let first = warmup.first().unwrap_or(0);
     let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
@@ -465,7 +481,9 @@ fn runs(
     if let Some(tid) = ui_tid {
         let ui = |r: &Run| r.span.threads.iter().find(|t| t.tid == tid).cloned();
         extra.insert("ui.cpu".into(), per_run(&|r| ui(r).and_then(|t| t.cpu_ms).unwrap_or(f64::NAN)));
-        extra.insert("ui.wakes".into(), per_run(&|r| ui(r).map_or(f64::NAN, |t| if r.span.ms > 0.0 { t.switches as f64 / (r.span.ms / 1e3) } else { f64::NAN })));
+        if super::super::outside::not_on_this_os("ui.wakes").is_none() {
+            extra.insert("ui.wakes".into(), per_run(&|r| ui(r).map_or(f64::NAN, |t| if r.span.ms > 0.0 { t.switches as f64 / (r.span.ms / 1e3) } else { f64::NAN })));
+        }
     }
     let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().enumerate().filter_map(|(j, g)| Some((key(j), g.gpu_3d_pct?))).collect();
     if !gpu_3d.is_empty() {
@@ -630,13 +648,14 @@ fn runs(
     if unsteady {
         values.insert("warmup.unsteady".into(), 1.0);
     }
+    // A metric no run gave a number for (an empty per-run map's median) is missing, not a value.
+    values.retain(|_, x| x.is_finite());
+    let have = Have { ui_thread: ui_tid.is_some(), windowless, gpu: samples.gpu_available, pinned: !pinned.is_empty() };
     for m in std::iter::once(&s.primary).chain(&s.metrics) {
         if values.contains_key(m) || refused.contains_key(m) {
             continue;
         }
-        if let Some(why) = missing(m, ui_tid.is_some()) {
-            refused.insert(m.clone(), line(&why));
-        }
+        refused.insert(m.clone(), missing(m, &have));
     }
     for m in refused.keys() {
         values.remove(m);
@@ -654,8 +673,9 @@ fn runs(
     let screen = screen_state(&procs0, &procs1);
     let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
     let recording = if keep || set == Set::Attribution {
-        let id = store::new_id("rec");
-        let dir = store::recording_dir(&id)?;
+        // Discarded on any error before its meta.json: no recording is left half written.
+        let (id, dir) = store::new_recording()?;
+        let draft = store::Draft::new(&dir);
         let names: BTreeMap<u32, String> =
             spans.iter().flat_map(|s| s.threads.iter().map(|t| t.tid)).collect::<std::collections::BTreeSet<_>>().into_iter().filter_map(|t| Some((t, host::thread_name(t)?))).collect();
         store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(&spans, &names, &wakes::modules(&spans))))?;
@@ -707,6 +727,7 @@ fn runs(
                 "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
             }),
         )?;
+        draft.keep();
         Some(id)
     } else {
         None
@@ -753,21 +774,48 @@ fn native_leak(readings: &[memory::Reading], n: usize) -> Value {
     json!({ "runs": 2 * n, "readings": readings.len(), "native_host": growth(&host, n, bound, &bytes), "native_private": growth(&private, n, bound, &bytes), "host_bytes": host, "private_bytes": private })
 }
 
-/// Why a declared metric has no value on a native target.
-fn missing(metric: &str, ui_thread: bool) -> Option<String> {
+/// What a native block had to measure with, for why a declared metric has no value.
+struct Have {
+    /// The main window's thread was found (`ui.*`).
+    ui_thread: bool,
+    windowless: bool,
+    /// The OS sampler opened a per-process GPU source.
+    gpu: bool,
+    /// The target runs on pinned CPUs (`cpu.foreign`).
+    pinned: bool,
+}
+
+/// Why a declared metric has no value in a native run block: what this OS cannot read, what a native
+/// target has none of, or what the runs gave nothing for. Every declared metric ends with a value or
+/// one of these (SPEC §13.6), never as "no value".
+fn missing(metric: &str, have: &Have) -> Refusal {
+    if let Some(r) = super::super::outside::not_on_this_os(metric) {
+        return r;
+    }
+    let refuse = |v: ValidatorId, why: String| Refusal::new(v, format!("{metric}{why}"));
     let area = metric.split('.').next().unwrap_or("");
     match area {
-        "frames" if metric.starts_with("frames.presented.") && metric != "frames.presented.count" => Some(format!(
-            "NoPresentSource: {metric} is a frame's begin to its screen time; from outside strobe sees when a frame reached the screen, not when the app began it (frames.interval.*, frames.dropped and interaction.* it does see)"
-        )),
-        "frames" | "interaction" | "scroll" | "display" => Some(format!("NoPresentSource: {metric}: the runs gave no OS present events for it (no window, or no frames in the runs)")),
-        "ui" if !ui_thread => Some(format!("NoPresentSource: {metric} is the UI thread's (the main window's); this target has no window")),
-        "ui" => Some(format!("NoPresentSource: {metric} is not measured: native apps have ui.cpu and ui.wakes, from outside")),
-        "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
-        "phase" => Some(format!("NoPhase: {metric}: no measured run entered phase(\"{}\")", &metric[6..])),
-        "input" => Some(format!("NoInput: {metric}: no measured run dragged (page.drag, or moves while page.down(\"Mouse\") holds a button)")),
-        "gpu" if metric == "gpu.compile" => Some(format!("NoPresentSource: {metric} is a browser engine's; a native app has none")),
-        _ => None,
+        "frames" if metric.starts_with("frames.presented.") && metric != "frames.presented.count" => refuse(
+            ValidatorId::NoPresentSource,
+            " is a frame's begin to its screen time; from outside strobe sees when a frame reached the screen, not when the app began it (frames.interval.*, frames.dropped and interaction.* it does see)".into(),
+        ),
+        "frames" | "interaction" | "scroll" | "display" if have.windowless => refuse(ValidatorId::NotForTarget, ": the app shows no window (window: false), so nothing of it reaches the screen".into()),
+        "frames" | "interaction" | "scroll" | "display" => refuse(ValidatorId::NoPresentSource, ": the runs gave no OS present events for it (no frames in the runs)".into()),
+        "ui" if !have.ui_thread => refuse(ValidatorId::NotForTarget, " is the UI thread's, the thread of the main window; this target shows none".into()),
+        "ui" if metric == "ui.cpu" || metric == "ui.wakes" => refuse(ValidatorId::RunIncomplete, ": the UI thread was not among the app's threads at the end of every run (did the window move to another thread?)".into()),
+        "ui" => refuse(ValidatorId::NotForTarget, " is not measured: native apps have ui.cpu and ui.wakes".into()),
+        "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" | "leak" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
+        "phase" => refuse(ValidatorId::NoPhase, format!(": no measured run entered phase(\"{}\")", &metric[6..])),
+        "input" => refuse(ValidatorId::NoInput, ": no measured run dragged (page.drag, or moves while page.down(\"Mouse\") holds a button)".into()),
+        "launch" => refuse(ValidatorId::NotForTarget, " is a launch case's: give the case `launch` to time the app's launch".into()),
+        _ => match metric {
+            "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
+            "gpu.process.3d" | "gpu.vram" | "gpu.shared" if !have.gpu => super::super::outside::gpu_unread(metric),
+            "cpu.foreign" | "cpu.foreign.max" if !have.pinned => refuse(ValidatorId::NotForTarget, " is other work on the CPUs the target is pinned to, and this bench pins it to none (--pin none)".into()),
+            "cpu.work" | "cpu.app.total" | "cpu.process.total" | "cpu.wakes" | "io.read" | "io.write" | "memory.app.private" | "memory.app.host" | "gpu.process.3d" | "gpu.vram" | "gpu.shared"
+            | "cpu.foreign" | "cpu.foreign.max" => refuse(ValidatorId::RunIncomplete, ": the app's processes could not be read in every run (they exited, or strobe may not open them)".into()),
+            _ => refuse(ValidatorId::NotForTarget, " is not measured for a native app".into()),
+        },
     }
 }
 
@@ -808,15 +856,17 @@ fn differs(a: &[u8], b: &[u8]) -> bool {
 
 /// Every 30 ms until `stop`: keeps the app's windows on top without focus, and sends a sample (with
 /// pixels when `capture`). Returns the pixel samples.
-fn watch(pid: u32, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender<Sample>) -> Vec<(f64, Vec<u8>)> {
+fn watch(pid: u32, home: &Path, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender<Sample>) -> Vec<(f64, Vec<u8>)> {
     let mut out = Vec::new();
-    let mut pids = Vec::new();
-    let mut read = Instant::now() - Duration::from_secs(1);
+    let mut raised = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
-        if read.elapsed() > Duration::from_millis(300) {
-            pids = host::tree_pids(pid);
+        // The app's process set (its tree, what carries its home's stamp, its job), one snapshot a
+        // look: a launcher that hands its window to a detached process is still the app.
+        let set = host::process_set(pid, Some(home));
+        let pids: Vec<u32> = set.iter().map(|p| p.pid).collect();
+        if raised.elapsed() > Duration::from_millis(300) {
             host::raise_windows(&pids);
-            read = Instant::now();
+            raised = Instant::now();
         }
         let shown = host::main_window(&pids).is_some();
         let px = if capture && shown { host::window_pixels(&pids) } else { None };
@@ -824,7 +874,7 @@ fn watch(pid: u32, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender
         if let Some(p) = &px {
             out.push((at, p.clone()));
         }
-        let cycles = host::process_tree(pid).iter().map(|p| p.cycles).sum();
+        let cycles = set.iter().map(|p| p.cycles).sum();
         let _ = tx.send(Sample { at, shown, px, cycles });
         std::thread::sleep(Duration::from_millis(30));
     }
@@ -876,6 +926,11 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if !capture && matches!(until, Until::Painted | Until::Settled) {
         return Err(Error::usage(format!("{}: launch.until.window painted or settled reads the window's pixels; drop screen: false", s.case)));
     }
+    // A launch timed to its pixels on a Mac without Screen Recording would wait for pixels that never come.
+    #[cfg(target_os = "macos")]
+    if matches!(until, Until::Painted | Until::Settled) && !host::macos::screen_capture_allowed() {
+        return Err(Error::refused("NoPresentSource", format!("{}: launch.until.window {}: {}", s.case, until_text(&until), super::launch::no_pixels(true)), "grant Screen Recording, or time the launch to a selector or a milestone"));
+    }
     let warm = match spec["profile"].as_str().unwrap_or("fresh") {
         "fresh" => false,
         "warm" => true,
@@ -923,14 +978,14 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     };
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
-    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
+    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
         // A windowless app has no window to keep on top or sample.
         let watcher = (!windowless).then(|| {
-            let (stop, pid) = (stop.clone(), n.pid);
-            std::thread::spawn(move || watch(pid, capture, &stop, tx))
+            let (stop, pid, home) = (stop.clone(), n.pid, n.home.clone());
+            std::thread::spawn(move || watch(pid, &home, capture, &stop, tx))
         });
         let mut lines: Vec<Line> = Vec::new();
         let tails = {
@@ -960,8 +1015,10 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 if let Some(at) = found {
                     break (at, n.processes().iter().map(|p| p.cycles).sum());
                 }
-                if n.exited().is_some() && n.processes().is_empty() {
-                    return Err(Error::refused("RunIncomplete", format!("{} launch: the app exited before milestone {name}", s.case), "check the milestone's match and where it looks"));
+                if let Some(code) = n.exited().filter(|_| n.processes().is_empty()) {
+                    let out: Vec<String> = lines.iter().filter(|l| l.2 == "output").map(|l| l.1.clone()).collect();
+                    let last = &out[out.len().saturating_sub(5)..];
+                    return Err(super::super::record::exited(code, &format!("before its launch reached milestone {name}"), last));
                 }
                 guard.check("while the app started")?;
                 if Instant::now() > deadline {
@@ -1132,9 +1189,17 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             values.insert("launch.painted".into(), painted - n.epoch_ms);
             values.insert("launch.settled".into(), settled - n.epoch_ms);
         }
+        if super::launch::declares(s, "memory.app.") {
+            super::launch::memory(&n.processes(), &mut values);
+        }
+        let why_no_pixels = if windowless { "the app shows no window (window: false)".to_string() } else { super::launch::no_pixels(capture) };
+        let refused = super::launch::refusals(s, &values, &why_no_pixels, false);
+        if let (false, Some(r)) = (profile, refused.get(&s.primary)) {
+            return Err(r.clone().fix("pick a primary a launch case measures").into());
+        }
         let recording = if profile {
-            let id = store::new_id("rec");
-            let dir = store::recording_dir(&id)?;
+            let (id, dir) = store::new_recording()?;
+            let draft = store::Draft::new(&dir);
             // Stacks from the spawn until the launch was ready (its settling after is not the launch).
             let ready_ns = n.at_ns + ((ready.0 - n.epoch_ms).max(0.0) * 1e6) as u64;
             let stacks_note = match stacks.take().map(|r| r.and_then(|c| c.stop())) {
@@ -1170,11 +1235,12 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                     "note": format!("a native launch's attribution: its values and output, not timed; {stacks_note}"),
                 }),
             )?;
+            draft.keep();
             Some(id)
         } else {
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, ..Block::default() })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, ..Block::default() })
     })();
     // A launch that failed before its recording still ends the helper's session.
     if let Some(Ok(c)) = stacks.take() {

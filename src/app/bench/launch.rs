@@ -100,7 +100,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
     ctx.used = Some(window.clone());
-    let screen = cfg!(windows) && !web && spec["screen"] != false && !profile;
+    let screen = !web && spec["screen"] != false && !profile;
     let inspect_port = if spec["inspect"] == true && !profile { Some(free_port()?) } else { None };
     let mut guard = None;
     // The time stamp counter's rate, from two readings around the launch: cycles to ms.
@@ -129,12 +129,12 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let result = (|| -> Result<Block> {
         let watch = Watch::start(&browser.cdp, observer(&spec["until"])?, profile)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let pid = browser.pid;
+        let (pid, profile_dir) = (browser.pid, browser.profile.clone());
         // An app's windows stay on top without focus (an occluded window never paints); `screen` also
         // captures their pixels.
         let sampler = (!web).then(|| {
             let stop = stop.clone();
-            std::thread::spawn(move || sample_screen(pid, screen, &stop))
+            std::thread::spawn(move || sample_screen(pid, profile_dir.as_deref(), screen, &stop))
         });
         let tails = {
             let globs: Vec<String> = milestones.iter().filter(|m| m.source != "output" && m.source != "page").map(|m| m.source.clone()).collect();
@@ -255,6 +255,14 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             }
             lap("node", &mut steps);
         }
+        if !web && declares(s, "memory.app.") {
+            memory(&browser.processes(), &mut values);
+        }
+        let why_no_pixels = if web { "a page's launch is timed in the page; window pixels are an app, exe or command target's".to_string() } else { no_pixels(screen) };
+        let refused = refusals(s, &values, &why_no_pixels, web);
+        if let (false, Some(r)) = (profile, refused.get(&s.primary)) {
+            return Err(r.clone().fix("pick a primary a launch case measures").into());
+        }
         let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
         // What the launch ended on, once its values and profiles are taken.
         let end = shown::page(ctx, s, v, pair, "end", &page);
@@ -275,7 +283,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             steps: steps.clone(),
             background: Vec::new(),
             leak: None,
-            refused: BTreeMap::new(),
+            refused,
             locked: false,
             display: None,
             screen: None,
@@ -308,6 +316,64 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", v.role, e.message)));
     }
     result
+}
+
+/// What a launch case measures is the launch: from the spawn until ready, its milestones, the CPU it
+/// took and, for a launched app, its memory once ready. Every other declared metric is refused with
+/// why (a run's, or one this OS cannot read), never left without a value. `pixels`: why the window's
+/// pixels were not read, when they were not.
+pub(super) fn refusals(s: &Series, values: &BTreeMap<String, f64>, pixels: &str, web: bool) -> BTreeMap<String, Refusal> {
+    let mut out = BTreeMap::new();
+    for m in std::iter::once(&s.primary).chain(&s.metrics) {
+        if values.contains_key(m) || out.contains_key(m) {
+            continue;
+        }
+        let r = super::super::outside::not_on_this_os(m).unwrap_or_else(|| match m.as_str() {
+            "launch.painted" | "launch.settled" => Refusal::new(ValidatorId::NoPresentSource, format!("{m} reads the window's pixels: {pixels}")),
+            _ if m.starts_with("launch.node.") => Refusal::new(
+                ValidatorId::NotForTarget,
+                format!("{m} is Node's own timing, read over --inspect from an app or exe target's main process (launch.inspect: true); this launch gave none"),
+            ),
+            "cpu.work" => Refusal::new(ValidatorId::RunIncomplete, "cpu.work: no CPU of the app's processes could be read when it was ready"),
+            "memory.app.private" | "memory.app.host" if web => {
+                Refusal::new(ValidatorId::NotForTarget, format!("{m}: a page's launch runs in the browser strobe started before it, so its memory is not the launch's"))
+            }
+            "memory.app.private" | "memory.app.host" => Refusal::new(ValidatorId::RunIncomplete, format!("{m}: the app's processes could not be read when it was ready")),
+            _ => Refusal::new(
+                ValidatorId::NotForTarget,
+                format!("{m} is measured over a run; a launch case measures the launch from the spawn until ready (launch.*, cpu.work, memory.app.*): declare {m} on a run case"),
+            ),
+        });
+        out.insert(m.clone(), r);
+    }
+    out
+}
+
+/// Whether the series declares a metric starting with `prefix` (its primary or a secondary).
+pub(super) fn declares(s: &Series, prefix: &str) -> bool {
+    std::iter::once(&s.primary).chain(&s.metrics).any(|m| m.starts_with(prefix))
+}
+
+/// Why a launch read none of its window's pixels.
+pub(super) fn no_pixels(asked: bool) -> String {
+    if !asked {
+        return "the case turns them off (screen: false)".into();
+    }
+    #[cfg(target_os = "macos")]
+    if !host::macos::screen_capture_allowed() {
+        return format!("macOS gives strobe a window's pixels only with Screen Recording ({}, for {})", host::macos::screen_recording_pane(), host::macos::screen_recording_grantee());
+    }
+    "no frame of the window was read while the app launched (it showed none in time, or the OS gave strobe none of its pixels: a native Wayland window)".into()
+}
+
+/// A launch's memory once ready (`memory.app.private`, and `memory.app.host` where the OS gives
+/// memory by what holds it), from its process set.
+pub(super) fn memory(procs: &[host::ProcTimes], values: &mut BTreeMap<String, f64>) {
+    let private = procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+    if private > 0.0 {
+        values.insert("memory.app.private".into(), private);
+    }
+    values.extend(probe::memory::Reading::take(procs, "when the launch was ready").values().into_iter().map(|(k, v)| (k.to_string(), v)));
 }
 
 pub(super) fn no_page(_: &str, _: &Value) -> Result<Value> {
@@ -350,6 +416,8 @@ pub(super) fn pattern(d: &Value, what: &str) -> Result<regex_lite::Regex> {
 #[derive(Default)]
 pub(super) struct Lines {
     watches: Vec<LineWatch>,
+    /// The app's last few output lines, for a refusal when it exits.
+    last: std::collections::VecDeque<String>,
 }
 
 struct LineWatch {
@@ -374,7 +442,7 @@ impl Drop for LineWatch {
 
 impl Lines {
     /// Hands the app's new output lines to the watches waiting on output; with none waiting they are
-    /// dropped, so nothing buffers while no case asks.
+    /// dropped but the last few, so nothing buffers while no case asks.
     fn pull(&mut self, rx: Option<&Receiver<isolate::OutputLine>>) {
         let Some(rx) = rx else { return };
         while let Ok((_, at, line)) = rx.try_recv() {
@@ -383,7 +451,17 @@ impl Lines {
                     w.found = Some((at, line.clone()));
                 }
             }
+            if self.last.len() == 5 {
+                self.last.pop_front();
+            }
+            self.last.push_back(line);
         }
+    }
+
+    /// The app's last output lines (none unless the target pipes its output: `output: true`).
+    pub(super) fn last(&mut self, rx: Option<&Receiver<isolate::OutputLine>>) -> Vec<String> {
+        self.pull(rx);
+        self.last.iter().cloned().collect()
     }
 
     pub(super) fn serve(&mut self, rx: Option<&Receiver<isolate::OutputLine>>, home: &Path, a: &Value) -> Result<Value> {
@@ -607,15 +685,16 @@ fn is_page(info: &Value) -> bool {
     info["type"] == "page" && !info["url"].as_str().unwrap_or("").starts_with("devtools://")
 }
 
-/// Keeps the app's windows on top without focus, re-reading its process tree every 300 ms, and with
-/// `capture` reads the window's 16×16 average pixels every 30 ms (epoch ms).
-fn sample_screen(pid: u32, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8>)> {
+/// Keeps the app's windows on top without focus, re-reading its process set (its tree, what carries
+/// its home's stamp, its job) every 300 ms, and with `capture` reads the window's 16×16 average
+/// pixels every 30 ms (epoch ms).
+fn sample_screen(pid: u32, home: Option<&Path>, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8>)> {
     let mut out = Vec::new();
     let mut pids = Vec::new();
     let mut read = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
         if read.elapsed() > Duration::from_millis(300) {
-            pids = host::tree_pids(pid);
+            pids = host::process_set(pid, home).iter().map(|p| p.pid).collect();
             host::raise_windows(&pids);
             read = Instant::now();
         }
@@ -754,8 +833,8 @@ fn node_timing(port: u16) -> Result<Vec<(String, f64)>> {
 /// The attribution launch's profiles as a recording: the page's (`cpu-0`) and the main process's
 /// (`cpu-main`), both from their first statement.
 fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, started: &Started, values: &BTreeMap<String, f64>) -> Result<String> {
-    let id = store::new_id("rec");
-    let dir = store::recording_dir(&id)?;
+    let (id, dir) = store::new_recording()?;
+    let draft = store::Draft::new(&dir);
     let renderer = probe::cpu::stop(page)?;
     store::write_json(&dir.join("cpu-0.cpuprofile"), &renderer)?;
     let mut scripts = std::collections::BTreeSet::new();
@@ -775,5 +854,6 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
             "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
         }),
     )?;
+    draft.keep();
     Ok(id)
 }

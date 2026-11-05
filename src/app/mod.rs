@@ -3,6 +3,7 @@
 pub mod bench;
 pub mod bisect;
 pub mod card;
+pub mod config;
 pub mod fmt;
 pub mod helper;
 pub mod history;
@@ -77,7 +78,8 @@ pub fn main() -> i32 {
 
 pub fn dispatch(args: &Args) -> Result<Output> {
     if args.has("help") {
-        return Ok(Output::new(HELP.to_string(), json!({ "help": HELP })));
+        let help = crate::cli::help(&args.command);
+        return Ok(Output::new(help.clone(), json!({ "help": help })));
     }
     // A strobe killed mid-run left the user on its power plan: put theirs back first.
     crate::host::power::restore_stale();
@@ -91,6 +93,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "report" => report::run(args),
         "open" => open::run(args),
         "look" => look::run(args),
+        "config" => config::run(args),
         "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),

@@ -418,8 +418,11 @@ impl Conn {
                 if !owned_by(root, sid) {
                     return Err(Error::msg(format!("process {root} does not run as this user")));
                 }
+                // The rest of the target's process set (what left its tree: a detached service), as
+                // far as it runs as this user too.
+                let more: Vec<u32> = req["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).filter(|&p| p != root && owned_by(p, sid)).collect();
                 if self.stacks.is_none() {
-                    self.stacks = Some(super::kernel_profile::Capture::start(root)?);
+                    self.stacks = Some(super::kernel_profile::Capture::start(root, &more)?);
                 }
                 Ok(json!({ "ok": {} }))
             }

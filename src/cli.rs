@@ -13,125 +13,160 @@ pub enum Kind {
 
 use Kind::{Number, Switch, Value};
 
-/// Every flag strobe reads and how it takes its value. The parser refuses any other flag (a typo is an
+/// Every flag strobe reads, how it takes its value, and the commands that read it (`*`: every
+/// command), which `strobe <command> --help` lists. The parser refuses any other flag (a typo is an
 /// error, not a silently ignored setting), and MCP tool schemas take their types from here (SPEC §17),
 /// so the two cannot drift. A new flag goes here.
-pub const FLAGS: &[(&str, Kind)] = &[
+pub const FLAGS: &[(&str, Kind, &str)] = &[
     // Global.
-    ("json", Switch),
-    ("quiet", Switch),
-    ("verbose", Switch),
-    ("help", Switch),
-    ("version", Switch),
-    ("progress", Value),
+    ("json", Switch, "*"),
+    ("quiet", Switch, "*"),
+    ("verbose", Switch, "*"),
+    ("help", Switch, "*"),
+    ("version", Switch, "*"),
+    ("progress", Value, "*"),
     // record, bench, plan, run.
-    ("id", Value),
-    ("for", Value),
-    ("probes", Value),
-    ("headless", Switch),
-    ("served", Value),
-    ("style", Switch),
-    ("native", Switch),
-    ("app", Value),
-    ("home", Value),
-    ("os-frames", Switch),
-    ("bench", Value),
-    ("gpu-cache", Value),
-    ("until-line", Value),
-    ("stop-line", Value),
-    ("head", Value),
-    ("base", Value),
-    ("aa", Switch),
-    ("check", Switch),
-    ("filter", Value),
-    ("target", Value),
-    ("params", Value),
-    ("primary", Value),
-    ("equivalence", Number),
-    ("noworse", Value),
-    ("pairs", Value),
-    ("runs", Number),
-    ("repeat", Number),
-    ("why", Value),
-    ("trace", Value),
-    ("power", Value),
-    ("pin", Value),
-    ("reserve-cpus", Value),
-    ("pixels", Switch),
-    ("pixels-only", Switch),
-    ("bisect", Value),
-    ("keep", Switch),
-    ("max-time", Value),
-    ("unlock-wait", Value),
-    ("require-verdict", Switch),
-    ("plan", Switch),
-    ("effect", Number),
-    ("pilot", Switch),
-    ("stop", Value),
-    ("resume", Value),
-    ("gpu-store", Value),
+    ("id", Value, "record bench"),
+    ("for", Value, "record"),
+    ("probes", Value, "record bench plan"),
+    ("headless", Switch, "record bench"),
+    ("served", Value, "record"),
+    ("style", Switch, "record bench"),
+    ("native", Switch, "record query"),
+    ("app", Value, "record look"),
+    ("home", Value, "record look"),
+    ("os-frames", Switch, "record"),
+    ("bench", Value, "record"),
+    ("gpu-cache", Value, "record"),
+    ("until-line", Value, "record"),
+    ("stop-line", Value, "record"),
+    ("head", Value, "record bench plan track"),
+    ("base", Value, "bench plan track"),
+    ("aa", Switch, "bench plan"),
+    ("check", Switch, "bench update"),
+    ("filter", Value, "bench plan track"),
+    ("target", Value, "record bench top track"),
+    ("params", Value, "record bench track"),
+    ("primary", Value, "bench track"),
+    ("equivalence", Number, "bench plan track"),
+    ("noworse", Value, "bench"),
+    ("pairs", Value, "bench plan"),
+    ("runs", Number, "record bench plan"),
+    ("repeat", Number, "bench"),
+    ("why", Value, "bench plan track"),
+    ("trace", Value, "bench"),
+    ("power", Value, "record bench run"),
+    ("pin", Value, "record bench run"),
+    ("reserve-cpus", Value, "bench run"),
+    ("pixels", Switch, "bench"),
+    ("pixels-only", Switch, "bench"),
+    ("bisect", Value, "bench track"),
+    ("keep", Switch, "bench"),
+    ("max-time", Value, "bench"),
+    ("unlock-wait", Value, "bench"),
+    ("require-verdict", Switch, "bench"),
+    ("plan", Switch, "bench"),
+    ("effect", Number, "plan"),
+    ("pilot", Switch, "plan"),
+    ("stop", Value, "bench"),
+    ("resume", Value, "bench"),
+    ("gpu-store", Value, ""),
     // query, report, open, history.
-    ("by", Value),
-    ("top", Number),
-    ("reveal", Switch),
-    ("at", Value),
-    ("thread", Value),
-    ("phase", Value),
-    ("timeline", Switch),
-    ("format", Value),
-    ("out", Value),
-    ("open", Switch),
-    ("update-pr", Number),
-    ("repo", Value),
-    ("force", Switch),
-    ("no-card", Switch),
-    ("theme", Value),
-    ("badge-url", Switch),
-    ("no-browser", Switch),
+    ("by", Value, "query"),
+    ("top", Number, "query history"),
+    ("reveal", Switch, "query"),
+    ("at", Value, "query"),
+    ("thread", Value, "query"),
+    ("phase", Value, "query"),
+    ("timeline", Switch, "query"),
+    ("format", Value, "report"),
+    ("out", Value, "report look history"),
+    ("open", Switch, "report"),
+    ("update-pr", Number, "report"),
+    ("repo", Value, "report"),
+    ("force", Switch, "report update"),
+    ("no-card", Switch, "report"),
+    ("theme", Value, "report"),
+    ("badge-url", Switch, "report"),
+    ("no-browser", Switch, "open"),
     // track.
-    ("ref", Value),
-    ("range", Value),
-    ("every", Number),
-    ("blocks", Number),
-    ("again", Switch),
-    ("confirm", Switch),
-    ("no-confirm", Switch),
-    ("alert", Value),
-    ("alert-command", Value),
-    ("alert-webhook", Value),
-    ("schedule", Value),
-    ("schedules", Switch),
-    ("unschedule", Value),
-    ("from-schedule", Value),
+    ("ref", Value, "track"),
+    ("range", Value, "track"),
+    ("every", Number, "track"),
+    ("blocks", Number, "bench track"),
+    ("again", Switch, "track"),
+    ("confirm", Switch, "track"),
+    ("no-confirm", Switch, "track"),
+    ("alert", Value, "track"),
+    ("alert-command", Value, "track"),
+    ("alert-webhook", Value, "track"),
+    ("schedule", Value, "track"),
+    ("schedules", Switch, "track"),
+    ("unschedule", Value, "track"),
+    ("from-schedule", Value, "track"),
     // look.
-    ("until", Value),
-    ("wait", Value),
-    ("size", Value),
-    ("scale", Number),
-    ("chars", Number),
-    ("keys", Number),
-    ("full", Switch),
-    ("headed", Switch),
-    ("build", Switch),
-    ("timeout", Value),
+    ("until", Value, "look"),
+    ("wait", Value, "look"),
+    ("size", Value, "look"),
+    ("scale", Number, "look"),
+    ("chars", Number, "look"),
+    ("keys", Number, "look"),
+    ("full", Switch, "look"),
+    ("headed", Switch, "look"),
+    ("build", Switch, "look bench plan"),
+    ("timeout", Value, "look"),
     // status, top.
-    ("calibrate", Switch),
-    ("fast", Switch),
-    ("once", Switch),
-    ("interval", Value),
-    ("limit", Number),
-    ("sort", Value),
+    ("calibrate", Switch, "status"),
+    ("fast", Switch, "status"),
+    ("once", Switch, "top"),
+    ("interval", Value, "top"),
+    ("limit", Number, "top"),
+    ("sort", Value, "top"),
     // up, update, leave, helper.
-    ("skip", Value),
-    ("yes", Switch),
-    ("from", Value),
-    ("log", Value),
-    ("sid", Value),
+    ("skip", Value, "up"),
+    ("yes", Switch, "leave"),
+    ("from", Value, "update"),
+    ("log", Value, "helper"),
+    ("sid", Value, "helper"),
 ];
 
 /// How `--name` takes its value, when strobe has such a flag.
 pub fn kind(name: &str) -> Option<Kind> {
-    FLAGS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
+    FLAGS.iter().find(|(n, _, _)| *n == name).map(|(_, k, _)| *k)
+}
+
+/// `strobe <command> --help`: that command's lines of the help, then every flag it reads (from
+/// `FLAGS`). A command the help does not name gets the whole help.
+pub fn help(command: &str) -> String {
+    let mut lines = Vec::new();
+    let mut taking = false;
+    for l in HELP.lines() {
+        let indent = l.len() - l.trim_start().len();
+        if indent == 2 {
+            taking = l[2..].split([' ', '\t']).next() == Some(command);
+        } else if indent < 2 {
+            taking = false;
+        }
+        if taking {
+            lines.push(l);
+        }
+    }
+    if lines.is_empty() {
+        return HELP.to_string();
+    }
+    let mut out = format!("strobe {command}\n\n{}\n\nFlags\n", lines.join("\n"));
+    let mut row = String::from(" ");
+    for (name, kind, _) in FLAGS.iter().filter(|(_, _, c)| c.split(' ').any(|c| c == command)) {
+        let flag = format!(" --{name}{}", if *kind == Switch { "" } else { " <value>" });
+        if row.len() + flag.len() > 100 {
+            out += &format!("{row}\n");
+            row = String::from(" ");
+        }
+        row += &flag;
+    }
+    out += &format!("{row}\n");
+    out += "Global    --json  -q  -h  -V  --progress stderr|stdout|off\n";
+    out
 }
 
 /// The refusal for a flag strobe does not have, naming the closest one.
@@ -150,11 +185,11 @@ pub fn unknown_flag(name: &str) -> Error {
         }
         row[b.len()]
     };
-    let near = FLAGS.iter().map(|(n, _)| (distance(name, n), *n)).filter(|(d, n)| *d <= 1 + name.len() / 4 || (name.len() >= 3 && n.starts_with(name))).min();
+    let near = FLAGS.iter().map(|(n, _, _)| (distance(name, n), *n)).filter(|(d, n)| *d <= 1 + name.len() / 4 || (name.len() >= 3 && n.starts_with(name))).min();
     let e = Error::usage(format!("unknown flag --{name}"));
     match near {
-        Some((_, n)) => e.hint(format!("did you mean --{n}? strobe --help lists the flags")),
-        None => e.hint("strobe --help lists the flags"),
+        Some((_, n)) => e.hint(format!("did you mean --{n}? strobe <command> --help lists a command's flags")),
+        None => e.hint("strobe <command> --help lists a command's flags"),
     }
 }
 
@@ -296,14 +331,16 @@ Use
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
         [--unlock-wait 2h]             (a series that needs a presenting window waits at most that long for an unlock)
+        --filter: case names, comma-separated; exact unless a name holds * (a glob)
+                                  run an experiment; a verdict per series
   plan <file.bench.ts> [--base <variant>] [--head <variant>] [--filter …] [--effect <pct>] [--pilot]
                                   before a bench: pairs and minutes per series from earlier runs here, builds, the slot's
                                   queue (= bench --plan; --pilot runs 4 pairs first to learn the spread)
   bench --stop <exp> | --resume <exp>
                                   stop a running bench after its block (at once while it waits; it keeps what finished),
                                   or go on with one (a unique prefix of the id works)
-        --filter: case names, comma-separated; exact unless a name holds * (a glob)
-                                  run an experiment; a verdict per series
+  config [<dir>]                  check the project's strobe.json (and your own) without a bench: where it is, each
+                                  app profile resolved for this OS (its executable, guards, window), build and serve
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
                                   (a..b: hotspots alloc layout style threads frames summary heap memory, per-run deltas;
@@ -348,8 +385,8 @@ Setup
                                   keeps a newer or local build unless --force
   leave [--yes]                   undo up (--yes also deletes recordings and experiments)
 
-Targets   https://… · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native] · cdp:<port> · cdp:ws://… · file:<path>
-          · pid:<n> · proc:<name>
+Targets   https://… · a local page.html (or file:page.html) · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native]
+          · cdp:<port> · cdp:ws://… · file:<trace> (import) · pid:<n> · proc:<name>
 Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
 Global    --json  -q  -h  -V  --progress stderr|stdout|off (stdout for shells that count stderr lines as a failure)
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable

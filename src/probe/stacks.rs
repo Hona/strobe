@@ -54,7 +54,27 @@ pub fn stacks_how(d: &Deep) -> String {
     }
 }
 
-/// A sampled-stack session for a process tree (attribution only): the kernel's sampled profile in
+/// What a capture samples: a target's process set (`host::process_set`: its tree, every process
+/// stamped with its home, and on Windows its job), read again as it samples, so a detached service
+/// or a daemon the app starts outside its tree is sampled too. A target strobe did not launch (`pid:`)
+/// has no home: its set is its tree.
+#[derive(Clone, Debug)]
+pub struct Targets {
+    pub root: u32,
+    pub home: Option<std::path::PathBuf>,
+}
+
+impl Targets {
+    pub fn new(root: u32, home: Option<&std::path::Path>) -> Targets {
+        Targets { root, home: home.map(std::path::Path::to_path_buf) }
+    }
+
+    pub fn pids(&self) -> Vec<u32> {
+        crate::host::process_set(self.root, self.home.as_deref()).iter().map(|p| p.pid).collect()
+    }
+}
+
+/// A sampled-stack session for a process set (attribution only): the kernel's sampled profile in
 /// the helper, else (Windows) strobe's own sampler, which needs no elevation. Dropped without `stop`,
 /// each ends its sampling (the helper when its client goes).
 pub enum StackCapture {
@@ -69,28 +89,30 @@ pub enum StackCapture {
 }
 
 impl StackCapture {
-    pub fn start(root: u32) -> crate::model::Result<StackCapture> {
-        StackCapture::start_with(root, false)
+    pub fn start(targets: Targets) -> crate::model::Result<StackCapture> {
+        StackCapture::start_with(targets, false)
     }
 
     /// `unprivileged`: strobe's own sampler even when the helper is installed (Windows;
     /// `record pid:… --probes stacks-unprivileged`).
-    pub fn start_with(root: u32, unprivileged: bool) -> crate::model::Result<StackCapture> {
+    pub fn start_with(targets: Targets, unprivileged: bool) -> crate::model::Result<StackCapture> {
         #[cfg(not(windows))]
         let _ = unprivileged;
         #[cfg(windows)]
         {
             if unprivileged || !helper::access().helper {
-                return Ok(StackCapture::Suspend(super::suspend::Capture::start(root)?));
+                return Ok(StackCapture::Suspend(super::suspend::Capture::start(targets)?));
             }
+            // The helper runs elevated in a process of its own, which holds no job of this strobe's
+            // and reads no stamps for it: it gets the set as it is now, and follows its children.
             let mut client = helper::Client::connect()?;
-            client.call(serde_json::json!({ "op": "stacks.start", "root": root }))?;
+            client.call(serde_json::json!({ "op": "stacks.start", "root": targets.root, "pids": targets.pids() }))?;
             Ok(StackCapture::Helper(client))
         }
         #[cfg(target_os = "linux")]
-        return Ok(StackCapture::Perf(super::perf::Capture::start(root)?));
+        return Ok(StackCapture::Perf(super::perf::Capture::start(targets)?));
         #[cfg(target_os = "macos")]
-        return Ok(StackCapture::Sample(super::sample::Capture::start(root)?));
+        return Ok(StackCapture::Sample(super::sample::Capture::start(targets)?));
     }
 
     /// Stops sampling; thread names and missing module lists come from the live processes.

@@ -239,6 +239,141 @@ pub(super) fn page(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &str
     finish(ctx, s, v, pair, at, screen, img)
 }
 
+/// What a run starts from that its input acts on (`ResetIncomplete`, SPEC §10.1): the text of every
+/// editable element (text fields, search and combo boxes, spin buttons, sliders), the state of every
+/// check box, radio button and switch, and which screen shows (its open dialogs and first headings),
+/// by element. Labels, counters and clocks are left out: an app rewrites them by itself between runs,
+/// while these change only through input, which a run gives and its reset must take back. Focus is
+/// left out too: every click moves it, and where it rests changes a run's work only when the run then
+/// types without naming an element, which shows in a value.
+pub(super) type Start = BTreeMap<String, String>;
+
+/// Values longer than this are cut (a run that appends its text grows them on every run).
+const START_VALUE: usize = 200;
+
+fn cut(s: &str) -> String {
+    let s = s.trim();
+    if s.chars().count() > START_VALUE { format!("{}…", s.chars().take(START_VALUE).collect::<String>()) } else { s.to_string() }
+}
+
+/// A native app's start, from one read of its tree through the case's own driving session.
+pub(super) fn native_start(se: &Session) -> Option<Start> {
+    use crate::target::a11y::{PATTERN_TOGGLE, role_name};
+    let tree = se.tree().ok()?;
+    let mut out = Start::new();
+    let mut seen: BTreeMap<String, usize> = BTreeMap::new();
+    let mut put = |key: String, v: String| {
+        let n = seen.entry(key.clone()).or_default();
+        *n += 1;
+        out.insert(if *n == 1 { key } else { format!("{key} #{n}") }, v);
+    };
+    let mut marks: Vec<String> = Vec::new();
+    for (i, n) in tree.nodes.iter().enumerate() {
+        let role = if role_name(n.role).is_empty() { n.role_text.as_str() } else { role_name(n.role) };
+        let key = || {
+            let path = tree.key_path(i);
+            if path.is_empty() { format!("{role} {:?}", n.name.split_whitespace().collect::<Vec<_>>().join(" ")) } else { path }
+        };
+        let toggle = matches!(role, "checkbox" | "radio") || (n.role == 50000 && n.patterns & PATTERN_TOGGLE != 0);
+        if matches!(role, "textbox" | "combobox" | "spinbutton" | "slider") {
+            put(key(), format!("{:?}", cut(n.value.as_deref().unwrap_or(""))));
+        } else if toggle && let Some(t) = n.toggled {
+            put(key(), if t { "checked" } else { "unchecked" }.into());
+        }
+        let shows = (n.dialog && n.parent.is_some() && tree.visible_rect(i).is_some()) || (n.heading && marks.iter().filter(|m| m.starts_with("heading")).count() < 3);
+        if shows {
+            let text = if n.name.trim().is_empty() { n.value.clone().unwrap_or_default() } else { n.name.clone() };
+            marks.push(format!("{} {:?}", if n.dialog { "dialog" } else { "heading" }, cut(&text)));
+        }
+    }
+    out.insert("screen".into(), marks.join(" · "));
+    Some(out)
+}
+
+/// A page's start: the value of every input, text area, select and editable element (a password by
+/// its length), every check box's and radio button's state, and its open dialogs and first headings.
+pub(super) fn page_start(page: &Page) -> Option<Start> {
+    const PROBE: &str = r##"JSON.stringify((() => {
+  const out = {}, seen = {}
+  const put = (k, v) => { seen[k] = (seen[k] || 0) + 1; out[seen[k] === 1 ? k : k + " #" + seen[k]] = v }
+  const key = (e) => e.id ? "#" + e.id : e.name ? e.tagName.toLowerCase() + "[name=" + e.name + "]" : e.getAttribute("aria-label") ? e.tagName.toLowerCase() + "[aria-label=" + e.getAttribute("aria-label") + "]" : e.tagName.toLowerCase()
+  for (const e of document.querySelectorAll("input, textarea, select, [contenteditable=''], [contenteditable='true']")) {
+    const t = (e.type || "").toLowerCase()
+    if (t === "hidden" || t === "file" || t === "submit" || t === "button" || t === "reset" || t === "image") continue
+    if (t === "checkbox" || t === "radio") put(key(e), e.checked ? "checked" : "unchecked")
+    else if (t === "password") put(key(e), e.value.length + " characters")
+    else put(key(e), JSON.stringify((e.isContentEditable ? e.innerText : e.value).trim().slice(0, 200)))
+  }
+  const marks = []
+  for (const d of document.querySelectorAll("dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]")) {
+    const r = d.getBoundingClientRect()
+    if (r.width > 0 && r.height > 0) marks.push("dialog " + JSON.stringify((d.getAttribute("aria-label") || d.querySelector("h1, h2, h3, [role=heading]")?.textContent || "").trim().slice(0, 200)))
+  }
+  for (const h of [...document.querySelectorAll("h1, h2, [role=heading]")].slice(0, 3)) marks.push("heading " + JSON.stringify(h.textContent.trim().slice(0, 200)))
+  out.screen = marks.join(" · ")
+  return out
+})())"##;
+    let v = page.eval(PROBE).ok()?;
+    serde_json::from_str(v.as_str()?).ok()
+}
+
+/// Every run's start, checked against the first one read: a run that starts from another screen
+/// measures other work (a reset that took back nothing, so each run appended its text again).
+pub(super) struct Starts {
+    first: Option<(String, Start)>,
+    on: bool,
+}
+
+impl Starts {
+    /// Attribution and leak blocks are not checked: no verdict comes from them, and a leak case may
+    /// grow what it leaves on purpose.
+    pub(super) fn new(set: Set) -> Starts {
+        Starts { first: None, on: !matches!(set, Set::Attribution | Set::Memory) }
+    }
+
+    /// Before run `run` (1-based); `after` true: after the last run and its reset, where a run after
+    /// it would start (so a single `--check` run is checked too). `read` reads the start (None:
+    /// nothing to read, skipped). A start that differs is read again for up to a second (a reset whose
+    /// last change lands a frame late), then refuses the block.
+    pub(super) fn check(&mut self, run: usize, after: bool, read: &dyn Fn() -> Option<Start>) -> Result<()> {
+        if !self.on {
+            return Ok(());
+        }
+        let Some(mut now) = read() else { return Ok(()) };
+        let when = if after { format!("a run after the last (run {}) would start", run.saturating_sub(1)) } else { format!("run {run} started") };
+        let Some((first_when, first)) = &self.first else {
+            self.first = Some((format!("run {run}"), now));
+            return Ok(());
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while now != *first && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            match read() {
+                Some(again) => now = again,
+                None => return Ok(()),
+            }
+        }
+        if now == *first {
+            return Ok(());
+        }
+        let keys: std::collections::BTreeSet<&String> = first.keys().chain(now.keys()).collect();
+        let diffs: Vec<String> = keys
+            .into_iter()
+            .filter(|k| first.get(*k) != now.get(*k))
+            .take(3)
+            .map(|k| {
+                let show = |v: Option<&String>| v.map_or("(not there)".to_string(), |v| if v.is_empty() { "(none)".into() } else { v.clone() });
+                format!("{k} {} (was {})", show(now.get(k)), show(first.get(k)))
+            })
+            .collect();
+        Err(Error::refused(
+            "ResetIncomplete",
+            format!("{when} from a different screen than {first_when} did: {}", diffs.join("; ")),
+            "every run must start from the same screen: the case's reset has to take back what its run changes (add a reset if it has none); select-all is Meta+a on macOS and Control+a elsewhere: ControlOrMeta+a works on every OS",
+        ))
+    }
+}
+
 /// Whether a selector matches a visible element of the page within 5 s, by the driver's own probe
 /// (what a `page.waitFor` would see).
 pub(super) fn page_shows(page: &Page, sel: &Value) -> Result<bool> {

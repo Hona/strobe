@@ -79,9 +79,26 @@ pub fn run(args: &Args) -> Result<Output> {
         return bench_case(args, file, case);
     }
     let target = args.pos.first().ok_or_else(|| Error::usage("record needs a target: strobe record https://… [--for 10s], or --bench <file>#<case>"))?.clone();
-    if let Some(path) = target.strip_prefix("file:") {
-        return super::query::import(path);
-    }
+    // A local page (`page.html` or `file:page.html`) opens in the browser as its file:// address;
+    // any other `file:` is a trace to import.
+    let page_file = |p: &str| {
+        let ext = std::path::Path::new(p).extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        matches!(ext.as_str(), "html" | "htm" | "xhtml" | "svg") && std::path::Path::new(p).is_file()
+    };
+    // `file:<path>`, `file:///<path>`, and on Windows `file:///C:/…`.
+    let local = target.strip_prefix("file://").or_else(|| target.strip_prefix("file:")).map(|p| if cfg!(windows) && p.len() > 2 && p.as_bytes()[2] == b':' { &p[1..] } else { p });
+    let target = match local {
+        Some(path) if page_file(path) => super::look::address(path),
+        Some(path) => return super::query::import(path),
+        None if !target.contains(':') || std::path::Path::new(&target).is_file() => {
+            if page_file(&target) {
+                super::look::address(&target)
+            } else {
+                return Err(Error::usage(format!("{target}: a local target is an HTML page (page.html) or a trace to import (file:<path>)")));
+            }
+        }
+        None => target,
+    };
     // A timed recording runs on the fastest power plan, as a bench does (SPEC §9.4); attribution,
     // deep and memory recordings are not timed.
     let _power = if args.get("probes").unwrap_or("timing") == "timing" { Some(super::bench::power_for(args)?) } else { None };
@@ -111,8 +128,8 @@ pub fn run(args: &Args) -> Result<Output> {
         a.kind = "native".into();
         return native(args, &a, &target, set, for_ms);
     }
-    if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") {
-        return Err(Error::usage(format!("unsupported target {target}: use https://…, app:<id>, exe:<path>, cdp:<port> or file:<path>")));
+    if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") && !target.starts_with("file://") {
+        return Err(Error::usage(format!("unsupported target {target}: use https://…, a local page.html, app:<id>, exe:<path>, cdp:<port> or file:<trace>")));
     }
     let mut guard = None;
     let browser = if attach {
@@ -146,11 +163,10 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let awake = host::Awake::start();
     // `--id`: a handle chosen up front, so an MCP call that outlives its timeout can be followed.
-    let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
+    let (id, dir) = claim(args)?;
+    let draft = store::Draft::new(&dir);
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
-    let dir = store::recording_dir(&id)?;
-    let draft = store::Draft::new(&dir);
     if set == Set::Memory {
         let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
@@ -175,16 +191,20 @@ pub fn run(args: &Args) -> Result<Output> {
     let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
     // `--os-frames`: the OS's present events beside the trace's frames, a cross-check of both.
     let os_frames = (args.has("os-frames") && !attach).then(crate::probe::present::PresentCapture::start);
-    let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+    // CPU in cycles over the time stamp counter, as native targets read it: process times move in
+    // clock ticks (15.6 ms on Windows), so an idle page read 0.00% on one run and 0.52% on the next.
+    let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+    let cpu0 = cycles();
     let t0 = host::now_ns();
     driver.mark("run:0:start")?;
     progress(format!("recording {} for {}", id, fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     driver.mark("run:0:end")?;
     let t1 = host::now_ns();
-    let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+    let cpu1 = cycles();
     let os = sampler.map(|s| s.stop().window(t0, t1));
-    let tree = host::tree_pids(browser.pid);
+    // The browser's process set (its tree, what carries its profile's stamp, its job), for the OS frames.
+    let tree = browser.pids();
     let os_frames = os_frames.map(|r| r.and_then(|c| c.stop()));
     if on_screen && (awake.locks() > 0 || host::session_locked()) {
         return Err(validity::locked());
@@ -216,8 +236,16 @@ pub fn run(args: &Args) -> Result<Output> {
     progress("reading the trace");
     let data = metrics::read(&dir.join("trace.pftrace"), &token)?;
     let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    if !attach && t1 > t0 && cpu1 > 0 {
-        extra.entry("cpu.app.total".into()).or_default().insert("run:0".into(), 100.0 * (cpu1 - cpu0) as f64 / (t1 - t0) as f64);
+    let mut refused = serde_json::Map::new();
+    match (cpu0.1, cpu1.1) {
+        (Some(a), Some(b)) if !attach && b > a && cpu1.0 > 0 => {
+            extra.entry("cpu.app.total".into()).or_default().insert("run:0".into(), 100.0 * cpu1.0.saturating_sub(cpu0.0) as f64 / (b - a) as f64);
+        }
+        _ if attach => {}
+        _ => {
+            let r = super::outside::not_on_this_os("cpu.app.total").unwrap_or_else(|| crate::model::Refusal::new(crate::model::ValidatorId::RunIncomplete, "cpu.app.total: no CPU of the browser's processes could be read"));
+            refused.insert("cpu.app.total".into(), json!(r.message()));
+        }
     }
     if let Some(p) = os.as_ref().and_then(|o| o.gpu_3d_pct) {
         extra.entry("gpu.process.3d".into()).or_default().insert("run:0".into(), p);
@@ -240,7 +268,7 @@ pub fn run(args: &Args) -> Result<Output> {
     };
     let mut meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
-        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "os": os, "os_frames": os_frames,
+        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "refused": refused, "os": os, "os_frames": os_frames,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
         // Rule 3: timing taken with profilers on describes the profiled target, not the target.
         "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
@@ -312,6 +340,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             }
             None => std::thread::sleep(Duration::from_secs(3)),
         }
+        app_gone(&mut n, "before the recording", |n| last_output(n, 5))?;
+        // Its process's CPU goes with it when it exits: one that ends inside the window refuses.
+        let running = n.exited().is_none();
         if !windowless {
             n.raise();
             n.check_visible()?;
@@ -320,8 +351,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             }
         }
         let awake = host::Awake::start();
-        let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
-        let dir = store::recording_dir(&id)?;
+        let (id, dir) = claim(args)?;
         let draft = store::Draft::new(&dir);
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
@@ -331,7 +361,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
+        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
@@ -356,6 +386,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let for_ms = (t1 - t0) / 1_000_000;
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
+        if let Some(code) = n.exited().filter(|_| running) {
+            return Err(exited(code, "during the recording", &last_output(&n, 5)));
+        }
         let screen = super::bench::screen_state(&procs0, &(host::now_ns(), host::all_processes()));
         if let Some(t) = timeline.borrow_mut().take() {
             let mut t = t.stop();
@@ -436,7 +469,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             if let Some(c) = t.cpu_ms {
                 values.insert("ui.cpu", c);
             }
-            values.insert("ui.wakes", t.switches as f64 / (ms / 1e3));
+            if super::outside::not_on_this_os("ui.wakes").is_none() {
+                values.insert("ui.wakes", t.switches as f64 / (ms / 1e3));
+            }
         }
         let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
         let spans = std::slice::from_ref(&span);
@@ -446,8 +481,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]),
         )?;
         let debug = host::debug_runtime(&app.exe);
+        let refused = super::outside::os_refusals(&|m| values.contains_key(m), os.gpu_3d_pct.is_some());
         let mut meta = json!({
-            "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "os": os,
+            "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "refused": refused, "os": os,
             "window": n.window, "ui_thread": ui_tid, "created": now_iso(), "valid": true, "os_frames": os_frames, "session_locked": session_locked,
             "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
             "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })),
@@ -467,6 +503,42 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     guard.check("after the app closed")?;
     let meta = result?;
     Ok(Output::new(summary_text(&meta), meta))
+}
+
+/// A new recording's id and folder: `--id` (a handle chosen up front, so an MCP call that outlives its
+/// timeout can be followed), else one claimed for this recording alone. The caller holds it in a
+/// `store::Draft` until its meta.json is written.
+pub fn claim(args: &Args) -> Result<(String, std::path::PathBuf)> {
+    match args.get("id").filter(|i| i.starts_with("rec_")) {
+        Some(id) => Ok((id.to_string(), store::recording_dir(id)?)),
+        None => store::new_recording(),
+    }
+}
+
+/// `RunIncomplete` once a launched native app is gone: its process exited and nothing of its process
+/// set remains (a launcher that handed over to a process stamped with its home is not gone). `when`
+/// says when ("before the runs"); `last` is its last output lines, when strobe read its output.
+pub fn app_gone(n: &mut crate::target::native::Native, when: &str, last: impl FnOnce(&crate::target::native::Native) -> Vec<String>) -> Result<()> {
+    let Some(code) = n.exited() else { return Ok(()) };
+    if !n.processes().is_empty() {
+        return Ok(());
+    }
+    Err(exited(code, when, &last(n)))
+}
+
+/// The refusal for an app that exited with `code` `when`, with its last output lines.
+pub fn exited(code: i32, when: &str, last: &[String]) -> Error {
+    let mut r = crate::model::Refusal::new(crate::model::ValidatorId::RunIncomplete, format!("the app exited (code {code}) {when}, so there was no app left to measure"));
+    if !last.is_empty() {
+        r = r.detail(format!("its last output: {}", last.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" | ")));
+    }
+    r.fix(if last.is_empty() { "run the app's command line by hand to see why it exits; output: true on the target keeps its last lines here" } else { "fix what made the app exit (its output above)" }).into()
+}
+
+/// Up to the last `n` lines of the app's output still waiting in its pipe.
+fn last_output(n: &crate::target::native::Native, keep: usize) -> Vec<String> {
+    let lines: Vec<String> = n.output.as_ref().map(|rx| rx.try_iter().map(|(_, _, l)| l).collect()).unwrap_or_default();
+    lines[lines.len().saturating_sub(keep)..].to_vec()
 }
 
 /// The first line of the app's output (stdout and stderr) matching `re`, within `timeout`.
@@ -671,6 +743,7 @@ fn summary_body(meta: &Value) -> String {
             g("display.hz")
         );
     }
+    s += &refused_lines(meta);
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: profilers ran during this recording, so its times are not the target's; take times with --probes timing\n";
     }
@@ -698,9 +771,9 @@ fn native_summary(meta: &Value) -> String {
         s += &format!("io       read {} · written {}\n", fmt::bytes(get("io.read")), fmt::bytes(get("io.write")));
     }
     s += &fmt::counters(get);
-    s += &memory_lines(v);
+    s += &memory_lines(meta);
     if get("ui.cpu").is_finite() {
-        s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
+        s += &ui_line(meta);
     }
     if get("frames.n").is_finite() {
         s += &format!(
@@ -713,6 +786,7 @@ fn native_summary(meta: &Value) -> String {
     if let Some(line) = background_line(meta) {
         s += &line;
     }
+    s += &refused_lines(meta);
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: take times with --probes timing\n";
     }
@@ -736,11 +810,14 @@ pub fn launch_line(v: &Value) -> String {
 
 /// A native target's GPU use and memory: what the GPU's statistics say and what holds the processes'
 /// memory (`memory.app.host` beside `memory.app.private`).
-pub fn memory_lines(v: &Value) -> String {
+pub fn memory_lines(meta: &Value) -> String {
+    let v = &meta["values"];
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    // A value, or `refused` when the recording says why there is none (`refused_lines` says it).
+    let shown = |k: &str, unit: &str| if meta["refused"][k].is_string() { "refused".to_string() } else { fmt::value(get(k), unit) };
     let mut s = String::new();
     if get("gpu.process.3d").is_finite() || get("gpu.vram").is_finite() {
-        s += &format!("gpu      3D {} · VRAM {} · shared {}\n", fmt::value(get("gpu.process.3d"), "%"), fmt::value(get("gpu.vram"), "MB"), fmt::value(get("gpu.shared"), "MB"));
+        s += &format!("gpu      3D {} · VRAM {} · shared {}\n", shown("gpu.process.3d", "%"), shown("gpu.vram", "MB"), shown("gpu.shared", "MB"));
     }
     if get("memory.app.private").is_finite() {
         s += &format!("memory   {} private", fmt::value(get("memory.app.private"), "MB"));
@@ -750,6 +827,31 @@ pub fn memory_lines(v: &Value) -> String {
         s += "\n";
     }
     s
+}
+
+/// The UI thread's CPU and wakes (`refused` where the OS counts no wakes per thread).
+pub fn ui_line(meta: &Value) -> String {
+    let get = |k: &str| meta["values"].get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let wakes = if meta["refused"]["ui.wakes"].is_string() { "wakes refused".to_string() } else { format!("{} wakes", fmt::value(get("ui.wakes"), "/s")) };
+    format!("ui       {} CPU on the UI thread (the main window's) · {wakes}\n", fmt::value(get("ui.cpu"), "ms"))
+}
+
+/// The recording's refused metrics, once per reason: `refused  gpu.vram, gpu.shared: macOS: …`.
+pub fn refused_lines(meta: &Value) -> String {
+    let mut reasons: Vec<(String, Vec<&str>)> = Vec::new();
+    for (m, why) in meta["refused"].as_object().into_iter().flatten() {
+        let line = why.as_str().unwrap_or("");
+        // `<validator>: <metric>: <why>` reads as `<validator>: <why>` under its metrics.
+        let why = match line.split_once(": ") {
+            Some((id, rest)) => format!("{id}: {}", rest.strip_prefix(&format!("{m}: ")).unwrap_or(rest)),
+            None => line.to_string(),
+        };
+        match reasons.iter_mut().find(|r| r.0 == why) {
+            Some(r) => r.1.push(m),
+            None => reasons.push((why, vec![m])),
+        }
+    }
+    reasons.iter().map(|(why, ms)| format!("refused  {}: {why}\n", ms.join(", "))).collect()
 }
 
 pub fn now_iso() -> String {

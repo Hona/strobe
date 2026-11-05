@@ -3301,9 +3301,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut runs: Vec<Run> = Vec::new();
         let mut nodes_all = Vec::new();
         let mut warmup = block::Warmup::new(x);
+        let mut starts = shown::Starts::new(set);
         while warmup.more(runs.len()) {
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
+            starts.check(i + 1, false, &|| shown::page_start(&page))?;
             runs.push(run_once(&format!("run:{i}"))?);
             if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
@@ -3340,6 +3342,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 }
             }
         }
+        starts.check(runs.len() + 1, true, &|| shown::page_start(&page))?;
         let unsteady = warmup.unsteady();
         let first = warmup.first().unwrap_or(0);
         // Warmup and measured runs interleave with the steadiness check: split the loop by run.

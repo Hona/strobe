@@ -6,7 +6,7 @@
 use super::{Output, fmt, progress};
 use crate::cli::{Args, duration_ms};
 use crate::host;
-use crate::model::{Error, Result};
+use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::present::{self, frames};
 use crate::probe::stacks::StackCapture;
 use crate::probe::{self, wakes};
@@ -14,6 +14,54 @@ use crate::store;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::time::Duration;
+
+/// What this OS gives strobe no way to read for another process (SPEC §13.6), as the refusal that
+/// says so (`NotOnThisOs`). None: the OS has a source, which the caller reads.
+pub fn not_on_this_os(metric: &str) -> Option<Refusal> {
+    let mac = cfg!(target_os = "macos");
+    let why = match metric {
+        "gpu.vram" | "gpu.shared" if mac => {
+            "macOS: Apple GPUs share system memory, so a process's GPU allocations are part of its physical footprint (memory.app.private); there is no VRAM per process"
+        }
+        "memory.app.host" if mac => "macOS: memory by what holds it reads another process's regions, which takes its task port (debuggers only); memory.app.private is its physical footprint",
+        "ui.wakes" if mac => "macOS counts context switches per process, not per thread (no public per-thread count): cpu.wakes has the process's",
+        "cpu.foreign" | "cpu.foreign.max" if mac => "macOS has no CPU affinity, so no CPUs are the target's own to measure other work on",
+        "cpu.work" | "cpu.app.total" | "cpu.process.total" if cfg!(all(windows, not(target_arch = "x86_64"))) => {
+            "Windows on Arm: process CPU comes as cycles, and strobe has no time stamp counter to turn them into time"
+        }
+        _ => return None,
+    };
+    Some(Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why}")))
+}
+
+/// Why the GPU fields are empty when the OS sampler opened no per-process GPU source.
+pub fn gpu_unread(metric: &str) -> Refusal {
+    let why = if cfg!(windows) {
+        "the GPU's per-process statistics (D3DKMT) did not open"
+    } else if cfg!(target_os = "macos") {
+        "the GPU's per-client statistics (IOAccelerator) did not open"
+    } else {
+        "the GPU driver publishes no per-client statistics (DRM fdinfo; NVIDIA's proprietary driver and virtual GPUs have none)"
+    };
+    Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why}"))
+}
+
+/// The refusals (`<validator>: <why>`) of what a process recording on this OS cannot hold, for its
+/// meta and summary: a missing number is never shown as if nothing were there.
+pub fn os_refusals(has: &dyn Fn(&str) -> bool, gpu: bool) -> serde_json::Map<String, Value> {
+    let mut out = serde_json::Map::new();
+    for m in ["gpu.process.3d", "gpu.vram", "gpu.shared", "memory.app.host", "ui.wakes"] {
+        // A UI thread's wakes are missing only beside its CPU: without a window it has neither.
+        if has(m) || (m == "ui.wakes" && !has("ui.cpu")) {
+            continue;
+        }
+        let r = not_on_this_os(m).or_else(|| (!gpu && m.starts_with("gpu.")).then(|| gpu_unread(m)));
+        if let Some(r) = r {
+            out.insert(m.into(), json!(r.message()));
+        }
+    }
+    out
+}
 
 /// `pid:<n>`, or `proc:<name>`: the one process of that name whose parent is not of that name.
 pub fn resolve(target: &str) -> Result<u32> {
@@ -52,14 +100,13 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         None => 10_000,
     };
     let awake = host::Awake::start();
-    let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
-    let dir = store::recording_dir(&id)?;
+    let (id, dir) = super::record::claim(args)?;
     let draft = store::Draft::new(&dir);
     // The lock screen covers every window: nothing reaches the display and presents stop. Stacks,
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
     if deep {
-        let cap = StackCapture::start_with(root, args.get("probes") == Some("stacks-unprivileged"))?;
+        let cap = StackCapture::start_with(crate::probe::stacks::Targets::new(root, None), args.get("probes") == Some("stacks-unprivileged"))?;
         progress(format!("sampling native stacks of {name} ({root}) for {}", fmt::ms_duration(for_ms)));
         std::thread::sleep(Duration::from_millis(for_ms));
         let d = cap.stop()?;
@@ -81,16 +128,20 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         );
         return Ok(Output::new(text, meta));
     }
+    // A process strobe did not launch has no home to find its detached processes by: its set is its
+    // tree (`process_set` with no home).
+    let set = move || host::process_set(root, None);
+    let pids_now = move || set().iter().map(|p| p.pid).collect::<Vec<u32>>();
     let presents = present::PresentCapture::start().map(|mut p| {
-        p.track(&host::tree_pids(root));
+        p.track(&pids_now());
         p
     });
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
     let sampler = probe::os::Sampler::start(root);
-    let cycles = || host::process_tree(root).iter().map(|p| p.cycles).sum::<u64>();
+    let cycles = || set().iter().map(|p| p.cycles).sum::<u64>();
     // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
-    let snap0 = wakes::Snapshot::take(&host::tree_pids(root));
-    let timeline = wakes::Timeline::start(move || host::tree_pids(root));
+    let snap0 = wakes::Snapshot::take(&pids_now());
+    let timeline = wakes::Timeline::start(pids_now);
     let procs0 = (host::now_ns(), host::all_processes());
     let (c0, tsc0, t0) = (cycles(), host::tsc(), host::now_ns());
     progress(format!("recording {name} ({root}) for {}", fmt::ms_duration(for_ms)));
@@ -100,7 +151,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let mut timeline = timeline.stop();
     timeline.marks.push(("recording".into(), t0, t1));
     crate::symbol::write_gz(&dir.join("timeline.json.gz"), &timeline)?;
-    let tree = host::process_tree(root);
+    let tree = set();
     let pids: Vec<u32> = tree.iter().map(|p| p.pid).collect();
     let span = wakes::span(&snap0, &wakes::Snapshot::take(&pids));
     let os = sampler.stop().window(t0, t1);
@@ -126,7 +177,9 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         if let Some(c) = t.cpu_ms {
             values.insert("ui.cpu".into(), c);
         }
-        values.insert("ui.wakes".into(), t.switches as f64 / (ms / 1e3));
+        if not_on_this_os("ui.wakes").is_none() {
+            values.insert("ui.wakes".into(), t.switches as f64 / (ms / 1e3));
+        }
     }
     let names: BTreeMap<u32, String> = span.threads.iter().filter_map(|t| Some((t.tid, host::thread_name(t.tid)?))).collect();
     // The busiest threads by CPU, for the summary: per-thread CPU needs no permission on any OS.
@@ -155,7 +208,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     // an overlay, such as a dictation HUD, has no main window).
     let display_of = |pids: &[u32]| host::main_window(pids).map(|w| w.hwnd).or_else(|| host::top_windows(pids).first().map(|w| w.0)).and_then(host::display_of);
     let unpaced = presents.as_ref().ok().and_then(|p| {
-        let pids = host::tree_pids(root);
+        let pids = pids_now();
         let display = display_of(&pids);
         let hz = frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
         frames::spin(&p.presents, &pids, &[(t0, t1)], hz)
@@ -164,7 +217,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let refused = match &presents {
         _ if session_locked => Some("SessionLocked: the session was locked while strobe recorded, so nothing reached the display".to_string()),
         Ok(p) => {
-            let pids = host::tree_pids(root);
+            let pids = pids_now();
             let display = display_of(&pids);
             let f = frames::native_values(p, &pids, &[(t0, t1)], display.as_ref());
             match f.refused {
@@ -182,9 +235,10 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         }
         Err(e) => Some(e.message.clone()),
     };
+    let os_refused = os_refusals(&|m| values.contains_key(m), os.gpu_3d_pct.is_some());
     let meta = json!({
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
-        "env": host::env(), "values": values, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,
+        "env": host::env(), "values": values, "refused": os_refused, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,
         "display_settings_hz": host::refresh_at(0, 0), "timing": "clean", "created": super::record::now_iso(), "valid": true, "screen": screen,
         "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })), "threads_top": threads_top,
     });
@@ -239,7 +293,7 @@ pub fn text(meta: &Value) -> String {
     }
     s += &fmt::counters(get);
     if get("ui.cpu").is_finite() {
-        s += &format!("ui       {} CPU on the UI thread (the main window's) · {} wakes\n", fmt::value(get("ui.cpu"), "ms"), fmt::value(get("ui.wakes"), "/s"));
+        s += &super::record::ui_line(meta);
     }
     for (i, t) in meta["threads_top"].as_array().into_iter().flatten().enumerate() {
         s += &format!(
@@ -250,7 +304,8 @@ pub fn text(meta: &Value) -> String {
             if t["pid"] != meta["pid"] { format!("(pid {})", t["pid"]) } else { String::new() }
         );
     }
-    s += &super::record::memory_lines(v);
+    s += &super::record::memory_lines(meta);
+    s += &super::record::refused_lines(meta);
     s += &format!(
         "next     strobe query {id} threads · strobe query {id} memory · strobe query {id} gpu · strobe record {} --probes deep (native stacks)\n",
         meta["target"].as_str().unwrap_or("")

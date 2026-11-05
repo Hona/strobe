@@ -1,7 +1,7 @@
 //! Native CPU samples on macOS (attribution blocks only, SPEC rule 3) through `/usr/bin/sample`, the
 //! one sampler macOS lets a user run on their own processes without root or an entitlement (reading
 //! another task's threads needs a task port, which only Apple-signed tools get). One `sample` per
-//! process of the tree, every 1 ms, stopped with SIGINT; its call graph becomes `Deep` stacks.
+//! process of the target's process set, every 1 ms, stopped with SIGINT; its call graph becomes `Deep` stacks.
 //!
 //! What it is, honestly: `sample` suspends the process each millisecond and walks every thread's user
 //! stack (frame pointers, always kept on arm64). So a sample is a thread's stack at that moment, not
@@ -10,7 +10,7 @@
 //! in `dropped`; a thread preempted while runnable in user code still counts. Samples carry no time
 //! (`untimed`), and processes started after the capture began are not sampled.
 
-use crate::probe::stacks::{Deep, Module};
+use crate::probe::stacks::{Deep, Module, Targets};
 use crate::model::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::process::{Child, Command, Stdio};
@@ -29,11 +29,11 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn start(root: u32) -> Result<Capture> {
+    pub fn start(targets: Targets) -> Result<Capture> {
         use std::os::unix::process::CommandExt;
-        let pids = crate::host::tree_pids(root);
+        let pids = targets.pids();
         if pids.is_empty() {
-            return Err(Error::msg(format!("process {root} is not running")));
+            return Err(Error::msg(format!("process {} is not running", targets.root)));
         }
         let mut runs = Vec::new();
         for pid in pids.into_iter().take(16) {

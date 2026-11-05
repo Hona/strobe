@@ -16,7 +16,7 @@
 //! strobe takes no lock of the target and calls nothing in it, so the target cannot stall strobe.
 //! Samples are capped at one per thread per 2 ms and 4,000 a second in all.
 
-use crate::probe::stacks::{Deep, Module, SuspendStats};
+use crate::probe::stacks::{Deep, Module, SuspendStats, Targets};
 use crate::host;
 use crate::model::{Error, Result};
 use std::collections::HashMap;
@@ -42,15 +42,15 @@ pub struct Capture {
 }
 
 impl Capture {
-    pub fn start(root: u32) -> Result<Capture> {
+    pub fn start(targets: Targets) -> Result<Capture> {
         if !cfg!(target_arch = "x86_64") {
             return Err(Error::msg("native stacks without the deep helper unwind x64 code only"));
         }
-        if host::tree_pids(root).is_empty() {
-            return Err(Error::msg(format!("process {root} is not running")));
+        if targets.pids().is_empty() {
+            return Err(Error::msg(format!("process {} is not running", targets.root)));
         }
         let (stop, rx) = mpsc::channel();
-        let thread = std::thread::Builder::new().name("strobe-stacks".into()).spawn(move || run(root, rx)).map_err(|e| Error::msg(format!("the stack sampler thread: {e}")))?;
+        let thread = std::thread::Builder::new().name("strobe-stacks".into()).spawn(move || run(&targets, rx)).map_err(|e| Error::msg(format!("the stack sampler thread: {e}")))?;
         Ok(Capture { stop, thread: Some(thread) })
     }
 
@@ -113,7 +113,7 @@ struct Image {
 #[repr(C, align(16))]
 struct Aligned(CONTEXT);
 
-fn run(root: u32, rx: mpsc::Receiver<()>) -> Result<Deep> {
+fn run(targets: &Targets, rx: mpsc::Receiver<()>) -> Result<Deep> {
     let t0 = host::now_ns();
     // A sampler preempted between a suspend and its resume stalls the target's thread with it: run
     // above normal threads (a 75 ms stall once at normal priority).
@@ -140,9 +140,9 @@ fn run(root: u32, rx: mpsc::Receiver<()>) -> Result<Deep> {
             Ok(()) | Err(mpsc::TryRecvError::Disconnected) => break,
             Err(mpsc::TryRecvError::Empty) => {}
         }
-        // Every 100 ms: the tree's threads, and which of them ran since the last look.
+        // Every 100 ms: the process set's threads, and which of them ran since the last look.
         if last_refresh.as_ref().is_none_or(|(at, _)| at.elapsed() >= std::time::Duration::from_millis(100)) {
-            let mut pids = host::tree_pids(root);
+            let mut pids = targets.pids();
             pids.sort_unstable();
             let (now, _) = host::threads(&pids);
             let cpu: HashMap<u32, u64> = now.iter().map(|t| (t.tid, t.cpu_ns)).collect();

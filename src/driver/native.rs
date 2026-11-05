@@ -461,6 +461,11 @@ mod imp {
             Ok(self.snapshot(None)?.nodes.len())
         }
 
+        /// The app's windows' tree now, main first (what a run starts from: `ResetIncomplete`).
+        pub fn tree(&self) -> Result<Tree> {
+            self.snapshot(None)
+        }
+
         /// Before an input that is measured: at least `min`, then until the app has presented
         /// nothing for two refreshes (at most 300 ms), so a frame of what came before (a hover, a
         /// click's pressed look) is not taken for the input's (SPEC §7.4). Reads only strobe's own

@@ -57,17 +57,19 @@ impl Drop for Raised {
 }
 
 impl Capture {
-    /// Samples the process tree under `root` (children started meanwhile included).
-    pub fn start(root: u32) -> Result<Capture> {
+    /// Samples the process tree under `root` and the processes `more` (the rest of the target's
+    /// process set, which the client read), with the children any of them start meanwhile.
+    pub fn start(root: u32, more: &[u32]) -> Result<Capture> {
         enable_privilege("SeSystemProfilePrivilege")?;
         // A helper that died while sampling left its session running and the interval raised: the
         // session is stopped and the interval put back first, so it is not taken for the system's.
         etw::reap();
         let raised = Raised::to(INTERVAL_100NS)?;
-        let pids: HashSet<u32> = crate::host::tree_pids(root).into_iter().collect();
-        if pids.is_empty() {
+        let tree = crate::host::tree_pids(root);
+        if tree.is_empty() {
             return Err(Error::msg(format!("process {root} is not running")));
         }
+        let pids: HashSet<u32> = tree.into_iter().chain(more.iter().flat_map(|&p| crate::host::tree_pids(p))).collect();
         let cfg = etw::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512), flush_ms: 0 };
         let t0 = crate::host::now_ns();
         let setup = |h: CONTROLTRACE_HANDLE| -> Result<()> {

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// A local file is a `file://` address; anything else goes as given.
-fn address(target: &str) -> String {
+pub(super) fn address(target: &str) -> String {
     let p = Path::new(target);
     if !target.contains("://") && !target.starts_with("about:") && !target.starts_with("data:") && p.exists() {
         let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());

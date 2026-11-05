@@ -22,6 +22,20 @@ pub mod symbols;
 pub mod trace;
 pub mod wakes;
 
+/// Joins a capture's thread once it has been told to stop, waiting at most `wait`: a stop or a drop
+/// never hangs on a thread that does not end. None when it panicked or is still running (then it is
+/// left to end by itself).
+pub fn join_within<T>(thread: std::thread::JoinHandle<T>, wait: std::time::Duration) -> Option<T> {
+    let deadline = std::time::Instant::now() + wait;
+    while !thread.is_finished() {
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(2));
+    }
+    thread.join().ok()
+}
+
 /// Named probe sets (SPEC §8.1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "lowercase")]

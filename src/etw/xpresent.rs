@@ -118,9 +118,8 @@ impl Capture {
     }
 
     pub fn stop(mut self) -> Result<Presents> {
-        self.stop.store(true, Ordering::Relaxed);
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
+        if !self.end() {
+            return Err(Error::msg("the present thread did not stop within 2 s"));
         }
         let sh = std::mem::take(&mut *self.shared.lock().unwrap_or_else(|e| e.into_inner()));
         Ok(Presents {
@@ -135,6 +134,19 @@ impl Capture {
             only: Some("the X Present extension".into()),
             unshared: Vec::new(),
         })
+    }
+
+    /// Stops the consumer thread (it sees the flag within its 100 ms poll); whether it ended.
+    fn end(&mut self) -> bool {
+        self.stop.store(true, Ordering::Relaxed);
+        self.thread.take().is_none_or(|t| crate::probe::join_within(t, Duration::from_secs(2)).is_some())
+    }
+}
+
+/// A capture dropped without `stop` (a failed block): its thread ends with it.
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.end();
     }
 }
 

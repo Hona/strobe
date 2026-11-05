@@ -130,12 +130,13 @@ pub fn sessions() -> Vec<String> {
         .collect()
 }
 
-/// Stops `strobe-<kind>-<pid>` sessions whose process is gone (a crash or a kill mid-recording).
+/// Stops `strobe-<kind>-<pid>` sessions whose process is gone (a crash or a kill mid-recording),
+/// and puts back the profile interval a sampled-stack one raised.
 pub fn reap() {
     for name in sessions() {
         let Some(pid) = name.strip_prefix("strobe-").and_then(|r| r.rsplit('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if crate::host::win::exe_of(pid).is_none() {
-            stop_named(&name);
+        if crate::host::win::exe_of(pid).is_none() && stop_named(&name) && name.starts_with("strobe-stacks-") {
+            super::stacks::reset_interval();
         }
     }
 }

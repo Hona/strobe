@@ -23,22 +23,44 @@ const FLAG_PROFILE: u32 = 0x0100_0000;
 const SAMPLED_PROFILE: u8 = 46;
 /// 200 µs in the profile interval's 100 ns units.
 pub const INTERVAL_100NS: u32 = 2000;
+/// Windows' own sampled-profile interval (1 ms), for when the current one cannot be read.
+const DEFAULT_100NS: u32 = 10_000;
 
+/// A sampled-stack session. Dropped without `stop` (an error, a client gone), its session stops and
+/// the profile interval goes back all the same: fields drop in order, the session before the interval.
 pub struct Capture {
     running: Running<Deep>,
-    old_interval: Option<u32>,
+    _raised: Raised,
     t0: u64,
+}
+
+/// The system-wide sampled-profile interval, raised for a capture and put back when this drops.
+struct Raised(u32);
+
+impl Raised {
+    fn to(v: u32) -> Result<Raised> {
+        let old = interval().unwrap_or(DEFAULT_100NS);
+        set_interval(v)?;
+        Ok(Raised(old))
+    }
+}
+
+impl Drop for Raised {
+    fn drop(&mut self) {
+        let _ = set_interval(self.0);
+    }
 }
 
 impl Capture {
     /// Samples the process tree under `root` (children started meanwhile included).
     pub fn start(root: u32) -> Result<Capture> {
         enable_privilege("SeSystemProfilePrivilege")?;
-        let old_interval = interval();
-        set_interval(INTERVAL_100NS)?;
+        // A helper that died while sampling left its session running and the interval raised: the
+        // session is stopped and the interval put back first, so it is not taken for the system's.
+        session::reap();
+        let raised = Raised::to(INTERVAL_100NS)?;
         let pids: HashSet<u32> = crate::host::tree_pids(root).into_iter().collect();
         if pids.is_empty() {
-            set_interval(old_interval.unwrap_or(10_000)).ok();
             return Err(Error::msg(format!("process {root} is not running")));
         }
         let cfg = session::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512), flush_ms: 0 };
@@ -51,25 +73,28 @@ impl Capture {
             }
             Ok(())
         };
-        let running = match Running::start(cfg, setup, move || Sampler::new(pids)) {
-            Ok(r) => r,
-            Err(e) => {
-                set_interval(old_interval.unwrap_or(10_000)).ok();
-                return Err(e);
-            }
-        };
-        Ok(Capture { running, old_interval, t0 })
+        let running = Running::start(cfg, setup, move || Sampler::new(pids))?;
+        Ok(Capture { running, _raised: raised, t0 })
     }
 
     pub fn stop(self) -> Result<Deep> {
         let t1 = crate::host::now_ns();
-        let result = self.running.stop();
-        set_interval(self.old_interval.unwrap_or(10_000)).ok();
+        let Capture { running, _raised: raised, t0 } = self;
+        let result = running.stop();
+        drop(raised);
         let (mut deep, stats) = result?;
-        deep.t0_ns = self.t0;
+        deep.t0_ns = t0;
         deep.t1_ns = t1;
         deep.events_lost = stats.events_lost + stats.buffers_lost;
         Ok(deep)
+    }
+}
+
+/// After a dead strobe's sampled-stack session was stopped (`session::reap`): the interval it raised
+/// goes back to Windows' own, unless something else has changed it since.
+pub fn reset_interval() {
+    if interval() == Some(INTERVAL_100NS) {
+        let _ = set_interval(DEFAULT_100NS);
     }
 }
 

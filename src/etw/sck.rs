@@ -57,6 +57,7 @@ unsafe extern "C" {
     static _NSConcreteStackBlock: c_void;
     fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
     fn dispatch_sync_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
+    fn dispatch_release(object: *mut c_void);
 }
 
 #[link(name = "ScreenCaptureKit", kind = "framework")]
@@ -684,7 +685,11 @@ impl Capture {
                 self.drop_stream(Stream { stream, output, rect });
                 return Err(Error::msg(format!("ScreenCaptureKit did not start: {why}")));
             }
-            None => return Err(Error::msg("ScreenCaptureKit did not start the window's stream in 5 s")),
+            None => {
+                // It may still start: stopped and drained like any other, so it captures nothing on.
+                self.drop_stream(Stream { stream, output, rect });
+                return Err(Error::msg("ScreenCaptureKit did not start the window's stream in 5 s"));
+            }
         }
         // The first frame is the window as it is: once it came, every later frame is new content.
         let sink = unsafe { object_getIvar(output, class_getInstanceVariable(output_class(), c"sink".as_ptr())) } as *const Sink;
@@ -748,11 +753,20 @@ impl Capture {
     }
 }
 
+/// After `stop`, or instead of it (a failed block): every stream stopped and drained, then the queue
+/// they delivered on released (each drain waited on it, so nothing still runs there).
 impl Drop for Capture {
     fn drop(&mut self) {
         self.end_watch();
+        let pool = unsafe { objc_autoreleasePoolPush() };
         for (_, s) in std::mem::take(&mut self.streams) {
             self.drop_stream(s);
+        }
+        unsafe {
+            objc_autoreleasePoolPop(pool);
+            if !self.queue.is_null() {
+                dispatch_release(self.queue);
+            }
         }
     }
 }

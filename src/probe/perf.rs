@@ -389,11 +389,15 @@ fn follow(root: u32, kernel: bool, rings: &mut Vec<Ring>, opened: &mut HashSet<u
     Ok(())
 }
 
-/// A running sampler: the reader thread drains every ring and unwinds as samples arrive.
+/// A running sampler: the reader thread drains every ring and unwinds as samples arrive. It owns
+/// the rings, so its end closes every perf event; a capture dropped without `stop` ends it too.
 pub struct Capture {
     stop: Arc<AtomicBool>,
-    thread: std::thread::JoinHandle<Result<Deep>>,
+    thread: Option<std::thread::JoinHandle<Result<Deep>>>,
 }
+
+/// How long `stop` waits for the reader to unwind what the rings still hold and name the threads.
+const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 impl Capture {
     pub fn start(root: u32) -> Result<Capture> {
@@ -474,11 +478,21 @@ impl Capture {
                 Ok(deep)
             })
             .map_err(|e| Error::msg(format!("start the sampler thread: {e}")))?;
-        Ok(Capture { stop, thread })
+        Ok(Capture { stop, thread: Some(thread) })
     }
 
-    pub fn stop(self) -> Result<Deep> {
+    pub fn stop(mut self) -> Result<Deep> {
         self.stop.store(true, Ordering::Relaxed);
-        self.thread.join().map_err(|_| Error::msg("the sampler thread panicked"))?
+        let thread = self.thread.take().ok_or_else(|| Error::msg("no sampler thread"))?;
+        super::join_within(thread, STOP_WAIT).ok_or_else(|| Error::msg(format!("the sampler thread did not end within {} s", STOP_WAIT.as_secs())))?
+    }
+}
+
+impl Drop for Capture {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            super::join_within(t, std::time::Duration::from_secs(2));
+        }
     }
 }

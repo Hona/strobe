@@ -316,16 +316,17 @@ pub fn stacks_how(d: &Deep) -> String {
 }
 
 /// A sampled-stack session for a process tree (attribution only): the kernel's sampled profile in
-/// the helper, else (Windows) strobe's own sampler, which needs no elevation.
-pub struct StackCapture {
+/// the helper, else (Windows) strobe's own sampler, which needs no elevation. Dropped without `stop`,
+/// each ends its sampling (the helper when its client goes).
+pub enum StackCapture {
     #[cfg(windows)]
-    client: Option<helper::Client>,
+    Helper(helper::Client),
     #[cfg(windows)]
-    suspend: Option<crate::probe::suspend::Capture>,
+    Suspend(crate::probe::suspend::Capture),
     #[cfg(target_os = "linux")]
-    perf: crate::probe::perf::Capture,
+    Perf(crate::probe::perf::Capture),
     #[cfg(target_os = "macos")]
-    sample: crate::probe::sample::Capture,
+    Sample(crate::probe::sample::Capture),
 }
 
 impl StackCapture {
@@ -341,34 +342,38 @@ impl StackCapture {
         #[cfg(windows)]
         {
             if unprivileged || !access().helper {
-                return Ok(StackCapture { client: None, suspend: Some(crate::probe::suspend::Capture::start(root)?) });
+                return Ok(StackCapture::Suspend(crate::probe::suspend::Capture::start(root)?));
             }
             let mut client = helper::Client::connect()?;
             client.call(serde_json::json!({ "op": "stacks.start", "root": root }))?;
-            Ok(StackCapture { client: Some(client), suspend: None })
+            Ok(StackCapture::Helper(client))
         }
         #[cfg(target_os = "linux")]
-        return Ok(StackCapture { perf: crate::probe::perf::Capture::start(root)? });
+        return Ok(StackCapture::Perf(crate::probe::perf::Capture::start(root)?));
         #[cfg(target_os = "macos")]
-        return Ok(StackCapture { sample: crate::probe::sample::Capture::start(root)? });
+        return Ok(StackCapture::Sample(crate::probe::sample::Capture::start(root)?));
     }
 
     /// Stops sampling; thread names and missing module lists come from the live processes.
     pub fn stop(self) -> crate::model::Result<Deep> {
-        #[cfg(windows)]
-        {
-            let mut deep: Deep = match (self.client, self.suspend) {
-                (Some(mut c), _) => serde_json::from_value(c.call(serde_json::json!({ "op": "stacks.stop" }))?)?,
-                (None, Some(s)) => s.stop()?,
-                (None, None) => return Err(crate::model::Error::msg("no stack session")),
-            };
-            fill_from_processes(&mut deep);
-            Ok(deep)
+        match self {
+            #[cfg(windows)]
+            StackCapture::Helper(mut c) => {
+                let mut deep: Deep = serde_json::from_value(c.call(serde_json::json!({ "op": "stacks.stop" }))?)?;
+                fill_from_processes(&mut deep);
+                Ok(deep)
+            }
+            #[cfg(windows)]
+            StackCapture::Suspend(s) => {
+                let mut deep = s.stop()?;
+                fill_from_processes(&mut deep);
+                Ok(deep)
+            }
+            #[cfg(target_os = "linux")]
+            StackCapture::Perf(p) => p.stop(),
+            #[cfg(target_os = "macos")]
+            StackCapture::Sample(s) => s.stop(),
         }
-        #[cfg(target_os = "linux")]
-        return self.perf.stop();
-        #[cfg(target_os = "macos")]
-        return self.sample.stop();
     }
 }
 

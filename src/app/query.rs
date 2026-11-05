@@ -1088,20 +1088,26 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
 }
 /// Busy time by thread from its task loop's tasks. A thread's other tracks hold spans that overlap
 /// its tasks (animation frames, GC sweeping): counting every top-level slice once read 70 s of
-/// "busy" time for one renderer thread in a 14 s trace.
+/// "busy" time for one renderer thread in a 14 s trace. Tasks on several tracks of one thread can
+/// still overlap (one thread read 33.8 s of tasks in a shorter trace), so busy time is the union of
+/// its tasks' spans, per thread (its tid), never more than the time they cover.
 fn threads(trace: &Path, top: usize) -> Result<Output> {
-    let sql = format!(
-        "select p.name as process, p.pid, t.name as thread, count(*) as tasks, round(sum(s.dur) / 1e6, 1) as busy_ms, round(max(s.dur) / 1e6, 1) as max_ms
-         from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) left join process p using(upid)
-         where s.depth = 0 and s.dur > 0 and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask') group by 1, 2, 3 order by busy_ms desc limit {top}"
-    );
-    let out = sql_view(trace, &sql, top)?;
+    let tasks = " and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask')";
+    let sql = |filter: &str| {
+        format!(
+            "with x as (select tt.utid, s.ts, s.ts + s.dur as e, s.dur from slice s join thread_track tt on s.track_id = tt.id where s.depth = 0 and s.dur > 0{filter}),
+             o as (select utid, ts, e, dur, max(e) over (partition by utid order by ts, e rows between unbounded preceding and 1 preceding) as before from x)
+             select p.name as process, p.pid, t.tid, t.name as thread, count(*) as tasks, round(sum(max(0, e - max(ts, coalesce(before, ts)))) / 1e6, 1) as busy_ms, round(max(dur) / 1e6, 1) as max_ms
+             from o join thread t using(utid) left join process p using(upid) group by o.utid order by busy_ms desc limit {top}"
+        )
+    };
+    let out = sql_view(trace, &sql(tasks), top)?;
     if out.json["total"].as_u64().unwrap_or(0) > 0 {
         return Ok(out);
     }
     // A trace without a task loop's slices (an imported one): every top-level slice, said so.
-    let mut out = sql_view(trace, &sql.replace(" and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask')", ""), top)?;
-    out.text += "no task-loop slices (RunTask) in this trace: every top-level slice counted, and slices on a thread's other tracks may overlap\n";
+    let mut out = sql_view(trace, &sql(""), top)?;
+    out.text += "no task-loop slices (RunTask) in this trace: every top-level slice of a thread counted, overlaps once\n";
     Ok(out)
 }
 

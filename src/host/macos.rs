@@ -605,13 +605,18 @@ pub fn tree_pids(root: u32) -> Vec<u32> {
 }
 
 /// What `host::kill_tree` ends: `tree_pids`, and when `root` has exited but is not reaped (a launch
-/// strobe still owns), what it left running: processes responsible to it (its XPC services, its
-/// children that went to launchd) that started no earlier than it. Its pid cannot name another
-/// process while it is unreaped. macOS answers such a process's own pid once the root has exited, so
+/// strobe still owns, whose start time `start` its owner read at the launch), what it left running:
+/// processes responsible to it (its XPC services, its children that went to launchd) that started
+/// no earlier than it. Its pid cannot name another process while it is unreaped. macOS answers such a process's own pid once the root has exited, so
 /// this goes by the last answer strobe read while the root ran: a process the root started and left
 /// between two reads of the set is not found.
-pub fn kill_set(root: u32) -> Vec<u32> {
-    let all = all_bsd();
+pub fn kill_set(root: u32, start: Option<u64>) -> Vec<u32> {
+    let mut all = all_bsd();
+    // macOS gives no BSD info of an exited, unreaped process: it stands in with the start time its
+    // owner read at the launch.
+    if let Some(start) = start.filter(|_| !all.iter().any(|b| b.pid == root)) {
+        all.push(Bsd { pid: root, ppid: 1, name: String::new(), start, zombie: true });
+    }
     tree_of(&all, &[root], true).into_iter().map(|i| all[i].pid).collect()
 }
 

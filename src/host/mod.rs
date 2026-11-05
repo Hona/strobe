@@ -241,20 +241,31 @@ pub fn process_list() -> Vec<(u32, u32, u64)> {
 
 /// Ends a running process and every process of its tree now: Windows terminates each (when its
 /// creation time is still the snapshot's), Unix sends SIGKILL to the process group it leads (when it
-/// runs and leads one) and to each process of the tree, children first. On macOS an exited, unreaped
-/// process still roots what it left running (`macos::kill_set`).
+/// runs and leads one) and to each process of the tree, children first.
 pub fn kill_tree(pid: u32) {
+    kill_launch(pid, None);
+}
+
+/// `kill_tree` of a launch strobe owns and has not reaped; `start` is its start time, read at the
+/// launch: on macOS a launch that exited still roots what it left running (`macos::kill_set`).
+pub(crate) fn kill_launch(pid: u32, start: Option<u64>) {
     if pid == 0 {
         return;
     }
     #[cfg(windows)]
-    win::kill_tree(pid);
+    {
+        let _ = start;
+        win::kill_tree(pid);
+    }
     #[cfg(unix)]
     {
         #[cfg(target_os = "macos")]
-        let tree = macos::kill_set(pid);
+        let tree = macos::kill_set(pid, start);
         #[cfg(not(target_os = "macos"))]
-        let tree = tree_pids(pid);
+        let tree = {
+            let _ = start;
+            tree_pids(pid)
+        };
         if tree.is_empty() {
             return;
         }

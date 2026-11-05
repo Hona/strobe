@@ -2519,7 +2519,8 @@ Strobe launches any Electron app the same way, with no change to the app:
   block's experiment and a native `record` carry `Unattributed` (§10.2) beside numbers that hold the
   app's own processes only (Electron and browser launches, whose work is in their own tree, are not
   checked). Ending a launch ends its XPC services too: a launch that already exited is not reaped
-  until strobe ends it, so its pid still roots what it left running (the processes responsible to
+  until strobe ends it, so its pid, with the start time read at the launch (macOS gives no
+  information of an exited, unreaped process), still roots what it left running (the processes responsible to
   it that started no earlier, its children that went to launchd), which are ended before it is
   reaped; otherwise its web content process could outlive it and write the app's Library folders
   again after strobe removed them. macOS answers such a process's own pid once the app has exited,

@@ -1174,7 +1174,7 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
             *by.entry(s.2).or_default() += 1;
         }
         let mut list: Vec<(u32, u64)> = by.into_iter().collect();
-        list.sort_by(|a, b| b.1.cmp(&a.1));
+        list.sort_by_key(|a| std::cmp::Reverse(a.1));
         let names: Vec<String> = list.iter().take(8).map(|(tid, k)| format!("{} ({k})", d.threads.get(tid).cloned().unwrap_or_else(|| format!("thread {tid}")))).collect();
         out.text += &format!("! no samples of a thread named or numbered {t:?}; the sampled threads (samples): {}\n", names.join(", "));
     } else if n.samples == 0 {

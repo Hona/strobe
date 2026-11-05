@@ -979,12 +979,21 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     let failed = series.iter().filter(|s| s["passed"] != true).count();
     let mut text = String::new();
     for s in &series {
+        // Why each refused metric was refused, said once per reason under the case: a missing
+        // permission refuses every frame metric with the same paragraph.
+        let mut reasons: Vec<(String, Vec<String>)> = Vec::new();
+        for (name, why) in s["refused"].as_object().into_iter().flatten() {
+            let why = why.as_str().unwrap_or("");
+            let why = why.strip_prefix(&format!("{name}: ")).unwrap_or(why).to_string();
+            let why = regex_lite::Regex::new(r"^(\w+): [a-z]+(\.[a-z0-9]+)+: ").ok().map(|re| re.replace(&why, "$1: ").to_string()).unwrap_or(why);
+            match reasons.iter_mut().find(|r| r.0 == why) {
+                Some(r) => r.1.push(name.clone()),
+                None => reasons.push((why, vec![name.clone()])),
+            }
+        }
         // The declared metrics' values: one run's worth, enough to see that a counter counts.
         let shown = |name: &str| {
-            s["values"][name]
-                .as_f64()
-                .map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit))))
-                .or_else(|| s["refused"][name].as_str().map(|why| format!("{name} refused ({why})")))
+            s["values"][name].as_f64().map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit)))).or_else(|| s["refused"][name].is_string().then(|| format!("{name} refused")))
         };
         // A launch's milestones too, declared or not: when each line or pixel change came.
         let declared: Vec<&str> = s["declared"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
@@ -1023,6 +1032,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             if let Some(h) = s["hint"].as_str() {
                 text += &format!("      fix: {h}\n");
             }
+        }
+        for (why, names) in &reasons {
+            text += &format!("      refused  {}: {why}\n", names.join(", "));
         }
         // The case's own console output: the last 10 lines, and where the rest is.
         let log: Vec<&str> = s["log"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();

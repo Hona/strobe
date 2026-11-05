@@ -357,6 +357,20 @@ mod imp {
             Ok((names, marks))
         }
 
+        /// The visible elements that carry a key (an automation id), in tree order, at most `max`:
+        /// (key path, role, name).
+        pub fn keys(&self, max: usize) -> Result<Vec<(String, String, String)>> {
+            let tree = self.snapshot(None)?;
+            Ok((0..tree.nodes.len())
+                .filter(|&i| !tree.nodes[i].id.is_empty() && tree.visible_rect(i).is_some())
+                .take(max)
+                .map(|i| {
+                    let d = tree.describe(i);
+                    (d["path"].as_str().unwrap_or("").to_string(), d["role"].as_str().unwrap_or("").to_string(), tree.nodes[i].name.split_whitespace().collect::<Vec<_>>().join(" "))
+                })
+                .collect())
+        }
+
         /// Whether a selector matches a visible element within `t`.
         pub fn shows(&self, sel: &Value, t: Duration) -> Result<bool> {
             match self.find(&Selector::parse(sel)?, None, t) {

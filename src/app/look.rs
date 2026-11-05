@@ -50,8 +50,113 @@ fn console_text(args: &Value) -> String {
         .join(" ")
 }
 
+/// `strobe look app:<id> | exe:<path>`: the native app launched in an isolated home as a bench
+/// launches it, nothing measured, then closed: its windows' titles and what its accessibility tree
+/// shows (the window names, open dialogs and headings a case's `expect` checks, and the keyed
+/// elements selectors name). The tree reads on a locked session too, so an `expect` can be checked
+/// before the next unlock.
+fn native(args: &Args, target: &str) -> Result<Output> {
+    use crate::target::{isolate, native as nt};
+    let config = crate::config::load(&crate::config::project_root(&std::env::current_dir()?));
+    let mut app = match (target.strip_prefix("app:"), target.strip_prefix("exe:"), args.get("app")) {
+        (Some(id), _, _) => isolate::app(id, &config)?,
+        (_, Some(path), Some(id)) => isolate::app(id, &config)?.with_exe(Path::new(path)),
+        (_, Some(path), None) => isolate::App::bare(Path::new(path)),
+        _ => return Err(Error::usage("look app:<id> or exe:<path>")),
+    };
+    app.kind = "native".into();
+    let wait = Duration::from_millis(args.get("wait").map(duration_ms).transpose()?.unwrap_or(2000));
+    let timeout = Duration::from_millis(args.get("timeout").map(duration_ms).transpose()?.unwrap_or(60_000));
+    let keys = args.num("keys")?.unwrap_or(40.0).max(0.0) as usize;
+    let home = isolate::prepare_home(&app, args.get("home").map(Path::new), None)?;
+    progress(format!("look: launching {} in an isolated home", app.exe.display()));
+    let (mut n, guard) = match nt::launch(&app, &home, &[], false, None) {
+        Ok(x) => x,
+        Err(e) => {
+            isolate::release_home(&home.dir);
+            isolate::remove_home(&home.dir);
+            return Err(e);
+        }
+    };
+    let result = (|| -> Result<Output> {
+        let started = Instant::now();
+        let mut problems: Vec<String> = Vec::new();
+        let main = if app.windowless {
+            None
+        } else {
+            let w = n.wait_window(timeout, &guard)?;
+            Some(w.hwnd)
+        };
+        let window_ms = started.elapsed().as_secs_f64() * 1e3;
+        let session = main.map(|m| crate::driver::native::Session::open(&n.pids(), m));
+        if let (Some(Ok(se)), Some(sel)) = (&session, args.get("until"))
+            && !se.shows(&Value::String(sel.to_string()), timeout)?
+        {
+            problems.push(format!("{sel:?} never showed in {} s", timeout.as_secs()));
+        }
+        std::thread::sleep(wait);
+        let windows = crate::host::top_windows(&n.pids());
+        let mut titles: Vec<String> = windows.iter().filter(|w| Some(w.0) == main).chain(windows.iter().filter(|w| Some(w.0) != main)).map(|w| w.1.trim().to_string()).filter(|t| !t.is_empty()).collect();
+        let (mut headings, mut keyed) = (Vec::new(), Vec::new());
+        match &session {
+            Some(Ok(se)) => {
+                match se.screen(Duration::from_secs(5)) {
+                    Ok((names, h)) => {
+                        for t in names {
+                            if !titles.contains(&t) {
+                                titles.push(t);
+                            }
+                        }
+                        headings = h;
+                    }
+                    Err(e) => problems.push(format!("accessibility: {}", e.message)),
+                }
+                keyed = se.keys(keys).unwrap_or_default();
+            }
+            Some(Err(e)) => problems.push(format!("accessibility: {}", e.message)),
+            None => problems.push("the app has no window (a windowless profile): nothing to read".into()),
+        }
+        let locked = crate::host::session_locked();
+        let mut text = format!("{} · {}\n", titles.first().map(String::as_str).unwrap_or("(no title)"), app.exe.display());
+        text += &format!("window   {}{}\n", if main.is_some() { format!("after {}", fmt::value(window_ms, "ms")) } else { "none".into() }, if locked { " · session locked (the tree still reads; pixels and input do not)" } else { "" });
+        for p in &problems {
+            text += &format!("!        {p}\n");
+        }
+        for (i, t) in titles.iter().enumerate() {
+            text += &format!("{}{t}\n", if i == 0 { "titles   " } else { "         " });
+        }
+        for (i, h) in headings.iter().enumerate() {
+            text += &format!("{}{h}\n", if i == 0 { "headings " } else { "         " });
+        }
+        if headings.is_empty() && matches!(session, Some(Ok(_))) {
+            text += "headings none: the tree marks no open dialog or heading, so an `expect.heading` would refuse this screen\n";
+        }
+        if !keyed.is_empty() {
+            text += &format!("keys     {} visible keyed elements{}\n", keyed.len(), if keyed.len() == keys { format!(" (the first {keys}; --keys N for more)") } else { String::new() });
+            for (path, role, name) in &keyed {
+                text += &format!("  {path:<32} {role:<12} {name}\n");
+            }
+        }
+        text += "expect   a case's `expect: { title, heading }` matches one of the titles, and one of the headings\n";
+        let json = json!({
+            "target": target, "exe": app.exe, "window_ms": main.map(|_| window_ms), "session_locked": locked, "titles": titles, "headings": headings,
+            "keys": keyed.iter().map(|(p, r, n)| json!({ "path": p, "role": r, "name": n })).collect::<Vec<_>>(), "problems": problems,
+        });
+        let mut o = Output::new(text, json);
+        if !problems.is_empty() {
+            o.code = 124;
+        }
+        Ok(o)
+    })();
+    n.close(true);
+    result
+}
+
 pub fn run(args: &Args) -> Result<Output> {
-    let target = args.pos.first().ok_or_else(|| Error::usage("look needs a page: strobe look <url | file> [--until <css>] [--wait 2s] [--out shot.png]"))?;
+    let target = args.pos.first().ok_or_else(|| Error::usage("look needs a page or an app: strobe look <url | file | app:<id> | exe:<path>> [--until <css>] [--wait 2s] [--out shot.png]"))?;
+    if target.starts_with("app:") || target.starts_with("exe:") {
+        return native(args, target);
+    }
     let url = address(target);
     let (width, height) = match args.get("size") {
         Some(s) => {

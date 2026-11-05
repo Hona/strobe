@@ -50,6 +50,8 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe history [<ser_…|file>]    tracked series: points, sparkline, changes, culprits (query history|changes; report history <ser_…>)
     strobe look <url|file> [--until <css>] [--wait 1s] [--out shot.png]   a page in a headless browser, nothing measured: title,
         headings, visible text, console messages and errors, a screenshot (check a UI loads instead of writing a browser script)
+    strobe look app:<id> | exe:<path> [--until <selector>]   a native app launched isolated, then closed: window titles, the
+        tree's dialogs and headings (what `expect` matches) and keyed elements; works on a locked session, so check `expect` with it
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
 MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.

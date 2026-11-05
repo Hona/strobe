@@ -499,6 +499,15 @@ page). A local file opens as `file://`. Exit 124 when the load event or `--until
 page's own errors are listed, not an exit code. It is a CLI command only, not an MCP tool (§17): it
 answers no measurement question.
 
+`look app:<id> | exe:<path> [--app <id>] [--until <selector>] [--wait 2s] [--keys 40] [--timeout
+60s]`: a native app launched in an isolated home as a bench block launches it (its profile from
+`strobe.json`), nothing measured, then closed with its home: after its main window opens (and
+`--until`'s element shows, then `--wait`) it prints the windows' titles, the accessibility tree's
+window names, open dialogs and headings (what a case's `expect: { title, heading }` matches, read the
+same way, §9.6), and the visible elements that carry a key, with role and name. The tree reads on a
+locked session too (pixels and input do not), so an `expect` can be checked before an unlock. Exit
+124 when the tree or `--until` could not be read.
+
 ## 6. Clock
 
 One monotonic timeline per recording.
@@ -1797,8 +1806,10 @@ markdown is GitHub-flavoured.
 `--format pr` (`app/pr.rs`) writes an experiment as one block of GitHub-flavoured Markdown for a
 pull request body, pasted verbatim. Few words, two drawers:
 
-- **Hero:** one `#` line, the biggest text GitHub draws and bigger than the `##` sections an author
-  writes above the block: the decided wins of the series' main metrics in the metric's words for
+- **Hero:** one heading line: `#` alone in a body (`--format pr` to stdout), with `--update-pr` one
+  level below the author's own top headings (`###` under `##` sections, `##` under `#`), and `##` in
+  a body with other blocks but no headings, so several experiments read as peers under the PR's
+  sections; every intact block in the body is put at the same level (its hash redone). The decided wins of the series' main metrics in the metric's words for
   its better direction, in the series' order, joined with ` · ` (`# 44% less CPU time · 78% less
   app memory`), the same metric in several series once (`# 19–23% less CPU time`), at most three.
   A secondary metric never outranks a main one: only a single win from one series makes room for
@@ -1822,7 +1833,12 @@ pull request body, pasted verbatim. Few words, two drawers:
   **−44%** per pair (medians 7.05 → 3.90 ms), better in 8 of 8 pairs, likely −54% to −32%.`;
   `Run time unchanged, within ±2% (…)`; `no clear change in 12 pairs (…); ~50 pairs would settle
   it`), and the hero's second win when it came from this series. An unsteady case says so on its
-  line (`; **unsteady case**: its work grew each run.`). A second line only for untested metrics
+  line (`; **unsteady case**: its work grew each run.`). When the medians and the paired change
+  point different ways by more than the bound (the paired change is the median of the pairs' own
+  changes, so a bimodal side can do it: medians 210 → 217 MB with a change of −20%), the line says
+  `**uneven pairs**` with both, and every such table row shows the medians' change beside its
+  own (`−20% medians +3.2%`) with a footnote giving each side's spread of block values; a
+  verdict's `~N pairs` is only a count past the pairs already run. A second line only for untested metrics
   whose whole likely range lies past the bound on the worse side (`**But** … (not tested).`, never
   for an unsteady case, which drifts by itself) and a warning that changes how to read that series
   (`**Mixed lock state:**`, `**Different screens:**`). Then at most one caveat line for the report
@@ -1831,13 +1847,21 @@ pull request body, pasted verbatim. Few words, two drawers:
 - **Details** (one drawer, plain `####` headings, one table per kind across series, each series
   opening its rows with a row of its name rather than a column): Metrics (every tested metric:
   before, this PR, change, likely range, verdict in a few words: the metric's word, same,
-  inconclusive, skipped), Pairs (each pair with its order, then before → this PR for the main metric
+  inconclusive, skipped; a refused row names its reason in a few words, `skipped no Screen
+  Recording`, and the sentence behind it is said once in How it was measured: `Frame and latency
+  metrics: not measured (strobe lacks Screen Recording on this Mac)`), Pairs (each pair with its order, then before → this PR for the main metric
   and the longest frame gap, the change, other apps' CPU as `22% → **117%**`; narrow enough for a
-  phone), Frame pacing (only when on-time frames moved by half a point or the p99 gap by a tenth),
-  Where it came from (the profiled launches, per run: threads and memory by what holds it for a
-  native app; main-thread phases, GC and the page functions that moved the way the main metric did
-  for a page, never the browser's native frames, whose sampled time the trace counts elsewhere;
-  left out when there is nothing to show), How it was measured (builds with subjects, machine,
+  phone; past 20 pairs a series lists its first and last five and up to five busy pairs, and one
+  `…` row sums up the rest: how many, their medians and their median change, with a footnote on how
+  many this PR did better in and where the middle 80% of their changes lay), Frame pacing (only
+  when on-time frames moved by half a point or the p99 gap by a tenth),
+  Where it came from, in profiled launches (untimed and slowed by the profiler, so only rows that
+  explain a change the timed pairs decided, moving the way it did: a thread's CPU for a decided CPU
+  metric, else its wake-ups for a decided wake-up metric, by 5% of its own or more; memory by what
+  holds it for a decided memory metric; for a page, main-thread phases, GC and the page functions
+  that moved the way the main metric did, never the browser's native frames, whose sampled time
+  the trace counts elsewhere; a series without a decided change has none, and the section is left
+  out when there is nothing to show), How it was measured (builds with subjects, machine,
   method, each note in plain words, the strobe that recorded it and the one that formatted it),
   then Also measured, not tested (what moved in a table; what held still in one line, `Unchanged:
   DOM nodes (108), run time (8.01 s).`, beside what read zero in both builds).
@@ -1852,8 +1876,12 @@ controls); no nested drawers, footnotes or emoji; one alert, only for regression
 percentiles use one definition everywhere, each launch's percentile and the median
 across launches (`frames.interval.*`); shares of late frames count every gap. Commit subjects lose
 `(#123)` references, which would link to the PR's repository. Variants are named by commit
-(`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), the bench file by its path in its repository, never
-a local folder. The output is deterministic for a strobe build and at most 24,000 characters (UTF-16,
+(`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), a prebuilt executable by the last two parts of
+its path (`exe:…/base/hex`), the bench file by its path in its repository, never a local folder;
+whatever a note quotes, a home folder reads `~` and another absolute path its last part. The
+block's first line names the bench file (`strobe · exp_c3c66b · perf/launch.bench.ts ·
+generated`), so a body with several blocks says which file each covers. Metric names drop the
+catalog's target prefix (`ui.cpu` is `UI-thread CPU time per run`). The output is deterministic for a strobe build and at most 24,000 characters (UTF-16,
 as GitHub counts; its limit is 65,536): a long report sheds, in order, attribution rows past 3, quiet
 pairs of series without a direction, the middle pairs of a series with more than 16, the untested
 metrics and attribution, then the pairs; never a series' line, its tested metrics, a refusal, the
@@ -1863,7 +1891,7 @@ The block is delimited so a reader and a tool can tell strobe's evidence from th
 
 ```
 <!-- strobe:report exp_9b3b26 v1 begin sha256:78fbde6b6f53f8b4 -->
-<sub>strobe · exp_9b3b26 · generated</sub>
+<sub>strobe · exp_9b3b26 · perf/idle.bench.ts · generated</sub>
 … the report …
 <sub>strobe · exp_9b3b26 · end of generated report</sub>
 <!-- strobe:report exp_9b3b26 end -->
@@ -2272,7 +2300,12 @@ As built (Linux and macOS): no helper process. Native stacks run in strobe's own
   only to root, to entitled debuggers, and with Developer Mode enabled). Its samples are wall-clock
   stack snapshots of every thread (system call leaves dropped and counted), with no times; a bench's
   attribution block keeps them all, warmup included, and says so. Hardened and system apps cannot be
-  sampled at all.
+  sampled at all. `sample` first reads the app's symbols (seconds for a large binary) and drops a
+  SIGINT that comes before it samples, after which it sampled its whole duration (an hour, then):
+  the capture begins once each `sample` says it samples (at most 20 s), it is stopped only once it
+  does, each runs at most 600 s, SIGINT is at its default disposition and unblocked in the child,
+  one that has not written its report 60 s after the stop is killed and the block goes on, and a
+  capture dropped without a stop (a failed block, Ctrl-C) ends its samplers.
 
 As built (Windows):
 
@@ -2955,6 +2988,25 @@ second update left the body alone, a hand edit inside the block was refused, and
 `--attach` put the block in as text. GitHub moves only a plain image's address to its signed image
 host; `<picture>` sources and `#gh-dark-mode-only` addresses keep the bare one (not checked for a
 private repository's readers), so the block uses plain `![alt](…)` and the SVG's own stylesheet.
+
+Batch 5 (2026-11-05, from the first pull request made with `--format pr`, hex#1347; adais locked,
+air unlocked; `--check` smoke runs, values noisy and not compared): the PR block's Pairs table past
+20 pairs, profiled-launch rows only beside a decided change, uneven pairs, short metric names, one
+refusal reason, `not pinned`, no machine paths, the hero's heading level under the author's
+sections and across blocks, the bench file in the first line (§11.2); `sample` bounded and stopped
+with its block (§13.4); `--check` groups refusals by reason; `look app:|exe:` (§5.12). Checked:
+19 reports (12 real, 7 synthetic, hex#1347's two experiments among them) render the same twice, fit,
+and carry no local path; `--update-pr` against hex#1347's real body through a stand-in `gh` put both
+blocks at `###` under its `##` sections, kept the author's text, changed nothing on a second run,
+and in a body without headings gave one block `#` and two blocks `##` with valid hashes; GitHub's
+Markdown API and CSS drew it light and dark at 900 and 400 px. On air (Hex, Rune's AccessKit
+adapter): `look exe:` listed the window, titles and 60 keyed elements; `page.click`, hover then
+click, and `down`/`up` on sidebar items each switched the pane, and `page.scroll` moved History by
+about 29 rows per 1,500 px (as `wheel` did), so the failures hex#1347 reported did not reproduce
+with this build (its bench still invokes and wheels on macOS); `console.error` from `run()` showed
+under the case in `--check`. An attribution `record --bench` of a 0.8 s case had waited the full
+60 s report wait: `sample` was still reading Hex's 84 MB of symbols at the stop and dropped the
+SIGINT (an hour before the bound); with the start wait it analysed in 0.4 s with 32 samples.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

@@ -1259,6 +1259,48 @@ svg .zeroline { stroke: var(--ink-4); stroke-width: 1; }
 #tip td { font-family: var(--mono); font-size: 11.5px; text-align: right; padding: 1px 0; color: var(--ink); overflow-wrap: anywhere; }
 
 .empty-card { max-width: 560px; margin: 12vh auto 0; padding: 28px 32px; display: flex; flex-direction: column; gap: 12px; }
+
+/* Rerun ledger banner */
+.ledger-banner { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 10px 16px; display: flex; flex-direction: column; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
+.ledger-banner.warn { border-color: var(--warn-border); background: var(--warn-bg); }
+.ledger-hd { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.ledger-hd b { color: var(--ink); font-weight: 600; }
+.ledger-tag { font-size: 11.5px; color: var(--warn-ink); }
+.ledger-row { display: grid; grid-template-columns: 110px 54px minmax(0, 1fr); column-gap: 10px; align-items: baseline; }
+.ledger-row .mono { color: var(--ink); }
+.ledger-when { color: var(--ink-3); font-size: 11.5px; }
+.ledger-changed { grid-column: 3; color: var(--ink-3); font-size: 11.5px; }
+
+/* Diff flame (icicle): width = mean of base and head per run, colour = the change */
+.flame-crumbs { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 24px 0; font: 11px/16px var(--mono); color: var(--ink-3); }
+.flame-crumbs button { border: 0; background: none; padding: 0; color: var(--accent); cursor: pointer; font: inherit; }
+.flame { position: relative; margin: 8px 24px 4px; }
+.fl-node { position: absolute; height: 17px; font: 11px/17px var(--mono); padding: 0 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; border-radius: 2px; cursor: pointer; color: var(--ink); box-shadow: inset 0 0 0 1px var(--hairline); }
+.fl-node:hover { box-shadow: inset 0 0 0 1px var(--ink-3); }
+.flame-legend { display: flex; flex-wrap: wrap; gap: 14px; padding: 6px 24px 14px; font-size: 11.5px; color: var(--ink-3); }
+.flame-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+
+/* Plan vs actual */
+.plan-row { display: grid; grid-template-columns: 120px minmax(0, 1fr) 300px; column-gap: 16px; align-items: center; padding: 8px 24px; border-top: 1px solid var(--hairline); font-size: 12.5px; }
+.plan-row .plan-k { color: var(--ink-3); }
+.plan-row .plan-v { font: 12px/18px var(--mono); color: var(--ink-2); text-align: right; }
+.plan-track { position: relative; height: 22px; }
+.plan-line { position: absolute; left: 0; right: 0; top: 10px; height: 2px; background: var(--hairline); }
+.plan-tick { position: absolute; top: 6px; width: 1px; height: 10px; background: var(--border-strong); }
+.plan-tick span { position: absolute; top: 10px; left: -8px; width: 16px; text-align: center; font: 10px/12px var(--mono); color: var(--ink-4); }
+.plan-mark { position: absolute; top: 3px; width: 10px; height: 16px; margin-left: -5px; border-radius: 2px; }
+.plan-mark.planned { border: 1.5px dashed var(--ink-3); }
+.plan-mark.actual { background: var(--accent); }
+.plan-bars { display: flex; flex-direction: column; gap: 3px; }
+.plan-bar { height: 8px; border-radius: 2px; display: flex; overflow: hidden; }
+.plan-bar.planned { background: var(--surface-subtle); box-shadow: inset 0 0 0 1px var(--border-strong); }
+.plan-seg { height: 100%; }
+.plan-legend { display: flex; flex-wrap: wrap; gap: 12px; padding: 4px 24px 12px; font-size: 11.5px; color: var(--ink-3); }
+.plan-legend i { display: inline-block; width: 10px; height: 8px; border-radius: 2px; margin-right: 5px; }
+@media (max-width: 720px) {
+  .plan-row { grid-template-columns: 90px minmax(0, 1fr); }
+  .plan-row .plan-v { grid-column: 1 / -1; text-align: left; }
+}
 </style>
 </head>
 <body>
@@ -1312,6 +1354,8 @@ const state = {
   distMode: "cdf",
   openRows: new Set(),
   fullStacks: new Set(),
+  flameKind: "cpu",
+  flameZoom: 0,
 };
 
 let observers = [];
@@ -1878,6 +1922,7 @@ function selectSeries(idx) {
   state.hoverPair = null;
   state.distOpen = false;
   state.openRows.clear();
+  state.flameZoom = 0;
   history.replaceState(null, "", "#series=" + idx);
   render();
 }
@@ -1947,6 +1992,9 @@ function renderExperiment(r) {
     return;
   }
 
+  const ledger = renderLedgerBanner(r);
+  if (ledger) shell.append(ledger);
+
   if (!s) {
     shell.append(h("div", { class: "card-surface card-bd" }, "No series recorded in this experiment."));
     return;
@@ -1961,16 +2009,19 @@ function renderExperiment(r) {
   const insightsSection = renderExperimentInsightsSection(r, s);
   const phaseSection = renderMainThreadPhaseSection(s, aa);
   const cpuSection = renderCpuHotspotsSection(s, aa);
+  const flameSection = renderDiffFlameSection(s, aa);
   const layoutSection = renderForcedLayoutSection(s, aa);
   const allocGcSection = renderAllocGcSection(s, aa);
   const liveHeapSection = renderLiveHeapExperimentSection(s, aa);
   const procMemSection = renderProcessMemoryExperimentSection(s);
+  const nativeMemSection = renderNativeMemoryDiffSection(s, aa);
   const pacingSection = impact.hasStream ? renderFramePacingSection(r, s, impact) : null;
   const distSection = state.distOpen ? renderDistExplorer(r, s, impact) : null;
   const metricsDisclosure = renderAllMetricsDisclosure(s, aa);
   const queriesDisclosure = renderTraceQueriesDisclosure(r, s);
+  const planSection = renderPlanVsActual(r, s);
 
-  const hasDeepDive = !!(insightsSection || phaseSection || cpuSection || layoutSection || allocGcSection || liveHeapSection || procMemSection || pacingSection || metricsDisclosure);
+  const hasDeepDive = !!(insightsSection || phaseSection || cpuSection || flameSection || layoutSection || allocGcSection || liveHeapSection || procMemSection || nativeMemSection || pacingSection || metricsDisclosure);
 
   appendKids(shell, [
     seriesList.length > 1 ? renderScorecard(seriesList, aa) : null,
@@ -1982,14 +2033,17 @@ function renderExperiment(r) {
     insightsSection,
     phaseSection,
     cpuSection,
+    flameSection,
     layoutSection,
     allocGcSection,
     liveHeapSection,
     procMemSection,
+    nativeMemSection,
     pacingSection,
     distSection,
     metricsDisclosure,
     queriesDisclosure,
+    planSection,
     renderRigFooter(r, s, impact),
   ]);
 }
@@ -4166,6 +4220,224 @@ function renderRigFooter(r, s, imp) {
       !s && finite(r.duration_ms) ? h("div", {}, `Duration: ${fmtDuration(r.duration_ms)}${r.probes ? ` · Probes: ${r.probes}` : ""}`) : null,
       !s && env.strobe ? h("div", {}, `Strobe ${env.strobe}`) : null,
       infoNotes.map((n) => h("div", { style: "color:var(--ink-4)" }, `Note: ${n.text}`))
+    )
+  );
+}
+
+/* ---------- Rerun Ledger Banner ---------- */
+function ordinalOf(n) {
+  const s = n % 100 >= 11 && n % 100 <= 13 ? "th" : ({ 1: "st", 2: "nd", 3: "rd" })[n % 10] || "th";
+  return `${n}${s}`;
+}
+
+function renderLedgerBanner(r) {
+  const l = r.ledger;
+  if (!l || !(l.total > 1)) return null;
+  const list = [
+    ...(l.earlier || []).map((e) => ({ ...e, when: "earlier" })),
+    ...(l.later || []).map((e) => ({ ...e, when: "later" })),
+  ];
+  return h("section", { class: "ledger-banner" + (l.changed ? " warn" : ""), id: "ledger", "aria-label": "Rerun ledger" },
+    h("div", { class: "ledger-hd" },
+      h("b", {}, `${ordinalOf(l.attempt)} of ${l.total} experiments on these variants`),
+      l.changed ? h("span", { class: "ledger-tag" }, "The setup changed between them: a verdict reached by changing the setup is not a verdict") : null
+    ),
+    list.map((e) => h("div", { class: "ledger-row" },
+      h("span", { class: "mono" }, e.id),
+      h("span", { class: "ledger-when" }, e.when),
+      h("span", {}, e.summary || "no result"),
+      e.changed?.length ? h("span", { class: "ledger-changed" }, e.changed.join(" · ")) : null
+    ))
+  );
+}
+
+/* ---------- Diff Flame (icicle of both sides' stacks) ---------- */
+function renderDiffFlameSection(s, aa) {
+  const t = s.diff_tree;
+  const kinds = [["cpu", "CPU time"], ["alloc", "Allocations"]].filter(([k]) => (t?.[k]?.nodes?.length || 0) > 1);
+  if (!kinds.length) return null;
+  if (!kinds.some(([k]) => k === state.flameKind)) state.flameKind = kinds[0][0];
+  const tree = t[state.flameKind];
+  const isBytes = tree.unit === "bytes";
+  const fmtV = (v) => (isBytes ? fmtBytes(v) : fmtVal(v, "ms"));
+  const fmtD = (v) => (isBytes ? fmtSignedBytes(v) : fmtSigned(v, "ms"));
+  const nodes = tree.nodes.map(([f, p, b, hd], i) => ({ i, f, p, b, h: hd, kids: [] }));
+  for (const n of nodes) if (n.p >= 0 && nodes[n.p]) nodes[n.p].kids.push(n);
+  const root = nodes[0];
+  const zoom = nodes[state.flameZoom] || root;
+  const total = Math.max(root.b, root.h, 1e-9);
+  const label = (n) => (n.f < 0 ? "all" : tree.frames[n.f]?.[0] || "?");
+  const file = (n) => (n.f < 0 ? "" : tree.frames[n.f]?.[1] || "");
+  const mean = (n) => (n.b + n.h) / 2;
+
+  // Colour: the share of the node that changed, faded where the change is small against the whole.
+  const tone = (n) => {
+    const d = n.h - n.b;
+    const big = Math.max(n.b, n.h, 1e-12);
+    const weight = Math.min(1, Math.abs(d) / (0.02 * total));
+    const pct = Math.round(Math.min(1, Math.abs(d) / big) * weight * 70);
+    if (pct < 3) return "var(--surface-subtle)";
+    return `color-mix(in srgb, ${d > 0 ? "var(--loss)" : "var(--win)"} ${pct}%, var(--surface-subtle))`;
+  };
+
+  const rowH = 18;
+  const cells = [];
+  let depth = 0;
+  // Deep stacks: rows below the cap are reached by zooming in.
+  const maxDepth = 32;
+  const place = (n, left, width, d) => {
+    if (width < 0.15 || d > maxDepth) return;
+    depth = Math.max(depth, d);
+    cells.push({ n, left, width, d });
+    let x = left;
+    const m = mean(n) || 1e-12;
+    for (const k of n.kids.slice().sort((a, b) => mean(b) - mean(a))) {
+      const w = (width * mean(k)) / m;
+      place(k, x, w, d + 1);
+      x += w;
+    }
+  };
+  place(zoom, 0, 100, 0);
+
+  const flame = h("div", { class: "flame", style: `height:${(depth + 1) * rowH}px` },
+    cells.map(({ n, left, width, d }) => {
+      const el = h("div", {
+        class: "fl-node",
+        style: `left:${left}%;width:calc(${width}% - 1px);top:${d * rowH}px;background:${tone(n)}`,
+        onclick: () => { state.flameZoom = n === zoom && n.p >= 0 ? n.p : n.i; render(); },
+      }, width > 3 ? label(n) : "");
+      el.addEventListener("pointerenter", (e) => showTip(e, label(n), [
+        file(n) ? ["File", file(n)] : null,
+        ["Base", `${fmtV(n.b)} / run`],
+        ["Head", `${fmtV(n.h)} / run`],
+        ["Δ", fmtD(n.h - n.b)],
+        ["Share", `${((100 * mean(n)) / ((root.b + root.h) / 2 || 1)).toFixed(1)}% of all`],
+      ].filter(Boolean)));
+      el.addEventListener("pointermove", moveTip);
+      el.addEventListener("pointerleave", hideTip);
+      return el;
+    })
+  );
+
+  const crumbs = [];
+  for (let n = zoom; n; n = n.p >= 0 ? nodes[n.p] : null) crumbs.unshift(n);
+  const toggle = kinds.length > 1
+    ? h("div", { class: "seg", role: "group", "aria-label": "Diff flame of" },
+        kinds.map(([k, lbl]) => h("button", { type: "button", "aria-pressed": String(state.flameKind === k), onclick: () => { state.flameKind = k; state.flameZoom = 0; render(); } }, lbl)))
+    : null;
+  const runs = tree.runs || [];
+  return h("section", { class: "card-surface", id: "diff-flame" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Diff flame"),
+        h("span", { class: "sec-sub" }, `${tree.what} · base and head call trees merged · ${tree.per_run ? `per run (${runs.join(" and ")} runs)` : "per recording"} · click to zoom`)
+      ),
+      h("div", { class: "card-hd-right" }, toggle)
+    ),
+    aa ? h("div", { class: "attr-note" }, "A/A control: both sides ran the same build; colour here is launch-to-launch and sampling variation.") : null,
+    crumbs.length > 1
+      ? h("div", { class: "flame-crumbs" }, crumbs.map((n, i) => [i ? " › " : "", i === crumbs.length - 1 ? h("span", {}, label(n)) : h("button", { type: "button", onclick: () => { state.flameZoom = n.i; render(); } }, label(n))]))
+      : null,
+    flame,
+    h("div", { class: "flame-legend" },
+      h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--loss) 60%, var(--surface-subtle))" }), "More in head"),
+      h("span", {}, h("i", { style: "background:color-mix(in srgb, var(--win) 60%, var(--surface-subtle))" }), "Less in head"),
+      h("span", {}, `Width: the mean of both sides · ${fmtV(root.b)} → ${fmtV(root.h)} in all (${fmtD(root.h - root.b)})`),
+      h("span", {}, `Nodes under ${isBytes ? fmtBytes(tree.floor) : fmtVal(tree.floor, "ms")} left out (${tree.nodes.length} of ${tree.nodes_total}) · ${depth >= maxDepth ? `${maxDepth + 1} levels shown: zoom in for deeper frames` : `${depth + 1} levels`}`)
+    )
+  );
+}
+
+/* ---------- Native Memory Diff (what holds the memory, base → head) ---------- */
+function renderNativeMemoryDiffSection(s, aa) {
+  const rows = (s.memory_diff?.rows || []).filter((r) => finite(r.delta_bytes)).slice(0, 10);
+  if (!rows.length) return null;
+  const maxAbs = Math.max(...rows.map((r) => Math.abs(r.delta_bytes)), 1);
+  const posPct = (v) => 50 + (v / (maxAbs * 1.12)) * 50;
+  return h("section", { class: "card-surface", id: "native-memory" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "What holds the memory"),
+        h("span", { class: "sec-sub" }, "Last reading of each attribution launch · by part · descriptive, not hypothesis-tested")
+      )
+    ),
+    h("div", { class: "attr-table" },
+      h("div", { class: "attr-row hd" },
+        h("span", {}, "Part"),
+        h("span", { class: "col-ba" }, "Base → Head"),
+        h("span", { style: "text-align:center" }, "← Less in head · More in head →"),
+        h("span", { style: "text-align:right" }, "Δ")
+      ),
+      rows.map((r) => {
+        const d = r.delta_bytes;
+        const left = Math.min(posPct(0), posPct(d));
+        const width = Math.max(0.8, Math.abs(posPct(d) - posPct(0)));
+        return h("div", { class: "attr-row" },
+          h("span", { class: "fn-name" }, r.layer),
+          h("span", { class: "mono col-ba", style: "color:var(--ink-3);font-size:11.5px" }, `${fmtBytes(r.base_bytes)} → ${fmtBytes(r.head_bytes)}`),
+          h("div", { class: "div-track" },
+            h("i", { class: "div-zero" }),
+            h("i", { class: `div-bar ${d < 0 ? (aa ? "saved-aa" : "saved") : "added"}`, style: `left:${left}%;width:${width}%` })
+          ),
+          h("span", { class: "mono", style: "text-align:right" }, fmtSignedBytes(d))
+        );
+      })
+    )
+  );
+}
+
+/* ---------- Plan vs Actual (pairs, series time, block steps) ---------- */
+const STEP_TONES = { launch: "var(--ph-script)", attach: "var(--ph-style)", checks: "var(--ph-style)", setup: "var(--ph-style)", warmup: "var(--ph-layout)", runs: "var(--head-tone)" };
+
+function renderPlanVsActual(r, s) {
+  const est = (r.plan?.estimate?.series || []).find((x) => x.label === s.label);
+  if (!est || !finite(s.pairs)) return null;
+  const looks = (r.plan?.looks || []).filter(finite);
+  const maxPairs = Math.max(...looks, est.pairs || 0, s.pairs || 0, 1);
+  const at = (p) => `${(100 * p) / maxPairs}%`;
+  const steps = (s.steps || []).filter((x) => Array.isArray(x) && finite(x[1]));
+  const block = steps.reduce((a, [, ms]) => a + ms, 0);
+  const maxBlock = Math.max(block, est.block_ms || 0, 1);
+  const maxTime = Math.max(est.ms || 0, s.elapsed_ms || 0, 1);
+  const bar = (ms, max, cls, segs) => h("div", { class: `plan-bar ${cls}`, style: `width:${Math.max(1, (100 * ms) / max)}%` }, segs || null);
+  return h("section", { class: "card-surface", id: "plan" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Plan vs actual"),
+        h("span", { class: "sec-sub" }, `What bench planned before the run (${est.expect || "no expected outcome"}) and what this series took`)
+      )
+    ),
+    h("div", { class: "plan-row" },
+      h("span", { class: "plan-k" }, "Pairs"),
+      h("div", { class: "plan-track" },
+        h("i", { class: "plan-line" }),
+        looks.map((l) => h("i", { class: "plan-tick", style: `left:${at(l)}` }, h("span", {}, String(l)))),
+        h("i", { class: "plan-mark actual", style: `left:${at(s.pairs)}`, title: `Ran: ${s.pairs} pairs` }),
+        finite(est.pairs) ? h("i", { class: "plan-mark planned", style: `left:${at(est.pairs)}`, title: `Planned: ${est.pairs} pairs` }) : null
+      ),
+      h("span", { class: "plan-v" }, `planned ${est.pairs ?? "?"}${finite(est.pairs_needed) ? ` (~${est.pairs_needed} needed)` : ""} · ran ${s.pairs}`)
+    ),
+    h("div", { class: "plan-row" },
+      h("span", { class: "plan-k" }, "Series time"),
+      h("div", { class: "plan-bars" },
+        bar(est.ms || 0, maxTime, "planned"),
+        bar(s.elapsed_ms || 0, maxTime, "", h("i", { class: "plan-seg", style: "width:100%;background:var(--accent)" }))
+      ),
+      h("span", { class: "plan-v" }, `planned ${fmtDuration(est.ms)} · took ${fmtDuration(s.elapsed_ms)}`)
+    ),
+    steps.length
+      ? h("div", { class: "plan-row" },
+          h("span", { class: "plan-k" }, "Per block"),
+          h("div", { class: "plan-bars" },
+            bar(est.block_ms || 0, maxBlock, "planned"),
+            bar(block, maxBlock, "", steps.map(([name, ms]) => h("i", { class: "plan-seg", style: `width:${(100 * ms) / (block || 1)}%;background:${STEP_TONES[name] || "var(--ink-4)"}`, title: `${name}: ${fmtDuration(ms)}` })))
+          ),
+          h("span", { class: "plan-v" }, `planned ${fmtDuration(est.block_ms)} (${est.block_source || "?"}) · took ${fmtDuration(block)}`)
+        )
+      : null,
+    h("div", { class: "plan-legend" },
+      h("span", {}, h("i", { style: "box-shadow: inset 0 0 0 1px var(--border-strong);background:var(--surface-subtle)" }), "Planned"),
+      steps.map(([name]) => h("span", {}, h("i", { style: `background:${STEP_TONES[name] || "var(--ink-4)"}` }), name))
     )
   );
 }

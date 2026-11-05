@@ -277,7 +277,7 @@ fn runs(
     let env = home.environment(app);
     // An app that exited is refused, never measured as a gone process (a windowless one has no window
     // whose loss would say so): its exit code and last output lines, when its output is read.
-    let last = || lines.borrow_mut().last(output.as_ref());
+    let last = || output.as_ref().map(|rx| lines.borrow_mut().last(Some(rx)));
     ctx.runner.call(
         "block",
         json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": v.root, "home": home.dir, "env": env, "exe": app.exe }),
@@ -352,7 +352,7 @@ fn runs(
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
         let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
         match n.exited() {
-            Some(code) if running => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), &last())),
+            Some(code) if running => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), last().as_deref())),
             _ => super::super::record::app_gone(n, &format!("before run {}", i + 1), |_| last())?,
         }
         ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
@@ -1018,7 +1018,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 if let Some(code) = n.exited().filter(|_| n.processes().is_empty()) {
                     let out: Vec<String> = lines.iter().filter(|l| l.2 == "output").map(|l| l.1.clone()).collect();
                     let last = &out[out.len().saturating_sub(5)..];
-                    return Err(super::super::record::exited(code, &format!("before its launch reached milestone {name}"), last));
+                    return Err(super::super::record::exited(code, &format!("before its launch reached milestone {name}"), Some(last)));
                 }
                 guard.check("while the app started")?;
                 if Instant::now() > deadline {

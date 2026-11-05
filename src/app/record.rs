@@ -387,7 +387,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
         if let Some(code) = n.exited().filter(|_| running) {
-            return Err(exited(code, "during the recording", &last_output(&n, 5)));
+            return Err(exited(code, "during the recording", last_output(&n, 5).as_deref()));
         }
         let screen = super::bench::screen_state(&procs0, &(host::now_ns(), host::all_processes()));
         if let Some(t) = timeline.borrow_mut().take() {
@@ -518,27 +518,30 @@ pub fn claim(args: &Args) -> Result<(String, std::path::PathBuf)> {
 /// `RunIncomplete` once a launched native app is gone: its process exited and nothing of its process
 /// set remains (a launcher that handed over to a process stamped with its home is not gone). `when`
 /// says when ("before the runs"); `last` is its last output lines, when strobe read its output.
-pub fn app_gone(n: &mut crate::target::native::Native, when: &str, last: impl FnOnce(&crate::target::native::Native) -> Vec<String>) -> Result<()> {
+pub fn app_gone(n: &mut crate::target::native::Native, when: &str, last: impl FnOnce(&crate::target::native::Native) -> Option<Vec<String>>) -> Result<()> {
     let Some(code) = n.exited() else { return Ok(()) };
     if !n.processes().is_empty() {
         return Ok(());
     }
-    Err(exited(code, when, &last(n)))
+    Err(exited(code, when, last(n).as_deref()))
 }
 
-/// The refusal for an app that exited with `code` `when`, with its last output lines.
-pub fn exited(code: i32, when: &str, last: &[String]) -> Error {
-    let mut r = crate::model::Refusal::new(crate::model::ValidatorId::RunIncomplete, format!("the app exited (code {code}) {when}, so there was no app left to measure"));
-    if !last.is_empty() {
-        r = r.detail(format!("its last output: {}", last.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" | ")));
+/// The refusal for an app that exited with `code` `when`, with its last output lines (None: strobe
+/// did not read its output).
+pub fn exited(code: i32, when: &str, last: Option<&[String]>) -> Error {
+    let r = crate::model::Refusal::new(crate::model::ValidatorId::RunIncomplete, format!("the app exited (code {code}) {when}, so there was no app left to measure"));
+    match last {
+        Some([]) => r.detail("it printed nothing").fix("run the app's command line by hand to see why it exits"),
+        Some(lines) => r.detail(format!("its last output: {}", lines.iter().map(|l| l.trim()).collect::<Vec<_>>().join(" | "))).fix("fix what made the app exit (its output above)"),
+        None => r.fix("run the app's command line by hand to see why it exits; output: true on the target keeps its last lines here"),
     }
-    r.fix(if last.is_empty() { "run the app's command line by hand to see why it exits; output: true on the target keeps its last lines here" } else { "fix what made the app exit (its output above)" }).into()
+    .into()
 }
 
-/// Up to the last `n` lines of the app's output still waiting in its pipe.
-fn last_output(n: &crate::target::native::Native, keep: usize) -> Vec<String> {
-    let lines: Vec<String> = n.output.as_ref().map(|rx| rx.try_iter().map(|(_, _, l)| l).collect()).unwrap_or_default();
-    lines[lines.len().saturating_sub(keep)..].to_vec()
+/// Up to the last `keep` lines of the app's output still waiting in its pipe; None when it is not read.
+fn last_output(n: &crate::target::native::Native, keep: usize) -> Option<Vec<String>> {
+    let lines: Vec<String> = n.output.as_ref()?.try_iter().map(|(_, _, l)| l).collect();
+    Some(lines[lines.len().saturating_sub(keep)..].to_vec())
 }
 
 /// The first line of the app's output (stdout and stderr) matching `re`, within `timeout`.

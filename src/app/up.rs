@@ -667,6 +667,11 @@ mod jsonc {
         };
         let line_start = text[..key].rfind('\n').map(|i| i + 1).unwrap_or(key);
         let prefix = if json[line_start..key].trim().is_empty() { line_start } else { key };
+        // The rest of its line, when only spaces or a comment (blank in `json`): its comment goes too.
+        let eol = json[end..].find('\n').map_or(json.len(), |n| end + n + 1);
+        if json[end..eol].trim().is_empty() {
+            return Some(format!("{}{}", &text[..prefix], &text[eol..]));
+        }
         Some(format!("{}{}", &text[..prefix], text[end..].trim_start_matches([' ', '\t']).trim_start_matches(['\r', '\n'])))
     }
 }

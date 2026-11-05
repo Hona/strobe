@@ -2498,14 +2498,32 @@ Strobe launches any Electron app the same way, with no change to the app:
   each with its tree, from one system snapshot; a child is followed only when it started no earlier
   than its parent (a reused parent pid is an older, unrelated process), and an exited process (a
   zombie) is in no tree. An app's detached service or a double-forked daemon is outside the tree but
-  in the set. A process's stamp is read once per pid and start time; one that shows none is read
+  in the set. On macOS a tree also holds every process whose responsible process is in it, with
+  that process's own tree (`responsibility_get_pid_responsible_for_pid`, a libSystem call looked up
+  at run time; no permission for this user's processes; read once per pid and start time): launchd
+  starts an app's XPC services (web content, GPU and network helpers of a web view, the app's own
+  services) with parent pid 1, so the parent tree alone missed most of a web view app's CPU, memory
+  and GPU. A process joins only when it started no earlier than the member it is responsible to; one
+  responsible for itself (a system daemon), to another app (the person's own browser, another app's
+  services) or to what both were run from (a terminal, a daemon) never joins. macOS makes a process
+  responsible for itself when launchd starts it (Finder, the Dock, `open`); any other inherits its
+  parent's. So a launch for a home whose program is an app bundle's executable
+  (`.app/Contents/MacOS/`) starts as its own responsible process, as a person starts an app: between
+  fork and exec, `posix_spawn` with `POSIX_SPAWN_SETEXEC` and the responsibility disclaim replaces the
+  child in place (same pid, group, descriptors and environment). macOS then asks the app's own
+  permissions (its bundle's grants), not those of the app strobe runs under. A bare executable keeps
+  strobe's responsible process, as when a person runs it from a terminal: its XPC services are
+  responsible to that process, shared with everything else run from there, so no set can tell them
+  apart and they are not counted. A process's stamp is read once per pid and start time; one that shows none is read
   again for 2 s after it was first seen (a process that has just started may not have its
   environment yet). The set is what `cpu.work`, `cpu.app.total`, `memory.*`, a native target's
   wakes, threads and IO, its windows (found, placed, raised, checked), its accessibility session and
   its present events read, and so do native stacks (the helper gets the set from strobe and follows
   its children), a launch's screen pixels (`launch.painted`, `launch.settled`) and `record
   --os-frames`. The OS sampler (`gpu.process.3d`, `gpu.vram`, `gpu.shared`) still reads the tree
-  alone (§24.2). A process strobe did not launch (`record pid:`) has no home: its set is its tree.
+  alone (§24.2). A process strobe did not launch (`record pid:`) has no home: its set is its tree
+  (on macOS with the XPC services it is responsible for: an app a person opened is responsible for
+  itself).
 - The launched child is never reaped before its group is ended: its exit is read without reaping it
   (`waitid` with `WNOWAIT` on Unix), so its pid, which is also the group's id, cannot name another
   process when strobe ends the group, and a process set's root is never a reused pid. Tree kills end
@@ -2520,7 +2538,8 @@ Strobe launches any Electron app the same way, with no change to the app:
   except what broke away from the job, which the next strobe ends by its stamp. On Unix a strobe
   that dies leaves its launches running, and the next strobe ends what carries its stamp; a process
   started with a cleared environment outside the tree is not found then (no job holds it on Unix),
-  nor counted in the process set while strobe runs (its group still ends it on close). A strobe counts
+  nor counted in the process set while strobe runs (its group still ends it on close), unless macOS
+  holds it responsible to a process of the set. A strobe counts
   as gone once its process has exited, even while another process holds a handle to it (Windows) or
   has not reaped it (a zombie).
 - **GPU shader caches** (`gpuCache`, a case option over a native or app target option, else the
@@ -3645,6 +3664,24 @@ path as pages), thread origins of a real GPU driver's threads on Linux (vps has 
 reservation's last pass (a process started in a block's last 200 ms), counter blocks of a native
 app with a window.
 
+macOS XPC accounting (13.2; 2026-11-06): a macOS tree (`host::tree_pids`, `host::process_set`, so
+every metric, sampler, thread list, GPU read and tree kill built on them) also holds the processes
+responsible to one of its members, and a launch for a home whose program is in an app bundle starts
+as its own responsible process (`host::macos::own_responsibility`). Checked on air (macOS 27.0.1,
+M4, on AC, in the bench slot) with a bundled web view app whose page spins one core (50 ms of busy
+script, then `setTimeout(0)`): `record exe: --native` read `cpu.app.total` 0.67% of a core before
+and 90.4% after (`memory.app.private` 26 → 136 MB, `gpu.process.3d` 0.00 → 0.68%); `record pid:` of
+the same app opened with `open -n` read 0.50% before and 89.7% after, its busiest thread now the web
+content process's (4,468 ms of the 5 s window); `bench --check` read 1.05% before and 91.7% after.
+Launched by strobe's main build, the app's web content, GPU and network processes were responsible
+to the remote shell's daemon, shared with every other process started through it; launched by this
+build they were responsible to the app, with its pid, group, environment and isolated home
+unchanged. Another app's web view processes (responsible to that app) were in no set, and nothing
+was left after a run. A bare executable reads as before (0.64% and 0.73%): its services stay
+responsible to the shell's daemon, and §13.2 says so. Reading every process's responsible pid
+(809 processes) took under 5 ms, once per process. Not checked: an app whose bundle needs a
+permission the app strobe runs under had and the bundle lacks (it is now asked for the bundle).
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).
@@ -3675,7 +3712,8 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `launch.settled`, and the cycles a launch timed to its window reads) and `record --os-frames` read
   its process set (tree, stamp and job). Only the OS sampler (`probe::os::Sampler`: `gpu.process.3d`,
   `gpu.vram`, `gpu.shared`) still reads the root's tree (`host::tree_pids`), so a detached service's GPU
-  use is left out of it. `record pid:` targets have no home (strobe launched nothing, so nothing
+  use is left out of it (on macOS the tree holds the XPC services responsible to it, so a web view's
+  GPU process counts). `record pid:` targets have no home (strobe launched nothing, so nothing
   carries a stamp or sits in a job of its): their set is their tree (`host::process_set` with no
   home), with no start-time check on the root (a pid reused after the target exits would be read).
 - Validity of native blocks (§10.1, §13.6): every native block (windowless included, where no window's

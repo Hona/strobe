@@ -363,6 +363,9 @@ export default bench({
 - What strobe launches is the target's whole process set: its tree plus everything started for its home (an app's detached service, a double-forked daemon).
   - It is counted in `cpu.*`, wakes and memory and ended with the target, also when a block fails early.
   - On Windows each launch is a job, so a strobe that dies takes its launches with it.
+  - On macOS it holds the XPC services the app is responsible for (a web view's web content, GPU and network processes), also for `record pid:` of an app opened from Finder.
+  - An app bundle's executable launches as its own responsible app, as from Finder: macOS asks the bundle's own permissions, not those of the app strobe runs under.
+  - A bare executable's XPC services are responsible to your terminal or daemon and are not counted: measure a web view app as its `.app` bundle.
 - A strobe that crashed or was killed may leave its isolated app or browser running (on Windows only what broke away from its job).
   - The next `bench`, `record` or `look` ends it by itself (it prints `ended <exe> (pid N): the strobe that launched it (pid M) is gone and left it running`).
   - Everything strobe launches carries `STROBE_HOME` and `STROBE_OWNER` in its environment, so it never touches a copy you started or a command that merely names a strobe folder.

@@ -93,7 +93,7 @@ strobe open <rec_… | exp_…[/head|base|<block>|<case>]> [--no-browser]
 ```text
 strobe report experiment|recording <handle> [--format html|md|pr]
 strobe report experiment <exp> --format pr --update-pr <n> [-R owner/repo] [--force] [--no-card]
-strobe report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]
+strobe report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url] [--scoreboard]
 ```
 
 - Writes a file; show it in the Review pane.
@@ -105,6 +105,11 @@ strobe report experiment <exp> --format card|badge [--out <file.png|file.svg>] [
   - card 1200×630 (decided wins as large numbers with before → this PR and one dot per pair; otherwise what happened)
   - badge one line (`run time −84%`)
   - `--badge-url` prints a shields.io URL (sends the label to shields.io).
+- Two implementations (sides are two targets): every report names each side by its target's `name`.
+  - Headline: the case marked `hero: true`, else the biggest win that counts after Holm across journeys.
+  - Card: that journey large on the left, every journey on a forest plot on the right, the scoreboard.
+  - `--format badge --scoreboard`: `vs <base> | better in 4/5 · 1 gap`.
+  - "Better in K of M" counts a win only after Holm; every regression counts; gaps are never compared.
 
 ### `strobe track`
 

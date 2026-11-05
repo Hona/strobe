@@ -89,6 +89,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("no-card", Switch, "report"),
     ("theme", Value, "report"),
     ("badge-url", Switch, "report"),
+    ("scoreboard", Switch, "report"),
     ("no-browser", Switch, "open"),
     // track.
     ("ref", Value, "track"),
@@ -356,8 +357,10 @@ Use
   report experiment <exp> --format pr --update-pr <n> [-R owner/repo] [--force] [--no-card]
                                   put the block in PR n's body, with the result card and badges attached through gh
   report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]
+                                  [--scoreboard]
                                   the result as an image: card 1200×630 (decided wins large, else what happened), badge one
-                                  line; SVG follows the reader's colour scheme (auto); --badge-url prints a shields.io URL
+                                  line; SVG follows the reader's colour scheme (auto); --badge-url prints a shields.io URL;
+                                  --scoreboard: an implementation comparison's journeys (vs <base> | better in 4/5 · 1 gap)
   open <rec_…|exp_…[/head|base|<block>|<case>]> [--no-browser]
                                   the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
                                   and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory

@@ -1291,6 +1291,34 @@ flowchart LR
     average, where two-sided equivalence (±2%) said `same` in 87% after 29; with t₃ tails 77% against
     53%. A true +5% with margin 2% was `worse` in 97–100%. `--aa --noworse 0%` on a device is the A/A
     for this mode: each claim must stay near 2.5%.
+- **Families of journeys** (an implementation comparison, `comparison: "implementations"`): each
+  journey keeps its own sequential verdict; `--filter` never changes one. The scoreboard ("better in
+  4 of 5 compared journeys") is a family claim (`app/family.rs` over `stats::family`):
+  - **Repeated p** (`stats::repeated_p`, Jennison and Turnbull's repeated-confidence-interval
+    p-value): the smallest overall α at which the series' Pocock interval at the analysis where it
+    stopped excludes 0. The nominal two-sided signed-rank p there is the per-look level of a boundary
+    c; α is the chance that a series with no difference crosses ±c at any planned look (Brownian
+    motion seen at the looks' pairs, summed crossing by crossing, Simpson's rule on 161 points,
+    ~2 ms), with the stop counted as a look of its own when it is not one. One look (`--pairs N`): α
+    is the nominal p. The five looks at nominal 1.58% come to 5.1% overall (their spacing is uneven).
+  - **Holm** across the compared journeys at 5% on the repeated p: a journey decided better on its
+    own counts as `better` only when Holm rejects it, else as `unclear` ("better on its own, not after
+    Holm"). Every journey decided `worse` on its own counts as `worse`: Holm never hides a regression.
+    Gaps are counted apart and never compared.
+  - **family_min_pairs(M)**: the fewest pairs at which n-of-n wins clear Holm's first step across M
+    journeys (`stats::family_min_pairs`: 9 pairs for M = 2–3, 10 for 4–6, 11 for 7–12, 12 for 13–16;
+    8 of 8 pairs has repeated p 2.7%, enough for one journey only). A journey decided at an earlier
+    look runs on to it, like `holm_pairs` for secondaries.
+  - **No worse in all** (`--noworse X%` on every journey): an intersection–union claim, every compared
+    journey `no worse` at its own 2.5% one-sided, with no multiplicity correction (Berger 1982).
+  - **Checked** (simulation of the real `stats.rs`, 2,000 families per row, normal and t₃ log-ratio
+    differences, σ 1% and 3%, looks 8–40 at 98.42%, runs on to family_min_pairs): A/A families of 3,
+    5, 8 and 10 journeys counted any journey `better` in 0.2–1.6% (FWER ≤ 5%; per journey without
+    Holm the same families showed a win in 2.5–20%); one journey exactly at a 5% margin and the rest
+    at 0 or at the margin: "no worse in all" 1.9–2.9% (nominal 2.5%, standard error 0.35%); every
+    journey truly −30% (σ 3%): all M counted in 100% of families for M = 3, 5, 7, 10 when they run on
+    to family_min_pairs, in 0% when they stop at 8 pairs; three true −20% journeys among eight: 3.00
+    of 3 counted, nulls falsely counted in 0.8% of families.
 - **Exact metrics**: a counter (`kind: exact`) that holds one value on each side in every block,
   from 2 pairs, is compared exactly: the difference is the answer, printed as `exact`, with
   `same (exact)` or a direction word. It needs no test, so it skips Holm and the primary's gate. A
@@ -2403,8 +2431,10 @@ size), from the same rows as the hero line and its caution (`pr::hero`): up to t
 hero's order (a metric that won in several series gets a tile per series), each the
 change as a very large number in the direction's colour (`90%`, `219 MB`), the metric in words for
 that direction (`fewer wake-ups`), `before 71.4/s → this PR 7.06/s`, a strip with one dot per pair
-(green past the bound the good way, red the bad way, grey inside the shaded bound, around a `no
-change` tick) and `better in 8 of 8 pairs`; the series above each tile when they differ. What got
+on a log-ratio scale, `ln(head / base)`, for a ratio comparison (so −80% and +400% sit as far from no
+change as they are; a difference comparison plots differences) (green past the bound the good way,
+red the bad way, grey inside the shaded bound, ln(1 − b) to ln(1 + b), around a `no change` tick)
+and `better in 8 of 8 pairs`; the series above each tile when they differ. What got
 decidedly worse beside a win takes up to two tiles (in red), and results without room are counted
 (`2 more in the report`). Without a win, the hero's calm heading (`No measurable change`, `Not
 decided yet: needs ~445 pairs`, `Not measured`, `Identical builds matched`) with a line on why and
@@ -2426,6 +2456,51 @@ tables carry them. The setup line and the rerun
 command keep every flag that chose what ran and how (`--filter`, `--primary`, `--pairs`, `--runs`,
 `--probes`, `--params`, `--aa`, …; the experiment stores its command line); a bench stores its file's
 path in its repository as `file_repo`.
+An implementation comparison (`comparison: "implementations"`, two targets) reads by
+implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/implementations.rs`,
+`app/card/forest.rs`):
+
+- **Headline:** the journey whose case says `hero: true` when its win counts on the scoreboard (9.3),
+  else the biggest counted win, by the size of its primary's log ratio (`|ln(head / base)|`; the
+  first in the file on a tie): `# Rewrite uses 83% less CPU time than Original · idle`.
+  Verbs follow the metric (`uses … less`, `opens … faster`, `responds … faster`, `takes … less
+  time`, `has … fewer`). An increase of 2× or more reads as a factor (`2.4× more app memory`, ranges
+  `2.3× to 2.5×`), never `+140%`. Without a counted win the biggest main-metric regression leads
+  (`# Regression: …`), else a calm line (`No measurable difference from Original`, `Not decided yet`).
+- **PR block:** every regression in one `> [!CAUTION]` (main and tested metrics), the scoreboard line
+  (`**Better in 4 of 5 compared journeys** · worse in 1 · not comparable: 1 (Find in session: no
+  `@find` in Rewrite). Holm-adjusted across 5 journeys.`, or the no-worse family claim), one
+  line per journey (`Same `@topRow` after every run.` from `expect.same`; a win Holm did not count
+  says so), a fairness line (machine, window, same server and data, OS input, what CPU summed on each
+  side, pairs), Details (Metrics with side-name columns; Per implementation, not compared, from
+  `series[].per_side`; Equivalence checked; Where each spends its time, each side's profiled threads,
+  never a diff; How it was measured: both identities, machine, window, input and observer, fixture,
+  what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original --head
+  rewrite=<commit>`). Shedding drops Where each spends its time, then the per-side table, then the
+  equivalence table; never a journey's line, the caution or the scoreboard.
+- **Card** (1200×630, the same visual system): header `Rewrite vs Original · <file>` and the
+  id; left, the headline journey (title, its change very large in its tone, the words with the
+  comparator, the Care note of its metric, both medians named, the pairs' log-ratio strip, the tally
+  and interval, the equivalence checks); a 1px rule; right, a forest plot of every journey on one
+  log-ratio axis oriented better-left (a higher-is-better metric plotted negated; tick labels only
+  when no row is), wide enough for every interval, the bound shaded, each row's interval and estimate
+  in green (a counted win), red (worse) or grey, its change at the right, a gap row's
+  `not comparable: no @find`; every journey while 24 px rows fit (14), else every regression and the
+  headline stay and `and K more in the report`; the scoreboard and its Holm line under it. Footer:
+  two lines, machine · OS · window @scale, Hz · same server and data · OS input to both, and what
+  CPU summed on each side · pairs. One journey: the headline across the card.
+- **Badges:** per journey as for builds; `--format badge --scoreboard` draws `vs Original | better in
+  4/5 · worse in 1 · 1 gap` (green with no worse or unclear journey, red with a worse one, else grey);
+  `--scoreboard` on anything else is a usage error.
+- **HTML:** scoreboard pills (one per journey; the headline marked; a win Holm did not count in
+  grey), a panel of what was held the same (window, GPU, input, GPU caches, priority, fixture and
+  seed) and each side's identity, engine, process set, observer reads and fixture link and CPU; per
+  journey the usual verdict and pairs, then each side's start and end thumbnails above the
+  equivalence table, and each implementation on its own: its per-side numbers and its profiled
+  threads as bars on one ms-per-run scale for both. No function, flame or heap diffs: two
+  implementations share no code. `report` adds `scoreboard`, `p_repeated`, `holm_decided` and
+  `headline` to the page's payload (`app/family.rs`), the same reading the block and card use.
+
 Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
 stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed
 over the target once flushed, so the file is whole when the command returns and a reader never
@@ -3982,6 +4057,22 @@ none, so it reads unreadable), Linux display refresh, macOS GPU time against a G
 macOS window placement and pixels (they need Accessibility and Screen Recording).
 
 ### 24.2 Where the code differs from the design
+
+- Implementation comparisons, presentation and family statistics (9.3, 11.2): `stats::repeated_p`,
+  `family_min_pairs` and `family`, `app/family.rs` (the scoreboard, the headline, read from a stored
+  result), the implementation PR block (`app/pr/implementations.rs`), the split card with its forest
+  plot (`app/card/forest.rs`), `--format badge --scoreboard` and the viewer's implementation mode are
+  built; checked by simulating the real `stats.rs` (9.3) and by rendering hand-written results of 1,
+  3, 6 and 10 journeys (a regression, a 2.4× increase, a gap, Care notes, per-side numbers,
+  equivalence checks). The bench does not yet write `comparison`, `variants[].name`, `fixture`,
+  `fairness`, `per_side`, `equivalence`, `p_repeated`, `holm_decided` or `scoreboard`, nor run on to
+  `family_min_pairs`: the reports compute the family from the stored blocks until it does. Every
+  card's pair strip is now on a log-ratio scale (it was `(head − base) / base`, which drew −80% four
+  times closer to no change than +400%); builds-mode PR blocks are unchanged (55 stored experiments
+  matched byte for byte, the version line aside); 2 of their 55 cards moved their dots. A note's
+  `C:/Users/<name>/…` path now reads `~/…` (it read `C:~/…`). The Pairs
+  table and its summary row now show a pair's change in the main comparison's own scale (`relative`):
+  deciding it per pair once showed a zero head as −100% beside a comparison by differences.
 
 - Daemon and CLI safety: each invocation has its own scope (`app::RunScope`, thread-local and
   nested): its progress log and its stop files, so two benches the daemon runs at once never write

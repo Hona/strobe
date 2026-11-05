@@ -214,15 +214,15 @@ pub(super) fn wins(ps: &[Pair], metric: &str) -> (usize, usize) {
 pub(super) const LONG_PAIRS: usize = 20;
 pub(super) const SHOWN_ENDS: usize = 5;
 
-/// Each pair's change on `m`, sorted: a fraction when the metric compares as a ratio (as the
-/// Pairs table shows it), else a difference in its unit; and which.
-pub(super) fn pair_changes(ps: &[&Pair], m: &str) -> (Vec<f64>, bool) {
-    let unit = unit_of(m);
+/// Each pair's change on `m`, sorted, in the comparison's own scale (`ratio`: the comparison's
+/// `relative`, which `stats::compare` sets only when every value on both sides is positive): a
+/// fraction for a ratio comparison, else a difference in the metric's unit. Deciding it here from
+/// the pairs instead once showed a pair with a zero head as −100% beside a comparison of differences.
+pub(super) fn pair_changes(ps: &[&Pair], m: &str, ratio: bool) -> Vec<f64> {
     let both: Vec<(f64, f64)> = ps.iter().map(|p| (bv(p.base, m), bv(p.head, m))).filter(|(a, b)| a.is_finite() && b.is_finite()).collect();
-    let ratio = unit != "count" && both.iter().all(|(a, _)| *a > 0.0);
     let mut v: Vec<f64> = both.iter().map(|(a, b)| if ratio { b / a - 1.0 } else { b - a }).collect();
     v.sort_by(f64::total_cmp);
-    (v, ratio)
+    v
 }
 
 pub(super) fn show_change(x: f64, ratio: bool, m: &str) -> String {
@@ -236,14 +236,14 @@ pub(super) fn quantile(v: &[f64], q: f64) -> Option<f64> {
 
 /// The Pairs table's row for the pairs a long series does not list: how many, their medians, and
 /// the median of their own changes.
-pub(super) fn summary_row(rest: &[&Pair], m: &str, frames: bool, foreign: bool) -> String {
+pub(super) fn summary_row(rest: &[&Pair], m: &str, ratio: bool, frames: bool, foreign: bool) -> String {
     let unit = unit_of(m);
     let med = |head: bool| {
         let mut v: Vec<f64> = rest.iter().map(|p| bv(if head { p.head } else { p.base }, m)).filter(|x| x.is_finite()).collect();
         v.sort_by(f64::total_cmp);
         quantile(&v, 0.5).unwrap_or(f64::NAN)
     };
-    let (ch, ratio) = pair_changes(rest, m);
+    let ch = pair_changes(rest, m, ratio);
     let mid = quantile(&ch, 0.5).map(|x| format!("{} <sub>median</sub>", nb(&show_change(x, ratio, m)))).unwrap_or_else(|| "—".into());
     let mut row = format!("| … | {} more pairs: medians {} | {mid} |", rest.len(), arrow(&disp(med(false), unit), &disp(med(true), unit)));
     for on in [frames, foreign] {
@@ -584,7 +584,8 @@ pub(super) fn permission(text: &str) -> Option<(&'static str, &'static str)> {
 
 /// Local paths out: a user's home as `~`, other absolute paths by their last part.
 pub(super) fn scrub_paths(s: &str) -> String {
-    let home = regex_lite::Regex::new(r"(/Users|/home)/[^/\s`|)]+").expect("pattern");
+    // `C:/Users/x/…` too, or the drive letter stayed behind (`C:~/…`).
+    let home = regex_lite::Regex::new(r"([A-Za-z]:)?(/Users|/home)/[^/\s`|)]+").expect("pattern");
     let s = home.replace_all(s, "~");
     let drive = regex_lite::Regex::new(r#"(\\\\\?\\)?\b[A-Za-z]:[\\/](?:[^\s\\/|`)<>"]+[\\/])+"#).expect("pattern");
     drive.replace_all(&s, "…/").to_string()

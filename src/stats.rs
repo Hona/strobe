@@ -164,6 +164,185 @@ pub fn holm(p: &[f64], alpha: f64) -> Vec<bool> {
     out
 }
 
+/// Complementary error function with a small relative error in the tails (Numerical Recipes
+/// `erfcc`, fractional error under 1.2e-7 everywhere), so a family's tiny p-values keep their digits.
+fn erfc(x: f64) -> f64 {
+    let z = x.abs();
+    let t = 1.0 / (1.0 + 0.5 * z);
+    let r = t
+        * (-z * z - 1.26551223
+            + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))))
+            .exp();
+    if x >= 0.0 { r } else { 2.0 - r }
+}
+
+/// P(|N(0, 1)| ≥ z).
+fn two_tail(z: f64) -> f64 {
+    erfc(z / std::f64::consts::SQRT_2)
+}
+
+/// The chance that a series with no true difference crosses ±`c` (in standard-normal units) at any
+/// of the analyses at `pairs`, the information growing with the pairs (a Brownian motion seen at
+/// those times). Summed crossing by crossing (Armitage, McPherson and Rowe), each the tail mass past
+/// the boundary of the paths that had not crossed before, so a small answer keeps its digits.
+fn crossing(c: f64, pairs: &[usize]) -> f64 {
+    let last = *pairs.last().unwrap_or(&1) as f64;
+    let t: Vec<f64> = pairs.iter().map(|&n| n as f64 / last).collect();
+    // Simpson's rule on an odd grid: the step stays under a tenth of the smallest step's spread
+    // (√(1/40) for five looks), so the sums are good to about 1e-7.
+    const N: usize = 161;
+    let simpson = |i: usize| {
+        if i == 0 || i + 1 == N {
+            1.0 / 3.0
+        } else if i % 2 == 1 {
+            4.0 / 3.0
+        } else {
+            2.0 / 3.0
+        }
+    };
+    // The paths that have not crossed yet, as a density over B(t_k) on a grid of the continuation interval.
+    let mut grid: Vec<f64> = Vec::new();
+    let mut dens: Vec<f64> = Vec::new();
+    let mut total = 0.0;
+    for k in 0..t.len() {
+        let dt = if k == 0 { t[0] } else { t[k] - t[k - 1] };
+        if dt <= 0.0 {
+            continue;
+        }
+        let sd = dt.sqrt();
+        let edge = c * t[k].sqrt();
+        // Crossing now: the mass of the surviving paths that lands beyond ±edge.
+        total += if k == 0 || grid.is_empty() {
+            two_tail(edge / sd)
+        } else {
+            let h = grid[1] - grid[0];
+            grid.iter()
+                .zip(&dens)
+                .enumerate()
+                .map(|(i, (s, f))| simpson(i) * h * f * 0.5 * (erfc((edge - s) / (sd * std::f64::consts::SQRT_2)) + erfc((edge + s) / (sd * std::f64::consts::SQRT_2))))
+                .sum::<f64>()
+        };
+        // The survivors' density at this analysis, for the next.
+        let next: Vec<f64> = (0..N).map(|i| -edge + 2.0 * edge * i as f64 / (N - 1) as f64).collect();
+        let phi = |x: f64| (-0.5 * x * x).exp() / (2.0 * std::f64::consts::PI).sqrt();
+        let nd: Vec<f64> = if k == 0 || grid.is_empty() {
+            next.iter().map(|y| phi(y / sd) / sd).collect()
+        } else {
+            let h = grid[1] - grid[0];
+            next.iter().map(|y| grid.iter().zip(&dens).enumerate().map(|(i, (s, f))| simpson(i) * h * f * phi((y - s) / sd) / sd).sum()).collect()
+        };
+        grid = next;
+        dens = nd;
+    }
+    total.min(1.0)
+}
+
+/// The repeated-confidence-interval p-value of a sequential series (Jennison and Turnbull): the
+/// smallest overall level α at which its Pocock interval at the analysis where it stopped excludes
+/// 0. `d` holds its pairs' differences (log ratios or differences); `looks` the pairs at which the
+/// design checks (one look for `--pairs N`). The nominal two-sided signed-rank p at the stop is the
+/// per-look level of some Pocock boundary c; α is the chance of crossing that boundary at any of
+/// the planned looks, with the stop counted as a look of its own when it is not one (a series run on
+/// past a look for its secondaries or its family). One look: α is the nominal p.
+pub fn repeated_p(d: &[f64], looks: &[usize]) -> f64 {
+    let n = d.iter().filter(|x| x.is_finite()).count();
+    repeated_p_at(wilcoxon_p(d), n, looks)
+}
+
+/// `repeated_p` from the nominal p at `n` pairs.
+pub(crate) fn repeated_p_at(nominal: f64, n: usize, looks: &[usize]) -> f64 {
+    if n == 0 || !nominal.is_finite() {
+        return 1.0;
+    }
+    if nominal >= 1.0 {
+        return 1.0;
+    }
+    let mut at: Vec<usize> = looks.iter().copied().filter(|&l| l > 0).collect();
+    at.push(n);
+    at.sort_unstable();
+    at.dedup();
+    if at.len() == 1 {
+        return nominal;
+    }
+    let c = normal_quantile(1.0 - nominal / 2.0);
+    crossing(c, &at).max(nominal).min(1.0)
+}
+
+/// The fewest pairs at which a series whose every pair went one way (the strongest result its
+/// signed-rank test can give) clears the first step of Holm across `journeys` series at 5%, on its
+/// repeated p (`repeated_p`): a series decided at an early look runs on to these pairs so a family
+/// claim ("better in K of M") can count it. 8 of 8 pairs (p 0.0078 at the first of five looks)
+/// clears Holm only for one series.
+pub fn family_min_pairs(journeys: usize, looks: &[usize]) -> usize {
+    let first = looks.first().copied().unwrap_or(2);
+    (first..=60).find(|&n| repeated_p_at(2.0 / 2f64.powi(n as i32), n, looks) <= 0.05 / journeys.max(1) as f64).unwrap_or(60)
+}
+
+/// One journey of a family, as the scoreboard reads it.
+#[derive(Clone, Copy, Debug)]
+pub struct Journey {
+    /// The journey's own primary verdict, unchanged by the family.
+    pub kind: VerdictKind,
+    /// Its repeated p (`repeated_p`).
+    pub p: f64,
+    /// A parity gap: one implementation could not run it, so it was not compared.
+    pub gap: bool,
+}
+
+/// What a family of journeys supports (SPEC §9.3). `better` counts journeys decided better on their
+/// own whose repeated p also clears Holm across the compared journeys at 5%, so "better in K of M"
+/// holds as a family claim; one better on its own but not after Holm counts as `unclear`. `worse`
+/// counts every journey decided worse on its own: Holm never hides a regression. `all_no_worse`
+/// (non-inferiority) is an intersection–union claim: every compared journey `no worse` at its own
+/// 2.5% one-sided, which needs no multiplicity correction (Berger 1982); a gap leaves it standing
+/// over the journeys that were compared, and names itself beside it.
+#[derive(Clone, Debug, Serialize)]
+pub struct Family {
+    pub journeys: usize,
+    pub compared: usize,
+    pub better: usize,
+    pub same: usize,
+    pub worse: usize,
+    pub unclear: usize,
+    pub gaps: usize,
+    /// Better on their own, not after Holm.
+    pub better_alone: usize,
+    pub family: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub all_no_worse: Option<bool>,
+    /// Per journey, in order: decided better after Holm.
+    #[serde(skip)]
+    pub holm: Vec<bool>,
+}
+
+pub fn family(js: &[Journey], noworse: bool) -> Family {
+    let compared: Vec<usize> = (0..js.len()).filter(|&i| !js[i].gap).collect();
+    let ps: Vec<f64> = compared.iter().map(|&i| if js[i].p.is_finite() { js[i].p } else { 1.0 }).collect();
+    let rejected = holm(&ps, 0.05);
+    let mut holm_ok = vec![false; js.len()];
+    for (&i, r) in compared.iter().zip(rejected) {
+        holm_ok[i] = r && js[i].kind == VerdictKind::Better;
+    }
+    let count = |f: &dyn Fn(usize) -> bool| compared.iter().filter(|&&i| f(i)).count();
+    let better = count(&|i| holm_ok[i]);
+    let better_alone = count(&|i| js[i].kind == VerdictKind::Better && !holm_ok[i]);
+    let same = count(&|i| matches!(js[i].kind, VerdictKind::Same | VerdictKind::NoWorse));
+    let worse = count(&|i| js[i].kind == VerdictKind::Worse);
+    Family {
+        journeys: js.len(),
+        compared: compared.len(),
+        better,
+        same,
+        worse,
+        unclear: compared.len() - better - same - worse,
+        gaps: js.len() - compared.len(),
+        better_alone,
+        family: "holm",
+        all_no_worse: noworse.then(|| !compared.is_empty() && compared.iter().all(|&i| js[i].kind == VerdictKind::NoWorse)),
+        holm: holm_ok,
+    }
+}
+
 /// mValue (Brendan Gregg), as BenchmarkDotNet uses it: above 3.2 the values likely have several modes.
 pub fn mvalue(values: &[f64]) -> Option<f64> {
     let v: Vec<f64> = values.iter().copied().filter(|x| x.is_finite()).collect();

@@ -9,11 +9,13 @@ use super::fmt;
 
 mod extract;
 mod github;
+mod implementations;
 mod markdown;
 
 use extract::*;
 use github::*;
 pub use github::{Updated, hero_level, relevel, splice, update_pr};
+pub use implementations::{claim, factor_or_pct, fairness};
 use markdown::*;
 use crate::model::{self, Better, Error, Result, VerdictKind};
 use crate::stats;

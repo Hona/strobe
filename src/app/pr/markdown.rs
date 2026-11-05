@@ -32,6 +32,9 @@ impl<'a> Doc<'a> {
     /// report, then two drawers: Details (metrics, pairs, profiles, method under plain headings) and
     /// Rerun.
     pub(super) fn render(&self) -> String {
+        if crate::app::family::implementations(self.r) {
+            return self.render_implementations();
+        }
         let mut out = String::new();
         // The hero: one `#` line, bigger than the `##` sections an author writes above the block, with
         // the decided wins of the main metrics; without one, what happened, calmly, or the regression.
@@ -624,8 +627,9 @@ impl<'a> Doc<'a> {
             let unit = unit_of(m);
             let flagged = |p: &Pair| bv(p.base, "cpu.foreign.max") >= 25.0 || bv(p.head, "cpu.foreign.max") >= 25.0;
             let directional = matches!(self.primary_out(s), Out::Better | Out::Worse | Out::AaFalse);
-            let ratio = |a: f64| a > 0.0 && unit != "count";
-            let change = |a: f64, b: f64| if ratio(a) { fmt::pct(b / a - 1.0) } else { signed_disp(b - a, abs_unit(unit)) };
+            // Each pair in the main comparison's own scale: percentages only when it compared ratios.
+            let ratio = s["primary"]["relative"] == true;
+            let change = |a: f64, b: f64| if ratio { fmt::pct(b / a - 1.0) } else { signed_disp(b - a, abs_unit(unit)) };
             if self.multi() {
                 // The series names its rows, so no column is spent on it.
                 t += &self.series_cell(s, 0);
@@ -637,7 +641,7 @@ impl<'a> Doc<'a> {
             let mut rest: Vec<&Pair> = Vec::new();
             for (i, p) in ps.iter().enumerate() {
                 if long && i + SHOWN_ENDS == ps.len() && !rest.is_empty() {
-                    t += &summary_row(&rest, m, frames, foreign);
+                    t += &summary_row(&rest, m, ratio, frames, foreign);
                     summed.push(self.summary_note(s, &rest, m));
                 }
                 if long {
@@ -700,7 +704,8 @@ impl<'a> Doc<'a> {
         let which = if last - first + 1 == rest.len() { format!("pairs {first}–{last}") } else { format!("{} other pairs", rest.len()) };
         let owned: Vec<Pair> = rest.iter().map(|p| **p).collect();
         let (w, n) = wins(&owned, m);
-        let (ch, ratio) = pair_changes(rest, m);
+        let ratio = s["primary"]["relative"] == true;
+        let ch = pair_changes(rest, m, ratio);
         let who = if self.multi() { format!(" of {}", self.title(s)) } else { String::new() };
         let spread = match (quantile(&ch, 0.1), quantile(&ch, 0.9)) {
             (Some(lo), Some(hi)) => format!("; the middle 80% of their changes ran from {} to {}", nb(&show_change(lo, ratio, m)), nb(&show_change(hi, ratio, m))),
@@ -969,22 +974,7 @@ impl<'a> Doc<'a> {
                     .unwrap_or_default()
             );
         }
-        let mut hw = vec![r["env"]["os"].as_str().unwrap_or("").to_string(), short_cpu(r["env"]["cpu"].as_str().unwrap_or(""))];
-        hw.push(r["gpu"]["devices"][0].as_str().unwrap_or("").to_string());
-        hw.push(r["env"]["power_plan"].as_str().map(|p| format!("{p} power plan")).unwrap_or_default());
-        hw.push(r["browser"].as_str().unwrap_or("").replace('/', " "));
-        if self.drew_frames() {
-            hw.push(r["refresh_hz"].as_f64().map(|x| format!("{x:.0} Hz display")).unwrap_or_default());
-        }
-        if let Some(p) = r["plan"]["pin"].as_str().filter(|p| !p.is_empty()) {
-            let n = r["plan"]["reserve"]["cpus"].as_u64().map(|m| format!(", other processes kept off its {} CPUs", m.count_ones())).unwrap_or_default();
-            let p = p.split(" · ").next().unwrap_or(p);
-            hw.push(match p.strip_prefix("unpinned") {
-                Some(why) => format!("not pinned{why}"),
-                None => format!("pinned to {p}{n}"),
-            });
-        }
-        t += &format!("- **Machine:** {}\n", cell(&fmt::fields(hw).replace(" · ", ", ")));
+        t += &format!("- **Machine:** {}\n", cell(&self.machine()));
         // What each build showed on screen (`bench::shown_line`), so a reader sees what was measured.
         for s in &self.series {
             if let Some(l) = crate::app::bench::shown_line(s) {
@@ -1002,7 +992,35 @@ impl<'a> Doc<'a> {
                 nb(&fmt::ms_duration(elapsed as u64))
             )
         };
-        // Every note strobe made, once, with the series it came from.
+        t += &self.notes();
+        t + &self.recorded()
+    }
+
+    /// The machine in one line: OS, CPU, GPU, power plan, browser, display, pinning.
+    pub(super) fn machine(&self) -> String {
+        let r = self.r;
+        let mut hw = vec![r["env"]["os"].as_str().unwrap_or("").to_string(), short_cpu(r["env"]["cpu"].as_str().unwrap_or(""))];
+        hw.push(r["gpu"]["devices"][0].as_str().unwrap_or("").to_string());
+        hw.push(r["env"]["power_plan"].as_str().map(|p| format!("{p} power plan")).unwrap_or_default());
+        hw.push(r["browser"].as_str().unwrap_or("").replace('/', " "));
+        if self.drew_frames() {
+            hw.push(r["refresh_hz"].as_f64().map(|x| format!("{x:.0} Hz display")).unwrap_or_default());
+        }
+        if let Some(p) = r["plan"]["pin"].as_str().filter(|p| !p.is_empty()) {
+            let n = r["plan"]["reserve"]["cpus"].as_u64().map(|m| format!(", other processes kept off its {} CPUs", m.count_ones())).unwrap_or_default();
+            let p = p.split(" · ").next().unwrap_or(p);
+            hw.push(match p.strip_prefix("unpinned") {
+                Some(why) => format!("not pinned{why}"),
+                None => format!("pinned to {p}{n}"),
+            });
+        }
+        fmt::fields(hw).replace(" · ", ", ")
+    }
+
+    /// Every note strobe made, once, with the series it came from, then the rerun ledger: a line each.
+    pub(super) fn notes(&self) -> String {
+        let r = self.r;
+        let mut t = String::new();
         let mut seen: Vec<(String, String, Vec<String>)> = Vec::new();
         for (series, w) in r["warnings"]
             .as_array()
@@ -1037,17 +1055,35 @@ impl<'a> Doc<'a> {
         if let Some(l) = store::ledger::line(r) {
             t += &format!("- **Other experiments on these builds:** {}\n", cell(&l));
         }
+        t
+    }
+
+    /// The strobe that recorded the result and the one that formatted it.
+    pub(super) fn recorded(&self) -> String {
         let now = version();
-        t += &match r["env"]["strobe"].as_str() {
+        match self.r["env"]["strobe"].as_str() {
             Some(v) if now != format!("strobe {v}") => format!("- **Recorded with** strobe {v}, **formatted with** {now}\n"),
             _ => format!("- **Recorded and formatted with** {now}\n"),
-        };
-        t
+        }
+    }
+
+    /// A side in a sentence: `before` and `this PR`, or each implementation's name.
+    pub(super) fn side_word(&self, base: bool) -> String {
+        if crate::app::family::implementations(self.r) {
+            let (b, h) = side_names(self.r);
+            cell(if base { &b } else { &h })
+        } else {
+            (if base { "before" } else { "this PR" }).to_string()
+        }
     }
 
     /// Rerun: the command, then where to look closer.
     pub(super) fn rerun_drawer(&self) -> String {
-        let cmd = self.rerun();
+        self.rerun_drawer_with(self.rerun())
+    }
+
+    /// The Rerun drawer around a `strobe bench` command.
+    pub(super) fn rerun_drawer_with(&self, cmd: String) -> String {
         let (first, rest) = cmd.split_once('\n').unwrap_or((&cmd, ""));
         // One flag per line, so no line scrolls sideways.
         let first = first.replace(" --", " \\\n  --");
@@ -1063,7 +1099,7 @@ impl<'a> Doc<'a> {
                 .into_iter()
                 .flatten()
                 .take(2)
-                .filter_map(|x| Some(format!("{} ({}, pair {})", code(x["recording"].as_str()?), if x["variant"] == "base" { "before" } else { "this PR" }, x["pair"].as_u64()? + 1)))
+                .filter_map(|x| Some(format!("{} ({}, pair {})", code(x["recording"].as_str()?), self.side_word(x["variant"] == "base"), x["pair"].as_u64()? + 1)))
                 .collect();
             if !kept.is_empty() {
                 t += &format!("- **Kept launches{}:** {}\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() }, kept.join(", "));

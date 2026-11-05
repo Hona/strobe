@@ -1301,6 +1301,34 @@ svg .zeroline { stroke: var(--ink-4); stroke-width: 1; }
   .plan-row { grid-template-columns: 90px minmax(0, 1fr); }
   .plan-row .plan-v { grid-column: 1 / -1; text-align: left; }
 }
+/* Implementation comparisons: two targets side by side, never a diff. */
+.impl-board { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 14px 24px 0; }
+.impl-pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 8px; border: 1px solid var(--border); font: 600 12px/18px var(--sans); color: var(--ink-2); }
+.impl-pill.win { color: var(--win-ink); border-color: var(--win); }
+.impl-pill.loss { color: var(--loss-ink); border-color: var(--loss); }
+.impl-board-note { font: 12px/18px var(--sans); color: var(--ink-3); }
+.impl-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0; }
+.impl-grid > div { padding: 14px 24px; min-width: 0; }
+.impl-grid > div + div { border-left: 1px solid var(--border); }
+.impl-side-name { font: 600 13px/18px var(--sans); color: var(--ink); margin-bottom: 6px; }
+.impl-kv { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 2px 10px; font: 12px/18px var(--sans); color: var(--ink-2); }
+.impl-kv > span:nth-child(odd) { color: var(--ink-3); }
+.impl-table { width: 100%; border-collapse: collapse; font: 12px/18px var(--sans); }
+.impl-table th, .impl-table td { text-align: left; padding: 4px 8px; border-top: 1px solid var(--border); vertical-align: top; }
+.impl-table th { color: var(--ink-3); font-weight: 600; }
+.impl-table td.num { text-align: right; font: 12px/18px var(--mono); font-variant-numeric: tabular-nums; }
+.impl-thumbs { display: flex; gap: 16px; flex-wrap: wrap; padding: 12px 24px 0; }
+.impl-thumbs figure { margin: 0; }
+.impl-thumbs img { width: 240px; height: auto; border: 1px solid var(--border); display: block; }
+.impl-thumbs figcaption { font: 11px/16px var(--mono); color: var(--ink-3); margin-top: 4px; }
+.impl-bar-row { display: grid; grid-template-columns: minmax(0, 150px) minmax(0, 1fr) 64px; gap: 8px; align-items: center; font: 12px/18px var(--sans); padding: 2px 0; }
+.impl-bar-row .fn-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.impl-bar-track { height: 8px; background: var(--surface-subtle); position: relative; }
+.impl-bar-track i { position: absolute; left: 0; top: 0; bottom: 0; background: var(--accent); }
+@media (max-width: 720px) {
+  .impl-grid { grid-template-columns: minmax(0, 1fr); }
+  .impl-grid > div + div { border-left: 0; border-top: 1px solid var(--border); }
+}
 </style>
 </head>
 <body>
@@ -1951,8 +1979,10 @@ function renderExperiment(r) {
 
   const baseVar = (r.variants || []).find((v) => v.role === "base");
   const headVar = (r.variants || []).find((v) => v.role === "head");
-  const baseTag = shortRef(baseVar, headVar);
-  const headTag = shortRef(headVar, baseVar);
+  const impl = isImpl(r);
+  // Two implementations are named by their targets, never by build.
+  const baseTag = impl ? sideName(baseVar, "base") : shortRef(baseVar, headVar);
+  const headTag = impl ? sideName(headVar, "head") : shortRef(headVar, baseVar);
 
   const createdStr = r.created
     ? new Date(r.created).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
@@ -1975,7 +2005,7 @@ function renderExperiment(r) {
                 `Base: ${baseVar?.spec || baseTag}${baseVar?.subject ? " — " + baseVar.subject : ""}`,
                 `Head: ${headVar?.spec || headTag}${headVar?.subject ? " — " + headVar.subject : ""}`,
               ].join("\n"),
-            }, `${baseTag} → ${headTag}`)
+            }, impl ? `${headTag} vs ${baseTag}` : `${baseTag} → ${headTag}`)
           : headVar
             ? h("span", { class: "ref-pill", title: `${headVar.spec || headTag}${headVar.subject ? " — " + headVar.subject : ""}` }, headTag)
             : null,
@@ -2016,6 +2046,26 @@ function renderExperiment(r) {
 
   if (s.kind === "leak") {
     renderLeakSeries(shell, r, s, seriesList, aa, baseVar, headVar, baseTag, headTag);
+    return;
+  }
+
+  // Two implementations share no code: no function diffs, flame diffs or heap diffs, only each side
+  // on its own (SPEC §11.2).
+  if (impl) {
+    const gap = isGap(s);
+    const impactI = gap ? null : buildImpactModel(r, s);
+    appendKids(shell, [
+      renderImplPanel(r, baseVar, headVar),
+      gap ? null : renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar),
+      gap ? null : renderImpactStrip(s, impactI, aa),
+      gap ? null : renderEvidenceSection(r, s, aa),
+      ...renderImplSeries(r, s, baseVar, headVar),
+      gap ? null : renderNextStepsSection(r, s, aa),
+      gap || !impactI.hasStream ? null : renderFramePacingSection(r, s, impactI),
+      gap ? null : renderAllMetricsDisclosure(s, aa),
+      gap ? null : renderPlanVsActual(r, s),
+      gap ? null : renderRigFooter(r, s, impactI),
+    ]);
     return;
   }
 
@@ -2254,6 +2304,157 @@ function renderShown(s) {
       );
     })
   );
+}
+
+/* ---------- Implementation comparisons (two targets) ---------- */
+const isImpl = (r) => r?.comparison === "implementations";
+const sideName = (v, role) => v?.name || v?.target || role;
+const isGap = (s) => !!s?.gap || s?.primary?.refusal?.validator === "ParityGap";
+
+// The scoreboard as pills (one per journey, in the bench file's order), the family's count, and what
+// was held the same for both: window, GPU, input, fixture, and each side's process set.
+function renderImplPanel(r, baseVar, headVar) {
+  const bn = sideName(baseVar, "base"), hn = sideName(headVar, "head");
+  const sb = r.scoreboard || {};
+  const pills = (r.series || []).map((s, i) => {
+    const c = s.primary || {};
+    const m = c.metric || "";
+    const cl = classify(c, m, false);
+    const gap = isGap(s);
+    const counted = c.holm_decided === true;
+    const tone = gap ? "" : cl.tone === "loss" ? "loss" : cl.tone === "win" && (counted || (sb.compared || 0) < 2) ? "win" : "";
+    // An increase of 2× or more reads as a factor, as in the PR block and card.
+    const change = c.relative !== false && finite(c.estimate) && c.estimate >= 1 ? `${(1 + c.estimate).toFixed(1 + c.estimate >= 10 ? 0 : 1)}×` : fmtDelta(c.estimate, c, unitOf(m));
+    const what = gap ? (s.gap?.missing ? `gap: no ${s.gap.missing}` : "gap") : cl.kind === "same" ? "same" : cl.tone === "neutral" ? "unclear" : change;
+    return h("button", { type: "button", class: `impl-pill ${tone}`, title: gap ? s.gap?.reason || "" : `${labelOf(m)}${finite(c.p_repeated) ? ` · repeated p ${fmtP(c.p_repeated)}` : ""}${cl.tone === "win" && !counted ? " · not after Holm" : ""}`, onclick: () => selectSeries(i) },
+      `${capFirst(s.case || s.label)} · ${what}${s.headline ? " · headline" : ""}`);
+  });
+  const parts = [];
+  if (sb.all_no_worse === true) parts.push(`No worse than ${bn} in all ${sb.compared} compared journeys`);
+  else if (sb.all_no_worse === false) parts.push(`Not no worse in all ${sb.compared} compared journeys`);
+  else parts.push(`Better in ${sb.better ?? 0} of ${sb.compared ?? 0} compared journeys`);
+  if (sb.worse) parts.push(`worse in ${sb.worse}`);
+  if (sb.unclear) parts.push(`unclear in ${sb.unclear}`);
+  if (sb.gaps) parts.push(`${sb.gaps} not comparable`);
+  const note = (sb.compared || 0) > 1 ? (sb.all_no_worse != null ? "each journey at its own 2.5% (intersection–union)" : `Holm-adjusted across ${sb.compared} journeys on repeated-interval p-values; every regression counts`) : "";
+  const f = r.fairness || {};
+  const w = f.window || {};
+  const fx = r.fixture;
+  const kv = (rows) => h("div", { class: "impl-kv" }, rows.filter((x) => x[1] != null && x[1] !== "").flatMap(([k, v]) => [h("span", {}, k), h("span", {}, String(v))]));
+  const side = (v, role) => h("div", {},
+    h("div", { class: "impl-side-name" }, `${sideName(v, role)} · ${role}`),
+    kv([
+      ["Build", v?.label || v?.spec || ""],
+      ["Commit", v?.commit ? `${v.commit}${v.dirty ? " (dirty)" : ""}${v.subject ? " · " + v.subject : ""}` : ""],
+      ["Engine", v?.engine || ""],
+      ["GPU backend", v?.gpu_backend || ""],
+      ["Processes", finite(v?.process_set?.median_count) ? `${v.process_set.median_count} · ${Object.entries(v.process_set.by_program || {}).map(([p, n]) => `${p} ×${n}`).join(", ")}` : ""],
+      ["Observed via", f.observer?.[role] || ""],
+      ["Reads per run", finite(f.observer?.reads_per_run?.[role]) ? f.observer.reads_per_run[role] : ""],
+      ["Fixture link", fx ? (fx.connected?.[role] ? "connected" : "not connected") : ""],
+      ["Fixture CPU", fx && finite(fx.cpu_ms_per_run?.[role]) ? `${fmtVal(fx.cpu_ms_per_run[role], "ms")} per run` : ""],
+    ])
+  );
+  return h("section", { class: "card-surface" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, `${hn} vs ${bn}`),
+        h("span", { class: "sec-sub" }, parts.join(" · "))
+      )
+    ),
+    h("div", { class: "impl-board" }, pills, note ? h("span", { class: "impl-board-note" }, note) : null),
+    h("div", { class: "impl-grid" },
+      h("div", {},
+        h("div", { class: "impl-side-name" }, "Held the same on both"),
+        kv([
+          ["Window", finite(w.client_dip?.[0]) ? `${w.client_dip[0]}×${w.client_dip[1]} DIP @${w.scale ?? 1}×${finite(w.hz) ? `, ${w.hz} Hz` : ""}${w.display ? " · " + w.display : ""}` : ""],
+          ["GPU", f.adapter || ""],
+          ["Input", f.input === "os" ? "real OS input to both" : f.input || ""],
+          ["GPU caches", f.gpu_cache || ""],
+          ["Priority", f.priority || ""],
+          ["Fixture", fx ? fx.command : ""],
+          ["Seed", fx?.seed ? `${fx.seed}${fx.seed_sha256 ? ` · sha256 ${String(fx.seed_sha256).slice(0, 12)}` : ""}` : ""],
+        ])
+      ),
+      h("div", {},
+        h("div", { class: "impl-side-name" }, "Not checked by strobe"),
+        h("div", { class: "sec-sub" }, "That both render the same features beyond the equivalence checks, and that the fixture behaves like production.")
+      )
+    ),
+    h("div", { class: "impl-grid" }, side(baseVar, "base"), side(headVar, "head"))
+  );
+}
+
+// One journey: what each side showed (start and end thumbnails), what `expect.same` read on both,
+// each side's own numbers, and where each spent its time on one shared ms-per-run scale.
+function renderImplSeries(r, s, baseVar, headVar) {
+  const bn = sideName(baseVar, "base"), hn = sideName(headVar, "head");
+  const out = [];
+  if (isGap(s)) {
+    out.push(h("section", { class: "card-surface card-bd" },
+      h("h2", { class: "sec-title" }, `${capFirst(s.case || s.label)}: not compared`),
+      h("p", { class: "sec-sub" }, s.gap?.reason || `no ${s.gap?.missing || "step"} in ${s.gap?.side === "base" ? bn : hn}`)
+    ));
+    return out;
+  }
+  const sh = s.shown || {};
+  const thumbs = ["base", "head"].flatMap((role) => {
+    const v = sh[role] || {};
+    const name = role === "base" ? bn : hn;
+    return [["start", v.thumb_start], ["end", v.thumb_end || v.thumb]].filter(([, src]) => src).map(([when, src]) =>
+      h("figure", {}, h("img", { src, alt: `${name} ${when}` }), h("figcaption", {}, `${name} · ${when}${when === "end" && v.end ? ` · '${v.end}'` : ""}`)));
+  });
+  const eq = s.equivalence || [];
+  if (thumbs.length || eq.length) {
+    out.push(h("section", { class: "card-surface" },
+      h("div", { class: "card-hd" }, h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Same outcome on both"),
+        h("span", { class: "sec-sub" }, "Read on each side after setup and after every run, outside the measured window")
+      )),
+      thumbs.length ? h("div", { class: "impl-thumbs" }, thumbs) : null,
+      eq.length ? h("div", { class: "card-bd" }, h("table", { class: "impl-table" },
+        h("thead", {}, h("tr", {}, h("th", {}, "Check"), h("th", {}, bn), h("th", {}, hn), h("th", {}, "Pairs"), h("th", {}, ""))),
+        h("tbody", {}, eq.map((e) => h("tr", {},
+          h("td", { class: "mono" }, e.selector),
+          h("td", {}, e.base === "" ? "(empty)" : String(e.base ?? "—")),
+          h("td", {}, e.head === "" ? "(empty)" : String(e.head ?? "—")),
+          h("td", { class: "num" }, String(e.pairs ?? "")),
+          h("td", { style: `color:var(${e.ok ? "--win-ink" : "--loss-ink"})` }, e.ok ? "same" : "differed")
+        )))
+      )) : null
+    ));
+  }
+  const ps = s.per_side || {};
+  const keys = [...new Set([...Object.keys(ps.base || {}), ...Object.keys(ps.head || {})])].sort();
+  const threads = (role) => (s.hotspots?.[role]?.threads?.threads || []).filter((t) => finite(t.cpu_ms_per_run) && t.cpu_ms_per_run > 0).sort((a, b) => b.cpu_ms_per_run - a.cpu_ms_per_run).slice(0, 12);
+  const tb = threads("base"), th = threads("head");
+  if (keys.length || tb.length || th.length) {
+    // One scale for both columns, so widths compare across implementations.
+    const max = Math.max(1e-9, ...tb.map((t) => t.cpu_ms_per_run), ...th.map((t) => t.cpu_ms_per_run));
+    const col = (role, list) => h("div", {},
+      h("div", { class: "impl-side-name" }, role === "base" ? bn : hn),
+      keys.length ? h("table", { class: "impl-table", style: "margin-bottom:10px" }, h("tbody", {}, keys.map((k) => {
+        const v = ps[role]?.[k];
+        const u = v?.unit || unitOf(k);
+        const x = v?.median ?? v?.value;
+        return h("tr", {}, h("td", {}, labelOf(k)), h("td", { class: "num" }, v ? (u === "bytes" ? fmtBytes(x) : fmtVal(x, u)) : "—"));
+      }))) : null,
+      list.length ? [h("div", { class: "sec-sub" }, "Threads, CPU per run (profiled)"), list.map((t) => h("div", { class: "impl-bar-row" },
+        h("span", { class: "fn-name mono", title: t.module || "" }, t.name || "(unnamed)"),
+        h("div", { class: "impl-bar-track" }, h("i", { style: `width:${(100 * t.cpu_ms_per_run) / max}%` })),
+        h("span", { class: "mono", style: "text-align:right" }, fmtVal(t.cpu_ms_per_run, "ms"))
+      ))] : null,
+      s.attribution?.[role] ? h("div", { class: "sec-sub", style: "margin-top:6px" }, cmdRow(`strobe open ${s.attribution[role]}`)) : null
+    );
+    out.push(h("section", { class: "card-surface" },
+      h("div", { class: "card-hd" }, h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Each implementation on its own"),
+        h("span", { class: "sec-sub" }, "Never compared: each measures its engine its own way · bars share one ms-per-run scale")
+      )),
+      h("div", { class: "impl-grid" }, col("base", tb), col("head", th))
+    ));
+  }
+  return out;
 }
 
 function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {

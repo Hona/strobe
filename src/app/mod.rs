@@ -4,6 +4,7 @@ pub mod bench;
 pub mod bisect;
 pub mod card;
 pub mod config;
+pub mod family;
 pub mod fmt;
 pub mod helper;
 pub mod history;

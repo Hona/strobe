@@ -150,6 +150,7 @@ const TOOLS: &[Tool] = &[
             ("force", "with update-pr: replace a block another experiment wrote"),
             ("no-card", "with update-pr: no result card or badges"),
             ("badge-url", "with format badge: print a shields.io URL"),
+            ("scoreboard", "with format badge, for an implementation comparison: its journeys' scoreboard (vs <base> | better in 4/5 · 1 gap)"),
         ],
         required: &["handle"],
         long: false,

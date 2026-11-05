@@ -16,6 +16,8 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
+mod forest;
+
 const W: f32 = 1200.0;
 const H: f32 = 630.0;
 const HEAD: f32 = 72.0;
@@ -308,10 +310,12 @@ struct Tile {
     before: String,
     after: String,
     tone: Tone,
-    /// Each pair's change, relative (a fraction) or in the metric's unit, as the comparison is.
+    /// Each pair's change as the comparison measured it: a log ratio `ln(head / base)` for a ratio
+    /// metric (so −80% and +400% sit as far from no change as they are), else a difference in the
+    /// metric's unit.
     dots: Vec<f64>,
-    /// The comparison's bound in the same scale: changes inside it count as no change.
-    band: f64,
+    /// The comparison's bound in the same scale, (low, high): changes inside it count as no change.
+    band: (f64, f64),
     lower: bool,
     tally: String,
     series: String,
@@ -342,7 +346,8 @@ fn tile(s: &Value, c: &Value, series: String) -> Tile {
         if !x.is_finite() || !y.is_finite() {
             continue;
         }
-        let d = if relative { if x != 0.0 { (y - x) / x.abs() } else { continue } } else { y - x };
+        // A ratio comparison had every value positive (`stats::compare`): its pairs as log ratios.
+        let d = if relative { if x > 0.0 && y > 0.0 { (y / x).ln() } else { continue } } else { y - x };
         n += 1;
         if (lower && y < x) || (!lower && y > x) {
             won += 1;
@@ -361,20 +366,10 @@ fn tile(s: &Value, c: &Value, series: String) -> Tile {
         _ => format!("better in {won} of {n} pairs"),
     };
     let band = f(&c["bound"]).abs();
-    Tile {
-        amount,
-        words: format!("{word} {noun}"),
-        delta,
-        noun,
-        before: disp(f(&c["base"]), unit),
-        after: disp(f(&c["head"]), unit),
-        tone,
-        dots,
-        band: if band.is_finite() { band } else { 0.02 },
-        lower,
-        tally,
-        series,
-    }
+    let band = if band.is_finite() { band } else { 0.02 };
+    // `same` means a change inside ±bound of base: in log ratios, ln(1 − b) to ln(1 + b).
+    let band = if relative { ((1.0 - band).max(1e-9).ln(), (1.0 + band).ln()) } else { (-band, band) };
+    Tile { amount, words: format!("{word} {noun}"), delta, noun, before: disp(f(&c["base"]), unit), after: disp(f(&c["head"]), unit), tone, dots, band, lower, tally, series }
 }
 
 /// Each pair's two blocks (base, head), in pair order.
@@ -465,7 +460,7 @@ fn build(r: &Value) -> Card {
                 after: format!("{:.1}%", h * 100.0),
                 tone: Tone::Err,
                 dots: Vec::new(),
-                band: 0.0,
+                band: (0.0, 0.0),
                 lower: true,
                 tally: format!("more in {k} of {n} pairs · not tested"),
                 series: name(s),
@@ -765,13 +760,13 @@ fn strip(svg: &mut Svg, x: f32, y: f32, w: f32, t: &Tile, r: f32, colour: bool) 
     }
     let h = r * 6.0;
     let cy = y + h / 2.0;
-    let band = t.band.abs();
-    let lo = t.dots.iter().cloned().fold(-band * 1.5, f64::min).min(0.0);
-    let hi = t.dots.iter().cloned().fold(band * 1.5, f64::max).max(0.0);
+    let (b_lo, b_hi) = t.band;
+    let lo = t.dots.iter().cloned().fold(b_lo * 1.5, f64::min).min(0.0);
+    let hi = t.dots.iter().cloned().fold(b_hi * 1.5, f64::max).max(0.0);
     let pad = (hi - lo) * 0.06;
     let (lo, hi) = (lo - pad, hi + pad);
     let px = |v: f64| x + r + ((v - lo) / (hi - lo)) as f32 * (w - 2.0 * r);
-    svg.rect(px(-band), y, (px(band) - px(-band)).max(1.0), h, Ink::Band);
+    svg.rect(px(b_lo), y, (px(b_hi) - px(b_lo)).max(1.0), h, Ink::Band);
     svg.line(x, cy.round() + 0.5, x + w, cy.round() + 0.5, Ink::Line);
     let zero = px(0.0).round() + 0.5;
     svg.line(zero, y, zero, y + h, Ink::Muted);
@@ -791,8 +786,8 @@ fn strip(svg: &mut Svg, x: f32, y: f32, w: f32, t: &Tile, r: f32, colour: bool) 
         let dx = px(v);
         let row = [0, -1, 1, -2, 2].into_iter().find(|row| !placed.iter().any(|(px2, r2)| r2 == row && (px2 - dx).abs() < 2.0 * r + 1.0)).unwrap_or(0);
         placed.push((dx, row));
-        let better = if t.lower { v < -band } else { v > band };
-        let worse = if t.lower { v > band } else { v < -band };
+        let better = if t.lower { v < b_lo } else { v > b_hi };
+        let worse = if t.lower { v > b_hi } else { v < b_lo };
         let ink = if colour && better {
             Ink::Ok
         } else if colour && worse {
@@ -1020,15 +1015,48 @@ fn headline(card: &Card) -> (String, String, Tone) {
     }
 }
 
-/// `report experiment <exp> --format card|badge [--out <file.png|.svg>] [--theme light|dark|auto] [--badge-url]`.
+/// What a card draws, for either kind of experiment: the image's source, its words, each series'
+/// badge, the headline badge.
+struct Drawn {
+    draw: Box<dyn Fn(Theme) -> String>,
+    id: String,
+    alt: String,
+    badges: Vec<(String, String, String, Tone)>,
+    headline: (String, String, Tone),
+    /// An implementation comparison's scoreboard badge.
+    scoreboard: Option<(String, String, Tone)>,
+}
+
+fn drawn(r: &Value) -> Drawn {
+    if crate::app::family::implementations(r) {
+        let card = Arc::new(forest::build(r));
+        let c = card.clone();
+        return Drawn {
+            draw: Box::new(move |t| forest::svg(&c, t)),
+            id: r["id"].as_str().unwrap_or("").to_string(),
+            alt: card.alt.clone(),
+            badges: card.badges.clone(),
+            headline: card.headline.clone(),
+            scoreboard: Some(card.scoreboard_badge.clone()),
+        };
+    }
+    let card = Arc::new(build(r));
+    let c = card.clone();
+    Drawn { draw: Box::new(move |t| card_svg(&c, t)), id: card.id.clone(), alt: card.alt.clone(), badges: card.badges.clone(), headline: headline(&card), scoreboard: None }
+}
+
+/// `report experiment <exp> --format card|badge [--out <file.png|.svg>] [--theme light|dark|auto] [--badge-url] [--scoreboard]`.
 pub fn report(args: &Args, dir: &Path, r: &Value, format: &str) -> Result<Output> {
-    let card = build(r);
+    let card = drawn(r);
     let default = if format == "card" { "card.png" } else { "badge.svg" };
     let out = args.get("out").map(PathBuf::from).unwrap_or_else(|| dir.join(default));
     let svg_out = out.extension().is_some_and(|e| e.eq_ignore_ascii_case("svg"));
     let theme = Theme::parse(args.get("theme"), if svg_out { Theme::Auto } else { Theme::Light })?;
+    if args.has("scoreboard") && (format != "badge" || card.scoreboard.is_none()) {
+        return Err(Error::usage("--scoreboard draws an implementation comparison's scoreboard as a badge: --format badge of an experiment whose sides are two targets"));
+    }
     if format == "badge" {
-        let (noun, value, tone) = headline(&card);
+        let (noun, value, tone) = if args.has("scoreboard") { card.scoreboard.clone().unwrap_or(card.headline.clone()) } else { card.headline.clone() };
         let url = shields_url(&noun, &value, tone);
         let series: Vec<Value> = card.badges.iter().map(|b| json!({ "series": b.0, "label": b.1, "value": b.2, "url": shields_url(&b.1, &b.2, b.3) })).collect();
         // The zero-file form: shields.io draws it, and GitHub fetches it through its image proxy.
@@ -1040,7 +1068,7 @@ pub fn report(args: &Args, dir: &Path, r: &Value, format: &str) -> Result<Output
         let path = out.display().to_string();
         return Ok(Output::new(format!("{path} · {noun} {value}\n"), json!({ "path": path, "bytes": bytes.len(), "label": noun, "value": value, "url": url, "series": series })));
     }
-    let bytes = image(|t| card_svg(&card, t), &out, theme, &card.alt, 1.0)?;
+    let bytes = image(&card.draw, &out, theme, &card.alt, 1.0)?;
     super::report::write_whole(&out, &bytes)?;
     let path = out.display().to_string();
     Ok(Output::new(format!("{path} · {}\n{}\n", super::fmt::bytes(bytes.len() as f64), card.alt), json!({ "path": path, "bytes": bytes.len(), "alt": card.alt })))
@@ -1051,7 +1079,7 @@ pub fn report(args: &Args, dir: &Path, r: &Value, format: &str) -> Result<Output
 /// by series label, each a `./name` that `gh --attach` replaces with the uploaded image's address,
 /// and a `digest` of the images) and the files.
 pub fn for_pr(r: &Value, dir: &Path) -> Result<(Value, Vec<PathBuf>)> {
-    let card = build(r);
+    let card = drawn(r);
     let folder = dir.join("pr-card");
     std::fs::create_dir_all(&folder)?;
     let id = card.id.clone();
@@ -1060,7 +1088,7 @@ pub fn for_pr(r: &Value, dir: &Path) -> Result<(Value, Vec<PathBuf>)> {
     let path = folder.join(&name);
     use sha2::Digest;
     let mut hash = sha2::Sha256::new();
-    let bytes = image(|t| card_svg(&card, t), &path, Theme::Auto, &card.alt, 1.0)?;
+    let bytes = image(&card.draw, &path, Theme::Auto, &card.alt, 1.0)?;
     hash.update(&bytes);
     super::report::write_whole(&path, &bytes)?;
     files.push(path);

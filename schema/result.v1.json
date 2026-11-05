@@ -101,7 +101,8 @@
         "NoCounter",
         "NotOnThisOs",
         "NotForTarget",
-        "ResetIncomplete"
+        "ResetIncomplete",
+        "EngineUnsupported"
       ]
     },
     "verdictKind": {

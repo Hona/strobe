@@ -189,8 +189,8 @@ cli/            argument parsing, help, text + JSON rendering
 app/            commands (up, status, record, bench, query, report, top, update, leave, daemon)
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
 target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
-                process.rs, isolate.rs (isolated launches), electron.rs, native.rs (native apps,
-                §13.7), a11y/ (the OS accessibility client: uia.rs, ax.rs, atspi.rs; input:
+                process.rs, isolate.rs (isolated launches), electron.rs, webview.rs (apps on the OS's
+                webview, §13.8), native.rs (native apps, §13.7), a11y/ (the OS accessibility client: uia.rs, ax.rs, atspi.rs; input:
                 input.rs (posted messages), cg_input.rs (Quartz), xtest.rs; keys.rs shared)
 driver/         the bench file's `page`: over CDP, or a native app's accessibility tree and
                 message loop (native.rs)
@@ -273,7 +273,7 @@ adais: a successful `record --bench` exits 0 (`$LASTEXITCODE`), and its shell re
 |---|---|
 | `https://…`, `http://…` | a page in a strobe-launched Chromium: isolated profile, real GPU, fixed window (§13.1) |
 | `cdp:<port>`, `cdp:ws://…` | a running CDP endpoint (Playwright's, a dev Electron's) |
-| `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7) |
+| `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7), one with `kind: "webview"` an app on the OS's webview (§13.8) |
 | `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
 | `node:<port>`, `bun:<port>` | an inspector endpoint (§13.5) |
 | `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, OS present events, deep (§13.6). `proc:` takes the one process of that name whose parent is not of that name |
@@ -366,6 +366,8 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   (`--target` picks one of its targets). `--gpu-cache` is refused there: the bench target's
   `gpuCache` decides, as in a bench. `--headless` runs a page case in a headless browser, as
   `bench --check --headless` does (§5.6): no display needed, frame and latency metrics refused.
+  `record app:<id> --headless` (or `exe:`) is a usage error: an app draws its own window, and the
+  flag once only skipped the lock check on it.
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
@@ -1444,8 +1446,8 @@ reserved for tools that list a project's bench files; strobe does not read it ye
   env (`VariantMismatch`).
 - `app:<id>` and `exe:<path>` need no build.
 - `build` and `serve` are what a `web()` target runs for each variant; `serve` gets a free port
-  per variant. A `native(appId)` target from a directory or git ref runs `build` and launches its
-  `output`, the executable (§13.7). Like a profile's `exe`, `output` is one path or one per OS
+  per variant. A `native(appId)` or `webview(appId)` target from a directory or git ref runs `build`
+  and launches its `output`, the executable (§13.7, §13.8). Like a profile's `exe`, `output` is one path or one per OS
   (`{ "windows": "{cache}/cargo-target/release/my-app.exe", "macos": "{cache}/cargo-target/release/my-app" }`):
   a Cargo build names `my-app.exe` only on Windows.
 - **Per OS:** `build.windows`, `build.macos` and `build.linux` are objects that overlay the rest
@@ -1553,6 +1555,9 @@ export default bench({
   opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, unset?, window? })` is a
   native app (§13.7): `viewport` sizes the main window's client area in device-independent pixels
   where the app allows; `window: false` is an app with no window (a tray app).
+  `webview(appIdOrPath, { home?, viewport?, gpuCache?, expect? })` is an app on the OS's webview
+  (§13.8): launched as an app target, its page driven and measured over the webview's own
+  debugging port, whatever `kind` its profile names.
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
   targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
@@ -1887,6 +1892,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. A start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
+| `EngineUnsupported` | a target, metric, probe or hook needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (13.8) |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
@@ -2615,6 +2621,7 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   string that is exactly `{port}` becomes a number) shape the copy; `args` are extra command-line
   arguments. `window: false`: the app opens no window (a tray app); `record app:<id>` waits for none.
   `moved`: the user's folders the profile's `env` moves into the home (macOS Library rule, below).
+  `kind`: `electron` (the default), `webview` (§13.8) or `native` (§13.7).
 - **Seeds** (`home` seed folders, copied into each fresh home): a file of 64 MB or more (a model) is
   shared, not copied. strobe keeps one read-only copy per seed version in `<state>/seeds` and
   hard-links it into each home, so a launch writes nothing that size again: a fresh copy per block
@@ -3082,6 +3089,78 @@ and not the `reset()` between runs), and `query <rec> hotspots` ranks them by fu
 package from the variant's own PDB (§12.2). An attribution launch samples from just after the spawn
 until the launch was ready.
 
+### 13.8 Apps on the OS's webview
+
+An app whose UI is a page in the webview the OS ships (WebView2 on Windows, WebKitGTK on Linux,
+WKWebView on macOS) is a webview target: `webview(appIdOrPath)` in a bench file, or `app:<id>` with
+a profile of `kind: "webview"` (`target/webview.rs`). It launches exactly as an Electron app (§13.2):
+a fresh private home, the profile's `env`, `unset`, `dirs`, `files`, `args`, `guard` and
+`protocols`, `LiveChannel`, its own job or process group, warm GPU caches (the driver's, and the
+webview's own Chromium caches under its user data folder), and on close the tree, the group and
+everything stamped with the home ended and the home deleted. What differs is how the page is reached.
+
+- **Windows (WebView2).** WebView2 reads two variables when the app creates its environment, whatever
+  the app passes: `WEBVIEW2_USER_DATA_FOLDER` replaces the app's user data folder, and
+  `WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS` is appended to the app's own arguments.
+  - The user's own `WEBVIEW2_*` variables (a browser folder, a release channel, a script debugger
+    pipe) are removed from the launch; only the profile's `env` sets any.
+  - The folder is `{home}/WebView2`. A profile may name another folder inside the home; one outside
+    it, or a path with `..`, is a usage error (compared without case, as Windows does): the copy would
+    share that webview data. A `DevToolsActivePort` left in it is removed before the launch.
+  - The arguments are the profile's, then strobe's: `--remote-debugging-port=0`, and as for a browser
+    strobe launches (§13.1) `--mute-audio`, `--no-first-run`, `--disable-background-networking` and
+    `--disable-component-update`. A profile whose arguments already name a debugging port is a usage
+    error.
+  - WebView2 writes `DevToolsActivePort` into its profile folder (`<folder>/EBWebView`); strobe
+    attaches over CDP, and the browser's own process (`SystemInfo.getProcessInfo`) must be in the
+    launch's process set, else `LiveChannel`. When WebView2's processes (`msedgewebview2`) run in the
+    launch for 5 s with no port in strobe's folder, the app or a WebView2 policy (LoaderOverride, a
+    registry override) replaced the folder or the arguments, and its webview may use data outside
+    the home: strobe checks the guards and refuses `LiveChannel` at once, never waiting a minute
+    against that data. An app that exits with code 0 and leaves nothing running, or opens no port in
+    60 s, fails with the advice to measure it as `kind: "native"`.
+  - The app's page is the page target that is not the browser's own (`devtools://`, `edge://`,
+    `chrome://`, `chrome-extension://`): the visible one with the largest viewport, `about:blank` only
+    after 2 s with nothing else, and a page that closes while strobe attaches (a splash screen) is
+    passed over (the same pick serves Electron apps).
+  - Each run block places the app's main window as a native app's (§13.7) and, with the target's
+    `viewport`, sizes its client area so the page's `innerWidth` × `innerHeight` is the viewport (a
+    second pass takes off what the app draws around its webview); an app that keeps its size is a
+    usage error. result.json's `window` is the page's own size and scale, as measured; a launch case
+    records the window the app opened.
+  - Closing asks the app's windows to close (`WM_CLOSE`), waits 2 s, then ends the tree and the
+    group: `Browser.close` would end only WebView2's browser and leave the app to be waited on.
+  - There is no Node main process: `launch.inspect` is refused and an attribution launch profiles
+    the page only. `DevBuild` reads the app's executable (a debug C runtime) as for native apps.
+  - So an unmodified release app is a page target: the driver, every page metric and Chromium's
+    timing and attribution probes, with `cpu.app.total`, memory and GPU over the whole process set.
+    Checked on adais with a release Tauri v2 app (no plugins, `cargo build --release`): the app's
+    own browser arguments stayed (`--disable-features=msWebOOUI,…`) beside strobe's, the WebView2
+    browser process is the app's child and every WebView2 process (browser, GPU, renderer, utility,
+    crashpad) is in the launch's job and its tree, so the process set counts them.
+  - `track` puts the target's browser (the WebView2 runtime's version, which Windows updates under
+    the app) into a `webview()` series' fingerprint.
+- **Linux (WebKitGTK) and macOS (WKWebView): `EngineUnsupported`.** strobe drives WebKit through
+  neither its inspector protocol nor WebDriver yet, so a webview target there is refused before
+  anything launches, with the fix to use `kind: "native"` (the app through the OS accessibility tree,
+  §13.7). The route for later, checked on vps (WebKitGTK 2.54, Xvfb) with the same release Tauri v2
+  app built there: with `WEBKIT_INSPECTOR_HTTP_SERVER` set to a loopback port, the inspector's index
+  listed its page (`tauri://localhost`) at `/socket/<connection>/<target>/WebPage`, and over that
+  socket `Target.sendMessageToTarget` to the page target ran `Runtime.evaluate` (the title and
+  WebKit's user agent came back; a bare `Runtime.evaluate` is not found at that level). So an
+  unmodified release app on WebKitGTK is inspectable through the variable alone. macOS opens no
+  inspector to another process: there only a WebDriver server the app serves itself would do.
+- **`kind: "native"` on the same app** (checked 2026-11-06): on vps (Xvfb, AT-SPI) the tree reads the
+  page (heading, links, the text box and button by role and name) and the process set holds
+  `WebKitWebProcess` and `WebKitNetworkProcess` beside the app; on adais UI Automation reads the page's
+  elements (the `greet-input` text box by its id) but no heading; on air (AX) the app's window shows no
+  page elements. That air check (28 MB, the app alone) predates the responsible-process accounting of
+  §13.2, which now joins WKWebView's WebContent, GPU and Networking XPC services (parent 1) to the
+  app's set; not checked again with this app.
+- A `webview()` or `native()` target whose directory or git-ref variants differ (two specs, or any git
+  ref) needs strobe.json's `build` for this OS: without one each variant would launch the profile's
+  same executable, which is a usage error before any block.
+
 ## 14. Storage
 
 ### 14.1 Recordings
@@ -3300,7 +3379,7 @@ read 40–80% (script) and 7% (native): strobe's own between-run reads, never in
     linux-x64 and linux-arm64 (Linux builds are static musl binaries, for glibc and musl alike).
     `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
     install folder (§5.3), so the daemon never runs from a project's `node_modules`.
-  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native` and the types of bench
+  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native`, `webview` and the types of bench
     files (§9.6), built from `sdk/bench` (`dist/index.js`, `dist/index.d.ts`). strobe embeds the
     SDK, the runner and the script host and rewrites a bench file's `@hona/strobe` import (or the old
     `@hona/strobe-bench`) to its own copy, so a bench file runs with the SDK of the binary running it,
@@ -3375,6 +3454,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | 4 | Windows OS and GPU samplers; the viewer (`experiment`, `recording` incl. memory); JS symbols through stored source maps; imports of a trace, `.cpuprofile` or `.heapsnapshot` | report views `bench-summary`, `memory-timeline`, `frames`, `hotspots`, `flame`, `compare`, `leak`; folder imports by `manifest.json` |
 | 5 | `top`, insights, `--bisect` | core migration (needs deep), the flight recorder (`--ring`) |
 | native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | `frames.presented.*` from outside; macOS driving and ScreenCaptureKit frames not yet run with the permissions granted (§24.1) |
+| webview | apps on the OS's webview (§13.8): `kind: "webview"` profiles, `webview()` bench targets, `record app:<id>`; Windows WebView2 attached over CDP through its environment variables (checked on adais, locked, with a release Tauri v2 app: launch, the user's own WEBVIEW2_* removed, strobe's arguments beside the app's, browser pid in the process set, page eval, trace, CPU and memory over the app and its WebView2 processes, attribution and memory recordings, WebView2's GPU caches kept per executable, closing in 5 s instead of 11.5 s for a 1 s recording); Linux and macOS refused `EngineUnsupported` before anything launches (vps) | WebKit drivers (the WebKitGTK inspector route is checked, §13.8); on an unlocked Windows session: frames, input latency, window sizing to `viewport` and a `bench --check` of a `webview()` target; the override refusal against a real WebView2 policy; `look` of a webview profile reads its accessibility tree, not its page |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
 | 7 | history: `strobe track` (points, E-divisive change points, paired confirmation, bisect to the culprit, alert hooks, daemon schedules), `history`, `query history` and `query changes`, `report history` (§25) | CI budgets, mesh; cheap paired points (each commit against the previous tracked one) |
 

@@ -25,9 +25,7 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
         (_, Some(id)) => isolate::app(id, config)?,
         _ => {
             let path = target["path"].as_str().ok_or_else(|| Error::usage("native(): give an app profile id or an executable path"))?;
-            let mut a = isolate::App::bare(Path::new(path));
-            a.kind = "native".into();
-            a
+            isolate::App::bare(Path::new(path)).as_kind(isolate::AppKind::Native)
         }
     };
     let base = match (&v.kind, &v.exe) {
@@ -134,12 +132,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
     let timed = set != Set::Attribution && set != Set::Memory && x.pixels.is_none();
-    if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
-        return Err(Error::refused(
-            "DevBuild",
-            format!("{} imports {crt}, a debug C runtime: its timings describe no build people run", app.exe.display()),
-            "build the app optimized (strobe.json build: a release or profiling profile)",
-        ));
+    if timed {
+        dev_build(&app.exe)?;
     }
     // `Throttled`: there is no page to run the speed check in, so strobe runs a fixed workload of its
     // own on the target's CPUs before the launch, once the last block's app has left them quiet.
@@ -323,7 +317,7 @@ fn runs(
         shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
     }
     let procs0 = (host::now_ns(), host::all_processes());
-    let sampler = probe::os::Sampler::start(n.pid);
+    let sampler = probe::os::Sampler::start(n.pid, Some(n.home.clone()));
     let sampled = Instant::now();
     let mut cost = SelfCost::new(ctx.runner.pid());
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.

@@ -45,9 +45,14 @@ impl Raised {
     }
 }
 
+/// Puts the interval back only while it is still strobe's and no other strobe samples at it (that
+/// capture's weights assume 200 µs; it puts it back when it ends). An interval read while another
+/// strobe had raised it goes back to Windows' own.
 impl Drop for Raised {
     fn drop(&mut self) {
-        let _ = set_interval(self.0);
+        if interval() == Some(INTERVAL_100NS) && !session::sessions().iter().any(|n| n.starts_with("strobe-stacks-")) {
+            let _ = set_interval(if self.0 == INTERVAL_100NS { DEFAULT_100NS } else { self.0 });
+        }
     }
 }
 
@@ -90,8 +95,8 @@ impl Capture {
     }
 }
 
-/// After a dead strobe's sampled-stack session was stopped (`session::reap`): the interval it raised
-/// goes back to Windows' own, unless something else has changed it since.
+/// After a dead strobe's sampled-stack session was stopped and none remains (`session::reap`): the
+/// interval it raised goes back to Windows' own, unless something else has changed it since.
 pub fn reset_interval() {
     if interval() == Some(INTERVAL_100NS) {
         let _ = set_interval(DEFAULT_100NS);

@@ -128,8 +128,10 @@ written `0600` from their creation (`host::paths::write_owner_only`). Every file
 written whole or not at all: into a temporary file beside it, flushed to disk, then renamed over it
 (`host::paths::write_atomic`; on Windows a rename that a scanner holds up is tried again for about
 2.5 s). A file written in pieces (a trace streamed from the target, a heap snapshot) goes the same
-way (`host::paths::Atomic`, through `store::create`): an error midway leaves no file. Random ids and
-tokens come from the OS's random source (`host::paths::csprng_hex`).
+way (`host::paths::Atomic`, through `store::create`, `0600` like a secret: it holds the target's data
+verbatim): an error midway leaves no file. A recording that fails or is refused before its
+`meta.json` leaves no folder (`store::Draft`). Random ids and tokens come from the OS's random
+source (`host::paths::csprng_hex`).
 
 ```
 state.json          { "mcp_port", "helper", "engine", "last_calibration" }
@@ -217,7 +219,7 @@ ui/             embedded viewer and calibration assets
   `store`, and reads the trace it just took through `engine::query` while the page is still open (a
   census's allocators, a layout shift's moved elements: the rows name nodes only the live page can
   resolve). Only `engine` runs trace_processor; only `store` writes `experiments/` and
-  `recordings/` (`store::write_atomic`, `write_json`, `create` for streamed files, `discard`). They
+  `recordings/` (`store::write_atomic`, `write_json`, `create` for streamed files, `Draft`). They
   return `model` types.
 - One backend each until a second exists. No traits or plugin layers ahead of need.
 - Idiomatic Rust: `pub(crate)` by default, `cargo fmt`, `cargo clippy` clean.
@@ -2516,9 +2518,10 @@ As built (Linux and macOS): no helper process. Native stacks run in strobe's own
   prompts for it. Each thread's ring buffer is mapped; without CAP_IPC_LOCK the per-user
   `perf_event_mlock_kb` budget may force small buffers, and the kernel's lost-sample records go to
   `events_lost`. An inherited event cannot be mapped, so new threads are found every 50 ms instead.
-  One reader thread owns every ring: `stop` waits for it at most 60 s, and a capture dropped without
-  a stop (a failed block, an early error in a long-lived daemon) tells it to end and waits at most
-  2 s, so no sampling or perf event outlives the capture.
+  One reader thread owns every ring: `stop` lets it drain and unwind what the rings hold and waits
+  for it at most 60 s; a capture dropped without a stop (a failed block, an early error in a
+  long-lived daemon) tells it to end at once, without unwinding, and waits at most 2 s, so no
+  sampling or perf event outlives the capture.
 - **macOS**: the only sampler a user may run on their own processes without root or an entitlement
   is `/usr/bin/sample` (reading another task's threads takes a task port, which `task_for_pid` gives
   only to root, to entitled debuggers, and with Developer Mode enabled). Its samples are wall-clock
@@ -2552,24 +2555,32 @@ As built (Windows):
   it runs a copy of the helper; a server whose image cannot be read is refused too.
   Operations, one JSON line each way: `hello`, `presents.start`/`presents.stop` (every present and
   vertical blank, as JSON) and `stacks.start {root}`/`stacks.stop` (only for a process tree running
-  as the same user). A client that disconnects stops its sessions.
+  as the same user). A client that disconnects drops its sessions: they end without making their
+  result, and the profile interval goes back at once.
 - **Which helper.** Each build carries two ids from `build.rs`: `STROBE_BUILD_ID` (every source file)
   and `STROBE_HELPER_PROTOCOL` (the sources of the helper's operations and what they return,
-  `src/etw/`). The client's first request is `hello`, and it refuses a helper whose protocol id is
-  not its own ("the installed deep-mode helper is another build … run strobe up"): `strobe update`
-  or a build of another commit of the same version may have left an older copy installed. Builds
-  that changed other files keep using the installed helper. `up` replaces the installed copy when its
-  build id is not this build's, and `status` says when it is another build's.
-- **Native stacks**: a system logger session with the profile source at 200 µs (5 kHz, the
-  system-wide interval put back when the capture stops or is dropped, on any error), a stack walk on
-  every sample, image loads with the rundown of loaded images, and process starts, so children of
-  the target count from their first sample. Samples of other processes are dropped as they arrive; kernel and user parts of a stack
-  merge by timestamp and thread. The user's strobe adds thread names (`GetThreadDescription`) and
-  module lists the rundown missed. Recordings keep `deep.json.gz` (modules, unique stacks,
-  samples), symbolized on read (§12.2). A helper that dies while sampling (strobe aborts on a panic,
-  or `up` ends the task) leaves its session and the raised interval: the next session that starts
-  stops sessions of dead strobe processes, and after stopping a `strobe-stacks-<pid>` one puts the
-  interval back to Windows' own 1 ms when it is still strobe's 200 µs.
+  `src/etw/`, carriage returns left out so CRLF and LF checkouts agree). The client's first request
+  is `hello`, and it refuses a helper whose protocol id is not its own ("the installed deep-mode
+  helper is another build … run strobe up"): `strobe update` or a build of another commit of the
+  same version may have left an older copy installed. Builds that changed other files keep using the
+  installed helper. `up` replaces the installed copy when its build id is not this build's (it copies
+  the windowless `strobew` beside it only when that is this build too, else this executable), and
+  `status` says when it is another build's.
+- **Native stacks**: a system logger session with the profile source at 200 µs (5 kHz), a stack
+  walk on every sample, image loads with the rundown of loaded images, and process starts, so
+  children of the target count from their first sample. Samples of other processes are dropped as
+  they arrive; kernel and user parts of a stack merge by timestamp and thread. The user's strobe adds
+  thread names (`GetThreadDescription`) and module lists the rundown missed. Recordings keep
+  `deep.json.gz` (modules, unique stacks, samples), symbolized on read (§12.2).
+- **The system-wide interval** goes back when the capture stops or is dropped (on any error), after
+  its session stopped, and only while it is still strobe's 200 µs and no other strobe session
+  samples at it (that capture's samples count 200 µs each); one read while another strobe had raised
+  it goes back to Windows' own 1 ms. Sessions are named `strobe-<kind>-<pid>-<start time>`. A helper
+  that dies while sampling (strobe aborts on a panic, or `up` ends the task) leaves its session and
+  the raised interval: each session start first stops sessions whose process is gone (its pid runs
+  nothing, or a process that started at another time; a process this user may not open is left
+  alone), and once no `strobe-stacks-` session remains, puts the interval back to 1 ms when it is
+  still 200 µs, before raising it again.
 - **Why ETW first, not suspending threads from outside**: a non-elevated sampler stops each thread
   for tens of microseconds per sample (5 kHz across a dozen threads perturbs the target far more
   than an interrupt-time stack walk), can only sample threads it knows ran (biased toward threads
@@ -3357,8 +3368,9 @@ and its events (Linux), the X Present thread, and ScreenCaptureKit streams (a st
 included) and their queue (macOS); the helper and the runner's SDK are keyed by build; traces, heap
 snapshots, source maps, Perfetto traces and page snapshots are written whole or not at all through
 `store`. Checked on vps: a native `record` through `strobe mcp` whose app's output ended mid-run
-left one perf event and a `strobe-perf` thread in the process 20 s later before, none after; `record
-pid: --probes deep` sampled as before. On air (macOS 27, M4): Cocoa `ax.bench.ts --check` 8 of 8
+left one perf event and a `strobe-perf` thread in the process 20 s later before, none after, and
+left no recording folder (one, without `meta.json`, before); `record pid: --probes deep` sampled as
+before. On air (macOS 27, M4): Cocoa `ax.bench.ts --check` 8 of 8
 and an isolated native app's idle `--check` passed, each block making and dropping a capture, with
 no crash. On adais (locked, no helper): an attribution `record` of a page wrote its trace, heap
 snapshot and Perfetto trace with no temporary file left, `stacks-unprivileged` sampled, and a script

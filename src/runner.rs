@@ -22,7 +22,7 @@ pub fn sdk_dir() -> Result<PathBuf> {
     for (name, body) in [("index.ts", INDEX), ("runner.ts", RUNNER), ("preload.ts", PRELOAD), ("host.mjs", HOST)] {
         let p = dir.join(name);
         if std::fs::read_to_string(&p).ok().as_deref() != Some(body) {
-            std::fs::write(&p, body)?;
+            paths::write_atomic(&p, body.as_bytes())?;
         }
     }
     Ok(dir)

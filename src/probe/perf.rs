@@ -18,7 +18,7 @@ use framehop::{ExplicitModuleSectionInfo, Unwinder};
 use object::{Object, ObjectSection, ObjectSegment};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, Ordering};
 
 /// 1 ms of a thread's CPU time per sample (1 kHz): each sample carries a stack copy.
 pub const INTERVAL_NS: u64 = 1_000_000;
@@ -392,12 +392,16 @@ fn follow(root: u32, kernel: bool, rings: &mut Vec<Ring>, opened: &mut HashSet<u
 /// A running sampler: the reader thread drains every ring and unwinds as samples arrive. It owns
 /// the rings, so its end closes every perf event; a capture dropped without `stop` ends it too.
 pub struct Capture {
-    stop: Arc<AtomicBool>,
+    /// RUN, then STOP (drain the rings and make the result) or DROP (end at once, nothing kept).
+    state: Arc<AtomicU8>,
     thread: Option<std::thread::JoinHandle<Result<Deep>>>,
 }
 
 /// How long `stop` waits for the reader to unwind what the rings still hold and name the threads.
 const STOP_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+const RUN: u8 = 0;
+const STOP: u8 = 1;
+const DROP: u8 = 2;
 
 impl Capture {
     pub fn start(root: u32) -> Result<Capture> {
@@ -414,8 +418,8 @@ impl Capture {
         if let Err(e) = follow(root, kernel, &mut rings, &mut opened) {
             return Err(Error::msg(format!("perf_event_open: {e}")));
         }
-        let stop = Arc::new(AtomicBool::new(false));
-        let flag = stop.clone();
+        let state = Arc::new(AtomicU8::new(RUN));
+        let flag = state.clone();
         let t0 = crate::host::now_ns();
         let thread = std::thread::Builder::new()
             .name("strobe-perf".into())
@@ -428,7 +432,11 @@ impl Capture {
                 let mut seen_pids: HashSet<u32> = HashSet::new();
                 let mut followed = std::time::Instant::now();
                 loop {
-                    let done = flag.load(Ordering::Relaxed);
+                    let done = match flag.load(Ordering::Relaxed) {
+                        RUN => false,
+                        STOP => true,
+                        _ => return Err(Error::msg("the capture was dropped")),
+                    };
                     if followed.elapsed().as_millis() >= 50 {
                         let _ = follow(root, kernel, &mut rings, &mut opened);
                         followed = std::time::Instant::now();
@@ -439,6 +447,9 @@ impl Capture {
                         r.drain(kernel, &mut raw, &mut lost);
                     }
                     for r in raw.drain(..) {
+                        if flag.load(Ordering::Relaxed) == DROP {
+                            return Err(Error::msg("the capture was dropped"));
+                        }
                         let mut frames = r.kernel.clone();
                         frames.extend(unwind.frames(&r));
                         if frames.is_empty() {
@@ -478,19 +489,21 @@ impl Capture {
                 Ok(deep)
             })
             .map_err(|e| Error::msg(format!("start the sampler thread: {e}")))?;
-        Ok(Capture { stop, thread: Some(thread) })
+        Ok(Capture { state, thread: Some(thread) })
     }
 
     pub fn stop(mut self) -> Result<Deep> {
-        self.stop.store(true, Ordering::Relaxed);
+        self.state.store(STOP, Ordering::Relaxed);
         let thread = self.thread.take().ok_or_else(|| Error::msg("no sampler thread"))?;
         super::join_within(thread, STOP_WAIT).ok_or_else(|| Error::msg(format!("the sampler thread did not end within {} s", STOP_WAIT.as_secs())))?
     }
 }
 
+/// Dropped without `stop`: the reader ends at its next ring poll (10 ms) or sample, dropping the
+/// rings (every perf event and mapping) without unwinding what they still hold.
 impl Drop for Capture {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.state.store(DROP, Ordering::Relaxed);
         if let Some(t) = self.thread.take() {
             super::join_within(t, std::time::Duration::from_secs(2));
         }

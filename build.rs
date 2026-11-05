@@ -57,11 +57,13 @@ fn main() {
     println!("cargo:rustc-env=STROBE_BUILD_ID={h:016x}");
     // The deep-mode helper's protocol (`STROBE_HELPER_PROTOCOL`): a hash of the sources that make its
     // operations and what they return. A client refuses a helper that differs, while builds that
-    // changed only other files keep using the installed one.
+    // changed only other files keep using the installed one. Carriage returns do not count: a
+    // checkout with CRLF line ends (Windows CI) and one with LF are one protocol.
     let mut p = 0xcbf2_9ce4_8422_2325u64;
     for f in files.iter().filter(|f| HELPER_SOURCES.iter().any(|s| f.starts_with(s))) {
         fnv(&mut p, f.to_string_lossy().replace('\\', "/").as_bytes());
-        fnv(&mut p, &std::fs::read(f).unwrap_or_default());
+        let text: Vec<u8> = std::fs::read(f).unwrap_or_default().into_iter().filter(|b| *b != b'\r').collect();
+        fnv(&mut p, &text);
     }
     println!("cargo:rustc-env=STROBE_HELPER_PROTOCOL={p:016x}");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {

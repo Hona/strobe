@@ -38,7 +38,7 @@ const STACK_BYTES: usize = 64 << 10;
 
 pub struct Capture {
     stop: mpsc::Sender<()>,
-    thread: std::thread::JoinHandle<Result<Deep>>,
+    thread: Option<std::thread::JoinHandle<Result<Deep>>>,
 }
 
 impl Capture {
@@ -51,12 +51,23 @@ impl Capture {
         }
         let (stop, rx) = mpsc::channel();
         let thread = std::thread::Builder::new().name("strobe-stacks".into()).spawn(move || run(root, rx)).map_err(|e| Error::msg(format!("the stack sampler thread: {e}")))?;
-        Ok(Capture { stop, thread })
+        Ok(Capture { stop, thread: Some(thread) })
     }
 
-    pub fn stop(self) -> Result<Deep> {
+    pub fn stop(mut self) -> Result<Deep> {
         let _ = self.stop.send(());
-        self.thread.join().map_err(|_| Error::msg("the stack sampler thread panicked"))?
+        self.thread.take().ok_or_else(|| Error::msg("no stack sampler thread"))?.join().map_err(|_| Error::msg("the stack sampler thread panicked"))?
+    }
+}
+
+/// Dropped without `stop`: the sampler ends at its next 2 ms tick (never between a suspend and its
+/// resume), closing every thread and process handle, joined within 2 s.
+impl Drop for Capture {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(t) = self.thread.take() {
+            super::join_within(t, std::time::Duration::from_secs(2));
+        }
     }
 }
 

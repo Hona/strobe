@@ -50,7 +50,7 @@ pub fn run(args: &Args) -> Result<Output> {
 pub fn setup(skip: bool) -> (&'static str, String) {
     use crate::etw::helper;
     let a = crate::etw::access();
-    let current = a.helper && helper_current();
+    let current = a.helper && helper::helper_current();
     let grouped = a.token != "none" || a.pending_sign_out;
     if current && grouped {
         return ("✓", describe(&a));
@@ -74,13 +74,6 @@ pub fn setup(skip: bool) -> (&'static str, String) {
     }
 }
 
-/// Whether the installed helper is this build (`up` refreshes it otherwise): its build id, which
-/// tells two commits of one version apart.
-#[cfg(windows)]
-fn helper_current() -> bool {
-    super::mcp::file_build(&crate::etw::helper::helper_exe()).as_deref() == Some(super::mcp::build_id())
-}
-
 /// What this user can do today, for `up` and `status`.
 pub fn describe(a: &crate::etw::Access) -> String {
     let presents = match (a.token, a.pending_sign_out, a.helper) {
@@ -97,7 +90,7 @@ pub fn describe(a: &crate::etw::Access) -> String {
         (false, false) => "off (strobe up)",
     };
     #[cfg(windows)]
-    if a.helper && !helper_current() {
+    if a.helper && !crate::etw::helper::helper_current() {
         return format!("{presents} · native stacks {stacks} · the installed helper is another build: strobe up replaces it");
     }
     format!("{presents} · native stacks {stacks}")

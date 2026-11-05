@@ -125,6 +125,7 @@ impl Capture {
     /// Starts tracking presents in this process (needs admin or Performance Log Users). Buffers
     /// flush every 10 ms, so a wait on the next frame hears of it within a frame or two.
     pub fn start() -> Result<Capture> {
+        session::reap();
         let cfg = session::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256), flush_ms: 10 };
         let t0 = crate::host::now_ns();
         let armed = Arc::new(AtomicU64::new(0));

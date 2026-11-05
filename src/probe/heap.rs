@@ -27,7 +27,7 @@ pub fn snapshot(page: &Page, path: &Path) -> Result<u64> {
         let params = json!({ "reportProgress": false, "captureNumericValue": false, "exposeInternals": false });
         let _ = done_tx.send(p.cdp.send_timeout("HeapProfiler.takeHeapSnapshot", params, Some(&p.session), Duration::from_secs(1800)));
     });
-    let mut out = GzEncoder::new(std::io::BufWriter::with_capacity(1 << 20, crate::store::create_owner_only(path)?), Compression::fast());
+    let mut out = GzEncoder::new(std::io::BufWriter::with_capacity(1 << 20, crate::store::create(path)?), Compression::fast());
     loop {
         match events.recv_timeout(Duration::from_millis(100)) {
             Ok(ev) => chunk(&mut out, &ev, &page.session)?,

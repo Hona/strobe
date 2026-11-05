@@ -150,12 +150,13 @@ pub fn run(args: &Args) -> Result<Output> {
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
     let dir = store::recording_dir(&id)?;
+    let draft = store::Draft::new(&dir);
     if set == Set::Memory {
         let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
-            store::discard(&dir);
             return Err(validity::locked());
         }
+        draft.keep();
         if !attach {
             browser.close();
         }
@@ -186,7 +187,6 @@ pub fn run(args: &Args) -> Result<Output> {
     let tree = host::tree_pids(browser.pid);
     let os_frames = os_frames.map(|r| r.and_then(|c| c.stop()));
     if on_screen && (awake.locks() > 0 || host::session_locked()) {
-        store::discard(&dir);
         return Err(validity::locked());
     }
     if set == Set::Attribution {
@@ -248,6 +248,7 @@ pub fn run(args: &Args) -> Result<Output> {
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
+    draft.keep();
     Ok(Output::new(summary_text(&meta), meta))
 }
 
@@ -321,6 +322,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let awake = host::Awake::start();
         let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
         let dir = store::recording_dir(&id)?;
+        let draft = store::Draft::new(&dir);
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
         let presents = (set != Set::Attribution && !windowless).then(|| {
@@ -365,7 +367,6 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
         let session_locked = awake.locks() > 0 || host::session_locked();
         if session_locked && !windowless {
-            store::discard(&dir);
             return Err(validity::locked());
         }
         if !windowless {
@@ -458,6 +459,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         }
         refuse_background(&mut meta, qos.clone());
         store::write_json(&dir.join("meta.json"), &meta)?;
+        draft.keep();
         Ok(meta)
     })();
     n.close(true);

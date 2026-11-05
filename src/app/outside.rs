@@ -53,6 +53,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let awake = host::Awake::start();
     let id = args.get("id").filter(|i| i.starts_with("rec_")).map(str::to_string).unwrap_or_else(|| store::new_id("rec"));
     let dir = store::recording_dir(&id)?;
+    let draft = store::Draft::new(&dir);
     // The lock screen covers every window: nothing reaches the display and presents stop. Stacks,
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
@@ -72,6 +73,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
             "timing": "perturbed", "created": super::record::now_iso(), "valid": true, "suspend": d.suspend,
         });
         store::write_json(&dir.join("meta.json"), &meta)?;
+        draft.keep();
         let text = format!(
             "{id} · {target} ({name}) · {} · deep\n{top}next     strobe query {id} hotspots --by package · strobe query {id} hotspots --thread <name> · strobe report recording {id} --open\n",
             fmt::ms_duration(for_ms)
@@ -185,6 +187,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })), "threads_top": threads_top,
     });
     store::write_json(&dir.join("meta.json"), &meta)?;
+    draft.keep();
     Ok(Output::new(super::record::summary_text(&meta), meta))
 }
 

@@ -188,11 +188,19 @@ impl Hidden for std::process::Command {
     }
 }
 
-/// The binary the helper runs: the windowless build beside this one, so the task opens no console.
+/// The binary the helper runs: the windowless build beside this one, so the task opens no console,
+/// when it is this build (a `cargo build --bin strobe` leaves an older one there); else this one.
 fn source_exe() -> Option<PathBuf> {
+    use crate::host::build::{build_id, file_build};
     let me = std::env::current_exe().ok()?;
     let w = me.with_file_name("strobew.exe");
-    Some(if w.is_file() { w } else { me })
+    Some(if file_build(&w).as_deref() == Some(build_id()) { w } else { me })
+}
+
+/// Whether the installed helper is this build (`up` replaces it otherwise): its build id, which
+/// tells two commits of one version apart.
+pub fn helper_current() -> bool {
+    crate::host::build::file_build(&helper_exe()).as_deref() == Some(crate::host::build::build_id())
 }
 
 /// Runs this binary elevated with `args` (one UAC prompt) and waits; returns its exit code.
@@ -423,13 +431,11 @@ impl Conn {
         }
     }
 
+    /// The client went: its sessions are dropped, not stopped (nobody reads their events), so the
+    /// profile interval goes back at once.
     fn close(&mut self) {
-        if let Some(c) = self.presents.take() {
-            let _ = c.stop();
-        }
-        if let Some(c) = self.stacks.take() {
-            let _ = c.stop();
-        }
+        self.presents = None;
+        self.stacks = None;
     }
 }
 

@@ -61,8 +61,8 @@ pub fn recording_dir(id: &str) -> Result<PathBuf> {
     Ok(dir)
 }
 
-/// Removes a recording that was refused (a locked session): none of it is kept.
-pub fn discard(dir: &Path) {
+/// Removes an unfinished recording (`Draft`): none of it is kept.
+fn discard(dir: &Path) {
     if dir.parent().is_some_and(|p| p == paths::recordings() || p == paths::experiments()) {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -80,16 +80,33 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     paths::write_atomic(path, bytes).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
 }
 
-/// A file of a recording written in pieces (a trace streamed from the target), whole or not at all:
-/// it appears at `path` only on `commit` (`host::paths::Atomic`).
+/// A file of a recording written in pieces (a trace or a heap snapshot streamed from the target),
+/// whole or not at all: it appears at `path` only on `commit` (`host::paths::Atomic`). What it holds
+/// is the target's data verbatim (SPEC rule 9), so only its owner may read it, from its creation.
 pub fn create(path: &Path) -> Result<paths::Atomic> {
-    paths::Atomic::create(path, 0o644).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
+    paths::Atomic::create(path, 0o600).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
 }
 
-/// `create` for what holds the target's data verbatim (a heap snapshot, SPEC rule 9): only its owner
-/// may read it, from its creation.
-pub fn create_owner_only(path: &Path) -> Result<paths::Atomic> {
-    paths::Atomic::create(path, 0o600).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
+/// A recording's folder until it is complete: dropped before `keep` (an error, a refusal), the folder
+/// and all it holds go, so no recording is left without its `meta.json`.
+pub struct Draft(Option<PathBuf>);
+
+impl Draft {
+    pub fn new(dir: &Path) -> Draft {
+        Draft(Some(dir.to_path_buf()))
+    }
+
+    pub fn keep(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Draft {
+    fn drop(&mut self) {
+        if let Some(dir) = self.0.take() {
+            discard(&dir);
+        }
+    }
 }
 
 pub fn write_json(path: &Path, value: &Value) -> Result<()> {

@@ -58,7 +58,10 @@ pub trait Handler {
 pub struct Running<O> {
     handle: CONTROLTRACE_HANDLE,
     name: Vec<u16>,
-    thread: Option<std::thread::JoinHandle<(O, u64)>>,
+    /// The consumer: its handler's result and its CPU cycles, None when the session was dropped.
+    thread: Option<std::thread::JoinHandle<Option<(O, u64)>>>,
+    /// Set by a drop: the consumer returns without making its result.
+    abandon: std::sync::Arc<std::sync::atomic::AtomicBool>,
     tsc0: Option<u64>,
     ns0: u64,
     pub events: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -130,19 +133,49 @@ pub fn sessions() -> Vec<String> {
         .collect()
 }
 
-/// Stops `strobe-<kind>-<pid>` sessions whose process is gone (a crash or a kill mid-recording),
-/// and puts back the profile interval a sampled-stack one raised.
+/// `strobe-<kind>-<pid>-<start>`: the process that runs the session, named by its pid and its start
+/// time, so a pid that was reused does not keep a dead strobe's session alive.
+fn session_name(kind: &str) -> String {
+    let pid = std::process::id();
+    format!("strobe-{kind}-{pid}-{}", crate::host::start_time(pid).unwrap_or(0))
+}
+
+/// (kind, pid, start time) of a strobe session's name; no start time in names before it had one.
+fn parse_name(name: &str) -> Option<(&str, u32, Option<u64>)> {
+    let rest = name.strip_prefix("strobe-")?;
+    let mut parts = rest.rsplitn(3, '-');
+    let (a, b, c) = (parts.next()?, parts.next()?, parts.next());
+    match c {
+        Some(kind) if b.parse::<u32>().is_ok() => Some((kind, b.parse().ok()?, Some(a.parse().ok()?))),
+        _ => Some((b, a.parse().ok()?, None)),
+    }
+}
+
+/// Stops strobe's sessions whose process is gone (a crash, a kill mid-recording, a helper `up`
+/// ended): its pid runs no process, or one that started at another time. A process this user may
+/// not open (another user's strobe) is left alone. Once no sampled-stack session remains, the
+/// profile interval a dead one raised goes back. Called once before a session starts.
 pub fn reap() {
+    let live: std::collections::HashSet<u32> = crate::host::all_processes().iter().map(|p| p.pid).collect();
+    let mut stacks = false;
     for name in sessions() {
-        let Some(pid) = name.strip_prefix("strobe-").and_then(|r| r.rsplit('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
-        if crate::host::win::exe_of(pid).is_none() && stop_named(&name) && name.starts_with("strobe-stacks-") {
-            super::stacks::reset_interval();
+        let Some((kind, pid, start)) = parse_name(&name) else { continue };
+        let gone = !live.contains(&pid)
+            || match start {
+                Some(s) => crate::host::start_time(pid).is_some_and(|now| now != s),
+                None => crate::host::exe_of(pid).is_some_and(|e| !e.file_stem().is_some_and(|s| s.to_string_lossy().starts_with("strobe"))),
+            };
+        if gone && stop_named(&name) {
+            stacks |= kind == "stacks";
         }
+    }
+    if stacks && !sessions().iter().any(|n| n.starts_with("strobe-stacks-")) {
+        super::stacks::reset_interval();
     }
 }
 
 pub struct Config {
-    /// `strobe-<kind>-<pid>`.
+    /// `strobe-<kind>-<pid>-<start>`.
     pub kind: &'static str,
     /// Kernel flags (`EVENT_TRACE_FLAG_*`): a system logger session when nonzero.
     pub kernel: u32,
@@ -156,14 +189,13 @@ pub struct Config {
 impl<O: Send + 'static> Running<O> {
     /// Starts the session, connects the consumer (a thread that owns the handler `make` builds),
     /// calls `setup` with the session handle (stack walking, the profile interval), then enables
-    /// the providers.
+    /// the providers. The caller reaps dead strobes' sessions first (`reap`).
     pub fn start<H, F>(cfg: Config, setup: impl FnOnce(CONTROLTRACE_HANDLE) -> Result<()>, make: F) -> Result<Running<O>>
     where
         H: Handler<Out = O>,
         F: FnOnce() -> H + Send + 'static,
     {
-        reap();
-        let name_text = format!("strobe-{}-{}", cfg.kind, std::process::id());
+        let name_text = session_name(cfg.kind);
         let name = wide(&name_text);
         let mut buf = props(&name);
         let p = buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES;
@@ -202,6 +234,8 @@ impl<O: Send + 'static> Running<O> {
         let (ready, ready_rx) = std::sync::mpsc::channel::<std::result::Result<(), u32>>();
         let consumer_name = name.clone();
         let counter = events.clone();
+        let abandon = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abandoned = abandon.clone();
         let thread = std::thread::Builder::new()
             .name("strobe-etw".into())
             .spawn(move || {
@@ -227,18 +261,21 @@ impl<O: Send + 'static> Running<O> {
                 let trace = unsafe { OpenTraceW(&mut log) };
                 if trace.Value == u64::MAX {
                     let _ = ready.send(Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0) as u32));
-                    return (ctx.h.finish(), 0);
+                    return None;
                 }
                 let _ = ready.send(Ok(()));
                 unsafe {
                     ProcessTrace(&trace, 1, std::ptr::null(), std::ptr::null());
                     CloseTrace(trace);
                 }
+                if abandoned.load(std::sync::atomic::Ordering::Relaxed) {
+                    return None;
+                }
                 let spent = crate::host::thread_cycles().saturating_sub(k0);
-                (ctx.h.finish(), spent)
+                Some((ctx.h.finish(), spent))
             })
             .map_err(|e| Error::msg(format!("spawn the ETW consumer: {e}")))?;
-        let mut running = Running { handle, name, thread: Some(thread), tsc0: crate::host::tsc(), ns0: crate::host::now_ns(), events };
+        let mut running = Running { handle, name, thread: Some(thread), abandon, tsc0: crate::host::tsc(), ns0: crate::host::now_ns(), events };
         match ready_rx.recv() {
             Ok(Ok(())) => {}
             Ok(Err(rc)) => {
@@ -281,7 +318,7 @@ impl<O: Send + 'static> Running<O> {
     /// Stops the session; the consumer delivers what the buffers still hold, then returns.
     pub fn stop(mut self) -> Result<(O, Stats)> {
         let mut stats = self.stop_session();
-        let (out, cycles) = self.thread.take().and_then(|t| t.join().ok()).ok_or_else(|| Error::msg("the ETW consumer panicked"))?;
+        let (out, cycles) = self.thread.take().and_then(|t| t.join().ok().flatten()).ok_or_else(|| Error::msg("the ETW consumer ended without its events"))?;
         let hz = self.tsc0.zip(crate::host::tsc()).map(|(a, b)| (b - a) as f64 / ((crate::host::now_ns() - self.ns0) as f64 / 1e9)).filter(|hz| *hz > 0.0);
         stats.consumer_cpu_ms = hz.filter(|_| cycles > 0).map(|hz| cycles as f64 / hz * 1e3);
         stats.events = self.events.load(std::sync::atomic::Ordering::Relaxed);
@@ -289,13 +326,17 @@ impl<O: Send + 'static> Running<O> {
     }
 }
 
+/// Dropped without `stop` (an error, a client gone): the session stops, and the consumer returns
+/// without making its result (a sampled-stack one would read every driver's image), joined within 2 s.
 impl<O> Drop for Running<O> {
     fn drop(&mut self) {
-        if self.thread.is_some() {
+        if let Some(t) = self.thread.take() {
+            self.abandon.store(true, std::sync::atomic::Ordering::Relaxed);
             let mut p = props(&self.name);
             unsafe {
                 ControlTraceW(self.handle, std::ptr::null(), p.as_mut_ptr() as *mut _, CONTROL_STOP);
             }
+            crate::probe::join_within(t, std::time::Duration::from_secs(2));
         }
     }
 }

@@ -461,9 +461,16 @@ mod imp {
             Ok(self.snapshot(None)?.nodes.len())
         }
 
-        /// The app's windows' tree now, main first (what a run starts from: `ResetIncomplete`).
-        pub fn tree(&self) -> Result<Tree> {
-            self.snapshot(None)
+        /// The app's windows' tree now, main first (what a run starts from: `ResetIncomplete`), and the
+        /// count of changes the app had announced when it was read.
+        pub fn tree(&self) -> Result<(Tree, u64)> {
+            let seen = self.a11y.changes().count;
+            Ok((self.snapshot(None)?, seen))
+        }
+
+        /// Waits until the app announces a change after the `seen`th, or `t` passes.
+        pub fn wait_change(&self, seen: u64, t: Duration) {
+            self.a11y.wait_change(seen, Instant::now() + t);
         }
 
         /// Before an input that is measured: at least `min`, then until the app has presented

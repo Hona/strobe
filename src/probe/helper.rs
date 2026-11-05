@@ -414,15 +414,18 @@ impl Conn {
                 Ok(json!({ "ok": c.stop()? }))
             }
             "stacks.start" => {
+                // The target's root and the rest of its process set (what left its tree: a detached
+                // service): only those running as this user are sampled.
                 let root = req["root"].as_u64().ok_or_else(|| Error::msg("stacks.start needs root"))? as u32;
-                if !owned_by(root, sid) {
-                    return Err(Error::msg(format!("process {root} does not run as this user")));
+                let asked = std::iter::once(root).chain(req["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)));
+                let mut roots: Vec<u32> = asked.filter(|&p| owned_by(p, sid)).collect();
+                roots.sort_unstable();
+                roots.dedup();
+                if roots.is_empty() {
+                    return Err(Error::msg(format!("no process of the target (root {root}) runs as this user")));
                 }
-                // The rest of the target's process set (what left its tree: a detached service), as
-                // far as it runs as this user too.
-                let more: Vec<u32> = req["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).filter(|&p| p != root && owned_by(p, sid)).collect();
                 if self.stacks.is_none() {
-                    self.stacks = Some(super::kernel_profile::Capture::start(root, &more)?);
+                    self.stacks = Some(super::kernel_profile::Capture::start(&roots)?);
                 }
                 Ok(json!({ "ok": {} }))
             }

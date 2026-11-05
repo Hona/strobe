@@ -6,13 +6,18 @@ use std::path::{Path, PathBuf};
 /// The state folder, created user-only (`0700` on Linux and macOS; `%LOCALAPPDATA%` is the user's
 /// own on Windows). Traces and heap snapshots in it can hold what the target showed (SPEC rule 9).
 pub fn state_dir() -> PathBuf {
-    let dir = if cfg!(windows) {
+    let dir = state_path();
+    owner_only_dir(&dir);
+    dir
+}
+
+/// Where the state folder is, without making it or changing its mode (a read-only command's).
+pub fn state_path() -> PathBuf {
+    if cfg!(windows) {
         std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(super::home).join("strobe")
     } else {
         std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| super::home().join(".local/share")).join("strobe")
-    };
-    owner_only_dir(&dir);
-    dir
+    }
 }
 
 pub fn sub(name: &str) -> PathBuf {

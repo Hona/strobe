@@ -509,6 +509,11 @@ impl Samples {
                 }
             }
             s.gpu_unreadable_pids = self.gpu_unreadable.clone();
+            // A process whose GPU statistics could not be opened would count as none: no sums then
+            // (the metric is refused, never a partial 0).
+            if !self.gpu_unreadable.is_empty() {
+                (s.gpu_3d_pct, s.vram_dedicated_mb, s.vram_shared_mb) = (None, None, None);
+            }
         }
         let device = match primary {
             Some(p) => self.devices.iter().position(|d| d.adapter == Some(p)),

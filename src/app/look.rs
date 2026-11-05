@@ -19,6 +19,8 @@ pub(super) fn address(target: &str) -> String {
         let abs = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
         let s = abs.display().to_string().replace('\\', "/");
         let s = s.trim_start_matches("//?/");
+        // A path's own `%`, spaces, `?` and `#` are not a URL's: escaped, they stay part of the path.
+        let s = &s.replace('%', "%25").replace(' ', "%20").replace('?', "%3F").replace('#', "%23");
         return if s.starts_with('/') { format!("file://{s}") } else { format!("file:///{s}") };
     }
     target.to_string()

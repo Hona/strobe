@@ -98,7 +98,10 @@
         "NoPhase",
         "NoInput",
         "NoSpan",
-        "NoCounter"
+        "NoCounter",
+        "NotOnThisOs",
+        "NotForTarget",
+        "ResetIncomplete"
       ]
     },
     "verdictKind": {

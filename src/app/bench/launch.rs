@@ -833,8 +833,8 @@ fn node_timing(port: u16) -> Result<Vec<(String, f64)>> {
 /// The attribution launch's profiles as a recording: the page's (`cpu-0`) and the main process's
 /// (`cpu-main`), both from their first statement.
 fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, started: &Started, values: &BTreeMap<String, f64>) -> Result<String> {
-    let (id, dir) = store::new_recording()?;
-    let draft = store::Draft::new(&dir);
+    let (id, draft) = store::new_recording()?;
+    let dir = draft.dir().to_path_buf();
     let renderer = probe::cpu::stop(page)?;
     store::write_json(&dir.join("cpu-0.cpuprofile"), &renderer)?;
     let mut scripts = std::collections::BTreeSet::new();

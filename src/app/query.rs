@@ -1655,8 +1655,8 @@ pub fn import(path: &str) -> Result<Output> {
     if !src.exists() {
         return Err(Error::usage(format!("{path} does not exist")));
     }
-    let id = store::new_id("rec");
-    let dir = store::recording_dir(&id)?;
+    let (id, draft) = store::new_recording()?;
+    let dir = draft.dir().to_path_buf();
     let mut kinds = Vec::new();
     let copy = |from: &Path, name: &str| -> Result<()> { std::fs::copy(from, dir.join(name)).map(|_| ()).map_err(Error::from) };
     if src.is_dir() {
@@ -1687,6 +1687,7 @@ pub fn import(path: &str) -> Result<Output> {
     }
     let meta = json!({ "id": id, "kind": "import", "target": format!("file:{path}"), "probes": "import", "token": "", "valid": "unknown", "files": kinds, "values": {}, "duration_ms": 0, "created": super::record::now_iso() });
     store::write_json(&dir.join("meta.json"), &meta)?;
+    draft.keep();
     let text = format!(
         "{id} · imported {} · valid: unknown (nothing proves how it was taken)\nnext     strobe query {id} sql \"select name, count(*) from slice group by 1 order by 2 desc limit 20\"\n",
         path

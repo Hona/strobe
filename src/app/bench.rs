@@ -113,6 +113,8 @@ struct Series {
     primary: String,
     metrics: Vec<String>,
     reset: bool,
+    /// Whether every run must start from the same state (`ResetIncomplete`); the case's `resetCheck`.
+    reset_check: bool,
     /// A launch case's `launch` spec (`until`, `milestones`, `before`, …); null for a run case.
     launch: Value,
     /// The case's `timeout` (ms) for a run or reset, when it sets one.
@@ -3178,7 +3180,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // A counter block traces nothing: its times are dropped, and tracing would add the browser's
         // own instructions to what the counters count.
         let tracing = if set == Set::Memory || x.counters { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
-        let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
+        // A kept recording is claimed for this block alone and discarded on any error before its meta.json.
+        let mut draft: Option<store::Draft> = None;
+        let mem_dir = if set == Set::Memory { Some(draft.insert(store::claim_recording(&id)?).dir().to_path_buf()) } else { None };
         // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
@@ -3224,7 +3228,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             };
             let mut roles = process_roles(&browser);
             let listed = probe::wakes::wall_us();
-            let (procs_start, cyc0, tsc0, cpu0) = read();
+            let (procs_start, cyc0, tsc0, _) = read();
             let k0 = probe::wakes::Counters::take(listed, &procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
             *carried.borrow_mut() = [0.0; 6];
             if !counted.is_empty() {
@@ -3280,7 +3284,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // No process readings (an OS without a process sampler yet): unknown, never 0%.
                 _ if cyc1 == 0 && cpu1 == 0 => f64::NAN,
                 (Some(a), Some(b)) if b > a && cyc0 > 0 => 100.0 * cyc1.saturating_sub(cyc0) as f64 / (b - a) as f64,
-                _ if wall > 0.0 => 100.0 * cpu1.saturating_sub(cpu0) as f64 / wall,
+                // Never from process times, which move in 15.6 ms ticks on Windows (Windows on Arm, whose
+                // cycle counters strobe does not convert yet, is refused instead).
                 _ => f64::NAN,
             };
             let carry = *carried.borrow();
@@ -3301,11 +3306,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut runs: Vec<Run> = Vec::new();
         let mut nodes_all = Vec::new();
         let mut warmup = block::Warmup::new(x);
-        let mut starts = shown::Starts::new(set);
+        let mut starts = shown::Starts::new(s, x);
+        let read_start = || shown::page_start(&page);
+        let wait_start = |t: Duration| {
+            let _ = crate::driver::wait_change(&page, t);
+        };
         while warmup.more(runs.len()) {
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
-            starts.check(i + 1, false, &|| shown::page_start(&page))?;
+            starts.check(i + 1, false, &read_start, &wait_start)?;
             runs.push(run_once(&format!("run:{i}"))?);
             if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
@@ -3342,7 +3351,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 }
             }
         }
-        starts.check(runs.len() + 1, true, &|| shown::page_start(&page))?;
+        starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
         let unsteady = warmup.unsteady();
         let first = warmup.first().unwrap_or(0);
         // Warmup and measured runs interleave with the steadiness check: split the loop by run.
@@ -3389,7 +3398,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
-        let dir = if keep || set == Set::Memory { store::recording_dir(&id)? } else { host::paths::run().join(&id) };
+        let dir = match (&draft, keep) {
+            (Some(d), _) => d.dir().to_path_buf(),
+            (None, true) => draft.insert(store::claim_recording(&id)?).dir().to_path_buf(),
+            (None, false) => host::paths::run().join(&id),
+        };
         std::fs::create_dir_all(&dir)?;
         let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
         if set == Set::Attribution {
@@ -3581,11 +3594,22 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 meta["leak"] = json!({ "js_heap": l["js_heap"], "dom_nodes": l["dom_nodes"], "runs": l["runs"] });
             }
             store::write_json(&dir.join("meta.json"), &meta)?;
+            if let Some(d) = draft.take() {
+                d.keep();
+            }
             Some(id)
         } else {
             let _ = std::fs::remove_dir_all(&dir);
             None
         };
+        // CPU this OS gives strobe no time for (Windows on Arm) is refused, as `record` refuses it.
+        let mut refused = uncounted;
+        for m in ["cpu.app.total", "cpu.process.total"] {
+            if let Some(r) = super::outside::not_on_this_os(m).filter(|_| declared_metrics(s).iter().any(|d| d.as_str() == m)) {
+                values.remove(m);
+                refused.insert(m.to_string(), r);
+            }
+        }
         Ok(Block {
             variant: v.role.to_string(),
             pair,
@@ -3601,7 +3625,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             steps: steps.borrow().clone(),
             background,
             leak,
-            refused: uncounted,
+            refused,
             locked: false,
             display: None,
             screen: Some(screen),
@@ -3912,6 +3936,7 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
                     noworse: noworse.clone(),
                     metrics: c["metrics"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default(),
                     reset: c["reset"].as_bool().unwrap_or(false),
+                    reset_check: c["resetCheck"] != false,
                     launch: c["launch"].clone(),
                     timeout: c["timeout"].as_u64(),
                     gpu_cache: c["gpuCache"].as_str().map(str::to_string),

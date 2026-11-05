@@ -81,6 +81,10 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         let help = crate::cli::help(&args.command);
         return Ok(Output::new(help.clone(), json!({ "help": help })));
     }
+    // Strictly read-only: it puts nothing back and makes no state folder.
+    if args.command == "config" {
+        return config::run(args);
+    }
     // A strobe killed mid-run left the user on its power plan: put theirs back first.
     crate::host::power::restore_stale();
     // And the CPU sets of processes it moved off a timed block's CPUs (`--reserve-cpus`).
@@ -93,7 +97,6 @@ pub fn dispatch(args: &Args) -> Result<Output> {
         "report" => report::run(args),
         "open" => open::run(args),
         "look" => look::run(args),
-        "config" => config::run(args),
         "run" => run::run(args),
         "status" => status::run(args),
         "top" => top::run(args),

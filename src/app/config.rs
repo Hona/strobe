@@ -11,13 +11,14 @@ use serde_json::json;
 use std::path::PathBuf;
 
 pub fn run(args: &Args) -> Result<Output> {
-    let dir = match args.pos.first() {
-        Some(d) => PathBuf::from(d),
-        None => std::env::current_dir()?,
+    let dir = match args.pos.as_slice() {
+        [] => std::env::current_dir()?,
+        [d] => PathBuf::from(d),
+        [_, extra, ..] => return Err(Error::usage(format!("config takes one folder at most, not also {extra}"))),
     };
     let root = crate::config::project_root(&dir);
     let project = root.join("strobe.json");
-    let user = crate::host::paths::state_dir().join("strobe.json");
+    let user = crate::host::paths::state_path().join("strobe.json");
     let config = crate::config::load(&root)?;
     let mut text = String::new();
     let found = |p: &PathBuf| if p.is_file() { p.display().to_string() } else { format!("{} (none)", p.display()) };
@@ -43,14 +44,20 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let build = isolate::build_for_os(&config["build"]);
     if let Some(cmd) = build["command"].as_str() {
-        text += &format!("build    {cmd}{}\n", isolate::per_os(&build["output"]).map(|o| format!(" → {o}")).unwrap_or_default());
+        // An output given per OS that names none for this OS leaves a build here with nothing to launch.
+        if build["output"].is_object() && isolate::per_os(&build["output"]).is_none() {
+            failed += 1;
+            text += &format!("build    {cmd} · output names no path for {}: a variant built here has nothing to launch\n", isolate::os());
+        } else {
+            text += &format!("build    {cmd}{}\n", isolate::per_os(&build["output"]).map(|o| format!(" → {o}")).unwrap_or_default());
+        }
     }
     if let Some(cmd) = config["serve"]["command"].as_str() {
         text += &format!("serve    {cmd}\n");
     }
     let out = json!({ "project": project, "user": user, "root": root, "apps": apps, "build": build, "serve": config["serve"], "ok": failed == 0 });
     if failed > 0 {
-        return Err(Error::usage(format!("{text}{failed} app profile{} cannot be used on this machine", if failed == 1 { "" } else { "s" })));
+        return Err(Error::usage(format!("{text}{failed} problem{} for this machine", if failed == 1 { "" } else { "s" })));
     }
     text += "ok       strobe.json reads as strobe reads it\n";
     Ok(Output::new(text, out))

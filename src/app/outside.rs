@@ -27,35 +27,47 @@ pub fn not_on_this_os(metric: &str) -> Option<Refusal> {
         "ui.wakes" if mac => "macOS counts context switches per process, not per thread (no public per-thread count): cpu.wakes has the process's",
         "cpu.foreign" | "cpu.foreign.max" if mac => "macOS has no CPU affinity, so no CPUs are the target's own to measure other work on",
         "cpu.work" | "cpu.app.total" | "cpu.process.total" if cfg!(all(windows, not(target_arch = "x86_64"))) => {
-            "Windows on Arm: process CPU comes as cycles, and strobe has no time stamp counter to turn them into time"
+            "Windows on Arm: strobe reads process CPU as cycles there and does not yet convert ARM64 cycle counts into time (process times move in 15.6 ms ticks, too coarse to use)"
         }
         _ => return None,
     };
     Some(Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why}")))
 }
 
-/// Why the GPU fields are empty when the OS sampler opened no per-process GPU source.
-pub fn gpu_unread(metric: &str) -> Refusal {
-    let why = if cfg!(windows) {
-        "the GPU's per-process statistics (D3DKMT) did not open"
+/// Whether the OS sampler read the GPU of every process it followed: its per-process source opened and
+/// no process's statistics were unreadable (otherwise the GPU fields are empty, never a partial sum).
+pub fn gpu_read(s: &probe::os::Samples) -> bool {
+    s.gpu_available && s.gpu_unreadable.is_empty()
+}
+
+/// Why the GPU fields are empty: the per-process source did not open, or some processes' statistics
+/// could not be read (`unreadable`).
+pub fn gpu_unread(metric: &str, unreadable: &[u32]) -> Refusal {
+    let source = if cfg!(windows) {
+        "the GPU's per-process statistics (D3DKMT)"
     } else if cfg!(target_os = "macos") {
-        "the GPU's per-client statistics (IOAccelerator) did not open"
+        "the GPU's per-client statistics (IOAccelerator)"
     } else {
-        "the GPU driver publishes no per-client statistics (DRM fdinfo; NVIDIA's proprietary driver and virtual GPUs have none)"
+        "the GPU driver's per-client statistics (DRM fdinfo; NVIDIA's proprietary driver and virtual GPUs publish none)"
+    };
+    let why = match unreadable {
+        [] => format!("{source} did not open"),
+        pids => format!("{source} of processes {} could not be read, so a sum would leave them out", pids.iter().map(u32::to_string).collect::<Vec<_>>().join(", ")),
     };
     Refusal::new(ValidatorId::NotOnThisOs, format!("{metric}: {why}"))
 }
 
 /// The refusals (`<validator>: <why>`) of what a process recording on this OS cannot hold, for its
-/// meta and summary: a missing number is never shown as if nothing were there.
-pub fn os_refusals(has: &dyn Fn(&str) -> bool, gpu: bool) -> serde_json::Map<String, Value> {
+/// meta and summary: a missing number is never shown as if nothing were there. `gpu`: None when the
+/// sampler read every process's GPU, else the processes it could not read.
+pub fn os_refusals(has: &dyn Fn(&str) -> bool, gpu: Option<&[u32]>) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
-    for m in ["gpu.process.3d", "gpu.vram", "gpu.shared", "memory.app.host", "ui.wakes"] {
+    for m in ["cpu.work", "cpu.app.total", "gpu.process.3d", "gpu.vram", "gpu.shared", "memory.app.host", "ui.wakes"] {
         // A UI thread's wakes are missing only beside its CPU: without a window it has neither.
         if has(m) || (m == "ui.wakes" && !has("ui.cpu")) {
             continue;
         }
-        let r = not_on_this_os(m).or_else(|| (!gpu && m.starts_with("gpu.")).then(|| gpu_unread(m)));
+        let r = not_on_this_os(m).or_else(|| gpu.filter(|_| m.starts_with("gpu.")).map(|u| gpu_unread(m, u)));
         if let Some(r) = r {
             out.insert(m.into(), json!(r.message()));
         }
@@ -100,8 +112,8 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         None => 10_000,
     };
     let awake = host::Awake::start();
-    let (id, dir) = super::record::claim(args)?;
-    let draft = store::Draft::new(&dir);
+    let (id, draft) = super::record::claim(args)?;
+    let dir = draft.dir().to_path_buf();
     // The lock screen covers every window: nothing reaches the display and presents stop. Stacks,
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
@@ -138,7 +150,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     });
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
     let sampler = probe::os::Sampler::start(root);
-    let cycles = || set().iter().map(|p| p.cycles).sum::<u64>();
+    let cycles = || super::record::per_process(&set());
     // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
     let snap0 = wakes::Snapshot::take(&pids_now());
     let timeline = wakes::Timeline::start(pids_now);
@@ -154,7 +166,9 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let tree = set();
     let pids: Vec<u32> = tree.iter().map(|p| p.pid).collect();
     let span = wakes::span(&snap0, &wakes::Snapshot::take(&pids));
-    let os = sampler.stop().window(t0, t1);
+    let samples = sampler.stop();
+    let gpu_missing = (!gpu_read(&samples)).then(|| samples.gpu_unreadable.clone());
+    let os = samples.window(t0, t1);
     let presents = presents.and_then(|p| p.stop());
     let session_locked = locked(&awake);
     let ms = (t1 - t0) as f64 / 1e6;
@@ -162,8 +176,9 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     if let (Some(a), Some(b)) = (tsc0, tsc1)
         && b > a
     {
-        values.insert("cpu.app.total".into(), 100.0 * c1.saturating_sub(c0) as f64 / (b - a) as f64);
-        values.insert("cpu.work".into(), c1.saturating_sub(c0) as f64 / (b - a) as f64 * ms);
+        let used = super::record::cycles_used(&c0, &c1) as f64;
+        values.insert("cpu.app.total".into(), 100.0 * used / (b - a) as f64);
+        values.insert("cpu.work".into(), used / (b - a) as f64 * ms);
     }
     if !span.threads.is_empty() {
         values.insert("cpu.wakes".into(), span.wakes_per_s());
@@ -235,7 +250,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         }
         Err(e) => Some(e.message.clone()),
     };
-    let os_refused = os_refusals(&|m| values.contains_key(m), os.gpu_3d_pct.is_some());
+    let os_refused = os_refusals(&|m| values.contains_key(m), gpu_missing.as_deref());
     let meta = json!({
         "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "timing", "token": "", "duration_ms": for_ms,
         "env": host::env(), "values": values, "refused": os_refused, "os": os, "presents": session, "presents_refused": refused, "session_locked": session_locked, "ui_thread": ui_tid,

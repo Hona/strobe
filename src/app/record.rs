@@ -79,6 +79,9 @@ pub fn run(args: &Args) -> Result<Output> {
         return bench_case(args, file, case);
     }
     let target = args.pos.first().ok_or_else(|| Error::usage("record needs a target: strobe record https://… [--for 10s], or --bench <file>#<case>"))?.clone();
+    if let Some(id) = args.get("id") {
+        store::free_recording_id(id)?;
+    }
     // A local page (`page.html` or `file:page.html`) opens in the browser as its file:// address;
     // any other `file:` is a trace to import.
     let page_file = |p: &str| {
@@ -163,8 +166,8 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let awake = host::Awake::start();
     // `--id`: a handle chosen up front, so an MCP call that outlives its timeout can be followed.
-    let (id, dir) = claim(args)?;
-    let draft = store::Draft::new(&dir);
+    let (id, draft) = claim(args)?;
+    let dir = draft.dir().to_path_buf();
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone(), token.clone());
     if set == Set::Memory {
@@ -326,6 +329,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let (root, dir) = (n.pid, home.dir.clone());
         wakes::Timeline::start(move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect())
     }));
+    // The app's last output lines `wait_line` read, for a refusal when it exits.
+    let seen = std::cell::RefCell::new(std::collections::VecDeque::new());
     let result = (|| -> Result<Value> {
         if !windowless {
             n.wait_window(Duration::from_secs(60), &guard)?;
@@ -335,12 +340,12 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         // The app loads itself; give it time to settle before recording, or wait for the line that says it is ready.
         match &until {
             Some(re) => {
-                let l = wait_line(&n, re, Duration::from_secs(120))?;
+                let l = wait_line(&n, re, Duration::from_secs(120), &seen)?;
                 progress(format!("start: {}", l.trim()));
             }
             None => std::thread::sleep(Duration::from_secs(3)),
         }
-        app_gone(&mut n, "before the recording", |n| last_output(n, 5))?;
+        app_gone(&mut n, "before the recording", |n| last_output(n, &seen, 5))?;
         // Its process's CPU goes with it when it exits: one that ends inside the window refuses.
         let running = n.exited().is_none();
         if !windowless {
@@ -351,8 +356,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             }
         }
         let awake = host::Awake::start();
-        let (id, dir) = claim(args)?;
-        let draft = store::Draft::new(&dir);
+        let (id, draft) = claim(args)?;
+        let dir = draft.dir().to_path_buf();
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
         let presents = (set != Set::Attribution && !windowless).then(|| {
@@ -362,7 +367,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             })
         });
         let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
-        let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+        let cycles = || -> (Cycles, Option<u64>) { (per_process(&n.processes()), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
             None => format!("recording {id} for {}", fmt::ms_duration(for_ms)),
@@ -374,7 +379,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         match &stop {
             Some(re) => {
                 let cap = if args.get("for").is_some() { Duration::from_millis(for_ms) } else { Duration::from_secs(600) };
-                match wait_line(&n, re, cap) {
+                match wait_line(&n, re, cap, &seen) {
                     Ok(l) => progress(format!("stop: {}", l.trim())),
                     Err(e) if e.code == 124 => progress(format!("stop: no line matched in {} (the cap)", fmt::ms_duration(cap.as_millis() as u64))),
                     Err(e) => return Err(e),
@@ -386,8 +391,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let for_ms = (t1 - t0) / 1_000_000;
         let c1 = cycles();
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
-        if let Some(code) = n.exited().filter(|_| running) {
-            return Err(exited(code, "during the recording", last_output(&n, 5).as_deref()));
+        // A launcher that exits cleanly (code 0) and leaves the app running is not the app ending.
+        if let Some(code) = n.exited().filter(|&c| running && (c != 0 || n.processes().is_empty())) {
+            return Err(exited(code, "during the recording", last_output(&n, &seen, 5).as_deref()));
         }
         let screen = super::bench::screen_state(&procs0, &(host::now_ns(), host::all_processes()));
         if let Some(t) = timeline.borrow_mut().take() {
@@ -395,7 +401,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             t.marks.push(("recording".into(), t0, t1));
             crate::symbol::write_gz(&dir.join("timeline.json.gz"), &t)?;
         }
-        let os = sampler.stop().window(t0, t1);
+        let samples = sampler.stop();
+        let gpu_missing = (!super::outside::gpu_read(&samples)).then(|| samples.gpu_unreadable.clone());
+        let os = samples.window(t0, t1);
         let presents = presents.map(|r| r.and_then(|c| c.stop()));
         let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
         let session_locked = awake.locks() > 0 || host::session_locked();
@@ -437,9 +445,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let mut values: BTreeMap<&str, f64> = BTreeMap::new();
         values.insert("run.duration", ms);
         if let (Some(a), Some(b)) = (c0.1, c1.1)
-            && c1.0 > 0
+            && c1.0.values().any(|c| *c > 0)
         {
-            let cpu = c1.0.saturating_sub(c0.0) as f64 / b.saturating_sub(a).max(1) as f64 * ms;
+            let cpu = cycles_used(&c0.0, &c1.0) as f64 / b.saturating_sub(a).max(1) as f64 * ms;
             values.insert("cpu.work", cpu);
             values.insert("cpu.app.total", 100.0 * cpu / ms);
         }
@@ -481,7 +489,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             &json!([{ "run": "run:0", "ms": ms, "switches": span.switches, "wakes_per_s": span.wakes_per_s(), "io_read": span.io_read, "io_write": span.io_write }]),
         )?;
         let debug = host::debug_runtime(&app.exe);
-        let refused = super::outside::os_refusals(&|m| values.contains_key(m), os.gpu_3d_pct.is_some());
+        let refused = super::outside::os_refusals(&|m| values.contains_key(m), gpu_missing.as_deref());
         let mut meta = json!({
             "id": id, "kind": "record", "native": true, "target": target, "exe": app.exe, "probes": set, "duration_ms": for_ms, "env": host::env(), "values": values, "refused": refused, "os": os,
             "window": n.window, "ui_thread": ui_tid, "created": now_iso(), "valid": true, "os_frames": os_frames, "session_locked": session_locked,
@@ -505,12 +513,25 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     Ok(Output::new(summary_text(&meta), meta))
 }
 
-/// A new recording's id and folder: `--id` (a handle chosen up front, so an MCP call that outlives its
-/// timeout can be followed), else one claimed for this recording alone. The caller holds it in a
-/// `store::Draft` until its meta.json is written.
-pub fn claim(args: &Args) -> Result<(String, std::path::PathBuf)> {
-    match args.get("id").filter(|i| i.starts_with("rec_")) {
-        Some(id) => Ok((id.to_string(), store::recording_dir(id)?)),
+/// CPU so far in cycles by process (pid and start time).
+pub type Cycles = BTreeMap<(u32, u64), u64>;
+
+pub fn per_process(procs: &[host::ProcTimes]) -> Cycles {
+    procs.iter().map(|p| ((p.pid, host::start_time(p.pid).unwrap_or(0)), p.cycles)).collect()
+}
+
+/// Cycles used between two readings, each process against its own earlier reading: one that started in
+/// between counts from zero, and one that exited takes its CPU with it instead of lowering the others'
+/// sum (a launcher that handed over, a utility process that ended).
+pub fn cycles_used(a: &Cycles, b: &Cycles) -> u64 {
+    b.iter().map(|(k, c)| c.saturating_sub(a.get(k).copied().unwrap_or(0))).sum()
+}
+
+/// A new recording's id and folder, held as a draft until its meta.json is written: `--id` (a handle
+/// chosen up front, so an MCP call that outlives its timeout can be followed), else a fresh one.
+pub fn claim(args: &Args) -> Result<(String, store::Draft)> {
+    match args.get("id") {
+        Some(id) => Ok((id.to_string(), store::claim_recording(id)?)),
         None => store::new_recording(),
     }
 }
@@ -520,6 +541,12 @@ pub fn claim(args: &Args) -> Result<(String, std::path::PathBuf)> {
 /// says when ("before the runs"); `last` is its last output lines, when strobe read its output.
 pub fn app_gone(n: &mut crate::target::native::Native, when: &str, last: impl FnOnce(&crate::target::native::Native) -> Option<Vec<String>>) -> Result<()> {
     let Some(code) = n.exited() else { return Ok(()) };
+    // A process the app started just before it exited may show no stamp for a moment (a child between
+    // fork and exec): one more look before refusing.
+    if !n.processes().is_empty() {
+        return Ok(());
+    }
+    std::thread::sleep(Duration::from_millis(100));
     if !n.processes().is_empty() {
         return Ok(());
     }
@@ -538,14 +565,25 @@ pub fn exited(code: i32, when: &str, last: Option<&[String]>) -> Error {
     .into()
 }
 
-/// Up to the last `keep` lines of the app's output still waiting in its pipe; None when it is not read.
-fn last_output(n: &crate::target::native::Native, keep: usize) -> Option<Vec<String>> {
-    let lines: Vec<String> = n.output.as_ref()?.try_iter().map(|(_, _, l)| l).collect();
+/// Up to the last `keep` lines of the app's output: those `wait_line` read (`seen`), then what its
+/// pipe still holds, read until the pipe closes or for half a second (a crash's last stderr lines come
+/// after its exit). None when its output is not read.
+fn last_output(n: &crate::target::native::Native, seen: &std::cell::RefCell<std::collections::VecDeque<String>>, keep: usize) -> Option<Vec<String>> {
+    let rx = n.output.as_ref()?;
+    let mut lines: Vec<String> = seen.borrow().iter().cloned().collect();
+    let deadline = std::time::Instant::now() + Duration::from_millis(500);
+    while let Some(left) = deadline.checked_duration_since(std::time::Instant::now()) {
+        match rx.recv_timeout(left.min(Duration::from_millis(100))) {
+            Ok((_, _, l)) => lines.push(l),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
     Some(lines[lines.len().saturating_sub(keep)..].to_vec())
 }
 
 /// The first line of the app's output (stdout and stderr) matching `re`, within `timeout`.
-fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout: Duration) -> Result<String> {
+fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout: Duration, seen: &std::cell::RefCell<std::collections::VecDeque<String>>) -> Result<String> {
     let rx = n.output.as_ref().ok_or_else(|| Error::msg("the app's output is not being read"))?;
     let deadline = std::time::Instant::now() + timeout;
     loop {
@@ -554,8 +592,17 @@ fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout:
             return Err(Error::timeout(format!("no line of the app's output matched {re} in {} s", timeout.as_secs())).hint("check the pattern against what the app prints (stdout and stderr)"));
         }
         match rx.recv_timeout(left) {
-            Ok((_, _, line)) if re.is_match(&line) => return Ok(line),
-            Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Ok((_, _, line)) => {
+                let mut s = seen.borrow_mut();
+                if s.len() == 5 {
+                    s.pop_front();
+                }
+                s.push_back(line.clone());
+                if re.is_match(&line) {
+                    return Ok(line);
+                }
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Error::msg(format!("the app's output ended before a line matched {re}"))),
         }
     }

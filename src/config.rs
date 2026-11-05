@@ -23,7 +23,8 @@ pub fn project_root(dir: &Path) -> PathBuf {
 /// serves every repository on the machine, so a problem in one of its app profiles fails only when
 /// that profile is used (`check_app`), and a key it does not know elsewhere only warns.
 pub fn load(root: &Path) -> Result<Value> {
-    let user_path = host::paths::state_dir().join("strobe.json");
+    // Read only: loading the configuration makes and changes nothing (`strobe config`).
+    let user_path = host::paths::state_path().join("strobe.json");
     let (mut out, problems) = read(&user_path)?;
     for p in problems {
         match p.path.as_slice() {

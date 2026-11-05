@@ -4,6 +4,7 @@
 //! bench file's `page` drives it through the OS's accessibility tree and its own message loop
 //! (`driver::native`), and input latency comes from those inputs to the presents that showed them.
 
+use super::super::record::{Cycles, per_process};
 use super::launch::{Line, found_all, joined, milestones, no_page, screen_times, tail};
 use super::*;
 use crate::driver::native::{Log, Session};
@@ -78,15 +79,17 @@ impl Drive {
     }
 }
 
-/// The target's processes' CPU so far in cycles, and the time stamp counter.
-fn cycles(n: &Native) -> (u64, Option<u64>) {
-    (n.processes().iter().map(|p| p.cycles).sum(), host::tsc())
+/// The target's processes' CPU so far in cycles, each by its pid and start time, and the time stamp
+/// counter.
+fn cycles(n: &Native) -> (Cycles, Option<u64>) {
+    (per_process(&n.processes()), host::tsc())
 }
 
-/// CPU ms between two `cycles` readings over `wall_ms`; unknown (NaN) without cycles.
-fn cpu_ms(a: (u64, Option<u64>), b: (u64, Option<u64>), wall_ms: f64) -> f64 {
+/// CPU ms between two `cycles` readings over `wall_ms` (`record::cycles_used`); unknown (NaN) without
+/// cycles.
+fn cpu_ms(a: (Cycles, Option<u64>), b: (Cycles, Option<u64>), wall_ms: f64) -> f64 {
     match (a.1, b.1) {
-        (Some(t0), Some(t1)) if t1 > t0 && b.0 > 0 => b.0.saturating_sub(a.0) as f64 / (t1 - t0) as f64 * wall_ms,
+        (Some(t0), Some(t1)) if t1 > t0 && b.0.values().any(|c| *c > 0) => super::super::record::cycles_used(&a.0, &b.0) as f64 / (t1 - t0) as f64 * wall_ms,
         _ => f64::NAN,
     }
 }
@@ -320,7 +323,22 @@ fn runs(
     let perf = x.counters.then(wakes::Perf::new);
     let leak = set == Set::Memory;
     let mut readings: Vec<memory::Reading> = Vec::new();
-    let mut starts = shown::Starts::new(set);
+    // Every run starts from the same state, read through the session the case drives the app with (none:
+    // nothing read, so strobe connects to no app the case did not drive). An untimed block (`--check`)
+    // opens it before run 1 when the case drives the app only from its runs, so one run is checked too.
+    let mut starts = shown::Starts::new(s, x);
+    if x.untimed && starts.on() && !windowless && drive.session.get().is_none() {
+        let _ = drive.get();
+    }
+    let changes_seen = Cell::new(0u64);
+    let read_start = || drive.session.get().and_then(shown::native_start).map(|(st, seen)| {
+        changes_seen.set(seen);
+        st
+    });
+    let wait_start = |t: Duration| match drive.session.get() {
+        Some(se) => se.wait_change(changes_seen.get(), t),
+        None => std::thread::sleep(t),
+    };
     while warmup.more(runs.len()) {
         let i = runs.len();
         let began = Instant::now();
@@ -335,9 +353,7 @@ fn runs(
             se.set_pids(&pids);
             se.take_log();
         }
-        // Every run starts from the same screen, read through the session the case drives the app
-        // with (none yet: nothing read, so strobe connects to no app the case did not drive).
-        starts.check(i + 1, false, &|| drive.session.get().and_then(shown::native_start))?;
+        starts.check(i + 1, false, &read_start, &wait_start)?;
         hooks.begin(&format!("run:{i}"));
         // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
         let running = n.exited().is_none();
@@ -349,10 +365,12 @@ fn runs(
         let t1 = host::now_ns();
         cost.end();
         let procs1 = n.processes();
-        let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
+        let c1 = (per_process(&procs1), host::tsc());
         let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+        // A launcher that hands over to the app and exits cleanly (code 0) is not the app ending: what
+        // its process set still holds goes on (each process's CPU is its own difference).
         match n.exited() {
-            Some(code) if running => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), last().as_deref())),
+            Some(code) if running && (code != 0 || procs1.is_empty()) => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), last().as_deref())),
             _ => super::super::record::app_gone(n, &format!("before run {}", i + 1), |_| last())?,
         }
         ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
@@ -382,7 +400,7 @@ fn runs(
             readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
         }
     }
-    starts.check(runs.len() + 1, true, &|| drive.session.get().and_then(shown::native_start))?;
+    starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
     let unsteady = warmup.unsteady();
     let first = warmup.first().unwrap_or(0);
     let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
@@ -650,7 +668,7 @@ fn runs(
     }
     // A metric no run gave a number for (an empty per-run map's median) is missing, not a value.
     values.retain(|_, x| x.is_finite());
-    let have = Have { ui_thread: ui_tid.is_some(), windowless, gpu: samples.gpu_available, pinned: !pinned.is_empty() };
+    let have = Have { ui_thread: ui_tid.is_some(), windowless, gpu: (!super::super::outside::gpu_read(&samples)).then(|| samples.gpu_unreadable.clone()), pinned: !pinned.is_empty() };
     for m in std::iter::once(&s.primary).chain(&s.metrics) {
         if values.contains_key(m) || refused.contains_key(m) {
             continue;
@@ -661,7 +679,10 @@ fn runs(
         values.remove(m);
     }
     if let Some(why) = refused.get(&s.primary) {
-        return Err(Refusal { summary: format!("{}: {}", s.primary, why.summary), fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into());
+        // Most refusals already begin with the metric they refuse; the rest (a whole block's frames) get it.
+        let named = why.summary.starts_with(&format!("{}:", s.primary)) || why.summary.starts_with(&format!("{} ", s.primary));
+        let summary = if named { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) };
+        return Err(Refusal { summary, fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into());
     }
     if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
         ctx.warnings.push(validity::warn(
@@ -674,8 +695,8 @@ fn runs(
     let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
     let recording = if keep || set == Set::Attribution {
         // Discarded on any error before its meta.json: no recording is left half written.
-        let (id, dir) = store::new_recording()?;
-        let draft = store::Draft::new(&dir);
+        let (id, draft) = store::new_recording()?;
+        let dir = draft.dir().to_path_buf();
         let names: BTreeMap<u32, String> =
             spans.iter().flat_map(|s| s.threads.iter().map(|t| t.tid)).collect::<std::collections::BTreeSet<_>>().into_iter().filter_map(|t| Some((t, host::thread_name(t)?))).collect();
         store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(&spans, &names, &wakes::modules(&spans))))?;
@@ -779,8 +800,9 @@ struct Have {
     /// The main window's thread was found (`ui.*`).
     ui_thread: bool,
     windowless: bool,
-    /// The OS sampler opened a per-process GPU source.
-    gpu: bool,
+    /// The processes whose GPU the OS sampler could not read (empty: its source did not open); None:
+    /// it read them all.
+    gpu: Option<Vec<u32>>,
     /// The target runs on pinned CPUs (`cpu.foreign`).
     pinned: bool,
 }
@@ -810,7 +832,7 @@ fn missing(metric: &str, have: &Have) -> Refusal {
         "launch" => refuse(ValidatorId::NotForTarget, " is a launch case's: give the case `launch` to time the app's launch".into()),
         _ => match metric {
             "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
-            "gpu.process.3d" | "gpu.vram" | "gpu.shared" if !have.gpu => super::super::outside::gpu_unread(metric),
+            "gpu.process.3d" | "gpu.vram" | "gpu.shared" if have.gpu.is_some() => super::super::outside::gpu_unread(metric, have.gpu.as_deref().unwrap_or(&[])),
             "cpu.foreign" | "cpu.foreign.max" if !have.pinned => refuse(ValidatorId::NotForTarget, " is other work on the CPUs the target is pinned to, and this bench pins it to none (--pin none)".into()),
             "cpu.work" | "cpu.app.total" | "cpu.process.total" | "cpu.wakes" | "io.read" | "io.write" | "memory.app.private" | "memory.app.host" | "gpu.process.3d" | "gpu.vram" | "gpu.shared"
             | "cpu.foreign" | "cpu.foreign.max" => refuse(ValidatorId::RunIncomplete, ": the app's processes could not be read in every run (they exited, or strobe may not open them)".into()),
@@ -1198,8 +1220,8 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             return Err(r.clone().fix("pick a primary a launch case measures").into());
         }
         let recording = if profile {
-            let (id, dir) = store::new_recording()?;
-            let draft = store::Draft::new(&dir);
+            let (id, draft) = store::new_recording()?;
+            let dir = draft.dir().to_path_buf();
             // Stacks from the spawn until the launch was ready (its settling after is not the launch).
             let ready_ns = n.at_ns + ((ready.0 - n.epoch_ms).max(0.0) * 1e6) as u64;
             let stacks_note = match stacks.take().map(|r| r.and_then(|c| c.stop())) {

@@ -303,7 +303,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 .filter(|p| p.extension().is_some_and(|x| x == ext))
                 .max_by_key(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
         };
-        let rec = store::recording_dir(&id)?;
+        let draft = store::claim_recording(&id)?;
+        let rec = draft.dir().to_path_buf();
         if let Some(p) = newest("cpuprofile") {
             store::write_atomic(&rec.join("cpu-0.cpuprofile"), &std::fs::read(&p)?)?;
         }
@@ -320,6 +321,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 "note": "script profiles cover the whole host process: its start, setup, warmup and measured runs",
             }),
         )?;
+        draft.keep();
         block.recording = Some(id);
     }
     Ok(block)

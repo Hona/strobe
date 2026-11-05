@@ -243,11 +243,13 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress
 `strobe <command> --help` prints that command's lines of the help and every flag it reads, from the
 flag table; `strobe --help` (or a command the help does not name) prints all of it.
 
-`strobe config [<dir>]` checks a project's strobe.json without a bench: the strict read every command
+`strobe config [<dir>]` checks a project's strobe.json without a bench, strictly read-only (it runs before
+the power plan and CPU-set restores every other command does, and makes no state folder): the strict read every command
 does (§9.5), then every app profile resolved for this OS as a launch resolves it (its executable,
 its guards and `moved` folders, whose variables must be set: a profile that cannot be used here is a
 usage error naming it), its kind, whether its executable is there yet (relative paths from the
-project root) and `window: false`, and the build and serve commands for this OS. It launches nothing.
+project root) and `window: false`, and the build and serve commands for this OS; a `build.output` given per OS without this OS is a problem.
+It launches nothing.
 
 Every flag strobe reads is in one table (`cli::FLAGS`, with whether it takes a value and which
 commands read it); any other
@@ -275,7 +277,7 @@ adais: a successful `record --bench` exits 0 (`$LASTEXITCODE`), and its shell re
 | `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
 | `node:<port>`, `bun:<port>` | an inspector endpoint (§13.5) |
 | `pid:<n>`, `proc:<name>` | outside-in only: OS, GPU, OS present events, deep (§13.6). `proc:` takes the one process of that name whose parent is not of that name |
-| `page.html`, `file:page.html` | a local page (`.html`, `.htm`, `.xhtml`, `.svg` that exists) in a strobe-launched Chromium at its `file://` address, as `https://…` |
+| `page.html`, `file:page.html` | a local page (`.html`, `.htm`, `.xhtml`, `.svg` that exists) in a strobe-launched Chromium at its `file://` address (the path's `%`, spaces, `?` and `#` escaped), as `https://…`; any other `file:` is an import |
 | `file:<path>` | import an existing capture: a Chrome trace, `.cpuprofile`, `.heapsnapshot`, or a folder of them with a `manifest.json` (§8.7) |
 | `<target>@<device>` | run on a mesh device through `mesh exec`; results come back tagged with the device |
 
@@ -1883,7 +1885,7 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
-| `ResetIncomplete` | a run started from a different screen than the first run did: strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first: the text of every editable element (text fields, search and combo boxes, spin buttons, sliders; a password by its length), the state of every check box, radio button and switch, and the screen (open dialogs, the first three headings), by element. Labels, counters and clocks are not compared (an app rewrites them by itself; these change only through input), nor focus (every click moves it; a run that then types without naming an element changes a value). A start that differs is read again for up to a second before it refuses. Native apps are read through the session the case already drives them with (none: nothing is read); pages through one in-page script. Attribution and leak blocks are not checked. Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different screen than run 1 did: history-search "cache key" (was "")` |
+| `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. A start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -2844,9 +2846,11 @@ gpu.vram, gpu.shared        value            value (DRM)               NotOnThis
 memory.app.host             value            value (smaps)             NotOnThisOs: another process's regions need its task port
 ui.wakes                    value            value                     NotOnThisOs: switches are counted per process only
 cpu.foreign                 value (pinned)   value (pinned)            NotOnThisOs: no CPU affinity
-cpu.work, cpu.app.total     value (x64; Arm: NotOnThisOs, no time stamp counter)   value   value
-gpu.process.3d|vram|shared  without a per-process GPU source: NotOnThisOs, naming it (D3DKMT; DRM fdinfo,
-                            which NVIDIA's proprietary driver lacks; IOAccelerator)
+cpu.work, cpu.app.total     value (x64; Arm: NotOnThisOs: ARM64 cycle counts are not converted yet, and
+                            process times move in 15.6 ms ticks; page blocks and record refuse alike)   value   value
+gpu.process.3d|vram|shared  without a per-process GPU source, or with any followed process's statistics
+                            unreadable (no partial sums): NotOnThisOs, naming the source (D3DKMT; DRM fdinfo,
+                            which NVIDIA's proprietary driver and virtual GPUs lack; IOAccelerator) or the pids
 
 target or case              refused, and why
 native run block            browser-engine metrics (main.*, layout.*, style.*, js.*, dom.*, net.*, canvas.*,
@@ -3687,15 +3691,24 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   launches read their window's pixels on every OS (macOS: with Screen Recording; a launch timed to
   `painted` or `settled` without it refuses `NoPresentSource` at once instead of waiting 120 s).
   `ResetIncomplete` (§10.1) reads each run's start in native run blocks (`shown::native_start`, one
-  tree read through the case's session, which `driver::native::Session::tree` gives) and page blocks
-  (`shown::page_start`, one in-page script), before every run and once after the last reset, and
-  compares them with the first (`shown::Starts`); checked on adais (Character Map, locked: a typing run
-  without a reset refused, with one passed, Character Map's dev cases unchanged) and air (pages,
-  headless: a typing run and a check box click without a reset refused; a Meta+A reset that selected
-  nothing refused too, which is the page driver sending no editing command on macOS).
-  Recordings a block or launch keeps are claimed with `store::new_recording` and held in a
-  `store::Draft` until their meta.json is written, as `record` and `record pid:` do: a failed one
-  leaves no folder.
+  tree read through the case's session, `driver::native::Session::tree`, settling on its change events
+  through `Session::wait_change`) and page blocks (`__strobe.state` and `__strobe.change` in the page
+  probe), before every run and once after the last reset, and compares them with the first
+  (`shown::Starts`); checked on adais (Character Map, locked: a typing run without a reset refused,
+  with one passed, Character Map's dev cases unchanged) and air (pages, headless: a typing run and a
+  check box click without a reset refused; a Meta+A reset that selected nothing refused too, which is
+  the page driver sending no editing command on macOS).
+- Page blocks no longer fall back to process times for `cpu.app.total`: a share needs cycles over the
+  time stamp counter; Windows on Arm refuses `cpu.app.total` (`NotOnThisOs`) in pages and `record` alike.
+- A native run's CPU is each process's own difference by pid and start time (`record::cycles_used`):
+  a process that exits in a run takes its CPU with it instead of lowering the others' sum, and one that
+  starts counts from zero. A clean exit (code 0) of the launched process while its set still holds
+  processes (a launcher that handed over) is not the app ending; any other exit in a run refuses. A
+  set found empty is looked at again 100 ms later (a child between fork and exec shows no stamp yet).
+  Every recording is claimed as a `store::Draft` (`store::new_recording`, or `store::claim_recording`
+  for a caller's `--id`, which must be `rec_` and letters, digits, `_` or `-` and name no folder yet)
+  and kept only once its meta.json is written: a failed one leaves no folder, and a draft never deletes
+  a folder it did not create (`record`, `record pid:`, page, native, script and launch blocks, imports).
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.
   `cdp:<port>` reads `/json/version` by its `Content-Length` (or chunks): Chrome and Node keep the
   connection open after the reply. A Node inspector on that port is refused with a pointer to

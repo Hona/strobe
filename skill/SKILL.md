@@ -173,6 +173,7 @@ strobe update [<version>] [--from <path>] [--check]
 - `app:<id>`: a profile in strobe.json `apps`, Electron or native
 - `exe:<path>`: `--native` for a native app
 - `cdp:ws://…`
+- `page.html` (or `file:page.html`): a local page in the browser
 - `file:<path>`: import a trace, .cpuprofile or .heapsnapshot
 - `pid:<n>` · `proc:<name>`: a running process, from outside
 
@@ -373,6 +374,23 @@ export default bench({
 - Output says `shown  'Hex Settings · General'` per series, the PR block an `On screen:` line, and `ScreenChanged` warns when base and head (or some blocks) showed different screens.
 - Read it before trusting a number: a first-run dialog over the pane once turned a whole A/B into a measurement of the dialog.
 - Pin it with `expect: { title: /Settings/, heading: "General", visible: "nav-general" }` on the case or target: a block on another screen is refused `WrongScreen` instead of timed.
+
+### Every run starts from the same state
+
+- Before each run and after the last reset, strobe compares the values of editable controls and the states of check boxes, radio buttons and switches with run 1's start (not labels, clocks, headings or focus).
+- A reset that takes back nothing, or a typing run with no reset, is refused `ResetIncomplete`, naming the control: `history-search "cache keycache key" (was "")`.
+  - Select-all is `ControlOrMeta+a`: Control+a moves to the line start on macOS.
+- `resetCheck: false` on a case whose runs build on each other on purpose.
+
+### Refused, never "no value"
+
+- A declared metric gets a value or a typed refusal:
+  - `NotOnThisOs`: the OS cannot read it (macOS: `gpu.vram`, `gpu.shared`, `memory.app.host`, `ui.wakes`; a GPU whose per-process statistics did not open or left a process unread).
+  - `NotForTarget`: the target or case has none (a run's metric on a launch case, `ui.*` without a window).
+- A native app that exits is refused `RunIncomplete` with its exit code and, with `output: true` on the target, its last output lines.
+- `strobe <command> --help` lists that command's flags.
+- `strobe config` checks the project's strobe.json and every app profile on this OS without a bench, read-only.
+- `strobe record page.html` records a local page.
 
 ### Phases, spans and counters
 

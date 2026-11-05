@@ -239,13 +239,13 @@ pub(super) fn page(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &str
     finish(ctx, s, v, pair, at, screen, img)
 }
 
-/// What a run starts from that its input acts on (`ResetIncomplete`, SPEC §10.1): the text of every
-/// editable element (text fields, search and combo boxes, spin buttons, sliders), the state of every
-/// check box, radio button and switch, and which screen shows (its open dialogs and first headings),
-/// by element. Labels, counters and clocks are left out: an app rewrites them by itself between runs,
-/// while these change only through input, which a run gives and its reset must take back. Focus is
-/// left out too: every click moves it, and where it rests changes a run's work only when the run then
-/// types without naming an element, which shows in a value.
+/// What a run starts from that its input acts on (`ResetIncomplete`, SPEC §10.1), by control: the value
+/// of every visible, enabled, writable editable control (text fields, search and combo boxes, spin
+/// buttons, sliders, editing hosts; a secure field by its length) and the state of every check box,
+/// radio button and switch. Nothing else: labels, counters and clocks an app rewrites by itself between
+/// runs, and screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s. Focus is left out
+/// too: every click moves it, and where it rests changes a run's work only when the run then types
+/// without naming a control, which shows in a value.
 pub(super) type Start = BTreeMap<String, String>;
 
 /// Values longer than this are cut (a run that appends its text grows them on every run).
@@ -256,10 +256,11 @@ fn cut(s: &str) -> String {
     if s.chars().count() > START_VALUE { format!("{}…", s.chars().take(START_VALUE).collect::<String>()) } else { s.to_string() }
 }
 
-/// A native app's start, from one read of its tree through the case's own driving session.
-pub(super) fn native_start(se: &Session) -> Option<Start> {
+/// A native app's start, from one read of its tree through the case's own driving session, and the
+/// count of changes the app had announced then (to wait for the next one).
+pub(super) fn native_start(se: &Session) -> Option<(Start, u64)> {
     use crate::target::a11y::{PATTERN_TOGGLE, role_name};
-    let tree = se.tree().ok()?;
+    let (tree, seen_changes) = se.tree().ok()?;
     let mut out = Start::new();
     let mut seen: BTreeMap<String, usize> = BTreeMap::new();
     let mut put = |key: String, v: String| {
@@ -267,8 +268,11 @@ pub(super) fn native_start(se: &Session) -> Option<Start> {
         *n += 1;
         out.insert(if *n == 1 { key } else { format!("{key} #{n}") }, v);
     };
-    let mut marks: Vec<String> = Vec::new();
     for (i, n) in tree.nodes.iter().enumerate() {
+        // Shown (not offscreen, with a box; a scroll position that clips it does not count) and enabled.
+        if n.offscreen || n.rect[2] <= 0.0 || n.rect[3] <= 0.0 || !n.enabled {
+            continue;
+        }
         let role = if role_name(n.role).is_empty() { n.role_text.as_str() } else { role_name(n.role) };
         let key = || {
             let path = tree.key_path(i);
@@ -276,100 +280,78 @@ pub(super) fn native_start(se: &Session) -> Option<Start> {
         };
         let toggle = matches!(role, "checkbox" | "radio") || (n.role == 50000 && n.patterns & PATTERN_TOGGLE != 0);
         if matches!(role, "textbox" | "combobox" | "spinbutton" | "slider") {
-            put(key(), format!("{:?}", cut(n.value.as_deref().unwrap_or(""))));
+            let value = n.value.as_deref().unwrap_or("");
+            // A secure field (AXSecureTextField, a password box) by its length only.
+            let secure = n.role_text.to_ascii_lowercase().contains("secure") || n.role_text.to_ascii_lowercase().contains("password");
+            put(key(), if secure { format!("{} characters", value.chars().count()) } else { format!("{:?}", cut(value)) });
         } else if toggle && let Some(t) = n.toggled {
             put(key(), if t { "checked" } else { "unchecked" }.into());
         }
-        let shows = (n.dialog && n.parent.is_some() && tree.visible_rect(i).is_some()) || (n.heading && marks.iter().filter(|m| m.starts_with("heading")).count() < 3);
-        if shows {
-            let text = if n.name.trim().is_empty() { n.value.clone().unwrap_or_default() } else { n.name.clone() };
-            marks.push(format!("{} {:?}", if n.dialog { "dialog" } else { "heading" }, cut(&text)));
-        }
     }
-    out.insert("screen".into(), marks.join(" · "));
-    Some(out)
+    Some((out, seen_changes))
 }
 
-/// A page's start: the value of every input, text area, select and editable element (a password by
-/// its length), every check box's and radio button's state, and its open dialogs and first headings.
+/// A page's start, through the page probe (`driver::state`).
 pub(super) fn page_start(page: &Page) -> Option<Start> {
-    const PROBE: &str = r##"JSON.stringify((() => {
-  const out = {}, seen = {}
-  const put = (k, v) => { seen[k] = (seen[k] || 0) + 1; out[seen[k] === 1 ? k : k + " #" + seen[k]] = v }
-  const key = (e) => e.id ? "#" + e.id : e.name ? e.tagName.toLowerCase() + "[name=" + e.name + "]" : e.getAttribute("aria-label") ? e.tagName.toLowerCase() + "[aria-label=" + e.getAttribute("aria-label") + "]" : e.tagName.toLowerCase()
-  for (const e of document.querySelectorAll("input, textarea, select, [contenteditable=''], [contenteditable='true']")) {
-    const t = (e.type || "").toLowerCase()
-    if (t === "hidden" || t === "file" || t === "submit" || t === "button" || t === "reset" || t === "image") continue
-    if (t === "checkbox" || t === "radio") put(key(e), e.checked ? "checked" : "unchecked")
-    else if (t === "password") put(key(e), e.value.length + " characters")
-    else put(key(e), JSON.stringify((e.isContentEditable ? e.innerText : e.value).trim().slice(0, 200)))
-  }
-  const marks = []
-  for (const d of document.querySelectorAll("dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]")) {
-    const r = d.getBoundingClientRect()
-    if (r.width > 0 && r.height > 0) marks.push("dialog " + JSON.stringify((d.getAttribute("aria-label") || d.querySelector("h1, h2, h3, [role=heading]")?.textContent || "").trim().slice(0, 200)))
-  }
-  for (const h of [...document.querySelectorAll("h1, h2, [role=heading]")].slice(0, 3)) marks.push("heading " + JSON.stringify(h.textContent.trim().slice(0, 200)))
-  out.screen = marks.join(" · ")
-  return out
-})())"##;
-    let v = page.eval(PROBE).ok()?;
-    serde_json::from_str(v.as_str()?).ok()
+    crate::driver::state(page, Duration::from_secs(5)).ok()
 }
 
-/// Every run's start, checked against the first one read: a run that starts from another screen
-/// measures other work (a reset that took back nothing, so each run appended its text again).
+/// Every run's start, checked against the first one read: a run that starts from another state measures
+/// other work (a reset that took back nothing, so each run appended its text again).
 pub(super) struct Starts {
     first: Option<(String, Start)>,
     on: bool,
 }
 
 impl Starts {
-    /// Attribution and leak blocks are not checked: no verdict comes from them, and a leak case may
-    /// grow what it leaves on purpose.
-    pub(super) fn new(set: Set) -> Starts {
-        Starts { first: None, on: !matches!(set, Set::Attribution | Set::Memory) }
+    /// Off for a case with `resetCheck: false`, and for blocks no verdict comes from in the way a run's
+    /// start matters: attribution, leak runs (a leak case may grow what it leaves on purpose) and
+    /// pixel blocks (`--pixels`).
+    pub(super) fn new(s: &Series, x: &Exec) -> Starts {
+        Starts { first: None, on: s.reset_check && !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none() }
     }
 
-    /// Before run `run` (1-based); `after` true: after the last run and its reset, where a run after
-    /// it would start (so a single `--check` run is checked too). `read` reads the start (None:
-    /// nothing to read, skipped). A start that differs is read again for up to a second (a reset whose
-    /// last change lands a frame late), then refuses the block.
-    pub(super) fn check(&mut self, run: usize, after: bool, read: &dyn Fn() -> Option<Start>) -> Result<()> {
+    pub(super) fn on(&self) -> bool {
+        self.on
+    }
+
+    /// Before run `run` (1-based); `after` true: after the last run and its reset, where a run after it
+    /// would start (so a single `--check` run is checked too). `read` reads the start (None: it could not
+    /// be read); `wait(t)` returns at the target's next change or after `t`. A start that differs is read
+    /// again at each change (and at least every 250 ms, for a value set without an event) for up to a
+    /// second, then refuses the block; a read that fails there counts as differing. A start that cannot
+    /// be read before any was is skipped: the first start read is what the others are compared with.
+    pub(super) fn check(&mut self, run: usize, after: bool, read: &dyn Fn() -> Option<Start>, wait: &dyn Fn(Duration)) -> Result<()> {
         if !self.on {
             return Ok(());
         }
-        let Some(mut now) = read() else { return Ok(()) };
-        let when = if after { format!("a run after the last (run {}) would start", run.saturating_sub(1)) } else { format!("run {run} started") };
         let Some((first_when, first)) = &self.first else {
-            self.first = Some((format!("run {run}"), now));
+            if let Some(now) = read() {
+                self.first = Some((format!("run {run}"), now));
+            }
             return Ok(());
         };
         let deadline = Instant::now() + Duration::from_secs(1);
-        while now != *first && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(100));
-            match read() {
-                Some(again) => now = again,
-                None => return Ok(()),
+        let mut now = read();
+        while now.as_ref() != Some(first) {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else { break };
+            wait(left.min(Duration::from_millis(250)));
+            now = read();
+        }
+        let diffs: Vec<String> = match &now {
+            Some(n) if n == first => return Ok(()),
+            None => vec!["its state could not be read again".into()],
+            Some(n) => {
+                let keys: std::collections::BTreeSet<&String> = first.keys().chain(n.keys()).collect();
+                let show = |v: Option<&String>| v.map_or("(not there)".to_string(), |v| v.clone());
+                keys.into_iter().filter(|k| first.get(*k) != n.get(*k)).take(3).map(|k| format!("{k} {} (was {})", show(n.get(k)), show(first.get(k)))).collect()
             }
-        }
-        if now == *first {
-            return Ok(());
-        }
-        let keys: std::collections::BTreeSet<&String> = first.keys().chain(now.keys()).collect();
-        let diffs: Vec<String> = keys
-            .into_iter()
-            .filter(|k| first.get(*k) != now.get(*k))
-            .take(3)
-            .map(|k| {
-                let show = |v: Option<&String>| v.map_or("(not there)".to_string(), |v| if v.is_empty() { "(none)".into() } else { v.clone() });
-                format!("{k} {} (was {})", show(now.get(k)), show(first.get(k)))
-            })
-            .collect();
+        };
+        let when = if after { format!("a run after the last (run {}) would start", run.saturating_sub(1)) } else { format!("run {run} started") };
         Err(Error::refused(
             "ResetIncomplete",
-            format!("{when} from a different screen than {first_when} did: {}", diffs.join("; ")),
-            "every run must start from the same screen: the case's reset has to take back what its run changes (add a reset if it has none); select-all is Meta+a on macOS and Control+a elsewhere: ControlOrMeta+a works on every OS",
+            format!("{when} from a different state than {first_when} did: {}", diffs.join("; ")),
+            "every run must start from the same state: the case's reset has to take back what its run changes (add a reset if it has none); select-all is Meta+a on macOS and Control+a elsewhere: ControlOrMeta+a works on every OS. A case whose runs build on each other on purpose sets resetCheck: false",
         ))
     }
 }

@@ -46,7 +46,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "record",
         description: "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), app:<id>, exe:<path>, cdp:<port>, pid:<n>, file:<path> (import). With bench (file#case), records that bench case (it drives the app) with the attribution probes; target then names one of the bench file's targets.",
-        args: &[("target", "https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, pid:<n>, proc:<name>, or file:<path>; with bench: a target name from the bench file")],
+        args: &[("target", "https://…, a local page.html (or file:page.html), app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, pid:<n>, proc:<name>, or file:<path> (a trace to import); with bench: a target name from the bench file")],
         flags: &[
             ("for", "duration, e.g. 10s (default 10s)"),
             ("probes", "timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot); pid:/proc: targets also deep"),

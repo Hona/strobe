@@ -217,7 +217,7 @@ export interface Launch<P> {
   before?(ctx: LaunchContext<P>): unknown
   /** Starts the main process with `--inspect` and reads Node's own bootstrap timing after the launch (`launch.node.*`). App and exe targets. */
   inspect?: boolean
-  /** Times `launch.painted` and `launch.settled` from the window's pixels (Windows; default on for apps). */
+  /** Times `launch.painted` and `launch.settled` from the window's pixels (default on for apps; macOS needs Screen Recording). */
   screen?: boolean
   /** Milliseconds before a launch that never shows `until` fails. Default 120000. */
   timeout?: number
@@ -236,6 +236,13 @@ interface CaseBase {
   expect?: Expect
   /** App, exe and native targets: this case's GPU shader caches, over its target's and its app profile's `gpuCache`. */
   gpuCache?: GpuCache
+  /**
+   * Every run must start from the same state: strobe compares the values of editable controls and the
+   * states of check boxes, radio buttons and switches before each run with the first run's, and refuses
+   * `ResetIncomplete` when `reset` did not put them back. `false` turns the check off for a case whose
+   * runs are meant to build on each other (say why in a comment).
+   */
+  resetCheck?: boolean
 }
 
 /**

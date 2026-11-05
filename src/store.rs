@@ -31,10 +31,39 @@ pub fn new_id(prefix: &str) -> String {
     }
 }
 
-/// A new recording's id and its folder, made by this call alone: a folder that already exists
-/// (another process took the id) draws another.
-pub fn new_recording() -> Result<(String, PathBuf)> {
-    claim("rec", &paths::recordings())
+/// A new recording's id and its folder, made by this call alone (a folder that already exists:
+/// another process took the id, draws another), held as a `Draft` until its meta.json is written.
+pub fn new_recording() -> Result<(String, Draft)> {
+    let (id, dir) = claim("rec", &paths::recordings())?;
+    Ok((id, Draft(Some(dir))))
+}
+
+/// Whether `id` may name a new recording: `rec_` and letters, digits, `_` or `-`, and no folder yet
+/// (checked again when it is claimed). A command checks it before it launches anything.
+pub fn free_recording_id(id: &str) -> Result<()> {
+    let ok = id.strip_prefix("rec_").is_some_and(|r| !r.is_empty() && r.len() <= 64 && r.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'));
+    if !ok {
+        return Err(Error::usage(format!("--id {id}: a recording id is rec_ and letters, digits, _ or -")));
+    }
+    if paths::recordings().join(id).exists() {
+        return Err(Error::usage(format!("--id {id}: that recording exists already; pick another id")));
+    }
+    Ok(())
+}
+
+/// The folder of a recording whose id the caller chose (`--id`, so an MCP call that outlives its
+/// timeout can be followed), made by this call alone: an id that is not `rec_` and letters, digits,
+/// `_` or `-`, or that names a folder already, is a usage error, so no draft ever deletes another
+/// recording.
+pub fn claim_recording(id: &str) -> Result<Draft> {
+    free_recording_id(id)?;
+    let dir = paths::recordings().join(id);
+    std::fs::create_dir_all(paths::recordings())?;
+    match std::fs::create_dir(&dir) {
+        Ok(()) => Ok(Draft(Some(dir))),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(Error::usage(format!("--id {id}: that recording exists already; pick another id"))),
+        Err(e) => Err(Error::msg(format!("create {}: {e}", dir.display()))),
+    }
 }
 
 /// `new_recording` for an experiment.
@@ -53,12 +82,6 @@ fn claim(prefix: &str, root: &Path) -> Result<(String, PathBuf)> {
         }
     }
     Err(Error::msg(format!("no free {prefix}_ id in {}", root.display())))
-}
-
-pub fn recording_dir(id: &str) -> Result<PathBuf> {
-    let dir = paths::recordings().join(id);
-    std::fs::create_dir_all(&dir)?;
-    Ok(dir)
 }
 
 /// Removes an unfinished recording (`Draft`): none of it is kept.
@@ -88,12 +111,14 @@ pub fn create(path: &Path) -> Result<paths::Atomic> {
 }
 
 /// A recording's folder until it is complete: dropped before `keep` (an error, a refusal), the folder
-/// and all it holds go, so no recording is left without its `meta.json`.
+/// and all it holds go, so no recording is left without its `meta.json`. Only `new_recording` and
+/// `claim_recording` make one, over a folder they created, so a draft never deletes a folder it did
+/// not make.
 pub struct Draft(Option<PathBuf>);
 
 impl Draft {
-    pub fn new(dir: &Path) -> Draft {
-        Draft(Some(dir.to_path_buf()))
+    pub fn dir(&self) -> &Path {
+        self.0.as_deref().unwrap_or(Path::new(""))
     }
 
     pub fn keep(mut self) {

@@ -218,6 +218,40 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     }, timeout)
     kick()
   })
+  // What a run starts from that its input acts on (`ResetIncomplete`): the value of every visible, enabled and
+  // writable text field, search box, combo box, spin button, slider and editing host (a password by its length),
+  // and the state of every check box, radio button and switch, by its id, name or label (else its role), in the
+  // page and its shadow roots, with the roles a native app's tree gives them.
+  s.state = () => {
+    const out = {}, seen = {}
+    const put = (k, v) => { seen[k] = (seen[k] ?? 0) + 1; out[seen[k] === 1 ? k : k + " #" + seen[k]] = v }
+    const toggles = ["checkbox", "radio", "switch", "menuitemcheckbox", "menuitemradio"]
+    const values = ["textbox", "searchbox", "combobox", "spinbutton", "slider"]
+    const cut = (t) => JSON.stringify(String(t ?? "").trim().slice(0, 200))
+    for (const root of [document, ...roots]) for (const el of root.querySelectorAll("input, textarea, select, [role], [contenteditable]")) {
+      const role = roleOf(el)
+      const host = el.isContentEditable && !el.parentElement?.isContentEditable
+      if (!host && !toggles.includes(role) && !values.includes(role)) continue
+      if (!visible(el) || el.disabled || el.readOnly || el.getAttribute("aria-readonly") === "true" || el.closest("[inert], [aria-disabled=true]")) continue
+      const label = el.getAttribute("aria-label")
+      const key = el.id ? '#' + el.id : el.name ? el.localName + "[name=" + el.name + "]" : label ? (role || "editable") + " " + JSON.stringify(label) : role || "editable"
+      if (toggles.includes(role)) put(key, el.localName === "input" ? (el.checked ? "checked" : "unchecked") : (el.getAttribute("aria-checked") ?? "false"))
+      else if (el.type === "password") put(key, el.value.length + " characters")
+      else if (typeof el.value === "string" && /^(input|textarea|select)$/.test(el.localName)) put(key, cut(el.value))
+      else if (role === "slider" || role === "spinbutton") put(key, cut(el.getAttribute("aria-valuetext") ?? el.getAttribute("aria-valuenow")))
+      else put(key, cut(el.innerText ?? el.textContent))
+    }
+    return JSON.stringify(out)
+  }
+  // True at the first change input could make (the DOM, an input or change event), false after `timeout` ms.
+  s.change = (timeout) => new Promise((resolve) => {
+    const events = ["input", "change"]
+    const done = (v) => { unwatch(); for (const e of events) document.removeEventListener(e, yes, true); clearTimeout(t); resolve(v) }
+    const yes = () => done(true)
+    const unwatch = observe(yes, { subtree: true, childList: true, attributes: true, characterData: true })
+    for (const e of events) document.addEventListener(e, yes, true)
+    const t = setTimeout(() => done(false), timeout)
+  })
   s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))
   s.nodes = () => document.getElementsByTagName("*").length
   return s
@@ -242,6 +276,18 @@ fn helped(page: &Page, expr: &str, timeout: Duration) -> Result<Value> {
 pub fn screen(page: &Page, max: usize, chars: usize, timeout: Duration) -> Result<Value> {
     let v = helped(page, &format!("__strobe.screen({max}, {chars})"), timeout)?;
     v.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(|| Error::msg("the page's screen did not read"))
+}
+
+/// What a run would start from (`__strobe.state`): each editable control's value and each toggle's
+/// state, by control.
+pub fn state(page: &Page, timeout: Duration) -> Result<std::collections::BTreeMap<String, String>> {
+    let v = helped(page, "__strobe.state()", timeout)?;
+    v.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(|| Error::msg("the page's state did not read"))
+}
+
+/// Waits until the page changes (`__strobe.change`) or `t` passes.
+pub fn wait_change(page: &Page, t: Duration) -> Result<bool> {
+    Ok(helped(page, &format!("__strobe.change({})", t.as_millis()), t + Duration::from_secs(2))? == Value::Bool(true))
 }
 
 /// Whether a visible element matches `sel` within `timeout`, re-checked on each DOM and focus change

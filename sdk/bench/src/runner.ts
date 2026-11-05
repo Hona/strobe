@@ -145,6 +145,7 @@ function describe() {
         primary: c.primary ?? (c.launch ? "launch.ready" : undefined),
         metrics: c.metrics ?? [],
         reset: !!c.reset,
+        resetCheck: c.resetCheck !== false,
         targets: c.targets,
         timeout: c.timeout,
         noworse: c.noworse,

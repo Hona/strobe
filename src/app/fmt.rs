@@ -31,18 +31,7 @@ pub fn value(v: f64, unit: &str) -> String {
     }
 }
 
-pub fn bytes(v: f64) -> String {
-    let a = v.abs();
-    if a >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.2} GB", v / (1024.0 * 1024.0 * 1024.0))
-    } else if a >= 1024.0 * 1024.0 {
-        format!("{:.1} MB", v / (1024.0 * 1024.0))
-    } else if a >= 1024.0 {
-        format!("{:.0} KB", v / 1024.0)
-    } else {
-        format!("{v:.0} B")
-    }
-}
+pub use crate::fmt::bytes;
 
 /// A relative change as a signed percentage, e.g. −7.7% or +12%.
 pub fn pct(r: f64) -> String {

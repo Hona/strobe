@@ -170,7 +170,7 @@ pub fn reap() {
         }
     }
     if stacks && !sessions().iter().any(|n| n.starts_with("strobe-stacks-")) {
-        super::stacks::reset_interval();
+        super::kernel_profile::reset_interval();
     }
 }
 

@@ -174,7 +174,7 @@ pub fn run(args: &Args) -> Result<Output> {
     std::thread::sleep(Duration::from_millis(300));
     let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
     // `--os-frames`: the OS's present events beside the trace's frames, a cross-check of both.
-    let os_frames = (args.has("os-frames") && !attach).then(crate::etw::PresentCapture::start);
+    let os_frames = (args.has("os-frames") && !attach).then(crate::probe::present::PresentCapture::start);
     let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
     let t0 = host::now_ns();
     driver.mark("run:0:start")?;
@@ -229,9 +229,9 @@ pub fn run(args: &Args) -> Result<Output> {
     // The trace's mark times are its own clock; the OS window is the same span on QPC (§6).
     let os_frames = match os_frames {
         Some(Ok(p)) => {
-            let run = crate::etw::frames::from_presents(&p.presents, &tree, t0, t1);
+            let run = crate::probe::present::frames::from_presents(&p.presents, &tree, t0, t1);
             let display = host::main_window(&tree).and_then(|w| host::display_of(w.hwnd));
-            let v = crate::etw::frames::values(&[run], crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()));
+            let v = crate::probe::present::frames::values(&[run], crate::probe::present::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()));
             crate::symbol::write_gz(&dir.join("presents.json.gz"), &p)?;
             json!({ "values": v, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "pids": tree })
         }
@@ -326,12 +326,12 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
         let presents = (set != Set::Attribution && !windowless).then(|| {
-            crate::etw::PresentCapture::start().map(|mut c| {
+            crate::probe::present::PresentCapture::start().map(|mut c| {
                 c.track(&n.pids());
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
+        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
         let cycles = || -> (u64, Option<u64>) { (n.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
@@ -376,15 +376,15 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let unpaced = match &presents {
             Some(Ok(p)) => {
                 let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
-                let hz = crate::etw::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
-                crate::etw::frames::spin(&p.presents, &n.pids(), &[(t0, t1)], hz)
+                let hz = crate::probe::present::frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
+                crate::probe::present::frames::spin(&p.presents, &n.pids(), &[(t0, t1)], hz)
             }
             _ => None,
         };
         let os_frames = match &presents {
             Some(Ok(p)) => {
                 let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
-                let f = crate::etw::frames::native_values(p, &n.pids(), &[(t0, t1)], display.as_ref());
+                let f = crate::probe::present::frames::native_values(p, &n.pids(), &[(t0, t1)], display.as_ref());
                 frame_values = f.values;
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
                 json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "refused_metrics": f.partial, "display": display })
@@ -395,10 +395,10 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let stacks_note = match stacks {
             Some(Ok(d)) => {
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                format!("native stacks: {} samples (query hotspots){}", d.samples.len(), crate::etw::stacks_how(&d))
+                format!("native stacks: {} samples (query hotspots){}", d.samples.len(), crate::probe::stacks::stacks_how(&d))
             }
             Some(Err(e)) => format!("native stacks failed: {}", e.message),
-            None => crate::etw::no_stacks().into(),
+            None => crate::probe::stacks::no_stacks().into(),
         };
         let ms = (t1 - t0) as f64 / 1e6;
         let mut values: BTreeMap<&str, f64> = BTreeMap::new();

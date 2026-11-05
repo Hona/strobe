@@ -5,7 +5,7 @@
 pub mod dwarf;
 pub mod pdb;
 
-use crate::etw::Deep;
+use crate::probe::stacks::Deep;
 use crate::model::{Error, Result};
 use crate::probe::symbols::Frame;
 use serde_json::{Value, json};
@@ -129,14 +129,14 @@ pub fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>>
         }
     }
     // Modules per process, by base; the kernel's under pid 0.
-    let mut modules: HashMap<u32, Vec<&crate::etw::Module>> = HashMap::new();
+    let mut modules: HashMap<u32, Vec<&crate::probe::stacks::Module>> = HashMap::new();
     for m in &deep.modules {
         modules.entry(m.pid).or_default().push(m);
     }
     for v in modules.values_mut() {
         v.sort_by_key(|m| m.base);
     }
-    let find = |pid: u32, a: u64| -> Option<&crate::etw::Module> {
+    let find = |pid: u32, a: u64| -> Option<&crate::probe::stacks::Module> {
         let list = modules.get(&if a >= KERNEL { 0 } else { pid })?;
         let i = list.partition_point(|m| m.base <= a).checked_sub(1)?;
         let m = list[i];

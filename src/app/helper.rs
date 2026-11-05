@@ -10,7 +10,7 @@ use serde_json::json;
 pub fn run(args: &Args) -> Result<Output> {
     #[cfg(windows)]
     {
-        use crate::etw::helper;
+        use crate::probe::helper;
         let sid = args.get("sid").map(str::to_string).or_else(helper::user_sid).ok_or_else(|| Error::usage("helper needs --sid"))?;
         let result = match args.pos.first().map(String::as_str) {
             Some("install") => helper::install(&sid),
@@ -48,8 +48,8 @@ pub fn run(args: &Args) -> Result<Output> {
 /// Performance Log Users). Returns (ok, detail).
 #[cfg(windows)]
 pub fn setup(skip: bool) -> (&'static str, String) {
-    use crate::etw::helper;
-    let a = crate::etw::access();
+    use crate::probe::helper;
+    let a = crate::probe::present::access();
     let current = a.helper && helper::helper_current();
     let grouped = a.token != "none" || a.pending_sign_out;
     if current && grouped {
@@ -66,7 +66,7 @@ pub fn setup(skip: bool) -> (&'static str, String) {
     let _ = std::fs::remove_file(&log);
     match code {
         Ok(0) => {
-            let a = crate::etw::access();
+            let a = crate::probe::present::access();
             ("✓", format!("{} · {}", reply["ok"].as_str().unwrap_or("installed"), describe(&a)))
         }
         Ok(_) => ("✗", format!("helper install failed: {}", reply["err"].as_str().unwrap_or("see the elevated window"))),
@@ -75,7 +75,7 @@ pub fn setup(skip: bool) -> (&'static str, String) {
 }
 
 /// What this user can do today, for `up` and `status`.
-pub fn describe(a: &crate::etw::Access) -> String {
+pub fn describe(a: &crate::probe::present::Access) -> String {
     let presents = match (a.token, a.pending_sign_out, a.helper) {
         ("admin", _, _) => "present events in-process (elevated)",
         ("group", _, _) => "present events in-process (Performance Log Users)",
@@ -90,7 +90,7 @@ pub fn describe(a: &crate::etw::Access) -> String {
         (false, false) => "off (strobe up)",
     };
     #[cfg(windows)]
-    if a.helper && !crate::etw::helper::helper_current() {
+    if a.helper && !crate::probe::helper::helper_current() {
         return format!("{presents} · native stacks {stacks} · the installed helper is another build: strobe up replaces it");
     }
     format!("{presents} · native stacks {stacks}")

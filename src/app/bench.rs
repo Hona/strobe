@@ -2012,7 +2012,7 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
 /// What an attribution block records for this target.
 fn why_text(target: &Value) -> &'static str {
     if is_native(target) {
-        if crate::etw::access().helper || !cfg!(windows) {
+        if crate::probe::present::access().helper || !cfg!(windows) {
             "OS samples and native stacks"
         } else {
             "OS samples and native stacks (sampled without the deep helper: user frames, a short stall per sample)"

@@ -35,7 +35,7 @@ pub use imp::Session;
 
 mod imp {
     use super::*;
-    use crate::etw::PresentCapture;
+    use crate::probe::present::PresentCapture;
     use crate::host;
     use crate::target::a11y::input::{self, Button, Key, Mods, Named, Poster, Target};
     use crate::target::a11y::{self, Accessibility, Action, Selector, Tree};

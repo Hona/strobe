@@ -59,7 +59,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let daemon = super::mcp::running();
     let autostart = super::up::autostart::state();
     let skill = super::up::skill_state();
-    let deep = crate::etw::access();
+    let deep = crate::probe::present::access();
     #[cfg(windows)]
     let deep_text = super::helper::describe(&deep);
     #[cfg(target_os = "linux")]
@@ -165,7 +165,7 @@ pub fn run(args: &Args) -> Result<Output> {
 fn native_drive() -> (bool, String) {
     #[cfg(windows)]
     {
-        let p = crate::etw::access();
+        let p = crate::probe::present::access();
         (true, format!("UI Automation, posted window messages · frames: {}", if p.presents() { "OS present events" } else { "none (strobe up)" }))
     }
     #[cfg(target_os = "macos")]
@@ -197,7 +197,7 @@ fn native_drive() -> (bool, String) {
     {
         let bus = host::dbus::Conn::session().ok().and_then(|mut s| s.call("org.a11y.Bus", "/org/a11y/bus", "org.a11y.Bus", "GetAddress", &[]).ok()).is_some();
         let x11 = std::env::var_os("DISPLAY").is_some();
-        let frames = match crate::etw::PresentCapture::start() {
+        let frames = match crate::probe::present::PresentCapture::start() {
             Ok(_) => "X Present".to_string(),
             Err(e) => format!("none ({})", e.message),
         };

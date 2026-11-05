@@ -16,7 +16,7 @@
 //! A present replaced before it was shown (a newer one InFrame for the window, a Discarded token, a
 //! later present of the swapchain displayed first) ends `discarded`.
 
-use super::session::{self, Field, Handler, Provider, Running, Schema, uint, uint_at};
+use crate::probe::etw::{self, Field, Handler, Provider, Running, Schema, uint, uint_at};
 use super::{Present, Presents};
 use crate::model::Result;
 use std::cell::RefCell;
@@ -74,7 +74,7 @@ pub fn providers() -> Vec<Provider> {
     use id::*;
     vec![
         Provider {
-            guid: session::guid(DXGKRNL),
+            guid: etw::guid(DXGKRNL),
             level: 4,
             any: 0x0800_0001,
             all: 0x1,
@@ -98,15 +98,15 @@ pub fn providers() -> Vec<Provider> {
                 VSYNC,
             ],
         },
-        Provider { guid: session::guid(WIN32K), level: 4, any: 0x8000_0004_0000_1000, all: 0x8000_0000_0000_1000, ids: vec![TOKEN_SURFACE, TOKEN_STATE] },
+        Provider { guid: etw::guid(WIN32K), level: 4, any: 0x8000_0004_0000_1000, all: 0x8000_0000_0000_1000, ids: vec![TOKEN_SURFACE, TOKEN_STATE] },
         Provider {
-            guid: session::guid(DWM),
+            guid: etw::guid(DWM),
             level: 5,
             any: 0x8000_0000_0000_0081,
             all: 0,
             ids: vec![GET_PRESENT_HISTORY, SCHEDULE_PRESENT, SCHEDULE_SURFACEUPDATE, FLIPCHAIN_PENDING, FLIPCHAIN_COMPLETE, FLIPCHAIN_DIRTY],
         },
-        Provider { guid: session::guid(DXGI), level: 0, any: 0x8000_0000_0000_0002, all: 0x8000_0000_0000_0002, ids: vec![PRESENT_START, PRESENT_STOP, PRESENT_MPO_START, PRESENT_MPO_STOP] },
+        Provider { guid: etw::guid(DXGI), level: 0, any: 0x8000_0000_0000_0002, all: 0x8000_0000_0000_0002, ids: vec![PRESENT_START, PRESENT_STOP, PRESENT_MPO_START, PRESENT_MPO_STOP] },
     ]
 }
 
@@ -125,8 +125,8 @@ impl Capture {
     /// Starts tracking presents in this process (needs admin or Performance Log Users). Buffers
     /// flush every 10 ms, so a wait on the next frame hears of it within a frame or two.
     pub fn start() -> Result<Capture> {
-        session::reap();
-        let cfg = session::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256), flush_ms: 10 };
+        etw::reap();
+        let cfg = etw::Config { kind: "presents", kernel: 0, providers: providers(), buffer_kb: 64, buffers: (32, 256), flush_ms: 10 };
         let t0 = crate::host::now_ns();
         let armed = Arc::new(AtomicU64::new(0));
         let tracker_armed = armed.clone();
@@ -134,7 +134,7 @@ impl Capture {
         let l = live.clone();
         let running = Running::start(cfg, |_| Ok(()), move || Tracker::with_armed(tracker_armed, Some(l)))?;
         // Every provider runs from here: presents that start later are seen whole.
-        armed.store(session::qpc_now(), Ordering::Release);
+        armed.store(etw::qpc_now(), Ordering::Release);
         Ok(Capture { running, t0, live })
     }
 
@@ -287,13 +287,13 @@ impl Handler for Tracker {
 
     fn event(&mut self, e: &EVENT_RECORD) {
         let g = &e.EventHeader.ProviderId;
-        if session::same(g, &self.guids[1]) {
+        if etw::same(g, &self.guids[1]) {
             self.dxgk(e);
-        } else if session::same(g, &self.guids[0]) {
+        } else if etw::same(g, &self.guids[0]) {
             self.dxgi(e);
-        } else if session::same(g, &self.guids[2]) {
+        } else if etw::same(g, &self.guids[2]) {
             self.win32k(e);
-        } else if session::same(g, &self.guids[3]) {
+        } else if etw::same(g, &self.guids[3]) {
             self.dwm(e);
         }
         if self.done.len() >= 4096 {
@@ -323,8 +323,8 @@ impl Tracker {
         Tracker {
             armed,
             schema: Schema::default(),
-            freq: session::qpc_freq(),
-            guids: [session::guid(DXGI), session::guid(DXGKRNL), session::guid(WIN32K), session::guid(DWM)],
+            freq: etw::qpc_freq(),
+            guids: [etw::guid(DXGI), etw::guid(DXGKRNL), etw::guid(WIN32K), etw::guid(DWM)],
             serial: 0,
             ring: vec![None; RING],
             next_ring: 0,
@@ -348,7 +348,7 @@ impl Tracker {
     /// Moves completed presents whose present call returned (or every one, at the end) to the output.
     fn drain(&mut self, all: bool) {
         let freq = self.freq;
-        let ns = |q: u64| if q == 0 { 0 } else { session::ns(q, freq) };
+        let ns = |q: u64| if q == 0 { 0 } else { etw::ns(q, freq) };
         let mut keep = Vec::new();
         for p in std::mem::take(&mut self.done) {
             let b = p.borrow();
@@ -618,8 +618,8 @@ impl Tracker {
         self.stop_tracking(p);
         if let Some(l) = &self.live {
             let b = p.borrow();
-            let screen = if b.state == Final::Presented && b.screen != 0 && !b.lost { session::ns(b.screen, self.freq) } else { 0 };
-            l.push(b.pid, session::ns(b.start, self.freq), screen);
+            let screen = if b.state == Final::Presented && b.screen != 0 && !b.lost { etw::ns(b.screen, self.freq) } else { 0 };
+            l.push(b.pid, etw::ns(b.start, self.freq), screen);
         }
         self.done.push(p.clone());
     }
@@ -885,7 +885,7 @@ impl Tracker {
             }
             id::VSYNC => {
                 let [fence, target] = self.schema.fields(e, ["FlipFenceId", "VidPnTargetId"]);
-                self.vsyncs.push((session::ns(ts, self.freq), uint(e, &target) as u32));
+                self.vsyncs.push((etw::ns(ts, self.freq), uint(e, &target) as u32));
                 let fence = uint(e, &fence);
                 if fence != 0
                     && let Some(p) = self.find_by_submit((fence >> 32) as u32)
@@ -907,7 +907,7 @@ impl Tracker {
                 // Multi-plane drivers log their vertical blanks here instead of `VSyncDPC` (an HSync
                 // is an immediate flip, not a blank).
                 if vsync && target.found {
-                    self.vsyncs.push((session::ns(ts, self.freq), uint(e, &target) as u32));
+                    self.vsyncs.push((etw::ns(ts, self.freq), uint(e, &target) as u32));
                 }
                 let (planes, entries) = (uint(e, &planes) as usize, uint(e, &entries) as usize);
                 let active = (0..planes.min(addrs.count.max(1)).min(64)).filter(|i| uint_at(e, &addrs, *i) != 0).count();

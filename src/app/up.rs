@@ -558,10 +558,10 @@ pub fn leave(args: &Args) -> Result<Output> {
     s.line("✓", "skill", "removed");
     // The deep-mode helper lives where only an elevated step writes: one UAC prompt removes it.
     #[cfg(windows)]
-    if crate::etw::access().helper
-        && let Some(sid) = crate::etw::helper::user_sid()
+    if crate::probe::present::access().helper
+        && let Some(sid) = crate::probe::helper::user_sid()
     {
-        match crate::etw::helper::elevated(&format!("helper uninstall --sid {sid}")) {
+        match crate::probe::helper::elevated(&format!("helper uninstall --sid {sid}")) {
             Ok(0) => s.line("✓", "deep", "removed the helper task, its copy and Performance Log Users membership"),
             Ok(_) => s.line("!", "deep", "helper uninstall failed; run strobe leave again"),
             Err(e) => s.line("!", "deep", format!("{}: the helper stays", e.message)),

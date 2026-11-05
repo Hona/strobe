@@ -3,19 +3,27 @@
 pub mod alloc;
 pub mod census;
 pub mod cpu;
+#[cfg(windows)]
+pub mod etw;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod gpu_linux;
 #[cfg(target_os = "macos")]
 pub mod gpu_macos;
 pub mod heap;
+#[cfg(windows)]
+pub mod helper;
+#[cfg(windows)]
+pub mod kernel_profile;
 pub mod memory;
 pub mod os;
 #[cfg(target_os = "linux")]
 pub mod perf;
+pub mod present;
 #[cfg(target_os = "macos")]
 pub mod sample;
 pub mod shifts;
+pub mod stacks;
 #[cfg(windows)]
 pub mod suspend;
 pub mod symbols;

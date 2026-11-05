@@ -16,7 +16,7 @@
 //! strobe takes no lock of the target and calls nothing in it, so the target cannot stall strobe.
 //! Samples are capped at one per thread per 2 ms and 4,000 a second in all.
 
-use crate::etw::{Deep, Module, SuspendStats};
+use crate::probe::stacks::{Deep, Module, SuspendStats};
 use crate::host;
 use crate::model::{Error, Result};
 use std::collections::HashMap;

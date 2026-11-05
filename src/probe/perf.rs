@@ -12,7 +12,7 @@
 //! - Needs `perf_event_paranoid` ≤ 2 for the user's own processes (Debian ships 3), or CAP_PERFMON;
 //!   kernel frames need ≤ 1 or CAP_PERFMON. `strobe status` names the one setting to change.
 
-use crate::etw::{Deep, Module};
+use crate::probe::stacks::{Deep, Module};
 use crate::model::{Error, Result};
 use framehop::{ExplicitModuleSectionInfo, Unwinder};
 use object::{Object, ObjectSection, ObjectSegment};

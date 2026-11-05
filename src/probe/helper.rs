@@ -13,7 +13,7 @@
 //! a sampled-stack session for a process tree the user runs, returning the events over the pipe.
 //! It exits after two minutes without a client. One UAC prompt (in `up`) installs it.
 
-use super::Access;
+use super::present::Access;
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::io::Write;
@@ -389,8 +389,8 @@ fn req_op(line: &str) -> String {
 /// One client's sessions; a client that goes away stops them.
 #[derive(Default)]
 struct Conn {
-    presents: Option<super::present::Capture>,
-    stacks: Option<super::stacks::Capture>,
+    presents: Option<super::present::windows::Capture>,
+    stacks: Option<super::kernel_profile::Capture>,
 }
 
 impl Conn {
@@ -399,7 +399,7 @@ impl Conn {
             "hello" => Ok(json!({ "ok": { "pid": std::process::id(), "build": env!("STROBE_BUILD_ID"), "protocol": env!("STROBE_HELPER_PROTOCOL") } })),
             "presents.start" => {
                 if self.presents.is_none() {
-                    self.presents = Some(super::present::Capture::start()?);
+                    self.presents = Some(super::present::windows::Capture::start()?);
                 }
                 Ok(json!({ "ok": {} }))
             }
@@ -419,7 +419,7 @@ impl Conn {
                     return Err(Error::msg(format!("process {root} does not run as this user")));
                 }
                 if self.stacks.is_none() {
-                    self.stacks = Some(super::stacks::Capture::start(root)?);
+                    self.stacks = Some(super::kernel_profile::Capture::start(root)?);
                 }
                 Ok(json!({ "ok": {} }))
             }

@@ -7,7 +7,7 @@
 use super::launch::{Line, found_all, joined, milestones, no_page, screen_times, tail};
 use super::*;
 use crate::driver::native::{Log, Session};
-use crate::etw::{PresentCapture, frames};
+use crate::probe::present::{PresentCapture, frames};
 use crate::probe::memory;
 use crate::probe::wakes::{self, Snapshot, Span};
 use crate::target::native::{self as nt, Native};
@@ -242,7 +242,7 @@ fn runs(
             Err(e) => presents_err = Some(e.message),
         }
     }
-    let stacks = (set == Set::Attribution && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
+    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
     let hooks = super::block::Hooks::default();
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
@@ -682,12 +682,12 @@ fn runs(
                 format!(
                     "native stacks: {} samples (query hotspots){}{}",
                     d.samples.len(),
-                    crate::etw::stacks_how(&d),
+                    crate::probe::stacks::stacks_how(&d),
                     if d.untimed { "; untimed (macOS sample): they cover the warmup runs and the resets too" } else { "" }
                 )
             }
             Some(Err(e)) => format!("native stacks failed: {}", e.message),
-            None if set == Set::Attribution => crate::etw::no_stacks().into(),
+            None if set == Set::Attribution => crate::probe::stacks::no_stacks().into(),
             None => String::new(),
         };
         store::write_json(
@@ -919,7 +919,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     };
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
-    let mut stacks = (profile && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
+    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(n.pid));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1139,10 +1139,10 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                         d.samples.retain(|x| x.0 >= n.at_ns && x.0 <= ready_ns);
                     }
                     crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                    format!("native stacks from just after the spawn until ready: {} samples (query hotspots){}", d.samples.len(), crate::etw::stacks_how(&d))
+                    format!("native stacks from just after the spawn until ready: {} samples (query hotspots){}", d.samples.len(), crate::probe::stacks::stacks_how(&d))
                 }
                 Some(Err(e)) => format!("native stacks failed: {}", e.message),
-                None => crate::etw::no_stacks().into(),
+                None => crate::probe::stacks::no_stacks().into(),
             };
             let mut meta_values = json!(values);
             if let Some(span) = &launch_span {

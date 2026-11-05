@@ -6,8 +6,8 @@
 //! Needs SeSystemProfilePrivilege, which only administrators hold, so it runs in the helper (§13.4).
 //! Samples of other processes are dropped as they arrive; the idle loop never leaves the kernel.
 
-use super::session::{self, Handler, Running};
-use super::{Deep, Module};
+use super::etw::{self, Handler, Running};
+use super::stacks::{Deep, Module};
 use crate::model::{Error, Result};
 use std::collections::{HashMap, HashSet};
 use windows_sys::Win32::System::Diagnostics::Etw::*;
@@ -50,7 +50,7 @@ impl Raised {
 /// strobe had raised it goes back to Windows' own.
 impl Drop for Raised {
     fn drop(&mut self) {
-        if interval() == Some(INTERVAL_100NS) && !session::sessions().iter().any(|n| n.starts_with("strobe-stacks-")) {
+        if interval() == Some(INTERVAL_100NS) && !etw::sessions().iter().any(|n| n.starts_with("strobe-stacks-")) {
             let _ = set_interval(if self.0 == INTERVAL_100NS { DEFAULT_100NS } else { self.0 });
         }
     }
@@ -62,19 +62,19 @@ impl Capture {
         enable_privilege("SeSystemProfilePrivilege")?;
         // A helper that died while sampling left its session running and the interval raised: the
         // session is stopped and the interval put back first, so it is not taken for the system's.
-        session::reap();
+        etw::reap();
         let raised = Raised::to(INTERVAL_100NS)?;
         let pids: HashSet<u32> = crate::host::tree_pids(root).into_iter().collect();
         if pids.is_empty() {
             return Err(Error::msg(format!("process {root} is not running")));
         }
-        let cfg = session::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512), flush_ms: 0 };
+        let cfg = etw::Config { kind: "stacks", kernel: FLAG_PROCESS | FLAG_IMAGE_LOAD | FLAG_PROFILE, providers: Vec::new(), buffer_kb: 1024, buffers: (64, 512), flush_ms: 0 };
         let t0 = crate::host::now_ns();
         let setup = |h: CONTROLTRACE_HANDLE| -> Result<()> {
-            let ids = [CLASSIC_EVENT_ID { EventGuid: session::guid(PERFINFO), Type: SAMPLED_PROFILE, Reserved: [0; 7] }];
+            let ids = [CLASSIC_EVENT_ID { EventGuid: etw::guid(PERFINFO), Type: SAMPLED_PROFILE, Reserved: [0; 7] }];
             let rc = unsafe { TraceSetInformation(h, TraceStackTracingInfo, ids.as_ptr() as *const _, std::mem::size_of_val(&ids) as u32) };
             if rc != 0 {
-                return Err(Error::msg(format!("stack walking: {}", session::win_error(rc))));
+                return Err(Error::msg(format!("stack walking: {}", etw::win_error(rc))));
             }
             Ok(())
         };
@@ -95,7 +95,7 @@ impl Capture {
     }
 }
 
-/// After a dead strobe's sampled-stack session was stopped and none remains (`session::reap`): the
+/// After a dead strobe's sampled-stack session was stopped and none remains (`etw::reap`): the
 /// interval it raised goes back to Windows' own, unless something else has changed it since.
 pub fn reset_interval() {
     if interval() == Some(INTERVAL_100NS) {
@@ -115,7 +115,7 @@ fn set_interval(v: u32) -> Result<()> {
     let i = TRACE_PROFILE_INTERVAL { Source: 0, Interval: v };
     let rc = unsafe { TraceSetInformation(CONTROLTRACE_HANDLE { Value: 0 }, TraceSampledProfileIntervalInfo, &i as *const _ as *const _, std::mem::size_of_val(&i) as u32) };
     if rc != 0 {
-        return Err(Error::msg(format!("set the profile interval: {}", session::win_error(rc))));
+        return Err(Error::msg(format!("set the profile interval: {}", etw::win_error(rc))));
     }
     Ok(())
 }
@@ -161,13 +161,13 @@ const KERNEL: u64 = 0xFFFF_8000_0000_0000;
 impl Sampler {
     pub fn new(pids: HashSet<u32>) -> Sampler {
         Sampler {
-            guids: [session::guid(STACKWALK), session::guid(IMAGE), session::guid(PROCESS)],
+            guids: [etw::guid(STACKWALK), etw::guid(IMAGE), etw::guid(PROCESS)],
             pids,
             pending: HashMap::new(),
             samples: Vec::with_capacity(1 << 16),
             images: Vec::new(),
             seen: HashSet::new(),
-            freq: session::qpc_freq(),
+            freq: etw::qpc_freq(),
         }
     }
 }
@@ -186,8 +186,8 @@ impl Handler for Sampler {
     fn event(&mut self, e: &EVENT_RECORD) {
         let g = &e.EventHeader.ProviderId;
         let op = e.EventHeader.EventDescriptor.Opcode;
-        let d = session::payload(e);
-        if session::same(g, &self.guids[0]) && op == 32 {
+        let d = etw::payload(e);
+        if etw::same(g, &self.guids[0]) && op == 32 {
             let (ts, pid, tid) = (u64_at(d, 0), u32_at(d, 8), u32_at(d, 12));
             if !self.pids.contains(&pid) {
                 return;
@@ -211,14 +211,14 @@ impl Handler for Sampler {
                     self.samples.push((ts, pid, tid, cpu, frames));
                 }
             }
-        } else if session::same(g, &self.guids[1]) && matches!(op, 10 | 3 | 4) {
+        } else if etw::same(g, &self.guids[1]) && matches!(op, 10 | 3 | 4) {
             let (base, size, pid) = (u64_at(d, 0), u64_at(d, 8), u32_at(d, 16));
             if (pid != 0 && !self.pids.contains(&pid)) || !self.seen.insert((pid, base)) {
                 return;
             }
             let name: Vec<u16> = d.get(56..).unwrap_or(&[]).as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes(*c)).take_while(|c| *c != 0).collect();
             self.images.push(Module { pid, base, size, path: String::from_utf16_lossy(&name) });
-        } else if session::same(g, &self.guids[2]) && matches!(op, 1 | 3) {
+        } else if etw::same(g, &self.guids[2]) && matches!(op, 1 | 3) {
             let (pid, parent) = (u32_at(d, 8), u32_at(d, 12));
             if self.pids.contains(&parent) {
                 self.pids.insert(pid);
@@ -236,7 +236,7 @@ impl Handler for Sampler {
                 stacks.push(frames);
                 next
             });
-            samples.push((session::ns(ts, self.freq), pid, tid, cpu, at));
+            samples.push((etw::ns(ts, self.freq), pid, tid, cpu, at));
         }
         let devices = dos_devices();
         let mut modules: Vec<Module> = self.images.into_iter().map(|m| Module { path: dos_path(&m.path, &devices), ..m }).collect();

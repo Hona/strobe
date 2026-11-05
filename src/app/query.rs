@@ -946,7 +946,7 @@ fn thread_timeline(dir: &Path, top: usize) -> Result<Output> {
 /// inputs strobe gave the app, and each input's latency to the frame that showed it (SPEC §7.4).
 fn native_frames(dir: &Path, top: usize) -> Result<Output> {
     let f = store::read_json(&dir.join("frames.json")).map_err(|_| Error::usage("this native recording has no frames: they come from bench blocks of a native target (--keep, or attribution)"))?;
-    let presents: crate::etw::Presents = {
+    let presents: crate::probe::present::Presents = {
         let path = dir.join("presents.json.gz");
         let mut text = String::new();
         std::io::Read::read_to_string(
@@ -956,27 +956,27 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
         serde_json::from_str(&text)?
     };
     let pids: Vec<u32> = f["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).collect();
-    let refresh = crate::etw::frames::refresh_ms(&presents.vsyncs, presents.t0_ns, presents.t1_ns, None);
-    let quiet = crate::etw::frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
+    let refresh = crate::probe::present::frames::refresh_ms(&presents.vsyncs, presents.t0_ns, presents.t1_ns, None);
+    let quiet = crate::probe::present::frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
     let mut text = String::new();
     let mut runs_json = Vec::new();
     let mut slow: Vec<(f64, String, &'static str)> = Vec::new();
     for (run, r) in f["runs"].as_object().into_iter().flatten() {
         let (t0, t1) = (r["t0_ns"].as_u64().unwrap_or(0), r["t1_ns"].as_u64().unwrap_or(0));
-        let shown = crate::etw::frames::from_presents(&presents.presents, &pids, t0, t1);
+        let shown = crate::probe::present::frames::from_presents(&presents.presents, &pids, t0, t1);
         let mut screens: Vec<u64> = shown.shown.iter().map(|s| s.screen_ns).collect();
         screens.sort_unstable();
         let mut gaps: Vec<f64> = screens.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
         gaps.sort_by(f64::total_cmp);
         let inputs = r["inputs"].as_array().cloned().unwrap_or_default();
         let kind = |k: &str| inputs.iter().filter(|i| i["kind"] == k).count();
-        let sent: Vec<crate::etw::frames::Sent> = inputs
+        let sent: Vec<crate::probe::present::frames::Sent> = inputs
             .iter()
             .filter(|i| i["kind"] == "discrete" || (i["kind"] == "scroll" && i["first"] == true))
-            .map(|i| crate::etw::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll" })
+            .map(|i| crate::probe::present::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll" })
             .collect();
         let changes: Vec<u64> = r["changes"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
-        let got = crate::etw::frames::reactions(&sent, &changes, &presents.presents, &pids, quiet);
+        let got = crate::probe::present::frames::reactions(&sent, &changes, &presents.presents, &pids, quiet);
         slow.extend(got.interaction.iter().map(|ms| (*ms, run.clone(), "input")));
         slow.extend(got.scroll.iter().map(|ms| (*ms, run.clone(), "scroll")));
         text += &format!(
@@ -1100,9 +1100,9 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
         out.text += &format!("! Unresolved: {:.1}% of samples have no symbol ({what}): {}\n", 100.0 - share, missing.join(", "));
     }
     // Sampled by strobe itself without the helper: how, and what it cost the threads.
-    let deep: Option<crate::etw::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
+    let deep: Option<crate::probe::stacks::Deep> = std::fs::File::open(dir.join("deep.json.gz")).ok().and_then(|f| serde_json::from_reader(std::io::BufReader::new(flate2::read::GzDecoder::new(f))).ok());
     if let Some(d) = deep.filter(|d| d.suspend.is_some()) {
-        out.text += &format!("i native stacks{}\n", crate::etw::stacks_how(&d));
+        out.text += &format!("i native stacks{}\n", crate::probe::stacks::stacks_how(&d));
         out.json["suspend"] = json!(d.suspend);
     }
     Ok(out)

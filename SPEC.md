@@ -196,7 +196,12 @@ driver/         the bench file's `page`: over CDP, or a native app's accessibili
                 message loop (native.rs)
 probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
                 census.rs, coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
-                helper.rs
+                stacks.rs (native stacks: `Deep`, one sampler per OS: kernel_profile.rs in the helper,
+                suspend.rs on Windows, perf.rs on Linux, sample.rs on macOS), etw.rs (ETW sessions),
+                helper.rs (the deep-mode helper, §13.4), present/ (what reached the screen, §7.2:
+                windows.rs ETW present events, sck.rs ScreenCaptureKit, xpresent.rs X11 Present,
+                frames.rs frame metrics). The helper runs present and stack sessions, and both use
+                its access, so they live in one backend.
 heapsnap.rs     V8 heap snapshots: streaming parse, dominators, classes, retainer paths, diff, leaks
 metrics.rs      a block's trace → metric values
 engine/         trace_processor: the only place that runs it (§15)
@@ -757,7 +762,7 @@ What strobe reads from a native app (§13.7), per run:
     of a block's inputs like that refuses `interaction.*` (`AmbiguousInteraction`). No reacting input
     or no shown frame refuses it (`NoPresentSource`, with the reason), as does a block without
     present events.
-  - It is testable: `etw::frames::reactions` takes the posted inputs, the change times and the
+  - It is testable: `probe::present::frames::reactions` takes the posted inputs, the change times and the
     presents, all on the host clock, and `query <rec> frames` shows per run which inputs counted and
     why the others did not.
 - Every metric a native target cannot measure is listed refused with its reason, never dropped.
@@ -2592,7 +2597,8 @@ As built (Windows):
   result, and the profile interval goes back at once.
 - **Which helper.** Each build carries two ids from `build.rs`: `STROBE_BUILD_ID` (every source file)
   and `STROBE_HELPER_PROTOCOL` (the sources of the helper's operations and what they return,
-  `src/etw/`, carriage returns left out so CRLF and LF checkouts agree). The client's first request
+  `probe/{helper,etw,kernel_profile,stacks}.rs` and `probe/present/{mod,windows}.rs`, carriage
+  returns left out so CRLF and LF checkouts agree). The client's first request
   is `hello`, and it refuses a helper whose protocol id is not its own ("the installed deep-mode
   helper is another build … run strobe up"): `strobe update` or a build of another commit of the
   same version may have left an older copy installed. Builds that changed other files keep using the

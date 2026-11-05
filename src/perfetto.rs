@@ -632,7 +632,7 @@ impl Builder {
     /// OS present events: every present by process, the app's frames on screen and their
     /// intervals, and each display's vertical blanks.
     fn presents(&mut self, dir: &Path, meta: &Value) {
-        let Some(p) = read_gz::<crate::etw::Presents>(&dir.join("presents.json.gz")) else { return };
+        let Some(p) = read_gz::<crate::probe::present::Presents>(&dir.join("presents.json.gz")) else { return };
         let app: HashSet<u32> = store::read_json(&dir.join("frames.json"))
             .ok()
             .and_then(|f| f["pids"].as_array().cloned())
@@ -643,7 +643,7 @@ impl Builder {
             .collect();
         let group = self.track("OS presents", 20, None);
         let mut shown: Vec<u64> = Vec::new();
-        let mut by_pid: BTreeMap<u32, Vec<&crate::etw::Present>> = BTreeMap::new();
+        let mut by_pid: BTreeMap<u32, Vec<&crate::probe::present::Present>> = BTreeMap::new();
         for x in &p.presents {
             by_pid.entry(x.pid).or_default().push(x);
         }
@@ -857,7 +857,7 @@ impl Builder {
                 return;
             }
         };
-        let mut modules: HashMap<u32, Vec<&crate::etw::Module>> = HashMap::new();
+        let mut modules: HashMap<u32, Vec<&crate::probe::stacks::Module>> = HashMap::new();
         for m in &deep.modules {
             modules.entry(m.pid).or_default().push(m);
         }
@@ -865,7 +865,7 @@ impl Builder {
             v.sort_by_key(|m| m.base);
         }
         let kernel = crate::symbol::KERNEL;
-        let find = |pid: u32, a: u64| -> Option<&crate::etw::Module> {
+        let find = |pid: u32, a: u64| -> Option<&crate::probe::stacks::Module> {
             let list = modules.get(&if a >= kernel { 0 } else { pid })?;
             let i = list.partition_point(|m| m.base <= a).checked_sub(1)?;
             let m = list[i];
@@ -914,7 +914,7 @@ impl Builder {
             self.built.notes.push("native samples carry no times (macOS sample): they all stand at the capture's start; the flame graph is whole, the timeline is not".into());
         }
         if deep.suspend.is_some() {
-            self.built.notes.push(format!("native stacks{}", crate::etw::stacks_how(&deep)));
+            self.built.notes.push(format!("native stacks{}", crate::probe::stacks::stacks_how(&deep)));
         }
         self.out.extend_from_slice(&st.out);
     }

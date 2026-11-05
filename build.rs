@@ -10,7 +10,7 @@ use std::process::Command;
 
 const SOURCES: &[&str] = &["src", "sdk/bench/src", "viewer", "skill", "calibration", "Cargo.toml", "Cargo.lock", "build.rs"];
 /// What the helper runs and returns: its requests, the present and stack sessions, `Presents` and `Deep`.
-const HELPER_SOURCES: &[&str] = &["src/etw"];
+const HELPER_SOURCES: &[&str] = &["src/probe/helper.rs", "src/probe/etw.rs", "src/probe/kernel_profile.rs", "src/probe/stacks.rs", "src/probe/present/mod.rs", "src/probe/present/windows.rs"];
 
 /// FNV-1a, 64 bits: stable across Rust releases, unlike the standard library's hasher.
 fn fnv(h: &mut u64, bytes: &[u8]) {

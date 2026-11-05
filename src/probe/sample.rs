@@ -10,7 +10,7 @@
 //! in `dropped`; a thread preempted while runnable in user code still counts. Samples carry no time
 //! (`untimed`), and processes started after the capture began are not sampled.
 
-use crate::etw::{Deep, Module};
+use crate::probe::stacks::{Deep, Module};
 use crate::model::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
 use std::process::{Child, Command, Stdio};

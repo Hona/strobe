@@ -5,9 +5,10 @@
 
 use super::{Output, fmt, progress};
 use crate::cli::{Args, duration_ms};
-use crate::etw::{self, frames};
 use crate::host;
 use crate::model::{Error, Result};
+use crate::probe::present::{self, frames};
+use crate::probe::stacks::StackCapture;
 use crate::probe::{self, wakes};
 use crate::store;
 use serde_json::{Value, json};
@@ -58,7 +59,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
     if deep {
-        let cap = etw::StackCapture::start_with(root, args.get("probes") == Some("stacks-unprivileged"))?;
+        let cap = StackCapture::start_with(root, args.get("probes") == Some("stacks-unprivileged"))?;
         progress(format!("sampling native stacks of {name} ({root}) for {}", fmt::ms_duration(for_ms)));
         std::thread::sleep(Duration::from_millis(for_ms));
         let d = cap.stop()?;
@@ -80,7 +81,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         );
         return Ok(Output::new(text, meta));
     }
-    let presents = etw::PresentCapture::start().map(|mut p| {
+    let presents = present::PresentCapture::start().map(|mut p| {
         p.track(&host::tree_pids(root));
         p
     });

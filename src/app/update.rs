@@ -103,7 +103,7 @@ pub fn run(args: &Args) -> Result<Output> {
         let new = dir.join(exe("strobe"));
         let mut skip = vec!["calibrate"];
         #[cfg(windows)]
-        if !crate::etw::access().helper {
+        if !crate::probe::present::access().helper {
             skip.push("deep");
         }
         #[cfg(not(windows))]

@@ -23,6 +23,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod block;
 mod launch;
 mod native;
 pub mod plan;
@@ -2717,7 +2718,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let token = id.trim_start_matches("rec_").to_string();
         let mut driver = Driver::new(page.clone(), token.clone());
         driver.pixels = x.pixels.clone();
-        let current = RefCell::new(String::new());
+        // This run's `count.<name>` values (the bench file's `ctx.count` and the page's counter global)
+        // and the run's key, which names its phase marks.
+        let hooks = block::Hooks::default();
         // TaskDuration (ms), then WORK_PARTS: cumulative per document (`Performance.enable` comes before the runs).
         let counters = || -> [f64; 6] {
             let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
@@ -2731,16 +2734,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // A run that loads a page (`goto`) starts the counters again in the new document: what the
         // departing document did is read just before it goes and carried into the run's totals.
         let carried = RefCell::new([0.0f64; 6]);
-        // This run's `count.<name>` values: the bench file's `ctx.count` and the page's counter global.
-        let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
         let page_counts =
             || -> BTreeMap<String, f64> { page.eval("JSON.stringify(globalThis.__strobeCounts ?? {})").ok().and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok())).unwrap_or_default() };
-        let add_counts = |from: BTreeMap<String, f64>| {
-            let mut c = counts.borrow_mut();
-            for (k, n) in from {
-                *c.entry(k).or_default() += n;
-            }
-        };
         // This run's canvas frame times, one list per document it showed (a page load starts a new clock).
         let canvas_docs: RefCell<Vec<Vec<f64>>> = RefCell::new(Vec::new());
         let take_canvas = || {
@@ -2759,14 +2754,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 "driver" => {
                     let call = a["call"].as_str().unwrap_or("");
                     let args = a["args"].as_array().cloned().unwrap_or_default();
-                    if call == "goto" && !current.borrow().is_empty() {
+                    if call == "goto" && hooks.in_run() {
                         let before = counters();
                         let mut c = carried.borrow_mut();
                         for (sum, v) in c.iter_mut().zip(before) {
                             *sum += v;
                         }
                         if !counted.is_empty() {
-                            add_counts(page_counts());
+                            hooks.add(&page_counts());
                         }
                         take_canvas();
                     }
@@ -2782,17 +2777,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     r
                 }
                 "count" => {
-                    if !current.borrow().is_empty() {
-                        add_counts(BTreeMap::from([(a["name"].as_str().unwrap_or("").to_string(), a["n"].as_f64().unwrap_or(1.0))]));
-                    }
+                    hooks.count(a);
                     Ok(Value::Bool(true))
                 }
+                // A page's phases are marks in its own trace, read from there with the run's frames.
                 "phase" => {
-                    let name: String = a["name"].as_str().unwrap_or("phase").chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-                    let edge = a["edge"].as_str().unwrap_or("start");
-                    let key = current.borrow().clone();
-                    if !key.is_empty() {
-                        driver.mark(&format!("{key}:phase:{name}:{edge}"))?;
+                    if let Some(key) = hooks.phase_key(a) {
+                        driver.mark(&key)?;
                     }
                     Ok(Value::Bool(true))
                 }
@@ -2864,9 +2855,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         .collect();
         let tracing = if set == Set::Memory { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
         let mem_dir = if set == Set::Memory { Some(store::recording_dir(&id)?) } else { None };
+        // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
-        // A leak run measures 2 × N runs: N to S1 and N more to S2.
-        let measured_runs = if set == Set::Memory { 2 * n } else { n };
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
         let sampler = probe::os::Sampler::start(browser.pid);
         let (sampled, runner_pid) = (Instant::now(), ctx.runner.pid());
@@ -2888,7 +2878,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
-            *current.borrow_mut() = key.to_string();
+            hooks.begin(key);
             // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
             // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between. One read of the
             // target's processes at each end of the run gives its cycles, times and roles.
@@ -2910,7 +2900,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let mut roles = process_roles(&browser);
             let (procs_start, cyc0, tsc0, cpu0) = read();
             *carried.borrow_mut() = [0.0; 6];
-            counts.borrow_mut().clear();
             if !counted.is_empty() {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
             }
@@ -2939,16 +2928,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
-                add_counts(page_counts());
+                hooks.add(&page_counts());
             }
             take_canvas();
             run_canvas.borrow_mut().push(canvas_docs.take());
             let index = run_counts.borrow().len();
-            run_counts.borrow_mut().push(counts.borrow().clone());
+            run_counts.borrow_mut().push(hooks.counts());
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
-            current.borrow_mut().clear();
+            hooks.end();
             // A key or button the run left held would be down in the next one: let go, outside its span.
             driver.release_all()?;
             if s.reset {
@@ -2981,13 +2970,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // blocks start their profiler at the steady point, so they measure the runs after it.
         let mut runs: Vec<Run> = Vec::new();
         let mut nodes_all = Vec::new();
-        let mut first: Option<usize> = None;
-        let mut unsteady = false;
-        while first.is_none_or(|f| runs.len() < f + measured_runs) {
+        let mut warmup = block::Warmup::new(x);
+        while warmup.more(runs.len()) {
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
             runs.push(run_once(&format!("run:{i}"))?);
-            if let Some(f) = first {
+            if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
                 if let Some(dir) = &mem_dir {
                     let mut c = probe::census::take(&browser, &page);
@@ -3006,17 +2994,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 }
                 continue;
             }
-            // Within 5%, or within 1 ms of main-thread time: an idle run does about 3 ms, where 5% is noise.
-            let steady = i >= 1 && {
-                let (a, b) = (runs[i - 1].task, runs[i].task);
-                a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
-            };
-            // `--check` measures the first run: it asks whether a case works, not what it costs.
-            if x.untimed {
-                first = Some(0);
-            } else if steady || i >= MAX_WARMUP {
-                unsteady = !steady;
-                first = Some(if set == Set::Attribution || set == Set::Memory || !steady { i + 1 } else { i - 1 });
+            // The work that must hold steady is the renderer's main-thread time. `--check` measures the
+            // first run: it asks whether a case works, not what it costs.
+            if warmup.after(&runs.iter().map(|r| r.task).collect::<Vec<_>>()) && !x.untimed {
                 if set == Set::Attribution {
                     probe::cpu::start(&page)?;
                     probe::alloc::start(&page)?;
@@ -3030,7 +3010,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 }
             }
         }
-        let first = first.unwrap_or(0);
+        let unsteady = warmup.unsteady();
+        let first = warmup.first().unwrap_or(0);
         // Warmup and measured runs interleave with the steadiness check: split the loop by run.
         // `+ 0.0`: an empty f64 sum is -0.0, which would print as "-0.0s".
         let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;

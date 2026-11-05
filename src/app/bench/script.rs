@@ -196,23 +196,16 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let heap_mb = || -> Result<f64> { Ok(host.borrow_mut().request(json!({ "op": "heap" }), Duration::from_secs(120))?.as_f64().unwrap_or(f64::NAN) / (1024.0 * 1024.0)) };
     steps.push(("launch".into(), launched.elapsed().as_secs_f64() * 1e3));
     let pid = host.borrow().pid();
-    let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
-    let counting = std::cell::Cell::new(false);
-    let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
+    let hooks = super::block::Hooks::default();
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "call" => host.borrow_mut().request(json!({ "name": a["name"], "args": a["args"] }), Duration::from_secs(600)),
             "count" => {
-                if counting.get() {
-                    *counts.borrow_mut().entry(a["name"].as_str().unwrap_or("").to_string()).or_default() += a["n"].as_f64().unwrap_or(1.0);
-                }
+                hooks.count(a);
                 Ok(Value::Bool(true))
             }
             "phase" => {
-                if counting.get() {
-                    let name = a["name"].as_str().unwrap_or("phase");
-                    marks.borrow_mut().push((format!("run:phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
-                }
+                hooks.phase(a);
                 Ok(Value::Bool(true))
             }
             "driver" => Err(Error::msg("a script target has no page: call its exports with ctx.call(name, ...args)")),
@@ -228,15 +221,13 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
-        let measured_runs = x.runs;
         let mut runs: Vec<ScriptRun> = Vec::new();
         let mut cost = SelfCost::new(ctx.runner.pid());
-        let mut first: Option<usize> = None;
-        while first.is_none_or(|f| runs.len() < f + measured_runs) {
+        // Steady once two runs cost the same CPU (SPEC §9.2).
+        let mut warmup = super::block::Warmup::new(x);
+        while warmup.more(runs.len()) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
-            counts.borrow_mut().clear();
-            marks.borrow_mut().clear();
-            counting.set(true);
+            hooks.begin(&format!("run:{}", runs.len()));
             let c0 = cpu(pid);
             cost.start();
             let t0 = Instant::now();
@@ -244,27 +235,15 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             let wall = t0.elapsed().as_secs_f64() * 1e3;
             cost.end();
             let used = cpu_ms(c0, cpu(pid), wall);
-            counting.set(false);
+            hooks.end();
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
-            runs.push((wall, used, counts.borrow().clone(), retained, marks.borrow_mut().drain(..).collect()));
+            runs.push((wall, used, hooks.counts(), retained, hooks.take_marks()));
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             }
-            let i = runs.len() - 1;
-            if x.untimed {
-                first = Some(0);
-            } else if first.is_none() {
-                // Steady once two runs cost the same CPU, within 5% or 1 ms, as for pages (SPEC §9.2).
-                let steady = i >= 1 && {
-                    let (a, b) = (runs[i - 1].1, runs[i].1);
-                    (a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05)
-                };
-                if steady || i >= MAX_WARMUP {
-                    first = Some(if steady && set != Set::Attribution { i - 1 } else { i + 1 });
-                }
-            }
+            warmup.after(&runs.iter().map(|r| r.1).collect::<Vec<_>>());
         }
-        let first = first.unwrap_or(0);
+        let first = warmup.first().unwrap_or(0);
         let (strobe_pct, runner_pct) = cost.share(first);
         steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
         let measured = &runs[first..];
@@ -276,14 +255,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         if heap {
             extra.insert("js.heap.retained".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.3)).collect());
         }
-        for name in s.metrics.iter().chain(std::iter::once(&s.primary)).filter(|m| m.starts_with("count.")) {
-            let counter = name.trim_start_matches("count.");
-            extra.insert(name.clone(), measured.iter().enumerate().map(|(j, r)| (key(j), r.2.get(counter).copied().unwrap_or(0.0))).collect());
-        }
-        for name in s.metrics.iter().chain(std::iter::once(&s.primary)).filter_map(|m| m.strip_prefix("phase.")) {
-            extra.insert(format!("phase.{name}"), measured.iter().enumerate().map(|(j, r)| (key(j), super::phase_ms(&r.4, name))).filter(|(_, x)| x.is_finite()).collect());
-        }
+        let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.2, r.4.as_slice())).collect();
+        extra.extend(super::block::per_run_hooks(s, &key, &hooked));
         let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
+        if warmup.unsteady() {
+            values.insert("warmup.unsteady".into(), 1.0);
+        }
         let private_mb = host::process_tree(pid).iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);

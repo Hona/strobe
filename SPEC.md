@@ -3561,7 +3561,11 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   "the page ran headless"); `ctx.waitForLine` (native: output, as native blocks now read it, or log
   files under the home; checked with a fake tray app's `tick` lines and a log glob); a page launch's
   `until` in the shared grammar (`role=heading text="Later"` timed a heading that appears after
-  1.5 s at 1533 ms, headless); `look app:<id> --build`. Each block's `overhead` (§19); not yet: a
+  1.5 s at 1533 ms, headless); `look app:<id> --build`. Page, native and script blocks share one
+  warmup (`block::Warmup`: steady within 5% or 1 ms, the steady pair measured in timing blocks, a
+  leak run's 2 × N) and one way of serving `ctx.count` and `ctx.phase` and turning them into
+  `count.*` and `phase.*` (`block::Hooks`); a script block now flags `warmup.unsteady` as the others
+  do. Their launch, probes, `expect` and attribution stay each target's own. Each block's `overhead` (§19); not yet: a
   track of strobe's own CPU over time in `perfetto.pftrace` (it needs the sampler to sample strobe
   too).
 

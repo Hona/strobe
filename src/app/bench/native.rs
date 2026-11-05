@@ -242,9 +242,7 @@ fn runs(
         }
     }
     let stacks = (set == Set::Attribution && crate::etw::stacks_available()).then(|| crate::etw::StackCapture::start(n.pid));
-    let current = RefCell::new(String::new());
-    let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
-    let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
+    let hooks = super::block::Hooks::default();
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
     let output = n.output.take();
@@ -264,17 +262,11 @@ fn runs(
                 session.dispatch(call, &args, &presents, pixels.as_deref())
             }
             "count" => {
-                if !current.borrow().is_empty() {
-                    *counts.borrow_mut().entry(a["name"].as_str().unwrap_or("").to_string()).or_default() += a["n"].as_f64().unwrap_or(1.0);
-                }
+                hooks.count(a);
                 Ok(Value::Bool(true))
             }
             "phase" => {
-                let key = current.borrow().clone();
-                if !key.is_empty() {
-                    let name: String = a["name"].as_str().unwrap_or("phase").chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-                    marks.borrow_mut().push((format!("{key}:phase:{name}:{}", a["edge"].as_str().unwrap_or("start")), host::now_ns()));
-                }
+                hooks.phase(a);
                 Ok(Value::Bool(true))
             }
             other => Err(Error::msg(format!("unknown runner request {other}"))),
@@ -315,21 +307,17 @@ fn runs(
     let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
     let run_timeout = s.run_timeout();
     let mut runs: Vec<Run> = Vec::new();
-    let mut first: Option<usize> = None;
-    let mut unsteady = false;
-    // A leak run (`--probes memory`, SPEC §8.6): 2 × N runs after warmup, the processes' memory read
-    // before the first and after each, between runs.
+    // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
+    // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
+    let mut warmup = super::block::Warmup::new(x);
     let leak = set == Set::Memory;
-    let measured_runs = if leak { 2 * x.runs } else { x.runs };
     let mut readings: Vec<memory::Reading> = Vec::new();
-    while first.is_none_or(|f| runs.len() < f + measured_runs) {
+    while warmup.more(runs.len()) {
         let i = runs.len();
         let began = Instant::now();
         if !windowless {
             n.raise();
         }
-        counts.borrow_mut().clear();
-        marks.borrow_mut().clear();
         // One read of the app's processes per end of a run: what the session follows, what the
         // snapshot covers, and (at the end) the cycles.
         let pids = n.pids();
@@ -337,7 +325,7 @@ fn runs(
             se.set_pids(&pids);
             se.take_log();
         }
-        *current.borrow_mut() = format!("run:{i}");
+        hooks.begin(&format!("run:{i}"));
         let snap0 = Snapshot::take(&pids);
         let c0 = cycles(n);
         cost.start();
@@ -350,12 +338,12 @@ fn runs(
         let procs1 = n.processes();
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
         let snap1 = Snapshot::take(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>());
-        current.borrow_mut().clear();
+        hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
-        log.marks.extend(marks.borrow_mut().drain(..));
+        log.marks.extend(hooks.take_marks());
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: counts.borrow().clone(), log, changes: Vec::new(), elements, t0, t1, total: 0.0 });
+        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), elements, t0, t1, total: 0.0 });
         // A key or button the run left held would be down in the next one.
         if let Some(se) = drive.session.get() {
             se.release_all();
@@ -369,27 +357,15 @@ fn runs(
             }
         }
         runs[i].total = began.elapsed().as_secs_f64() * 1e3;
-        if leak && first.is_some() {
-            readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - first.unwrap_or(0))));
+        if let (true, Some(f)) = (leak, warmup.first()) {
+            readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - f)));
         }
-        if x.untimed {
-            first = Some(0);
-        } else if first.is_none() {
-            // Steady once two runs do the same work, within 5% or 1 ms, as for pages (SPEC §9.1).
-            let steady = i >= 1 && {
-                let (a, b) = (runs[i - 1].cpu, runs[i].cpu);
-                a.is_finite() && b.is_finite() && ((a - b).abs() <= 1.0 || (a.max(b) > 0.0 && (a - b).abs() / a.max(b) <= 0.05))
-            };
-            if steady || i >= MAX_WARMUP {
-                unsteady = !steady;
-                first = Some(if steady && set != Set::Attribution && !leak { i - 1 } else { i + 1 });
-                if leak {
-                    readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
-                }
-            }
+        if warmup.after(&runs.iter().map(|r| r.cpu).collect::<Vec<_>>()) && leak {
+            readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
         }
     }
-    let first = first.unwrap_or(0);
+    let unsteady = warmup.unsteady();
+    let first = warmup.first().unwrap_or(0);
     let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
     steps.push(("warmup".into(), warm_ms));
     steps.push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
@@ -492,15 +468,9 @@ fn runs(
     if !gpu_3d.is_empty() {
         extra.insert("gpu.process.3d".into(), gpu_3d);
     }
-    // The bench file's `ctx.count`.
-    let counters: std::collections::BTreeSet<String> = std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
-    for name in &counters {
-        extra.insert(format!("count.{name}"), per_run(&|r: &Run| r.counts.get(name).copied().unwrap_or(0.0)));
-    }
-    // `phase.<name>`: the run's phase spans, from strobe's own marks.
-    for name in std::iter::once(&s.primary).chain(&s.metrics).filter_map(|m| m.strip_prefix("phase.")) {
-        extra.insert(format!("phase.{name}"), per_run(&|r: &Run| super::phase_ms(&r.log.marks, name)));
-    }
+    // The bench file's `ctx.count`, and `phase.<name>` from strobe's own marks.
+    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice())).collect();
+    extra.extend(super::block::per_run_hooks(s, &key, &hooked));
     // Drags: the moves strobe posted, beside the frames the app drew.
     if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
         extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));

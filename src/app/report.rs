@@ -117,16 +117,9 @@ pub fn run(args: &Args) -> Result<Output> {
     Ok(Output::new(format!("{path} · {size}\n"), json!({ "path": path, "bytes": body.len() })))
 }
 
-/// Writes beside the target and renames over it once flushed, so a reader never sees half a report.
+/// Writes a report whole or not at all (`store::write_atomic`), so a reader never sees half a report.
 pub(super) fn write_whole(path: &std::path::Path, body: &[u8]) -> Result<()> {
-    use std::io::Write;
-    let tmp = path.with_extension(format!("{}.tmp", path.extension().and_then(|e| e.to_str()).unwrap_or("")));
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(body)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path)?;
-    Ok(())
+    store::write_atomic(path, body)
 }
 
 /// The "why" of each series, one series at a time: its attribution recordings (base and head) as the

@@ -1838,16 +1838,26 @@ session.
 
 `a..b` works with `hotspots`, `alloc`, `layout`, `style`, `threads`, `frames`, `summary`, `memory`
 and `heap`; `query exp_… <view>` runs the same views on each series' base and head attribution
-recordings. Every row is per measured run on each side (each side's own run count), so two
-launches with different run counts compare. Two recordings are two launches, often two builds in two
-folders: rows match by name and a portable location (the last three steps of a file's path, a script
-URL without origin, query and bundler hash), never by line. The weighted views (`hotspots`, native
-samples too, `alloc`, `layout`, by `--by function|file|package`) rank rows by the size of their
-change and give, per function, the stacks where the change concentrated (each ≥ 5% of the row's
-change). Sampled views carry each change's 95% interval from the two sides' sample counts (each
-side's variance v²/n) and mark `~` a change inside it; the interval covers sampling only, not
-launch-to-launch variation, and the text says so. Traced views (`layout`, `style`) are exact counts
-over the runs. `frames`, `threads` and `summary` of attribution recordings say their timing is
+recordings. Every row is per measured run on each side (each side's own run count) when both sides
+know their runs; otherwise neither side is divided and the header says per recording. Native samples
+without times (macOS `sample`) cover the whole capture, launch, warmups and resets included: never
+divided by runs, and they name no insight movers. Two recordings are two launches, often two builds
+in two checkouts: rows match by name and a portable location, never by line. The location starts at
+a step no checkout names: a monorepo's `packages/`, `crates/` or `apps/`, a toolchain's `library/`,
+else the last `src/` or `lib/`; a dependency from its package (`node_modules/…`, a cargo crate
+without its version or a build script's hash); a script URL without origin, query and bundler hash.
+The weighted views (`hotspots`, native samples too with `--thread` and `--phase`, `alloc`, `layout`,
+by `--by function|file|package`) rank rows by the size of their change and give, per function, the
+stacks where the change concentrated (each ≥ 5% of the row's change). Sampled views carry each
+change's 95% interval from sampling, from each stack's variance as its sampler gives it: Σ Δt² for
+CPU samples (each weighs the time to the next sample), the Horvitz-Thompson (s/p)²(1 − p) of V8's
+allocation sampling (an allocation of s bytes is sampled with p = 1 − e^(−s/B); one large
+allocation has almost none; without a sample list, w·B), n·interval² for native samples. A side with
+no sample counts two samples of the other side's variance, the line an exact binomial test draws
+for equal samples (0 against 5 reads as noise, 0 against 6 does not). `~` marks a change inside its
+interval; the interval covers sampling only, not launch-to-launch variation, and the text says so.
+Traced views (`layout`, `style`) are exact counts over the runs; trace slices that start together
+are read longest first, so nesting counts the outer one. `frames`, `threads` and `summary` of attribution recordings say their timing is
 perturbed (§1 rule 3) and that one recording per side has no interval. `threads` of a trace counts
 the task loop's tasks (`RunTask`) that started in each measured run, by process type and thread
 name: a thread's other tracks hold spans that overlap its tasks (animation frames, GC sweeping).
@@ -1867,8 +1877,8 @@ An experiment's HTML also carries, per series, the diff flame (`diff_tree`): CPU
 samples when the recordings have no JavaScript profile) and allocations as one call tree of both
 sides' stacks merged by portable frame, each node with its inclusive value per run on each side;
 nodes under 0.2% of the larger side's total, and past 3,000 nodes, are left out. The viewer draws it
-as an icicle (width the mean of both sides, red where head has more, green where it has less, click
-to zoom, 33 levels at a time). It also shows the rerun ledger as a banner when other experiments
+as an icicle (width the mean of both sides, red where head has more, green where it has less, grey
+in an A/A where a difference is variation, click to zoom, 33 levels at a time). It also shows the rerun ledger as a banner when other experiments
 compared the same variants (amber when the setup changed between them), the plan against what ran
 (pairs on the looks, series time, and the block time by step against the planned block), and a
 native series' memory by part, base → head.

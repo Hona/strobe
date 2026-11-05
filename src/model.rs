@@ -6,7 +6,7 @@ use std::fmt;
 /// An error with the exit code it maps to (SPEC §5.2) and an optional fix. A refusal (exit 4) also
 /// carries what refused it, typed: `refusal` is set exactly when `code` is 4 and it came from
 /// `Error::refused` or a `Refusal`.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Error {
     pub code: i32,
     pub message: String,

@@ -97,16 +97,9 @@ impl NativeStacks {
     }
 }
 
-/// A failure cached with its source, handed again to each view that asks (an `Error` is not `Clone`).
-fn again(e: &Error) -> Error {
-    let mut x = Error::msg(e.message.clone());
-    x.code = e.code;
-    x.hint = e.hint.clone();
-    x
-}
-
+/// A failure cached with its source, handed again to each view that asks.
 pub(super) fn cached<T>(r: &Result<T>) -> Result<&T> {
-    r.as_ref().map_err(again)
+    r.as_ref().map_err(Error::clone)
 }
 
 impl Rec {
@@ -206,7 +199,7 @@ impl Rec {
             }
             Err(e) => {
                 for p in todo {
-                    cache.insert(p, Err(again(&e)));
+                    cache.insert(p, Err(e.clone()));
                 }
             }
         }
@@ -218,7 +211,7 @@ impl Rec {
         }
         self.prefetch(&[p]);
         let cache = self.trace.lock().unwrap_or_else(|e| e.into_inner());
-        cache.get(&p).map(|r| r.as_ref().map(Arc::clone).map_err(again)).unwrap_or_else(|| Err(Error::msg("trace part missing")))
+        cache.get(&p).map(|r| r.as_ref().map(Arc::clone).map_err(Error::clone)).unwrap_or_else(|| Err(Error::msg("trace part missing")))
     }
 
     fn load_cpu(&self) -> Result<Stacks> {

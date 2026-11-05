@@ -2538,7 +2538,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).inspect(|b| restate_recording(ctx, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(s, b)).inspect(|b| restate_recording(ctx, b));
         let r = match reserve.map(host::reserve::Reserve::finish) {
             Some(report) => {
                 ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
@@ -2704,6 +2704,22 @@ fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     b.values.retain(|k, _| !drawn(k));
     for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| drawn(m)) {
         b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page ran headless (--headless), so nothing it drew reached a display")));
+    }
+    b
+}
+
+/// A declared `phase.<name>` that a block which measured its runs has no value for: no measured run
+/// entered the phase, so it is refused `NoPhase` rather than left without a value (native blocks say
+/// so themselves; page and script blocks did not).
+fn phase_state(s: &Series, mut b: Block) -> Block {
+    if b.values.is_empty() {
+        return b;
+    }
+    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("phase.")) {
+        if !b.values.get(m).is_some_and(|v| v.is_finite()) && !b.refused.contains_key(m) {
+            b.values.remove(m);
+            b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPhase, format!("{m}: no measured run entered phase(\"{}\")", &m["phase.".len()..])));
+        }
     }
     b
 }

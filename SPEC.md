@@ -3646,7 +3646,9 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   written), and `headless`; `display.*` is refused headless, and `gpu.vram`/`gpu.shared` when the
   headless browser drew in software. `OverheadBudget` warns for timed blocks only, once per series and
   part; a page's strobe cost spans its start and end marks. The MCP `bench` tool takes `blocks` and
-  `headless`; `result.v1.json` has `outcome`, `blocksPrimary`, `headless` and `overhead`.
+  `headless`; `result.v1.json` has `outcome`, `blocksPrimary`, `headless` and `overhead` (every
+  local result.json since `verdict_kind` validates: 198 on adais, 183 on air). Page and script blocks
+  refuse a declared `phase.<name>` no measured run entered (`NoPhase`), as native blocks did.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

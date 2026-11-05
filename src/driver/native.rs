@@ -45,6 +45,11 @@ mod imp {
     /// Quiet that counts as idle: no present and no accessibility change for this long.
     const IDLE_NS: u64 = 300_000_000;
 
+    /// The least time between two reads of the app's tree while a wait follows its changes: an app
+    /// that announces changes in a burst (an animation's every frame) is read at most once a frame,
+    /// not once per change, since each read costs the app's own accessibility provider work.
+    const REREAD: Duration = Duration::from_millis(16);
+
     pub struct Session {
         a11y: Box<dyn Accessibility>,
         poster: Poster,
@@ -179,20 +184,34 @@ mod imp {
             Ok(t)
         }
 
+        /// A read of the tree inside a wait: the first at once, each later one no sooner than
+        /// `REREAD` after the one before (never past `deadline`).
+        fn reread(&self, window: Option<&str>, last: &mut Option<Instant>, deadline: Instant) -> Result<Tree> {
+            if let Some(w) = last.map(|at| (at + REREAD).min(deadline)).and_then(|next| next.checked_duration_since(Instant::now())) {
+                std::thread::sleep(w);
+            }
+            *last = Some(Instant::now());
+            self.snapshot(window)
+        }
+
         /// The first visible element `sel` matches, waiting up to `timeout` for the app's tree to show
-        /// it (re-read on each change it announces, never on a timer). An app with no tree at all
-        /// says so.
+        /// it (re-read on each change it announces, never on a timer, except a placeholder tree:
+        /// `settle`). An app with no tree at all says so.
         fn find(&self, sel: &Selector, window: Option<&str>, timeout: Duration) -> Result<(Tree, usize)> {
             let deadline = Instant::now() + timeout;
+            let mut read = None;
             loop {
                 let seen = self.a11y.changes().count;
-                let tree = self.snapshot(window)?;
+                let tree = self.reread(window, &mut read, deadline)?;
                 if let Some(&i) = tree.find(sel).first() {
                     return Ok((tree, i));
                 }
                 if Instant::now() >= deadline {
-                    let why = if let Some(miss) = sel.text_misses(&tree) {
-                        format!("{miss} in {} s", timeout.as_secs())
+                    let secs = timeout.as_secs_f64();
+                    let why = if let Some(n) = sel.index_misses(&tree) {
+                        format!("only {n} visible element{} matched in {secs:.1} s, and index={} needs at least {}", if n == 1 { "" } else { "s" }, sel.index(), sel.index() + 1)
+                    } else if let Some(miss) = sel.text_misses(&tree) {
+                        format!("{miss} in {secs:.1} s")
                     } else if tree.nodes.len() <= tree.windows.len() {
                         format!(
                             "the app's windows expose no accessibility tree ({} element{}): strobe finds elements through it, so this app can be measured from outside only",
@@ -200,7 +219,7 @@ mod imp {
                             if tree.nodes.len() == 1 { "" } else { "s" }
                         )
                     } else {
-                        format!("nothing visible matched in {} s ({} elements in its windows)", timeout.as_secs(), tree.nodes.len())
+                        format!("nothing visible matched in {secs:.1} s ({} elements in its windows)", tree.nodes.len())
                     };
                     return Err(Error::timeout(format!("selector {:?}: {why}", sel.source)).hint("check the key with page.query(\"role=button\") or an accessibility inspector"));
                 }
@@ -280,6 +299,7 @@ mod imp {
         /// after `after`; returns when the quiet began.
         pub fn idle(&self, after: u64, t: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<u64> {
             let deadline = Instant::now() + t;
+            let first = self.a11y.changes().count;
             loop {
                 let c = self.a11y.changes();
                 let mut last = after.max(c.last_ns).max(self.last_input.get());
@@ -293,11 +313,55 @@ mod imp {
                     return Ok(last);
                 }
                 if Instant::now() >= deadline {
-                    return Err(Error::timeout(format!("idle: the app kept drawing or changing for {} s", t.as_secs())));
+                    return Err(self.busy(t, c.count - first, presents));
                 }
                 let wake = Instant::now() + Duration::from_nanos(quiet_at - now);
                 self.a11y.wait_change(c.count, wake.min(deadline));
             }
+        }
+
+        /// Why `idle` never saw the app quiet, with counts: the frames of the app that reached the
+        /// screen in the last second (from the block's present events, when it has them) and its
+        /// accessibility changes in the last second and over the whole wait.
+        fn busy(&self, t: Duration, changes: u64, presents: &RefCell<Option<PresentCapture>>) -> Error {
+            let now = host::now_ns();
+            let since = now.saturating_sub(1_000_000_000);
+            let recent = self.a11y.change_times().iter().filter(|&&c| c > since).count();
+            // Each step finds the next present after the last one found; a second of frames is at most a few hundred.
+            let frames = presents.borrow_mut().as_mut().map(|p| {
+                let (mut n, mut after) = (0usize, since);
+                while n < 1000 {
+                    match p.live(&self.pids.borrow(), after, Duration::ZERO) {
+                        Ok(v) if v.next_start_ns != 0 && v.next_start_ns <= now => {
+                            n += 1;
+                            after = v.next_start_ns;
+                        }
+                        _ => break,
+                    }
+                }
+                n
+            });
+            let input = self.last_input.get() > since;
+            let drew = frames.is_some_and(|f| f > 0);
+            let what = match (drew, recent > 0) {
+                (true, false) => "it kept drawing (an animation, a caret or a spinner) without changing its accessibility tree",
+                (false, true) => "its accessibility tree kept changing (a clock, a counter or a progress value)",
+                (true, true) => "it kept drawing and changing its accessibility tree",
+                (false, false) if frames.is_none() => "its accessibility tree went quiet only at the end, and this block has no present events to tell whether it kept drawing",
+                (false, false) => "it went quiet only at the end",
+            };
+            let counted = match frames {
+                Some(f) => format!("{f} frame{} reached the screen", if f == 1 { "" } else { "s" }),
+                None => "frames not counted (no present events)".to_string(),
+            };
+            Error::timeout(format!(
+                "idle: the app never went quiet for {} ms in {} s: {what}. In the last second {counted} and its tree changed {recent} time{} ({changes} changes over the wait){}",
+                IDLE_NS / 1_000_000,
+                t.as_secs(),
+                if recent == 1 { "" } else { "s" },
+                if input { "; strobe's own input came in that second too" } else { "" }
+            ))
+            .hint("wait for what the step brings instead (until: a selector), or stop what keeps the app busy in setup")
         }
 
         /// A launch's `until` selector: when strobe began the last read of the app's tree that lacked
@@ -323,26 +387,23 @@ mod imp {
 
         /// What the app's windows show: their names, then their visible open dialogs' and headings'
         /// names in tree order (at most 6). A provider that answers first with a placeholder root
-        /// (lazy, such as AccessKit's) gets up to `t` to build its tree.
+        /// (lazy, such as AccessKit's: `sparse`) gets up to `t` to build its tree; a full tree is read
+        /// once.
         pub fn screen(&self, t: Duration) -> Result<(Vec<String>, Vec<String>)> {
             let deadline = Instant::now() + t;
             let mut seen = self.a11y.changes().count;
             let mut tree = self.snapshot(None)?;
-            while tree.nodes.len() <= tree.windows.len() && Instant::now() < deadline {
-                self.a11y.wait_change(seen, deadline);
-                seen = self.a11y.changes().count;
-                tree = self.snapshot(None)?;
-            }
-            // AccessKit's first answer is a few nodes (Hex: 6 of over 100) and the rest comes a
-            // moment later, without a notification on macOS: read again until two reads 250 ms apart
-            // agree on the node count.
-            while Instant::now() < deadline {
+            // AccessKit's first answer is a few nodes (Hex: 6 of over 100) and the rest comes a moment
+            // later, without a notification on macOS: while the tree is a placeholder, read again on
+            // each change and every 250 ms, until it is not or two reads agree on a tree (a small app's
+            // whole tree is a few nodes).
+            while sparse(&tree) && Instant::now() < deadline {
                 self.a11y.wait_change(seen, (Instant::now() + Duration::from_millis(250)).min(deadline));
                 seen = self.a11y.changes().count;
                 let again = self.snapshot(None)?;
-                let settled = again.nodes.len() == tree.nodes.len();
+                let agreed = again.nodes.len() == tree.nodes.len() && again.nodes.len() > again.windows.len();
                 tree = again;
-                if settled {
+                if agreed {
                     break;
                 }
             }
@@ -484,8 +545,13 @@ mod imp {
         /// `find`, then until the element is enabled: a click on a disabled one does nothing.
         fn find_enabled(&self, sel: &Selector, window: Option<&str>, t: Duration) -> Result<(Tree, usize)> {
             let deadline = Instant::now() + t;
+            let mut read: Option<Instant> = None;
             loop {
                 let seen = self.a11y.changes().count;
+                if let Some(w) = read.map(|at| (at + REREAD).min(deadline)).and_then(|next| next.checked_duration_since(Instant::now())) {
+                    std::thread::sleep(w);
+                }
+                read = Some(Instant::now());
                 let (tree, i) = self.find(sel, window, deadline.saturating_duration_since(Instant::now()))?;
                 if tree.nodes[i].enabled {
                     return Ok((tree, i));
@@ -495,6 +561,27 @@ mod imp {
                     let what = Some(tree.key_path(i)).filter(|p| !p.is_empty()).unwrap_or_else(|| format!("{} {:?}", n.role_text, n.name));
                     return Err(Error::timeout(format!("selector {:?}: {what} stayed disabled for {} s, and a click on a disabled element does nothing", sel.source, t.as_secs()))
                         .hint("wait for what enables it, or pick an enabled element (page.query lists enabled)"));
+                }
+                self.a11y.wait_change(seen, deadline);
+            }
+        }
+
+        /// After `setValue`: waits up to a second (on the app's change events) for node `i` to hold
+        /// `want`, and fails when it does not, since a bench that set a value the app ignored measures
+        /// something else. A toolkit applies the write on its own turn, so it is read back from the app.
+        fn took(&self, i: usize, want: &str, sel: &Value) -> Result<()> {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let seen = self.a11y.changes().count;
+                let Some(got) = self.a11y.value(i)? else { return Ok(()) };
+                if same_value(want, &got) {
+                    return Ok(());
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::usage(format!(
+                        "page.act({sel}, \"setValue\", {{ value: {want:?} }}): the element still holds {got:?} a second later, so the app ignored the write or keeps the value in another form"
+                    ))
+                    .hint("check what it holds with page.query; a control that takes no accessibility writes takes typing (page.type), and a value it clamps or rounds is set as the value it shows"));
                 }
                 self.a11y.wait_change(seen, deadline);
             }
@@ -528,10 +615,17 @@ mod imp {
         }
     }
 
-    /// How long to wait for the next change: until the deadline, except while a window has not
-    /// answered for its tree yet (no events can come from it then), when the tree is read again in 50 ms.
+    /// A tree that is a placeholder at most: none yet, or a few elements per window. A lazy provider
+    /// (AccessKit) answers first with one and builds the rest a moment later, without a change event
+    /// on macOS.
+    fn sparse(tree: &Tree) -> bool {
+        tree.nodes.len() <= tree.windows.len().max(1) * 8
+    }
+
+    /// How long to wait for the next change: until the deadline, except while the tree is a
+    /// placeholder (`sparse`: no event may come as it fills in), when it is read again in 50 ms.
     fn settle(tree: &Tree, deadline: Instant) -> Instant {
-        if tree.nodes.is_empty() { deadline.min(Instant::now() + Duration::from_millis(50)) } else { deadline }
+        if sparse(tree) { deadline.min(Instant::now() + Duration::from_millis(50)) } else { deadline }
     }
 
     /// A wheel movement too small for a wheel that moves in whole clicks (X11's XTest device).
@@ -541,6 +635,17 @@ mod imp {
 
     fn timeout(opts: &Value) -> Duration {
         opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(Duration::from_secs(30))
+    }
+
+    /// Whether a value read back is the one written: the same text (trimmed), or the same number, also
+    /// when the app shows it with a unit (`0.5` and `"0.50 ×"`).
+    fn same_value(want: &str, got: &str) -> bool {
+        let num = |s: &str| {
+            let s = s.trim();
+            let end = s.find(|c: char| !(c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'))).unwrap_or(s.len());
+            s[..end].parse::<f64>().ok()
+        };
+        want.trim() == got.trim() || matches!((want.trim().parse::<f64>().ok(), num(got)), (Some(a), Some(b)) if (a - b).abs() <= 1e-9 * a.abs().max(1.0))
     }
 
     fn parse_sel(v: &Value) -> Result<Selector> {
@@ -704,6 +809,9 @@ mod imp {
                     let action = Action::parse(&s(1), value.as_deref())?;
                     let at = self.a11y.act(i, &action)?;
                     self.input(at, "pattern", false);
+                    if let Action::SetValue(want) = &action {
+                        self.took(i, want, &sel(0))?;
+                    }
                     self.until(&o, at, presents)?;
                 }
                 "query" => {

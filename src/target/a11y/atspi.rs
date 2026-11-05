@@ -511,6 +511,23 @@ impl Worker {
         }
     }
 
+    /// What node `i` holds now: an editable text's text, or a value's current value.
+    fn value(&mut self, i: usize) -> Result<Option<String>> {
+        let el = self.elements.get(i).cloned().ok_or_else(|| Error::msg("value: no such element in the last snapshot"))?;
+        let ifaces = self.bus.call(&el.0, &el.1, ACC, "GetInterfaces", &[]).ok().and_then(|r| r.first().cloned()).map(|a| a.fields().iter().filter_map(|s| s.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+        let got = if ifaces.iter().any(|f| f == "org.a11y.atspi.EditableText") {
+            self.bus.call(&el.0, &el.1, "org.a11y.atspi.Text", "GetText", &[Arg::I32(0), Arg::I32(-1)])
+        } else if ifaces.iter().any(|f| f == "org.a11y.atspi.Value") {
+            self.bus.call(&el.0, &el.1, PROPS, "Get", &[Arg::Str("org.a11y.atspi.Value"), Arg::Str("CurrentValue")])
+        } else {
+            return Ok(None);
+        };
+        Ok(got.ok().and_then(|v| match v.first()? {
+            Value::Str(s) => Some(s.clone()),
+            x => x.as_f64().map(|d| if d.fract() == 0.0 { format!("{d:.0}") } else { d.to_string() }),
+        }))
+    }
+
     fn expanded(&mut self, el: &Ref) -> bool {
         let words = self.bus.call(&el.0, &el.1, ACC, "GetState", &[]).ok().and_then(|v| v.first().cloned());
         words.and_then(|w| w.fields().first().and_then(Value::as_i64)).is_some_and(|s| s >> EXPANDED & 1 == 1)
@@ -660,6 +677,10 @@ impl Accessibility for Atspi {
 
     fn act(&self, i: usize, action: &Action) -> Result<u64> {
         self.with(|w| w.act(i, action))
+    }
+
+    fn value(&self, i: usize) -> Result<Option<String>> {
+        self.with(|w| w.value(i))
     }
 
     fn set_pids(&self, pids: &[u32]) {

@@ -447,6 +447,13 @@ impl Accessibility for Uia {
         self.call(move |s| s.act(i, &a))
     }
 
+    fn value(&self, i: usize) -> Result<Option<String>> {
+        self.call(move |s| {
+            let e = s.elements.get(i).ok_or_else(|| Error::msg("value: no such element in the last snapshot"))?;
+            Ok(unsafe { e.GetCurrentPropertyValue(UIA_ValueValuePropertyId) }.ok().and_then(|v| BSTR::try_from(&v).ok()).map(|b| b.to_string()))
+        })
+    }
+
     fn set_pids(&self, pids: &[u32]) {
         *self.signal.pids.lock().unwrap_or_else(|e| e.into_inner()) = pids.to_vec();
     }

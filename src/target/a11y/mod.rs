@@ -228,6 +228,17 @@ impl Selector {
         json!({ "css": css, "role": self.role, "text": self.text, "exact": self.exact, "index": self.index, "focus": self.focus })
     }
 
+    /// The match `index=` takes, from 0.
+    pub fn index(&self) -> usize {
+        self.index
+    }
+
+    /// When only `index` missed (fewer visible matches than it needs): how many there are.
+    pub fn index_misses(&self, t: &Tree) -> Option<usize> {
+        let n = t.find(&Selector { index: 0, ..self.clone() }).len();
+        (self.index > 0 && n > 0 && n <= self.index).then_some(n)
+    }
+
     /// When the selector carries a text filter and only that missed: what the visible elements it
     /// would match without the filter hold (up to three), for a timeout's message.
     pub fn text_misses(&self, t: &Tree) -> Option<String> {
@@ -465,6 +476,9 @@ pub trait Accessibility {
     fn hit(&self, i: usize, x: f64, y: f64) -> Result<std::result::Result<(), String>>;
     /// Does `action` on node `i` of the last snapshot through its pattern; returns when (host clock).
     fn act(&self, i: usize, action: &Action) -> Result<u64>;
+    /// The value node `i` of the last snapshot holds now (read from the app, not the snapshot); None
+    /// when it holds none the OS can read.
+    fn value(&self, i: usize) -> Result<Option<String>>;
     /// The app's processes now (focus events come from the whole desktop; children start late).
     fn set_pids(&self, pids: &[u32]);
 }

@@ -633,6 +633,13 @@ impl Accessibility for Ax {
         self.with(|w| w.act(i, action))
     }
 
+    fn value(&self, i: usize) -> Result<Option<String>> {
+        self.with(|w| {
+            let el = w.elements.get(i).ok_or_else(|| Error::msg("value: no such element in the last snapshot"))?;
+            Ok(copy(el.0, "AXValue").and_then(|v| cf_string(v.0).or_else(|| cf_f64(v.0).map(|d| d.to_string()))))
+        })
+    }
+
     fn set_pids(&self, pids: &[u32]) {
         *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = pids.to_vec();
         self.with(|w| {

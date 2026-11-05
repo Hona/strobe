@@ -34,13 +34,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let awake = host::Awake::start();
     awake.hold(true);
     progress(format!("strobe run · {pin_label} · power plan {}{}", power.used, if reserve.is_some() { " · others kept off those CPUs" } else { "" }));
-    // The child inherits strobe's affinity at spawn; strobe's own comes back right after.
-    let previous = pin.and_then(host::set_affinity);
     let started = Instant::now();
-    let spawned = Command::new(program).args(rest).spawn();
-    if let Some(p) = previous {
-        host::set_affinity(p);
-    }
+    let spawned = host::spawn_pinned(Command::new(program).args(rest), pin);
     let status = spawned.map_err(|e| Error::msg(format!("run {program}: {e}"))).and_then(|mut c| c.wait().map_err(Error::from));
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let report = reserve.map(host::reserve::Reserve::finish);

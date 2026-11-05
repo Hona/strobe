@@ -337,7 +337,8 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 - `strobe run [--pin …] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]` runs an
   ad-hoc harness under a bench block's conditions: it takes the device's bench slot (so it never
   overlaps a timed block), switches to the fastest power plan, pins the command to the target's CPUs
-  (`--pin auto`: the V-Cache CCD) and keeps this user's other processes off them (Windows, §9.4),
+  (`--pin auto`: the V-Cache CCD; the child gets the mask before it runs, strobe's own threads keep
+  theirs) and keeps this user's other processes off them (Windows, §9.4),
   and puts everything back when it exits; its exit code is strobe's. It measures nothing itself: the
   harness prints its own numbers. A harness timed the same build at 190 ms and 250–330 ms an hour
   later while other agents kept 60% of the CPUs busy; strobe's reservation covered only its benches.

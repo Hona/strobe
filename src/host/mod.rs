@@ -4,6 +4,7 @@ pub mod http;
 pub mod paths;
 pub mod power;
 pub mod reserve;
+mod spawn;
 #[cfg(windows)]
 pub mod win;
 #[cfg(target_os = "linux")]
@@ -14,6 +15,8 @@ pub mod linux;
 pub mod macos;
 #[cfg(target_os = "linux")]
 pub mod x11;
+
+pub use spawn::spawn_pinned;
 
 #[cfg(target_os = "linux")]
 use linux as os;

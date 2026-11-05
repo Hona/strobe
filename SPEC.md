@@ -3905,6 +3905,9 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
   what it takes; `timeout` must be a whole number of seconds. `record` with `bench`
   (`<file>#<case>`) returns an `exp_…`, and its `target` names one of the bench file's targets
   (`--target`); `bench` with `stop` or `resume` (not both) takes an experiment instead of `file`.
+  Through the daemon, whose working folder is strobe's install folder, `bench` and `record` with
+  `bench` need `head`, and a relative bench file or head folder is refused (usage, naming the
+  absolute path to give): `.` would have built the install folder.
 - The MCP token and `strobe open`'s session tokens come from the OS's secure random source
   (`host::paths::csprng_hex`); the token file and each session file (the key to its trace)
   are 0600, in folders only the user can enter, on Unix.

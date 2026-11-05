@@ -60,7 +60,7 @@ const TOOLS: &[Tool] = &[
             ("until-line", "native app: start recording when it prints a line matching this regex (instead of after a 3 s settle)"),
             ("stop-line", "native app: stop recording when it prints a line matching this regex"),
             ("bench", "<file.bench.ts>#<case>: record that bench case (a case glob works) instead of a target"),
-            ("head", "with bench: the variant to record (default .)"),
+            ("head", "with bench: the variant to record (required through the daemon; stdio: default .)"),
             ("gpu-cache", "a native app (not with bench, where the bench target's gpuCache decides): warm or cold GPU shader caches (default warm)"),
             ("params", "with bench: k=v,k2=v2"),
             ("runs", "with bench: measured runs (default 5)"),
@@ -73,10 +73,10 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "bench",
         description: "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress. stop asks a running experiment to stop (at once while it waits, else after its block); resume goes on with a stopped one.",
-        args: &[("file", "path to the .bench.ts file (not with stop or resume)")],
+        args: &[("file", "absolute path to the .bench.ts file (not with stop or resume)")],
         flags: &[
-            ("head", "variant under test: a directory (default .), a git ref, url:<href>, cmd:<line> (a cli() target's command line); or a target of the file, target[=variant] (target:name to disambiguate), for an implementation comparison"),
-            ("base", "baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>, cmd:<line> (a cli() target's command line); or a target of the file, target[=variant]: base and head naming two targets compare two implementations"),
+            ("head", "variant under test: an absolute directory, a git ref, exe:<absolute path>, url:<href>, cmd:<line> (a cli() target's command line); or a target of the file, target[=variant] (target:name to disambiguate), for an implementation comparison (required through the daemon, whose working folder is not your project; stdio: default .)"),
+            ("base", "baseline variant: an absolute directory, a git ref (e.g. origin/dev), url:<href>, cmd:<line> (a cli() target's command line); or a target of the file, target[=variant]: base and head naming two targets compare two implementations"),
             ("aa", "same build on both sides (checks the method)"),
             ("check", "validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
             ("headless", "page targets in a headless browser (check and timed blocks): no display needed, runs through a locked session; frame, input-latency and GPU-use metrics refused (Headless)"),
@@ -238,6 +238,7 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
             // A bench case is an experiment (`exp_…`) that keeps its recordings; `target` then picks
             // one of the bench file's targets (`--target`).
             let id = if has("bench") {
+                need_head(obj)?;
                 if let Some(t) = get("target") {
                     a.extend(["--target".into(), t]);
                 }
@@ -263,6 +264,7 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
                 }
             } else {
                 a.push(get("file").ok_or_else(|| Error::usage("bench needs file (or stop / resume with an experiment)"))?);
+                need_head(obj)?;
                 let id = store::new_id("exp");
                 a.push("--id".into());
                 a.push(id.clone());
@@ -296,6 +298,29 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
     a.extend(flags);
     let timeout = obj.get("timeout").and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).unwrap_or(600);
     Ok((a, timeout, pending_id))
+}
+
+/// In the daemon a bench's `head` has no default: `.` would be the daemon's own working folder (strobe's
+/// install folder), not the caller's project, and a relative path (the bench file's too) would name a
+/// file under it.
+fn need_head(obj: &serde_json::Map<String, Value>) -> Result<()> {
+    if !super::in_daemon() {
+        return Ok(());
+    }
+    let relative = |p: &str| std::path::Path::new(p).is_relative();
+    let file = obj.get("file").or(obj.get("bench")).and_then(Value::as_str).map(|f| f.rsplit_once('#').map_or(f, |(f, _)| f));
+    if let Some(f) = file.filter(|f| relative(f)) {
+        return Err(Error::usage(format!("bench file {f:?} is relative, which the daemon would read from its own working folder: give the absolute path")));
+    }
+    match obj.get("head").and_then(Value::as_str) {
+        None | Some("") => Err(Error::usage(
+            "bench needs head through the daemon: the variant under test as an absolute directory, a git ref (git:<ref>), exe:<path>, app:<id> or url:<href>; the daemon's working folder is not your project",
+        )),
+        Some(h) if h == "." || h.starts_with("./") || h.starts_with("..") || (relative(h) && !h.contains(':') && std::path::Path::new(h).is_dir()) => {
+            Err(Error::usage(format!("head {h:?} is a relative folder, which the daemon would read from its own working folder: give the absolute path")))
+        }
+        Some(_) => Ok(()),
+    }
 }
 
 fn result(out: Output) -> Value {

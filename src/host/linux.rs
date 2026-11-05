@@ -237,6 +237,10 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     let Some(text) = read("/proc/stat") else { return false };
     for line in text.lines() {
         let Some(rest) = line.strip_prefix("cpu") else { break };
+        // `cpu  <user> …` is the total: its first field is a tick count, not a CPU number.
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
         let mut f = rest.split_whitespace();
         let Some(Ok(cpu)) = f.next().map(str::parse::<usize>) else { continue };
         let v: Vec<u64> = f.filter_map(|x| x.parse().ok()).collect();

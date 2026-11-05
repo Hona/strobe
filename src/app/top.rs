@@ -155,19 +155,25 @@ struct ProcRow {
 
 impl Top {
     fn new(target: Option<u32>, limit: usize, sort: String) -> Top {
-        let probe = Probe::new(true, &[]);
-        let prev = host::all_processes().into_iter().map(|p| (p.pid, (p.cpu_ns, p.cycles))).collect();
+        let procs = host::all_processes();
+        let mut pids: Vec<u32> = if cfg!(windows) { Vec::new() } else { procs.iter().map(|p| p.pid).collect() };
+        pids.sort_unstable();
+        let probe = Probe::new(true, &pids);
+        let prev = procs.into_iter().map(|p| (p.pid, (p.cpu_ns, p.cycles))).collect();
         let t = host::now_ns();
         let tsc0 = host::tsc().map(|c| (c, t));
         Top { probe, prev, prev_t: t, tsc0, freq: None, target, limit, sort, topo: host::topology(), cpu_name: host::env().cpu }
     }
 
     fn frame(&mut self) -> Frame {
-        let tick = self.probe.tick(&[]);
+        let procs = host::all_processes();
+        // Every PID, for an OS without an every-process GPU counter (Windows reads PDH's).
+        let mut pids: Vec<u32> = if cfg!(windows) { Vec::new() } else { procs.iter().map(|p| p.pid).collect() };
+        pids.sort_unstable();
+        let tick = self.probe.tick(&pids);
         if tick.freq.is_some() {
             self.freq = tick.freq.clone();
         }
-        let procs = host::all_processes();
         let t = host::now_ns();
         // Cycle counts are exact; kernel + user times move in 15.6 ms clock ticks.
         let tsc_hz = match (self.tsc0, host::tsc()) {
@@ -200,7 +206,7 @@ impl Top {
                 let gpu_3d = use_.map(|u| u.iter().filter(|((_, e), _)| engine_name(*e) == "3D").map(|(_, &v)| v).fold(0.0, f64::max)).unwrap_or(0.0);
                 let busiest = use_.and_then(|u| u.iter().max_by(|a, b| a.1.total_cmp(b.1)));
                 // Without a GPU context a process has no GPU memory; others are read below.
-                let present = self.probe.present.binary_search(&p.pid).is_ok();
+                let present = !self.probe.vram_readable() || self.probe.present.binary_search(&p.pid).is_ok();
                 ProcRow {
                     pid: p.pid,
                     parent: p.parent,
@@ -234,7 +240,8 @@ impl Top {
             v.1 += m.shared;
         }
         let unreadable = self.probe.gpu_unreadable().to_vec();
-        for r in rows.iter_mut().filter(|r| r.vram_dedicated_mb.is_none() && !unreadable.contains(&r.pid)) {
+        let readable = self.probe.vram_readable();
+        for r in rows.iter_mut().filter(|r| readable && r.vram_dedicated_mb.is_none() && !unreadable.contains(&r.pid)) {
             if let Some(&(d, s)) = vram.get(&r.pid) {
                 r.vram_dedicated_mb = Some(d as f64 / MB);
                 r.vram_shared_mb = Some(s as f64 / MB);

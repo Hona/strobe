@@ -64,6 +64,10 @@ pub struct Probe {
     pub nominal_mhz: Option<f64>,
     /// With `all`: PIDs that had a GPU context at the last tick (sorted).
     pub present: Vec<u32>,
+    /// `all` asked for, without the every-process engine counters (Linux, macOS): `tick` reads its `pids` instead.
+    every: bool,
+    /// With `every`: the last tick's memory rows.
+    last_vram: Vec<VramUse>,
     last_ns: u64,
     slow_ns: u64,
 }
@@ -71,20 +75,27 @@ pub struct Probe {
 impl Probe {
     /// Opens every source and takes the baseline collection rates need. GPU rows cover the
     /// PIDs given to `tick` (D3DKMT, cost scales with them); with `all`, engine rows cover every
-    /// process instead (PDH, about 0.5 ms per tick) and memory comes from `vram`.
+    /// process instead (PDH, about 0.5 ms per tick) and memory comes from `vram`. Where the OS has
+    /// no every-process counter, `all` reads the PIDs given to `tick` (a caller passes every PID).
     pub fn new(all: bool, pids: &[u32]) -> Probe {
         let adapters = gpu::adapters();
         let mut engines = Vec::new();
         let kmt = gpu::Kmt::new(&adapters, &mut engines);
         let nvml = gpu::Nvml::load(&adapters);
+        let wide = all;
         let all = if all { gpu::Engines::open() } else { None };
-        let mut p = Probe { cpus: Cpus::open(), all, kmt, nvml, adapters, engines, nominal_mhz: None, present: Vec::new(), last_ns: 0, slow_ns: 0 };
+        let every = wide && all.is_none() && cfg!(not(windows));
+        let mut p = Probe { cpus: Cpus::open(), all, kmt, nvml, adapters, engines, nominal_mhz: None, present: Vec::new(), every, last_vram: Vec::new(), last_ns: 0, slow_ns: 0 };
         p.tick(pids);
         p
     }
 
     /// GPU memory of `pids` (sorted) now, for a probe opened with `all`.
     pub fn vram(&mut self, pids: &[u32]) -> Vec<VramUse> {
+        if self.every {
+            // The last tick read every PID's memory; reading again would reset the others' engine baselines.
+            return self.last_vram.iter().filter(|v| pids.binary_search(&v.pid).is_ok()).copied().collect();
+        }
         let mut out = Vec::new();
         if let Some(k) = self.kmt.as_mut() {
             k.read(pids, 0, false, &mut Vec::new(), &mut out);
@@ -112,7 +123,15 @@ impl Probe {
                 self.present.clear();
                 e.read(&mut self.adapters, &mut self.engines, &mut tick.gpu, &mut self.present);
             }
-            (None, Some(k)) => k.read(pids, dt, true, &mut tick.gpu, &mut tick.vram),
+            (None, Some(k)) => {
+                k.read(pids, dt, true, &mut tick.gpu, &mut tick.vram);
+                if self.every {
+                    self.last_vram = tick.vram.clone();
+                    self.present = tick.gpu.iter().map(|e| e.pid).chain(tick.vram.iter().map(|v| v.pid)).chain(k.unreadable.iter().copied()).collect();
+                    self.present.sort_unstable();
+                    self.present.dedup();
+                }
+            }
             (None, None) => {}
         }
         if let Some(n) = self.nvml.as_mut() {
@@ -123,6 +142,11 @@ impl Probe {
 
     pub fn gpu_available(&self) -> bool {
         self.kmt.is_some()
+    }
+
+    /// False where a process's GPU memory has no meaning: Apple GPUs share the system's memory.
+    pub fn vram_readable(&self) -> bool {
+        cfg!(not(target_os = "macos"))
     }
 
     /// PIDs whose GPU statistics could not be opened (another user, protected).

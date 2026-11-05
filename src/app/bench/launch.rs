@@ -121,7 +121,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         "command" => {
             let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
-            command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), &window, ctx.pin)?
+            command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), !warm, &window, ctx.pin)?
         }
         _ if web => (chromium::launch(&window, ctx.headless, ctx.pin, &[])?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
@@ -616,7 +616,7 @@ fn sample_screen(pid: u32, capture: bool, stop: &AtomicBool) -> Vec<(f64, Vec<u8
     while !stop.load(Ordering::Relaxed) {
         if read.elapsed() > Duration::from_millis(300) {
             pids = host::tree_pids(pid);
-            host::raise_windows(pid);
+            host::raise_windows(&pids);
             read = Instant::now();
         }
         if let Some(px) = host::window_pixels(&pids).filter(|_| capture) {

@@ -2358,15 +2358,26 @@ Strobe launches any Electron app the same way, with no change to the app:
   breakaway allowed so no app fails for it), its own process group on Unix. On Windows the child is
   created suspended, put in its job and given its CPUs, then resumed (`NtResumeProcess`, microseconds);
   on Linux the CPUs are set between fork and exec. strobe's own affinity never moves for a launch
-  (`host::spawn_owned`). The app's processes, for every metric and every window or wake it reads,
-  are its tree, every process stamped with its home or profile (`STROBE_HOME`), and on Windows every
-  process in its job, each with its tree, from one system snapshot; a child is followed only when it
-  started no earlier than its parent (a reused parent pid is an older, unrelated process). An app's
-  detached service or a double-forked daemon is outside the tree but counts. A process's stamp is
-  read once per pid and start time, so a scan reads only the processes that started since the last.
+  (`host::spawn_owned`). A launched target's process set (`host::process_set`) is its tree, every
+  process stamped with its home or profile (`STROBE_HOME`), and on Windows every process in its job,
+  each with its tree, from one system snapshot; a child is followed only when it started no earlier
+  than its parent (a reused parent pid is an older, unrelated process), and an exited process (a
+  zombie) is in no tree. An app's detached service or a double-forked daemon is outside the tree but
+  in the set. A process's stamp is read once per pid and start time; one that shows none is read
+  again for 2 s after it was first seen (a process that has just started may not have its
+  environment yet). The set is what `cpu.work`, `cpu.app.total`, `memory.*`, a native target's
+  wakes, threads and IO, its windows (found, placed, raised, checked), its accessibility session and
+  its present events read. The OS sampler (`gpu.process.3d`, `gpu.vram`, `gpu.shared`), native
+  stacks, a launch's screen pixels (`launch.painted`, `launch.settled`) and `record --os-frames`
+  still read the tree alone (§24.2).
+- The launched child is never reaped before its group is ended: its exit is read without reaping it
+  (`waitid` with `WNOWAIT` on Unix), so its pid, which is also the group's id, cannot name another
+  process when strobe ends the group, and a process set's root is never a reused pid. Tree kills end
+  a process only when it is still the one the snapshot listed (Windows: its creation time; Unix: a
+  running process, and its group only when it leads one).
 - On close, and when strobe drops a launched target without closing it (an early return, an error,
   a panic), it ends the tree (read first: ending the group orphans it), the group (`TerminateJobObject`;
-  `SIGKILL` to the group, unless its leader's pid now names a newer process) and everything stamped
+  `SIGKILL` to the group) and everything stamped
   with the home, restores URL schemes, returns lent GPU caches, unlinks shared seeds and deletes the
   home. A dropped target deletes only a home made for that launch; a warm home stays for its caller.
   Windows ends a job when its last handle closes, so a strobe that dies takes its launches with it,
@@ -3450,6 +3461,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   runner's CPUs for the bench, and the native speed check widens it for its own thread. The CLI refuses
   flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
   their types from that table (§17).
+- Process sets (§13.2): a launched target's metrics, wakes, windows and present events read its
+  process set (tree, stamp and job), but these still read only the root's tree (`host::tree_pids`):
+  the OS sampler (`probe::os::Sampler`: `gpu.process.3d`, `gpu.vram`, `gpu.shared`), native stacks
+  (`etw::stacks`, `probe::perf`, `probe::sample`, `probe::suspend`), a launch's screen pixels
+  (`launch.painted`, `launch.settled`) and `record --os-frames`. A detached service's GPU use, stacks
+  or windows are left out of those. `record pid:` targets have no home: their tree alone, with no
+  start-time check on the root (a pid reused after the target exits would be read).
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.
   `cdp:<port>` reads `/json/version` by its `Content-Length` (or chunks): Chrome and Node keep the
   connection open after the reply. A Node inspector on that port is refused with a pointer to

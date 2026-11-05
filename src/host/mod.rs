@@ -239,8 +239,9 @@ pub fn process_list() -> Vec<(u32, u32, u64)> {
     }
 }
 
-/// Ends a process and every process of its tree now: Windows terminates each, Unix sends SIGKILL to
-/// the process group it leads (when it leads one) and to each process of the tree, children first.
+/// Ends a running process and every process of its tree now: Windows terminates each (when its
+/// creation time is still the snapshot's), Unix sends SIGKILL to the process group it leads (when it
+/// runs and leads one) and to each process of the tree, children first.
 pub fn kill_tree(pid: u32) {
     if pid == 0 {
         return;
@@ -250,7 +251,12 @@ pub fn kill_tree(pid: u32) {
     #[cfg(unix)]
     {
         let tree = tree_pids(pid);
-        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        if tree.is_empty() {
+            return;
+        }
+        if unsafe { libc::getpgid(pid as i32) } == pid as i32 {
+            unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+        }
         for p in tree.iter().rev() {
             unsafe { libc::kill(*p as i32, libc::SIGKILL) };
         }
@@ -719,7 +725,6 @@ pub fn system_busy(ms: u64) -> f64 {
     }
 }
 
-/// Raises the visible windows of a process tree to topmost without activating them; returns how many.
 /// The largest visible window of these processes, shrunk to a 16×16 grid of averaged BGRA pixels read
 /// from the screen: what a person sees of it, for "painted" and "settled" (Windows only).
 pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
@@ -733,15 +738,16 @@ pub fn window_pixels(pids: &[u32]) -> Option<Vec<u8>> {
     }
 }
 
-pub fn raise_windows(root: u32) -> usize {
+/// Raises the visible windows of these processes (a target's process set) to topmost without
+/// activating them; returns how many.
+pub fn raise_windows(pids: &[u32]) -> usize {
     #[cfg(windows)]
     {
-        let pids: Vec<u32> = process_tree(root).iter().map(|p| p.pid).collect();
-        win::raise_windows(&pids)
+        win::raise_windows(pids)
     }
     #[cfg(not(windows))]
     {
-        os::raise_windows(&tree_pids(root))
+        os::raise_windows(pids)
     }
 }
 

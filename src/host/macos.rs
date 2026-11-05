@@ -303,18 +303,19 @@ fn rusage(pid: u32) -> Option<(u64, u64, u64, u64, u64)> {
 }
 
 /// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
-/// children that started no earlier than their parent (a reused pid).
+/// children that started no earlier than their parent (a reused pid). A zombie is in no tree: it
+/// runs nothing, and its children have left it.
 fn tree_of(all: &[Bsd], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
-        if p.ppid != p.pid {
+        if p.ppid != p.pid && !p.zombie {
             children.entry(p.ppid).or_default().push(i);
         }
     }
     let mut seen = vec![false; all.len()];
     let mut out = Vec::new();
     for &root in roots {
-        let Some(r) = all.iter().position(|p| p.pid == root) else { continue };
+        let Some(r) = all.iter().position(|p| p.pid == root && !p.zombie) else { continue };
         if std::mem::replace(&mut seen[r], true) {
             continue;
         }
@@ -433,7 +434,7 @@ pub fn threads(pids: &[u32]) -> (Vec<ThreadInfo>, Vec<(u32, u64, u64)>) {
         let mut others: Vec<u32> = known.values().map(|(p, _)| *p).filter(|p| !pids.contains(p)).collect();
         others.sort_unstable();
         others.dedup();
-        let gone: Vec<u32> = others.into_iter().filter(|&p| bsd(p).is_none()).collect();
+        let gone: Vec<u32> = others.into_iter().filter(|&p| bsd(p).is_none_or(|b| b.zombie)).collect();
         known.retain(|_, (p, _)| !pids.contains(p) && !gone.contains(p));
         known.extend(map);
     }

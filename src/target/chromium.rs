@@ -2,12 +2,12 @@
 
 use super::cdp::{Cdp, wait_event};
 use crate::host;
-use crate::host::spawn::Group;
+use crate::host::spawn::Owned;
 use crate::model::{Error, Result};
 use serde::Serialize;
 use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -27,15 +27,14 @@ impl Default for Window {
     }
 }
 
-/// A browser or Electron app strobe launched (or attached to: no child, group or profile). Dropped
+/// A browser or Electron app strobe launched (or attached to: no child or profile). Dropped
 /// without `close`, it still ends everything it launched and releases its profile.
 pub struct Browser {
     pub cdp: Arc<Cdp>,
     /// The browser-level DevTools WebSocket URL (what Playwright's connectOverCDP takes).
     pub ws: String,
-    pub child: Option<Child>,
-    /// The launch's process group (`host::spawn_owned`).
-    pub group: Option<Group>,
+    /// The launched child with its group (`host::spawn_owned`).
+    pub child: Option<Owned>,
     pub pid: u32,
     /// The launch's home or profile, released (and removed) with the browser; a caller that keeps
     /// it takes it first.
@@ -156,7 +155,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     args.push("about:blank".into());
     let mut cmd = Command::new(&exe);
     cmd.args(&args).envs(super::isolate::launch_env(&profile)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    let (child, group) = match host::spawn_owned(&mut cmd, cpus, 0, Some(&profile)) {
+    let child = match host::spawn_owned(&mut cmd, cpus, 0, Some(&profile)) {
         Ok(c) => c,
         Err(e) => {
             super::isolate::release_home(&profile);
@@ -164,9 +163,9 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
             return Err(Error::msg(format!("launch {}: {e}", exe.display())));
         }
     };
-    let pid = child.id();
+    let pid = child.pid();
     // A launch that fails from here ends the browser and its profile.
-    let launching = super::isolate::Launching { pid, child: Some(child), group: Some(group), home: Some(profile.clone()), fresh: true };
+    let launching = super::isolate::Launching::new(child, Some(profile.clone()), true);
     let port_file = profile.join("DevToolsActivePort");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let text = loop {
@@ -185,8 +184,8 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     let ws = format!("ws://127.0.0.1:{port}{path}");
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    let (child, group, profile) = launching.done();
-    Ok(Browser { cdp, ws, child, group, pid, profile, fresh: true, exe, version, window: window.clone() })
+    let (child, profile) = launching.done();
+    Ok(Browser { cdp, ws, child, pid, profile, fresh: true, exe, version, window: window.clone() })
 }
 
 /// Attaches to a running endpoint: `cdp:<port>`, `cdp:ws://…` or a bare `ws://…`.
@@ -208,7 +207,7 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
     };
     let cdp = Cdp::connect(&url)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    Ok(Browser { cdp, ws: url, child: None, group: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default() })
+    Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default() })
 }
 
 /// One GET on a debugging port. Chrome and Node keep the connection open after the reply, even with
@@ -304,7 +303,7 @@ impl Browser {
         if self.pid != 0 && cfg!(windows) {
             // An occluded Chromium window stops rendering: keep ours on top, without taking focus.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while host::raise_windows(self.pid) == 0 && std::time::Instant::now() < deadline {
+            while host::raise_windows(&self.pids()) == 0 && std::time::Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
             }
         }
@@ -350,10 +349,7 @@ impl Browser {
         let _ = self.cdp.send_timeout("Browser.close", json!({}), None, Duration::from_secs(5));
         if let Some(c) = self.child.as_mut() {
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
-            while std::time::Instant::now() < deadline {
-                if let Ok(Some(_)) = c.try_wait() {
-                    break;
-                }
+            while std::time::Instant::now() < deadline && c.exited().is_none() {
                 std::thread::sleep(Duration::from_millis(50));
             }
         }
@@ -364,11 +360,12 @@ impl Browser {
     /// app's own detached service outlives the tree), then releases the profile and with `remove`
     /// deletes it (Chromium may hold files for a moment after exit: `remove_home` retries).
     fn end(&mut self, remove: bool) {
-        if self.child.is_none() && self.group.is_none() && self.profile.is_none() {
-            return;
-        }
-        super::isolate::end_launch(self.pid, self.group.take(), self.child.as_mut(), self.profile.take().as_deref(), remove);
-        self.child = None;
+        super::isolate::end_launch(self.child.take(), self.profile.take().as_deref(), remove);
+    }
+
+    /// This target's process set as pids (`processes`).
+    pub fn pids(&self) -> Vec<u32> {
+        self.processes().iter().map(|p| p.pid).collect()
     }
 }
 

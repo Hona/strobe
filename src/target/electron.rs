@@ -97,7 +97,7 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         }
     };
     let (pid, epoch, output) = (spawned.pid, spawned.epoch_ms, spawned.output);
-    let mut launching = Launching { pid, child: Some(spawned.child), group: Some(spawned.group), home: Some(home.clone()), fresh: prepared.fresh };
+    let mut launching = Launching::new(spawned.child, Some(home.clone()), prepared.fresh);
     let main = match extra.profile_main {
         Some(port) => Some(profile_from_start(port)?),
         None => None,
@@ -111,10 +111,10 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         }
         // A program that is not Chromium-based rejects the flag and fails: say so now, not in 60 s. A launcher
         // stub that starts the real app and exits succeeds, so a clean exit keeps waiting for the port.
-        if let Some(Ok(Some(status))) = launching.child.as_mut().map(|c| c.try_wait())
-            && !status.success()
+        if let Some(code) = launching.child.as_mut().and_then(|c| c.exited())
+            && code != 0
         {
-            return Err(Error::unreachable(format!("{} exited ({status}) before it opened a debugging port", app.exe.display()))
+            return Err(Error::unreachable(format!("{} exited (code {code}) before it opened a debugging port", app.exe.display()))
                 .hint("exe: and app: targets are Chromium or Electron apps; for any other program use exe:<path> --native, or record a running process with pid:<pid>"));
         }
         if Instant::now() > deadline {
@@ -128,8 +128,8 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let fresh = launching.fresh;
-    let (child, group, profile) = launching.done();
-    Ok((Browser { cdp, ws, child, group, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
+    let (child, profile) = launching.done();
+    Ok((Browser { cdp, ws, child, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone() }, guard, Started { epoch_ms: epoch, output, main }))
 }
 
 /// The app window's page: the first page target that is not DevTools.
@@ -146,7 +146,7 @@ pub fn main_page(browser: &Browser) -> Result<super::chromium::Page> {
             let page = super::chromium::Page { cdp: browser.cdp.clone(), session, target };
             page.send("Page.enable", json!({}))?;
             let deadline = Instant::now() + Duration::from_secs(5);
-            while cfg!(windows) && host::raise_windows(browser.pid) == 0 && Instant::now() < deadline {
+            while cfg!(windows) && host::raise_windows(&browser.pids()) == 0 && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(100));
             }
             return Ok(page);

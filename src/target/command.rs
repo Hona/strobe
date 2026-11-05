@@ -63,7 +63,9 @@ pub fn shell(line: &str) -> Command {
 
 /// Starts the command with `home` as `{home}`, waits for its endpoint and attaches. The browser's
 /// profile is the home, so closing it removes the folder; the command's whole process tree ends with it.
-pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> Result<(Browser, Started)> {
+/// `fresh`: the caller made the home for this launch, so a failed or dropped launch removes it (a warm
+/// home stays).
+pub fn launch(spec: &Spec, home: &Path, fresh: bool, window: &Window, cpus: Option<u64>) -> Result<(Browser, Started)> {
     if spec.run.trim().is_empty() {
         return Err(Error::usage("a command target needs `run`, the command line to start"));
     }
@@ -83,12 +85,20 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     cmd.current_dir(&spec.cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let epoch = epoch_ms();
     // Its own group, so the dev server, the app and everything they spawn end together.
-    let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, Some(home)).map_err(|e| Error::msg(format!("start `{}`: {e}", spec.run)))?;
-    let pid = child.id();
+    let mut child = match host::spawn_owned(&mut cmd, cpus, 0, Some(home)) {
+        Ok(c) => c,
+        Err(e) => {
+            super::isolate::release_home(home);
+            if fresh {
+                super::isolate::remove_home(home);
+            }
+            return Err(Error::msg(format!("start `{}`: {e}", spec.run)));
+        }
+    };
+    let pid = child.pid();
     let output = lines(&mut child);
-    // A start that fails from here ends the command's processes and what runs for its home; the
-    // folder is the caller's.
-    let launching = Launching { pid, child: Some(child), group: Some(group), home: Some(home.to_path_buf()), fresh: false };
+    // A start that fails from here ends the command's processes and what runs for its home.
+    let launching = Launching::new(child, Some(home.to_path_buf()), fresh);
     // The lines read while waiting, replayed to the caller (milestones before the endpoint count too).
     let (tx, rx) = std::sync::mpsc::channel();
     let deadline = Instant::now() + spec.timeout;
@@ -120,8 +130,7 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     });
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    let (child, group, profile) = launching.done();
-    // The home is a fresh folder per launch (a caller that keeps it takes `profile`): it goes with the browser.
-    let browser = Browser { cdp, ws, child, group, pid, profile, fresh: true, exe: PathBuf::from(&spec.run), version, window: window.clone() };
+    let (child, profile) = launching.done();
+    let browser = Browser { cdp, ws, child, pid, profile, fresh, exe: PathBuf::from(&spec.run), version, window: window.clone() };
     Ok((browser, Started { epoch_ms: epoch, output: Some(rx), main: None }))
 }

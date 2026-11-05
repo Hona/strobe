@@ -3,11 +3,10 @@
 
 use super::chromium::Window;
 use super::isolate::{self, App, Guard, Home};
-use crate::host::spawn::Group;
+use crate::host::spawn::Owned;
 use crate::host::{self, TopWindow};
 use crate::model::{Error, Hidden, Refusal, Result};
 use std::path::PathBuf;
-use std::process::Child;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -34,13 +33,11 @@ fn inactive(pid: u32) -> bool {
 /// A launched native app. Dropped without `close`, it still ends everything it launched, releases
 /// its home and removes the home when `prepare_home` made it for this launch.
 pub struct Native {
-    pub child: Child,
-    group: Option<Group>,
+    /// The launched child with its group; taken when it ends.
+    child: Option<Owned>,
     pub pid: u32,
     pub home: PathBuf,
     fresh: bool,
-    /// `close` ran (or the drop did).
-    ended: bool,
     pub exe: PathBuf,
     /// When it was spawned: Unix epoch ms and the host clock (ns).
     pub epoch_ms: f64,
@@ -58,12 +55,10 @@ pub fn launch(app: &App, home: &Home, env: &[(String, String)], output: bool, cp
     isolate::live(app, &guard)?;
     let s = isolate::spawn(app, home, &[], env, output, cpus)?;
     let n = Native {
-        child: s.child,
-        group: Some(s.group),
+        child: Some(s.child),
         pid: s.pid,
         home: home.dir.clone(),
         fresh: home.fresh,
-        ended: false,
         exe: app.exe.clone(),
         epoch_ms: s.epoch_ms,
         at_ns: s.at_ns,
@@ -85,9 +80,9 @@ impl Native {
         host::process_set(self.pid, Some(&self.home))
     }
 
-    /// The process's exit code, once it has exited.
+    /// The process's exit code, once it has exited (it is not reaped before `close`).
     pub fn exited(&mut self) -> Option<i32> {
-        self.child.try_wait().ok().flatten().map(|s| s.code().unwrap_or(-1))
+        self.child.as_mut()?.exited()
     }
 
     /// Why no window may show on Linux: the app was given a Wayland display, where toolkits open a
@@ -151,7 +146,7 @@ impl Native {
 
     /// Keeps the window on top without focus (a covered window may skip its frames).
     pub fn raise(&self) {
-        host::raise_windows(self.pid);
+        host::raise_windows(&self.pids());
     }
 
     /// `WindowHidden` (SPEC §10.1) unless the main window is still there, visible, unminimized and not
@@ -197,10 +192,9 @@ impl Native {
     }
 
     fn end(&mut self, remove: bool) {
-        if std::mem::replace(&mut self.ended, true) {
-            return;
+        if let Some(child) = self.child.take() {
+            isolate::end_launch(Some(child), Some(self.home.as_path()), remove);
         }
-        isolate::end_launch(self.pid, self.group.take(), Some(&mut self.child), Some(self.home.as_path()), remove);
     }
 }
 

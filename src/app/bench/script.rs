@@ -10,9 +10,8 @@ use std::sync::mpsc::Receiver;
 
 /// The host process and its line protocol, over a loopback connection.
 struct Host {
-    child: Child,
-    /// Its process group: dropped, the host and what it started end.
-    group: Option<host::spawn::Group>,
+    /// The host with its process group: dropped, the host and what it started end.
+    child: host::spawn::Owned,
     conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
@@ -78,7 +77,7 @@ impl Host {
         let out = std::fs::OpenOptions::new().create(true).append(true).open(log)?;
         let err = out.try_clone()?;
         cmd.stdin(Stdio::null()).stdout(out).stderr(err);
-        let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("start the script host: {e}")))?;
+        let mut child = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("start the script host: {e}")))?;
         let failed = |log: &Path| {
             let tail: Vec<String> = std::fs::read_to_string(log).unwrap_or_default().lines().rev().take(12).map(str::to_string).collect::<Vec<_>>().into_iter().rev().collect();
             Error::msg(format!("the script host did not load {}:\n{}", entry.display(), tail.join("\n")))
@@ -92,8 +91,7 @@ impl Host {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(Error::msg(format!("script host connection: {e}"))),
             }
-            if Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
-                isolate::kill_tree(child.id());
+            if Instant::now() > deadline || child.exited().is_some() {
                 return Err(failed(log));
             }
             std::thread::sleep(Duration::from_millis(10));
@@ -109,7 +107,7 @@ impl Host {
                 }
             }
         });
-        let host = Host { child, group: Some(group), conn, lines, next: 1 };
+        let host = Host { child, conn, lines, next: 1 };
         loop {
             let line = host.lines.recv_timeout(Duration::from_secs(60)).map_err(|_| failed(log))?;
             if serde_json::from_str::<Value>(&line).ok().is_some_and(|v| v["ready"] == true) {
@@ -140,29 +138,15 @@ impl Host {
     }
 
     fn pid(&self) -> u32 {
-        self.child.id()
+        self.child.pid()
     }
 
-    /// A normal exit (profiles are written), then the tree, whatever is left of it.
+    /// A normal exit (profiles are written), then its group, whatever is left of it (the drop).
     fn exit(mut self) {
         let _ = self.request(json!({ "op": "exit" }), Duration::from_secs(5));
         let deadline = Instant::now() + Duration::from_secs(30);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
+        while Instant::now() < deadline && self.child.exited().is_none() {
             std::thread::sleep(Duration::from_millis(50));
-        }
-        isolate::kill_tree(self.child.id());
-    }
-}
-
-impl Drop for Host {
-    fn drop(&mut self) {
-        if let Some(group) = self.group.take() {
-            drop(group);
-            let _ = self.child.kill();
-            let _ = self.child.wait();
         }
     }
 }

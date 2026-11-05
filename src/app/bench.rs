@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod block;
@@ -163,7 +163,8 @@ struct Variant {
     label: String,
     root: Option<PathBuf>,
     base_url: Option<String>,
-    server: Option<Child>,
+    /// The variant's server with its process group (`host::spawn_owned`): ended with the variant.
+    server: Option<host::spawn::Owned>,
     /// A native target's executable built for this variant (strobe.json `build`), copied out of the build.
     exe: Option<PathBuf>,
     /// The commit a directory or git variant is at (short), and whether a directory had uncommitted changes.
@@ -251,14 +252,6 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
         "flags": flags,
         "series": series.iter().map(|s| json!({ "label": s.label(), "case": s.case, "primary": s.primary, "noworse": s.noworse })).collect::<Vec<_>>(),
     })
-}
-
-impl Drop for Variant {
-    fn drop(&mut self) {
-        if let Some(mut s) = self.server.take() {
-            kill_tree(&mut s);
-        }
-    }
 }
 
 thread_local! {
@@ -2784,7 +2777,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let mut guard = None;
     let browser = if kind == "command" {
         let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
-        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), &window, ctx.pin)?.0
+        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), true, &window, ctx.pin)?.0
     } else if app {
         let launch = with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?;
         let seed = seed_dir(ctx, s, &target);
@@ -4098,7 +4091,9 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     let cmd = serve["command"].as_str().unwrap_or("").replace("{port}", &port.to_string());
     let cwd = root.join(serve["cwd"].as_str().unwrap_or("."));
     progress(format!("  serve {} on :{port}", v.role));
-    let child = shell(&cmd).current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().map_err(|e| Error::msg(format!("serve {}: {e}", v.role)))?;
+    let mut serve_cmd = shell(&cmd);
+    serve_cmd.current_dir(&cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    let child = host::spawn_owned(&mut serve_cmd, None, 0, None).map_err(|e| Error::msg(format!("serve {}: {e}", v.role)))?;
     v.server = Some(child);
     let ready = serve["ready"].as_str().unwrap_or("http://127.0.0.1:{port}/").replace("{port}", &port.to_string());
     let deadline = Instant::now() + Duration::from_secs(90);
@@ -4308,13 +4303,6 @@ fn http_ok(url: &str) -> bool {
     head.starts_with("HTTP/1.1 2") || head.starts_with("HTTP/1.1 3") || head.starts_with("HTTP/1.0 2")
 }
 
-fn kill_tree(child: &mut Child) {
-    if cfg!(windows) {
-        let _ = Command::new("taskkill").args(["/T", "/F", "/PID", &child.id().to_string()]).stdout(Stdio::null()).stderr(Stdio::null()).status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
 
 pub(crate) fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>, Option<u64>, String)> {
     let all: u64 = if topo.logical >= 64 { u64::MAX } else { (1u64 << topo.logical) - 1 };

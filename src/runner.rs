@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
 
@@ -54,8 +54,9 @@ pub fn incomplete(what: &str, op: &str, e: Error, extra: &str, fix: &str) -> Err
 /// The runner process, in a group of its own with everything its hooks start: dropped (after `exit`
 /// or without it), the group ends.
 pub struct Runner {
-    child: Child,
-    group: Option<host::spawn::Group>,
+    /// Taken when it ends.
+    child: Option<host::spawn::Owned>,
+    pid: u32,
     conn: TcpStream,
     lines: Receiver<String>,
     next: u64,
@@ -87,8 +88,8 @@ impl Runner {
             .stdin(Stdio::null())
             .stdout(out)
             .stderr(err);
-        // An early return from here drops the group, which ends the runner and what it started.
-        let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("spawn bun: {e}")))?;
+        // An early return from here drops the child, which ends the runner and what it started.
+        let mut child = host::spawn_owned(&mut cmd, cpus, 0, None).map_err(|e| Error::msg(format!("spawn bun: {e}")))?;
         listener.set_nonblocking(true)?;
         let deadline = std::time::Instant::now() + Duration::from_secs(120);
         let conn = loop {
@@ -97,9 +98,8 @@ impl Runner {
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => return Err(Error::msg(format!("runner connection: {e}"))),
             }
-            if std::time::Instant::now() > deadline || child.try_wait().ok().flatten().is_some() {
-                let _ = child.kill();
-                let _ = child.wait();
+            if std::time::Instant::now() > deadline || child.exited().is_some() {
+                drop(child);
                 let text = std::fs::read_to_string(&log).unwrap_or_default();
                 let tail: Vec<&str> = text.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
                 return Err(Error::msg(format!("the bench runner did not start\n{}", tail.join("\n"))));
@@ -117,7 +117,8 @@ impl Runner {
                 }
             }
         });
-        let mut runner = Runner { child, group: Some(group), conn, lines: rx, next: 1, log };
+        let pid = child.pid();
+        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -132,7 +133,6 @@ impl Runner {
     }
 
     fn died(&mut self, what: &str) -> Error {
-        let _ = self.child.try_wait();
         let log = std::fs::read_to_string(&self.log).unwrap_or_default();
         let tail: Vec<&str> = log.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
         Error::msg(format!("the bench runner {what}\n{}", tail.join("\n")))
@@ -200,7 +200,7 @@ impl Runner {
 
     /// The runner's process, for its CPU in a block's overhead.
     pub fn pid(&self) -> u32 {
-        self.child.id()
+        self.pid
     }
 
     pub fn describe(&mut self) -> Result<Describe> {
@@ -209,31 +209,12 @@ impl Runner {
 
     /// Asks the runner to exit (its `close` hooks have run), up to 3 s, then ends its group.
     pub fn exit(&mut self) {
-        if self.group.is_none() {
-            return;
-        }
+        let Some(mut child) = self.child.take() else { return };
         let _ = self.write(&json!({ "id": 0, "op": "exit" }));
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
-        while std::time::Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                break;
-            }
+        while std::time::Instant::now() < deadline && child.exited().is_none() {
             std::thread::sleep(Duration::from_millis(30));
         }
-        self.end();
-    }
-
-    fn end(&mut self) {
-        if let Some(group) = self.group.take() {
-            drop(group);
-            let _ = self.child.kill();
-            let _ = self.child.wait();
-        }
-    }
-}
-
-impl Drop for Runner {
-    fn drop(&mut self) {
-        self.end();
+        child.end();
     }
 }

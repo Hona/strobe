@@ -52,8 +52,9 @@ pub fn stamp_of(pid: u32) -> Option<Stamp> {
 
 /// Every running process strobe stamped, but this strobe: (pid, parent, stamp). A process's
 /// environment is read once (a process is its pid and start time), so a scan reads only the
-/// processes that started since the last one; strobe's own children are read again until they show a
-/// stamp (between fork and exec a child still has strobe's environment).
+/// processes that started since the last one. A process that shows no stamp is read again for 2 s
+/// after it was first seen: one that has just started may not have its environment yet (a Windows
+/// process before its parameters are written, a Unix one between fork and exec).
 pub fn stamped() -> Vec<(u32, u32, Stamp)> {
     stamped_in(&super::process_list())
 }
@@ -61,8 +62,9 @@ pub fn stamped() -> Vec<(u32, u32, Stamp)> {
 /// `stamped` over a process list (pid, parent, start time) already taken.
 pub(super) fn stamped_in(list: &[(u32, u32, u64)]) -> Vec<(u32, u32, Stamp)> {
     use std::collections::HashMap;
-    /// Each process's stamp (or none) by its pid and start time.
-    type Seen = HashMap<(u32, u64), Option<Stamp>>;
+    use std::time::{Duration, Instant};
+    /// Each process's stamp (or none), and when it was first seen, by its pid and start time.
+    type Seen = HashMap<(u32, u64), (Option<Stamp>, Instant)>;
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
     let me = std::process::id();
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -73,16 +75,15 @@ pub(super) fn stamped_in(list: &[(u32, u32, u64)]) -> Vec<(u32, u32, Stamp)> {
         if pid == 0 || pid == me {
             continue;
         }
-        let stamp = match old.get(&(pid, start)) {
-            Some(s) => s.clone(),
-            None => stamp_of(pid),
+        let entry = match old.get(&(pid, start)) {
+            Some((None, first)) if first.elapsed() < Duration::from_secs(2) => (stamp_of(pid), *first),
+            Some(e) => e.clone(),
+            None => (stamp_of(pid), Instant::now()),
         };
-        if let Some(s) = &stamp {
+        if let Some(s) = &entry.0 {
             out.push((pid, parent, s.clone()));
         }
-        if stamp.is_some() || parent != me {
-            now.insert((pid, start), stamp);
-        }
+        now.insert((pid, start), entry);
     }
     *seen = Some(now);
     out
@@ -99,73 +100,99 @@ pub(super) fn pids_in(list: &[(u32, u32, u64)], dir: &Path) -> Vec<u32> {
     stamped_in(list).into_iter().filter(|(_, _, s)| s.home == k).map(|(p, _, _)| p).collect()
 }
 
-/// What one launch started, as one group: on Windows a job object that holds the child and
-/// everything it starts but what breaks away (the job allows that, so no app fails for it), and
-/// that the OS ends when strobe exits however it exits; on Unix the child's own process group, which
-/// what it starts joins unless it makes its own (a daemon's `setsid`). Dropping it ends the group.
-pub struct Group {
+/// A child strobe launched, with everything it starts as one group: on Windows a job object that
+/// holds the child and all it starts but what breaks away (the job allows that, so no app fails for
+/// it), which the OS ends when strobe exits however it exits; on Unix the child's own process group,
+/// which what it starts joins unless it makes its own (a daemon's `setsid`).
+///
+/// The child is never reaped before its group is ended (`exited` reads its status without reaping
+/// it), so on Unix the group's id, the child's pid, cannot name another process when strobe ends the
+/// group. Dropping it ends it all (`end`).
+pub struct Owned {
+    child: Child,
+    /// Taken by `end`.
+    group: Option<Group>,
+}
+
+struct Group {
     #[cfg(windows)]
     job: Option<isize>,
-    /// The group's id (its leader's pid) and the leader's start time.
+    /// The group's id: the child's pid.
     #[cfg(unix)]
-    leader: Option<(u32, u64)>,
-    /// The folder the launch was for: `group_pids` finds the group by it.
-    #[cfg_attr(unix, allow(dead_code))]
-    home: Option<String>,
+    pgid: u32,
 }
 
 /// Jobs by the folder their launch was for (Windows), for `group_pids`.
 #[cfg(windows)]
 static JOBS: std::sync::Mutex<Vec<(String, isize)>> = std::sync::Mutex::new(Vec::new());
 
-impl Group {
-    /// Ends every process of the group now.
-    pub fn kill(&mut self) {
+impl Owned {
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    /// The child's output pipes, when it was started with them.
+    pub fn output(&mut self) -> (Option<std::process::ChildStdout>, Option<std::process::ChildStderr>) {
+        (self.child.stdout.take(), self.child.stderr.take())
+    }
+
+    /// The child's exit code once it has exited (-1: ended by a signal). On Unix the child stays a
+    /// zombie (`waitid` with `WNOWAIT`): its pid stays its own until `end` reaps it.
+    pub fn exited(&mut self) -> Option<i32> {
         #[cfg(windows)]
-        if let Some(job) = self.job {
-            unsafe { windows_sys::Win32::System::JobObjects::TerminateJobObject(job as _, 1) };
+        {
+            self.child.try_wait().ok().flatten().map(|s| s.code().unwrap_or(-1))
         }
         #[cfg(unix)]
-        if let Some((pgid, start)) = self.leader {
-            // While the leader runs (or waits to be reaped) the id is this group's; once it is gone, the
-            // id names another group only when a new leader took the pid, with another start time.
-            if super::start_time(pgid).is_none_or(|s| s == start) {
-                unsafe { libc::kill(-(pgid as i32), libc::SIGKILL) };
+        unsafe {
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            let r = libc::waitid(libc::P_PID, self.child.id() as libc::id_t, &mut info, libc::WEXITED | libc::WNOHANG | libc::WNOWAIT);
+            if r != 0 || info.si_pid() == 0 {
+                return None;
+            }
+            Some(if info.si_code == libc::CLD_EXITED { info.si_status() } else { -1 })
+        }
+    }
+
+    /// Ends the child's tree (read first: ending the group orphans it), its group, then the child,
+    /// and reaps it. Idempotent.
+    pub fn end(&mut self) {
+        let Some(group) = self.group.take() else { return };
+        super::kill_tree(self.child.id());
+        #[cfg(windows)]
+        if let Some(job) = group.job {
+            use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+            let mut jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+            jobs.retain(|(_, j)| *j != job);
+            unsafe {
+                TerminateJobObject(job as _, 1);
+                windows_sys::Win32::Foundation::CloseHandle(job as _);
             }
         }
-    }
-
-    /// The group's processes now (Windows: the job's; Unix: none, the tree and the stamp find them).
-    pub fn pids(&self) -> Vec<u32> {
-        #[cfg(windows)]
-        {
-            self.job.map(job_pids).unwrap_or_default()
-        }
         #[cfg(unix)]
-        {
-            Vec::new()
+        unsafe {
+            libc::kill(-(group.pgid as i32), libc::SIGKILL);
         }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 }
 
-impl Drop for Group {
+impl Drop for Owned {
     fn drop(&mut self) {
-        self.kill();
-        #[cfg(windows)]
-        if let Some(job) = self.job.take() {
-            JOBS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(_, j)| *j != job);
-            unsafe { windows_sys::Win32::Foundation::CloseHandle(job as _) };
-        }
+        self.end();
     }
 }
 
-/// The processes of the groups launched for `dir` and still owned (Windows' jobs; none on Unix).
+/// The processes of the groups launched for `dir` and still owned (Windows' jobs; none on Unix: the
+/// tree and the stamp find them there).
 pub fn group_pids(dir: &Path) -> Vec<u32> {
     #[cfg(windows)]
     {
         let k = home_key(dir);
-        let jobs: Vec<isize> = JOBS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|(h, _)| *h == k).map(|(_, j)| *j).collect();
-        jobs.into_iter().flat_map(job_pids).collect()
+        // Read under the lock: `Owned::end` closes a job only after taking it out of the list.
+        let jobs = JOBS.lock().unwrap_or_else(|e| e.into_inner());
+        jobs.iter().filter(|(h, _)| *h == k).flat_map(|(_, j)| job_pids(*j)).collect()
     }
     #[cfg(unix)]
     {
@@ -191,12 +218,12 @@ pub fn spawn_pinned(cmd: &mut Command, cpus: Option<u64>, flags: u32) -> std::io
     }
 }
 
-/// `spawn_pinned` in a new `Group`, for a launch strobe ends whole when it is done with it; `home` is
-/// the folder the launch is for (its stamp, set by the caller).
-pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&Path>) -> std::io::Result<(Child, Group)> {
-    let home = home.map(home_key);
+/// `spawn_pinned` as an `Owned` launch, which strobe ends whole when it is done with it; `home` is the
+/// folder the launch is for (its stamp, set by the caller).
+pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&Path>) -> std::io::Result<Owned> {
     #[cfg(windows)]
     {
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
             CreateJobObjectW, JOB_OBJECT_LIMIT_BREAKAWAY_OK, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation, SetInformationJobObject,
         };
@@ -206,32 +233,41 @@ pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Optio
             limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE | JOB_OBJECT_LIMIT_BREAKAWAY_OK;
             let set = !j.is_null() && SetInformationJobObject(j, JobObjectExtendedLimitInformation, &limits as *const _ as *const _, std::mem::size_of_val(&limits) as u32) != 0;
             if !set && !j.is_null() {
-                windows_sys::Win32::Foundation::CloseHandle(j);
+                CloseHandle(j);
             }
             set.then_some(j as isize)
         };
-        let mut group = Group { job, home };
-        let (child, assigned) = windows(cmd, cpus, flags, job)?;
-        if !assigned {
-            // strobe's own job may refuse a nested one: the stamp and the tree still find everything.
-            if let Some(j) = group.job.take() {
-                unsafe { windows_sys::Win32::Foundation::CloseHandle(j as _) };
+        let (child, assigned) = match windows(cmd, cpus, flags, job) {
+            Ok(x) => x,
+            Err(e) => {
+                if let Some(j) = job {
+                    unsafe { CloseHandle(j as _) };
+                }
+                return Err(e);
             }
+        };
+        // strobe's own job may refuse a nested one: the stamp and the tree still find everything.
+        let job = match (job, assigned) {
+            (Some(j), false) => {
+                unsafe { CloseHandle(j as _) };
+                None
+            }
+            (j, _) => j,
+        };
+        if let (Some(j), Some(h)) = (job, home) {
+            JOBS.lock().unwrap_or_else(|e| e.into_inner()).push((home_key(h), j));
         }
-        if let (Some(j), Some(h)) = (group.job, &group.home) {
-            JOBS.lock().unwrap_or_else(|e| e.into_inner()).push((h.clone(), j));
-        }
-        Ok((child, group))
+        Ok(Owned { child, group: Some(Group { job }) })
     }
     #[cfg(not(windows))]
     {
         use std::os::unix::process::CommandExt;
-        let _ = flags;
+        let _ = (flags, home);
         cmd.process_group(0);
         pin(cmd, cpus);
         let child = cmd.spawn()?;
-        let leader = super::start_time(child.id()).map(|s| (child.id(), s));
-        Ok((child, Group { leader, home }))
+        let pgid = child.id();
+        Ok(Owned { child, group: Some(Group { pgid }) })
     }
 }
 

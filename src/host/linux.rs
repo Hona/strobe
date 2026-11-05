@@ -58,6 +58,8 @@ struct Stat {
     /// Start time after boot, in clock ticks: a parent's children start no earlier.
     start: u64,
     rss: u64,
+    /// Exited (a zombie `Z`, or dead `X`/`x`), kept only until its parent's wait.
+    gone: bool,
 }
 
 fn stat(pid: u32) -> Option<Stat> {
@@ -66,7 +68,8 @@ fn stat(pid: u32) -> Option<Stat> {
     let comm = text[open + 1..close].to_string();
     let f: Vec<&str> = text[close + 1..].split_whitespace().collect();
     let num = |i: usize| f.get(i).and_then(|s| s.parse::<u64>().ok()).unwrap_or(0);
-    Some(Stat { pid, ppid: num(1) as u32, comm, cpu_ns: (num(11) + num(12)) * 1_000_000_000 / tck(), threads: num(17) as u32, start: num(19), rss: num(21) * page() })
+    let gone = matches!(f.first(), Some(&"Z" | &"X" | &"x"));
+    Some(Stat { pid, ppid: num(1) as u32, comm, cpu_ns: (num(11) + num(12)) * 1_000_000_000 / tck(), threads: num(17) as u32, start: num(19), rss: num(21) * page(), gone })
 }
 
 fn pids() -> Vec<u32> {
@@ -137,18 +140,19 @@ pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
 }
 
 /// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
-/// children that started no earlier than their parent (a reused pid).
+/// children that started no earlier than their parent (a reused pid). An exited process (a zombie)
+/// is in no tree: it runs nothing, and its children have left it.
 fn tree_of(all: &[Stat], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
-        if p.ppid != p.pid {
+        if p.ppid != p.pid && !p.gone {
             children.entry(p.ppid).or_default().push(i);
         }
     }
     let mut seen = vec![false; all.len()];
     let mut out = Vec::new();
     for &root in roots {
-        let Some(r) = all.iter().position(|p| p.pid == root) else { continue };
+        let Some(r) = all.iter().position(|p| p.pid == root && !p.gone) else { continue };
         if std::mem::replace(&mut seen[r], true) {
             continue;
         }
@@ -388,11 +392,11 @@ pub fn env_of(pid: u32) -> Option<Vec<String>> {
 }
 
 /// When a running process started (clock ticks after boot), which with its pid names it uniquely.
-/// None for a zombie: it has exited, and only its parent's wait keeps the pid.
+/// None once it has exited (a zombie, or dead): only its parent's wait keeps the pid.
 pub fn start_time(pid: u32) -> Option<u64> {
     let text = read(format!("/proc/{pid}/stat"))?;
     let f: Vec<&str> = text.rsplit_once(')')?.1.split_whitespace().collect();
-    if f.first() == Some(&"Z") {
+    if matches!(f.first(), Some(&"Z" | &"X" | &"x")) {
         return None;
     }
     f.get(19)?.parse().ok()

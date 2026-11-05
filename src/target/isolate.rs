@@ -7,12 +7,12 @@
 
 use crate::host;
 pub use crate::host::kill_tree;
-use crate::host::spawn::{Group, HOME_VAR, OWNER_VAR, Stamp, home_key as key, owner_stamp, parse_owner, stamp_of, stamped};
+use crate::host::spawn::{HOME_VAR, Owned, OWNER_VAR, Stamp, home_key as key, owner_stamp, parse_owner, stamp_of, stamped};
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// One app to launch: an executable plus what its profile adds to the generic isolation.
@@ -552,20 +552,11 @@ pub fn release_home(home: &Path) {
     let_go(home);
 }
 
-/// Ends what a launch started, whatever state it is in: its tree (read before its group ends, which
-/// orphans it; not once the child has exited, when its pid may name another process), its group, the
-/// child (reaped), then everything stamped with its folder; releases the folder and, with `remove`,
+/// Ends what a launch started, whatever state it is in: the child, its tree and its group
+/// (`Owned::end`), then everything stamped with its folder; releases the folder and, with `remove`,
 /// deletes it.
-pub fn end_launch(pid: u32, group: Option<Group>, mut child: Option<&mut Child>, home: Option<&Path>, remove: bool) {
-    let exited = child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_))));
-    if !exited {
-        kill_tree(pid);
-    }
-    drop(group);
-    if let Some(c) = child {
-        let _ = c.kill();
-        let _ = c.wait();
-    }
+pub fn end_launch(child: Option<Owned>, home: Option<&Path>, remove: bool) {
+    drop(child);
     if let Some(h) = home {
         release_home(h);
         if remove {
@@ -716,12 +707,12 @@ pub fn epoch_ms() -> f64 {
 /// host clock in ns (beside phase marks and presents), and its text.
 pub type OutputLine = (f64, u64, String);
 
-/// Lines of `child`'s stdout and stderr with their arrival time and terminal colour codes removed;
+/// Lines of a launch's stdout and stderr with their arrival time and terminal colour codes removed;
 /// the pipes are always drained, so a chatty app never blocks on a full pipe.
-pub fn lines(child: &mut Child) -> std::sync::mpsc::Receiver<OutputLine> {
+pub fn lines(child: &mut Owned) -> std::sync::mpsc::Receiver<OutputLine> {
     let (tx, rx) = std::sync::mpsc::channel();
-    let readers: Vec<Box<dyn std::io::Read + Send>> =
-        [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten().collect();
+    let (out, err) = child.output();
+    let readers: Vec<Box<dyn std::io::Read + Send>> = [out.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), err.map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten().collect();
     for r in readers {
         let tx = tx.clone();
         std::thread::spawn(move || {
@@ -879,11 +870,10 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     Ok(Home { dir: home, port, env, shared, gpu_warm, fresh })
 }
 
-/// A spawned app: the child and its group, when it was spawned (epoch ms and the host clock), and its
-/// output lines when asked for.
+/// A spawned app: the child with its group, when it was spawned (epoch ms and the host clock), and
+/// its output lines when asked for.
 pub struct Spawned {
-    pub child: Child,
-    pub group: Group,
+    pub child: Owned,
     pub pid: u32,
     pub epoch_ms: f64,
     pub at_ns: u64,
@@ -910,9 +900,9 @@ pub fn spawn(app: &App, home: &Home, args: &[String], env: &[(String, String)], 
     let piped = || if output { Stdio::piped() } else { Stdio::null() };
     cmd.stdin(Stdio::null()).stdout(piped()).stderr(piped());
     let (epoch, at_ns) = (epoch_ms(), host::now_ns());
-    let (mut child, group) = host::spawn_owned(&mut cmd, cpus, 0, Some(&home.dir)).map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
+    let mut child = host::spawn_owned(&mut cmd, cpus, 0, Some(&home.dir)).map_err(|e| Error::msg(format!("launch {}: {e}", app.exe.display())))?;
     let output = output.then(|| lines(&mut child));
-    Ok(Spawned { pid: child.id(), child, group, epoch_ms: epoch, at_ns, output })
+    Ok(Spawned { pid: child.pid(), child, epoch_ms: epoch, at_ns, output })
 }
 
 /// A JSON seed file with placeholders filled; a string that is exactly `{port}` becomes a number.
@@ -1022,26 +1012,29 @@ pub fn live(app: &App, guard: &Guard) -> Result<()> {
 /// A launch until its target takes it (`done`): dropped before (a failed start, an early return), it
 /// ends what the launch started (`end_launch`) and releases its folder, removing it when `fresh`.
 pub struct Launching {
-    pub pid: u32,
-    pub child: Option<Child>,
-    pub group: Option<Group>,
+    pub child: Option<Owned>,
     pub home: Option<PathBuf>,
     /// The launch made the folder: it goes with a failed launch.
     pub fresh: bool,
+    done: bool,
 }
 
 impl Launching {
-    /// The launch started: its target owns the child, the group and the folder from here.
-    pub fn done(mut self) -> (Option<Child>, Option<Group>, Option<PathBuf>) {
-        self.pid = 0;
-        (self.child.take(), self.group.take(), self.home.take())
+    pub fn new(child: Owned, home: Option<PathBuf>, fresh: bool) -> Launching {
+        Launching { child: Some(child), home, fresh, done: false }
+    }
+
+    /// The launch started: its target owns the child and the folder from here.
+    pub fn done(mut self) -> (Option<Owned>, Option<PathBuf>) {
+        self.done = true;
+        (self.child.take(), self.home.take())
     }
 }
 
 impl Drop for Launching {
     fn drop(&mut self) {
-        if self.pid != 0 {
-            end_launch(self.pid, self.group.take(), self.child.as_mut(), self.home.take().as_deref(), self.fresh);
+        if !self.done {
+            end_launch(self.child.take(), self.home.take().as_deref(), self.fresh);
         }
     }
 }

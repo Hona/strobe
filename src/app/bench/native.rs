@@ -811,7 +811,7 @@ fn watch(pid: u32, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender
     while !stop.load(Ordering::Relaxed) {
         if read.elapsed() > Duration::from_millis(300) {
             pids = host::tree_pids(pid);
-            host::raise_windows(pid);
+            host::raise_windows(&pids);
             read = Instant::now();
         }
         let shown = host::main_window(&pids).is_some();
@@ -956,7 +956,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 if let Some(at) = found {
                     break (at, n.processes().iter().map(|p| p.cycles).sum());
                 }
-                if n.exited().is_some() && host::process_tree(n.pid).is_empty() {
+                if n.exited().is_some() && n.processes().is_empty() {
                     return Err(Error::refused("RunIncomplete", format!("{} launch: the app exited before milestone {name}", s.case), "check the milestone's match and where it looks"));
                 }
                 guard.check("while the app started")?;
@@ -977,7 +977,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 if let Some(w) = host::main_window(&n.pids()) {
                     break w;
                 }
-                if n.exited().is_some() && host::process_tree(n.pid).is_empty() {
+                if n.exited().is_some() && n.processes().is_empty() {
                     return Err(Error::refused("RunIncomplete", format!("{} launch: the app exited before it showed a window", s.case), "check that the app opens a window"));
                 }
                 guard.check("while the app started")?;
@@ -1051,7 +1051,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                         _ => {}
                     }
                 }
-                if n.exited().is_some() && host::process_tree(n.pid).is_empty() {
+                if n.exited().is_some() && n.processes().is_empty() {
                     return Err(Error::refused(
                         "RunIncomplete",
                         format!("{} launch: the app exited before its window {}", s.case, until_text(&until)),

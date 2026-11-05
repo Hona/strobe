@@ -33,7 +33,7 @@
           "spec": { "type": "string" },
           "label": { "type": "string" },
           "subject": {},
-          "kind": { "enum": ["dir", "git", "url", "app", "exe"] },
+          "kind": { "enum": ["dir", "git", "url", "app", "exe", "cmd"] },
           "commit": { "type": ["string", "null"] },
           "dirty": {}
         }
@@ -102,7 +102,9 @@
         "NotOnThisOs",
         "NotForTarget",
         "ResetIncomplete",
-        "EngineUnsupported"
+        "EngineUnsupported",
+        "NoMetric",
+        "NoWaits"
       ]
     },
     "verdictKind": {

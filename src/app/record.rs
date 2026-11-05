@@ -127,9 +127,12 @@ pub fn run(args: &Args) -> Result<Output> {
         _ => None,
     };
     // A native app (a profile of kind native, or `exe:<path> --native`): measured from outside.
-    if let Some(mut a) = app.clone().filter(|a| a.kind == "native" || args.has("native")) {
-        a.kind = "native".into();
-        return native(args, &a, &target, set, for_ms);
+    if let Some(a) = app.clone().filter(|a| a.kind == isolate::AppKind::Native || args.has("native")) {
+        return native(args, &a.as_kind(isolate::AppKind::Native), &target, set, for_ms);
+    }
+    // An app opens its own window: `--headless` would only skip the lock check on a headed app.
+    if args.has("headless") && app.is_some() {
+        return Err(Error::usage(format!("--headless runs a page in a headless browser; {target} draws its own window")));
     }
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") && !target.starts_with("file://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, a local page.html, app:<id>, exe:<path>, cdp:<port> or file:<trace>")));

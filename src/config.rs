@@ -159,7 +159,8 @@ const GUARD: Shape = Keys(&[("file", Req(&Str)), ("pid", Str), ("url", Str), ("o
 const APP: Shape = Keys(&[
     ("exe", PerOs),
     ("extends", Str),
-    ("kind", Enum(&["electron", "native"])),
+    ("kind", Enum(crate::target::isolate::AppKind::NAMES)),
+    ("webdriver", Str),
     ("env", StrMap),
     ("unset", Strings),
     ("dirs", Strings),

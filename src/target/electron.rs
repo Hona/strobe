@@ -66,6 +66,10 @@ fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
 
 /// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
 pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
+    // An app on the OS's webview opens the webview's own port, not Electron's.
+    if app.kind == isolate::AppKind::Webview {
+        return super::webview::launch_with(app, seed, window, cpus, extra);
+    }
     if isolate::interpreter(&app.exe) {
         return Err(Error::usage(format!(
             "{} is a script runtime, not a Chromium or Electron app: an exe: or app: target launches with a debugging port (--remote-debugging-port) it does not take",

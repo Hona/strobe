@@ -269,7 +269,7 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
                 None => (GUESS_BLOCK_MS, "a guess: no earlier run of this case here".to_string()),
             },
         };
-        let gpu_warm = matches!(kind, "native" | "app" | "exe") && s.launch.is_null() && s.gpu_cache.as_deref().or(target["gpuCache"].as_str()) != Some("cold") && !cfg!(target_os = "macos");
+        let gpu_warm = matches!(kind, "native" | "app" | "exe" | "webview") && s.launch.is_null() && s.gpu_cache.as_deref().or(target["gpuCache"].as_str()) != Some("cold") && !cfg!(target_os = "macos");
         let (warmup_blocks, warmup_ms) = match same.first() {
             Some(p) if p.warmup_blocks > 0.0 => (p.warmup_blocks, p.warmup_ms),
             _ if gpu_warm || s.launch.is_object() => (2.0, 2.0 * block_ms),
@@ -377,7 +377,7 @@ fn builds(series: &[Series], describe: &Value, config: &Value, project: &Path, v
         for t in &kinds {
             let build = match t["kind"].as_str() {
                 Some("script") | Some("command") => t["build"].as_str().map(|c| json!({ "command": c })),
-                Some("native") if !t["path"].is_string() => config.get("build").map(crate::target::isolate::build_for_os).filter(|b| b["command"].is_string()),
+                Some("native" | "webview") if !t["path"].is_string() => config.get("build").map(crate::target::isolate::build_for_os).filter(|b| b["command"].is_string()),
                 Some("web") => config.get("build").filter(|b| b.is_object()).map(crate::target::isolate::build_for_os),
                 _ => None,
             };

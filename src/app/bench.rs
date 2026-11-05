@@ -2961,7 +2961,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let (set, keep, n) = (x.set, x.keep, x.runs);
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
-    let app = kind == "app" || kind == "exe" || kind == "command";
+    let app = matches!(kind, "app" | "exe" | "webview" | "command");
     // What the series declared beyond the default probes: counters, network counts, layout shift.
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
@@ -3768,7 +3768,7 @@ fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut ap
 /// fills (the block before the pairs, discarded).
 fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
     let kind = target["kind"].as_str().unwrap_or("");
-    if !matches!(ctx.mode, Mode::Compare | Mode::Blocks(_)) || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe") {
+    if !matches!(ctx.mode, Mode::Compare | Mode::Blocks(_)) || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe" | "webview") {
         return Ok(false);
     }
     let profile = profile_of(target).and_then(|id| isolate::app(id, &ctx.config).ok());
@@ -3779,7 +3779,7 @@ fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
 fn profile_of(target: &Value) -> Option<&str> {
     match target["kind"].as_str()? {
         "app" => target["id"].as_str(),
-        "native" | "exe" => target["app"].as_str(),
+        "native" | "exe" | "webview" => target["app"].as_str(),
         _ => None,
     }
 }
@@ -3812,21 +3812,25 @@ fn preflight(series: &[Series], describe: &Value, variants: &[Variant], config: 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
 /// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
 fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
+    // `webview(…)` reaches the app through its webview whatever kind its profile names.
+    let webview = |a: isolate::App| if target["kind"] == "webview" { a.as_kind(isolate::AppKind::Webview) } else { a };
     if let Kind::App(id) = &v.kind {
-        return isolate::app(id, config);
+        return isolate::app(id, config).map(webview);
     }
     let profile = match target["kind"].as_str() {
         Some("app") => target["id"].as_str(),
-        Some("exe") => target["app"].as_str(),
+        Some("exe" | "webview") => target["app"].as_str(),
         _ => return Err(Error::usage("not an app target")),
     };
-    let base = match profile {
+    let base = webview(match profile {
         Some(id) => isolate::app(id, config)?,
         None => isolate::App::bare(Path::new(target["path"].as_str().unwrap_or(""))),
-    };
-    match &v.kind {
-        Kind::Exe(p) => Ok(base.with_exe(p)),
+    });
+    match (&v.kind, &v.exe) {
+        (Kind::Exe(p), _) => Ok(base.with_exe(p)),
         _ if target["kind"] == "exe" => Ok(base.with_exe(Path::new(target["path"].as_str().unwrap_or("")))),
+        // A directory or git-ref variant of a webview profile runs its own build.
+        (_, Some(p)) if target["kind"] == "webview" && target["path"].is_null() => Ok(base.with_exe(p)),
         _ => Ok(base),
     }
 }
@@ -4307,8 +4311,8 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     // (the executable) copied into strobe's own folder for the variant, so base and head coexist even
     // when the build writes to one shared place (`{cache}`). Without a `build`, both run the profile's
     // or the target's executable.
-    if is_native(target) {
-        // `native(path)` names a fixed executable: no build replaces it.
+    if is_native(target) || target["kind"] == "webview" {
+        // `native(path)` and `webview(path)` name a fixed executable: no build replaces it.
         if !matches!(v.kind, Kind::Dir | Kind::Git(_)) || v.exe.is_some() || target["path"].is_string() {
             return Ok(());
         }
@@ -4323,7 +4327,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
         let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
         overlay_harness(v, &root, h)?;
         let output = crate::target::isolate::per_os(&build["output"])
-            .ok_or_else(|| Error::usage(format!("a native target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
+            .ok_or_else(|| Error::usage(format!("a native or webview target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
         let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
         let built = root.join(cache_fill(output, &root));
         let exe = dest.join(built.file_name().ok_or_else(|| Error::usage(format!("build output {output} is not a file")))?);

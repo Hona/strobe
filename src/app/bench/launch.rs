@@ -75,7 +75,12 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
     // keeps), and the hook gets the environment and executable the app launches with, so it can start
     // what the app expects to find (a background service) the way the app would.
-    let app = if kind == "app" || kind == "exe" { Some(with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?) } else { None };
+    let app = if matches!(kind.as_str(), "app" | "exe" | "webview") { Some(with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?) } else { None };
+    // An app on the OS's webview has no Node main process to profile or inspect.
+    let electron = app.as_ref().is_some_and(|a| a.kind == isolate::AppKind::Electron);
+    if spec["inspect"] == true && !electron {
+        return Err(Error::usage(format!("{}: launch.inspect reads Node's timing from an Electron app's main process", s.case)));
+    }
     let seed = target["home"].as_str().map(|h| {
         let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
         Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
@@ -106,14 +111,14 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     // The time stamp counter's rate, from two readings around the launch: cycles to ms.
     let clock = (host::tsc(), Instant::now());
     let (mut browser, started) = match kind.as_str() {
-        "app" | "exe" => {
+        "app" | "exe" | "webview" => {
             let app = app.as_ref().ok_or_else(|| Error::msg("internal: an app target without its app"))?;
             let extra = Extra {
                 args: inspect_port.map(|p| vec![format!("--inspect={p}")]).unwrap_or_default(),
                 output: true,
                 home: home.clone(),
                 prepared: prepared.clone(),
-                profile_main: if profile { Some(free_port()?) } else { None },
+                profile_main: if profile && electron { Some(free_port()?) } else { None },
             };
             let (b, g, st) = electron::launch_with(app, seed.as_deref(), &window, ctx.pin, &extra)?;
             guard = Some(g);

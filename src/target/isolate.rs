@@ -2,8 +2,8 @@
 //!
 //! Generic: every per-user folder points into a fresh private home. What one app needs beyond that
 //! (its own env vars, seed files, the user state to guard, URL schemes it registers) is an app
-//! profile in strobe.json `apps`, never code here. Electron apps (`electron.rs`) and native apps
-//! (`native.rs`) both launch through this.
+//! profile in strobe.json `apps`, never code here. Electron apps (`electron.rs`), apps on the OS's
+//! webview (`webview.rs`) and native apps (`native.rs`) all launch through this.
 
 use crate::host;
 pub use crate::host::kill_tree;
@@ -15,13 +15,51 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+/// How strobe reaches an app's UI: the profile's `kind`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppKind {
+    /// An Electron app: a debugging port (`--remote-debugging-port`), CDP.
+    #[default]
+    Electron,
+    /// An app that embeds the OS's webview: the webview's own debugging port (`webview.rs`).
+    Webview,
+    /// No browser engine (or one strobe does not attach to): from outside and through the OS's
+    /// accessibility tree (§13.7).
+    Native,
+}
+
+impl AppKind {
+    pub const NAMES: &[&str] = &["electron", "webview", "native"];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            AppKind::Electron => "electron",
+            AppKind::Webview => "webview",
+            AppKind::Native => "native",
+        }
+    }
+
+    fn parse(name: &str) -> Option<AppKind> {
+        [AppKind::Electron, AppKind::Webview, AppKind::Native].into_iter().find(|k| k.name() == name)
+    }
+}
+
+impl std::fmt::Display for AppKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// One app to launch: an executable plus what its profile adds to the generic isolation.
 #[derive(Clone, Debug, Default)]
 pub struct App {
     pub id: String,
     pub exe: PathBuf,
-    /// `electron` (the default: a debugging port, CDP) or `native` (no browser engine).
-    pub kind: String,
+    pub kind: AppKind,
+    /// `webdriver`: where a webview app serves W3C WebDriver once its profile's `env` turns it on
+    /// (`http://127.0.0.1:{port}`), filled per launch.
+    pub webdriver: Option<String>,
     env: Vec<(String, String)>,
     unset: Vec<String>,
     dirs: Vec<String>,
@@ -52,7 +90,13 @@ struct GuardSpec {
 impl App {
     /// An executable with no profile: generic isolation only.
     pub fn bare(exe: &Path) -> App {
-        App { id: exe.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), exe: exe.to_path_buf(), kind: "electron".into(), ..App::default() }
+        App { id: exe.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default(), exe: exe.to_path_buf(), ..App::default() }
+    }
+
+    /// The same profile reached another way (`exe:<path> --native`, a `webview(path)` target).
+    pub fn as_kind(mut self, kind: AppKind) -> App {
+        self.kind = kind;
+        self
     }
 
     /// The same profile with another build of the app, such as a variant's `exe:<path>`.
@@ -161,14 +205,13 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
     }
     let moved: Vec<String> = strings("moved");
     let moved = moved.iter().map(|m| expand(m).map_err(|e| Error::usage(format!("app profile \"{id}\" moved: {}", e.message)))).collect::<Result<Vec<_>>>()?;
-    let kind = p["kind"].as_str().unwrap_or("electron").to_string();
-    if kind != "electron" && kind != "native" {
-        return Err(Error::usage(format!("app profile \"{id}\": kind is electron or native, not {kind}")));
-    }
+    let kind = p["kind"].as_str().unwrap_or("electron");
+    let kind = AppKind::parse(kind).ok_or_else(|| Error::usage(format!("app profile \"{id}\": kind is {}, not {kind}", AppKind::NAMES.join(", "))))?;
     Ok(App {
         id: id.to_string(),
         exe,
         kind,
+        webdriver: p["webdriver"].as_str().map(str::to_string),
         env: p["env"].as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default(),
         unset: strings("unset"),
         dirs: strings("dirs"),

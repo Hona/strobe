@@ -25,9 +25,7 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
         (_, Some(id)) => isolate::app(id, config)?,
         _ => {
             let path = target["path"].as_str().ok_or_else(|| Error::usage("native(): give an app profile id or an executable path"))?;
-            let mut a = isolate::App::bare(Path::new(path));
-            a.kind = "native".into();
-            a
+            isolate::App::bare(Path::new(path)).as_kind(isolate::AppKind::Native)
         }
     };
     let base = match (&v.kind, &v.exe) {

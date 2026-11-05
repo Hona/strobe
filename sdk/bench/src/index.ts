@@ -300,6 +300,7 @@ export type Target<P> =
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
   | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
+  | ({ kind: "webview"; app?: string; path?: string } & WebviewOptions)
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
 export type GpuCache = "warm" | "cold"
@@ -374,6 +375,16 @@ export interface NativeOptions {
   output?: boolean
 }
 
+export interface WebviewOptions {
+  /** A seed folder copied into each launch's fresh private home (`{param}` placeholders allowed), relative to the bench file. */
+  home?: string
+  viewport?: Viewport
+  /** As for `native`: whether launches find the GPU shader caches (the driver's and the webview's) earlier launches compiled. */
+  gpuCache?: GpuCache
+  /** What every block of this target must show (a case's `expect` adds to it). */
+  expect?: Expect
+}
+
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
 export type ParamValues = readonly unknown[] | { readonly run: readonly unknown[]; readonly more?: readonly unknown[] }
 
@@ -443,6 +454,18 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
 export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Target<P> {
   const path = /[\\/]|\.exe$/i.test(appOrPath)
   return { kind: "native", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
+}
+
+/**
+ * An app that embeds the OS's webview, by its profile in strobe.json `apps` (any `kind`), or an executable path.
+ * Each block launches it in a fresh isolated home with the webview's own debugging port open, and `page` drives
+ * its page as a web target's: page metrics, attribution and the app's whole process set (host and webview
+ * processes). Windows (WebView2) only for now; elsewhere it is refused, and `native()` measures the app through its
+ * accessibility tree. A directory or git-ref variant runs strobe.json's `build` and launches its `output`.
+ */
+export function webview<P = any>(appOrPath: string, opts: WebviewOptions = {}): Target<P> {
+  const path = /[\\/]|\.exe$/i.test(appOrPath)
+  return { kind: "webview", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
 }
 
 export function bench<const Params extends Record<string, ParamValues> = {}>(spec: Bench<Params>): Bench<Params> {

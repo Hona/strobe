@@ -2661,8 +2661,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     ctx.used = Some(window.clone());
     // As before a native block's speed check: a timed block launches once the target's CPUs are quiet
     // (the last block's browser still frees its memory and GPU objects there), waiting at most 10 s.
+    // Only CPUs strobe keeps for the target: an unpinned machine's every CPU is never all quiet (on
+    // air every block waited the full 10 s).
     let settled = Instant::now();
-    if x.measures_time() {
+    if x.measures_time() && ctx.pin.is_some() {
         validity::wait_quiet(ctx.pin, Duration::from_secs(10));
     }
     let quiet_ms = settled.elapsed().as_secs_f64() * 1e3;

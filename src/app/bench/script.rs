@@ -305,10 +305,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         };
         let rec = store::recording_dir(&id)?;
         if let Some(p) = newest("cpuprofile") {
-            std::fs::copy(&p, rec.join("cpu-0.cpuprofile"))?;
+            store::write_atomic(&rec.join("cpu-0.cpuprofile"), &std::fs::read(&p)?)?;
         }
         if let Some(p) = newest("heapprofile") {
-            std::fs::copy(&p, rec.join("alloc-0.heapprofile"))?;
+            store::write_atomic(&rec.join("alloc-0.heapprofile"), &std::fs::read(&p)?)?;
         }
         let _ = std::fs::remove_dir_all(&dir);
         store::write_json(

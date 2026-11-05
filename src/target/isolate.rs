@@ -740,9 +740,13 @@ pub fn epoch_ms() -> f64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs_f64() * 1e3).unwrap_or(0.0)
 }
 
+/// A line an app wrote: when strobe read it, as epoch ms (beside a log line's own time) and on the
+/// host clock in ns (beside phase marks and presents), and its text.
+pub type OutputLine = (f64, u64, String);
+
 /// Lines of `child`'s stdout and stderr with their arrival time and terminal colour codes removed;
 /// the pipes are always drained, so a chatty app never blocks on a full pipe.
-pub fn lines(child: &mut Child) -> std::sync::mpsc::Receiver<(f64, String)> {
+pub fn lines(child: &mut Child) -> std::sync::mpsc::Receiver<OutputLine> {
     let (tx, rx) = std::sync::mpsc::channel();
     let readers: Vec<Box<dyn std::io::Read + Send>> =
         [child.stdout.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>), child.stderr.take().map(|s| Box::new(s) as Box<dyn std::io::Read + Send>)].into_iter().flatten().collect();
@@ -751,7 +755,7 @@ pub fn lines(child: &mut Child) -> std::sync::mpsc::Receiver<(f64, String)> {
         std::thread::spawn(move || {
             use std::io::BufRead;
             for line in std::io::BufReader::new(r).lines().map_while(std::result::Result::ok) {
-                let _ = tx.send((epoch_ms(), strip_ansi(&line)));
+                let _ = tx.send((epoch_ms(), host::now_ns(), strip_ansi(&line)));
             }
         });
     }
@@ -907,7 +911,7 @@ pub struct Spawned {
     pub pid: u32,
     pub epoch_ms: f64,
     pub at_ns: u64,
-    pub output: Option<std::sync::mpsc::Receiver<(f64, String)>>,
+    pub output: Option<std::sync::mpsc::Receiver<crate::target::isolate::OutputLine>>,
 }
 
 /// Starts `app` in `home`: strobe's environment less the profile's `unset`, then the home's, then

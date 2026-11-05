@@ -58,7 +58,7 @@ impl Error {
 macro_rules! validators {
     ($($id:ident),* $(,)?) => {
         /// A validator (SPEC §10.1): what refuses a run, or one metric of it.
-        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
         pub enum ValidatorId { $($id),* }
 
         impl ValidatorId {
@@ -126,7 +126,7 @@ impl fmt::Display for ValidatorId {
 /// Why a window counted as hidden (`WindowHidden`), where a bench acts on the difference: on macOS
 /// it waits for a person to leave the Mac when the window is covered or the app is not the active
 /// one, and otherwise wakes the display once.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Hidden {
     /// Other apps' windows cover it (macOS).
@@ -138,7 +138,7 @@ pub enum Hidden {
 }
 
 /// Why a validator refused: a run (in an `Error`) or one metric (in a `Comparison`).
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, serde::Deserialize)]
 pub struct Refusal {
     pub validator: ValidatorId,
     /// What was wrong.

@@ -38,7 +38,7 @@ pub struct Native {
     /// When it was spawned: Unix epoch ms and the host clock (ns).
     pub epoch_ms: f64,
     pub at_ns: u64,
-    pub output: Option<Receiver<(f64, String)>>,
+    pub output: Option<Receiver<crate::target::isolate::OutputLine>>,
     /// Its main window once found.
     pub window: Option<TopWindow>,
 }

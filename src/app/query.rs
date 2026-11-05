@@ -343,7 +343,7 @@ pub fn insights(rec: &Rec) -> Result<Output> {
     if let Some(l) = meta["leak"]["js_heap"].as_object() {
         hit(
             "leak",
-            if l["verdict"].as_str().is_some_and(|x| x.starts_with("leaks")) { "warn" } else { "info" },
+            if crate::stats::kind_of(&meta["leak"]["js_heap"]) == crate::model::VerdictKind::Worse { "warn" } else { "info" },
             format!("js heap: {}", l["verdict"].as_str().unwrap_or("")),
             json!(l),
             vec![q("leaks"), q("memory")],

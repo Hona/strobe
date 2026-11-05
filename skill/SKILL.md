@@ -96,7 +96,7 @@ More in a bench file:
 - `launch: { until, milestones?, profile?, before?, inspect? }` instead of `run`: one cold launch per block, timed from spawn to `until` (`launch.ready`); milestones `{ match: "text" | /re/, in: "output" | "page" | "<log glob under the home>" }` become `launch.<name>`; `launch.painted`/`launch.settled` from the window's pixels.
 - `command("bun run dev:desktop", { cwd, env: { X: "{home}" }, unset: ["APP_*"] })`: an app started by a dev command, attached where it prints `DevTools listening on ws://…`; `before(ctx)` deletes caches for a cold start.
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
-- Native targets: `const saved = ctx.waitForLine(/saved/, { in: "output" | "<log glob under the home>" }); await page.click("save"); await saved`
+- Native targets: `const saved = ctx.waitForLine(/saved/, { in: "output" | "<log glob under the home>" }); await page.click("save"); await saved` (`"output"` needs `native(…, { output: true })` and an app that flushes each line)
   waits for a line the app writes (`{ line, at }`, `at` on strobe's clock). A case's `gpuCache: "cold"` overrides its target's.
 - `native("my-app")` (a strobe.json profile with `kind: "native"`) or `native("C:/…/app.exe")`: a native app (no browser), isolated like an Electron app,
   measured from outside: `cpu.work`, `ui.cpu` (CPU of the main window's thread: the primary for "does it cost less"), `cpu.wakes` (thread wakes/s;

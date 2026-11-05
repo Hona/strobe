@@ -35,7 +35,7 @@ pub struct Extra {
 /// the time each arrived.
 pub struct Started {
     pub epoch_ms: f64,
-    pub output: Option<std::sync::mpsc::Receiver<(f64, String)>>,
+    pub output: Option<std::sync::mpsc::Receiver<crate::target::isolate::OutputLine>>,
     /// The main process's inspector, profiling, with `extra.profile_main`.
     pub main: Option<Arc<Cdp>>,
 }

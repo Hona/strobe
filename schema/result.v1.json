@@ -55,6 +55,7 @@
     "commits": { "type": "array", "description": "bisect: the first-parent line from good to bad (commit, short, subject)." },
     "remaining": { "type": ["object", "null"], "description": "bisect: where the culprit may still be (good, bad)." },
     "verdict": { "type": "string", "description": "bisect: found, no change, or unclear." },
+    "outcome": { "enum": ["found", "no_change", "unclear"], "description": "bisect: what it found, for programs (verdict says it in words)." },
     "verdict_kind": { "$ref": "#/definitions/verdictKind", "description": "bisect: good against bad as step 0 found it, or unclear while undecided steps may hide the culprit." },
     "culprit": { "type": ["object", "null"], "description": "bisect: commit, short, subject." },
     "steps": { "type": "array", "description": "bisect: one summary per step.", "items": { "$ref": "#/definitions/step" } }
@@ -159,6 +160,30 @@
       "required": ["metric"],
       "properties": { "metric": { "type": "string" } }
     },
+    "blocksPrimary": {
+      "description": "A bench --blocks series' primary: its name, and a refusal when the blocks cannot give it a value (TailTooShort, NoPhase, a block's refusal).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric"],
+      "properties": {
+        "metric": { "type": "string" },
+        "verdict": { "type": "string", "description": "refused (<validator>): <why>" },
+        "verdict_kind": { "const": "refused" },
+        "refusal": { "$ref": "#/definitions/refusal" }
+      }
+    },
+    "overhead": {
+      "description": "What strobe cost inside the measured runs, as % of one core (SPEC 19); a series holds its blocks' mean.",
+      "type": ["object", "null"],
+      "additionalProperties": false,
+      "properties": {
+        "strobe_pct": { "type": "number", "description": "strobe's own process, every thread." },
+        "runner_pct": { "type": "number", "description": "The bench runner." },
+        "sampler_pct": { "type": "number", "description": "The OS and GPU sampler's thread (budget 0.5%)." },
+        "present_pct": { "type": "number", "description": "The OS present session's consumer (budget 0.5%)." },
+        "reserve_pct": { "type": "number", "description": "The reserved-CPU sweep (budget 5%, on strobe's own CPUs)." }
+      }
+    },
     "step": {
       "description": "One bisect step: the experiment of commit against good, summarized.",
       "type": "object",
@@ -189,9 +214,11 @@
         "case": { "type": "string" },
         "target": { "type": "string" },
         "target_kind": {},
-        "kind": { "type": "string", "description": "runs, launch or leak." },
+        "kind": { "type": "string", "description": "runs, launch or leak; check (--check), pixels (--pixels-only), blocks (--blocks: one build's timed blocks, nothing compared)." },
         "params": { "type": ["object", "null"] },
-        "primary": { "oneOf": [{ "$ref": "#/definitions/comparison" }, { "$ref": "#/definitions/leakPrimary" }, { "$ref": "#/definitions/checkPrimary" }] },
+        "primary": { "anyOf": [{ "$ref": "#/definitions/comparison" }, { "$ref": "#/definitions/leakPrimary" }, { "$ref": "#/definitions/checkPrimary" }, { "$ref": "#/definitions/blocksPrimary" }] },
+        "headless": { "type": "boolean", "description": "check: the page ran in a headless browser (--headless), its frame and input-latency metrics refused." },
+        "overhead": { "$ref": "#/definitions/overhead" },
         "secondaries": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "descriptive": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "decided": { "type": "boolean" },
@@ -217,7 +244,8 @@
               "values": { "type": "object", "additionalProperties": { "type": ["number", "null"] } },
               "refused": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Metrics the block refused: \"<validator>: <why>\"." },
               "recording": { "type": ["string", "null"] },
-              "locked": { "type": "boolean" }
+              "locked": { "type": "boolean" },
+              "overhead": { "$ref": "#/definitions/overhead" }
             }
           }
         },

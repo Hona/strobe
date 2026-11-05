@@ -38,7 +38,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "declared": s["declared"] })))
+        .filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"] })))
         .collect();
     if recordings.is_empty() {
         return Err(Error::msg(format!("{case}: no recording (the case failed or matched nothing):\n{}", out.text)));
@@ -46,7 +46,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     let mut text = String::new();
     for r in &recordings {
         let rec = r["recording"].as_str().unwrap_or("");
-        text += &format!("{rec} · {} · attribution\n", r["case"].as_str().unwrap_or(""));
+        text += &format!("{rec} · {} · attribution{}\n", r["case"].as_str().unwrap_or(""), if r["headless"] == true { " · headless: frames and input latency refused" } else { "" });
         // The check run before it (one cold run, timed): its launch milestones and declared metrics.
         text += &launch_line(&r["values"]);
         let declared: Vec<String> = r["declared"]
@@ -55,7 +55,10 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
             .flatten()
             .filter_map(Value::as_str)
             .filter(|m| !m.starts_with("launch."))
-            .filter_map(|m| Some(format!("{m} {}", fmt::value(r["values"][m].as_f64()?, crate::model::metric(m).map_or("", |d| d.unit)))))
+            .filter_map(|m| match r["values"][m].as_f64() {
+                Some(v) => Some(format!("{m} {}", fmt::value(v, crate::model::metric(m).map_or("", |d| d.unit)))),
+                None => r["refused"][m].is_string().then(|| format!("{m} refused")),
+            })
             .collect();
         if !declared.is_empty() {
             text += &format!("check    {}   (one cold run before it: its own numbers, not this recording's runs)\n", declared.join(" · "));
@@ -473,7 +476,7 @@ fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout:
             return Err(Error::timeout(format!("no line of the app's output matched {re} in {} s", timeout.as_secs())).hint("check the pattern against what the app prints (stdout and stderr)"));
         }
         match rx.recv_timeout(left) {
-            Ok((_, line)) if re.is_match(&line) => return Ok(line),
+            Ok((_, _, line)) if re.is_match(&line) => return Ok(line),
             Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return Err(Error::msg(format!("the app's output ended before a line matched {re}"))),
         }

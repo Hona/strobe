@@ -150,9 +150,6 @@ impl Runner {
         self.next += 1;
         self.write(&json!({ "id": id, "op": op, "args": args }))?;
         let deadline = std::time::Instant::now() + timeout;
-        // The last request a validator refused (a click on a covered window): a hook that fails with
-        // its message failed because of it, and keeps its validator across the bench file.
-        let mut refused: Option<Error> = None;
         loop {
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if left.is_zero() {
@@ -170,8 +167,11 @@ impl Runner {
                     let first = stack.lines().find(|l| l.contains(".bench.")).unwrap_or("").trim();
                     let message = format!("{op}: {err}{}", if first.is_empty() { String::new() } else { format!(" ({first})") });
                     let hint = msg.get("hint").and_then(Value::as_str).map(str::to_string);
-                    return Err(match refused.filter(|r| err.contains(&r.message)) {
-                        Some(r) => Error { message, ..r },
+                    // A driver call a validator refused (a click on a covered window), rethrown by the
+                    // hook: the refusal rides on the error frame both ways, so it keeps its validator.
+                    let refusal = msg.get("refusal").and_then(|r| serde_json::from_value::<crate::model::Refusal>(r.clone()).ok());
+                    return Err(match refusal {
+                        Some(r) => Error { message, ..Error::from(r) },
                         None => Error { hint, ..Error::msg(message) },
                     });
                 }
@@ -183,12 +183,12 @@ impl Runner {
                 let reply = match serve(&req_op, &args) {
                     Ok(v) => json!({ "id": rid, "ok": v }),
                     Err(e) => {
-                        let reply = match &e.hint {
-                            Some(h) => json!({ "id": rid, "error": e.message, "hint": h }),
-                            None => json!({ "id": rid, "error": e.message }),
-                        };
-                        if e.refusal.is_some() {
-                            refused = Some(e);
+                        let mut reply = json!({ "id": rid, "error": e.message });
+                        if let Some(h) = &e.hint {
+                            reply["hint"] = json!(h);
+                        }
+                        if let Some(r) = &e.refusal {
+                            reply["refusal"] = json!(r);
                         }
                         reply
                     }

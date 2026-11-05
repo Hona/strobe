@@ -208,6 +208,9 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
         let mut why: Option<String> = None;
         if s["not_run"] == true {
             why = Some(format!("not run: {}", s["halt"]["message"].as_str().unwrap_or("")));
+        } else if stats::kind_of(&s["primary"]) == model::VerdictKind::Refused {
+            // A refusal across the blocks (TailTooShort, NoPhase, a block's): no value, whatever the blocks hold.
+            why = Some(s["primary"]["verdict"].as_str().unwrap_or("refused").to_string());
         } else if values.len() < MIN_BLOCKS {
             why = Some(blocks_v.iter().find_map(|b| b["refused"][&metric].as_str()).map(|w| format!("refused ({w})")).unwrap_or_else(|| format!("{} of {} blocks gave {metric}", values.len(), blocks_v.len())));
         } else if s["session"] == "mixed" {

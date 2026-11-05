@@ -108,7 +108,7 @@ export interface Context<P> {
   call<T = unknown>(name: string, ...args: unknown[]): Promise<T>
   /**
    * Native targets: resolves with the first line matching `match` that the app writes after the call, from its
-   * output (`in: "output"`, the default) or from files under its home matching a glob (`in: "logs/*.log"`), and
+   * output (`in: "output"`, the default; needs the target's `output: true`) or from files under its home matching a glob (`in: "logs/*.log"`), and
    * when strobe read it on its host clock (`at`, ns: the clock of phase marks and presented frames). Start the wait
    * before what makes the app write: `const saved = ctx.waitForLine(/saved/); await page.click("Save"); await saved`.
    * Fails after `timeout` ms (default 30000).
@@ -360,6 +360,11 @@ export interface NativeOptions {
   window?: false
   /** What every block of this target must show (a case's `expect` adds to it). */
   expect?: Expect
+  /**
+   * `true`: strobe reads the app's stdout and stderr through a pipe, for `ctx.waitForLine` on its output. Off by
+   * default, as a pipe changes how a C runtime buffers stdout: an app whose output a case waits on must flush each line.
+   */
+  output?: boolean
 }
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */

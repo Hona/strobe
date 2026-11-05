@@ -7,7 +7,6 @@ use crate::jsonc::{self, Seg};
 use crate::model::{Error, Result};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 /// The project root for `dir`: the nearest ancestor with a strobe.json, else the git root, else `dir`.
 pub fn project_root(dir: &Path) -> PathBuf {
@@ -15,7 +14,7 @@ pub fn project_root(dir: &Path) -> PathBuf {
     if let Some(d) = found {
         return d.to_path_buf();
     }
-    host::output(Command::new("git").arg("-C").arg(dir).args(["rev-parse", "--show-toplevel"])).map(PathBuf::from).unwrap_or_else(|| dir.to_path_buf())
+    host::git::toplevel(dir).unwrap_or_else(|| dir.to_path_buf())
 }
 
 /// The project's strobe.json over the user's (`<state>/strobe.json`). `apps` merge per app, so a

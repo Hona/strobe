@@ -197,7 +197,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let grace = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(rx) = &started.output {
-                lines.extend(rx.try_iter().map(|(at, l)| (at, l, "output".to_string())));
+                lines.extend(rx.try_iter().map(|(at, _, l)| (at, l, "output".to_string())));
             }
             let now = Instant::now();
             if now >= grace || (now >= settle && found_all(&milestones, &lines, |m| m.source == "output")) {
@@ -340,90 +340,125 @@ pub(super) fn pattern(d: &Value, what: &str) -> Result<regex_lite::Regex> {
     regex_lite::Regex::new(&source).map_err(|e| Error::usage(format!("{what}: {e}")))
 }
 
-/// `ctx.waitForLine(match, { in, timeout })` in a block's hooks: each call first registers a watch
-/// (`watch`), then waits on it (`wait`) for the first line matching it that the app wrote after the
-/// watch, from its output (`in: "output"`, the default) or from files under its home matching a glob.
-/// A line carries when strobe read it on the host clock (ns), the clock of phase marks and presents.
+/// `ctx.waitForLine(match, { in, timeout })` in a block's hooks: each call registers a watch
+/// (`watch`) and then polls it (`poll`) until it has the first line matching it that the app wrote
+/// after the watch: from its output (`in: "output"`, the default; only a target with `output: true`
+/// pipes it) or from files under its home matching a glob. A poll never blocks, so the runner keeps
+/// serving the hook's other calls (a click) meanwhile. A line carries when strobe read it on the host
+/// clock (ns), the clock of phase marks and presents: output as its reader thread got it, a log file's
+/// line as the watch's own tail thread read it.
 #[derive(Default)]
 pub(super) struct Lines {
-    /// The app's output so far: when strobe read each line (host clock) and the line.
-    output: Vec<(u64, String)>,
     watches: Vec<LineWatch>,
 }
 
 struct LineWatch {
     pattern: regex_lite::Regex,
     source: String,
-    /// Output: the first line it may match. Files: each file's read offset and unfinished line.
-    from: usize,
-    files: BTreeMap<PathBuf, (u64, String)>,
+    deadline: Instant,
+    timeout: Duration,
+    tail: Option<Tail>,
+    found: Option<(u64, String)>,
+}
+
+/// A log glob's tail thread: the lines it read (host clock ns), and the flag that ends it.
+type Tail = (Receiver<(u64, String)>, Arc<AtomicBool>);
+
+impl Drop for LineWatch {
+    fn drop(&mut self) {
+        if let Some((_, stop)) = &self.tail {
+            stop.store(true, Ordering::Relaxed);
+        }
+    }
 }
 
 impl Lines {
-    /// Moves what the app has written into `output`, stamped on the host clock.
-    fn pull(&mut self, rx: Option<&Receiver<(f64, String)>>) {
+    /// Hands the app's new output lines to the watches waiting on output; with none waiting they are
+    /// dropped, so nothing buffers while no case asks.
+    fn pull(&mut self, rx: Option<&Receiver<isolate::OutputLine>>) {
         let Some(rx) = rx else { return };
-        while let Ok((at, line)) = rx.try_recv() {
-            let ago = ((epoch_ms() - at).max(0.0) * 1e6) as u64;
-            self.output.push((host::now_ns().saturating_sub(ago), line));
+        while let Ok((_, at, line)) = rx.try_recv() {
+            for w in self.watches.iter_mut().filter(|w| w.source == "output" && w.found.is_none()) {
+                if w.pattern.is_match(&line) {
+                    w.found = Some((at, line.clone()));
+                }
+            }
         }
     }
 
-    pub(super) fn serve(&mut self, rx: Option<&Receiver<(f64, String)>>, home: &Path, a: &Value) -> Result<Value> {
+    pub(super) fn serve(&mut self, rx: Option<&Receiver<isolate::OutputLine>>, home: &Path, a: &Value) -> Result<Value> {
         self.pull(rx);
         if a["step"] == "watch" {
             let source = a["in"].as_str().unwrap_or("output").to_string();
             if source == "output" && rx.is_none() {
-                return Err(Error::usage("waitForLine: strobe does not read this target's output; give `in` a glob of log files under its home"));
+                return Err(Error::usage(
+                    "waitForLine: strobe reads this target's output only with output: true on the target (native(…, { output: true })), which pipes it (an app that buffers a pipe must flush each line); or give `in` a glob of log files under its home",
+                ));
             }
-            let files = if source == "output" { BTreeMap::new() } else { matching(home, &source).into_iter().map(|p| (p.clone(), (std::fs::metadata(&p).map_or(0, |m| m.len()), String::new()))).collect() };
-            self.watches.push(LineWatch { pattern: pattern(a, "waitForLine")?, source, from: self.output.len(), files });
+            let timeout = Duration::from_millis(a["timeout"].as_u64().unwrap_or(30_000));
+            let tail = (source != "output").then(|| {
+                // Files that exist now are read from their end; later ones from their start.
+                let offsets: BTreeMap<PathBuf, u64> = matching(home, &source).into_iter().map(|p| (p.clone(), std::fs::metadata(&p).map_or(0, |m| m.len()))).collect();
+                let (tx, lines) = channel();
+                let stop = Arc::new(AtomicBool::new(false));
+                let (home, glob, flag) = (home.to_path_buf(), source.clone(), stop.clone());
+                std::thread::spawn(move || tail_from(&home, &glob, offsets, &flag, &tx));
+                (lines, stop)
+            });
+            self.watches.push(LineWatch { pattern: pattern(a, "waitForLine")?, source, deadline: Instant::now() + timeout, timeout, tail, found: None });
             return Ok(json!(self.watches.len() - 1));
         }
         let id = a["id"].as_u64().unwrap_or(u64::MAX) as usize;
-        let timeout = Duration::from_millis(a["timeout"].as_u64().unwrap_or(30_000));
-        let deadline = Instant::now() + timeout;
-        loop {
-            self.pull(rx);
-            let w = self.watches.get_mut(id).ok_or_else(|| Error::msg("waitForLine: no such watch"))?;
-            let found = if w.source == "output" {
-                self.output[w.from.min(self.output.len())..].iter().find(|(_, l)| w.pattern.is_match(l)).cloned()
-            } else {
-                read_new(home, w)
-            };
-            if let Some((at, line)) = found {
-                return Ok(json!({ "line": line, "at": at }));
+        let w = self.watches.get_mut(id).ok_or_else(|| Error::msg("waitForLine: no such watch"))?;
+        if let Some((lines, _)) = &w.tail {
+            while let (None, Ok((at, line))) = (&w.found, lines.try_recv()) {
+                if w.pattern.is_match(&line) {
+                    w.found = Some((at, line));
+                }
             }
-            if Instant::now() >= deadline {
-                return Err(Error::timeout(format!("waitForLine: no line matching {} in {} in {:.1} s", w.pattern.as_str(), w.source, timeout.as_secs_f64())));
-            }
-            std::thread::sleep(Duration::from_millis(10));
         }
+        if let Some((at, line)) = w.found.clone() {
+            w.tail = None;
+            return Ok(json!({ "line": line, "at": at }));
+        }
+        if Instant::now() >= w.deadline {
+            w.tail = None;
+            return Err(Error::timeout(format!("waitForLine: no line matching {} in {} in {:.1} s", w.pattern.as_str(), w.source, w.timeout.as_secs_f64())));
+        }
+        Ok(json!({ "pending": true }))
     }
 }
 
-/// What files matching a watch's glob gained since it last read them: the first line that matches.
-fn read_new(home: &Path, w: &mut LineWatch) -> Option<(u64, String)> {
+/// Lines appended to files under `home` matching `glob` after `offsets` (a file not in it: from its
+/// start), stamped on the host clock as read every 10 ms, until `stop`.
+fn tail_from(home: &Path, glob: &str, mut offsets: BTreeMap<PathBuf, u64>, stop: &AtomicBool, tx: &std::sync::mpsc::Sender<(u64, String)>) {
     use std::io::{Read, Seek, SeekFrom};
-    for path in matching(home, &w.source) {
-        let entry = w.files.entry(path.clone()).or_insert((0, String::new()));
-        let Ok(mut f) = std::fs::File::open(&path) else { continue };
-        let mut buf = Vec::new();
-        if f.seek(SeekFrom::Start(entry.0)).is_err() || f.read_to_end(&mut buf).is_err() {
-            continue;
-        }
-        entry.0 += buf.len() as u64;
-        entry.1.push_str(&String::from_utf8_lossy(&buf));
-        let at = host::now_ns();
-        while let Some(i) = entry.1.find('\n') {
-            let line = isolate::strip_ansi(entry.1[..i].trim_end_matches('\r'));
-            entry.1.drain(..=i);
-            if w.pattern.is_match(&line) {
-                return Some((at, line));
+    let mut partial: BTreeMap<PathBuf, String> = BTreeMap::new();
+    while !stop.load(Ordering::Relaxed) {
+        for path in matching(home, glob) {
+            let at = offsets.entry(path.clone()).or_insert(0);
+            if std::fs::metadata(&path).map_or(0, |m| m.len()) <= *at {
+                continue;
+            }
+            let Ok(mut f) = std::fs::File::open(&path) else { continue };
+            let mut buf = Vec::new();
+            if f.seek(SeekFrom::Start(*at)).is_err() || f.read_to_end(&mut buf).is_err() {
+                continue;
+            }
+            let now = host::now_ns();
+            *at += buf.len() as u64;
+            let text = partial.entry(path).or_default();
+            text.push_str(&String::from_utf8_lossy(&buf));
+            while let Some(i) = text.find('\n') {
+                let line = isolate::strip_ansi(text[..i].trim_end_matches('\r'));
+                text.drain(..=i);
+                if tx.send((now, line)).is_err() {
+                    return;
+                }
             }
         }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    None
 }
 
 pub(super) fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
@@ -443,11 +478,10 @@ fn observer(until: &Value) -> Result<String> {
   const q = {q}
   let done
   window.__strobeLaunch = new Promise((resolve) => (done = resolve))
-  const shows = () => !!window.__strobe.find(q)
-  const already = document.documentElement != null && shows()
-  const mo = new MutationObserver(() => {{ if (shows()) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }} }})
-  mo.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }})
-  if (already) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }}
+  const already = document.documentElement != null && !!window.__strobe.find(q)
+  // The probe's wait: every shadow root's changes, and each frame while an animation or a transition
+  // runs, so an element inside a shadow root or one that fades in counts when it shows.
+  window.__strobe.waitFor(q, 2147483647, "until").then(() => done(performance.timeOrigin + performance.now()))
   return already
 }})()"#,
         helper = crate::driver::HELPER,

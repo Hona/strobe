@@ -132,8 +132,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let home = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), None)?;
     crate::target::a11y::prepare();
     let launched = Instant::now();
-    // Its output is read (not discarded) for `ctx.waitForLine`.
-    let (mut n, guard) = match nt::launch(&app, &home, &[], true, ctx.pin) {
+    // Its output goes nowhere unless the target asks for it (`output: true`, for `ctx.waitForLine`):
+    // a pipe changes how a C runtime buffers stdout (a pipe is block-buffered, the null device is not).
+    let (mut n, guard) = match nt::launch(&app, &home, &[], target["output"] == true, ctx.pin) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home.dir);
@@ -511,16 +512,12 @@ fn runs(
                 reactions.unshown = (reactions.unshown.0 + got.unshown.0, reactions.unshown.1 + got.unshown.1);
                 reactions.unchanged += got.unchanged;
             }
-            // SPEC §19: the present session's consumer may use 0.5% of a core; past 2% it competes
-            // with the app it measures, and its frames describe a disturbed run.
+            // SPEC §19: the present session's consumer may use 0.5% of a core (`Overhead`, warned for
+            // timed blocks); past 2% it competes with the app it measures, and its frames describe a
+            // disturbed run.
             let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
             let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
             present_pct = overhead;
-            if let Some(o) = overhead.filter(|o| *o > 0.5)
-                && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
-            {
-                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: the OS present session's consumer used {o:.2}% of a core, over its 0.5% budget (SPEC §19)", v.role)));
-            }
             let spun = refresh.and_then(|ms| frames::unpaced(&p.presents, &pids, &spans, ms));
             // A spin the toolkit cannot see (composited while locked, a display asleep): said for
             // every series, declared frame metrics or not, with the display's own rate when no
@@ -948,7 +945,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             let when = |at: f64, l: &str| m.pattern.captures(l).map(|c| c.name("at").and_then(|v| v.as_str().parse::<f64>().ok()).filter(|v| *v > 1e12).unwrap_or(at));
             loop {
                 if let Some(rx) = &n.output {
-                    lines.extend(rx.try_iter().map(|(at, l)| (at, l, "output".to_string())));
+                    lines.extend(rx.try_iter().map(|(at, _, l)| (at, l, "output".to_string())));
                 }
                 let mut found = lines.iter().filter(|(_, _, src)| *src == m.source).find_map(|(at, l, _)| when(*at, l));
                 if found.is_none() && m.source != "output" {
@@ -1081,7 +1078,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         let grace = Instant::now() + Duration::from_secs(3);
         loop {
             if let Some(rx) = &n.output {
-                lines.extend(rx.try_iter().map(|(at, l)| (at, l, "output".to_string())));
+                lines.extend(rx.try_iter().map(|(at, _, l)| (at, l, "output".to_string())));
             }
             let now = Instant::now();
             if now >= grace || (now >= settle && found_all(&milestones, &lines, |m| m.source == "output")) {

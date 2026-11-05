@@ -78,6 +78,8 @@ const TOOLS: &[Tool] = &[
             ("base", "baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"),
             ("aa", "same build on both sides (checks the method)"),
             ("check", "validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
+            ("headless", "with check: page cases in a headless browser, no display needed; frame and input-latency metrics refused"),
+            ("blocks", "N timed blocks of head alone and their values, nothing compared (what track records for a commit)"),
             ("filter", "case names, comma-separated; exact unless a name holds * (a glob)"),
             ("target", "target names from the file, comma-separated"),
             ("params", "k=v,k2=v2, or all (adds every parameter's more values)"),

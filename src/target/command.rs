@@ -101,9 +101,9 @@ pub fn launch(spec: &Spec, home: &Path, window: &Window, cpus: Option<u64>) -> R
     let deadline = Instant::now() + spec.timeout;
     let ws = loop {
         match output.recv_timeout(Duration::from_millis(200)) {
-            Ok((at, line)) => {
+            Ok((at, ns, line)) => {
                 let found = line.find(&spec.attach).and_then(|i| line[i..].find("ws://").map(|j| i + j)).map(|start| line[start..].split_whitespace().next().unwrap_or("").to_string());
-                let _ = tx.send((at, line));
+                let _ = tx.send((at, ns, line));
                 if let Some(ws) = found.filter(|w| w.len() > "ws://".len()) {
                     break ws;
                 }

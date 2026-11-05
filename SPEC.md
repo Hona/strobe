@@ -435,7 +435,14 @@ browser. `record --bench … --headless` is the same for one case.
 `--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
 their values, with nothing compared and nothing decided; the text gives the primary per block and the
 blocks' median with a Hodges–Lehmann interval over them. It is what `track` records for a commit
-(§25.2); with `--base`, `--aa`, `--check` or `--probes memory` it is a usage error.
+(§25.2); with `--base`, `--aa`, `--check`, `--probes memory`, or anything that compares or decides
+(`--require-verdict`, `--plan`, `--noworse`, `--pairs`, `--pixels`, `--pixels-only`) it is a usage
+error, as is N that is not a whole number from 1. The primary is refused as a comparison would refuse
+it (rule 1): a block's refusal, `TailTooShort` when a block had too few of a percentile's events,
+`NoPhase` when a measured run never entered its phase; and one build's analysers run on its blocks
+(`HighVariance`, `MultimodalDistribution`, `NotSteady`, `Background`, `StateDrift`, `DisplayOff`).
+A refused primary gives `track` no point. `report` draws nothing for it (no comparison to show): its
+blocks are in its `result.json`.
 `--head` alone is an error that suggests `--base`, `--blocks` or `--check`. `--runs` is the measured runs per
 block (default 5). `--params all` adds the `more` values of every parameter (§9.6). Variants are
 described in §9.5. `--bisect` walks a commit range (§9.7). `--on` runs on mesh devices (§9.8).
@@ -1440,11 +1447,15 @@ export default bench({
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `waitForLine(match, { in, timeout })` (native targets: the first line matching a string or
-RegExp that the app writes after the call, from its output, which native blocks read for it, or from
-files under its home matching a glob `in`; it resolves with the line and `at`, when strobe read it on
-the host clock in ns, the clock of phase marks and presents, and fails after `timeout`, default 30 s;
-the call registers its watch at once and then waits, so `const saved = ctx.waitForLine(/saved/);
-await page.click(…); await saved` misses nothing), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
+RegExp that the app writes after the call, from its output, which strobe pipes only for a target
+with `output: true` (a pipe makes a C runtime buffer stdout: the app must flush each line; without
+it the output goes to the null device and a wait on it is a usage error), or from files under its
+home matching a glob `in`, tailed by a thread of its own every 10 ms; it resolves with the line and
+`at`, when strobe read it on the host clock in ns, the clock of phase marks and presents, and fails
+after `timeout`, default 30 s; the call registers its watch at once and then polls it, each poll
+answered at once, so strobe serves the hook's other calls meanwhile and `const saved =
+ctx.waitForLine(/saved/); await page.click(…); await saved` misses nothing and never deadlocks;
+output lines no watch waits for are dropped), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
 `playwright` and `mock(pattern, handler)`.
@@ -2988,20 +2999,22 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block) |
+| binary (viewer embedded) | ≤ 25 MB |
+| `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
 Every page, native and script block records what strobe cost inside its measured runs in
 `overhead`, as % of one core: strobe's own process (every thread) and the bench runner, each read
-from that one process just before a run begins and just after it ends, so strobe's work between runs
-(reading the target's processes, snapshots, resets, warmup runs) is not in it; and the parts that
-measure themselves over the block (`sampler_pct`, `present_pct`, `reserve_pct`). `--check` prints it
-per case (`self  strobe 0.81% · runner 0.40% · sampler 0.16% of a core`), a bench per series (the
-blocks' mean); a part over its budget above warns `OverheadBudget` once. strobe's own process has no
-budget yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless page's click
-run 0.61%; a script target's 30 ms runs 3–6%, which is strobe relaying each `ctx.call` between the
-runner and the script's host inside the run. Counted over the whole run loop instead, the same
-block read 40–80% (script) and 7% (native): strobe's own between-run reads, never inside a run.
-| binary (viewer embedded) | ≤ 25 MB |
-| `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
+from that one process just before a run begins and just after it ends (a page's: around its start
+and end marks), so strobe's work between runs (reading the target's processes, snapshots, resets,
+warmup runs) is not in it; and the parts that measure themselves over the block (`sampler_pct`,
+`present_pct`, `reserve_pct`). `--check` prints it per case (`self  strobe 0.81% · runner 0.40% ·
+sampler 0.16% of a core`), a bench per series (the blocks' mean); in a timed block a part over its
+budget above warns `OverheadBudget`, once per series and part. strobe's own process has no budget
+yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless page's click run
+0.61%; a script target's 30 ms runs 3–6%, which is strobe relaying each `ctx.call` between the
+runner and the script's host inside the run. Counted over the whole run loop instead, the same block
+read 40–80% (script) and 7% (native): strobe's own between-run reads, never inside a run. On air
+(M4) the OS sampler's thread read 0.85–1.2% of a core in `--check` blocks, over its 0.5% budget.
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
@@ -3558,7 +3571,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   slot or builds: a profile error had waited for the slot first. `bench --check --headless` and
   `record --bench … --headless` check page cases with no display (adais, locked: a page case's
   `main.work`, `count.*` and `phase.*` read, `frames.interval.p95` and `interaction.p95` refused
-  "the page ran headless"); `ctx.waitForLine` (native: output, as native blocks now read it, or log
+  "the page ran headless"); `ctx.waitForLine` (native: output with the target's `output: true`, or log
   files under the home; checked with a fake tray app's `tick` lines and a log glob); a page launch's
   `until` in the shared grammar (`role=heading text="Later"` timed a heading that appears after
   1.5 s at 1533 ms, headless); `look app:<id> --build`. Page, native and script blocks share one
@@ -3568,6 +3581,22 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   do. Their launch, probes, `expect` and attribution stay each target's own. Each block's `overhead` (§19); not yet: a
   track of strobe's own CPU over time in `perfetto.pftrace` (it needs the sampler to sample strobe
   too).
+- Review of the block engine (2026-11-05): `--blocks` refuses its primary as a comparison would
+  (a block's refusal, `TailTooShort`, `NoPhase`) and runs one build's analysers, rejects N below 1
+  and every comparing flag, and has no report; `Drift` floors a trend's range at 0.5 of the unit (1
+  for counts) when the base is 0, as `stats::compare` floors its bound. A driver call a validator
+  refused keeps its validator through a hook that rethrows it: the refusal rides on the runner's error
+  frame both ways (it matched the error's words). `waitForLine` polls (a blocking wait held strobe's
+  call loop, so a hook awaiting a line and then clicking could deadlock), stamps output when its
+  reader thread reads it and log lines on their own tail thread, and reads output only for a target
+  with `output: true`. A launch's `until` waits with the page probe's `waitFor` (shadow roots, fades).
+  A slow page speed check is `Background` only when work outside the browser kept the target's CPUs
+  busy during it (measured around the check, the busiest named). A kept recording's `meta.json` holds
+  the values and refusals its block ended with (headless and priority refusals came after it was
+  written), and `headless`; `display.*` is refused headless, and `gpu.vram`/`gpu.shared` when the
+  headless browser drew in software. `OverheadBudget` warns for timed blocks only, once per series and
+  part; a page's strobe cost spans its start and end marks. The MCP `bench` tool takes `blocks` and
+  `headless`; `result.v1.json` has `outcome`, `blocksPrimary`, `headless` and `overhead`.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

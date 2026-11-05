@@ -98,11 +98,16 @@ const context = () => ({
     void request("count", { name, n })
   },
   call: (name: string, ...args: unknown[]) => request("call", { name, args }),
-  // The watch goes in at the call, before whatever the hook does next; the wait follows.
+  // The watch goes in at the call, before whatever the hook does next; then short polls, each answered
+  // at once, so strobe serves the hook's other calls (a click) between them.
   async waitForLine(match: string | RegExp, opts: { in?: string; timeout?: number } = {}) {
     const pattern = match instanceof RegExp ? plain(match) : { match }
-    const id = await request("line", { step: "watch", ...pattern, in: opts.in ?? "output" })
-    return request("line", { step: "wait", id, timeout: opts.timeout ?? 30_000 })
+    const id = await request("line", { step: "watch", ...pattern, in: opts.in ?? "output", timeout: opts.timeout ?? 30_000 })
+    for (;;) {
+      const got: any = await request("line", { step: "poll", id })
+      if (!got?.pending) return got
+      await Bun.sleep(10)
+    }
   },
 })
 
@@ -310,8 +315,10 @@ createInterface({ input: socket }).on("line", (line) => {
   const waiting = pending.get(message.id)
   if (waiting) {
     pending.delete(message.id)
-    // strobe's fix for a failed call (a missing permission, a selector to try) rides along as `hint`.
-    if ("error" in message) waiting.reject(Object.assign(new Error(message.error), message.hint ? { hint: message.hint } : {}))
+    // strobe's fix for a failed call (a missing permission, a selector to try) rides along as `hint`,
+    // and the validator that refused it as `refusal`, which a hook that lets the error through hands back.
+    if ("error" in message)
+      waiting.reject(Object.assign(new Error(message.error), message.hint ? { hint: message.hint } : {}, message.refusal ? { refusal: message.refusal } : {}))
     else waiting.resolve(message.ok)
     return
   }
@@ -323,6 +330,7 @@ createInterface({ input: socket }).on("line", (line) => {
         error: String(error?.message ?? error),
         stack: String(error?.stack ?? ""),
         ...(typeof error?.hint === "string" ? { hint: error.hint } : {}),
+        ...(error?.refusal ? { refusal: error.refusal } : {}),
       }),
   )
 })

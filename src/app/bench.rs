@@ -456,6 +456,8 @@ struct Ctx<'a> {
     mode: Mode,
     /// `--check --headless`: pages run in a headless browser, which draws nothing to a display.
     headless: bool,
+    /// Series and part of strobe already warned over its §19 budget (`OverheadBudget`).
+    overhead_warned: std::collections::BTreeSet<String>,
     /// A native target's GPU adapter and window scale per variant (`VariantMismatch`).
     native_setup: BTreeMap<String, String>,
     /// The bench's harness, overlaid on every variant's folder (`overlay_harness`).
@@ -719,6 +721,15 @@ pub fn run(args: &Args) -> Result<Output> {
         RESUMED.with(|r| r.borrow_mut().take());
         return out;
     }
+    // `--blocks N`: one build's timed blocks, nothing compared, so nothing that compares or decides goes with it.
+    if args.get("blocks").is_some() {
+        if let Some(f) = ["require-verdict", "plan", "noworse", "pairs", "pixels", "pixels-only"].iter().find(|f| args.has(f)) {
+            return Err(Error::usage(format!("--blocks N times one build alone and decides nothing; --{f} needs a comparison: drop one of them")));
+        }
+        if args.num("blocks")?.is_none_or(|b| !b.is_finite() || b < 1.0 || b.fract() != 0.0) {
+            return Err(Error::usage(format!("--blocks: a whole number of blocks from 1, not {}", args.get("blocks").unwrap_or(""))));
+        }
+    }
     if args.has("plan") {
         return plan::run(args);
     }
@@ -735,7 +746,7 @@ pub fn run(args: &Args) -> Result<Output> {
     // `--probes memory`: a leak run per variant (SPEC §8.6); `--base` is optional there.
     let leak_run = args.get("probes") == Some("memory");
     let check = args.has("check");
-    let blocks = args.num("blocks")?.map(|b| b.max(1.0) as usize);
+    let blocks = args.num("blocks")?.map(|b| b as usize);
     let base_spec = match (args.get("base"), aa) {
         _ if check && (aa || args.get("base").is_some()) => return Err(Error::usage("--check runs each case once on --head, with nothing to compare; drop --base and --aa")),
         _ if check && blocks.is_some() => return Err(Error::usage("--check runs one untimed block per case; --blocks N runs N timed ones: pick one")),
@@ -828,6 +839,7 @@ pub fn run(args: &Args) -> Result<Output> {
         gpu_cache: BTreeMap::new(),
         mode,
         headless: args.has("headless"),
+        overhead_warned: Default::default(),
         native_setup: BTreeMap::new(),
         // Per bench: a long-lived daemon runs benches of several repositories.
         harness: harness(&file, &project, &config),
@@ -1417,7 +1429,7 @@ fn session_of<'a>(blocks: impl Iterator<Item = &'a Block>) -> (&'static str, usi
 /// steady like a bench's, and their values. Nothing is compared, so nothing is decided; a reader
 /// takes the blocks' values (and their spread) as the commit's point.
 fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, n: usize) -> Result<Value> {
-    model::metric(&s.primary)
+    let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
@@ -1467,17 +1479,39 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     if let Some(h) = halted.as_ref().filter(|_| blocks.is_empty()) {
         return Ok(json!({ "label": s.label(), "case": s.case, "not_run": true, "halt": { "code": h.code, "message": h.message } }));
     }
+    // The primary, refused as a paired comparison would refuse it (rule 1): a block refused it, a
+    // percentile's tail is too short, or no measured run entered its phase.
+    let mut primary = json!({ "metric": s.primary });
+    let refusal = blocks
+        .iter()
+        .find_map(|b| b.refused.get(&s.primary).cloned())
+        .or_else(|| tail_refusal(def, &blocks))
+        .or_else(|| {
+            let phase = s.primary.strip_prefix("phase.")?;
+            (!blocks.iter().all(|b| b.values.get(&s.primary).is_some_and(|v| v.is_finite()))).then(|| Refusal::new(ValidatorId::NoPhase, format!("{}: no measured run of some block entered phase(\"{phase}\")", s.primary)))
+        });
+    if let Some(r) = refusal {
+        primary["verdict"] = json!(format!("refused ({}): {}", r.validator, r.summary));
+        primary["verdict_kind"] = json!(VerdictKind::Refused);
+        primary["refusal"] = json!(r);
+    }
     let mut warnings: Vec<Warning> = Vec::new();
+    // The analysers of one build's blocks: HighVariance, MultimodalDistribution, NotSteady,
+    // Background, StateDrift (Drift is a trend of pair differences: none here).
+    analyse(s, def, &blocks, &[], false, &mut warnings);
     let (session, locked, _) = session_of(blocks.iter());
     if session == "mixed" {
         warnings.push(validity::warn("SessionLocked", format!("{locked} of {} blocks ran on a locked screen and the rest unlocked: their values do not compare", blocks.len())));
+    }
+    if blocks.iter().any(|b| b.display == Some(0)) {
+        warnings.push(validity::info("DisplayOff", "the blocks ran with the display off (a locked session's display sleeps): compare them only with runs whose display was off too"));
     }
     let (shown, screen_warnings) = shown::summarize(&blocks);
     warnings.extend(screen_warnings);
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
-        "primary": { "metric": s.primary }, "decided": false, "session": session,
+        "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
@@ -1909,7 +1943,7 @@ fn pixels_series(ctx: &mut Ctx, s: &Series, variants: &[Variant]) -> Result<Valu
                 let d = png::diff(&b, &h, noise);
                 let diff_path = root.join(format!("{name}.diff.png"));
                 if let Some(img) = &d.image {
-                    std::fs::write(&diff_path, png::write(img)?)?;
+                    store::write_atomic(&diff_path, &png::write(img)?)?;
                 }
                 json!({
                     "name": name, "state": if d.differing == 0 { "same" } else { "differ" }, "differing": d.differing, "total": d.total, "max_delta": d.max_delta, "noise": noise,
@@ -1964,19 +1998,22 @@ fn pixel_line(p: &Value) -> String {
 
 /// `TailTooShort` (SPEC §10.1): a percentile needs its minimum n of the events it is a percentile of.
 fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Comparison {
+    if let Some(r) = tail_refusal(def, blocks) {
+        c.refuse(r);
+    }
+    c
+}
+
+/// `TailTooShort` when a block had fewer of a percentile's events than it needs.
+fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
     let (count, what) = match def.name.split('.').next() {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
         _ => ("frames.n", "frames"),
     };
-    if def.min_n > 1 {
-        let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
-        if least < def.min_n {
-            c.refuse(Refusal::new(ValidatorId::TailTooShort, format!("{least} {what} < {}", def.min_n)));
-        }
-    }
-    c
+    let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
+    (def.min_n > 1 && least < def.min_n).then(|| Refusal::new(ValidatorId::TailTooShort, format!("{least} {what} < {}", def.min_n)))
 }
 
 /// What an attribution block records for this target.
@@ -2085,8 +2122,10 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
         // A trend smaller than 1% end to end (rounding of a near-constant difference) changes no verdict.
         let base = metrics::median(&pairs.iter().map(|&(a, _)| val(&blocks[a], &s.primary)).filter(|x| x.is_finite()).collect::<Vec<_>>()).abs();
         let range = d.iter().copied().fold(f64::NEG_INFINITY, f64::max) - d.iter().copied().fold(f64::INFINITY, f64::min);
-        let trivial = if relative { 0.01 } else { (0.01 * base).max(f64::MIN_POSITIVE) };
-        if rho.abs() > 0.6 && range >= trivial {
+        // A difference moves at least past a floor, as `stats::compare` floors its bound: 0.5 of the
+        // unit, a whole one for counts (a count that went 0 → 1 once is no trend).
+        let trend = if relative { range >= 0.01 } else { range > (0.01 * base).max(if def.unit == "count" { 1.0 } else { 0.5 }) };
+        if rho.abs() > 0.6 && trend {
             w.push(validity::warn("Drift", format!("the difference trends across pairs (Spearman {rho:.2}): the machine changed during the run")));
         }
     }
@@ -2171,6 +2210,45 @@ fn growth(ys: &[f64], n: usize, bound: f64, show: &dyn Fn(f64) -> String) -> Val
         (VerdictKind::Unclear, format!("unclear: {} … {}/run; more runs (--repeat) narrow it", show(lo), show(hi)))
     };
     json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "verdict_kind": kind, "decided": kind.decided() })
+}
+
+/// Other work on the target's CPUs over a span (a page's speed check), as `validity`'s native check
+/// measures it: their busy time from idle cycles, less the target browser's own CPU, and the busiest
+/// processes outside strobe's tree (the browser is in it).
+struct Foreign {
+    idle: Vec<u64>,
+    tsc: Option<u64>,
+    browser: u64,
+    procs: (u64, Vec<host::ProcInfo>),
+}
+
+impl Foreign {
+    fn start(browser: &chromium::Browser) -> Foreign {
+        let mut idle = Vec::new();
+        host::idle_cycles(&mut idle);
+        Foreign { idle, tsc: host::tsc(), browser: browser.processes().iter().map(|p| p.cycles).sum(), procs: (host::now_ns(), host::all_processes()) }
+    }
+
+    /// Other work on `cpus` (all when unpinned) as % of one core, and the busiest outside processes.
+    fn stop(self, cpus: Option<u64>, browser: &chromium::Browser) -> (f64, Vec<(String, f64)>) {
+        let mut idle = Vec::new();
+        let ok = host::idle_cycles(&mut idle);
+        let (tsc, own) = (host::tsc(), browser.processes().iter().map(|p| p.cycles).sum::<u64>());
+        let busiest = busiest_others(&self.procs, &(host::now_ns(), host::all_processes()));
+        let span = match (self.tsc, tsc) {
+            (Some(a), Some(b)) if b > a && ok && idle.len() == self.idle.len() => (b - a) as f64,
+            _ => return (0.0, busiest),
+        };
+        let busy: f64 = self
+            .idle
+            .iter()
+            .zip(&idle)
+            .enumerate()
+            .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
+            .map(|(_, (a, b))| (100.0 * (1.0 - b.saturating_sub(*a) as f64 / span)).clamp(0.0, 100.0))
+            .sum();
+        ((busy - 100.0 * own.saturating_sub(self.browser) as f64 / span).max(0.0), busiest)
+    }
 }
 
 /// The three busiest processes outside strobe's own tree (the target, runner and servers) between two
@@ -2460,7 +2538,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).inspect(|b| restate_recording(ctx, b));
         let r = match reserve.map(host::reserve::Reserve::finish) {
             Some(report) => {
                 ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
@@ -2472,11 +2550,13 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
             }
             None => r,
         };
-        // A part of strobe over its §19 budget competes with the app it measures: said once.
-        if let Some((part, pct, budget)) = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).and_then(|o| o.over().into_iter().next())
-            && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
-        {
-            ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", v.role, pct_of_core(pct))));
+        // A part of strobe over its §19 budget in a timed block competes with the app it measures:
+        // said once per series and part.
+        let over = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).filter(|_| x.measures_time()).map(Overhead::over).unwrap_or_default();
+        for (part, pct, budget) in over {
+            if ctx.overhead_warned.insert(format!("{}\n{part}", s.label())) {
+                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), v.role, pct_of_core(pct))));
+            }
         }
         r
     })
@@ -2594,7 +2674,21 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
 /// `BackgroundPriority`). At background QoS a drag read 83-91% dropped frames that dropped 0.4% at
 /// normal priority.
 pub(crate) fn foreground_metric(m: &str) -> bool {
-    ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+    ["frames.", "interaction.", "scroll.", "canvas.", "input.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+}
+
+/// A kept recording's values and refusals as the block ended with them: the block wrote its
+/// `meta.json` before `priority_state` and `headless_state` refused what the screen or the priority
+/// make meaningless, and the recording must not hold those values under its handle.
+fn restate_recording(ctx: &Ctx, b: &Block) {
+    let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) else { return };
+    let Ok(mut meta) = store::read_json(&dir.join("meta.json")) else { return };
+    meta["values"] = json!(b.values);
+    meta["refused"] = refusal_map(&b.refused);
+    if ctx.headless {
+        meta["headless"] = json!(true);
+    }
+    let _ = store::write_json(&dir.join("meta.json"), &meta);
 }
 
 /// `--headless`: what reached no display is not kept. Frames, input latencies, scrolling, canvas
@@ -2604,7 +2698,9 @@ fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     if !ctx.headless {
         return b;
     }
-    let drawn = |m: &str| foreground_metric(m) || gpu_use(m);
+    // GPU memory too when the headless browser drew in software: no GPU held it.
+    let software = ctx.gpu["software"] == true;
+    let drawn = |m: &str| foreground_metric(m) || gpu_use(m) || (software && matches!(m, "gpu.vram" | "gpu.shared"));
     b.values.retain(|k, _| !drawn(k));
     for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| drawn(m)) {
         b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page ran headless (--headless), so nothing it drew reached a display")));
@@ -2812,15 +2908,18 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         lap("load");
         validity::dev_build(&page)?;
+        let during = Foreign::start(&browser);
         let speed = validity::speed_check(&page)?;
         let ratio = match validity::throttled(speed, ctx.baseline) {
-            // A slow check while other work keeps the target's CPUs busy is that work's doing, as for a
-            // native block: `Background`, which the bench waits out, not `Throttled`.
+            // A slow check while other work kept the target's CPUs busy (the browser's own processes
+            // not counted) is that work's doing, as for a native block: `Background`, which the bench
+            // waits out, not `Throttled`.
             Err(e) => {
-                let (_, top) = validity::wait_quiet(ctx.pin, Duration::ZERO);
-                return Err(if top >= BACKGROUND_PCT {
-                    Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs busy ({})", e.message))
-                        .detail(format!("the busiest of them {top:.0}% busy after it"))
+                let (foreign, busiest) = during.stop(ctx.pin, &browser);
+                return Err(if foreign >= BACKGROUND_PCT {
+                    let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
+                    Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {foreign:.0}% of a core busy ({})", e.message))
+                        .detail(format!("busiest processes (% of a core): {}", if who.is_empty() { "none named (system work)".into() } else { who }))
                         .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
                         .into()
                 } else {
@@ -2914,18 +3013,19 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             let c0 = counters();
             driver.drags.borrow_mut().clear();
-            driver.mark(&format!("{key}:start"))?;
+            // strobe's own cost over the run as its trace marks bound it, from its start mark to its end mark.
             cost.start();
+            driver.mark(&format!("{key}:start"))?;
             let t0 = host::now_ns();
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
-            cost.end();
             let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
+            cost.end();
             let (procs_end, cyc1, tsc1, cpu1) = read();
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
@@ -4297,13 +4397,16 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     let def = model::metric(metric);
     let unit = def.map_or("", |d| d.unit);
     let values: Vec<f64> = s["blocks"].as_array().into_iter().flatten().filter_map(|b| b["values"][metric].as_f64()).filter(|v| v.is_finite()).collect();
-    let mut out = format!("strobe bench {file} · {} · head {} · {} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""), r["variants"][0]["label"].as_str().unwrap_or(""), values.len());
+    let blocks = s["blocks"].as_array().map_or(0, Vec::len);
+    let mut out = format!("strobe bench {file} · {} · head {} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""), r["variants"][0]["label"].as_str().unwrap_or(""));
     out += &format!("plan   {} · warmup until steady · {} runs per block\n", r["plan"]["pin"].as_str().unwrap_or(""), r["plan"]["runs_per_block"]);
     let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
     out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
     out += &self_line(s);
     let ratio = def.is_none_or(|d| d.kind != model::Kind::Exact && d.unit != "count" && d.unit != "score") && !values.is_empty() && values.iter().all(|v| *v > 0.0);
-    if values.len() >= 2 {
+    if stats::kind_of(&s["primary"]) == VerdictKind::Refused {
+        out += &format!("\n★ {metric}  {}\n", s["primary"]["verdict"].as_str().unwrap_or("refused"));
+    } else if values.len() >= 2 {
         let (lo, hi, conf) = if ratio {
             let (_, lo, hi, c) = stats::hodges_lehmann(&values.iter().map(|v| v.ln()).collect::<Vec<_>>(), 0.95);
             (lo.exp(), hi.exp(), c)
@@ -4319,7 +4422,8 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
             100.0 * conf
         );
     }
-    out += &format!("  blocks  {}\n", values.iter().map(|v| fmt::value(*v, unit)).collect::<Vec<_>>().join(" · "));
+    let each = s["blocks"].as_array().into_iter().flatten().map(|b| b["values"][metric].as_f64().filter(|v| v.is_finite()).map_or("—".to_string(), |v| fmt::value(v, unit)));
+    out += &format!("  blocks  {}\n", each.collect::<Vec<_>>().join(" · "));
     if s["session"] == "mixed" {
         out += "  ! some blocks ran on a locked screen and the rest unlocked: their values do not compare\n";
     }
@@ -4460,6 +4564,11 @@ fn render(r: &Value) -> String {
     if let Some(t) = store::ledger::line(r) {
         out += &format!("ledger  {t}\n");
     }
-    out += &format!("{id} · strobe report experiment {id} --open\n");
+    // `--blocks` compares nothing, so it has no report: its blocks are in its result.json.
+    if r["series"].as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|s| s["kind"] == "blocks")) {
+        out += &format!("{id} · strobe query {id}\n");
+    } else {
+        out += &format!("{id} · strobe report experiment {id} --open\n");
+    }
     out
 }

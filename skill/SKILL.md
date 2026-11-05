@@ -55,7 +55,9 @@ strobe records a target on one timeline and answers with verdicts and handles (`
         tree's dialogs and headings (what `expect` matches) and keyed elements; works on a locked session, so check `expect` with it
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
-MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI.
+MCP: `status`, `record`, `bench`, `query`, `report`: same names, arguments and JSON as the CLI (`record` with `bench` needs no
+target; `bench` with `stop` or `resume` takes an experiment). An input a tool lacks, or of the wrong type, is refused; so is an
+unknown CLI flag (exit 2, naming the closest one).
 
 Targets: `https://…` · `cdp:<port>` · `app:<id>` (a profile in strobe.json `apps`, Electron or native) · `exe:<path>` (`--native` for a native app) · `cdp:ws://…` · `file:<path>` (import a trace, .cpuprofile or .heapsnapshot) · `pid:<n>` · `proc:<name>` (a running process, from outside)
 

@@ -224,6 +224,10 @@ Internal   daemon · mcp · helper (hidden)
 Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress stderr|stdout|off
 ```
 
+Every flag strobe reads is in one table (`cli::FLAGS`, with whether it takes a value); any other
+flag is a usage error (exit 2) that names the closest one, never a setting silently ignored. MCP
+tool schemas take their types from the same table (§17).
+
 Progress lines of long commands go to stderr (stdout stays the result); `--progress stdout` (or
 `STROBE_PROGRESS=stdout`) puts them on stdout, `off` drops them; with `--json` stdout never gets
 them. Windows PowerShell 5.1 turns every stderr line of a native command it redirects (`2>&1`,
@@ -2085,7 +2089,7 @@ helper and is not built.
 Perfetto UI with everything strobe knows on one timeline. An experiment handle picks its head
 attribution recording (else its check recording, else its first kept block); `/base`, `/head`,
 `/<n>` (the n-th block over all series, from 0) and `/<case>` pick others, and a wrong pick lists
-what the experiment kept. `--perfetto` is the default viewer; `--no-browser` prints the URL.
+what the experiment kept. `--no-browser` prints the URL instead of opening it.
 
 **The trace** (`perfetto.pftrace` in the recording, written whole, rebuilt on every open) is
 protobuf written by hand (no generated code, no C):
@@ -2827,13 +2831,20 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | Tool | Input (beyond the CLI flags of the same name) | Output |
 |---|---|---|
 | `status` | `target?`, `calibrate?` | §5.4 JSON |
-| `record` | `target`, `probes?`, `for?`, `bench?`, `ring?`, `pin?`, `name?`, `timeout?` | `{ handle, valid, summary, warnings }` |
-| `bench` | `file`, `head`, `base?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `pin?`, `aa?`, `bisect?`, `on?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
-| `query` | `handle`, `view`, view arguments, `sql?`, `top?`, `max_bytes?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
-| `report` | `view`, `handles`, `format?` | `{ path, bytes }` |
+| `record` | `target` (not with `bench`), `for?`, `probes?`, `native?`, `app?`, `headless?`, `served?`, `style?`, `os-frames?`, `until-line?`, `stop-line?`, `bench?`, `head?`, `gpu-cache?`, `params?`, `runs?`, `pin?`, `power?`, `timeout?` | `{ handle, valid, summary, warnings }` (with `bench`: `{ recordings }`) |
+| `bench` | `file` (not with `stop`/`resume`), `head?`, `base?`, `aa?`, `check?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pilot?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `bisect?`, `pin?`, `power?`, `reserve-cpus?`, `why?`, `trace?`, `keep?`, `pixels?`, `pixels-only?`, `style?`, `max-time?`, `unlock-wait?`, `require-verdict?`, `stop?`, `resume?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
+| `query` | `handle`, `view?`, `sql?`, `by?`, `top?`, `reveal?`, `at?`, `native?`, `thread?`, `phase?`, `timeline?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
+| `report` | `handle`, `view?`, `format?`, `out?`, `theme?`, `update-pr?`, `repo?`, `force?`, `no-card?`, `badge-url?` | `{ path, bytes }` |
 
 - `timeout` (default 600 s): a call that runs longer returns `{ id, state: "running" }`; the
   work continues; `query <id> progress` follows it.
+- Each tool lists its positional inputs and the CLI flags it takes; each flag's JSON type
+  (boolean, number, string) comes from the CLI's flag table (§5), so the schemas cannot drift from
+  the CLI. A call with an input the tool lacks, or of the wrong type, is refused (`isError`) naming
+  what it takes. `record` with `bench` (`<file>#<case>`) takes no `target` and returns an `exp_…`;
+  `bench` with `stop` or `resume` takes an experiment instead of `file`.
+- The MCP token and `strobe open`'s session tokens come from the OS's secure random source
+  (BCryptGenRandom, `/dev/urandom`); the token file is written 0600 on Unix.
 - Output rules for agents: verdict first; handles instead of payloads; top-K and `max_bytes`
   (head and tail kept); provenance inline; a refusal names the validator and the fix.
 

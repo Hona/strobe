@@ -3,45 +3,159 @@
 use crate::model::{Error, Result};
 use std::collections::HashMap;
 
-/// Flags that take no value.
-const SWITCHES: &[&str] = &[
-    "json",
-    "quiet",
-    "verbose",
-    "help",
-    "version",
-    "aa",
-    "reveal",
-    "require-verdict",
-    "check",
-    "yes",
-    "open",
-    "calibrate",
-    "pin-runner",
-    "headless",
-    "keep",
-    "fast",
-    "once",
-    "pixels",
-    "pixels-only",
-    "native",
-    "os-frames",
-    "style",
-    "force",
-    "timeline",
-    "perfetto",
-    "no-browser",
-    "plan",
-    "pilot",
-    "confirm",
-    "no-confirm",
-    "schedules",
-    "again",
-    "headed",
-    "full",
-    "badge-url",
-    "no-card",
+/// How a flag takes its value. `Number` is a value that MCP tool schemas type as a number.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Kind {
+    Switch,
+    Value,
+    Number,
+}
+
+use Kind::{Number, Switch, Value};
+
+/// Every flag strobe reads and how it takes its value. The parser refuses any other flag (a typo is an
+/// error, not a silently ignored setting), and MCP tool schemas take their types from here (SPEC §17),
+/// so the two cannot drift. A new flag goes here.
+pub const FLAGS: &[(&str, Kind)] = &[
+    // Global.
+    ("json", Switch),
+    ("quiet", Switch),
+    ("verbose", Switch),
+    ("help", Switch),
+    ("version", Switch),
+    ("progress", Value),
+    // record, bench, plan, run.
+    ("id", Value),
+    ("for", Value),
+    ("probes", Value),
+    ("headless", Switch),
+    ("served", Value),
+    ("style", Switch),
+    ("native", Switch),
+    ("app", Value),
+    ("home", Value),
+    ("os-frames", Switch),
+    ("bench", Value),
+    ("gpu-cache", Value),
+    ("until-line", Value),
+    ("stop-line", Value),
+    ("head", Value),
+    ("base", Value),
+    ("aa", Switch),
+    ("check", Switch),
+    ("filter", Value),
+    ("target", Value),
+    ("params", Value),
+    ("primary", Value),
+    ("equivalence", Number),
+    ("noworse", Value),
+    ("pairs", Value),
+    ("runs", Number),
+    ("repeat", Number),
+    ("why", Value),
+    ("trace", Value),
+    ("power", Value),
+    ("pin", Value),
+    ("reserve-cpus", Value),
+    ("pixels", Switch),
+    ("pixels-only", Switch),
+    ("bisect", Value),
+    ("keep", Switch),
+    ("max-time", Value),
+    ("unlock-wait", Value),
+    ("require-verdict", Switch),
+    ("plan", Switch),
+    ("effect", Number),
+    ("pilot", Switch),
+    ("stop", Value),
+    ("resume", Value),
+    ("gpu-store", Value),
+    // query, report, open, history.
+    ("by", Value),
+    ("top", Number),
+    ("reveal", Switch),
+    ("at", Value),
+    ("thread", Value),
+    ("phase", Value),
+    ("timeline", Switch),
+    ("format", Value),
+    ("out", Value),
+    ("open", Switch),
+    ("update-pr", Number),
+    ("repo", Value),
+    ("force", Switch),
+    ("no-card", Switch),
+    ("theme", Value),
+    ("badge-url", Switch),
+    ("no-browser", Switch),
+    // track.
+    ("ref", Value),
+    ("range", Value),
+    ("every", Number),
+    ("blocks", Number),
+    ("again", Switch),
+    ("confirm", Switch),
+    ("no-confirm", Switch),
+    ("alert", Value),
+    ("alert-command", Value),
+    ("alert-webhook", Value),
+    ("schedule", Value),
+    ("schedules", Switch),
+    ("unschedule", Value),
+    ("from-schedule", Value),
+    // look.
+    ("until", Value),
+    ("wait", Value),
+    ("size", Value),
+    ("scale", Number),
+    ("chars", Number),
+    ("keys", Number),
+    ("full", Switch),
+    ("headed", Switch),
+    ("timeout", Value),
+    // status, top.
+    ("calibrate", Switch),
+    ("fast", Switch),
+    ("once", Switch),
+    ("interval", Value),
+    ("limit", Number),
+    ("sort", Value),
+    // up, update, leave, helper.
+    ("skip", Value),
+    ("yes", Switch),
+    ("from", Value),
+    ("log", Value),
+    ("sid", Value),
 ];
+
+/// How `--name` takes its value, when strobe has such a flag.
+pub fn kind(name: &str) -> Option<Kind> {
+    FLAGS.iter().find(|(n, _)| *n == name).map(|(_, k)| *k)
+}
+
+/// The refusal for a flag strobe does not have, naming the closest one.
+pub fn unknown_flag(name: &str) -> Error {
+    let distance = |a: &str, b: &str| {
+        let b: Vec<char> = b.chars().collect();
+        let mut row: Vec<usize> = (0..=b.len()).collect();
+        for (i, ca) in a.chars().enumerate() {
+            let mut prev = row[0];
+            row[0] = i + 1;
+            for (j, cb) in b.iter().enumerate() {
+                let cur = row[j + 1];
+                row[j + 1] = (prev + usize::from(ca != *cb)).min(row[j] + 1).min(cur + 1);
+                prev = cur;
+            }
+        }
+        row[b.len()]
+    };
+    let near = FLAGS.iter().map(|(n, _)| (distance(name, n), *n)).filter(|(d, n)| *d <= 1 + name.len() / 4 || (name.len() >= 3 && n.starts_with(name))).min();
+    let e = Error::usage(format!("unknown flag --{name}"));
+    match near {
+        Some((_, n)) => e.hint(format!("did you mean --{n}? strobe --help lists the flags")),
+        None => e.hint("strobe --help lists the flags"),
+    }
+}
 
 #[derive(Clone)]
 pub struct Args {
@@ -77,10 +191,11 @@ impl Args {
                 continue;
             };
             if let Some((key, value)) = name.split_once('=') {
+                kind(key).ok_or_else(|| unknown_flag(key))?;
                 flags.insert(key.to_string(), value.to_string());
                 continue;
             }
-            if SWITCHES.contains(&name.as_str()) {
+            if kind(&name).ok_or_else(|| unknown_flag(&name))? == Switch {
                 flags.insert(name, "true".to_string());
                 continue;
             }
@@ -163,11 +278,13 @@ Use
         [--bisect good..bad]           (the commit that moved the primary; one series)
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
+        [--unlock-wait 2h]             (a series that needs a presenting window waits at most that long for an unlock)
   plan <file.bench.ts> [--base <variant>] [--head <variant>] [--filter …] [--effect <pct>] [--pilot]
                                   before a bench: pairs and minutes per series from earlier runs here, builds, the slot's
                                   queue (= bench --plan; --pilot runs 4 pairs first to learn the spread)
   bench --stop <exp> | --resume <exp>
-                                  stop a running bench after its block (it keeps what finished), or go on with one
+                                  stop a running bench after its block (at once while it waits; it keeps what finished),
+                                  or go on with one (a unique prefix of the id works)
         --filter: case names, comma-separated; exact unless a name holds * (a glob)
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
@@ -182,7 +299,7 @@ Use
   report experiment <exp> --format card|badge [--out <file.png|file.svg>] [--theme light|dark|auto] [--badge-url]
                                   the result as an image: card 1200×630 (decided wins large, else what happened), badge one
                                   line; SVG follows the reader's colour scheme (auto); --badge-url prints a shields.io URL
-  open <rec_…|exp_…[/head|base|<block>|<case>]> [--perfetto] [--no-browser]
+  open <rec_…|exp_…[/head|base|<block>|<case>]> [--no-browser]
                                   the recording in the Perfetto UI (local): one trace with the Chrome trace, CPU profiles
                                   and native stacks as flame graphs, runs, phases, inputs, presents, threads, memory
                                   (--no-browser: print the URL instead of opening it)

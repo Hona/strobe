@@ -27,7 +27,7 @@ pub fn run(args: &Args) -> Result<Output> {
         let port = listener.local_addr()?.port();
         (port, Some(listener))
     };
-    let session = start(&p.trace, &id, port);
+    let session = start(&p.trace, &id, port)?;
     let url = format!("http://127.0.0.1:{port}/perfetto/s/{}", session.token);
     text += &format!(
         "{} {url}\n  {} · the Perfetto UI {} and the trace stay on this machine\n",
@@ -220,14 +220,15 @@ struct Session {
     note: Option<String>,
 }
 
-/// A trace_processor for the UI on a port of its own, and a token that lets the UI fetch the trace.
-fn start(trace: &Path, id: &str, ui_port: u16) -> Session {
+/// A trace_processor for the UI on a port of its own, and a token that lets the UI fetch the trace
+/// (16 bytes from the OS's secure random source: it is the only key to the trace).
+fn start(trace: &Path, id: &str, ui_port: u16) -> Result<Session> {
+    let token = super::mcp::random_hex(16)?;
     let free = std::net::TcpListener::bind("127.0.0.1:0").and_then(|l| l.local_addr()).map(|a| a.port());
     let (rpc, note) = match free.map_err(Error::from).and_then(|p| engine::httpd(p, &format!("http://127.0.0.1:{ui_port}")).map(|_| p)) {
         Ok(p) => (Some(p), None),
         Err(e) => (None, Some(format!("{}; the UI loads the trace itself", e.message))),
     };
-    let token = token();
     let dir = paths::run().join("perfetto");
     let _ = std::fs::create_dir_all(&dir);
     // Sessions from earlier days are gone; the traces stay in their recordings.
@@ -237,18 +238,7 @@ fn start(trace: &Path, id: &str, ui_port: u16) -> Session {
         }
     }
     let _ = store::write_json(&dir.join(format!("{token}.json")), &json!({ "trace": trace.display().to_string(), "recording": id, "rpc_port": rpc }));
-    Session { token, rpc, note }
-}
-
-fn token() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    let mut out = String::new();
-    for i in 0..2u64 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(i ^ crate::host::now_ns());
-        out += &format!("{:016x}", h.finish());
-    }
-    out
+    Ok(Session { token, rpc, note })
 }
 
 fn session(token: &str) -> Option<Value> {
@@ -313,7 +303,7 @@ pub fn serve(req: &http::Request, port: u16) -> Option<http::Response> {
             let (dir, id) = recording(handle)?;
             let p = prepare(&dir, &id)?;
             engine::ensure_ui()?;
-            let s = start(&p.trace, &id, port);
+            let s = start(&p.trace, &id, port)?;
             Ok(session_page(&s.token, &json!({ "recording": id, "rpc_port": s.rpc })))
         })();
         return Some(match opened {

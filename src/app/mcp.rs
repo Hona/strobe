@@ -2,8 +2,8 @@
 //! token, `strobe mcp` over stdio. Each tool is exactly a CLI command: same arguments, same JSON.
 
 use super::{Output, dispatch};
-use crate::cli::Args;
-use crate::host::{self, http, paths};
+use crate::cli::{self, Args, Kind};
+use crate::host::{http, paths};
 use crate::model::{Error, Result};
 use crate::store;
 use serde_json::{Value, json};
@@ -19,48 +19,207 @@ pub fn instructions() -> String {
     format!("strobe: measure performance (web pages, Electron apps, any process). Load the \"strobe\" skill before using strobe tools. CLI: {exe}")
 }
 
-fn tools() -> Value {
-    let s = |d: &str| json!({ "type": "string", "description": d });
-    let b = |d: &str| json!({ "type": "boolean", "description": d });
-    let n = |d: &str| json!({ "type": "number", "description": d });
-    json!([
-        { "name": "status", "description": "Environment, validity preflight (load, power, browser, engine, calibration) and recent recordings and experiments.",
-          "inputSchema": { "type": "object", "properties": { "target": s("optional target to check"), "fast": b("skip the 3 s idle-load sample"), "calibrate": b("run the full calibration") } } },
-        { "name": "record", "description": "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), cdp:<port>, file:<path> (import).",
-          "inputSchema": { "type": "object", "required": ["target"], "properties": {
-            "target": s("https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, or file:<path>"), "for": s("duration, e.g. 10s (default 10s)"),
-            "native": b("exe:<path> is a native app (no browser engine): recorded from outside: CPU, thread wakes, IO, GPU, memory, the UI thread's CPU and what reached the screen"),
-            "app": s("exe:<path>: the strobe.json app profile it borrows"),
-            "probes": s("timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot)"), "headless": b("draw off screen: attribution data stays meaningful, frame metrics do not"), "served": s("folder the target's http origin serves, to resolve source-mapped frames to files on disk"), "timeout": n("seconds before returning while it keeps running (default 600)") } } },
-        { "name": "bench", "description": "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress.",
-          "inputSchema": { "type": "object", "required": ["file"], "properties": {
-            "file": s("path to the .bench.ts file"), "head": s("variant under test: a directory (default .), a git ref, url:<href>"),
-            "base": s("baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"), "aa": b("same build on both sides (checks the method)"), "check": b("validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
-            "filter": s("case names, comma-separated; exact unless a name holds * (a glob)"), "target": s("one target name from the file"), "params": s("k=v,k2=v2, or all (adds every parameter's more values)"),
-            "primary": s("override the case's primary metric"), "equivalence": n("equivalence bound in % (default 2)"),
-            "noworse": s("non-inferiority: \"2%\" asks whether head's primary is at most 2% worse (verdicts no worse, worse, unclear); \"metric=2%,metric2=5%\" per metric"),
-            "plan": b("do not run: estimate pairs and minutes per series from earlier experiments here, builds and the bench slot's queue"),
-            "effect": n("with plan: the expected change of the primary in % (default: what the last run of the series measured, else 0)"),
-            "pairs": s("auto (default) or a number"), "runs": n("measured runs per block (default 5)"), "probes": s("timing skips attribution blocks; memory runs a leak run per variant (no --base needed)"), "repeat": n("leak run: N runs to the middle snapshot and N more to the last (default 10)"), "bisect": s("good..bad: find the commit on the first-parent line that moved the primary (one series)"),
-            "pin": s("auto (V-Cache CCD), none, ccdN, or a CPU list"), "power": s("high (default: the fastest plan for the run, restored after) or keep"),
-            "reserve-cpus": s("auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows), on (every block, --check too) or off"),
-            "why": s("attribution blocks: auto (default, only when the primary differs), always, never"), "trace": s("timing-block trace: lean (default) or full"),
-            "timeout": n("seconds before returning while it keeps running (default 600)") } } },
-        { "name": "query", "description": "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), shifts (the largest layout shifts and the elements they moved), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class), leaks (memory recordings: objects from the first half still alive at the end, with retainer paths), memory (by process, layer or allocator; rec_a..rec_b compares), insights (rules with evidence; exp_… too); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments). Tracked history (strobe track): handle history lists this device's series (or history <ser_…|bench file> one series' points with intervals), handle changes lists suspected and confirmed changes with their paired A/B and culprit; handle ser_… takes views history and changes.",
-          "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_… or exp_… (a unique prefix works); history, changes or ser_… for tracked history"), "view": s("summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress, insights)"),
-            "sql": s("SQL for the sql view"), "by": s("hotspots and alloc: function, file, package; memory: process, layer, allocator"), "top": n("rows (default 15)"),
-            "reveal": b("heap: show string values (redacted by default; snapshots can hold user content)"), "at": s("memory: which census (0 the first, -1 the last, default the last)") } } },
-        { "name": "report", "description": "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
-          "inputSchema": { "type": "object", "required": ["handle"], "properties": {
-            "handle": s("rec_…, exp_… or ser_… (a tracked series)"), "view": s("experiment, recording or history (default from the handle)"), "format": s("html (default), md, pr (an experiment's pull request block), card (its result as a 1200×630 PNG) or badge (an SVG badge)") } } },
-    ])
+/// One MCP tool: exactly a CLI command (SPEC §17). Its inputs are the command's positional arguments,
+/// by name, and the CLI flags it takes, whose JSON types come from the CLI's flag table (`cli::FLAGS`).
+struct Tool {
+    name: &'static str,
+    description: &'static str,
+    /// Positional arguments: input name, description.
+    args: &'static [(&'static str, &'static str)],
+    /// CLI flags: name, description.
+    flags: &'static [(&'static str, &'static str)],
+    /// Inputs every call must give.
+    required: &'static [&'static str],
+    /// Whether it may outlast the call (`timeout`, then it keeps running in the daemon).
+    long: bool,
 }
 
-/// Turns a tool call into CLI arguments, so MCP and the CLI share one code path.
+const TOOLS: &[Tool] = &[
+    Tool {
+        name: "status",
+        description: "Environment, validity preflight (load, power, browser, engine, calibration) and recent recordings and experiments.",
+        args: &[("target", "optional target to check")],
+        flags: &[("fast", "skip the 3 s idle-load sample"), ("calibrate", "run the full calibration")],
+        required: &[],
+        long: false,
+    },
+    Tool {
+        name: "record",
+        description: "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), app:<id>, exe:<path>, cdp:<port>, pid:<n>, file:<path> (import). With bench (file#case), records that bench case (it drives the app) with the attribution probes; no target then.",
+        args: &[("target", "https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, pid:<n>, proc:<name>, or file:<path>; not with bench")],
+        flags: &[
+            ("for", "duration, e.g. 10s (default 10s)"),
+            ("probes", "timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot); pid:/proc: targets also deep"),
+            ("native", "exe:<path> is a native app (no browser engine): recorded from outside: CPU, thread wakes, IO, GPU, memory, the UI thread's CPU and what reached the screen"),
+            ("app", "exe:<path>: the strobe.json app profile it borrows"),
+            ("headless", "draw off screen: attribution data stays meaningful, frame metrics do not"),
+            ("served", "folder the target's http origin serves, to resolve source-mapped frames to files on disk"),
+            ("style", "also trace what invalidated style (query <rec> style)"),
+            ("os-frames", "a Chromium record also takes the OS present events beside its trace"),
+            ("until-line", "native app: start recording when it prints a line matching this regex (instead of after a 3 s settle)"),
+            ("stop-line", "native app: stop recording when it prints a line matching this regex"),
+            ("bench", "<file.bench.ts>#<case>: record that bench case (a case glob works) instead of a target"),
+            ("head", "with bench: the variant to record (default .)"),
+            ("gpu-cache", "with bench, a native app: warm or cold GPU shader caches"),
+            ("params", "with bench: k=v,k2=v2"),
+            ("runs", "with bench: measured runs (default 5)"),
+            ("pin", "with bench: auto, none, ccdN or a CPU list"),
+            ("power", "high (default for timed recordings) or keep"),
+        ],
+        required: &[],
+        long: true,
+    },
+    Tool {
+        name: "bench",
+        description: "Run a .bench.ts file: every series (case × target × params) gets a verdict from pairs of fresh launches (A B, B A …). Refuses invalid setups. Long runs continue in the daemon: then query the returned exp_… with view progress. stop asks a running experiment to stop (at once while it waits, else after its block); resume goes on with a stopped one.",
+        args: &[("file", "path to the .bench.ts file (not with stop or resume)")],
+        flags: &[
+            ("head", "variant under test: a directory (default .), a git ref, url:<href>"),
+            ("base", "baseline variant: a directory, a git ref (e.g. origin/dev), url:<href>"),
+            ("aa", "same build on both sides (checks the method)"),
+            ("check", "validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
+            ("filter", "case names, comma-separated; exact unless a name holds * (a glob)"),
+            ("target", "target names from the file, comma-separated"),
+            ("params", "k=v,k2=v2, or all (adds every parameter's more values)"),
+            ("primary", "override the case's primary metric"),
+            ("equivalence", "equivalence bound in % (default 2)"),
+            ("noworse", "non-inferiority: \"2%\" asks whether head's primary is at most 2% worse (verdicts no worse, worse, unclear); \"metric=2%,metric2=5%\" per metric"),
+            ("plan", "do not run: estimate pairs and minutes per series from earlier experiments here, builds and the bench slot's queue"),
+            ("effect", "with plan: the expected change of the primary in % (default: what the last run of the series measured, else 0)"),
+            ("pilot", "with plan: run 4 pairs first to learn the spread"),
+            ("pairs", "auto (default) or a number"),
+            ("runs", "measured runs per block (default 5)"),
+            ("probes", "timing skips attribution blocks; memory runs a leak run per variant (no base needed)"),
+            ("repeat", "leak run: N runs to the middle snapshot and N more to the last (default 10)"),
+            ("bisect", "good..bad: find the commit on the first-parent line that moved the primary (one series)"),
+            ("pin", "auto (V-Cache CCD), none, ccdN, or a CPU list"),
+            ("power", "high (default: the fastest plan for the run, restored after) or keep"),
+            ("reserve-cpus", "auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows), on (every block, check too) or off"),
+            ("why", "attribution blocks: auto (default, only when the primary differs), always, never"),
+            ("trace", "timing-block trace: lean (default) or full"),
+            ("keep", "keep every block's recording"),
+            ("pixels", "also compare base and head at the case's page.snapshot()s"),
+            ("pixels-only", "only compare snapshots, no timing"),
+            ("style", "attribution blocks also trace what invalidated style"),
+            ("max-time", "stop starting pairs after this long, e.g. 30m"),
+            ("unlock-wait", "a series that needs a presenting window waits at most this long for an unlock (default: until unlocked), e.g. 2h"),
+            ("require-verdict", "exit 5 when a series has no verdict"),
+            ("stop", "exp_… (a unique prefix works): ask that running experiment to stop; it keeps what finished"),
+            ("resume", "exp_…: go on with a stopped experiment from its finished pairs"),
+        ],
+        required: &[],
+        long: true,
+    },
+    Tool {
+        name: "query",
+        description: "Views over a recording (rec_…) or experiment (exp_…): summary, frames, threads, hotspots (CPU self time by function|file|package with full stacks), alloc (bytes allocated by function|file|package with full stacks), layout (forced layouts and style recalcs by the call that forced them), shifts (the largest layout shifts and the elements they moved), gc (collections and GC time per run), heap (live objects by class with retained sizes, detached DOM, retainer paths; rec_a..rec_b diffs two recordings by class), leaks (memory recordings: objects from the first half still alive at the end, with retainer paths), memory (by process, layer or allocator; rec_a..rec_b compares), insights (rules with evidence; exp_… too); those need attribution recordings; sql (Perfetto trace_processor SQL), progress (running experiments). Tracked history (strobe track): handle history lists this device's series (or history <ser_…|bench file> one series' points with intervals), handle changes lists suspected and confirmed changes with their paired A/B and culprit; handle ser_… takes views history and changes.",
+        args: &[
+            ("handle", "rec_… or exp_… (a unique prefix works); history, changes or ser_… for tracked history"),
+            (
+                "view",
+                "summary (default), frames, threads (a native recording: its threads' wakes, CPU, names), hotspots, alloc, layout, shifts, gc, heap, leaks, memory, insights, sql, progress (exp_… takes summary, progress, insights)",
+            ),
+            ("sql", "SQL for the sql view"),
+        ],
+        flags: &[
+            ("by", "hotspots and alloc: function, file, package; memory: process, layer, allocator"),
+            ("top", "rows (default 15)"),
+            ("reveal", "heap: show string values (redacted by default; snapshots can hold user content)"),
+            ("at", "memory: which census (0 the first, -1 the last, default the last)"),
+            ("native", "hotspots: the native stacks"),
+            ("thread", "hotspots of a native recording: one thread by name"),
+            ("phase", "hotspots of a native recording: one phase"),
+            ("timeline", "threads: each thread's CPU per second from the launch"),
+        ],
+        required: &["handle"],
+        long: false,
+    },
+    Tool {
+        name: "report",
+        description: "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
+        args: &[("handle", "rec_…, exp_… or ser_… (a tracked series)"), ("view", "experiment, recording or history (default from the handle)")],
+        flags: &[
+            ("format", "html (default), md, pr (an experiment's pull request block), card (its result as a 1200×630 PNG) or badge (an SVG badge)"),
+            ("out", "where to write it"),
+            ("theme", "card and badge: light, dark or auto"),
+            ("update-pr", "with format pr: put the block in this pull request's body through gh"),
+            ("repo", "with update-pr: owner/repo"),
+            ("force", "with update-pr: replace a block another experiment wrote"),
+            ("no-card", "with update-pr: no result card or badges"),
+            ("badge-url", "with format badge: print a shields.io URL"),
+        ],
+        required: &["handle"],
+        long: false,
+    },
+];
+
+fn tools() -> Value {
+    let list: Vec<Value> = TOOLS
+        .iter()
+        .map(|t| {
+            let mut props = serde_json::Map::new();
+            for (k, d) in t.args {
+                props.insert(k.to_string(), json!({ "type": "string", "description": d }));
+            }
+            for (k, d) in t.flags {
+                let ty = match cli::kind(k) {
+                    Some(Kind::Switch) => "boolean",
+                    Some(Kind::Number) => "number",
+                    _ => "string",
+                };
+                props.insert(k.to_string(), json!({ "type": ty, "description": d }));
+            }
+            if t.long {
+                props.insert("timeout".into(), json!({ "type": "number", "description": "seconds before returning while it keeps running (default 600)" }));
+            }
+            json!({ "name": t.name, "description": t.description, "inputSchema": { "type": "object", "required": t.required, "properties": props } })
+        })
+        .collect();
+    Value::Array(list)
+}
+
+/// Turns a tool call into CLI arguments, so MCP and the CLI share one code path. Refuses an input the
+/// tool does not have, or one of the wrong type, instead of passing it on.
 fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String>)> {
+    let tool = TOOLS.iter().find(|t| t.name == name).ok_or_else(|| Error::usage(format!("unknown tool {name}")))?;
+    let empty = serde_json::Map::new();
+    let obj = match input {
+        Value::Object(o) => o,
+        Value::Null => &empty,
+        _ => return Err(Error::usage(format!("{name}: arguments must be an object"))),
+    };
+    let mut flags: Vec<String> = Vec::new();
+    for (k, v) in obj {
+        if tool.args.iter().any(|(a, _)| a == k) || (tool.long && k == "timeout") {
+            if !(v.is_string() || v.is_number() || v.is_null()) {
+                return Err(Error::usage(format!("{name}: {k} is a string")));
+            }
+            continue;
+        }
+        if !tool.flags.iter().any(|(f, _)| f == k) {
+            let all: Vec<&str> = tool.args.iter().map(|a| a.0).chain(tool.flags.iter().map(|f| f.0)).collect();
+            return Err(Error::usage(format!("{name} has no input {k}; it takes {}", all.join(", "))));
+        }
+        match (cli::kind(k), v) {
+            (_, Value::Null) | (Some(Kind::Switch), Value::Bool(false)) => {}
+            (Some(Kind::Switch), Value::Bool(true)) => flags.push(format!("--{k}")),
+            (Some(Kind::Switch), _) => return Err(Error::usage(format!("{name}: {k} is a boolean"))),
+            (Some(Kind::Number), Value::Number(n)) => flags.extend([format!("--{k}"), n.to_string()]),
+            (Some(Kind::Number), Value::String(s)) if s.trim_end_matches('%').parse::<f64>().is_ok() => flags.extend([format!("--{k}"), s.clone()]),
+            (Some(Kind::Number), _) => return Err(Error::usage(format!("{name}: {k} is a number"))),
+            (_, Value::String(s)) => flags.extend([format!("--{k}"), s.clone()]),
+            (_, Value::Number(n)) => flags.extend([format!("--{k}"), n.to_string()]),
+            _ => return Err(Error::usage(format!("{name}: {k} is a string"))),
+        }
+    }
+    for r in tool.required {
+        if obj.get(*r).is_none_or(Value::is_null) {
+            return Err(Error::usage(format!("{name} needs {r}")));
+        }
+    }
     let mut a = vec![name.to_string()];
-    let get = |k: &str| input.get(k).and_then(|v| v.as_str().map(str::to_string).or_else(|| (v.is_number()).then(|| v.to_string())));
+    let get = |k: &str| obj.get(k).and_then(|v| v.as_str().map(str::to_string).or_else(|| (v.is_number()).then(|| v.to_string())));
+    let has = |k: &str| obj.get(k).is_some_and(|v| !v.is_null() && *v != Value::Bool(false));
     let mut pending_id = None;
     match name {
         "status" => {
@@ -69,18 +228,35 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
             }
         }
         "record" => {
-            a.push(get("target").ok_or_else(|| Error::usage("record needs target"))?);
-            let id = store::new_id("rec");
+            // A bench case is an experiment (`exp_…`) that keeps its recordings.
+            let id = if has("bench") {
+                if has("target") {
+                    return Err(Error::usage("record: bench names its own target (the bench file's); drop target"));
+                }
+                store::new_id("exp")
+            } else {
+                a.push(get("target").ok_or_else(|| Error::usage("record needs target, or bench <file>#<case>"))?);
+                store::new_id("rec")
+            };
             a.push("--id".into());
             a.push(id.clone());
             pending_id = Some(id);
         }
         "bench" => {
-            a.push(get("file").ok_or_else(|| Error::usage("bench needs file"))?);
-            let id = store::new_id("exp");
-            a.push("--id".into());
-            a.push(id.clone());
-            pending_id = Some(id);
+            if has("stop") || has("resume") {
+                if has("file") {
+                    return Err(Error::usage("bench: stop and resume take an experiment, not a file"));
+                }
+                if let Some(h) = get("resume") {
+                    pending_id = super::bench::slot::experiment(&h).ok().map(|(_, id)| id);
+                }
+            } else {
+                a.push(get("file").ok_or_else(|| Error::usage("bench needs file (or stop / resume with an experiment)"))?);
+                let id = store::new_id("exp");
+                a.push("--id".into());
+                a.push(id.clone());
+                pending_id = Some(id);
+            }
         }
         "query" => {
             a.push(get("handle").ok_or_else(|| Error::usage("query needs handle"))?);
@@ -104,29 +280,10 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
             a.push(view);
             a.push(h);
         }
-        other => return Err(Error::usage(format!("unknown tool {other}"))),
+        _ => {}
     }
-    let skip = ["target", "file", "handle", "view", "sql", "timeout"];
-    if let Some(obj) = input.as_object() {
-        for (k, v) in obj {
-            if skip.contains(&k.as_str()) && !(name == "bench" && k == "target") {
-                continue;
-            }
-            match v {
-                Value::Bool(true) => a.push(format!("--{k}")),
-                Value::Bool(false) | Value::Null => {}
-                Value::String(s) => {
-                    a.push(format!("--{k}"));
-                    a.push(s.clone());
-                }
-                other => {
-                    a.push(format!("--{k}"));
-                    a.push(other.to_string());
-                }
-            }
-        }
-    }
-    let timeout = input.get("timeout").and_then(Value::as_u64).unwrap_or(600);
+    a.extend(flags);
+    let timeout = obj.get("timeout").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(600);
     Ok((a, timeout, pending_id))
 }
 
@@ -217,23 +374,59 @@ pub fn token_path() -> std::path::PathBuf {
     paths::state_dir().join("mcp-token")
 }
 
-/// The MCP token, created on first use (32 random bytes as hex).
+/// The MCP token, created on first use: 32 bytes from the OS's secure random source as hex, in a file
+/// only the user can read.
 pub fn token() -> Result<String> {
     let p = token_path();
     if let Ok(t) = std::fs::read_to_string(&p)
         && t.trim().len() >= 32
     {
+        owner_only(&p);
         return Ok(t.trim().to_string());
     }
-    use std::hash::{BuildHasher, Hasher};
-    let mut out = String::new();
-    for i in 0..4u64 {
-        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
-        h.write_u64(i ^ host::now_ns());
-        out += &format!("{:016x}", h.finish());
-    }
-    std::fs::write(&p, &out)?;
+    let out = random_hex(32)?;
+    let mut f = std::fs::OpenOptions::new();
+    f.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut f, 0o600);
+    f.open(&p)?.write_all(out.as_bytes())?;
+    owner_only(&p);
     Ok(out)
+}
+
+/// Owner-only permissions (0600) on a secret strobe wrote; on Windows the state folder's ACL is the
+/// user's alone already.
+fn owner_only(p: &std::path::Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    let _ = p;
+}
+
+/// `bytes` bytes from the OS's secure random source, as hex: BCryptGenRandom on Windows,
+/// /dev/urandom elsewhere. For secrets: the MCP token and `strobe open`'s session tokens.
+pub(super) fn random_hex(bytes: usize) -> Result<String> {
+    let mut buf = vec![0u8; bytes];
+    #[cfg(windows)]
+    {
+        #[link(name = "bcrypt")]
+        unsafe extern "system" {
+            fn BCryptGenRandom(alg: *mut std::ffi::c_void, buf: *mut u8, len: u32, flags: u32) -> i32;
+        }
+        // BCRYPT_USE_SYSTEM_PREFERRED_RNG
+        if unsafe { BCryptGenRandom(std::ptr::null_mut(), buf.as_mut_ptr(), buf.len() as u32, 2) } != 0 {
+            return Err(Error::msg("BCryptGenRandom failed"));
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom")?.read_exact(&mut buf)?;
+    }
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 pub fn port() -> u16 {
@@ -253,6 +446,7 @@ pub fn daemon(_args: &Args) -> Result<()> {
     let log = paths::state_dir().join("log");
     let _ = std::fs::create_dir_all(&log);
     unsafe { std::env::set_var("STROBE_QUIET", "1") };
+    super::DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
     // Tracked branches (`strobe track --schedule`): checked once a minute.
     std::thread::spawn(super::track::daemon_loop);
     std::thread::spawn(follow_installed);

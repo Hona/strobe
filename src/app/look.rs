@@ -73,6 +73,11 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         _ => return Err(Error::usage("look app:<id> or exe:<path>")),
     }
     .as_kind(isolate::AppKind::Native);
+    for page_only in ["element", "full", "size", "scale", "chars", "headed", "out"] {
+        if args.has(page_only) {
+            return Err(Error::usage(format!("--{page_only} is for a page; a native app's look reads its accessibility tree and takes no screenshot")));
+        }
+    }
     // `--build`: this checkout's own build of the app (strobe.json `build`), as a bench of it runs.
     if args.has("build") {
         if target.starts_with("exe:") {
@@ -178,6 +183,11 @@ pub fn run(args: &Args) -> Result<Output> {
     if target.starts_with("app:") || target.starts_with("exe:") {
         return native(args, target);
     }
+    for app_only in ["keys", "build", "app", "home"] {
+        if args.has(app_only) {
+            return Err(Error::usage(format!("--{app_only} is for a native app (look app:<id> or exe:<path>), not a page")));
+        }
+    }
     let url = address(target);
     let (width, height) = match args.get("size") {
         Some(s) => {
@@ -237,7 +247,30 @@ pub fn run(args: &Args) -> Result<Output> {
             }
         }
         use base64::Engine;
-        let shot = page.send_timeout("Page.captureScreenshot", json!({ "format": "png", "captureBeyondViewport": args.has("full"), }), Duration::from_secs(15))?;
+        // `--element`: the screenshot is that element's box on the page (scrolled to or not), so one
+        // section of a long page reads at full size.
+        let clip = match args.get("element") {
+            Some(sel) => {
+                let sel = Selector::parse(&Value::String(sel.to_string()), Dialect::Page)?;
+                let expr = format!(
+                    "(() => {{ const el = __strobe.find({}); if (!el) return null; const r = el.getBoundingClientRect(); return JSON.stringify({{ x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height }}) }})()",
+                    sel.page_spec()
+                );
+                let rect = page.eval_timeout(&expr, Duration::from_secs(10))?;
+                let r: Value = rect.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
+                match (r["x"].as_f64(), r["y"].as_f64(), r["width"].as_f64(), r["height"].as_f64()) {
+                    (Some(x), Some(y), Some(w), Some(h)) if w >= 1.0 && h >= 1.0 => Some(json!({ "x": x, "y": y, "width": w, "height": h, "scale": 1 })),
+                    (Some(_), _, _, _) => return Err(Error::usage(format!("--element {:?}: the element has no size to show (0×0)", sel.source))),
+                    _ => return Err(Error::usage(format!("--element {:?}: no visible element matches it", sel.source)).hint("strobe look <page> lists the headings and text; a selector is CSS, then role=, text=, index=")),
+                }
+            }
+            None => None,
+        };
+        let mut params = json!({ "format": "png", "captureBeyondViewport": args.has("full") || clip.is_some() });
+        if let Some(c) = &clip {
+            params["clip"] = c.clone();
+        }
+        let shot = page.send_timeout("Page.captureScreenshot", params, Duration::from_secs(15))?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str().unwrap_or("")).map_err(|e| Error::msg(format!("screenshot: {e}")))?;
         let out: PathBuf = match args.get("out") {
             Some(p) => PathBuf::from(p),
@@ -274,9 +307,13 @@ pub fn run(args: &Args) -> Result<Output> {
         for l in body.lines() {
             text += &format!("  {l}\n");
         }
-        text += &format!("shot     {}\n", out.display());
+        text += &format!(
+            "shot     {}{}\n",
+            out.display(),
+            clip.as_ref().map(|c| format!(" ({} only, {:.0}×{:.0})", args.get("element").unwrap_or(""), c["width"].as_f64().unwrap_or(0.0), c["height"].as_f64().unwrap_or(0.0))).unwrap_or_default()
+        );
         text += "expect   a case's `expect: { title, heading }` matches the title, and one of the headings\n";
-        let json = json!({ "url": info["url"], "title": info["title"], "load_ms": load_ms, "ready": info["ready"], "problems": problems, "headings": info["headings"], "console": console, "errors": errors, "text": body, "chars": total, "screenshot": out });
+        let json = json!({ "url": info["url"], "title": info["title"], "load_ms": load_ms, "ready": info["ready"], "problems": problems, "headings": info["headings"], "console": console, "errors": errors, "text": body, "chars": total, "screenshot": out, "clip": clip });
         let mut o = Output::new(text, json);
         // The page never loaded, or never showed `--until`: a timeout. Its own console errors are the
         // page's, and listed.

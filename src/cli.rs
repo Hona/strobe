@@ -116,6 +116,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("chars", Number, "look"),
     ("keys", Number, "look"),
     ("full", Switch, "look"),
+    ("element", Value, "look"),
     ("headed", Switch, "look"),
     ("build", Switch, "look"),
     ("timeout", Value, "look"),
@@ -377,7 +378,7 @@ Use
   track --confirm [<ser_…|chg_…>] confirm suspected changes (or one again)
   history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits
                                   (query history|changes, query <ser_…> history|changes; report history <ser_…|file>)
-  look <url|file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000] [--full] [--headed]
+  look <url|file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000] [--full | --element <css>] [--headed]
   look app:<id> | exe:<path> [--app <id>] [--build] [--until <selector>] [--wait 2s] [--keys 40]
                                   a page in a headless browser, nothing measured: title, address, headings, visible text,
                                   console messages and uncaught errors, and a screenshot (exit 124 when it never loads)

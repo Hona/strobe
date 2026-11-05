@@ -158,12 +158,13 @@ strobe history [<ser_…|file>]
 ### `strobe look`
 
 ```text
-strobe look <url|file> [--until <selector>] [--wait 1s] [--out shot.png]
+strobe look <url|file> [--until <selector>] [--wait 1s] [--out shot.png] [--full | --element <selector>]
 strobe look app:<id> | exe:<path> [--build] [--until <selector>]
 ```
 
 - `<url|file>`: a page in a headless browser, nothing measured.
   - Title, the headings `expect` checks, visible text, console messages and errors, a screenshot.
+  - `--element <selector>`: the screenshot of that element only (one section of a long report).
   - Check a UI loads instead of writing a browser script.
 - `app:<id> | exe:<path>`: a native app launched isolated (`--build`: this checkout's build), then closed.
   - Window titles, the tree's dialogs and headings (what `expect` matches) and keyed elements.

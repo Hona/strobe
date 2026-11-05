@@ -633,14 +633,17 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
 ### 5.12 `strobe look`
 
 `look <url | file> [--until <selector>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000]
-[--full] [--headed] [--timeout 30s]`: a page in a fresh headless Chromium (strobe's usual flags and a
+[--full | --element <selector>] [--headed] [--timeout 30s]`: a page in a fresh headless Chromium (strobe's usual flags and a
 throwaway profile), nothing measured, for checking that a UI loads and says what it should (an
 agent on a locked session, a report or tool page) without writing a browser script. `--until` takes
 the page selector grammar (§9.6) and waits as `waitFor` does. After the load event (and `--until`'s
 element visible, then `--wait`) it prints the title, the address, the open dialogs and headings a
 case's `expect.heading` checks (the same probe, §9.6), the console messages and uncaught exceptions with where they came from, the
 page's visible text (`innerText`, the first `--chars`), and writes a screenshot (`--full`: the whole
-page). A local file opens as `file://`. Exit 124 when the load event or `--until` never came; the
+page; `--element`: only the first visible element the selector matches, at full size wherever it is
+on the page, so one section of a long report reads; a selector that matches nothing is a usage
+error). A local file opens as `file://`. A page-only flag given to a native look, or an app-only one
+(`--keys`, `--build`, `--app`, `--home`) to a page's, is a usage error rather than ignored. Exit 124 when the load event or `--until` never came; the
 page's own errors are listed, not an exit code. It is a CLI command only, not an MCP tool (§17): it
 answers no measurement question.
 

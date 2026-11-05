@@ -262,9 +262,17 @@ pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Optio
     #[cfg(not(windows))]
     {
         use std::os::unix::process::CommandExt;
-        let _ = (flags, home);
+        let _ = flags;
         cmd.process_group(0);
         pin(cmd, cpus);
+        // A target (a launch for a home) starts as its own responsible process, as a person starts
+        // an app bundle, so its XPC services join its process set.
+        #[cfg(target_os = "macos")]
+        if home.is_some() {
+            super::macos::own_responsibility(cmd);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = home;
         let child = cmd.spawn()?;
         let pgid = child.id();
         Ok(Owned { child, group: Some(Group { pgid }) })

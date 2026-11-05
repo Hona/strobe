@@ -366,6 +366,7 @@ export default bench({
   - On macOS it holds the XPC services the app is responsible for (a web view's web content, GPU and network processes), also for `record pid:` of an app opened from Finder.
   - An app bundle's executable launches as its own responsible app, as from Finder: macOS asks the bundle's own permissions, not those of the app strobe runs under.
   - A bare executable's XPC services are responsible to your terminal or daemon and are not counted: measure a web view app as its `.app` bundle.
+  - `! Unattributed` means a bundle's launch did not become its own responsible app: its numbers hold its own processes only.
 - A strobe that crashed or was killed may leave its isolated app or browser running (on Windows only what broke away from its job).
   - The next `bench`, `record` or `look` ends it by itself (it prints `ended <exe> (pid N): the strobe that launched it (pid M) is gone and left it running`).
   - Everything strobe launches carries `STROBE_HOME` and `STROBE_OWNER` in its environment, so it never touches a copy you started or a command that merely names a strobe folder.

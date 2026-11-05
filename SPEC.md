@@ -3695,6 +3695,19 @@ was left after a run. A bare executable reads as before (0.64% and 0.73%): its s
 responsible to the shell's daemon, and §13.2 says so. Reading every process's responsible pid
 (809 processes) took under 5 ms, once per process. Not checked: an app whose bundle needs a
 permission the app strobe runs under had and the bundle lacks (it is now asked for the bundle).
+After review (same setup): a relative bundle path (`record exe:WebSpin.app/Contents/MacOS/WebSpin`)
+read 0.68% before (no disclaim: the path was not absolute) and 90.5% after; a bundle whose
+executable is a script without `#!` (which `posix_spawn` refuses and `execvp` runs with `sh`, so the
+disclaim cannot take) read 0.67% with `! Unattributed` naming the process it was responsible to; a
+bundle that starts an unstamped process in its own session and exits before its window was left
+running by `look` before and ended after (macOS answered that process's own pid once the bundle had
+exited, unreaped or not, and `proc_pidinfo` gave nothing of the unreaped bundle: hence the
+remembered answer and the start time read at the launch); the threads view labels the web content,
+GPU and the app's other XPC services `app` (they were `os`). Two review points did not reproduce:
+a web view app that exits mid-recording left no WebKit process behind before or after (they end
+with the app), and `/usr/bin/sample` sampled the web content process (its WebCore and JavaScriptCore
+frames are 57% of an attribution recording's samples), so `Unsampled` stays for processes past the
+16 and for processes macOS does refuse it.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

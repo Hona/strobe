@@ -3098,6 +3098,13 @@ everything stamped with the home ended and the home deleted. What differs is how
   (the title and WebKit's user agent came back); a bare `Runtime.evaluate` is not found at that
   level. So an unmodified release app on WebKitGTK is inspectable through the variable alone: the
   route a WebKit inspector driver takes (`target/web.rs`'s seam, later).
+- **`kind: "native"` on the same app** (checked 2026-11-06): on vps (Xvfb, AT-SPI) the tree reads the
+  page (heading, links, the text box and button by role and name) and the process set holds
+  `WebKitWebProcess` and `WebKitNetworkProcess` beside the app; on adais UI Automation reads the page's
+  elements (the `greet-input` text box by its id) but no heading; on air (AX) the app's window shows no
+  page elements, and the process set is the app alone: WKWebView's WebContent, GPU and Networking
+  processes are XPC services launchd starts (parent 1), so their CPU and memory are not counted until
+  the responsible-pid accounting in `host/macos.rs` lands.
 
 ## 14. Storage
 

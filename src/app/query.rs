@@ -1,5 +1,7 @@
 //! `strobe query`: views over recordings and experiments (SPEC §11.1).
 
+mod diff;
+
 use super::{Output, fmt};
 use crate::cli::Args;
 use crate::engine;
@@ -8,8 +10,521 @@ use crate::model::{Error, Result};
 use crate::probe::symbols::{Frame, Symbolizer};
 use crate::store;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+pub use diff::{ATTRIBUTION_PARTS, diff_tree, series_insights};
+
+/// One recording opened for views. Each source (the CPU and allocation profiles, native samples, the
+/// heap snapshot, the trace's views) is read once, however many views ask for it: a report asks for
+/// the same sources through a dozen views, and reading them once per view loaded one trace into
+/// trace_processor up to seven times at once.
+pub struct Rec {
+    pub dir: PathBuf,
+    pub id: String,
+    pub meta: Value,
+    /// Source maps decode once per script for every view (a `Symbolizer` caches per instance).
+    sym: Mutex<Symbolizer>,
+    cpu: OnceLock<Result<Stacks>>,
+    alloc: OnceLock<Result<Stacks>>,
+    native: OnceLock<Result<Option<NativeStacks>>>,
+    heap: OnceLock<Result<crate::heapsnap::Snapshot>>,
+    forced: OnceLock<Result<Forced>>,
+    /// Trace views by part: those asked for together run in one trace_processor pass.
+    trace: Mutex<BTreeMap<Part, Result<Arc<Rows>>>>,
+}
+
+type Rows = Vec<Vec<Option<String>>>;
+
+/// Weighted stacks with each distinct frame stored once: (stack, root first, as indices into
+/// `frames`; weight; samples).
+#[derive(Default)]
+pub struct Stacks {
+    pub frames: Vec<Frame>,
+    pub weights: Vec<(Vec<u32>, f64, u64)>,
+    at: BTreeMap<Frame, u32>,
+}
+
+impl Stacks {
+    fn intern(&mut self, f: Frame) -> u32 {
+        if let Some(&i) = self.at.get(&f) {
+            return i;
+        }
+        let i = self.frames.len() as u32;
+        self.frames.push(f.clone());
+        self.at.insert(f, i);
+        i
+    }
+
+    fn from_frames(weights: Vec<(Vec<Frame>, f64, u64)>) -> Stacks {
+        let mut s = Stacks::default();
+        for (stack, w, n) in weights {
+            let ids = stack.into_iter().map(|f| s.intern(f)).collect();
+            s.weights.push((ids, w, n));
+        }
+        s
+    }
+}
+
+/// A recording's native samples (`deep`) as stacks, with what resolved.
+struct NativeStacks {
+    stacks: Stacks,
+    interval_us: f64,
+    samples: u64,
+    resolved: u64,
+    facts: Value,
+}
+
+/// A failure cached with its source, handed again to each view that asks (an `Error` is not `Clone`).
+fn again(e: &Error) -> Error {
+    let mut x = Error::msg(e.message.clone());
+    x.code = e.code;
+    x.hint = e.hint.clone();
+    x
+}
+
+fn cached<T>(r: &Result<T>) -> Result<&T> {
+    r.as_ref().map_err(again)
+}
+
+impl Rec {
+    pub fn open(dir: &Path) -> Rec {
+        let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+        let id = meta["id"].as_str().map(str::to_string).unwrap_or_else(|| dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default());
+        Rec {
+            dir: dir.to_path_buf(),
+            id,
+            meta,
+            sym: Mutex::new(Symbolizer::open(dir)),
+            cpu: OnceLock::new(),
+            alloc: OnceLock::new(),
+            native: OnceLock::new(),
+            heap: OnceLock::new(),
+            forced: OnceLock::new(),
+            trace: Mutex::new(BTreeMap::new()),
+        }
+    }
+
+    pub fn resolve(handle: &str) -> Result<Rec> {
+        Ok(Rec::open(&store::resolve(handle)?))
+    }
+
+    /// The measured runs the recording's profiles cover: its `runs`, else its duration over one run's.
+    pub fn runs(&self) -> Option<u64> {
+        self.meta["runs"].as_u64().or_else(|| {
+            let dur = self.meta["duration_ms"].as_f64()?;
+            let one = self.meta["values"]["run.duration"].as_f64()?;
+            (one > 0.0).then(|| (dur / one).round().max(1.0) as u64)
+        })
+    }
+
+    fn cpu(&self) -> Result<&Stacks> {
+        cached(self.cpu.get_or_init(|| self.load_cpu()))
+    }
+
+    fn alloc(&self) -> Result<&Stacks> {
+        cached(self.alloc.get_or_init(|| self.load_alloc()))
+    }
+
+    fn native(&self) -> Result<Option<&NativeStacks>> {
+        let r = self.native.get_or_init(|| {
+            Ok(crate::symbol::native(&self.dir, None, None)?.map(|n| {
+                let facts = crate::symbol::summary(&n);
+                NativeStacks { interval_us: n.interval_us, samples: n.samples, resolved: n.resolved, facts, stacks: Stacks::from_frames(n.weights) }
+            }))
+        });
+        cached(r).map(Option::as_ref)
+    }
+
+    pub fn snapshot(&self) -> Result<&crate::heapsnap::Snapshot> {
+        cached(self.heap.get_or_init(|| crate::heapsnap::read(&heap_file(&self.dir)?)))
+    }
+
+    /// Loads the sources the given views read, all at once (each its own file read or trace pass).
+    pub fn preload(&self, parts: &[Part], cpu: bool, alloc: bool, heap: bool) {
+        std::thread::scope(|s| {
+            s.spawn(|| self.prefetch(parts));
+            if alloc {
+                s.spawn(|| self.alloc().is_ok());
+            }
+            if heap {
+                s.spawn(|| self.snapshot().is_ok());
+            }
+            if cpu {
+                let _ = self.cpu();
+            }
+        });
+    }
+
+    /// Whether this recording's trace can answer a part: run marks, and an attribution trace for
+    /// stacks, GC phases and invalidation tracking.
+    fn has(&self, p: Part) -> bool {
+        let token = self.meta["token"].as_str().unwrap_or("");
+        !token.is_empty() && self.dir.join("trace.pftrace").is_file() && (!p.attribution_only() || self.meta["probes"] == "attribution")
+    }
+
+    /// Runs the parts not yet read in one trace_processor pass: one load of the trace for all of them.
+    pub fn prefetch(&self, parts: &[Part]) {
+        let mut cache = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+        let mut todo: Vec<Part> = parts.iter().copied().filter(|p| !cache.contains_key(p) && self.has(*p)).collect();
+        todo.sort();
+        todo.dedup();
+        if todo.is_empty() {
+            return;
+        }
+        match engine::query(&self.dir.join("trace.pftrace"), &batch_sql(self.meta["token"].as_str().unwrap_or(""), &todo)) {
+            Ok(table) => {
+                let mut split: BTreeMap<Part, Rows> = todo.iter().map(|p| (*p, Vec::new())).collect();
+                for row in table.rows {
+                    let Some(p) = row.first().cloned().flatten().and_then(|t| t.parse::<usize>().ok()).and_then(|i| PARTS.get(i).copied()) else { continue };
+                    if let Some(rows) = split.get_mut(&p) {
+                        rows.push(row.into_iter().skip(1).take(p.width()).collect());
+                    }
+                }
+                for (p, mut rows) in split {
+                    if let Some((a, b)) = p.order() {
+                        rows.sort_by(|x, y| cell_cmp(x, y, a).then_with(|| cell_cmp(x, y, b)));
+                    }
+                    cache.insert(p, Ok(Arc::new(rows)));
+                }
+            }
+            Err(e) => {
+                for p in todo {
+                    cache.insert(p, Err(again(&e)));
+                }
+            }
+        }
+    }
+
+    fn part(&self, p: Part) -> Result<Arc<Rows>> {
+        if !self.has(p) {
+            return Err(Error::usage("this recording has no trace with strobe's run marks"));
+        }
+        self.prefetch(&[p]);
+        let cache = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+        cache.get(&p).map(|r| r.as_ref().map(Arc::clone).map_err(again)).unwrap_or_else(|| Err(Error::msg("trace part missing")))
+    }
+
+    fn load_cpu(&self) -> Result<Stacks> {
+        let profiles = files(&self.dir, "cpuprofile")?;
+        if profiles.is_empty() {
+            return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
+        }
+        let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Stacks::default();
+        for p in profiles {
+            let bytes = std::fs::read(&p)?;
+            let prof: CpuProfile = parse(&bytes)?;
+            let index: HashMap<u64, usize> = prof.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
+            let mut parent = vec![usize::MAX; prof.nodes.len()];
+            for (i, n) in prof.nodes.iter().enumerate() {
+                for c in &n.children {
+                    if let Some(&j) = index.get(c) {
+                        parent[j] = i;
+                    }
+                }
+            }
+            // Per profile node: µs and samples (a sample's time is the delta to the next sample).
+            let mut at: BTreeMap<usize, (f64, u64)> = BTreeMap::new();
+            for (i, s) in prof.samples.iter().enumerate() {
+                let Some(&k) = index.get(s) else { continue };
+                let e = at.entry(k).or_default();
+                e.0 += prof.time_deltas.get(i + 1).copied().unwrap_or(0.0).max(0.0);
+                e.1 += 1;
+            }
+            let mut frames = Symbolized::new(&sym, prof.nodes.len());
+            for (k, (us, n)) in at {
+                let stack = frames.chain(k, &parent, |i| &prof.nodes[i].call_frame, &mut out);
+                out.weights.push((stack, us, n));
+            }
+        }
+        Ok(out)
+    }
+
+    fn load_alloc(&self) -> Result<Stacks> {
+        let profiles = files(&self.dir, "heapprofile")?;
+        if profiles.is_empty() {
+            return Err(Error::usage("this recording has no allocation profile; record with --probes attribution"));
+        }
+        let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
+        let mut out = Stacks::default();
+        for p in profiles {
+            let bytes = std::fs::read(&p)?;
+            let prof: AllocProfile = parse(&bytes)?;
+            let mut hits: HashMap<u64, u64> = HashMap::new();
+            for s in &prof.samples {
+                *hits.entry(s.node_id).or_default() += 1;
+            }
+            // Flatten the call tree once (each node and its parent); a stack is built only for nodes
+            // where bytes were sampled (`selfSize`), not copied down every branch.
+            let mut nodes: Vec<&AllocNode> = Vec::new();
+            let mut parent: Vec<usize> = Vec::new();
+            let mut todo: Vec<(&AllocNode, usize)> = prof.head.iter().map(|h| (h, usize::MAX)).collect();
+            while let Some((n, up)) = todo.pop() {
+                let i = nodes.len();
+                nodes.push(n);
+                parent.push(up);
+                todo.extend(n.children.iter().map(|c| (c, i)));
+            }
+            let mut frames = Symbolized::new(&sym, nodes.len());
+            for i in 0..nodes.len() {
+                let bytes = nodes[i].self_size;
+                if bytes > 0.0 {
+                    let stack = frames.chain(i, &parent, |j| &nodes[j].call_frame, &mut out);
+                    out.weights.push((stack, bytes, hits.get(&nodes[i].id).copied().unwrap_or(1)));
+                }
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// The files of one kind in a recording's folder, in name order.
+fn files(dir: &Path, ext: &str) -> Result<Vec<PathBuf>> {
+    let mut v: Vec<PathBuf> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == ext)).collect();
+    v.sort();
+    Ok(v)
+}
+
+/// A profile from JSON: profiles nest one level per stack frame, past serde_json's default limit.
+fn parse<'a, T: serde::Deserialize<'a>>(bytes: &'a [u8]) -> Result<T> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    de.disable_recursion_limit();
+    Ok(T::deserialize(&mut de)?)
+}
+
+#[derive(serde::Deserialize)]
+struct CallFrame<'a> {
+    #[serde(default, borrow, rename = "functionName")]
+    name: Cow<'a, str>,
+    #[serde(default, borrow)]
+    url: Cow<'a, str>,
+    #[serde(default = "unknown", rename = "lineNumber")]
+    line: i64,
+    #[serde(default = "unknown", rename = "columnNumber")]
+    column: i64,
+}
+
+fn unknown() -> i64 {
+    -1
+}
+
+#[derive(serde::Deserialize)]
+struct CpuNode<'a> {
+    #[serde(default)]
+    id: u64,
+    #[serde(borrow, rename = "callFrame")]
+    call_frame: CallFrame<'a>,
+    #[serde(default)]
+    children: Vec<u64>,
+}
+
+#[derive(serde::Deserialize)]
+struct CpuProfile<'a> {
+    #[serde(default, borrow)]
+    nodes: Vec<CpuNode<'a>>,
+    #[serde(default)]
+    samples: Vec<u64>,
+    #[serde(default, rename = "timeDeltas")]
+    time_deltas: Vec<f64>,
+}
+
+#[derive(serde::Deserialize)]
+struct AllocNode<'a> {
+    #[serde(default)]
+    id: u64,
+    #[serde(borrow, rename = "callFrame")]
+    call_frame: CallFrame<'a>,
+    #[serde(default, rename = "selfSize")]
+    self_size: f64,
+    #[serde(default, borrow)]
+    children: Vec<AllocNode<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct AllocProfile<'a> {
+    #[serde(borrow)]
+    head: Option<AllocNode<'a>>,
+    #[serde(default)]
+    samples: Vec<AllocSample>,
+}
+
+#[derive(serde::Deserialize)]
+struct AllocSample {
+    #[serde(default, rename = "nodeId")]
+    node_id: u64,
+}
+
+/// Profile nodes to interned frames, each node and each distinct call frame resolved once.
+struct Symbolized<'s, 'a> {
+    sym: &'s Symbolizer,
+    node: Vec<Option<u32>>,
+    by_frame: HashMap<(&'a str, &'a str, i64, i64), u32>,
+}
+
+impl<'s, 'a> Symbolized<'s, 'a> {
+    fn new(sym: &'s Symbolizer, nodes: usize) -> Self {
+        Symbolized { sym, node: vec![None; nodes], by_frame: HashMap::new() }
+    }
+
+    /// The stack of node `i`, root first, without the `(root)` frame.
+    fn chain(&mut self, i: usize, parent: &[usize], frame_of: impl Fn(usize) -> &'a CallFrame<'a>, out: &mut Stacks) -> Vec<u32> {
+        let mut stack = Vec::new();
+        let mut at = i;
+        while at != usize::MAX {
+            let id = match self.node[at] {
+                Some(id) => id,
+                None => {
+                    let cf = frame_of(at);
+                    let key = (cf.url.as_ref(), cf.name.as_ref(), cf.line, cf.column);
+                    let id = match self.by_frame.get(&key) {
+                        Some(&id) => id,
+                        None => {
+                            let id = out.intern(self.sym.frame(&cf.url, cf.line, cf.column, &cf.name));
+                            self.by_frame.insert(key, id);
+                            id
+                        }
+                    };
+                    self.node[at] = Some(id);
+                    id
+                }
+            };
+            if out.frames[id as usize].name != "(root)" {
+                stack.push(id);
+            }
+            at = parent[at];
+        }
+        stack.reverse();
+        stack
+    }
+}
+
+/// A trace view strobe reads with SQL over the run windows (`_w`). Several parts run as one statement
+/// (a `union all` tagged by part), so the trace loads once for all of them.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+pub enum Part {
+    Layout,
+    Gc,
+    LongTasks,
+    Style,
+    Phases,
+    Threads,
+}
+
+const PARTS: [Part; 6] = [Part::Layout, Part::Gc, Part::LongTasks, Part::Style, Part::Phases, Part::Threads];
+
+impl Part {
+    /// Columns of the part's rows. Window rows (`_w`) carry only their key, the rest NULL.
+    fn width(self) -> usize {
+        match self {
+            Part::Layout => 6,
+            Part::Gc => 7,
+            Part::LongTasks => 2,
+            Part::Style => 9,
+            Part::Phases => 5,
+            Part::Threads => 5,
+        }
+    }
+
+    fn attribution_only(self) -> bool {
+        matches!(self, Part::Layout | Part::Gc | Part::Style)
+    }
+
+    /// The two columns its consumers read in order (thread then time, or run then time).
+    fn order(self) -> Option<(usize, usize)> {
+        match self {
+            Part::Layout | Part::Gc => Some((4, 2)),
+            Part::Phases => Some((0, 2)),
+            _ => None,
+        }
+    }
+
+    fn sql(self) -> &'static str {
+        match self {
+            Part::Layout => {
+                "select k, null, null, null, null, null from _w
+union all
+select w.k, s.name, s.ts, s.dur, t.tid,
+  (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a
+     where a.arg_set_id = s.arg_set_id and a.key glob 'debug.beginData.stackTrace*') as stack
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where s.name in ('Layout', 'UpdateLayoutTree') and t.name = 'CrRendererMain'"
+            }
+            Part::Gc => {
+                "select k, null, null, null, null, null, null from _w
+union all
+select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
+  extract_arg(s.arg_set_id, 'debug.usedHeapSizeBefore') - extract_arg(s.arg_set_id, 'debug.usedHeapSizeAfter') as freed
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where s.name in ('MinorGC', 'MajorGC') or s.name glob 'V8.GC*' or s.name glob 'BlinkGC*'"
+            }
+            Part::LongTasks => {
+                "select count(*), max(s.dur)
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+ where s.name = 'RunTask' and s.depth = 0 and t.name = 'CrRendererMain' and s.dur > 50000000"
+            }
+            Part::Style => {
+                "select k, null, null, null, null, null, null, null, null from _w
+union all
+select w.k, s.name, s.dur,
+  coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount')),
+  extract_arg(s.arg_set_id, 'debug.data.reason'),
+  coalesce('class .' || extract_arg(s.arg_set_id, 'debug.data.changedClass'), 'id #' || extract_arg(s.arg_set_id, 'debug.data.changedId'),
+    'attribute [' || extract_arg(s.arg_set_id, 'debug.data.changedAttribute') || ']', 'pseudo-class :' || extract_arg(s.arg_set_id, 'debug.data.changedPseudo')),
+  extract_arg(s.arg_set_id, 'debug.data.nodeName'),
+  (select group_concat(a.display_value, char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.selectors*.selector'),
+  (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.stackTrace*')
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where (s.name = 'UpdateLayoutTree' and t.name = 'CrRendererMain') or s.name glob '*InvalidationTracking'"
+            }
+            Part::Phases => {
+                "select k, null, null, null, null from _w
+union all
+select w.k, s.name, s.ts, s.dur, coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount'), 0)
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
+  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  where t.name = 'CrRendererMain' and s.name in ('UpdateLayoutTree', 'Layout', 'PrePaint', 'Paint')"
+            }
+            // Every process's threads in the run windows: task-loop tasks that started inside a run, by
+            // thread. Only the task loop's own slices: a thread's other tracks hold spans that overlap
+            // them (animation frames, GC sweeping), which would count time twice.
+            Part::Threads => {
+                "select k, null, null, null, null from _w
+union all
+select w.k, coalesce(p.name, '?'), coalesce(t.name, '?'), sum(s.dur), count(*)
+  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) left join process p using(upid)
+  join (select distinct k, t0, t1 from _w) w on s.ts >= w.t0 and s.ts < w.t1
+ where s.depth = 0 and s.dur > 0 and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask') group by 1, 2, 3"
+            }
+        }
+    }
+}
+
+/// One statement for several parts: the run windows once, then each part's rows tagged with its
+/// index and padded to the widest part.
+fn batch_sql(token: &str, parts: &[Part]) -> String {
+    let width = parts.iter().map(|p| p.width()).max().unwrap_or(0);
+    let selects: Vec<String> = parts
+        .iter()
+        .map(|p| format!("select {} as part, *{} from (\n{}\n)", PARTS.iter().position(|x| x == p).unwrap_or(0), ", null".repeat(width - p.width()), p.sql()))
+        .collect();
+    format!("{}\n{};", windows_sql(token), selects.join("\nunion all\n"))
+}
+
+/// Orders two rows by one column: numbers as numbers, NULL first, else as text.
+fn cell_cmp(x: &[Option<String>], y: &[Option<String>], i: usize) -> std::cmp::Ordering {
+    let (a, b) = (x.get(i).cloned().flatten(), y.get(i).cloned().flatten());
+    match (a.as_deref().map(str::parse::<i64>), b.as_deref().map(str::parse::<i64>)) {
+        (Some(Ok(p)), Some(Ok(q))) => p.cmp(&q),
+        _ => a.cmp(&b),
+    }
+}
 
 pub fn run(args: &Args) -> Result<Output> {
     let handle = args.pos.first().ok_or_else(|| Error::usage("query needs a handle: strobe query rec_… <view>"))?;
@@ -38,40 +553,42 @@ pub fn run(args: &Args) -> Result<Output> {
                     a.pos[0] = recs.remove(0);
                     return run(&a);
                 }
+                // A view of two recordings answers for the experiment: each series' base..head.
+                if diff::VIEWS.contains(&other) {
+                    return diff::experiment(&result, other, args, top);
+                }
                 for s in result["series"].as_array().into_iter().flatten() {
                     recs.extend(["base", "head"].iter().filter_map(|r| s["attribution"][r].as_str().map(str::to_string)));
                     recs.extend(s["attribution"].as_str().map(str::to_string));
                 }
                 Err(Error::usage(format!(
-                    "experiments support summary, progress and insights; {other} reads a recording{}",
+                    "experiments support summary, progress, insights and the base..head views ({}); {other} reads a recording{}",
+                    diff::VIEWS.join(" "),
                     if recs.is_empty() { " (this experiment kept none)".to_string() } else { format!(": strobe query <rec> {other} with one of {}", recs.join(", ")) }
                 )))
             }
         };
     }
-    // `a..b`: two recordings compared (heap snapshots by class).
+    // `a..b`: one view of two recordings, side by side and per run.
     if let Some((a, b)) = handle.split_once("..") {
-        let (a, b) = (store::resolve(a)?, store::resolve(b)?);
-        return match view {
-            "heap" => heap_diff(&a, &b, top, args.has("reveal")),
-            "memory" => memory_diff(&a, &b, top),
-            other => Err(Error::usage(format!("a..b supports heap and memory, not {other}"))),
-        };
+        let (a, b) = (Rec::resolve(a)?, Rec::resolve(b)?);
+        return diff::run(&a, &b, view, args, top);
     }
     let dir = store::resolve(handle)?;
-    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+    let rec = Rec::open(&dir);
+    let meta = &rec.meta;
     let trace = dir.join("trace.pftrace");
     match view {
         "summary" => {
-            let mut text = super::record::summary_text(&meta);
+            let mut text = super::record::summary_text(meta);
             let mut json = meta.clone();
-            if let Some((t, rows)) = run_phases(&dir, &meta) {
+            if let Some((t, rows)) = run_phases(&rec) {
                 text += &t;
                 json["per_run"] = rows;
             }
             Ok(Output::new(text, json))
         }
-        "style" => style(&dir, top),
+        "style" => style(&rec, top),
         "sql" => {
             let sql = args.pos.get(2).ok_or_else(|| Error::usage("query <h> sql \"select …\""))?;
             sql_view(&trace, sql, top.max(50))
@@ -79,40 +596,37 @@ pub fn run(args: &Args) -> Result<Output> {
         "frames" if dir.join("frames.json").exists() || meta["native"] == true => native_frames(&dir, top),
         "threads" if args.has("timeline") => thread_timeline(&dir, top),
         "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
-        "frames" => frames(&trace, &meta, top),
+        "frames" => frames(&trace, meta, top),
         "threads" => threads(&trace, top),
-        "gpu" if !trace.exists() => native_gpu(&dir, &meta),
+        "gpu" if !trace.exists() => native_gpu(&dir, meta),
         "gpu" => gpu(&trace, top),
         "hotspots" | "alloc" => {
-            let by = args.get("by").unwrap_or("function");
-            if !matches!(by, "function" | "file" | "package") {
-                return Err(Error::usage(format!("--by: function, file or package, not {by}")));
-            }
+            let by = by_arg(args)?;
             if view == "alloc" {
-                alloc(&dir, by, top)
+                alloc(&rec, by, top)
             } else if args.has("native") || args.has("thread") || args.has("phase") {
-                native_hotspots(&dir, by, top, args.get("thread"), args.get("phase"))
+                native_hotspots_of(&rec, by, top, args.get("thread"), args.get("phase"))
             } else {
-                hotspots(&dir, by, top)
+                hotspots_of(&rec, by, top)
             }
         }
-        "layout" => layout(&dir, top),
+        "layout" => layout(&rec, top),
         "shifts" => {
             let v =
                 store::read_json(&dir.join("shifts.json")).map_err(|_| Error::usage("no layout shifts in this recording: they come from attribution blocks of a series that declares layout.shift"))?;
             Ok(Output::new(crate::probe::shifts::text(&v), v))
         }
-        "gc" => gc(&dir),
-        "heap" => heap(&dir, top, args.has("reveal")),
-        "leaks" => leaks(&dir, top, args.has("reveal")),
-        "insights" => insights(&dir),
+        "gc" => gc(&rec),
+        "heap" => heap(&rec, top, args.has("reveal")),
+        "leaks" => leaks(&rec, top, args.has("reveal")),
+        "insights" => insights(&rec),
         "memory" => {
             let by = args.get("by").unwrap_or("process");
             if !matches!(by, "process" | "layer" | "allocator") {
                 return Err(Error::usage(format!("--by: process, layer or allocator, not {by}")));
             }
             if dir.join("memory.json").exists() {
-                return native_memory(&dir, &meta, by, top, args.get("at"));
+                return native_memory(&dir, meta, by, top, args.get("at"));
             }
             if meta["native"] == true || meta["pid"].is_u64() {
                 return Err(Error::usage(format!("this native recording has no memory reading: {}", crate::probe::memory::why_empty())));
@@ -123,27 +637,36 @@ pub fn run(args: &Args) -> Result<Output> {
     }
 }
 
+fn by_arg(args: &Args) -> Result<&str> {
+    let by = args.get("by").unwrap_or("function");
+    if !matches!(by, "function" | "file" | "package") {
+        return Err(Error::usage(format!("--by: function, file or package, not {by}")));
+    }
+    Ok(by)
+}
+
 /// The recording's heap snapshot: live objects by class with retained sizes, detached DOM, the largest
 /// owners and their retainer paths. String values stay hidden unless `--reveal` (SPEC §8.6).
-pub fn heap(dir: &Path, top: usize, reveal: bool) -> Result<Output> {
-    let snap = crate::heapsnap::read(&heap_file(dir)?)?;
-    let v = crate::heapsnap::summary(&snap, top, reveal);
+pub fn heap(rec: &Rec, top: usize, reveal: bool) -> Result<Output> {
+    let v = crate::heapsnap::summary(rec.snapshot()?, top, reveal);
     Ok(Output::new(crate::heapsnap::summary_text(&v, top), v))
 }
 
 /// Live objects in `b` against `a` by class: count, self and retained size changes, and what only `b` has.
 /// Two recordings are two processes, so new objects group by class, never by node id.
-pub fn heap_diff(a: &Path, b: &Path, top: usize, reveal: bool) -> Result<Output> {
-    let (base, head) = (crate::heapsnap::read(&heap_file(a)?)?, crate::heapsnap::read(&heap_file(b)?)?);
-    let v = crate::heapsnap::diff(&base, &head, false, top, reveal);
+pub fn heap_diff(a: &Rec, b: &Rec, top: usize, reveal: bool) -> Result<Output> {
+    let v = crate::heapsnap::diff(a.snapshot()?, b.snapshot()?, false, top, reveal);
     Ok(Output::new(crate::heapsnap::diff_text(&v, top), v))
 }
 
 /// Insights (SPEC §11.3): rules over one recording's own data, each hit with its numbers and the
 /// commands that show the evidence. Facts with thresholds, never a verdict strobe cannot back.
-pub fn insights(dir: &Path) -> Result<Output> {
-    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
-    let id = meta["id"].as_str().unwrap_or("").to_string();
+pub fn insights(rec: &Rec) -> Result<Output> {
+    // The trace's rules read one pass, not three.
+    rec.prefetch(&[Part::Layout, Part::Gc, Part::LongTasks]);
+    let dir = rec.dir.as_path();
+    let meta = &rec.meta;
+    let id = rec.id.clone();
     let runs = meta["runs"].as_f64().unwrap_or(1.0).max(1.0);
     let v = &meta["values"];
     let work = v["main.work"].as_f64().unwrap_or(f64::NAN);
@@ -152,7 +675,7 @@ pub fn insights(dir: &Path) -> Result<Output> {
         |rule: &str, level: &str, title: String, evidence: Value, handles: Vec<String>| hits.push(json!({ "rule": rule, "level": level, "title": title, "evidence": evidence, "handles": handles }));
     let q = |view: &str| format!("strobe query {id} {view}");
     // Forced layout: geometry read after a DOM write makes the browser lay out mid-script.
-    if let Ok(l) = layout(dir, 3).map(|o| o.json) {
+    if let Ok(l) = layout(rec, 3).map(|o| o.json) {
         let ms = l["forced"]["layout"]["ms_per_run"].as_f64().unwrap_or(0.0) + l["forced"]["style"]["ms_per_run"].as_f64().unwrap_or(0.0);
         let share = if work > 0.0 { ms / work } else { f64::NAN };
         if ms >= 5.0 || share >= 0.05 {
@@ -175,11 +698,11 @@ pub fn insights(dir: &Path) -> Result<Output> {
         }
     }
     // GC pressure: collections pause the main thread; allocation sites say who causes them.
-    if let Ok(g) = gc(dir).map(|o| o.json) {
+    if let Ok(g) = gc(rec).map(|o| o.json) {
         let ms = g["values"]["main_ms_per_run"].as_f64().unwrap_or(0.0);
         let share = if work > 0.0 { ms / work } else { f64::NAN };
         if share >= 0.05 || ms >= 10.0 {
-            let sites: Vec<String> = alloc(dir, "function", 3)
+            let sites: Vec<String> = alloc(rec, "function", 3)
                 .map(|o| o.json["rows"].as_array().into_iter().flatten().map(|r| format!("{} {}", r["name"].as_str().unwrap_or(""), fmt::bytes(r["weight"].as_f64().unwrap_or(0.0) / runs))).collect())
                 .unwrap_or_default();
             hit(
@@ -228,29 +751,17 @@ pub fn insights(dir: &Path) -> Result<Output> {
         );
     }
     // Long tasks: one task over 50 ms blocks input for that long.
-    let trace = dir.join("trace.pftrace");
-    if trace.is_file() && !meta["token"].as_str().unwrap_or("").is_empty() {
-        let sql = format!(
-            "{}
-select count(*), max(s.dur), (select s2.ts from slice s2 join thread_track tt2 on s2.track_id = tt2.id join thread t2 using(utid)
-                              where s2.name = 'RunTask' and s2.depth = 0 and t2.name = 'CrRendererMain' order by s2.dur desc limit 1)
-  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
-  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
- where s.name = 'RunTask' and s.depth = 0 and t.name = 'CrRendererMain' and s.dur > 50000000",
-            windows_sql(meta["token"].as_str().unwrap_or(""))
-        );
-        if let Ok(t) = engine::query(&trace, &sql) {
-            let cell = |i: usize| t.rows.first().and_then(|r| r.get(i).cloned().flatten()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-            let (n, worst) = (cell(0), cell(1) / 1e6);
-            if n > 0.0 {
-                hit(
-                    "long-tasks",
-                    "warn",
-                    format!("long tasks: {n:.0} main-thread tasks over 50 ms in the recording, the longest {}: input waits that long", fmt::value(worst, "ms")),
-                    json!({ "count": n, "longest_ms": worst }),
-                    vec![format!("strobe query {id} sql \"select ts, dur / 1e6 as ms from slice where name = 'RunTask' and depth = 0 and dur > 50e6 order by dur desc limit 20\""), q("hotspots")],
-                );
-            }
+    if let Ok(rows) = rec.part(Part::LongTasks) {
+        let cell = |i: usize| rows.first().and_then(|r| r.get(i).cloned().flatten()).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+        let (n, worst) = (cell(0), cell(1) / 1e6);
+        if n > 0.0 {
+            hit(
+                "long-tasks",
+                "warn",
+                format!("long tasks: {n:.0} main-thread tasks over 50 ms in the recording, the longest {}: input waits that long", fmt::value(worst, "ms")),
+                json!({ "count": n, "longest_ms": worst }),
+                vec![format!("strobe query {id} sql \"select ts, dur / 1e6 as ms from slice where name = 'RunTask' and depth = 0 and dur > 50e6 order by dur desc limit 20\""), q("hotspots")],
+            );
         }
     }
     // Work while idle: a recording with no input that still presents frames or keeps the main thread busy.
@@ -269,7 +780,7 @@ select count(*), max(s.dur), (select s2.ts from slice s2 join thread_track tt2 o
         }
     }
     // Detached DOM: removed from the document but kept alive by script.
-    if let Ok(h) = heap(dir, 3, false).map(|o| o.json) {
+    if let Ok(h) = heap(rec, 3, false).map(|o| o.json) {
         let d = &h["detached"];
         if d["count"].as_u64().unwrap_or(0) > 0 {
             let largest = &d["classes"][0];
@@ -299,7 +810,7 @@ select count(*), max(s.dur), (select s2.ts from slice s2 join thread_track tt2 o
         );
     }
     // Unresolved time: script without source maps, and native time strobe cannot name without deep.
-    if let Ok(h) = hotspots(dir, "function", 400).map(|o| o.json) {
+    if let Ok(h) = hotspots_of(rec, "function", 400).map(|o| o.json) {
         if h["native"] == true && h["resolved_share"].as_f64().is_some_and(|s| s < 0.95) {
             let share = h["resolved_share"].as_f64().unwrap_or(0.0);
             hit(
@@ -368,75 +879,22 @@ select count(*), max(s.dur), (select s2.ts from slice s2 join thread_track tt2 o
 }
 
 /// An experiment's insights: per series, what moved most between the base and head profiled launches
-/// (CPU self time, forced layout and allocations by function, per run), then the head recording's
-/// own insights. Functions match by name and file name: the two builds live in different folders.
+/// (`series_insights`), then the head recording's own insights.
 pub fn experiment_insights(result: &Value) -> Result<Output> {
-    const VIEWS: [(&str, &str, &str); 3] = [("CPU self time", "ms", "hotspots"), ("forced layout", "ms", "layout"), ("allocations", "bytes", "alloc")];
     let mut text = format!("insights · {}\n", result["id"].as_str().unwrap_or(""));
     let mut series_out = Vec::new();
     for s in result["series"].as_array().into_iter().flatten() {
         let (Some(b), Some(h)) = (s["attribution"]["base"].as_str(), s["attribution"]["head"].as_str()) else { continue };
-        let (bd, hd) = (store::resolve(b)?, store::resolve(h)?);
-        text += &format!("\n{}\n", s["label"].as_str().unwrap_or(""));
-        // Each view on each side is its own profile read or trace_processor run: all at once.
-        let (bp, hp) = (bd.as_path(), hd.as_path());
-        let (sides, own) = std::thread::scope(|scope| {
-            let sides: Vec<_> = VIEWS.iter().map(|&(_, unit, view)| (scope.spawn(move || mover_rows(bp, view, unit)), scope.spawn(move || mover_rows(hp, view, unit)))).collect();
-            let own = scope.spawn(move || insights(hp));
-            (sides.into_iter().map(|(x, y)| (x.join().unwrap_or_default(), y.join().unwrap_or_default())).collect::<Vec<_>>(), own.join())
-        });
-        let mut movers = Vec::new();
-        for ((what, unit, view), (base, head)) in VIEWS.iter().zip(sides) {
-            let mut deltas: Vec<(String, f64, f64)> = base
-                .keys()
-                .chain(head.keys())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .map(|k| (k.clone(), base.get(k).copied().unwrap_or(0.0), head.get(k).copied().unwrap_or(0.0)))
-                .collect();
-            deltas.sort_by(|x, y| (y.2 - y.1).abs().total_cmp(&(x.2 - x.1).abs()));
-            let floor = if *unit == "ms" { 1.0 } else { 64.0 * 1024.0 };
-            for (k, x, y) in deltas.into_iter().filter(|(_, x, y)| (y - x).abs() >= floor).take(3) {
-                let show = |v: f64| if *unit == "ms" { fmt::value(v, "ms") } else { fmt::bytes(v) };
-                let line = format!("{what}: {k} {} → {} per run ({}{})", show(x), show(y), if y > x { "+" } else { "−" }, show((y - x).abs()));
-                text += &format!("i {line}\n");
-                movers.push(json!({ "kind": what, "function": k, "base_per_run": x, "head_per_run": y, "unit": unit, "title": line, "handles": [format!("strobe query {h} {view}"), format!("strobe query {b} {view}")] }));
-            }
-        }
-        let own = own.map_err(|_| Error::msg("insights panicked"))??;
-        for line in own.text.lines().skip(1) {
-            text += &format!("{line}\n");
-        }
-        series_out.push(json!({ "series": s["label"], "movers": movers, "head": own.json["insights"] }));
+        let (base, head) = (Rec::resolve(b)?, Rec::resolve(h)?);
+        let o = series_insights(&base, &head, result["plan"]["runs_per_block"].as_u64())?;
+        text += &format!("\n{}\n{}", s["label"].as_str().unwrap_or(""), o.text);
+        let mut j = o.json;
+        j["series"] = s["label"].clone();
+        series_out.push(j);
     }
     Ok(Output::new(text, json!({ "experiment": result["id"], "series": series_out })))
 }
 
-/// One profiled launch's rows of a view as `function file-name` → value per run (ms for time, bytes
-/// for allocations); the `(idle)`-style pseudo-frames of a CPU profile are left out.
-fn mover_rows(dir: &Path, view: &str, unit: &str) -> BTreeMap<String, f64> {
-    let out = match view {
-        "hotspots" => hotspots(dir, "function", 200),
-        "layout" => layout(dir, 200),
-        _ => alloc(dir, "function", 200),
-    };
-    let runs = store::read_json(&dir.join("meta.json")).ok().and_then(|m| m["runs"].as_f64()).unwrap_or(1.0).max(1.0);
-    let scale = if unit == "ms" { 1000.0 } else { 1.0 };
-    out.map(|o| {
-        o.json["rows"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter(|r| !(view == "hotspots" && r["where"] == "(native)" && r["name"].as_str().unwrap_or("").starts_with('(')))
-            .map(|r| {
-                let file = r["where"].as_str().unwrap_or("").replace('\\', "/");
-                let file = file.rsplit('/').next().unwrap_or("").split(':').next().unwrap_or("").to_string();
-                (format!("{} {file}", r["name"].as_str().unwrap_or("")), r["weight"].as_f64().unwrap_or(0.0) / scale / runs)
-            })
-            .collect()
-    })
-    .unwrap_or_default()
-}
 /// The last two steps of a retainer path, as `… › parent › object`.
 fn path_tail(path: &Value) -> String {
     let steps: Vec<String> =
@@ -643,12 +1101,13 @@ fn census_at(dir: &Path, at: Option<&str>) -> Result<(Value, String)> {
 
 /// Leak suspects of a memory recording: objects allocated between its first and middle snapshots that
 /// are still alive in the last, by class, with retainer paths (SPEC §8.6).
-pub fn leaks(dir: &Path, top: usize, reveal: bool) -> Result<Output> {
-    let s = |name: &str| dir.join(format!("{name}.heapsnapshot.gz"));
-    if !s("heap-s0").exists() || !s("heap-s1").exists() {
+pub fn leaks(rec: &Rec, top: usize, reveal: bool) -> Result<Output> {
+    let s = |name: &str| rec.dir.join(format!("{name}.heapsnapshot.gz"));
+    if !s("heap-s0").exists() || !s("heap-s1").exists() || !s("heap-0").exists() {
         return Err(Error::usage("this recording has no leak snapshots; record with --probes memory"));
     }
-    let v = crate::heapsnap::leaks(&crate::heapsnap::ids(&s("heap-s0"))?, &crate::heapsnap::ids(&s("heap-s1"))?, &crate::heapsnap::read(&s("heap-0"))?, top, reveal);
+    // The last snapshot is the recording's own (`heap-0`), shared with `heap`.
+    let v = crate::heapsnap::leaks(&crate::heapsnap::ids(&s("heap-s0"))?, &crate::heapsnap::ids(&s("heap-s1"))?, rec.snapshot()?, top, reveal);
     Ok(Output::new(crate::heapsnap::leaks_text(&v, top), v))
 }
 
@@ -1061,51 +1520,39 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
     text += "an input counts when the app changed its accessibility tree after it and was not drawing already (SPEC §7.4)\n";
     Ok(Output::new(text, json!({ "runs": runs_json, "refresh_ms": refresh })))
 }
+/// Busy time by thread from its task loop's tasks. A thread's other tracks hold spans that overlap
+/// its tasks (animation frames, GC sweeping): counting every top-level slice once read 70 s of
+/// "busy" time for one renderer thread in a 14 s trace.
 fn threads(trace: &Path, top: usize) -> Result<Output> {
     let sql = format!(
         "select p.name as process, p.pid, t.name as thread, count(*) as tasks, round(sum(s.dur) / 1e6, 1) as busy_ms, round(max(s.dur) / 1e6, 1) as max_ms
          from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid) left join process p using(upid)
-         where s.depth = 0 and s.dur > 0 group by 1, 2, 3 order by busy_ms desc limit {top}"
+         where s.depth = 0 and s.dur > 0 and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask') group by 1, 2, 3 order by busy_ms desc limit {top}"
     );
-    sql_view(trace, &sql, top)
+    let out = sql_view(trace, &sql, top)?;
+    if out.json["total"].as_u64().unwrap_or(0) > 0 {
+        return Ok(out);
+    }
+    // A trace without a task loop's slices (an imported one): every top-level slice, said so.
+    let mut out = sql_view(trace, &sql.replace(" and s.name in ('RunTask', 'ThreadControllerImpl::RunTask', 'ThreadPool_RunTask')", ""), top)?;
+    out.text += "no task-loop slices (RunTask) in this trace: every top-level slice counted, and slices on a thread's other tracks may overlap\n";
+    Ok(out)
 }
 
 /// Self time per function, file or package from the recording's CPU profiles (attribution only).
 pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
-    let profiles: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "cpuprofile")).collect();
-    if profiles.is_empty() && dir.join("deep.json.gz").is_file() {
-        return native_hotspots(dir, by, top, None, None);
-    }
-    if profiles.is_empty() {
-        return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
-    }
-    let sym = Symbolizer::open(dir);
-    let mut weights: Vec<(Vec<Frame>, f64, u64)> = Vec::new();
-    for p in profiles {
-        let prof = store::read_json(&p)?;
-        let nodes = prof["nodes"].as_array().cloned().unwrap_or_default();
-        let by_id: BTreeMap<u64, &Value> = nodes.iter().filter_map(|n| Some((n["id"].as_u64()?, n))).collect();
-        let parent: BTreeMap<u64, u64> = nodes
-            .iter()
-            .flat_map(|n| {
-                let id = n["id"].as_u64().unwrap_or(0);
-                n["children"].as_array().into_iter().flatten().filter_map(move |c| Some((c.as_u64()?, id)))
-            })
-            .collect();
-        let frames: BTreeMap<u64, Frame> = by_id.iter().map(|(id, n)| (*id, sym.call_frame(&n["callFrame"]))).collect();
-        // Per profile node: µs and samples (a sample's time is the delta to the next sample).
-        let mut at: BTreeMap<u64, (f64, u64)> = BTreeMap::new();
-        let deltas = prof["timeDeltas"].as_array().cloned().unwrap_or_default();
-        for (i, s) in prof["samples"].as_array().into_iter().flatten().enumerate() {
-            let Some(id) = s.as_u64() else { continue };
-            let e = at.entry(id).or_default();
-            e.0 += deltas.get(i + 1).and_then(Value::as_f64).unwrap_or(0.0).max(0.0);
-            e.1 += 1;
-        }
-        weights.extend(at.into_iter().map(|(id, (us, n))| (chain(id, &frames, &parent), us, n)));
-    }
+    hotspots_of(&Rec::open(dir), by, top)
+}
+
+/// `hotspots` of an opened recording: its JavaScript profile, else its native samples.
+pub fn hotspots_of(rec: &Rec, by: &str, top: usize) -> Result<Output> {
+    let stacks = match rec.cpu() {
+        Ok(s) => s,
+        Err(_) if rec.dir.join("deep.json.gz").is_file() => return native_hotspots_of(rec, by, top, None, None),
+        Err(e) => return Err(e),
+    };
     let header = format!("hotspots by {by} · self time · {{samples}} samples at {} µs{{mapped}}", crate::probe::cpu::INTERVAL_US);
-    let mut out = rank(weights, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
+    let mut out = rank(stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
     out.json["interval_us"] = json!(crate::probe::cpu::INTERVAL_US);
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
@@ -1118,15 +1565,29 @@ pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
 /// sampled profile, symbolized from PDBs), in the shape of `hotspots`. `thread`: a thread name or id.
 /// `phase`: only samples inside that phase of each measured run (`phase(name, fn)` in the bench file).
 pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>, phase: Option<&str>) -> Result<Output> {
-    let spans = phase.map(|p| phase_spans(dir, p)).transpose()?;
-    let n = crate::symbol::native(dir, thread, spans.as_deref())?.ok_or_else(|| Error::usage("this recording has no native samples; record with --probes deep"))?;
+    native_hotspots_of(&Rec::open(dir), by, top, thread, phase)
+}
+
+pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>, phase: Option<&str>) -> Result<Output> {
+    let dir = rec.dir.as_path();
+    let missing = || Error::usage("this recording has no native samples; record with --probes deep");
+    // A thread or phase selects samples: symbolized for that question alone; all samples are shared.
+    let filtered;
+    let n: &NativeStacks = if thread.is_some() || phase.is_some() {
+        let spans = phase.map(|p| phase_spans(dir, p)).transpose()?;
+        let n = crate::symbol::native(dir, thread, spans.as_deref())?.ok_or_else(missing)?;
+        let facts = crate::symbol::summary(&n);
+        filtered = NativeStacks { interval_us: n.interval_us, samples: n.samples, resolved: n.resolved, facts, stacks: Stacks::from_frames(n.weights) };
+        &filtered
+    } else {
+        rec.native()?.ok_or_else(missing)?
+    };
     let share = if n.samples > 0 { 100.0 * n.resolved as f64 / n.samples as f64 } else { 0.0 };
     let header = format!("native hotspots by {by} · self time · {{samples}} samples at {} µs · {share:.1}% resolved{{mapped}}", n.interval_us);
-    let interval = n.interval_us;
-    let facts = crate::symbol::summary(&n);
-    let mut out = rank(n.weights, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
+    let facts = &n.facts;
+    let mut out = rank(&n.stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
     out.json["native"] = json!(true);
-    out.json["interval_us"] = json!(interval);
+    out.json["interval_us"] = json!(n.interval_us);
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     out.json["resolved_samples"] = facts["resolved_samples"].clone();
     out.json["resolved_share"] = facts["resolved_share"].clone();
@@ -1177,112 +1638,168 @@ fn phase_spans(dir: &Path, phase: &str) -> Result<Vec<(u64, u64)>> {
 
 /// Bytes allocated per function, file or package from the recording's sampling heap profiles
 /// (attribution only): who allocates, with full stacks, including objects already collected.
-pub fn alloc(dir: &Path, by: &str, top: usize) -> Result<Output> {
-    let profiles: Vec<_> = std::fs::read_dir(dir)?.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "heapprofile")).collect();
-    if profiles.is_empty() {
-        return Err(Error::usage("this recording has no allocation profile; record with --probes attribution"));
-    }
-    let sym = Symbolizer::open(dir);
-    let mut weights: Vec<(Vec<Frame>, f64, u64)> = Vec::new();
-    for p in profiles {
-        let prof = store::read_json(&p)?;
-        let mut hits: BTreeMap<u64, u64> = BTreeMap::new();
-        for s in prof["samples"].as_array().into_iter().flatten() {
-            *hits.entry(s["nodeId"].as_u64().unwrap_or(0)).or_default() += 1;
-        }
-        // Flatten the call tree once (each node's frame and parent); a stack is built only for nodes
-        // where bytes were sampled (`selfSize`), not copied down every branch.
-        let (mut frames, mut parent, mut sampled) = (BTreeMap::new(), BTreeMap::new(), Vec::new());
-        let mut todo: Vec<(&Value, Option<u64>)> = prof.get("head").map(|h| (h, None)).into_iter().collect();
-        while let Some((n, up)) = todo.pop() {
-            let id = n["id"].as_u64().unwrap_or(0);
-            frames.insert(id, sym.call_frame(&n["callFrame"]));
-            if let Some(u) = up {
-                parent.insert(id, u);
-            }
-            let bytes = n["selfSize"].as_f64().unwrap_or(0.0);
-            if bytes > 0.0 {
-                sampled.push((id, bytes));
-            }
-            todo.extend(n["children"].as_array().into_iter().flatten().map(|c| (c, Some(id))));
-        }
-        weights.extend(sampled.into_iter().map(|(id, bytes)| (chain(id, &frames, &parent), bytes, hits.get(&id).copied().unwrap_or(1))));
-    }
+pub fn alloc(rec: &Rec, by: &str, top: usize) -> Result<Output> {
     let header = format!("allocations by {by} · sampled every {} KB on average · {{samples}} samples{{mapped}}", crate::probe::alloc::INTERVAL_BYTES / 1024);
-    let mut out = rank(weights, by, top, &header, fmt::bytes);
+    let mut out = rank(rec.alloc()?, by, top, &header, fmt::bytes);
     out.json["interval_bytes"] = json!(crate::probe::alloc::INTERVAL_BYTES);
     Ok(out)
+}
+
+/// A recording's forced layouts and style recalculations in its measured runs: the stacks of the
+/// calls that forced them (µs each), and [forced, in the frame lifecycle] × [layout, style] counts
+/// and ms.
+pub struct Forced {
+    pub stacks: Stacks,
+    totals: [[(u64, f64); 2]; 2],
+    pub runs: usize,
+    runs_text: String,
+}
+
+fn forced(rec: &Rec) -> Result<&Forced> {
+    cached(rec.forced.get_or_init(|| {
+        attribution_meta(&rec.meta)?;
+        let rows = rec.part(Part::Layout)?;
+        let measured = measured_runs(&rec.meta, &rows);
+        let sym = rec.sym.lock().unwrap_or_else(|e| e.into_inner());
+        let mut sites: BTreeMap<(String, i64, i64, String), u32> = BTreeMap::new();
+        let mut stacks = Stacks::default();
+        let mut totals = [[(0u64, 0.0f64); 2]; 2];
+        let mut outer_end: BTreeMap<String, i64> = BTreeMap::new();
+        for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+            let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+            if !measured.contains(&cell(0)) {
+                continue;
+            }
+            let (ts, dur) = (cell(2).parse::<i64>().unwrap_or(0), cell(3).parse::<i64>().unwrap_or(0));
+            // Count only outermost events: nested ones are already inside their parent's time.
+            let end = outer_end.entry(cell(4)).or_insert(i64::MIN);
+            if ts < *end {
+                continue;
+            }
+            *end = ts + dur;
+            let stack = trace_stack(&cell(5));
+            let kind = usize::from(cell(1) == "UpdateLayoutTree");
+            let lifecycle = usize::from(stack.is_empty());
+            totals[lifecycle][kind].0 += 1;
+            totals[lifecycle][kind].1 += dur as f64 / 1e6;
+            if stack.is_empty() {
+                continue;
+            }
+            // Trace stacks are innermost first with 1-based lines and columns; `rank` wants root first.
+            let ids: Vec<u32> = stack
+                .into_iter()
+                .rev()
+                .map(|f| match sites.get(&f) {
+                    Some(&i) => i,
+                    None => {
+                        let i = stacks.intern(sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3));
+                        sites.insert(f, i);
+                        i
+                    }
+                })
+                .collect();
+            stacks.weights.push((ids, dur as f64 / 1e3, 1));
+        }
+        Ok(Forced { stacks, totals, runs: measured.len(), runs_text: runs_text(measured.len(), &rows) })
+    }))
 }
 
 /// Forced (synchronous) layouts and style recalculations in the measured runs, by the JavaScript call
 /// that forced them (attribution traces carry their stacks): reading geometry after a DOM write makes
 /// the browser lay out mid-script instead of once per frame.
-pub fn layout(dir: &Path, top: usize) -> Result<Output> {
-    let meta = attribution_meta(dir)?;
-    let sql = format!(
-        "{}
-select k, null, null, null, null, null from _w
-union all
-select w.k, s.name, s.ts, s.dur, t.tid,
-  (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a
-     where a.arg_set_id = s.arg_set_id and a.key glob 'debug.beginData.stackTrace*') as stack
-  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
-  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where s.name in ('Layout', 'UpdateLayoutTree') and t.name = 'CrRendererMain'
-  order by 5, 3",
-        windows_sql(meta["token"].as_str().unwrap_or(""))
-    );
-    let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
-    let measured = measured_runs(&meta, &table.rows);
-    let sym = Symbolizer::open(dir);
-    let mut sites: BTreeMap<(String, i64, i64, String), Frame> = BTreeMap::new();
-    let mut weights: Vec<(Vec<Frame>, f64, u64)> = Vec::new();
-    // [forced, in the frame lifecycle] × [layout, style]: count and ms.
-    let mut totals = [[(0u64, 0.0f64); 2]; 2];
-    let mut outer_end: BTreeMap<String, i64> = BTreeMap::new();
-    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
-        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
-        if !measured.contains(&cell(0)) {
-            continue;
-        }
-        let (ts, dur) = (cell(2).parse::<i64>().unwrap_or(0), cell(3).parse::<i64>().unwrap_or(0));
-        // Count only outermost events: nested ones are already inside their parent's time.
-        let end = outer_end.entry(cell(4)).or_insert(i64::MIN);
-        if ts < *end {
-            continue;
-        }
-        *end = ts + dur;
-        let stack = trace_stack(&cell(5));
-        let kind = usize::from(cell(1) == "UpdateLayoutTree");
-        let lifecycle = usize::from(stack.is_empty());
-        totals[lifecycle][kind].0 += 1;
-        totals[lifecycle][kind].1 += dur as f64 / 1e6;
-        if stack.is_empty() {
-            continue;
-        }
-        // Trace stacks are innermost first with 1-based lines and columns; `rank` wants root first.
-        let frames: Vec<Frame> = stack.into_iter().rev().map(|f| sites.entry(f.clone()).or_insert_with(|| sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3)).clone()).collect();
-        weights.push((frames, dur as f64 / 1e3, 1));
-    }
-    let runs = measured.len().max(1) as f64;
+pub fn layout(rec: &Rec, top: usize) -> Result<Output> {
+    let f = forced(rec)?;
+    let runs = f.runs.max(1) as f64;
     let per_run = |(n, ms): (u64, f64)| format!("{:.0} ({}) per run", n as f64 / runs, fmt::value(ms / runs, "ms"));
     let header = format!(
         "forced layout and style by the call that forced them · {}{{mapped}}\n  forced     layout {} · style {}\n  in frames  layout {} · style {}",
-        runs_text(measured.len(), &table.rows),
-        per_run(totals[0][0]),
-        per_run(totals[0][1]),
-        per_run(totals[1][0]),
-        per_run(totals[1][1]),
+        f.runs_text,
+        per_run(f.totals[0][0]),
+        per_run(f.totals[0][1]),
+        per_run(f.totals[1][0]),
+        per_run(f.totals[1][1]),
     );
-    let mut out = rank(weights, "function", top, &header, |us| fmt::value(us / 1000.0, "ms"));
+    let mut out = rank(&f.stacks, "function", top, &header, |us| fmt::value(us / 1000.0, "ms"));
     let summary = |(n, ms): (u64, f64)| json!({ "count": n, "ms": ms, "count_per_run": n as f64 / runs, "ms_per_run": ms / runs });
-    out.json["runs"] = json!(measured.len());
-    out.json["forced"] = json!({ "layout": summary(totals[0][0]), "style": summary(totals[0][1]) });
-    out.json["lifecycle"] = json!({ "layout": summary(totals[1][0]), "style": summary(totals[1][1]) });
+    out.json["runs"] = json!(f.runs);
+    out.json["forced"] = json!({ "layout": summary(f.totals[0][0]), "style": summary(f.totals[0][1]) });
+    out.json["lifecycle"] = json!({ "layout": summary(f.totals[1][0]), "style": summary(f.totals[1][1]) });
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
     Ok(out)
+}
+
+/// A recording's style invalidation in its measured runs, as counts (`style` divides them per run).
+pub struct Invalidation {
+    pub runs: usize,
+    runs_text: String,
+    pub recalcs: u64,
+    pub recalc_ms: f64,
+    pub elements: f64,
+    pub largest: f64,
+    pub tracked: u64,
+    /// What changed → (count, the nodes it hit).
+    pub what: BTreeMap<String, (u64, BTreeMap<String, u64>)>,
+    pub selectors: BTreeMap<String, u64>,
+    /// The script line that made the change (its name resolved), by call site.
+    pub sources: BTreeMap<Frame, u64>,
+}
+
+fn invalidation(rec: &Rec) -> Result<Invalidation> {
+    attribution_meta(&rec.meta)?;
+    let rows = rec.part(Part::Style)?;
+    let measured = measured_runs(&rec.meta, &rows);
+    let sym = rec.sym.lock().unwrap_or_else(|e| e.into_inner());
+    let mut v = Invalidation {
+        runs: measured.len(),
+        runs_text: runs_text(measured.len(), &rows),
+        recalcs: 0,
+        recalc_ms: 0.0,
+        elements: 0.0,
+        largest: 0.0,
+        tracked: 0,
+        what: BTreeMap::new(),
+        selectors: BTreeMap::new(),
+        sources: BTreeMap::new(),
+    };
+    for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
+        if !measured.contains(&cell(0)) {
+            continue;
+        }
+        let name = cell(1);
+        if name == "UpdateLayoutTree" {
+            v.recalcs += 1;
+            v.recalc_ms += cell(2).parse::<f64>().unwrap_or(0.0) / 1e6;
+            let n = cell(3).parse::<f64>().unwrap_or(0.0);
+            v.elements += n;
+            v.largest = v.largest.max(n);
+            continue;
+        }
+        v.tracked += 1;
+        let kind = name.trim_end_matches("InvalidationTracking");
+        let change = Some(cell(5)).filter(|c| !c.is_empty()).or_else(|| Some(cell(4)).filter(|r| !r.is_empty())).unwrap_or_else(|| "(no reason given)".into());
+        let e = v.what.entry(format!("{change} ({kind})")).or_default();
+        e.0 += 1;
+        *e.1.entry(Some(cell(6)).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into())).or_default() += 1;
+        for sel in cell(7).split('\u{1e}').filter(|s| !s.is_empty()) {
+            *v.selectors.entry(sel.to_string()).or_default() += 1;
+        }
+        if let Some(f) = trace_stack(&cell(8)).into_iter().next() {
+            let mut fr = sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3);
+            if fr.name.is_empty() {
+                fr.name = "(anonymous)".into();
+            }
+            *v.sources.entry(fr).or_default() += 1;
+        }
+    }
+    if v.tracked == 0 {
+        return Err(Error::usage(
+            "this recording has no style invalidation tracking: attribution blocks trace it for a series that declares main.style or style.count (or with --style); record --probes attribution --style for a page",
+        ));
+    }
+    Ok(v)
 }
 
 /// What invalidated style in the measured runs, from the trace's invalidation tracking (attribution
@@ -1290,83 +1807,25 @@ select w.k, s.name, s.ts, s.dur, t.tid,
 /// the elements each restyled, and the invalidations by what changed (a class, an id, an attribute,
 /// a pseudo-class such as `:hover`, an inline style, a sheet), by the node it hit, by the selector
 /// that matched, and by the script line that made the change.
-pub fn style(dir: &Path, top: usize) -> Result<Output> {
-    let meta = attribution_meta(dir)?;
-    let sql = format!(
-        "{}
-select k, null, null, null, null, null, null, null, null from _w
-union all
-select w.k, s.name, s.dur,
-  coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount')),
-  extract_arg(s.arg_set_id, 'debug.data.reason'),
-  coalesce('class .' || extract_arg(s.arg_set_id, 'debug.data.changedClass'), 'id #' || extract_arg(s.arg_set_id, 'debug.data.changedId'),
-    'attribute [' || extract_arg(s.arg_set_id, 'debug.data.changedAttribute') || ']', 'pseudo-class :' || extract_arg(s.arg_set_id, 'debug.data.changedPseudo')),
-  extract_arg(s.arg_set_id, 'debug.data.nodeName'),
-  (select group_concat(a.display_value, char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.selectors*.selector'),
-  (select group_concat(a.key || char(31) || coalesce(a.display_value, ''), char(30)) from args a where a.arg_set_id = s.arg_set_id and a.key glob 'debug.data.stackTrace*')
-  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
-  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where (s.name = 'UpdateLayoutTree' and t.name = 'CrRendererMain') or s.name glob '*InvalidationTracking'",
-        windows_sql(meta["token"].as_str().unwrap_or(""))
-    );
-    let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
-    let measured = measured_runs(&meta, &table.rows);
-    let runs = measured.len().max(1) as f64;
-    let sym = Symbolizer::open(dir);
-    let (mut recalcs, mut recalc_ms, mut elements, mut largest) = (0u64, 0.0f64, 0.0f64, 0.0f64);
-    let mut what: BTreeMap<String, (u64, BTreeMap<String, u64>)> = BTreeMap::new();
-    let mut selectors: BTreeMap<String, u64> = BTreeMap::new();
-    let mut sources: BTreeMap<String, u64> = BTreeMap::new();
-    let mut tracked = 0u64;
-    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
-        let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
-        if !measured.contains(&cell(0)) {
-            continue;
-        }
-        let name = cell(1);
-        if name == "UpdateLayoutTree" {
-            recalcs += 1;
-            recalc_ms += cell(2).parse::<f64>().unwrap_or(0.0) / 1e6;
-            let n = cell(3).parse::<f64>().unwrap_or(0.0);
-            elements += n;
-            largest = largest.max(n);
-            continue;
-        }
-        tracked += 1;
-        let kind = name.trim_end_matches("InvalidationTracking");
-        let change = Some(cell(5)).filter(|c| !c.is_empty()).or_else(|| Some(cell(4)).filter(|r| !r.is_empty())).unwrap_or_else(|| "(no reason given)".into());
-        let e = what.entry(format!("{change} ({kind})")).or_default();
-        e.0 += 1;
-        *e.1.entry(Some(cell(6)).filter(|n| !n.is_empty()).unwrap_or_else(|| "?".into())).or_default() += 1;
-        for sel in cell(7).split('\u{1e}').filter(|s| !s.is_empty()) {
-            *selectors.entry(sel.to_string()).or_default() += 1;
-        }
-        if let Some(f) = trace_stack(&cell(8)).into_iter().next() {
-            let fr = sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3);
-            *sources.entry(format!("{} ({})", if fr.name.is_empty() { "(anonymous)" } else { &fr.name }, fr.location())).or_default() += 1;
-        }
-    }
-    if tracked == 0 {
-        return Err(Error::usage(
-            "this recording has no style invalidation tracking: attribution blocks trace it for a series that declares main.style or style.count (or with --style); record --probes attribution --style for a page",
-        ));
-    }
+pub fn style(rec: &Rec, top: usize) -> Result<Output> {
+    let v = invalidation(rec)?;
+    let runs = v.runs.max(1) as f64;
     let per = |n: u64| n as f64 / runs;
     let mut text = format!(
         "style invalidation · {}\n  recalcs      {:.1} per run · {} per run · {} elements restyled per run (largest recalc {} elements)\n",
-        runs_text(measured.len(), &table.rows),
-        per(recalcs),
-        fmt::value(recalc_ms / runs, "ms"),
-        fmt::value(elements / runs, "count"),
-        fmt::value(largest, "count"),
+        v.runs_text,
+        per(v.recalcs),
+        fmt::value(v.recalc_ms / runs, "ms"),
+        fmt::value(v.elements / runs, "count"),
+        fmt::value(v.largest, "count"),
     );
     let ranked = |m: &BTreeMap<String, u64>| {
-        let mut v: Vec<(String, u64)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
-        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-        v.truncate(top);
-        v
+        let mut r: Vec<(String, u64)> = m.iter().map(|(k, n)| (k.clone(), *n)).collect();
+        r.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        r.truncate(top);
+        r
     };
-    let mut changes: Vec<_> = what.iter().collect();
+    let mut changes: Vec<_> = v.what.iter().collect();
     changes.sort_by_key(|c| std::cmp::Reverse(c.1.0));
     text += "  what changed (per run, the nodes it hit most)\n";
     let mut changes_json = Vec::new();
@@ -1375,13 +1834,17 @@ select w.k, s.name, s.dur,
         text += &format!("    {:>8.1}  {k}  · {}\n", per(*n), nodes.iter().take(3).map(|(nd, c)| format!("{nd} ×{c}")).collect::<Vec<_>>().join(", "));
         changes_json.push(json!({ "what": k, "per_run": per(*n), "count": n, "nodes": nodes }));
     }
-    let sels = ranked(&selectors);
+    let sels = ranked(&v.selectors);
     if !sels.is_empty() {
         text += "  by selector (invalidation sets that matched)\n";
         for (s, n) in &sels {
             text += &format!("    {:>8.1}  {s}\n", per(*n));
         }
     }
+    let sources: BTreeMap<String, u64> = v.sources.iter().fold(BTreeMap::new(), |mut m, (f, n)| {
+        *m.entry(format!("{} ({})", f.name, f.location())).or_default() += n;
+        m
+    });
     let srcs = ranked(&sources);
     if !srcs.is_empty() {
         text += "  by source (the script line that made the change)\n";
@@ -1392,8 +1855,8 @@ select w.k, s.name, s.dur,
     Ok(Output::new(
         text,
         json!({
-            "runs": measured.len(), "recalcs_per_run": per(recalcs), "recalc_ms_per_run": recalc_ms / runs, "elements_per_run": elements / runs, "largest_recalc": largest,
-            "invalidations_per_run": per(tracked), "changes": changes_json, "selectors": sels, "sources": srcs,
+            "runs": v.runs, "recalcs_per_run": per(v.recalcs), "recalc_ms_per_run": v.recalc_ms / runs, "elements_per_run": v.elements / runs, "largest_recalc": v.largest,
+            "invalidations_per_run": per(v.tracked), "changes": changes_json, "selectors": sels, "sources": srcs,
         }),
     ))
 }
@@ -1401,30 +1864,15 @@ select w.k, s.name, s.dur,
 /// Per measured run, the renderer main thread's style, layout and paint time and the elements style
 /// recalcs touched, from a trace that has them (timing with `--trace full`, attribution): the numbers
 /// a person would otherwise pull out with SQL over the run marks.
-pub fn run_phases(dir: &Path, meta: &Value) -> Option<(String, Value)> {
-    let token = meta["token"].as_str().filter(|t| !t.is_empty())?;
-    let trace = dir.join("trace.pftrace");
-    if !trace.exists() {
-        return None;
-    }
-    let sql = format!(
-        "{}
-select k, null, null, null, null from _w
-union all
-select w.k, s.name, s.ts, s.dur, coalesce(extract_arg(s.arg_set_id, 'debug.elementCount'), extract_arg(s.arg_set_id, 'debug.data.elementCount'), 0)
-  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
-  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where t.name = 'CrRendererMain' and s.name in ('UpdateLayoutTree', 'Layout', 'PrePaint', 'Paint')
-  order by 1, 3",
-        windows_sql(token)
-    );
-    let table = engine::query(&trace, &sql).ok()?;
-    let measured = if meta["probes"] == "attribution" { measured_runs(meta, &table.rows) } else { run_keys(&table.rows).into_iter().map(|k| k.1).collect() };
+pub fn run_phases(rec: &Rec) -> Option<(String, Value)> {
+    let meta = &rec.meta;
+    let rows = rec.part(Part::Phases).ok()?;
+    let measured = if meta["probes"] == "attribution" { measured_runs(meta, &rows) } else { run_keys(&rows).into_iter().map(|k| k.1).collect() };
     // [style, layout, paint] ms and elements restyled, per run; nested slices of one kind count once.
     let mut per: BTreeMap<String, ([f64; 3], f64)> = measured.iter().map(|k| (k.clone(), ([0.0; 3], 0.0))).collect();
     let mut end: BTreeMap<String, i64> = BTreeMap::new();
     let mut any = false;
-    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+    for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
         let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
         let Some(run) = per.get_mut(&cell(0)) else { continue };
         let i = match cell(1).as_str() {
@@ -1447,33 +1895,21 @@ select w.k, s.name, s.ts, s.dur, coalesce(extract_arg(s.arg_set_id, 'debug.eleme
     if !any {
         return None;
     }
-    let mut text = format!("per run  {} · renderer main thread\n         style ms (elements restyled)   layout ms   paint ms\n", runs_text(measured.len(), &table.rows));
-    let mut rows = Vec::new();
+    let mut text = format!("per run  {} · renderer main thread\n         style ms (elements restyled)   layout ms   paint ms\n", runs_text(measured.len(), &rows));
+    let mut out = Vec::new();
     for (k, (ms, el)) in &per {
         text += &format!("  {:<6} {:>8.1} ({:>8})          {:>9.1}   {:>8.1}\n", k.rsplit(':').next().map(|i| format!("run {i}")).unwrap_or_default(), ms[0], fmt::value(*el, "count"), ms[1], ms[2]);
-        rows.push(json!({ "run": k, "style_ms": ms[0], "elements_restyled": el, "layout_ms": ms[1], "paint_ms": ms[2] }));
+        out.push(json!({ "run": k, "style_ms": ms[0], "elements_restyled": el, "layout_ms": ms[1], "paint_ms": ms[2] }));
     }
-    Some((text, json!(rows)))
+    Some((text, json!(out)))
 }
 
 /// Garbage collection in the measured runs: collections, the main-thread pause they cost (incremental
 /// marking steps included) and the work they did on helper threads, from attribution traces.
-pub fn gc(dir: &Path) -> Result<Output> {
-    let meta = attribution_meta(dir)?;
-    let sql = format!(
-        "{}
-select k, null, null, null, null, null, null from _w
-union all
-select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
-  extract_arg(s.arg_set_id, 'debug.usedHeapSizeBefore') - extract_arg(s.arg_set_id, 'debug.usedHeapSizeAfter') as freed
-  from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
-  join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1
-  where s.name in ('MinorGC', 'MajorGC') or s.name glob 'V8.GC*' or s.name glob 'BlinkGC*'
-  order by 5, 3",
-        windows_sql(meta["token"].as_str().unwrap_or(""))
-    );
-    let table = engine::query(&dir.join("trace.pftrace"), &sql)?;
-    let measured = measured_runs(&meta, &table.rows);
+pub fn gc(rec: &Rec) -> Result<Output> {
+    attribution_meta(&rec.meta)?;
+    let rows = rec.part(Part::Gc)?;
+    let measured = measured_runs(&rec.meta, &rows);
     #[derive(Default, Clone, Copy)]
     struct Run {
         minor: u64,
@@ -1485,7 +1921,7 @@ select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
     let mut runs: BTreeMap<String, Run> = measured.iter().map(|k| (k.clone(), Run::default())).collect();
     // Union of GC intervals per thread: GC phases nest inside their collection.
     let mut covered: BTreeMap<String, i64> = BTreeMap::new();
-    for row in table.rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
+    for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
         let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
         let Some(run) = runs.get_mut(&cell(0)) else { continue };
         let (ts, dur) = (cell(2).parse::<i64>().unwrap_or(0), cell(3).parse::<i64>().unwrap_or(0));
@@ -1515,7 +1951,7 @@ select w.k, s.name, s.ts, s.dur, t.tid, t.name = 'CrRendererMain' as main,
     let g = |k: &str| values[k].as_f64().unwrap_or(f64::NAN);
     let mut text = format!(
         "garbage collection · median of {}\n  collections   {:.0} minor · {:.0} major per run\n  main thread   {} per run (pauses and incremental marking)\n  helpers       {} per run (concurrent and parallel work)\n  freed         {} per run\n",
-        runs_text(runs.len(), &table.rows),
+        runs_text(runs.len(), &rows),
         g("minor_per_run"),
         g("major_per_run"),
         fmt::value(g("main_ms_per_run"), "ms"),
@@ -1546,12 +1982,11 @@ create perfetto table _w as
     )
 }
 
-fn attribution_meta(dir: &Path) -> Result<Value> {
-    let meta = store::read_json(&dir.join("meta.json")).unwrap_or(Value::Null);
+fn attribution_meta(meta: &Value) -> Result<()> {
     if meta["probes"] != "attribution" {
         return Err(Error::usage("this view needs an attribution recording (stacks and GC phases); record with --probes attribution"));
     }
-    Ok(meta)
+    Ok(())
 }
 
 /// The window keys of the measured runs, from a result whose window rows (`_w`) have only their key
@@ -1598,51 +2033,43 @@ fn trace_stack(raw: &str) -> Vec<(String, i64, i64, String)> {
     frames.into_values().collect()
 }
 
-/// The stack of profile node `id`, root first, without the `(root)` frame.
-fn chain(id: u64, frames: &BTreeMap<u64, Frame>, parent: &BTreeMap<u64, u64>) -> Vec<Frame> {
-    let mut out = Vec::new();
-    let mut at = Some(id);
-    while let Some(n) = at {
-        if let Some(fr) = frames.get(&n).filter(|fr| fr.name != "(root)") {
-            out.push(fr.clone());
+/// The row a leaf frame counts toward by function (its name), file or package.
+fn row_key(f: &Frame, by: &str, packages: &mut BTreeMap<String, String>) -> String {
+    match by {
+        "package" if f.package.is_some() => f.package.clone().unwrap_or_default(),
+        "file" if f.url.is_empty() && !f.file.is_empty() => f.file.clone(),
+        "file" | "package" if f.url.is_empty() => f.name.clone(),
+        "file" => f.file.clone(),
+        "package" => {
+            let at = if f.mapped { &f.file } else { &f.url };
+            packages.entry(at.clone()).or_insert_with(|| package(at)).clone()
         }
-        at = parent.get(&n).copied();
+        _ => f.name.clone(),
     }
-    out.reverse();
-    out
 }
 
 /// Ranks weighted stacks (leaf = the frame that spent the time or allocated the bytes) by function, file
 /// or package. Rows keep complete locations; by function, each row keeps its three heaviest full stacks
 /// and the text prints the heaviest in full. `header` may use `{samples}` and `{mapped}`.
-fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str, show: impl Fn(f64) -> String) -> Output {
-    type Stacks = BTreeMap<Vec<Frame>, (f64, u64)>;
+fn rank(stacks: &Stacks, by: &str, top: usize, header: &str, show: impl Fn(f64) -> String) -> Output {
+    type ByStack<'a> = BTreeMap<&'a [u32], (f64, u64)>;
     /// (name, where) → (weight, samples, stacks).
-    type Row = ((String, String), (f64, u64, Stacks));
-    let mut rows: BTreeMap<(String, String), (f64, u64, Stacks)> = BTreeMap::new();
+    type Row<'a> = ((String, String), (f64, u64, ByStack<'a>));
+    let frame = |i: u32| &stacks.frames[i as usize];
+    let mut rows: BTreeMap<(String, String), (f64, u64, ByStack)> = BTreeMap::new();
     let (mut total, mut mapped, mut scripts) = (0.0, 0u64, 0u64);
-    let samples: u64 = weights.iter().map(|w| w.2).sum();
+    let samples: u64 = stacks.weights.iter().map(|w| w.2).sum();
     let mut packages: BTreeMap<String, String> = BTreeMap::new();
     let mut lines: BTreeMap<(String, String), BTreeMap<i64, f64>> = BTreeMap::new();
-    for (stack, w, hits) in weights {
-        let Some(f) = stack.last() else { continue };
+    for (stack, w, hits) in &stacks.weights {
+        let Some(f) = stack.last().map(|&i| frame(i)) else { continue };
         if f.mapped {
             mapped += hits;
         }
         if !f.url.is_empty() {
             scripts += hits;
         }
-        let key = match by {
-            "package" if f.package.is_some() => f.package.clone().unwrap_or_default(),
-            "file" if f.url.is_empty() && !f.file.is_empty() => f.file.clone(),
-            "file" | "package" if f.url.is_empty() => f.name.clone(),
-            "file" => f.file.clone(),
-            "package" => {
-                let at = if f.mapped { &f.file } else { &f.url };
-                packages.entry(at.clone()).or_insert_with(|| package(at)).clone()
-            }
-            _ => f.name.clone(),
-        };
+        let key = row_key(f, by, &mut packages);
         // A native frame is located at the sampled line: its function's row is the function in its
         // file, and the lines it spent the time on are kept beside it.
         let native = f.package.is_some() && f.line > 0;
@@ -1654,11 +2081,11 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
         if native && by == "function" {
             *lines.entry((key.clone(), detail.clone())).or_default().entry(f.line).or_default() += w;
         }
-        let e = rows.entry((key, detail)).or_insert((0.0, 0, Stacks::new()));
+        let e = rows.entry((key, detail)).or_insert((0.0, 0, ByStack::new()));
         e.0 += w;
         e.1 += hits;
         if by == "function" {
-            let st = e.2.entry(stack).or_insert((0.0, 0));
+            let st = e.2.entry(stack.as_slice()).or_insert((0.0, 0));
             st.0 += w;
             st.1 += hits;
         }
@@ -1679,15 +2106,17 @@ fn rank(weights: Vec<(Vec<Frame>, f64, u64)>, by: &str, top: usize, header: &str
         if !hot.is_empty() {
             text += &format!("             lines {}\n", hot.iter().take(4).map(|(l, x)| format!(":{l} {:.0}%", 100.0 * x / w.max(1e-9))).collect::<Vec<_>>().join(" · "));
         }
-        let mut heavy: Vec<(&Vec<Frame>, &(f64, u64))> = row_stacks.iter().collect();
-        heavy.sort_by(|a, b| b.1.0.total_cmp(&a.1.0));
+        let mut heavy: Vec<(&&[u32], &(f64, u64))> = row_stacks.iter().collect();
+        // Equal weights in frame order, root first.
+        heavy.sort_by(|a, b| b.1.0.total_cmp(&a.1.0).then_with(|| a.0.iter().map(|&i| frame(i)).cmp(b.0.iter().map(|&i| frame(i)))));
         if let Some((stack, (sw, _))) = heavy.first().filter(|(s, _)| s.len() > 1) {
             text += &format!("             heaviest stack ({:.0}% of this row):\n", 100.0 * sw / w.max(1e-9));
-            for fr in stack.iter().rev().skip(1) {
+            for fr in stack.iter().rev().skip(1).map(|&i| frame(i)) {
                 text += &format!("               ← {}  {}\n", fr.name, fr.location());
             }
         }
-        let stacks_json: Vec<Value> = heavy.iter().take(3).map(|(stack, (sw, sn))| json!({ "weight": sw, "samples": sn, "frames": stack.iter().map(Frame::json).collect::<Vec<_>>() })).collect();
+        let stacks_json: Vec<Value> =
+            heavy.iter().take(3).map(|(stack, (sw, sn))| json!({ "weight": sw, "samples": sn, "frames": stack.iter().map(|&i| frame(i).json()).collect::<Vec<_>>() })).collect();
         let mut row = json!({ "name": k, "weight": w, "samples": hits, "share": share, "share_ci": ci, "where": detail, "stacks": stacks_json });
         if !hot.is_empty() {
             row["line"] = json!(hot[0].0);

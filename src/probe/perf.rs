@@ -509,6 +509,377 @@ impl Drop for Capture {
     }
 }
 
+// Off-CPU waits (SPEC §11.1 `waits`, attribution only): the scheduler's own tracepoints.
+//
+// - Each thread of the target: `sched:sched_switch`, which fires in the thread that leaves its CPU,
+//   sampled with its user registers and stack (where it waited) and the task state it left in, and
+//   the event's context-switch records, whose switch-ins end each wait.
+// - Each CPU: `sched:sched_waking`, filtered on the target's threads, which fires in whoever wakes one
+//   (its stack: where it released the lock or set the event), or in an interrupt (a timer, a device).
+// - Tracepoint samples with their raw fields need CAP_PERFMON (or root, or perf_event_paranoid -1),
+//   and the event ids and field offsets come from tracefs.
+
+use crate::probe::stacks::{Wait, WaitKind, Waits, Waker};
+use crate::model::Refusal;
+
+const SAMPLE_RAW: u64 = 1 << 10;
+const RECORD_SWITCH: u32 = 14;
+const MISC_SWITCH_OUT: u16 = 1 << 13;
+/// `PERF_EVENT_IOC_SET_FILTER`: `_IOW('$', 6, char *)`.
+const SET_FILTER: libc::c_ulong = 0x4008_2406;
+/// Wake-up filters longer than this go unfiltered (and are filtered as they arrive).
+const FILTER_MAX: usize = 3000;
+
+/// A tracepoint's id and its fields' (offset, size) in its raw record.
+struct Format {
+    id: u64,
+    fields: HashMap<String, (usize, usize)>,
+}
+
+fn format(event: &str) -> Option<Format> {
+    let dir = ["/sys/kernel/tracing/events/sched", "/sys/kernel/debug/tracing/events/sched"].iter().map(|d| std::path::Path::new(d).join(event)).find(|d| d.join("id").is_file())?;
+    let id = std::fs::read_to_string(dir.join("id")).ok()?.trim().parse().ok()?;
+    let text = std::fs::read_to_string(dir.join("format")).ok()?;
+    let mut fields = HashMap::new();
+    for l in text.lines() {
+        // `field:pid_t prev_pid;	offset:24;	size:4;	signed:1;`
+        let Some(decl) = l.trim().strip_prefix("field:") else { continue };
+        let mut parts = decl.split(';').map(str::trim);
+        let name = parts.next().and_then(|d| d.split_whitespace().last()).map(|n| n.split('[').next().unwrap_or(n).to_string());
+        let num = |key: &str, p: &str| p.strip_prefix(key).and_then(|v| v.parse::<usize>().ok());
+        let rest: Vec<&str> = parts.collect();
+        let off = rest.iter().find_map(|p| num("offset:", p));
+        let size = rest.iter().find_map(|p| num("size:", p));
+        if let (Some(n), Some(o), Some(s)) = (name, off, size) {
+            fields.insert(n, (o, s));
+        }
+    }
+    Some(Format { id, fields })
+}
+
+impl Format {
+    fn read(&self, raw: &[u8], field: &str) -> Option<u64> {
+        let &(off, size) = self.fields.get(field)?;
+        let b = raw.get(off..off + size)?;
+        Some(match size {
+            1 => b[0] as u64,
+            2 => u16::from_le_bytes([b[0], b[1]]) as u64,
+            4 => u32::from_le_bytes(b.try_into().ok()?) as u64,
+            8 => u64::from_le_bytes(b.try_into().ok()?),
+            _ => return None,
+        })
+    }
+}
+
+/// Why waits cannot be read here, when they cannot.
+fn waits_refusal() -> Option<Refusal> {
+    let paranoid = std::fs::read_to_string("/proc/sys/kernel/perf_event_paranoid").ok().and_then(|s| s.trim().parse::<i32>().ok()).unwrap_or(2);
+    let privileged = unsafe { libc::geteuid() } == 0 || has_perfmon();
+    if !privileged && paranoid > -1 {
+        return Some(crate::probe::stacks::no_waits(
+            "off-CPU waits need the scheduler's tracepoints (sched_switch, sched_waking) with their raw fields, which perf gives only with CAP_PERFMON or root (or perf_event_paranoid -1)",
+            "give strobe CAP_PERFMON once: sudo setcap cap_perfmon+ep $(command -v strobe)",
+        ));
+    }
+    None
+}
+
+/// A tracepoint sampled on every hit: `pid` and `cpu` as `perf_event_open` takes them. `switches`
+/// adds the event's context-switch records (per-thread events only).
+fn open_tracepoint(config: u64, pid: i32, cpu: i32, switches: bool, pages: usize) -> std::io::Result<Ring> {
+    let mut a = Attr { kind: 2, size: 136, config, sample_period: 1, ..Attr::default() }; // PERF_TYPE_TRACEPOINT
+    a.sample_type = SAMPLE_TID | SAMPLE_TIME | SAMPLE_CPU | SAMPLE_RAW | SAMPLE_REGS_USER | SAMPLE_STACK_USER;
+    // exclude_hv, sample_id_all, use_clockid; per thread the context-switch records, per CPU disabled
+    // until its filter is set (unfiltered, it samples every wake-up on the machine).
+    a.flags = (1 << 6) | (1 << 18) | (1 << 25) | if switches { 1 << 26 } else { 1 };
+    a.wakeup = 1;
+    a.sample_regs_user = REGS;
+    a.sample_stack_user = STACK_BYTES;
+    a.clockid = libc::CLOCK_MONOTONIC;
+    let fd = unsafe { libc::syscall(libc::SYS_perf_event_open, &a as *const Attr, pid as libc::pid_t, cpu, -1, 8 as libc::c_ulong) } as i32;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let len = page * (1 + pages);
+    let base = unsafe { libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0) };
+    if base == libc::MAP_FAILED {
+        let e = std::io::Error::last_os_error();
+        unsafe { libc::close(fd) };
+        return Err(e);
+    }
+    Ok(Ring { fd, base: base as *mut u8, len })
+}
+
+impl Ring {
+    /// Every complete record since the last call as (type, misc, body), handed back to the kernel.
+    fn records(&self, out: &mut Vec<(u32, u16, Vec<u8>)>, lost: &mut u64) {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let meta = self.base;
+        let head = unsafe { std::ptr::read_volatile(meta.add(1024) as *const u64) };
+        std::sync::atomic::fence(Ordering::Acquire);
+        let tail_ptr = unsafe { meta.add(1032) as *mut u64 };
+        let mut tail = unsafe { std::ptr::read_volatile(tail_ptr) };
+        let data = unsafe { meta.add(page) };
+        let size = (self.len - page) as u64;
+        let read = |off: u64, n: usize| -> Vec<u8> { (0..n as u64).map(|i| unsafe { *data.add(((off + i) % size) as usize) }).collect() };
+        while tail + 8 <= head {
+            let hdr = read(tail, 8);
+            let kind = u32::from_le_bytes(hdr[0..4].try_into().unwrap_or_default());
+            let misc = u16::from_le_bytes(hdr[4..6].try_into().unwrap_or_default());
+            let len = u16::from_le_bytes(hdr[6..8].try_into().unwrap_or_default()) as u64;
+            if len == 0 {
+                break;
+            }
+            let body = read(tail + 8, len as usize - 8);
+            if kind == 2 {
+                *lost += body.get(8..16).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or_default()));
+            } else {
+                out.push((kind, misc, body));
+            }
+            tail += len;
+        }
+        std::sync::atomic::fence(Ordering::Release);
+        unsafe { std::ptr::write_volatile(tail_ptr, tail) };
+    }
+}
+
+/// A tracepoint sample of `open_tracepoint`'s layout: the thread, its time and CPU, the raw record,
+/// and its user registers and stack.
+fn parse_tracepoint(b: &[u8]) -> Option<(Raw, Vec<u8>)> {
+    let mut at = 0usize;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let s = b.get(at..at + n)?;
+        at += n;
+        Some(s)
+    };
+    let u64_of = |s: &[u8]| u64::from_le_bytes(s.try_into().unwrap_or_default());
+    let pt = u64_of(take(8)?);
+    let ns = u64_of(take(8)?);
+    let cpu = u64_of(take(8)?) as u32 as u16;
+    let raw_len = u32::from_le_bytes(take(4)?.try_into().ok()?) as usize;
+    let raw = take(raw_len)?.to_vec();
+    let abi = u64_of(take(8)?);
+    let mut regs = Vec::new();
+    if abi != 0 {
+        for _ in 0..REGS.count_ones() {
+            regs.push(u64_of(take(8)?));
+        }
+    }
+    let size = u64_of(take(8)?) as usize;
+    let stack = if size > 0 {
+        let s = take(size)?.to_vec();
+        let dyn_size = u64_of(take(8)?) as usize;
+        s[..dyn_size.min(size)].to_vec()
+    } else {
+        Vec::new()
+    };
+    Some((Raw { ns, pid: (pt & 0xffff_ffff) as u32, tid: (pt >> 32) as u32, cpu, kernel: Vec::new(), regs, stack }, raw))
+}
+
+/// The online CPUs (`/sys/devices/system/cpu/online`: `0-3,6`).
+fn online_cpus() -> Vec<i32> {
+    let text = std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or_default();
+    let mut out = Vec::new();
+    for part in text.trim().split(',').filter(|p| !p.is_empty()) {
+        match part.split_once('-') {
+            Some((a, b)) => out.extend(a.parse::<i32>().unwrap_or(0)..=b.parse::<i32>().unwrap_or(-1)),
+            None => out.extend(part.parse::<i32>().ok()),
+        }
+    }
+    out
+}
+
+/// A running waits capture: its thread follows the target's threads, drains the rings and unwinds as
+/// events arrive. It owns every event and ring, so its end (`stop`, or a drop) closes them.
+pub struct WaitCapture {
+    state: Arc<AtomicU8>,
+    thread: Option<std::thread::JoinHandle<Result<Waits>>>,
+}
+
+impl WaitCapture {
+    pub fn start(targets: Targets) -> std::result::Result<WaitCapture, Refusal> {
+        if let Some(r) = waits_refusal() {
+            return Err(r);
+        }
+        let (Some(switch), Some(waking)) = (format("sched_switch"), format("sched_waking")) else {
+            return Err(crate::probe::stacks::no_waits(
+                "off-CPU waits need tracefs (the scheduler's event ids and fields under /sys/kernel/tracing), which strobe could not read",
+                "mount tracefs (mount -t tracefs nodev /sys/kernel/tracing) and run strobe as a user that may read it",
+            ));
+        };
+        let cpus = online_cpus();
+        let mut wakers: Vec<Ring> = Vec::new();
+        for &c in &cpus {
+            match open_tracepoint(waking.id, -1, c, false, 64) {
+                Ok(r) => wakers.push(r),
+                Err(e) => return Err(crate::probe::stacks::no_waits(format!("sched_waking on CPU {c}: {e}"), "give strobe CAP_PERFMON (or run it as root)")),
+            }
+        }
+        let state = Arc::new(AtomicU8::new(RUN));
+        let flag = state.clone();
+        let thread = std::thread::Builder::new()
+            .name("strobe-waits".into())
+            .spawn(move || waits_loop(targets, switch, waking, wakers, flag))
+            .map_err(|e| crate::probe::stacks::no_waits(format!("start the waits thread: {e}"), "try again"))?;
+        Ok(WaitCapture { state, thread: Some(thread) })
+    }
+
+    pub fn stop(mut self) -> std::result::Result<Waits, Refusal> {
+        self.state.store(STOP, Ordering::Relaxed);
+        let thread = self.thread.take().ok_or_else(|| crate::probe::stacks::no_waits("no waits thread", "try again"))?;
+        match super::join_within(thread, STOP_WAIT) {
+            Some(Ok(w)) => Ok(w),
+            Some(Err(e)) => Err(crate::probe::stacks::no_waits(format!("the waits capture failed: {}", e.message), "try again")),
+            None => Err(crate::probe::stacks::no_waits(format!("the waits thread did not end within {} s", STOP_WAIT.as_secs()), "try again")),
+        }
+    }
+}
+
+impl Drop for WaitCapture {
+    fn drop(&mut self) {
+        self.state.store(DROP, Ordering::Relaxed);
+        if let Some(t) = self.thread.take() {
+            super::join_within(t, std::time::Duration::from_secs(2));
+        }
+    }
+}
+
+/// Linux task states as `sched_switch` reports the one a thread left its CPU in.
+fn task_state(state: u64) -> (WaitKind, &'static str) {
+    // Runnable (0), or the preempted marker the kernel adds above the states (`R+`).
+    match state & 0x7f {
+        0 => (WaitKind::Preempted, "R"),
+        s if s & 2 != 0 => (WaitKind::Io, "D"),
+        s if s & 1 != 0 => (WaitKind::Blocked, "S"),
+        _ => (WaitKind::Other, "other"),
+    }
+}
+
+fn waits_loop(targets: Targets, switch: Format, waking: Format, wakers: Vec<Ring>, flag: Arc<AtomicU8>) -> Result<Waits> {
+    let mut unwind = Unwind { spaces: HashMap::new(), files: HashMap::new(), cache: framehop::CacheNative::new() };
+    let mut rings: HashMap<u32, Ring> = HashMap::new();
+    let mut out = Waits::default();
+    let mut index: HashMap<Vec<u64>, u32> = HashMap::new();
+    let mut open: HashMap<u32, (u64, u32, WaitKind, &'static str, Option<u32>)> = HashMap::new();
+    let mut woken: Vec<(u32, u64, Waker)> = Vec::new();
+    let mut lost = 0u64;
+    let mut filtered: Vec<u32> = Vec::new();
+    let mut unfiltered = false;
+    let mut followed: Option<std::time::Instant> = None;
+    let mut buf = Vec::new();
+    loop {
+        let done = match flag.load(Ordering::Relaxed) {
+            RUN => false,
+            STOP => true,
+            _ => return Err(Error::msg("the capture was dropped")),
+        };
+        if followed.is_none_or(|t| t.elapsed().as_millis() >= 50) && !done {
+            for pid in targets.pids() {
+                for tid in tids(pid) {
+                    if let std::collections::hash_map::Entry::Vacant(e) = rings.entry(tid) {
+                        match open_tracepoint(switch.id, tid as i32, -1, true, 64) {
+                            Ok(r) => {
+                                e.insert(r);
+                            }
+                            Err(err) if err.raw_os_error() == Some(libc::ESRCH) => {}
+                            Err(err) => return Err(Error::msg(format!("sched_switch on thread {tid}: {err}"))),
+                        }
+                    }
+                }
+            }
+            // The wake-up filter names the threads being followed.
+            let mut now: Vec<u32> = rings.keys().copied().collect();
+            now.sort_unstable();
+            if now != filtered {
+                let text = now.iter().map(|t| format!("pid == {t}")).collect::<Vec<_>>().join(" || ");
+                unfiltered = text.len() > FILTER_MAX || text.is_empty();
+                let c = std::ffi::CString::new(if unfiltered { "pid != 0".to_string() } else { text }).unwrap_or_default();
+                for r in &wakers {
+                    unsafe {
+                        libc::ioctl(r.fd, SET_FILTER as _, c.as_ptr());
+                        // PERF_EVENT_IOC_ENABLE: on from its first filter.
+                        libc::ioctl(r.fd, 0x2400 as _, 0);
+                    }
+                }
+                filtered = now;
+            }
+            followed = Some(std::time::Instant::now());
+        }
+        let mut poll: Vec<libc::pollfd> = rings.values().chain(wakers.iter()).map(|r| libc::pollfd { fd: r.fd, events: libc::POLLIN, revents: 0 }).collect();
+        unsafe { libc::poll(poll.as_mut_ptr(), poll.len() as _, 10) };
+        for r in rings.values() {
+            r.records(&mut buf, &mut lost);
+            for (kind, misc, body) in buf.drain(..) {
+                if kind == 9 {
+                    let Some((raw, fields)) = parse_tracepoint(&body) else { continue };
+                    let (kind, word) = task_state(switch.read(&fields, "prev_state").unwrap_or(0));
+                    let frames = unwind.frames(&raw);
+                    let stack = out.stack(&mut index, frames);
+                    open.insert(raw.tid, (raw.ns, raw.pid, kind, word, stack));
+                } else if kind == RECORD_SWITCH && misc & MISC_SWITCH_OUT == 0 {
+                    // A switch-in: sample_id_all's pid, tid and time.
+                    let (Some(pt), Some(ns)) = (body.get(0..8), body.get(8..16)) else { continue };
+                    let tid = (u64::from_le_bytes(pt.try_into().unwrap_or_default()) >> 32) as u32;
+                    let ns = u64::from_le_bytes(ns.try_into().unwrap_or_default());
+                    if let Some((from, pid, kind, word, stack)) = open.remove(&tid).filter(|o| o.0 <= ns) {
+                        out.waits.push(Wait { pid, tid, from_ns: from, to_ns: ns, ready_ns: None, kind, reason: word.to_string(), stack, waker: None });
+                    }
+                }
+            }
+        }
+        for r in &wakers {
+            r.records(&mut buf, &mut lost);
+            for (kind, _, body) in buf.drain(..) {
+                if kind != 9 {
+                    continue;
+                }
+                let Some((raw, fields)) = parse_tracepoint(&body) else { continue };
+                let Some(wakee) = waking.read(&fields, "pid").map(|p| p as u32) else { continue };
+                if unfiltered && !rings.contains_key(&wakee) {
+                    continue;
+                }
+                // In a hard or soft interrupt (a timer, a device), or the idle task: no thread woke it.
+                let irq = waking.read(&fields, "common_flags").is_some_and(|f| f & (0x08 | 0x10) != 0) || raw.tid == 0;
+                let stack = if irq { None } else { out.stack(&mut index, unwind.frames(&raw)) };
+                woken.push((wakee, raw.ns, Waker { pid: raw.pid, tid: raw.tid, interrupt: irq, stack }));
+            }
+        }
+        if done {
+            break;
+        }
+    }
+    drop(rings);
+    drop(wakers);
+    // Each wait's waker: the last wake-up of its thread inside it.
+    woken.sort_by_key(|w| (w.0, w.1));
+    for w in &mut out.waits {
+        let lo = woken.partition_point(|x| (x.0, x.1) < (w.tid, w.from_ns));
+        let hi = woken.partition_point(|x| (x.0, x.1) <= (w.tid, w.to_ns));
+        if let Some((_, at, k)) = woken.get(lo..hi).and_then(|s| s.last()) {
+            w.ready_ns = Some(*at);
+            w.waker = Some(k.clone());
+        }
+    }
+    let mut pids: Vec<u32> = out.waits.iter().flat_map(|w| std::iter::once(w.pid).chain(w.waker.as_ref().filter(|k| !k.interrupt).map(|k| k.pid))).collect();
+    pids.sort_unstable();
+    pids.dedup();
+    for &pid in &pids {
+        let list = unwind.spaces.get(&pid).map(|s| s.maps.clone()).unwrap_or_else(|| maps(pid));
+        out.modules.extend(modules_of(pid, &list));
+    }
+    let mut named: Vec<u32> = out.waits.iter().flat_map(|w| std::iter::once(w.tid).chain(w.waker.as_ref().filter(|k| !k.interrupt).map(|k| k.tid))).collect();
+    named.sort_unstable();
+    named.dedup();
+    for tid in named {
+        if let Some(n) = crate::host::thread_name(tid) {
+            out.threads.insert(tid, n);
+        }
+    }
+    out.events_lost = lost;
+    Ok(out)
+}
+
 // Counting (SPEC §7.5 `cpu.instructions`): no samples, no interrupts, one counter per thread.
 
 use crate::probe::wakes::Uncounted;

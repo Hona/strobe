@@ -26,7 +26,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("version", Switch, "*"),
     ("progress", Value, "*"),
     // record, bench, plan, run.
-    ("id", Value, "record bench"),
+    ("id", Value, "record bench run"),
     ("for", Value, "record"),
     ("probes", Value, "record bench plan"),
     ("headless", Switch, "record bench"),
@@ -40,18 +40,18 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("gpu-cache", Value, "record"),
     ("until-line", Value, "record"),
     ("stop-line", Value, "record"),
-    ("head", Value, "record bench plan track"),
-    ("base", Value, "bench plan track"),
-    ("aa", Switch, "bench plan"),
-    ("check", Switch, "bench update"),
+    ("head", Value, "record bench plan track run"),
+    ("base", Value, "bench plan track run"),
+    ("aa", Switch, "bench plan run"),
+    ("check", Switch, "bench update run"),
     ("filter", Value, "bench plan track"),
     ("target", Value, "record bench top track"),
     ("params", Value, "record bench track"),
-    ("primary", Value, "bench track"),
-    ("equivalence", Number, "bench plan track"),
-    ("noworse", Value, "bench plan"),
-    ("pairs", Value, "bench plan"),
-    ("runs", Number, "record bench plan track"),
+    ("primary", Value, "bench track run"),
+    ("equivalence", Number, "bench plan track run"),
+    ("noworse", Value, "bench plan run"),
+    ("pairs", Value, "bench plan run"),
+    ("runs", Number, "record bench plan track run"),
     ("repeat", Number, "bench"),
     ("why", Value, "bench plan track"),
     ("trace", Value, "bench track"),
@@ -62,15 +62,16 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("pixels-only", Switch, "bench"),
     ("bisect", Value, "bench track"),
     ("keep", Switch, "bench"),
-    ("max-time", Value, "bench"),
+    ("max-time", Value, "bench run"),
     ("unlock-wait", Value, "bench"),
-    ("require-verdict", Switch, "bench"),
+    ("require-verdict", Switch, "bench run"),
     ("plan", Switch, "bench"),
     ("effect", Number, "bench plan"),
     ("pilot", Switch, "bench plan"),
     ("stop", Value, "bench"),
     ("resume", Value, "bench"),
     ("gpu-store", Value, ""),
+    ("metrics", Value, "run"),
     // query, report, open, history.
     ("by", Value, "query"),
     ("top", Number, "query history"),
@@ -342,7 +343,9 @@ Use
   config [<dir>]                  check the project's strobe.json (and your own) without a bench: where it is, each
                                   app profile resolved for this OS (its executable, guards, window), build and serve
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
-                                  views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
+                                  views: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights sql
+                                  (waits: where threads were off their CPUs and who woke them, from a native capture;
+                                  --thread <name> --phase <name> --by function|file|package)
                                   (a..b: hotspots alloc layout style threads frames summary heap memory, per-run deltas;
                                   exp_…: summary progress insights, and those views as each series' base..head;
                                   memory: --by process|layer|allocator --at <i>;
@@ -375,6 +378,11 @@ Use
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,
                                   pinned to the target's CPUs with other processes kept off them; it prints its own numbers
+  run --base \"<command>\" --head \"<command>\" [--aa] [--check] [--primary cpu.work] [--metrics metric.<name>,…] [--pairs auto|N]
+      [--runs 5] [--noworse 2%] [--pin …] [--reserve-cpus auto|on|off] [--power high|keep] [--require-verdict]
+                                  a paired A/B of two commands, as a bench (verdicts, report, PR block): each run starts the
+                                  command and waits for its exit; cpu.work, run.duration, cpu.wakes, memory.peak, io.*, and
+                                  metric.<name> from `strobe:metric <name>=<value>` lines it prints (--aa --head: an A/A)
 
 Setup
   up [--skip deep,daemon,mcp,calibrate]  install, download the engine, deep mode (one UAC prompt), start the daemon,
@@ -387,7 +395,7 @@ Setup
 
 Targets   https://… · a local page.html (or file:page.html) · app:<id> (a strobe.json profile, Electron or native) · exe:<path> [--app <id> | --native]
           · cdp:<port> · cdp:ws://… · file:<trace> (import) · pid:<n> · proc:<name>
-Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href>
+Variants  a directory · a git ref (git:<ref>) · app:<id> · exe:<path> · url:<href> · cmd:<line> (a cli() target's command)
 Global    --json  -q  -h  -V  --progress stderr|stdout|off (stdout for shells that count stderr lines as a failure)
 Exit codes: 0 ok · 1 error · 2 usage · 3 needs a human · 4 refused (invalid) · 5 inconclusive · 124 timeout · 255 unreachable
 ";

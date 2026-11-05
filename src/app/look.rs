@@ -71,8 +71,8 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         (_, Some(path), Some(id)) => isolate::app(id, &config)?.with_exe(Path::new(path)),
         (_, Some(path), None) => isolate::App::bare(Path::new(path)),
         _ => return Err(Error::usage("look app:<id> or exe:<path>")),
-    }
-    .as_kind(isolate::AppKind::Native);
+    };
+    app.kind = "native".into();
     // `--build`: this checkout's own build of the app (strobe.json `build`), as a bench of it runs.
     if args.has("build") {
         if target.starts_with("exe:") {

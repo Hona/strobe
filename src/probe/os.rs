@@ -265,17 +265,17 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Samples the process set of `root_pid` and the launch `home` (`host::process_set`: its tree
-    /// and what was launched for the home) every 100 ms (0: no process rows, only CPUs and devices).
-    /// Returns after the baseline collection, so ticks cover everything from the return on.
-    pub fn start(root_pid: u32, home: Option<std::path::PathBuf>) -> Sampler {
-        Sampler::every(root_pid, home, INTERVAL)
+    /// Samples the tree rooted at `root_pid` every 100 ms (0: no process rows, only CPUs and
+    /// devices). Returns after the baseline collection, so ticks cover everything from the
+    /// return on.
+    pub fn start(root_pid: u32) -> Sampler {
+        Sampler::every(root_pid, INTERVAL)
     }
 
-    pub fn every(root_pid: u32, home: Option<std::path::PathBuf>, interval: Duration) -> Sampler {
+    pub fn every(root_pid: u32, interval: Duration) -> Sampler {
         let (stop, stop_rx) = mpsc::channel();
         let (ready, ready_rx) = mpsc::channel();
-        let thread = std::thread::Builder::new().name("strobe-sampler".into()).spawn(move || run(root_pid, home, interval, stop_rx, ready)).expect("spawn the sampler thread");
+        let thread = std::thread::Builder::new().name("strobe-sampler".into()).spawn(move || run(root_pid, interval, stop_rx, ready)).expect("spawn the sampler thread");
         let _ = ready_rx.recv();
         Sampler { stop, thread }
     }
@@ -288,11 +288,10 @@ impl Sampler {
     }
 }
 
-fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mpsc::Receiver<()>, ready: mpsc::Sender<()>) -> Samples {
+fn run(root: u32, interval: Duration, stop: mpsc::Receiver<()>, ready: mpsc::Sender<()>) -> Samples {
     let (k0, tsc0, ns0) = (host::thread_cycles(), host::tsc(), host::now_ns());
-    // The process set, not the tree alone: a launcher that exits leaves the app outside the tree.
     let tree = || {
-        let mut p: Vec<u32> = if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).collect() };
+        let mut p = if root == 0 { Vec::new() } else { host::tree_pids(root) };
         p.sort_unstable();
         p
     };

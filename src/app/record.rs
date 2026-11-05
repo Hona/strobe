@@ -109,7 +109,11 @@ pub fn run(args: &Args) -> Result<Output> {
         return super::outside::record(args, &target);
     }
 
-    let set = Set::parse(args.get("probes").unwrap_or("timing")).ok_or_else(|| Error::usage("--probes: timing, attribution or memory"))?;
+    // `waits`: a native app's attribution recording with its off-CPU waits.
+    let set = match args.get("probes").unwrap_or("timing") {
+        "waits" => Set::Attribution,
+        p => Set::parse(p).ok_or_else(|| Error::usage("--probes: timing, attribution, memory or waits (a native app's attribution with off-CPU waits)"))?,
+    };
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,
         None => 10_000,
@@ -127,12 +131,9 @@ pub fn run(args: &Args) -> Result<Output> {
         _ => None,
     };
     // A native app (a profile of kind native, or `exe:<path> --native`): measured from outside.
-    if let Some(a) = app.clone().filter(|a| a.kind == isolate::AppKind::Native || args.has("native")) {
-        return native(args, &a.as_kind(isolate::AppKind::Native), &target, set, for_ms);
-    }
-    // An app opens its own window: `--headless` would only skip the lock check on a headed app.
-    if args.has("headless") && app.is_some() {
-        return Err(Error::usage(format!("--headless runs a page in a headless browser; {target} draws its own window")));
+    if let Some(mut a) = app.clone().filter(|a| a.kind == "native" || args.has("native")) {
+        a.kind = "native".into();
+        return native(args, &a, &target, set, for_ms);
     }
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") && !target.starts_with("file://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, a local page.html, app:<id>, exe:<path>, cdp:<port> or file:<trace>")));
@@ -141,7 +142,6 @@ pub fn run(args: &Args) -> Result<Output> {
     let browser = if attach {
         chromium::attach(&target)?
     } else if let Some(app) = &app {
-        let app = &with_gpu_store(args, app)?;
         progress(format!("launching {} in an isolated home", app.exe.display()));
         let (b, g) = electron::launch(app, args.get("home").map(std::path::Path::new), &Window::default(), None)?;
         guard = Some(g);
@@ -150,7 +150,6 @@ pub fn run(args: &Args) -> Result<Output> {
         chromium::launch(&Window::default(), args.has("headless"), None, &[])?
     };
     let gpu = validity::software_gpu(&browser);
-    let debug = app.as_ref().and_then(|a| host::debug_runtime(&a.exe));
     let page = if app.is_some() { electron::main_page(&browser)? } else { browser.page()? };
     if let Some(g) = &guard {
         g.check("after the app opened its window")?;
@@ -196,7 +195,7 @@ pub fn run(args: &Args) -> Result<Output> {
         probe::alloc::start(&page)?;
     }
     std::thread::sleep(Duration::from_millis(300));
-    let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid, browser.profile.clone()));
+    let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid));
     // `--os-frames`: the OS's present events beside the trace's frames, a cross-check of both.
     let os_frames = (args.has("os-frames") && !attach).then(crate::probe::present::PresentCapture::start);
     // CPU in cycles over the time stamp counter, as native targets read it: process times move in
@@ -278,28 +277,14 @@ pub fn run(args: &Args) -> Result<Output> {
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
         "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "refused": refused, "os": os, "os_frames": os_frames,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
-        // Rule 3: timing taken with profilers on describes the profiled target, not the target; an
-        // app with a debug C runtime is a debug build (`DevBuild`).
-        "timing": if set == Set::Attribution { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
+        // Rule 3: timing taken with profilers on describes the profiled target, not the target.
+        "timing": if set == Set::Attribution { "perturbed" } else { "clean" },
         "created": now_iso(), "valid": true,
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
     draft.keep();
     Ok(Output::new(summary_text(&meta), meta))
-}
-
-/// `app` with its GPU shader cache store: `--gpu-cache` (else the profile's `gpuCache`; default warm)
-/// lends each launch one store per executable, so a recording after the first runs with them warm,
-/// as for a person.
-fn with_gpu_store(args: &Args, app: &isolate::App) -> Result<isolate::App> {
-    let mut app = app.clone();
-    match args.get("gpu-cache").or(app.gpu_cache_mode.as_deref()).unwrap_or("warm") {
-        "warm" if !cfg!(target_os = "macos") => app.gpu_cache = Some(isolate::exe_gpu_store(&app.exe)),
-        "warm" | "cold" => {}
-        other => return Err(Error::usage(format!("--gpu-cache is warm or cold, not {other}"))),
-    }
-    Ok(app)
 }
 
 /// A native app for `for_ms` (SPEC §13.7): launched isolated, left to settle for 3 s, then one run
@@ -315,7 +300,15 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     // end at one (`--for` caps it then).
     let line = |k: &str| args.get(k).map(|r| regex_lite::Regex::new(r).map_err(|e| Error::usage(format!("--{k}: {e}")))).transpose();
     let (until, stop) = (line("until-line")?, line("stop-line")?);
-    let app = &with_gpu_store(args, app)?;
+    // `--gpu-cache` (else the profile's `gpuCache`; default warm): one store of GPU shader caches per
+    // executable, so a recording after the first runs with them warm, as for a person.
+    let mut app = app.clone();
+    match args.get("gpu-cache").or(app.gpu_cache_mode.as_deref()).unwrap_or("warm") {
+        "warm" if !cfg!(target_os = "macos") => app.gpu_cache = Some(isolate::exe_gpu_store(&app.exe)),
+        "warm" | "cold" => {}
+        other => return Err(Error::usage(format!("--gpu-cache is warm or cold, not {other}"))),
+    }
+    let app = &app;
     let home = isolate::prepare_home(app, args.get("home").map(std::path::Path::new), None)?;
     match home.gpu_warm {
         Some(true) => progress("GPU shader caches: warm, from earlier recordings of this executable"),
@@ -369,7 +362,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let awake = host::Awake::start();
         let (id, draft) = claim(args)?;
         let dir = draft.dir().to_path_buf();
-        let sampler = probe::os::Sampler::start(n.pid, Some(n.home.clone()));
+        let sampler = probe::os::Sampler::start(n.pid);
         // What reached the screen (OS present events), or in attribution, native stacks (the helper).
         let presents = (set != Set::Attribution && !windowless).then(|| {
             crate::probe::present::PresentCapture::start().map(|mut c| {
@@ -377,7 +370,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+        let waits = args.get("probes") == Some("waits");
+        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), waits));
         let cycles = || -> (Cycles, Option<u64>) { (per_process(&n.processes()), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
@@ -509,8 +503,6 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             // A debug build's times describe no build people run (`DevBuild`).
             "timing": if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
             "note": if set == Set::Attribution { format!("native attribution: OS samples; {stacks_note}") } else { String::new() },
-            // macOS: the app's XPC services are missing from every number (SPEC §13.2).
-            "unattributed": n.unattributed(),
         });
         for (k, x) in frame_values {
             meta["values"][k] = json!(x);
@@ -717,9 +709,6 @@ fn context_lines(meta: &Value) -> String {
     }
     if let (Some(fps), Some(hz)) = (meta["unpaced"]["fps"].as_f64(), meta["unpaced"]["hz"].as_f64()) {
         s += &format!("! UnpacedSpin  the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display, so it draws as fast as it can\n");
-    }
-    if let Some(why) = meta["unattributed"].as_str() {
-        s += &format!("! Unattributed  {why}: cpu, memory, wakes and GPU cover the app's own processes only\n");
     }
     s
 }

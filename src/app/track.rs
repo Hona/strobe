@@ -219,14 +219,10 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
             why = Some("the display turned off or on between the point's blocks".into());
         }
         let def = model::metric(&metric);
-        let mut fingerprint = json!({
+        let fingerprint = json!({
             "machine": statics, "power": r["env"]["power_plan"], "battery": r["env"]["on_battery"], "pin": r["plan"]["pin"],
             "runs": r["plan"]["runs_per_block"], "session": session, "display": display, "target_kind": s["target_kind"],
         });
-        // The OS updates its webview runtime under the app: another version is another series.
-        if s["target_kind"] == "webview" {
-            fingerprint["browser"] = r["browser"].clone();
-        }
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });
         let id = history::series_id(&family, &fingerprint);
         if !history::exists(&id) {

@@ -159,7 +159,7 @@ const GUARD: Shape = Keys(&[("file", Req(&Str)), ("pid", Str), ("url", Str), ("o
 const APP: Shape = Keys(&[
     ("exe", PerOs),
     ("extends", Str),
-    ("kind", Enum(crate::target::isolate::AppKind::NAMES)),
+    ("kind", Enum(&["electron", "native"])),
     ("env", StrMap),
     ("unset", Strings),
     ("dirs", Strings),

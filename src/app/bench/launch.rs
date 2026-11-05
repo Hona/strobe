@@ -58,17 +58,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         steps.push((name.to_string(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
     };
-    // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
-    // keeps), and the hook gets the environment and executable the app launches with, so it can start
-    // what the app expects to find (a background service) the way the app would.
-    let app = if matches!(kind.as_str(), "app" | "exe" | "webview") { Some(with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?) } else { None };
-    // An app on the OS's webview has no Node main process to profile or inspect.
-    let electron = app.as_ref().is_some_and(|a| a.kind == isolate::AppKind::Electron);
-    if spec["inspect"] == true && !electron {
-        return Err(Error::usage(format!("{}: launch.inspect reads Node's timing from an Electron app's main process", s.case)));
-    }
-    if let Some(a) = app.as_ref().filter(|_| !profile) {
-        dev_build(&a.exe)?;
+    if spec["inspect"] == true && kind != "app" && kind != "exe" {
+        return Err(Error::usage(format!("{}: launch.inspect reads Node's timing from an app or exe target's main process", s.case)));
     }
     // `fresh`: a new home per launch. `warm`: one home per series and variant, kept across its launches,
     // so caches and state from the discarded first launch are there, as for a person's second launch.
@@ -81,6 +72,10 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     if let Some(h) = &home {
         std::fs::create_dir_all(h)?;
     }
+    // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
+    // keeps), and the hook gets the environment and executable the app launches with, so it can start
+    // what the app expects to find (a background service) the way the app would.
+    let app = if kind == "app" || kind == "exe" { Some(with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?) } else { None };
     let seed = target["home"].as_str().map(|h| {
         let h = s.params.iter().fold(h.to_string(), |h, (k, val)| h.replace(&format!("{{{k}}}"), &value_text(val)));
         Path::new(ctx.describe["file"].as_str().unwrap_or(".")).parent().unwrap_or(Path::new(".")).join(h)
@@ -111,14 +106,14 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     // The time stamp counter's rate, from two readings around the launch: cycles to ms.
     let clock = (host::tsc(), Instant::now());
     let (mut browser, started) = match kind.as_str() {
-        "app" | "exe" | "webview" => {
+        "app" | "exe" => {
             let app = app.as_ref().ok_or_else(|| Error::msg("internal: an app target without its app"))?;
             let extra = Extra {
                 args: inspect_port.map(|p| vec![format!("--inspect={p}")]).unwrap_or_default(),
                 output: true,
                 home: home.clone(),
                 prepared: prepared.clone(),
-                profile_main: if profile && electron { Some(free_port()?) } else { None },
+                profile_main: if profile { Some(free_port()?) } else { None },
             };
             let (b, g, st) = electron::launch_with(app, seed.as_deref(), &window, ctx.pin, &extra)?;
             guard = Some(g);
@@ -190,10 +185,6 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             ));
         }
         validity::window_visible(&page)?;
-        // A webview app's launch is not moved or sized: the block records the window it opened.
-        if browser.embedded {
-            ctx.used = Some(crate::target::webview::fit(&browser, &page, None, false)?);
-        }
         if !ctx.gpu_checked {
             ctx.gpu = serde_json::to_value(if ctx.headless { browser.gpu()? } else { validity::software_gpu(&browser)? })?;
             ctx.browser_version = browser.version.clone();
@@ -308,9 +299,13 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         isolate::release_home(h);
     }
     let closed = ctx.runner.call("close", json!({}), t, &no_page);
-    // Its GPU caches go back to their store and shared seeds unlink before the home goes.
     if let Some(h) = home.filter(|_| !warm) {
-        isolate::remove_home(&h);
+        for _ in 0..20 {
+            if std::fs::remove_dir_all(&h).is_ok() || !h.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
     if let Some(g) = &guard {
         g.check("after a launch")?;

@@ -25,7 +25,9 @@ pub(super) fn app(v: &Variant, target: &Value, config: &Value) -> Result<isolate
         (_, Some(id)) => isolate::app(id, config)?,
         _ => {
             let path = target["path"].as_str().ok_or_else(|| Error::usage("native(): give an app profile id or an executable path"))?;
-            isolate::App::bare(Path::new(path)).as_kind(isolate::AppKind::Native)
+            let mut a = isolate::App::bare(Path::new(path));
+            a.kind = "native".into();
+            a
         }
     };
     let base = match (&v.kind, &v.exe) {
@@ -109,18 +111,6 @@ struct Run {
     total: f64,
 }
 
-/// `Unattributed` (macOS, SPEC §13.2): a launch of an app bundle that did not become its own
-/// responsible process, so its XPC services are missing from the block's numbers. Said once per
-/// variant and reason.
-fn unattributed(ctx: &mut Ctx, v: &Variant, n: &Native) {
-    if let Some(why) = n.unattributed() {
-        let w = validity::warn("Unattributed", format!("{}: {why}; cpu, memory, wakes and GPU cover the app's own processes only", v.role));
-        if !ctx.warnings.iter().any(|x| x.text == w.text) {
-            ctx.warnings.push(w);
-        }
-    }
-}
-
 /// Metrics read from frames: refused together when the app spun unpaced.
 fn frame_metric(metric: &str) -> bool {
     ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
@@ -132,8 +122,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     // `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
     let timed = set != Set::Attribution && set != Set::Memory && x.pixels.is_none();
-    if timed {
-        dev_build(&app.exe)?;
+    if let Some(crt) = host::debug_runtime(&app.exe).filter(|_| timed) {
+        return Err(Error::refused(
+            "DevBuild",
+            format!("{} imports {crt}, a debug C runtime: its timings describe no build people run", app.exe.display()),
+            "build the app optimized (strobe.json build: a release or profiling profile)",
+        ));
     }
     // `Throttled`: there is no page to run the speed check in, so strobe runs a fixed workload of its
     // own on the target's CPUs before the launch, once the last block's app has left them quiet.
@@ -151,7 +145,6 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             return Err(e);
         }
     };
-    unattributed(ctx, v, &n);
     let drive = Drive { session: OnceCell::new(), pid: n.pid, home: home.dir.clone(), main: Cell::new(0) };
     ctx.target_qos = host::background_qos(Some(n.pid));
     // The per-thread timeline, from the launch to the last run's end, in untimed blocks (`--check`,
@@ -252,7 +245,7 @@ fn runs(
             Err(e) => presents_err = Some(e.message),
         }
     }
-    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), ctx.args.get("probes") == Some("waits")));
     let hooks = super::block::Hooks::default();
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
@@ -317,7 +310,7 @@ fn runs(
         shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
     }
     let procs0 = (host::now_ns(), host::all_processes());
-    let sampler = probe::os::Sampler::start(n.pid, Some(n.home.clone()));
+    let sampler = probe::os::Sampler::start(n.pid);
     let sampled = Instant::now();
     let mut cost = SelfCost::new(ctx.runner.pid());
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
@@ -824,6 +817,7 @@ fn missing(metric: &str, have: &Have) -> Refusal {
     let refuse = |v: ValidatorId, why: String| Refusal::new(v, format!("{metric}{why}"));
     let area = metric.split('.').next().unwrap_or("");
     match area {
+        "frames" if crate::metrics::split_metric(metric) => refuse(ValidatorId::NotForTarget, " splits a browser frame by its pipeline stages; the OS's present events carry none".into()),
         "frames" if metric.starts_with("frames.presented.") && metric != "frames.presented.count" => refuse(
             ValidatorId::NoPresentSource,
             " is a frame's begin to its screen time; from outside strobe sees when a frame reached the screen, not when the app began it (frames.interval.*, frames.dropped and interaction.* it does see)".into(),
@@ -1005,10 +999,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             return Err(e);
         }
     };
-    unattributed(ctx, v, &n);
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
-    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), ctx.args.get("probes") == Some("waits")));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();

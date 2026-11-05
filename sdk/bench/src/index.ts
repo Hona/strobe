@@ -107,6 +107,13 @@ export interface Context<P> {
   /** Calls an export of a `script()` target's module in its process and returns what it returned (JSON). */
   call<T = unknown>(name: string, ...args: unknown[]): Promise<T>
   /**
+   * `cli()` targets: runs a command to its exit in the variant's folder, timed and counted from outside (its CPU,
+   * context switches, peak memory and IO, with everything it starts), and resolves with its exit code and output.
+   * Default: the target's command (with a `cmd:` variant, the variant's). A nonzero exit fails the run. Lines it
+   * prints as `strobe:metric <name>=<value>` add to `metric.<name>` for the run.
+   */
+  exec(line?: string): Promise<{ code: number; output: string }>
+  /**
    * Native targets: resolves with the first line matching `match` that the app writes after the call, from its
    * output (`in: "output"`, the default; needs the target's `output: true`) or from files under its home matching a glob (`in: "logs/*.log"`), and
    * when strobe read it on its host clock (`at`, ns: the clock of phase marks and presented frames). Start the wait
@@ -299,8 +306,8 @@ export type Target<P> =
   | { kind: "exe"; path: string; app?: string; home?: string; viewport?: Viewport; gpuCache?: GpuCache; expect?: Expect }
   | ({ kind: "command" } & CommandOptions)
   | ({ kind: "script" } & ScriptOptions)
+  | ({ kind: "cli" } & CliOptions)
   | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
-  | ({ kind: "webview"; app?: string; path?: string } & WebviewOptions)
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
 export type GpuCache = "warm" | "cold"
@@ -342,6 +349,19 @@ export interface ScriptOptions {
   build?: string
 }
 
+export interface CliOptions {
+  /**
+   * The command line each `ctx.exec()` runs in the variant's folder, to its exit. Unix: `sh -c "exec <run>"`;
+   * Windows: the first word is the program (a `.cmd` or `.bat` runs under cmd). Omit it when the variants are
+   * commands (`--base "cmd:<line>"`, what `strobe run --base … --head …` does).
+   */
+  run?: string
+  /** Extra environment for the command. */
+  env?: Record<string, string>
+  /** Run once per variant before its first block, in its folder. */
+  build?: string
+}
+
 export interface NativeOptions {
   /** A seed folder copied into each launch's fresh private home (`{param}` placeholders allowed), relative to the bench file. */
   home?: string
@@ -373,17 +393,6 @@ export interface NativeOptions {
    * default, as a pipe changes how a C runtime buffers stdout: an app whose output a case waits on must flush each line.
    */
   output?: boolean
-}
-
-export interface WebviewOptions {
-  /** A seed folder copied into each launch's fresh private home (`{param}` placeholders allowed), relative to the bench file. */
-  home?: string
-  /** The page's size in CSS pixels: strobe sizes the app's window to it, and refuses an app that keeps its size. */
-  viewport?: Viewport
-  /** As for `native`: whether launches find the GPU shader caches (the driver's and the webview's) earlier launches compiled. */
-  gpuCache?: GpuCache
-  /** What every block of this target must show (a case's `expect` adds to it). */
-  expect?: Expect
 }
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
@@ -446,6 +455,15 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
 }
 
 /**
+ * A command run to its exit per `ctx.exec()` (a CLI, a compiler, a test binary), measured from outside: `cpu.work`
+ * (its CPU with everything it starts), `run.duration` (spawn to exit), `cpu.wakes`, `memory.peak`, `io.read`,
+ * `io.write`, and `metric.<name>` from its `strobe:metric <name>=<value>` lines. Cases: `run: (ctx) => ctx.exec()`.
+ */
+export function cli<P = any>(run?: string, opts: Omit<CliOptions, "run"> = {}): Target<P> {
+  return { kind: "cli", run, ...opts }
+}
+
+/**
  * A native app (no browser engine): by its profile in strobe.json `apps` (`kind: "native"`), or an executable path.
  * Each block launches it in a fresh isolated home and measures it from outside: CPU in cycles, thread wakes
  * (`cpu.wakes`), the UI thread (`ui.cpu`), IO, GPU, memory, what reached the screen (`frames.*`, `interaction.*`), and
@@ -455,18 +473,6 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
 export function native<P = any>(appOrPath: string, opts: NativeOptions = {}): Target<P> {
   const path = /[\\/]|\.exe$/i.test(appOrPath)
   return { kind: "native", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
-}
-
-/**
- * An app that embeds the OS's webview, by its profile in strobe.json `apps` (any `kind`), or an executable path.
- * Each block launches it in a fresh isolated home with the webview's own debugging port open, and `page` drives
- * its page as a web target's: page metrics, attribution and the app's whole process set (host and webview
- * processes). Windows (WebView2) only for now; elsewhere it is refused `EngineUnsupported`, and `native()` measures the app through its
- * accessibility tree. A directory or git-ref variant runs strobe.json's `build` and launches its `output`.
- */
-export function webview<P = any>(appOrPath: string, opts: WebviewOptions = {}): Target<P> {
-  const path = /[\\/]|\.exe$/i.test(appOrPath)
-  return { kind: "webview", ...(path ? { path: appOrPath } : { app: appOrPath }), ...opts }
 }
 
 export function bench<const Params extends Record<string, ParamValues> = {}>(spec: Bench<Params>): Bench<Params> {

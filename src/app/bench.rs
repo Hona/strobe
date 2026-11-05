@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod block;
+mod cli;
 mod launch;
 mod native;
 pub mod plan;
@@ -156,6 +157,22 @@ enum Kind {
     Url(String),
     App(String),
     Exe(PathBuf),
+    /// `cmd:<line>`: a command line, for a `cli()` target (`strobe run --base … --head …`); it runs in
+    /// the folder strobe was started in.
+    Cmd(String),
+}
+
+impl Kind {
+    fn name(&self) -> &'static str {
+        match self {
+            Kind::Dir => "dir",
+            Kind::Git(_) => "git",
+            Kind::Url(_) => "url",
+            Kind::App(_) => "app",
+            Kind::Exe(_) => "exe",
+            Kind::Cmd(_) => "cmd",
+        }
+    }
 }
 
 struct Variant {
@@ -210,6 +227,7 @@ fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
         Kind::App(id) => format!("app:{id}{}", isolate::app(id, config).map(|a| stamp(&a.exe)).unwrap_or_default()),
         Kind::Exe(p) => format!("exe:{}{}", p.display(), stamp(p)),
         Kind::Url(h) => format!("url:{h}"),
+        Kind::Cmd(l) => format!("cmd:{l}"),
     }
 }
 
@@ -1137,7 +1155,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "file_repo": super::pr::repo_relative(&file.display().to_string()), "identity": ident, "ledger": ledger,
         "variants": variants.iter().map(|v| json!({
             "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
-            "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
+            "kind": v.kind.name(),
         })).collect::<Vec<_>>(),
         // The command line, for the rerun line under a PR table.
         "args": ctx.saved["args"],
@@ -1508,7 +1526,6 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
-    unbuilt(&target, variants, &s.label())?;
     progress(format!("\n{}  primary {} · {n} blocks of head alone", s.label(), s.primary));
     let series_started = Instant::now();
     let waited_before = ctx.waited_ms;
@@ -1612,7 +1629,6 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     for v in variants.iter_mut() {
         prepare_variant(v, &target, config, &ctx.harness, &ctx.project)?;
     }
-    unbuilt(&target, variants, &s.label())?;
     let bound =
         ctx.args.num("equivalence")?.map(|b| b / 100.0).unwrap_or_else(|| config["metrics"]["equivalence"].as_str().and_then(|e| e.trim_end_matches('%').parse::<f64>().ok()).unwrap_or(2.0) / 100.0);
     // Verdicts only at planned looks, each at a Pocock level, so looking more than once keeps the
@@ -1646,7 +1662,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if !pairs.is_empty() {
         progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
     }
-    let script = target["kind"] == "script" || is_native(&target);
+    let script = target["kind"] == "script" || target["kind"] == "cli" || is_native(&target);
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
     // Why the series ended early (a stop, or an error after some pairs), as the error to report.
@@ -1901,7 +1917,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut descriptive: Vec<Comparison> = Vec::new();
     // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
     let found: Vec<String> =
-        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
+        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || k.starts_with("metric.") || *k == "memory.peak" || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
         if name == s.primary || names.iter().any(|n| n == name) {
@@ -1964,6 +1980,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
+        // A command ends inside each run: there is nothing to profile it with.
+        _ if target["kind"] == "cli" => false,
         "always" => true,
         "never" => false,
         "auto" => differs,
@@ -2173,6 +2191,7 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
+        _ if metrics::split_metric(def.name) => ("frames.split.n", "frames with their stages"),
         _ => ("frames.n", "frames"),
     };
     let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
@@ -2464,7 +2483,7 @@ pub(crate) fn screen_line(s: &Value) -> Option<String> {
 
 /// The commit subject of a git variant, so a report still says what was compared days later.
 fn subject(v: &Variant) -> Option<String> {
-    let root = v.root.as_ref()?;
+    let root = v.root.as_ref().filter(|_| !matches!(v.kind, Kind::Cmd(_)))?;
     Some(git::subject(root, "HEAD")).filter(|s| !s.is_empty())
 }
 
@@ -2765,7 +2784,9 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
 /// One block of whatever kind the target and case are.
 fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let native = is_native(&ctx.describe["targets"][&s.target]);
-    if s.launch.is_object() && native {
+    if ctx.describe["targets"][&s.target]["kind"] == "cli" {
+        cli::block(ctx, s, v, pair, x)
+    } else if s.launch.is_object() && native {
         native::launch(ctx, s, v, pair, x)
     } else if s.launch.is_object() {
         launch::block(ctx, s, v, pair, x)
@@ -2809,7 +2830,7 @@ fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     match t["kind"].as_str().unwrap_or("") {
-        "script" => true,
+        "script" | "cli" => true,
         // A headless page draws to no display: the lock screen covers nothing of it.
         "web" | "url" if ctx.headless => true,
         _ if x.set == Set::Memory => true,
@@ -2887,7 +2908,7 @@ fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     if b.values.is_empty() {
         return b;
     }
-    let page = !is_native(&ctx.describe["targets"][&s.target]) && ctx.describe["targets"][&s.target]["kind"] != "script";
+    let page = !is_native(&ctx.describe["targets"][&s.target]) && !matches!(ctx.describe["targets"][&s.target]["kind"].as_str(), Some("script" | "cli"));
     for m in declared_metrics(s) {
         if b.values.get(m).is_some_and(|v| v.is_finite()) || b.refused.contains_key(m) {
             continue;
@@ -2963,7 +2984,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let (set, keep, n) = (x.set, x.keep, x.runs);
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
-    let app = matches!(kind, "app" | "exe" | "webview" | "command");
+    let app = kind == "app" || kind == "exe" || kind == "command";
     // What the series declared beyond the default probes: counters, network counts, layout shift.
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
@@ -2996,9 +3017,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), true, &window, ctx.pin)?.0
     } else if app {
         let launch = with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?;
-        if !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none() {
-            dev_build(&launch.exe)?;
-        }
         let seed = seed_dir(ctx, s, &target);
         let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
         guard = Some(g);
@@ -3027,11 +3045,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         if !app && target.get("viewport").is_some_and(Value::is_object) {
             browser.fit_viewport(&page, window.width, window.height)?;
-        }
-        // A webview app's window is placed like a native app's, and sized to the viewport; the block
-        // records the page's own size, not the one asked for.
-        if browser.embedded {
-            ctx.used = Some(crate::target::webview::fit(&browser, &page, Some(&window), target.get("viewport").is_some_and(Value::is_object))?);
         }
         // The driver's frame waits use the browser's own rAF, kept before the page's scripts can replace it.
         page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": crate::driver::NATIVE_RAF }))?;
@@ -3196,7 +3209,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
-        let sampler = probe::os::Sampler::start(browser.pid, browser.profile.clone());
+        let sampler = probe::os::Sampler::start(browser.pid);
         let (sampled, runner_pid) = (Instant::now(), ctx.runner.pid());
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
@@ -3614,6 +3627,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         };
         // CPU this OS gives strobe no time for (Windows on Arm) is refused, as `record` refuses it.
         let mut refused = uncounted;
+        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
+            refused.insert(m.clone(), metrics::split_refusal(m, &values));
+        }
         for m in ["cpu.app.total", "cpu.process.total"] {
             if let Some(r) = super::outside::not_on_this_os(m).filter(|_| declared_metrics(s).iter().any(|d| d.as_str() == m)) {
                 values.remove(m);
@@ -3732,39 +3748,6 @@ fn seed_dir(ctx: &Ctx, s: &Series, target: &Value) -> Option<PathBuf> {
     })
 }
 
-/// `DevBuild`: an executable that imports a debug C runtime is a debug build (timing blocks only).
-pub(crate) fn dev_build(exe: &Path) -> Result<()> {
-    match host::debug_runtime(exe) {
-        Some(crt) => Err(Error::refused(
-            "DevBuild",
-            format!("{} imports {crt}, a debug C runtime: its timings describe no build people run", exe.display()),
-            "build the app optimized (strobe.json build: a release or profiling profile)",
-        )),
-        None => Ok(()),
-    }
-}
-
-/// A native or webview target's directory and git-ref variants run strobe.json's `build`; without one
-/// they all launch the profile's executable, so commits or folders that differ would be measured as
-/// the same build (an A/A of one spec is the same build on purpose).
-fn unbuilt(target: &Value, variants: &[Variant], label: &str) -> Result<()> {
-    if !(is_native(target) || target["kind"] == "webview") || target["path"].is_string() {
-        return Ok(());
-    }
-    let unbuilt: Vec<&Variant> = variants.iter().filter(|v| matches!(v.kind, Kind::Dir | Kind::Git(_)) && v.exe.is_none()).collect();
-    let differ = unbuilt.iter().any(|v| matches!(v.kind, Kind::Git(_))) || unbuilt.windows(2).any(|w| w[0].spec != w[1].spec);
-    if !differ {
-        return Ok(());
-    }
-    Err(Error::usage(format!(
-        "{label}: {} name{} a folder or git ref, but strobe.json has no build for {}, so each would launch the profile's same executable",
-        unbuilt.iter().map(|v| v.role).collect::<Vec<_>>().join(" and "),
-        if unbuilt.len() == 1 { "s" } else { "" },
-        isolate::os()
-    ))
-    .hint("add a build (command and output) to strobe.json, or compare executables: --base exe:<path> --head exe:<path>"))
-}
-
 /// Native targets (`native.rs`).
 fn is_native(target: &Value) -> bool {
     target["kind"] == "native"
@@ -3811,7 +3794,7 @@ fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut ap
 /// fills (the block before the pairs, discarded).
 fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
     let kind = target["kind"].as_str().unwrap_or("");
-    if !matches!(ctx.mode, Mode::Compare | Mode::Blocks(_)) || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe" | "webview") {
+    if !matches!(ctx.mode, Mode::Compare | Mode::Blocks(_)) || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe") {
         return Ok(false);
     }
     let profile = profile_of(target).and_then(|id| isolate::app(id, &ctx.config).ok());
@@ -3822,7 +3805,7 @@ fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
 fn profile_of(target: &Value) -> Option<&str> {
     match target["kind"].as_str()? {
         "app" => target["id"].as_str(),
-        "native" | "exe" | "webview" => target["app"].as_str(),
+        "native" | "exe" => target["app"].as_str(),
         _ => None,
     }
 }
@@ -3855,25 +3838,21 @@ fn preflight(series: &[Series], describe: &Value, variants: &[Variant], config: 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
 /// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
 fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
-    // `webview(…)` reaches the app through its webview whatever kind its profile names.
-    let webview = |a: isolate::App| if target["kind"] == "webview" { a.as_kind(isolate::AppKind::Webview) } else { a };
     if let Kind::App(id) = &v.kind {
-        return isolate::app(id, config).map(webview);
+        return isolate::app(id, config);
     }
     let profile = match target["kind"].as_str() {
         Some("app") => target["id"].as_str(),
-        Some("exe" | "webview") => target["app"].as_str(),
+        Some("exe") => target["app"].as_str(),
         _ => return Err(Error::usage("not an app target")),
     };
-    let base = webview(match profile {
+    let base = match profile {
         Some(id) => isolate::app(id, config)?,
         None => isolate::App::bare(Path::new(target["path"].as_str().unwrap_or(""))),
-    });
-    match (&v.kind, &v.exe) {
-        (Kind::Exe(p), _) => Ok(base.with_exe(p)),
+    };
+    match &v.kind {
+        Kind::Exe(p) => Ok(base.with_exe(p)),
         _ if target["kind"] == "exe" => Ok(base.with_exe(Path::new(target["path"].as_str().unwrap_or("")))),
-        // A directory or git-ref variant of a webview profile runs its own build.
-        (_, Some(p)) if target["kind"] == "webview" && target["path"].is_null() => Ok(base.with_exe(p)),
         _ => Ok(base),
     }
 }
@@ -4172,7 +4151,12 @@ fn glob(pattern: &str, text: &str) -> bool {
 }
 
 fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Value) -> Result<Variant> {
-    let (kind, label, root) = if let Some(href) = spec.strip_prefix("url:") {
+    let (kind, label, root) = if let Some(line) = spec.strip_prefix("cmd:") {
+        if line.trim().is_empty() {
+            return Err(Error::usage("cmd:<line> needs a command line"));
+        }
+        (Kind::Cmd(line.to_string()), line.to_string(), Some(std::env::current_dir()?))
+    } else if let Some(href) = spec.strip_prefix("url:") {
         (Kind::Url(href.to_string()), href.to_string(), None)
     } else if let Some(id) = spec.strip_prefix("app:") {
         // Fails early when the profile is missing or the app is not installed.
@@ -4336,7 +4320,14 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     }
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
     // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
-    if matches!(target["kind"].as_str(), Some("command") | Some("script")) {
+    if matches!(v.kind, Kind::Cmd(_)) && target["kind"] != "cli" {
+        return Err(Error::usage(format!("{}: a cmd:<line> variant is a command line, for a cli() target; this target is a {}", v.role, target["kind"].as_str().unwrap_or("?"))));
+    }
+    if matches!(target["kind"].as_str(), Some("command") | Some("script") | Some("cli")) {
+        // A command line runs as given, in the folder strobe started in: nothing to place or build.
+        if let Kind::Cmd(_) = &v.kind {
+            return Ok(());
+        }
         if let Kind::Git(r) = &v.kind
             && v.root.is_none()
         {
@@ -4354,8 +4345,8 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     // (the executable) copied into strobe's own folder for the variant, so base and head coexist even
     // when the build writes to one shared place (`{cache}`). Without a `build`, both run the profile's
     // or the target's executable.
-    if is_native(target) || target["kind"] == "webview" {
-        // `native(path)` and `webview(path)` name a fixed executable: no build replaces it.
+    if is_native(target) {
+        // `native(path)` names a fixed executable: no build replaces it.
         if !matches!(v.kind, Kind::Dir | Kind::Git(_)) || v.exe.is_some() || target["path"].is_string() {
             return Ok(());
         }
@@ -4370,7 +4361,7 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
         let root = v.root.clone().ok_or_else(|| Error::msg("variant has no directory"))?;
         overlay_harness(v, &root, h)?;
         let output = crate::target::isolate::per_os(&build["output"])
-            .ok_or_else(|| Error::usage(format!("a native or webview target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
+            .ok_or_else(|| Error::usage(format!("a native target's build in strobe.json needs output for {}: the executable it builds", crate::target::isolate::os())))?;
         let dest = host::paths::sub("builds").join("out").join(hash_str(&root.to_string_lossy()));
         let built = root.join(cache_fill(output, &root));
         let exe = dest.join(built.file_name().ok_or_else(|| Error::usage(format!("build output {output} is not a file")))?);

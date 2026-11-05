@@ -6,12 +6,6 @@
 //! - Wakes: `proc_taskinfo.pti_csw`, a process's context switches (live and exited threads). macOS
 //!   keeps no per-thread count a user can read: per-thread rows carry CPU and names, not wakes.
 //! - No CPU affinity API exists (Apple Silicon ignores affinity tags): targets run unpinned.
-//! - Trees: launchd starts an app's XPC services (web content, GPU and network helpers, the app's
-//!   own services) with parent pid 1, so a tree also takes every process whose responsible process
-//!   is in it (`responsibility_get_pid_responsible_for_pid`, libSystem, no permission for this
-//!   user's processes). A process is responsible for itself when launchd starts it (Finder, the
-//!   Dock, `open`) or its launch disclaims its parent (`own_responsibility`); any other inherits its
-//!   parent's responsible process.
 //! - Windows from `CGWindowListCopyWindowInfo` (no permission for bounds, owner and on-screen state);
 //!   moving another app's window needs the Accessibility permission; reading its pixels needs Screen
 //!   Recording. Neither is asked for: without them strobe says what it cannot do.
@@ -369,14 +363,8 @@ pub fn energy_counters() -> bool {
 
 /// Indexes into `all` of the trees of `roots` (each root first, each process once), following only
 /// children that started no earlier than their parent (a reused pid). A zombie is in no tree: it
-/// runs nothing, and its children have left it. A process whose responsible process is in a tree
-/// joins it with its own tree (an XPC service launchd started for an app in it), when it started no
-/// earlier than that process; one responsible for itself or to anything outside the trees (another
-/// app, a shared system daemon, the terminal both were run from) never joins. `zombie_roots`: a
-/// root that exited and is not reaped yet still roots its tree, joined by its children that went to
-/// launchd and its services by their remembered responsible process (`responsible_pids`), for
-/// `kill_set` alone.
-fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
+/// runs nothing, and its children have left it.
+fn tree_of(all: &[Bsd], roots: &[u32]) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
         if p.ppid != p.pid && !p.zombie {
@@ -385,9 +373,10 @@ fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
     }
     let mut seen = vec![false; all.len()];
     let mut out = Vec::new();
-    let grow = |r: usize, seen: &mut [bool], out: &mut Vec<usize>| {
+    for &root in roots {
+        let Some(r) = all.iter().position(|p| p.pid == root && !p.zombie) else { continue };
         if std::mem::replace(&mut seen[r], true) {
-            return;
+            continue;
         }
         out.push(r);
         let mut stack = vec![r];
@@ -399,178 +388,8 @@ fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
                 }
             }
         }
-    };
-    for &root in roots {
-        if let Some(r) = all.iter().position(|p| p.pid == root && (zombie_roots || !p.zombie)) {
-            grow(r, &mut seen, &mut out);
-        }
     }
-    if out.is_empty() {
-        return out;
-    }
-    let responsible = responsible_pids(all, zombie_roots);
-    // Until no process joins: one that joined may hold a process responsible for itself (a
-    // disclaimed launch), whose services join after it.
-    loop {
-        let members: HashMap<u32, u64> = out.iter().map(|&i| (all[i].pid, all[i].start)).collect();
-        let joining: Vec<usize> = (0..all.len()).filter(|&i| !seen[i] && !all[i].zombie && responsible[i].and_then(|r| members.get(&r)).is_some_and(|&start| all[i].start >= start)).collect();
-        if joining.is_empty() {
-            return out;
-        }
-        for i in joining {
-            grow(i, &mut seen, &mut out);
-        }
-    }
-}
-
-/// `responsibility_get_pid_responsible_for_pid`: a private libSystem call, looked up rather than
-/// linked so a macOS without it still runs strobe (trees then follow parents alone).
-fn responsible_for() -> Option<unsafe extern "C" fn(libc::pid_t) -> libc::pid_t> {
-    static F: OnceLock<Option<unsafe extern "C" fn(libc::pid_t) -> libc::pid_t>> = OnceLock::new();
-    *F.get_or_init(|| {
-        let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"responsibility_get_pid_responsible_for_pid".as_ptr()) };
-        (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, unsafe extern "C" fn(libc::pid_t) -> libc::pid_t>(f) })
-    })
-}
-
-/// Each process's responsible process, aligned with `all`: None when it is responsible for itself,
-/// launchd is, or the call fails. macOS fixes it when a process starts, but the start time is the
-/// fork's, and a process may still change it at its exec (a disclaimed launch between fork and
-/// exec): so it is read again during a process's first 2 s, and a failed read is never kept.
-/// macOS answers a process's own pid once its responsible process has exited, reaped or not, so
-/// `remembered` (for `kill_set`) gives a process's last other answer: what an exited app left.
-fn responsible_pids(all: &[Bsd], remembered: bool) -> Vec<Option<u32>> {
-    use std::time::{Duration, Instant};
-    /// (answer, first seen, last answer naming another process).
-    type Seen = HashMap<(u32, u64), (Option<u32>, Instant, Option<u32>)>;
-    static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
-    let Some(f) = responsible_for() else { return vec![None; all.len()] };
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    let old = seen.take().unwrap_or_default();
-    let mut now = HashMap::with_capacity(all.len());
-    let out = all
-        .iter()
-        .map(|p| {
-            let key = (p.pid, p.start);
-            let (first, last) = match old.get(&key) {
-                Some(&e) if e.1.elapsed() >= Duration::from_secs(2) => {
-                    now.insert(key, e);
-                    return if remembered { e.0.or(e.2) } else { e.0 };
-                }
-                Some(&(_, first, last)) => (first, last),
-                None => (Instant::now(), None),
-            };
-            let r = unsafe { f(p.pid as libc::pid_t) };
-            if r < 0 {
-                if let Some(&e) = old.get(&key) {
-                    now.insert(key, e);
-                }
-                return if remembered { last } else { None };
-            }
-            let r = (r > 1 && r as u32 != p.pid).then_some(r as u32);
-            let last = r.or(last);
-            now.insert(key, (r, first, last));
-            if remembered { r.or(last) } else { r }
-        })
-        .collect();
-    *seen = Some(now);
     out
-}
-
-/// Why a launch `own_responsibility` was asked to make its own responsible process is not (its XPC
-/// services then go uncounted), read once the exec is done: None when it is.
-pub fn unattributed(pid: u32) -> Option<String> {
-    let Some(f) = responsible_for() else {
-        return Some("this macOS does not say which process is responsible for which (no responsibility_get_pid_responsible_for_pid), so the app's XPC services are not counted".into());
-    };
-    match unsafe { f(pid as libc::pid_t) } {
-        r if r as u32 == pid => None,
-        r if r < 0 => Some(format!("macOS did not say which process process {pid} is responsible to, so the app's XPC services are not counted")),
-        r => Some(format!("the app started responsible to process {r} (what strobe runs under), not to itself, so its XPC services (web content, GPU and network helpers) are not counted")),
-    }
-}
-
-/// Starts `cmd` as its own responsible process when its program is an app bundle's executable, as
-/// Finder, the Dock and `open` start an app: the XPC services it asks for are then responsible to it
-/// and join its tree, and macOS asks the app's own permissions (its bundle's grants). Launched as
-/// strobe's child, the app and its services would be responsible to strobe's own responsible
-/// process (the terminal or daemon strobe runs under), shared with everything else run from there,
-/// so no tree could tell its services apart. A bare executable keeps its parent's, as when a person
-/// runs it from a terminal. Between fork and exec, `posix_spawn` with `POSIX_SPAWN_SETEXEC` and the
-/// disclaim replaces the child in place (same pid, group and descriptors); if it fails, the
-/// ordinary exec follows, so the caller checks the child (`unattributed`). Returns whether the
-/// program is an app bundle's executable (a relative path is one against the command's folder, its
-/// symlinks left as they are).
-pub fn own_responsibility(cmd: &mut std::process::Command) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::process::CommandExt;
-    type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
-    static F: OnceLock<Option<SetDisclaim>> = OnceLock::new();
-    let program = Path::new(cmd.get_program());
-    // A name without a slash is looked up on PATH, never a bundle's executable.
-    if !program.as_os_str().as_bytes().contains(&b'/') {
-        return false;
-    }
-    let Ok(path) = std::path::absolute(cmd.get_current_dir().map(|d| d.join(program)).unwrap_or_else(|| program.to_path_buf())) else { return false };
-    if !path.to_string_lossy().contains(".app/Contents/MacOS/") {
-        return false;
-    }
-    let disclaim = *F.get_or_init(|| {
-        let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"responsibility_spawnattrs_setdisclaim".as_ptr()) };
-        (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(f) })
-    });
-    let Some(disclaim) = disclaim else { return true };
-    // The environment std's own exec would pass: strobe's, changed as `cmd` says.
-    let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
-    for (k, v) in cmd.get_envs() {
-        match v {
-            Some(v) => env.insert(k.to_owned(), v.to_owned()),
-            None => env.remove(k),
-        };
-    }
-    let cstr = |b: &[u8]| CString::new(b).ok();
-    let argv = std::iter::once(program.as_os_str()).chain(cmd.get_args()).map(|a| cstr(a.as_bytes())).collect::<Option<Vec<_>>>();
-    let envp = env.iter().map(|(k, v)| cstr(&[k.as_bytes(), b"=", v.as_bytes()].concat())).collect::<Option<Vec<_>>>();
-    let (Some(path), Some(argv), Some(envp)) = (cstr(path.as_os_str().as_bytes()), argv, envp) else { return true };
-    let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
-    if unsafe { libc::posix_spawnattr_init(&mut attr) } != 0 {
-        return true;
-    }
-    if unsafe { disclaim(&mut attr, 1) } != 0 || unsafe { libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short) } != 0 {
-        unsafe { libc::posix_spawnattr_destroy(&mut attr) };
-        return true;
-    }
-    let exec = Disclaimed { argv_p: argv.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(), envp_p: envp.iter().map(|e| e.as_ptr()).chain([std::ptr::null()]).collect(), path, _argv: argv, _envp: envp, attr };
-    // Only async-signal-safe work after fork: everything is built above.
-    unsafe {
-        cmd.pre_exec(move || {
-            let mut pid: libc::pid_t = 0;
-            libc::posix_spawn(&mut pid, exec.path.as_ptr(), std::ptr::null(), &exec.attr, exec.argv_p.as_ptr() as *const *mut c_char, exec.envp_p.as_ptr() as *const *mut c_char);
-            Ok(())
-        });
-    }
-    true
-}
-
-/// What `own_responsibility`'s exec needs, built before fork. The pointers point into `argv` and
-/// `envp`, which never move once built.
-struct Disclaimed {
-    path: CString,
-    _argv: Vec<CString>,
-    _envp: Vec<CString>,
-    argv_p: Vec<*const c_char>,
-    envp_p: Vec<*const c_char>,
-    attr: libc::posix_spawnattr_t,
-}
-
-// Read-only after it is built; the child of a fork uses its own copy.
-unsafe impl Send for Disclaimed {}
-unsafe impl Sync for Disclaimed {}
-
-impl Drop for Disclaimed {
-    fn drop(&mut self) {
-        unsafe { libc::posix_spawnattr_destroy(&mut self.attr) };
-    }
 }
 
 fn all_bsd() -> Vec<Bsd> {
@@ -589,7 +408,7 @@ pub fn process_list() -> Vec<(u32, u32, u64)> {
 pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
     let all = all_bsd();
     let roots = roots(&all.iter().map(|b| (b.pid, b.ppid, b.start)).collect::<Vec<_>>());
-    tree_of(&all, &roots, false)
+    tree_of(&all, &roots)
         .into_iter()
         .map(|i| {
             let b = &all[i];
@@ -601,23 +420,7 @@ pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = all_bsd();
-    tree_of(&all, &[root], false).into_iter().map(|i| all[i].pid).collect()
-}
-
-/// What `host::kill_tree` ends: `tree_pids`, and when `root` has exited but is not reaped (a launch
-/// strobe still owns, whose start time `start` its owner read at the launch), what it left running:
-/// processes responsible to it (its XPC services, its children that went to launchd) that started
-/// no earlier than it. Its pid cannot name another process while it is unreaped. macOS answers such a process's own pid once the root has exited, so
-/// this goes by the last answer strobe read while the root ran: a process the root started and left
-/// between two reads of the set is not found.
-pub fn kill_set(root: u32, start: Option<u64>) -> Vec<u32> {
-    let mut all = all_bsd();
-    // macOS gives no BSD info of an exited, unreaped process: it stands in with the start time its
-    // owner read at the launch.
-    if let Some(start) = start.filter(|_| !all.iter().any(|b| b.pid == root)) {
-        all.push(Bsd { pid: root, ppid: 1, name: String::new(), start, zombie: true });
-    }
-    tree_of(&all, &[root], true).into_iter().map(|i| all[i].pid).collect()
+    tree_of(&all, &[root]).into_iter().map(|i| all[i].pid).collect()
 }
 
 pub fn all_processes() -> Vec<ProcInfo> {

@@ -287,14 +287,11 @@ pub fn by_thread(spans: &[Span], names: &BTreeMap<u32, String>, modules: &BTreeM
             // macOS's per-process row (tid 0) is its process: its executable says whose it is.
             let exe = (tid == 0).then(|| host::exe_of(pid).map(|p| p.display().to_string())).flatten();
             let module = exe.as_ref().or_else(|| modules.get(&tid));
-            // An XPC service in the target's set runs for the app (its web content, its own services)
-            // whatever folder macOS keeps it in; the Metal shader compiler works for the GPU driver.
-            let xpc = exe.as_ref().filter(|e| e.contains(".xpc/")).map(|e| if e.contains("MTLCompilerService") { "driver" } else { "app" });
             // macOS counts wakes per process (the tid 0 row): its threads' own wakes are unknown, not 0.
             let unknown = cfg!(target_os = "macos") && tid != 0;
             serde_json::json!({
                 "pid": pid, "tid": tid, "name": names.get(&tid), "switches": if unknown { None } else { Some(n) },
-                "module": module.map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m)), "origin": xpc.or(module.map(|m| origin(m))),
+                "module": module.map(|m| m.rsplit(['\\', '/']).next().unwrap_or(m)), "origin": module.map(|m| origin(m)),
                 "wakes_per_s": if unknown { None } else if total_ms > 0.0 { Some(n as f64 / (total_ms / 1e3)) } else { Some(f64::NAN) },
                 "cpu_ms_per_run": if known { Some(cpu / runs) } else { None },
             })

@@ -104,8 +104,8 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     let name = host::all_processes().into_iter().find(|p| p.pid == root).map(|p| p.name).unwrap_or_default();
     let deep = match args.get("probes").unwrap_or("timing") {
         "timing" => false,
-        "deep" | "attribution" | "stacks-unprivileged" => true,
-        other => return Err(Error::usage(format!("--probes for a process: timing, deep or stacks-unprivileged, not {other}"))),
+        "deep" | "attribution" | "stacks-unprivileged" | "waits" => true,
+        other => return Err(Error::usage(format!("--probes for a process: timing, deep, waits (deep with off-CPU waits) or stacks-unprivileged, not {other}"))),
     };
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,
@@ -118,7 +118,8 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     // CPU and GPU work need no display, so only frames are refused then (SPEC §10.5).
     let locked = |awake: &host::Awake| awake.locks() > 0 || host::session_locked();
     if deep {
-        let cap = StackCapture::start_with(crate::probe::stacks::Targets::new(root, None), args.get("probes") == Some("stacks-unprivileged"))?;
+        let waits = args.get("probes") == Some("waits");
+        let cap = StackCapture::start_with(crate::probe::stacks::Targets::new(root, None), args.get("probes") == Some("stacks-unprivileged"), waits)?;
         progress(format!("sampling native stacks of {name} ({root}) for {}", fmt::ms_duration(for_ms)));
         std::thread::sleep(Duration::from_millis(for_ms));
         let d = cap.stop()?;
@@ -131,12 +132,18 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
             "id": id, "kind": "record", "target": target, "pid": root, "process": name, "probes": "deep", "token": "", "duration_ms": for_ms,
             "env": host::env(), "values": {}, "native": facts, "samples": d.samples.len(), "events_lost": d.events_lost, "pids": d.pids,
             "timing": "perturbed", "created": super::record::now_iso(), "valid": true, "suspend": d.suspend,
+            "waits": d.waits.as_ref().map(|w| w.waits.len()), "waits_refused": d.waits_refused.as_ref().filter(|_| waits).map(|r| r.message()),
         });
+        if let Some(r) = d.waits_refused.as_ref().filter(|_| waits) {
+            progress(format!("waits refused: {}", r.message()));
+        }
         store::write_json(&dir.join("meta.json"), &meta)?;
         draft.keep();
         let text = format!(
-            "{id} · {target} ({name}) · {} · deep\n{top}next     strobe query {id} hotspots --by package · strobe query {id} hotspots --thread <name> · strobe report recording {id} --open\n",
-            fmt::ms_duration(for_ms)
+            "{id} · {target} ({name}) · {} · deep{}\n{top}next     strobe query {id} hotspots --by package · strobe query {id} hotspots --thread <name>{} · strobe report recording {id} --open\n",
+            fmt::ms_duration(for_ms),
+            if d.waits.is_some() { " with off-CPU waits" } else { "" },
+            if d.waits.is_some() { format!(" · strobe query {id} waits") } else { String::new() }
         );
         return Ok(Output::new(text, meta));
     }
@@ -149,7 +156,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         p
     });
     let via = presents.as_ref().map(|p| p.via()).unwrap_or("");
-    let sampler = probe::os::Sampler::start(root, None);
+    let sampler = probe::os::Sampler::start(root);
     let cycles = || super::record::per_process(&set());
     // The tree's threads around the window: wakes and CPU per thread, as for a launched native app.
     let snap0 = wakes::Snapshot::take(&pids_now());

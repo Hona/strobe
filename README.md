@@ -1,6 +1,8 @@
 # strobe
 
-Benchmarks for web pages, Electron apps and native apps, on Windows, macOS and Linux. It runs your before and after builds in alternating pairs, says whether the change really helped, and points at the code when it didn't. Numbers it can't defend get refused, with the reason, never printed.
+strobe makes your app faster, and proves it. Your agent finds what's slow, fixes it, and knows for certain it worked, with numbers it can't fake.
+
+One tool for web, Electron and native apps on Windows, macOS and Linux. It measures what your users actually feel and explains it all the way down: the line of code, the native stack, every thread, wake-up, allocation, frame, GPU and byte of VRAM.
 
 ```ts
 // perf/scroll.bench.ts

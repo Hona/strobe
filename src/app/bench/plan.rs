@@ -34,7 +34,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let describe = runner.describe();
     runner.exit();
     let _ = std::fs::remove_file(&log);
-    let describe = describe?;
+    let mut describe = describe?;
+    super::apply_engines(&mut describe, args)?;
     let mut notes = Vec::new();
     if let Some(f) = args.get("filter") {
         let (text, err) = super::filter_report(&describe, f);
@@ -50,6 +51,7 @@ pub fn run(args: &Args) -> Result<Output> {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
     // What a bench would refuse before anything builds, the plan refuses too.
+    super::check_engines(&series, &describe, args)?;
     if variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2 {
         super::implementation_preflight(&describe, &series, &variants, &config, &super::target_projects(&describe)?)?;
     }

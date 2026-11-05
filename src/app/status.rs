@@ -18,6 +18,12 @@ pub fn run(args: &Args) -> Result<Output> {
     let topo = host::topology();
     let busy = host::system_busy(if args.has("fast") { 300 } else { 3000 });
     let browser = chromium::find();
+    // Optional: page targets run in Firefox only when a bench or record asks for it (`--engine firefox`).
+    let firefox = crate::target::firefox::find();
+    let firefox_text = firefox.as_ref().map(|p| {
+        let patched = if crate::target::firefox::patched(p) { " (Playwright's patched build, from STROBE_FIREFOX: not the Firefox people run)" } else { "" };
+        format!("{} · {}{patched}", crate::target::firefox::version_of(p).unwrap_or_else(|| "Firefox".into()), p.display())
+    });
     let bun = runner::find_bun();
     let state: Value = std::fs::read_to_string(host::paths::state_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
     let recordings = store::list("rec", 5);
@@ -89,7 +95,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let json = json!({
         "env": env, "topology": { "groups": groups, "vcache": vcache }, "busy": busy,
-        "browser": browser, "bun": bun, "engine": { "installed": engine::installed(), "version": engine::VERSION, "path": engine::path() },
+        "browser": browser, "firefox": firefox, "bun": bun, "engine": { "installed": engine::installed(), "version": engine::VERSION, "path": engine::path() },
         "calibration": calibration, "recordings": recordings.iter().map(|r| &r.0).collect::<Vec<_>>(),
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
         "session_locked": locked, "background_priority": qos, "timer_coalescing": timers, "valid": problems.is_empty(), "problems": problems,
@@ -111,6 +117,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     t += &format!("  {} screen     {}\n", mark(!locked), if locked { "locked: benches wait for an unlock" } else { "unlocked" });
     t += &format!("  {} browser    {}\n", mark(browser.is_some()), browser.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
+    t += &format!("  {} firefox    {}\n", if firefox.is_some() { "✓" } else { "i" }, firefox_text.as_deref().unwrap_or("none (only for --engine firefox)"));
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} deep       {}\n", mark(deep.presents() && deep.helper), deep_text);
     t += &format!("  {} native     {}\n", mark(native_ok), native_text);

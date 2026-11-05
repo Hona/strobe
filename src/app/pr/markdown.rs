@@ -382,6 +382,7 @@ impl<'a> Doc<'a> {
         }
         let (flagged, blocks) = self.busy_blocks();
         let line = match self.regime().as_str() {
+            "headless (no display)" => "Measured in a headless browser (no display): CPU and counters only; compare only with other headless runs.".to_string(),
             "session locked, display off" => "Measured with the screen locked and the display off: compare only with runs measured the same way.".to_string(),
             "session locked" => "Measured with the screen locked: compare only with other locked runs.".to_string(),
             _ if blocks > 0 && flagged * 2 >= blocks => format!("Other apps were busy in {flagged} of {blocks} timed blocks: expect wider ranges."),
@@ -421,6 +422,10 @@ impl<'a> Doc<'a> {
         let locked = ran.iter().all(|s| s["session"] == "locked");
         let mixed = ran.iter().any(|s| s["session"] == "mixed") || (!locked && ran.iter().any(|s| s["session"] == "locked"));
         let dark = ran.iter().all(|s| has_warning(s, "DisplayOff"));
+        // A headless page drew to no display: that, not the lock, is what its numbers compare with.
+        if !ran.is_empty() && ran.iter().all(|s| s["headless"] == true) {
+            return "headless (no display)".into();
+        }
         match (mixed, locked, dark) {
             (true, _, _) => "session lock state mixed".into(),
             (_, true, true) => "session locked, display off".into(),
@@ -985,7 +990,11 @@ impl<'a> Doc<'a> {
         let mut hw = vec![r["env"]["os"].as_str().unwrap_or("").to_string(), short_cpu(r["env"]["cpu"].as_str().unwrap_or(""))];
         hw.push(r["gpu"]["devices"][0].as_str().unwrap_or("").to_string());
         hw.push(r["env"]["power_plan"].as_str().map(|p| format!("{p} power plan")).unwrap_or_default());
-        hw.push(r["browser"].as_str().unwrap_or("").replace('/', " "));
+        let browsers: Vec<&str> = self.series.iter().filter_map(|s| s["browser"].as_str()).collect();
+        hw.push(browsers.first().copied().or(r["browser"].as_str()).unwrap_or("").replace('/', " "));
+        if !self.series.is_empty() && self.series.iter().all(|s| s["headless"] == true) {
+            hw.push("headless browser (no display)".into());
+        }
         if self.drew_frames() {
             hw.push(r["refresh_hz"].as_f64().map(|x| format!("{x:.0} Hz display")).unwrap_or_default());
         }

@@ -227,12 +227,7 @@ pub(super) fn page(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, at: &str
         }
         None => screen.missing.push("page: it did not answer for its title and headings in 5 s".into()),
     }
-    use base64::Engine;
-    let img = page
-        .send_timeout("Page.captureScreenshot", json!({ "format": "png" }), Duration::from_secs(5))
-        .ok()
-        .and_then(|r| base64::engine::general_purpose::STANDARD.decode(r["data"].as_str()?).ok())
-        .and_then(|b| png::read(&b).ok());
+    let img = page.screenshot(Duration::from_secs(5)).ok().and_then(|b| png::read(&b).ok());
     if img.is_none() {
         screen.missing.push("pixels: the page gave no screenshot in 5 s".into());
     }

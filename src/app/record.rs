@@ -5,11 +5,11 @@ use crate::cli::{Args, duration_ms};
 use crate::driver::Driver;
 use crate::host;
 use crate::metrics;
-use crate::model::{Error, Result};
+use crate::model::{Error, Result, WebEngine};
 use crate::probe::{self, Set};
 use crate::store;
 use crate::target::chromium::{self, Window};
-use crate::target::{electron, isolate};
+use crate::target::{electron, isolate, web};
 use crate::validity;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
@@ -28,7 +28,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.
     b.set("gpu-store", "exe");
-    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless"] {
+    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless", "engine"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }
@@ -137,6 +137,12 @@ pub fn run(args: &Args) -> Result<Output> {
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") && !target.starts_with("file://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, a local page.html, app:<id>, exe:<path>, cdp:<port> or file:<trace>")));
     }
+    // `--engine`: a page in another browser engine; Chromium (the default) records below.
+    match args.get("engine").map(WebEngine::parse).transpose()? {
+        Some(_) if attach || app.is_some() => return Err(Error::usage("--engine picks the browser strobe launches for a page (https://…, page.html); an attached endpoint or app is the browser it is")),
+        Some(WebEngine::Chromium) | None => {}
+        Some(engine) => return engine_page(args, engine, &target, set, for_ms),
+    }
     let mut guard = None;
     let browser = if attach {
         chromium::attach(&target)?
@@ -149,7 +155,7 @@ pub fn run(args: &Args) -> Result<Output> {
     } else {
         chromium::launch(&Window::default(), args.has("headless"), None, &[])?
     };
-    let gpu = validity::software_gpu(&browser);
+    let gpu = browser.gpu().and_then(validity::software_gpu);
     let debug = app.as_ref().and_then(|a| host::debug_runtime(&a.exe));
     let page = if app.is_some() { electron::main_page(&browser)? } else { browser.page()? };
     if let Some(g) = &guard {
@@ -163,7 +169,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let gpu = gpu?;
     // A launched target inherits strobe's priority; an attached one runs as its user left it.
     let qos = if attach { None } else { host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid))) };
-    validity::window_visible(&page)?;
+    validity::window_visible(&page.clone().into())?;
     // A headless target draws off screen, so only a headed one cares about the lock screen.
     let on_screen = !args.has("headless");
     if on_screen && host::session_locked() {
@@ -174,7 +180,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let (id, draft) = claim(args)?;
     let dir = draft.dir().to_path_buf();
     let token = id.trim_start_matches("rec_").to_string();
-    let driver = Driver::new(page.clone(), token.clone());
+    let driver = Driver::new(page.clone().into(), token.clone());
     if set == Set::Memory {
         let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
@@ -300,6 +306,115 @@ fn with_gpu_store(args: &Args, app: &isolate::App) -> Result<isolate::App> {
         other => return Err(Error::usage(format!("--gpu-cache is warm or cold, not {other}"))),
     }
     Ok(app)
+}
+
+/// A page in an engine other than Chromium (`--engine firefox`) for `for_ms`: what needs no Chromium
+/// trace, from outside as for a native app: its processes' CPU in cycles, GPU use and memory from the OS,
+/// the DOM's size, and headed, the OS's presents of its processes (`frames.*`, SPEC §7.2). Profilers,
+/// heap snapshots and the census are Chromium's DevTools: `--probes attribution|memory` refuses.
+fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u64) -> Result<Output> {
+    if set != Set::Timing {
+        return Err(Error::refused("EngineUnsupported", format!("--probes {}: profilers, heap snapshots and the memory census are Chromium's DevTools; {engine} has none in strobe yet", args.get("probes").unwrap_or("")), "record the page in Chromium (drop --engine) for attribution or memory"));
+    }
+    let headless = args.has("headless");
+    let patched = web::patched(engine);
+    if let Some(why) = &patched {
+        progress(format!("! PatchedBrowser  {why}"));
+    }
+    let browser = web::launch(engine, &Window::default(), headless, None)?;
+    let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
+    let page = browser.page()?;
+    progress(format!("loading {target} in {}", browser.version()));
+    page.navigate(target, Duration::from_secs(60))?;
+    let qos = host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid())));
+    validity::window_visible(&page)?;
+    if !headless && host::session_locked() {
+        return Err(validity::locked());
+    }
+    let awake = host::Awake::start();
+    let (id, draft) = claim(args)?;
+    let dir = draft.dir().to_path_buf();
+    std::thread::sleep(Duration::from_millis(300));
+    let sampler = probe::os::Sampler::start(browser.pid(), browser.profile());
+    // The capture follows the browser's windows (macOS and X11 stream them by window).
+    let presents = (!headless).then(|| {
+        crate::probe::present::PresentCapture::start().map(|mut c| {
+            c.track(&browser.pids());
+            c
+        })
+    });
+    let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+    let cpu0 = cycles();
+    let t0 = host::now_ns();
+    progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
+    std::thread::sleep(Duration::from_millis(for_ms));
+    let t1 = host::now_ns();
+    let cpu1 = cycles();
+    let os = sampler.stop().window(t0, t1);
+    let tree = browser.pids();
+    let presents = presents.map(|r| r.and_then(|c| c.stop()));
+    if !headless && (awake.locks() > 0 || host::session_locked()) {
+        return Err(validity::locked());
+    }
+    let mut values: BTreeMap<String, f64> = BTreeMap::new();
+    let mut refused = serde_json::Map::new();
+    // Where cycles are not time on this machine (`outside::not_on_this_os`), both CPU metrics are refused.
+    match (cpu0.1, cpu1.1, super::outside::not_on_this_os("cpu.app.total")) {
+        (Some(a), Some(b), None) if b > a && cpu1.0 > 0 => {
+            let share = cpu1.0.saturating_sub(cpu0.0) as f64 / (b - a) as f64;
+            values.insert("cpu.app.total".into(), 100.0 * share);
+            values.insert("cpu.work".into(), share * (t1 - t0) as f64 / 1e6);
+        }
+        (_, _, why) => {
+            let r = why.unwrap_or_else(|| crate::model::Refusal::new(crate::model::ValidatorId::RunIncomplete, "no CPU of the browser's processes could be read"));
+            for m in ["cpu.app.total", "cpu.work"] {
+                refused.insert(m.into(), json!(r.message()));
+            }
+        }
+    }
+    if let Some(p) = os.gpu_3d_pct.filter(|_| !headless) {
+        values.insert("gpu.process.3d".into(), p);
+    }
+    // A headless browser that drew in software held no GPU memory: nothing to read there.
+    if let Some(v) = os.vram_dedicated_mb.filter(|_| !(headless && gpu.software)) {
+        values.insert("gpu.vram".into(), v);
+    }
+    values.insert("memory.app.private".into(), browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0));
+    if let Some(n) = page.eval("document.getElementsByTagName('*').length").ok().and_then(|v| v.as_f64()) {
+        values.insert("dom.nodes".into(), n);
+    }
+    let os_frames = match presents {
+        Some(Ok(p)) => {
+            let display = host::main_window(&tree).and_then(|w| host::display_of(w.hwnd));
+            let f = crate::probe::present::frames::native_values(&p, &tree, &[(t0, t1)], display.as_ref());
+            // What `query <rec> frames` reads for a recording without a trace, as a native one's.
+            crate::symbol::write_gz(&dir.join("presents.json.gz"), &p)?;
+            store::write_json(&dir.join("frames.json"), &json!({ "pids": tree, "runs": { "run:0": { "t0_ns": t0, "t1_ns": t1, "inputs": [], "marks": [], "changes": [] } } }))?;
+            match f.refused {
+                Some(why) => json!({ "refused": why }),
+                None => {
+                    values.extend(f.values.clone());
+                    for (m, why) in &f.partial {
+                        refused.insert(m.clone(), json!(why));
+                    }
+                    json!({ "values": f.values, "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "pids": tree })
+                }
+            }
+        }
+        Some(Err(e)) => json!({ "refused": e.message }),
+        None => json!({ "refused": "Headless: the page ran headless, so nothing it drew reached a display" }),
+    };
+    let version = browser.version().to_string();
+    browser.close();
+    let mut meta = json!({
+        "id": id, "kind": "record", "target": target, "probes": set, "token": "", "duration_ms": for_ms, "engine": engine, "headless": headless,
+        "browser": version, "gpu": gpu, "env": host::env(), "values": values, "refused": refused, "os": os, "os_frames": os_frames, "phases": [],
+        "timing": "clean", "created": now_iso(), "valid": true, "patched_browser": patched,
+    });
+    refuse_background(&mut meta, qos);
+    store::write_json(&dir.join("meta.json"), &meta)?;
+    draft.keep();
+    Ok(Output::new(summary_text(&meta), meta))
 }
 
 /// A native app for `for_ms` (SPEC §13.7): launched isolated, left to settle for 3 s, then one run
@@ -689,6 +804,39 @@ fn background_line(meta: &Value) -> Option<String> {
     meta["background_priority"].as_str().map(|why| format!("frames   refused (BackgroundPriority): the target ran at {why}; frames and input latencies there describe no person's machine (CPU is kept)\n"))
 }
 
+/// A page recorded in another engine than Chromium (`engine_page`): what it measured from outside.
+fn engine_summary(meta: &Value) -> String {
+    let v = &meta["values"];
+    let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
+    let id = meta["id"].as_str().unwrap_or("");
+    let mut s = format!(
+        "{id} · {} · {} · {}{}\n",
+        meta["target"].as_str().unwrap_or(""),
+        fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
+        meta["browser"].as_str().unwrap_or(""),
+        if meta["headless"] == true { " · headless" } else { "" }
+    );
+    s += &format!("cpu      {} of one core (cpu.app.total) · {} in the window (cpu.work), all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
+    s += &format!("memory   {} private · {} DOM nodes\n", fmt::value(get("memory.app.private"), "MB"), fmt::value(get("dom.nodes"), "count"));
+    match (background_line(meta), meta["os_frames"]["refused"].as_str()) {
+        (Some(line), _) => s += &line,
+        (None, Some(why)) => s += &format!("frames   refused: {why}\n"),
+        (None, None) => {
+            s += &format!(
+                "frames   {} on screen (OS presents) · {} of refreshes dropped · display {}\n",
+                fmt::value(get("frames.presented.count"), "count"),
+                fmt::value(get("frames.dropped.pct"), "%"),
+                if get("display.hz").is_finite() { format!("{:.0} Hz", get("display.hz")) } else { "?".into() }
+            );
+            if get("gpu.process.3d").is_finite() {
+                s += &format!("gpu      {} of the 3D engine\n", fmt::value(get("gpu.process.3d"), "%"));
+            }
+        }
+    }
+    s += &format!("next     strobe query {id} summary\n");
+    s
+}
+
 pub fn summary_text(meta: &Value) -> String {
     let mut s = summary_body(meta);
     s += &context_lines(meta);
@@ -757,6 +905,9 @@ fn summary_body(meta: &Value) -> String {
     }
     if meta["native"] == true {
         return native_summary(meta);
+    }
+    if meta["engine"].as_str().is_some_and(|e| e != "chromium") {
+        return engine_summary(meta);
     }
     let mut s = format!(
         "{} · {} · {} · {}\n",

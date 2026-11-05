@@ -21,6 +21,7 @@ strobe status [--calibrate]
 
 ```text
 strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
+strobe record https://… --engine firefox [--headless] [--for 10s]
 strobe record --bench <file.bench.ts>#<case> [--head <variant>]
 strobe record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]
 strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
@@ -30,6 +31,7 @@ strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
 - `pid:<n>|proc:<name>`: any running process from outside: frames from the OS's present events, CPU, threads, IO, GPU, memory.
   - `deep`: native stacks (kernel sampled profile, PDB symbols).
 - `--until-line`: a native app from the line it prints when ready (to the next line), not a fixed settle.
+- `--engine firefox`: the page in Firefox, from outside: CPU, GPU, memory, DOM nodes, and headed the OS's frames.
 
 ### `strobe bench`
 
@@ -39,12 +41,19 @@ strobe bench <file.bench.ts> --head <variant>
     [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power high|keep]
     [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
     [--pixels | --pixels-only] [--reserve-cpus auto|on|off] [--noworse 2% | metric=2%,…]
+    [--engine chromium|firefox] [--headless]
 ```
 
 - variant: a directory, a git ref, `app:<id>`, `exe:<path>`; or a target of the file, `<target>[=<variant>]`, on both sides: an implementation comparison.
   - Every variant builds and serves with head's harness (the bench file's folder, strobe.json and its `harness` paths), so a base from before the bench works.
 - `--filter`: case names, comma-separated, exact unless they hold `*` (`"window-closed*"` also runs `window-closed-memory`).
   - strobe prints what runs and what it skips before building.
+- `--engine firefox`: page targets in Firefox (only the file's Firefox targets, when it has some).
+  - No trace there: `main.*`, `layout.*`, `js.heap.*`, `span.*`, `frames.presented.p*` refuse.
+  - Use `cpu.work` (every page block has it, in both engines), `phase.<name>`, `count.<name>`, `net.*`.
+  - Headed: frames and `interaction.*` from the OS's presents (macOS, Linux: counts only).
+  - No attribution blocks, launch cases or leak runs in Firefox yet. `ctx.mock` works; `ctx.playwright` throws.
+- `--headless`: page targets headless, timed too; runs through a lock. Frame, latency, scroll, canvas and GPU-use metrics refuse `Headless`; `input.rate` stays. Pages only (an app or native target is a usage error).
 
 ### `strobe plan`
 
@@ -174,7 +183,7 @@ strobe update [<version>] [--from <path>] [--check]
 
 ### Targets
 
-- `https://…`
+- `https://…`: Chromium, or Firefox with `--engine firefox` (stock Firefox only; `status` shows it)
 - `cdp:<port>`
 - `app:<id>`: a profile in strobe.json `apps`, Electron or native
 - `exe:<path>`: `--native` for a native app
@@ -331,7 +340,7 @@ export default bench({
 ### Locked sessions
 
 - A locked session: series that need no presenting window run anyway and say `session locked`; compare those only with locked runs. They are:
-  - script targets, leak runs
+  - script targets, leak runs, headless pages (`--headless`)
   - `window: false` native cases measuring `cpu.*`, `memory.*`, `gpu.vram`, `gpu.shared`, `io.*`, `count.*`, `phase.*`, `energy.*`, milestones
   - any native case with those under `--check`
 - Both blocks of a pair also share the display state (a locked display sleeps; `DisplayOff` says so).
@@ -443,7 +452,8 @@ export default bench({
 Fewer than 6 pairs never gets a verdict.
 
 - Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
-- No display (locked, a server)? `--check --headless` checks page cases with frame and latency metrics refused.
+- No display (locked, a server)? `--headless` runs page cases (check or timed) with frame and latency metrics refused.
+- Comparing engines? `cpu.work` is the one primary both have; a Firefox page's main-thread split does not exist.
 - `--blocks N` times one build alone (what `track` records).
 
 ### `strobe.json`

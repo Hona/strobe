@@ -73,7 +73,9 @@ const state: {
   mocks: { pattern: string; test: RegExp; handler: Function }[]
   session: any
   fixture: { url: string; port: number; pid: number; home: string } | null
-} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null }
+  engine: string
+  relay: any
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null }
 
 const context = () => ({
   page,
@@ -113,6 +115,8 @@ const context = () => ({
   },
 })
 
+// Playwright connects over CDP, which only Chromium speaks: on another engine reading it throws, typed
+// as strobe's EngineUnsupported refusal, so the bench names the cause instead of a null page failing later.
 const prepareContext = () => ({
   case: state.case,
   params: state.params,
@@ -120,7 +124,12 @@ const prepareContext = () => ({
   variant: state.variant,
   url: state.url,
   root: state.root,
-  playwright: state.playwright,
+  get playwright() {
+    if (state.engine === "chromium") return state.playwright
+    const summary = `ctx.playwright connects over Chromium's DevTools protocol; this target runs in ${state.engine}`
+    const fix = "use ctx.mock for network mocks and the page driver for the rest, or run the target in Chromium"
+    throw Object.assign(new Error(`EngineUnsupported: ${summary}`), { hint: fix, refusal: { validator: "EngineUnsupported", summary, fix } })
+  },
   mock,
 })
 
@@ -200,14 +209,64 @@ async function strobePage(context: any, target: string) {
 // Mocks through the Fetch domain on only the mocked patterns: unlike Playwright's routing, which turns
 // the HTTP cache off for the page, every other request loads as it would for a person.
 async function mock(pattern: string, handler: Function) {
-  if (!state.playwright) throw new Error("mock needs the block's browser: call it in prepare")
   const test = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replaceAll("?", ".").replaceAll("*", ".*") + "$")
+  if (state.engine !== "chromium") {
+    // Another engine has one remote connection, strobe's: strobe intercepts and asks these handlers.
+    state.mocks.push({ pattern, test, handler })
+    const where = await request("mock", { pattern })
+    if (!state.relay) state.relay = await relay(where.port, where.token)
+    return
+  }
+  if (!state.playwright) throw new Error("mock needs the block's browser: call it in prepare")
   state.mocks.push({ pattern, test, handler })
   if (!state.session) {
     state.session = await state.playwright.context.newCDPSession(state.playwright.page)
     state.session.on("Fetch.requestPaused", (event: any) => void answer(state.session, event))
   }
   await state.session.send("Fetch.enable", { patterns: state.mocks.map((m) => ({ urlPattern: m.pattern, requestStage: "Request" })) })
+}
+
+// The handler's response as plain parts: status, header pairs and the body's bytes.
+async function respond(req: any): Promise<{ status: number; headers: [string, string][]; body: Uint8Array } | undefined> {
+  for (const m of state.mocks.toReversed()) {
+    if (!m.test.test(req.url)) continue
+    const res = await m.handler(req)
+    if (res === undefined) continue
+    const raw = res.body
+    const json = raw !== undefined && typeof raw !== "string" && !(raw instanceof Uint8Array)
+    const body = raw === undefined ? new Uint8Array() : raw instanceof Uint8Array ? raw : new TextEncoder().encode(json ? JSON.stringify(raw) : raw)
+    const out = { ...(json ? { "content-type": "application/json" } : {}), ...res.headers }
+    return { status: res.status ?? 200, headers: Object.entries(out).map(([k, v]) => [k, String(v)] as [string, string]), body }
+  }
+  return undefined
+}
+
+// strobe's relay for an engine without a CDP session: one line per paused request, one line back.
+// The request body is not given (WebDriver BiDi does not carry it), so `body` is undefined there.
+async function relay(port: number, token: string) {
+  const sock = connect(port, "127.0.0.1")
+  await new Promise((resolve, reject) => {
+    sock.once("connect", resolve)
+    sock.once("error", reject)
+  })
+  sock.setNoDelay(true)
+  // strobe ends the relay with the block: a reset then is its close, not the bench's failure.
+  sock.on("error", () => {})
+  sock.write(token + "\n")
+  const lines = createInterface({ input: sock })
+  lines.on("error", () => {})
+  lines.on("line", async (line) => {
+    const r = JSON.parse(line)
+    const req = { url: r.url, method: r.method, headers: r.headers ?? {}, body: undefined, json: () => null }
+    try {
+      const res = await respond(req)
+      sock.write(JSON.stringify(res ? { id: r.id, status: res.status, headers: res.headers, body: Buffer.from(res.body).toString("base64") } : { id: r.id, pass: true }) + "\n")
+    } catch (error) {
+      console.error(`mock ${r.method} ${r.url}: ${error instanceof Error ? error.stack : error}`)
+      sock.write(JSON.stringify({ id: r.id, error: String(error) }) + "\n")
+    }
+  })
+  return sock
 }
 
 async function answer(session: any, event: any) {
@@ -261,6 +320,8 @@ async function handle(op: string, args: any) {
         prepared: undefined,
         mocks: [],
         session: null,
+        engine: args.engine ?? "chromium",
+        relay: null,
       })
       return true
     case "before":
@@ -279,7 +340,7 @@ async function handle(op: string, args: any) {
     case "prepare": {
       const target = spec.targets[state.target]
       if (target?.prepare) {
-        state.playwright = await playwright(args.endpoint, args.target)
+        if (args.endpoint) state.playwright = await playwright(args.endpoint, args.target)
         state.prepared = await target.prepare(prepareContext())
       }
       // A `url` function names the first page from what `prepare` returned, so the block loads one page.
@@ -305,7 +366,8 @@ async function handle(op: string, args: any) {
       await Promise.resolve(spec.targets[state.target]?.teardown?.(prepareContext())).catch((e) => errors.push(e))
       if (state.session) await state.session.detach().catch(() => {})
       if (state.playwright) await state.playwright.browser.close().catch(() => {})
-      Object.assign(state, { playwright: null, session: null, mocks: [] })
+      if (state.relay) state.relay.end()
+      Object.assign(state, { playwright: null, session: null, mocks: [], relay: null })
       if (errors.length) throw new AggregateError(errors, `teardown failed: ${errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; ")}`)
       return true
     }

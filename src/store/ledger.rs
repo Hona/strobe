@@ -87,6 +87,23 @@ fn attempt(line: &Value, current: &Value, later: bool) -> Value {
             changed.push(format!("no-worse margins {} → {}", margins(&x["noworse"]), margins(&y["noworse"])));
         }
     }
+    // A page target's engine, browser version and headless mode (`identity.engines`).
+    let engines = |id: &Value| id["engines"].as_object().cloned().unwrap_or_default();
+    let (ea, eb) = (engines(then), engines(now));
+    // An identity from before strobe recorded engines says nothing about them.
+    let known = then.get("engines").is_some() && now.get("engines").is_some();
+    let mut targets: Vec<&String> = ea.keys().chain(eb.keys()).filter(|_| known).collect();
+    targets.sort();
+    targets.dedup();
+    for t in targets {
+        let show = |e: Option<&Value>| match e {
+            Some(e) => format!("{}{}", e["browser"].as_str().unwrap_or("?"), if e["headless"] == true { " headless" } else { "" }),
+            None => "none".into(),
+        };
+        if ea.get(t) != eb.get(t) {
+            changed.push(format!("{t}: {} → {}", show(ea.get(t)), show(eb.get(t))));
+        }
+    }
     let flags = |id: &Value| id["flags"].as_object().cloned().unwrap_or_default();
     let (fa, fb) = (flags(then), flags(now));
     let mut keys: Vec<&String> = fa.keys().chain(fb.keys()).collect();

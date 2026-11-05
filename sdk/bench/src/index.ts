@@ -173,7 +173,7 @@ export interface PrepareContext<P> {
   url: string
   /** The variant's folder: a git ref's worktree, or the directory it names. */
   root: string
-  /** Playwright, connected to this block's browser. Only on targets with a debug port. */
+  /** Playwright, connected to this block's browser. Only on Chromium targets; reading it on another engine throws (EngineUnsupported). */
   playwright: { browser: any; context: any; page: any }
   /**
    * Answers requests whose URL matches `pattern` (`*` is any run of characters) in this block's page.
@@ -312,8 +312,8 @@ interface Hooks<P> {
 
 export type Target<P> = Side &
   (
-    | ({ kind: "web"; url: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P>)
-    | ({ kind: "url"; href: string; viewport?: Viewport; scale?: number } & Hooks<P>)
+    | ({ kind: "web"; url: FirstPage<P> } & PageOptions & Hooks<P>)
+    | ({ kind: "url"; href: string } & PageOptions & Hooks<P>)
     | ({ kind: "app"; id: string } & AppOptions)
     | ({ kind: "exe"; path: string; app?: string } & AppOptions)
     | ({ kind: "command" } & CommandOptions)
@@ -346,6 +346,22 @@ export interface AppOptions {
   env?: Record<string, string>
   /** Files written into the home before the launch, over the profile's (JSON or text; placeholders as in `args`; a string that is exactly `{fixture.port}` or `{fixture.pid}` becomes a number). */
   files?: Record<string, unknown>
+}
+
+/**
+ * The browser a page runs in: `"chromium"` (default; over CDP, with its trace, profilers and heap snapshots),
+ * `"firefox"` (over WebDriver BiDi: CPU, GPU, memory, counters, phases, network, and headed the OS's frames and
+ * input latency; Chromium-only metrics are refused EngineUnsupported) or `"webkit"` (refused: not built yet).
+ */
+export type Engine = "chromium" | "firefox" | "webkit"
+
+export interface PageOptions {
+  viewport?: Viewport
+  scale?: number
+  /** The browser engine (`--engine` overrides it, or picks the targets of one engine). */
+  engine?: Engine
+  /** Run headless: no display needed (runs through a locked session); frame, input-latency and GPU-use metrics are refused (Headless). */
+  headless?: boolean
 }
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
@@ -466,12 +482,12 @@ export interface Bench<Params extends Record<string, ParamValues>> {
  * page's own caches) whose warmup runs fill Chromium's GPU caches before the measured runs, and the GPU
  * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
  */
-export function web<P = any>(opts: { url?: FirstPage<P>; viewport?: Viewport; scale?: number } & Hooks<P> & Side = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd }
+export function web<P = any>(opts: { url?: FirstPage<P> } & PageOptions & Hooks<P> & Side = {}): Target<P> {
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */
-export function url<P = any>(href: string, opts: { viewport?: Viewport; scale?: number } & Hooks<P> & Side = {}): Target<P> {
+export function url<P = any>(href: string, opts: PageOptions & Hooks<P> & Side = {}): Target<P> {
   return { kind: "url", href, ...opts }
 }
 

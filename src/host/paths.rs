@@ -52,7 +52,7 @@ pub fn sdk() -> PathBuf {
 /// Creates `dir` (its parents as the umask says) and makes it the user's alone on Linux and macOS:
 /// created `0700`, and an existing one (an older strobe made it with the umask's mode) that others
 /// may read is set to `0700` when it is seen.
-fn owner_only_dir(dir: &Path) {
+pub fn owner_only_dir(dir: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt, PermissionsExt};

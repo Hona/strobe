@@ -72,6 +72,10 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(p) => s.line("✓", "browser", p.display().to_string()),
         None => s.line("✗", "browser", "no Chromium: install Chrome or run bunx playwright install chromium"),
     }
+    match crate::target::firefox::find() {
+        Some(p) => s.line("✓", "firefox", format!("{} · {}", crate::target::firefox::version_of(&p).unwrap_or_else(|| "Firefox".into()), p.display())),
+        None => s.line("i", "firefox", "none (only --engine firefox needs it: install Firefox from mozilla.org)"),
+    }
     match runner::find_bun() {
         Some(p) => s.line("✓", "bun", p.display().to_string()),
         None => s.line("!", "bun", "missing: bench files need Bun (https://bun.sh)"),
@@ -459,18 +463,19 @@ pub fn calibrate(full: bool) -> Result<Value> {
     let base = format!("http://127.0.0.1:{port}/");
     let browser = chromium::launch(&Window::default(), false, None, &[])?;
     let result = (|| -> Result<Value> {
-        validity::software_gpu(&browser)?;
+        validity::software_gpu(browser.gpu()?)?;
         let page = browser.page()?;
+        let shown: crate::target::web::WebPage = page.clone().into();
         page.navigate(&format!("{base}?case=idle"), Duration::from_secs(30))?;
-        validity::window_visible(&page)?;
-        let mut speeds: Vec<f64> = (0..5).filter_map(|_| validity::speed_check(&page).ok()).collect();
+        validity::window_visible(&shown)?;
+        let mut speeds: Vec<f64> = (0..5).filter_map(|_| validity::speed_check(&shown).ok()).collect();
         speeds.sort_by(|a, b| a.total_cmp(b));
         let speed = metrics::median(&speeds);
         let mut checks = Vec::new();
         let measure = |query: &str, ms: u64| -> Result<BTreeMap<String, f64>> {
             page.navigate(&format!("{base}?{query}"), Duration::from_secs(30))?;
             let token = format!("cal{}", host::now_ns() % 1_000_000);
-            let driver = Driver::new(page.clone(), token.clone());
+            let driver = Driver::new(page.clone().into(), token.clone());
             let tracing = probe::trace::start(&browser.cdp, Set::Timing)?;
             std::thread::sleep(Duration::from_millis(300));
             driver.mark("run:0:start")?;
@@ -554,6 +559,11 @@ pub fn leave(args: &Args) -> Result<Output> {
         }
     }
     s.line("✓", "mcp", "removed");
+    // Snap Firefox's profiles live in its own folder, outside the state folder (`firefox::snap_profiles`).
+    if crate::target::firefox::snap_profiles().exists() {
+        let _ = std::fs::remove_dir_all(crate::target::firefox::snap_profiles());
+        s.line("✓", "firefox", "removed strobe's Snap Firefox profiles");
+    }
     let _ = std::fs::remove_dir_all(skill_path().parent().unwrap_or(Path::new("")));
     s.line("✓", "skill", "removed");
     // The deep-mode helper lives where only an elevated step writes: one UAC prompt removes it.

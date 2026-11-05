@@ -107,6 +107,7 @@ validators!(
     NotComparable,
     ParityGap,
     InputMismatch,
+    Headless,
 );
 
 impl ValidatorId {
@@ -123,8 +124,42 @@ impl ValidatorId {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
-            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch => false,
+            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless => false,
         }
+    }
+}
+
+/// The browser engine a page target runs in (SPEC §13.1): Chromium over CDP (the default), Firefox
+/// over WebDriver BiDi, WebKit (not built yet: a typed refusal).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebEngine {
+    #[default]
+    Chromium,
+    Firefox,
+    Webkit,
+}
+
+impl WebEngine {
+    pub const ALL: [WebEngine; 3] = [WebEngine::Chromium, WebEngine::Firefox, WebEngine::Webkit];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            WebEngine::Chromium => "chromium",
+            WebEngine::Firefox => "firefox",
+            WebEngine::Webkit => "webkit",
+        }
+    }
+
+    /// `chromium`, `firefox` or `webkit` (`--engine`, a target's `engine`); anything else is a usage error.
+    pub fn parse(s: &str) -> Result<WebEngine> {
+        WebEngine::ALL.into_iter().find(|e| e.name() == s).ok_or_else(|| Error::usage(format!("engine: chromium, firefox or webkit, not {s:?}")))
+    }
+}
+
+impl fmt::Display for WebEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
     }
 }
 

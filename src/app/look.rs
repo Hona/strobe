@@ -215,12 +215,12 @@ pub fn run(args: &Args) -> Result<Output> {
         // The same selectors and probe as a bench's page calls and `expect`, so what look says is what they see.
         if let Some(sel) = args.get("until") {
             let sel = Selector::parse(&Value::String(sel.to_string()), Dialect::Page)?;
-            if !crate::driver::shows(&page, &sel, timeout)? {
+            if !crate::driver::shows(&page.clone().into(), &sel, timeout)? {
                 problems.push(format!("{:?} never showed in {} s", sel.source, timeout.as_secs()));
             }
         }
         std::thread::sleep(Duration::from_millis(wait));
-        let info = crate::driver::screen(&page, 6, chars, Duration::from_secs(10))?;
+        let info = crate::driver::screen(&page.clone().into(), 6, chars, Duration::from_secs(10))?;
         // Everything the page said while it loaded and settled.
         let mut console: Vec<Value> = Vec::new();
         for ev in events.try_iter().filter(|e| e["sessionId"].as_str() == Some(page.session.as_str())) {

@@ -106,6 +106,8 @@ fn fingerprint_text(s: &Series) -> String {
         format!("session {}", f["session"].as_str().unwrap_or("")),
         format!("display {}", f["display"].as_str().unwrap_or("")),
         f["pin"].as_str().unwrap_or("").to_string(),
+        f["browser"].as_str().unwrap_or("").to_string(),
+        if f["headless"] == true { "headless".to_string() } else { String::new() },
     ])
 }
 

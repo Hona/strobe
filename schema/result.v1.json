@@ -16,10 +16,10 @@
     "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
     "passed": { "type": "boolean", "description": "check: every case passed." },
     "env": { "type": "object", "description": "The device: OS, CPU, GPU, displays, power, strobe's build." },
-    "browser": { "type": ["string", "null"], "description": "The browser's version, for page targets." },
-    "gpu": { "type": ["object", "null"], "description": "The browser's GPU: devices, compositing, software." },
+    "browser": { "type": ["string", "null"], "description": "The first page target's browser version (each series has its own: series.browser)." },
+    "gpu": { "type": ["object", "null"], "description": "The first page target's browser GPU: devices, compositing, software." },
     "window": { "type": ["object", "null"], "description": "The window's place and size: x, y, width, height." },
-    "refresh_hz": { "type": ["number", "null"] },
+    "refresh_hz": { "type": ["number", "null"], "description": "The display's refresh; null when every series ran headless (no display)." },
     "args": { "type": ["object", "null"], "description": "The command line: command, flags, pos." },
     "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache." },
     "identity": { "type": ["object", "null"], "description": "What makes two experiments the same comparison (SPEC 14.2)." },
@@ -159,7 +159,8 @@
         "FixtureMismatch",
         "NotComparable",
         "ParityGap",
-        "InputMismatch"
+        "InputMismatch",
+        "Headless"
       ]
     },
     "verdictKind": {
@@ -293,7 +294,9 @@
         "kind": { "type": "string", "description": "runs, launch or leak; check (--check), pixels (--pixels-only), blocks (--blocks: one build's timed blocks, nothing compared)." },
         "params": { "type": ["object", "null"] },
         "primary": { "anyOf": [{ "$ref": "#/definitions/comparison" }, { "$ref": "#/definitions/leakPrimary" }, { "$ref": "#/definitions/checkPrimary" }, { "$ref": "#/definitions/blocksPrimary" }] },
-        "headless": { "type": "boolean", "description": "check: the page ran in a headless browser (--headless), its frame and input-latency metrics refused." },
+        "headless": { "type": "boolean", "description": "A page target ran in a headless browser (--headless, or the target's headless): no display, so its frame, input-to-screen latency, scroll, canvas and GPU-use metrics are refused (Headless); CPU, counters, memory and input pacing stay." },
+        "engine": { "enum": ["chromium", "firefox", "webkit", null], "description": "A page target's browser engine (--engine, or the target's engine)." },
+        "browser": { "type": ["string", "null"], "description": "The browser versions this series' blocks ran (`a / b` when the sides of an implementation comparison ran two); part of a tracked series' fingerprint." },
         "overhead": { "$ref": "#/definitions/overhead" },
         "secondaries": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "descriptive": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },

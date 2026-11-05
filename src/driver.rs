@@ -1,11 +1,14 @@
-//! The `page` driver (SPEC §9.6): inputs over CDP, event-driven waits, run and phase marks.
+//! The `page` driver (SPEC §9.6): inputs over CDP or WebDriver BiDi, event-driven waits, run and phase
+//! marks.
 
 pub mod native;
 
 use crate::model::{Error, Result};
 use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
 use crate::target::a11y::{Dialect, Selector};
-use crate::target::chromium::Page;
+use crate::target::bidi;
+use crate::target::chromium;
+use crate::target::web::WebPage as Page;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
@@ -329,6 +332,42 @@ fn cdp_button(b: Button) -> (&'static str, i64) {
     }
 }
 
+/// WebDriver's button number.
+fn bidi_button(b: Button) -> u8 {
+    match b {
+        Button::Left => 0,
+        Button::Middle => 1,
+        Button::Right => 2,
+    }
+}
+
+/// The modifier keys of CDP modifier bits, in the order they go down.
+fn mod_keys(bits: i64) -> Vec<Key> {
+    [(2, Named::Control), (8, Named::Shift), (1, Named::Alt), (4, Named::Meta)].into_iter().filter(|(b, _)| bits & b != 0).map(|(_, n)| Key::Named(n)).collect()
+}
+
+/// A key source's down or up action for WebDriver input.
+fn key_action(k: Key, down: bool) -> Result<Value> {
+    Ok(json!({ "type": if down { "keyDown" } else { "keyUp" }, "value": bidi::key_value(k)? }))
+}
+
+/// One BiDi `performActions` list: `pointer` actions with the modifier keys `mods` (CDP bits) pressed
+/// around them, as ticks of a key source beside the pointer source.
+fn with_mods(pointer: Vec<Value>, mods: i64) -> Result<Value> {
+    let keys = mod_keys(mods);
+    if keys.is_empty() {
+        return Ok(json!([{ "type": "pointer", "id": "mouse", "parameters": { "pointerType": "mouse" }, "actions": pointer }]));
+    }
+    let pause = || json!({ "type": "pause" });
+    let mut key_src: Vec<Value> = keys.iter().map(|k| key_action(*k, true)).collect::<Result<_>>()?;
+    key_src.extend((0..pointer.len()).map(|_| pause()));
+    key_src.extend(keys.iter().rev().map(|k| key_action(*k, false)).collect::<Result<Vec<_>>>()?);
+    let mut ptr: Vec<Value> = (0..keys.len()).map(|_| pause()).collect();
+    ptr.extend(pointer);
+    ptr.extend((0..keys.len()).map(|_| pause()));
+    Ok(json!([{ "type": "key", "id": "keyboard", "actions": key_src }, { "type": "pointer", "id": "mouse", "parameters": { "pointerType": "mouse" }, "actions": ptr }]))
+}
+
 /// No selector given: `""`, or none at all.
 fn no_selector(sel: &Value) -> bool {
     sel.is_null() || sel.as_str() == Some("")
@@ -353,6 +392,11 @@ pub struct Driver {
     /// Each drag's move times on the host clock (a button held by `down` or `drag`), for
     /// `input.rate` and `input.gap.p95`; the block takes them per run.
     pub drags: RefCell<Vec<Vec<u64>>>,
+    /// The inputs a person's interaction latency is measured from (a click's release, each key press,
+    /// a scroll's first wheel step), on the host clock as strobe sent them, with whether it was a
+    /// scroll: a page without the browser's own input latencies (Firefox) joins them to the frames
+    /// that showed them.
+    pub inputs: RefCell<Vec<(u64, bool)>>,
 }
 
 impl Driver {
@@ -369,6 +413,7 @@ impl Driver {
             frame_ms: Cell::new(None),
             pacer: Pacer::default(),
             drags: RefCell::new(Vec::new()),
+            inputs: RefCell::new(Vec::new()),
         }
     }
 
@@ -376,10 +421,69 @@ impl Driver {
         Selector::parse(v, Dialect::Page)
     }
 
-    /// A mouse event at (x, y) carrying the held buttons and modifiers.
+    /// A mouse event at (x, y) carrying the held buttons and modifiers. Over BiDi the held buttons and
+    /// keys are the session's own input state; `extra` modifiers go down around the event.
     fn mouse(&self, kind: &str, (x, y): (f64, f64), button: Option<Button>, mask: i64, count: u64, extra: i64) -> Result<()> {
-        let name = button.map_or("none", |b| cdp_button(b).0);
-        self.page.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": count, "modifiers": self.mods.get() | extra })).map(|_| ())
+        match &self.page {
+            Page::Chromium(p) => {
+                let name = button.map_or("none", |b| cdp_button(b).0);
+                p.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": count, "modifiers": self.mods.get() | extra })).map(|_| ())
+            }
+            Page::Firefox(p) => {
+                let at = json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" });
+                let b = button.map_or(0, bidi_button);
+                let pointer = match kind {
+                    "mouseMoved" => vec![at],
+                    "mousePressed" => vec![at, json!({ "type": "pointerDown", "button": b })],
+                    _ => vec![json!({ "type": "pointerUp", "button": b })],
+                };
+                p.actions(with_mods(pointer, extra & !self.mods.get())?)
+            }
+        }
+    }
+
+    /// A click over BiDi as a person clicks, as native targets are clicked: `mods` go down once and
+    /// stay down over the move, every press and release; each press is held (60 ms for one click, a
+    /// frame between a double click's presses), and the input time is taken just before the last
+    /// release goes out. The session's input state keeps keys and buttons between the action lists.
+    fn bidi_click(&self, p: &crate::target::firefox::Page, (x, y): (f64, f64), b: Button, mods: i64, count: u64) -> Result<()> {
+        let keys = mod_keys(mods);
+        let pointer = |actions: Vec<Value>| json!({ "type": "pointer", "id": "mouse", "parameters": { "pointerType": "mouse" }, "actions": actions });
+        let key_list = |down: bool| -> Result<Value> { Ok(json!({ "type": "key", "id": "keyboard", "actions": keys.iter().map(|k| key_action(*k, down)).collect::<Result<Vec<_>>>()? })) };
+        let at = json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" });
+        let n = bidi_button(b);
+        if keys.is_empty() {
+            p.actions(json!([pointer(vec![at])]))?;
+        } else {
+            // Keys first, then the move: the key source's ticks, then the pointer's after them.
+            let pause = keys.iter().map(|_| json!({ "type": "pause" })).chain(std::iter::once(at)).collect();
+            p.actions(json!([key_list(true)?, pointer(pause)]))?;
+        }
+        let gap = Duration::from_millis(if count > 1 { 16 } else { 60 });
+        let result = (|| -> Result<()> {
+            for k in 1..=count {
+                p.actions(json!([pointer(vec![json!({ "type": "pointerDown", "button": n })])]))?;
+                std::thread::sleep(gap);
+                if k == count {
+                    self.input_at(false);
+                }
+                p.actions(json!([pointer(vec![json!({ "type": "pointerUp", "button": n })])]))?;
+            }
+            Ok(())
+        })();
+        if !keys.is_empty() {
+            let mut up = key_list(false)?;
+            if let Some(a) = up["actions"].as_array_mut() {
+                a.reverse();
+            }
+            p.actions(json!([up]))?;
+        }
+        result
+    }
+
+    /// The pointer's input time for `interaction.*` (a click's release).
+    fn input_at(&self, scroll: bool) {
+        self.inputs.borrow_mut().push((crate::host::now_ns(), scroll));
     }
 
     /// A pointer move to (x, y) carrying the held buttons. While one is held it is a drag's move: sent
@@ -395,8 +499,13 @@ impl Driver {
         if !paced {
             return self.mouse("mouseMoved", (x, y), last.filter(|_| mask != 0), mask, 0, 0);
         }
-        let p = json!({ "type": "mouseMoved", "x": x, "y": y, "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() });
-        self.page.post("Input.dispatchMouseEvent", p)
+        match &self.page {
+            Page::Chromium(p) => {
+                let e = json!({ "type": "mouseMoved", "x": x, "y": y, "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() });
+                p.post("Input.dispatchMouseEvent", e)
+            }
+            Page::Firefox(p) => p.post_actions(with_mods(vec![json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" })], 0)?),
+        }
     }
 
     /// A mouse button going down or up where the pointer is.
@@ -465,7 +574,7 @@ impl Driver {
         // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
         // a destroyed context, which says nothing about what happened to the page.
         helped(&self.page, expr, timeout + Duration::from_secs(10)).map_err(|e| {
-            if e.message.contains("Promise was collected") || e.message.contains("context was destroyed") {
+            if ["Promise was collected", "context was destroyed", "no such frame", "was discarded"].iter().any(|m| e.message.contains(m)) {
                 Error::msg(format!("the page reloaded or navigated away while strobe waited ({expr}): the app replaced the document on its own"))
             } else {
                 e
@@ -479,7 +588,12 @@ impl Driver {
     }
 
     /// Writes a `performance.mark` that the trace records on its own clock.
+    /// A page without such a trace (Firefox) takes none: its runs and phases are strobe's own spans on
+    /// the host clock, as a native app's.
     pub fn mark(&self, name: &str) -> Result<()> {
+        if self.page.cdp().is_none() {
+            return Ok(());
+        }
         let full = format!("strobe:{}:{}", self.token, name.replace(['"', '\\', '\n'], "_"));
         self.page.eval(&format!(r#"performance.mark("{full}"), performance.clearMarks("{full}"), true"#)).map(|_| ())
     }
@@ -543,10 +657,20 @@ impl Driver {
                 let count = o["count"].as_u64().unwrap_or(1).clamp(1, 3);
                 let (held, bit) = (self.buttons.get().0, cdp_button(b).1);
                 self.pointer.set((x, y));
+                match &self.page {
+                    Page::Firefox(p) => {
+                        self.bidi_click(p, (x, y), b, mods & !self.mods.get(), count)?;
+                        return self.until(&o);
+                    }
+                    Page::Chromium(_) => {}
+                }
                 self.mouse("mouseMoved", (x, y), None, held, 0, mods)?;
                 // Each press of a double or triple click carries its count, as a mouse's do.
                 for k in 1..=count {
                     self.mouse("mousePressed", (x, y), Some(b), held | bit, k, mods)?;
+                    if k == count {
+                        self.input_at(false);
+                    }
                     self.mouse("mouseReleased", (x, y), Some(b), held, k, mods)?;
                 }
                 self.until(&o)
@@ -594,8 +718,12 @@ impl Driver {
                 let by = o.get("by").and_then(Value::as_f64).unwrap_or(0.0);
                 let by_x = o.get("byX").and_then(Value::as_f64).unwrap_or(0.0);
                 let speed = o.get("speed").and_then(Value::as_f64).unwrap_or(2000.0);
-                self.page
-                    .send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
+                match &self.page {
+                    Page::Chromium(p) => {
+                        p.send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
+                    }
+                    Page::Firefox(p) => self.paced_wheel(p, (x, y), (by_x, by), speed)?,
+                }
                 self.until(&opts(2))
             }
             // One wheel event at the element's centre (the viewport's without a selector), as a mouse wheel
@@ -610,10 +738,16 @@ impl Driver {
                 };
                 let delta = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
                 let (mask, last) = self.buttons.get();
-                self.page.send(
-                    "Input.dispatchMouseEvent",
-                    json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy"), "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() }),
-                )?;
+                self.input_at(true);
+                match &self.page {
+                    Page::Chromium(p) => {
+                        p.send(
+                            "Input.dispatchMouseEvent",
+                            json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy"), "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() }),
+                        )?;
+                    }
+                    Page::Firefox(p) => p.actions(json!([{ "type": "wheel", "id": "wheel", "actions": [wheel_step((x, y), (delta("dx"), delta("dy")))] }]))?,
+                }
                 self.until(&opts(2))
             }
             "window" => Err(Error::usage("page.window() shows, hides, focuses or closes a native app's windows; a page has none of its own")),
@@ -664,8 +798,7 @@ impl Driver {
             "snapshot" => {
                 let Some(dir) = &self.pixels else { return Ok(Value::Bool(false)) };
                 let name: String = s(0).chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' }).collect();
-                let shot = self.page.send_long("Page.captureScreenshot", json!({ "format": "png" }))?;
-                let png = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, shot["data"].as_str().unwrap_or("")).map_err(|e| Error::msg(format!("snapshot {name}: {e}")))?;
+                let png = self.page.screenshot(Duration::from_secs(120)).map_err(|e| Error::msg(format!("snapshot {name}: {}", e.message)))?;
                 std::fs::create_dir_all(dir)?;
                 crate::store::write_atomic(&dir.join(format!("{name}.png")), &png)?;
                 Ok(Value::Bool(true))
@@ -700,10 +833,52 @@ impl Driver {
 
     /// A key pressed and released with `extra` modifiers on top of the held ones. Modifiers mark the
     /// events, as CDP takes them; they are not keys of their own.
+    /// Over BiDi a chord's modifiers (and Shift for a character a US keyboard types with it) go down as
+    /// keys around it, in one action list.
     fn stroke(&self, key: Key, extra: i64) -> Result<()> {
         let m = self.mods.get() | extra;
-        self.key_event(key, true, m)?;
-        self.key_event(key, false, m)
+        self.input_at(false);
+        let p = match &self.page {
+            Page::Chromium(_) => {
+                self.key_event(key, true, m)?;
+                return self.key_event(key, false, m);
+            }
+            Page::Firefox(p) => p,
+        };
+        let shift = if matches!(key, Key::Char(c) if keys::us_key(c).is_some_and(|k| k.1)) { 8 } else { 0 };
+        let press = (extra | shift) & !self.mods.get();
+        let key = match key {
+            Key::Char(c) if (m | shift) & 8 != 0 && c.is_ascii_graphic() => Key::Char(keys::us_shifted(c)),
+            k => k,
+        };
+        let mut actions: Vec<Value> = mod_keys(press).into_iter().map(|k| key_action(k, true)).collect::<Result<_>>()?;
+        actions.push(key_action(key, true)?);
+        actions.push(key_action(key, false)?);
+        actions.extend(mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<Vec<_>>>()?);
+        p.actions(json!([{ "type": "key", "id": "keyboard", "actions": actions }]))
+    }
+
+    /// `scroll` over BiDi, which has no scroll gesture: wheel steps of the distance at `speed` (CSS px a
+    /// second), one per display frame on strobe's clock, sent without waiting for each to be handled,
+    /// then one empty action list that returns once the page has handled them all.
+    fn paced_wheel(&self, p: &crate::target::firefox::Page, at: (f64, f64), (dx, dy): (f64, f64), speed: f64) -> Result<()> {
+        let frame = self.frame_period()?;
+        let dist = dx.hypot(dy);
+        let steps = ((dist / speed.max(1.0)) * 1e3 / frame).ceil().max(1.0) as u32;
+        let start = Instant::now();
+        let mut sent = (0.0, 0.0);
+        for k in 1..=steps {
+            if k > 1 {
+                self.pacer.wait(start + Duration::from_secs_f64(frame * (k - 1) as f64 / 1e3), Duration::from_secs_f64(frame / 1e3));
+            } else {
+                self.input_at(true);
+            }
+            let f = k as f64 / steps as f64;
+            let to = ((dx * f).round(), (dy * f).round());
+            p.post_actions(json!([{ "type": "wheel", "id": "wheel", "actions": [wheel_step(at, (to.0 - sent.0, to.1 - sent.1))] }]))?;
+            sent = to;
+        }
+        p.actions(json!([{ "type": "none", "id": "sync", "actions": [{ "type": "pause", "duration": 0 }] }]))
     }
 
     /// One key going down or up, from the key table: its `key`, `code` and virtual key, and its text only
@@ -731,7 +906,11 @@ impl Driver {
         if let Some(t) = text {
             e["text"] = json!(t);
         }
-        self.page.send("Input.dispatchKeyEvent", e).map(|_| ())
+        match &self.page {
+            Page::Chromium(p) => p.send("Input.dispatchKeyEvent", e).map(|_| ()),
+            // The session's input state holds the modifiers already down.
+            Page::Firefox(p) => p.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }])),
+        }
     }
 
     /// One key, pressed (`down`) or let go: a held key stays down across other calls until its `up`. A held
@@ -758,11 +937,19 @@ impl Driver {
             }
         }
         self.mods.set(if down { self.mods.get() | bit } else { self.mods.get() & !bit });
+        if down && bit == 0 {
+            self.input_at(false);
+        }
         self.key_event(key, down, self.mods.get())
     }
 }
 
-impl Page {
+/// One wheel step at a viewport point, for WebDriver input (whole pixels).
+fn wheel_step((x, y): (f64, f64), (dx, dy): (f64, f64)) -> Value {
+    json!({ "type": "scroll", "x": x.round() as i64, "y": y.round() as i64, "deltaX": dx.round() as i64, "deltaY": dy.round() as i64, "origin": "viewport" })
+}
+
+impl chromium::Page {
     /// Like `send`, for commands that take as long as the gesture they perform.
     pub fn send_long(&self, method: &str, params: Value) -> Result<Value> {
         self.cdp.send_timeout(method, params, Some(&self.session), Duration::from_secs(120))

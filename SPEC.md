@@ -67,6 +67,8 @@ When a design change is agreed, update this file in the same change.
 - `opencode` installed for MCP and skill registration. Not needed to measure.
 - Chromium targets: an installed Chrome, Edge or Chromium, or Playwright's Chromium. strobe finds
   one; it never downloads a browser.
+- Firefox targets (`--engine firefox`, optional): a stock Firefox from Mozilla (release, Developer
+  Edition or Nightly; a distribution's package; Snap). Never Playwright's patched Firefox (§13.1).
 - Deep mode (§13.4): one UAC (Windows) or one sudo (Linux) during `up`.
 
 Tools may be installed but not on PATH (desktop-app shells). strobe looks in known install
@@ -192,7 +194,9 @@ bin/strobew.rs  Windows windowless build (daemon autostart)
 cli/            argument parsing, help, text + JSON rendering
 app/            commands (up, status, record, bench, query, report, top, update, leave, daemon)
 model/          plain data: Target, Probe, Recording, Run, Metric, Verdict, Env, Validity
-target/         finding and driving targets → chromium.rs (CDP), bridge.rs, inspector.rs,
+target/         finding and driving targets → chromium.rs (CDP), firefox.rs and bidi.rs (WebDriver
+                BiDi), web.rs (a page in any engine: the WebBrowser and WebPage enums every page
+                caller drives), bridge.rs, inspector.rs,
                 process.rs, isolate.rs (isolated launches), electron.rs, webview.rs (apps on the OS's
                 webview, §13.8), native.rs (native apps, §13.7), a11y/ (the OS accessibility client: uia.rs, ax.rs, atspi.rs; input:
                 input.rs (posted messages), cg_input.rs (Quartz), xtest.rs; keys.rs shared)
@@ -275,7 +279,7 @@ adais: a successful `record --bench` exits 0 (`$LASTEXITCODE`), and its shell re
 
 | Syntax | Meaning |
 |---|---|
-| `https://…`, `http://…` | a page in a strobe-launched Chromium: isolated profile, real GPU, fixed window (§13.1) |
+| `https://…`, `http://…` | a page in a strobe-launched Chromium (or `--engine firefox`: Firefox): isolated profile, real GPU, fixed window (§13.1) |
 | `cdp:<port>`, `cdp:ws://…` | a running CDP endpoint (Playwright's, a dev Electron's) |
 | `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7), one with `kind: "webview"` an app on the OS's webview (§13.8) |
 | `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
@@ -372,6 +376,17 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   `bench --check --headless` does (§5.6): no display needed, frame and latency metrics refused.
   `record app:<id> --headless` (or `exe:`) is a usage error: an app draws its own window, and the
   flag once only skipped the lock check on it.
+  `--engine` passes on as in a bench; a Firefox case gets no attribution block (no profilers yet), only
+  its check run.
+- `--engine firefox [--headless]` records a page in Firefox (§13.1) from outside: its processes' CPU
+  in cycles (`cpu.app.total`, `cpu.work`), GPU use and VRAM from the OS sampler, private memory, DOM
+  nodes, and headed the OS's presents of its processes (`frames.*`, §7.2), kept as `presents.json.gz`
+  and `frames.json` so `query <rec> frames` reads them as a native recording's. Where cycles are not
+  time on the device (Windows on Arm, §13.7) both CPU metrics are refused, as for a native app; a
+  headless browser that drew in software reports no `gpu.vram`. A Playwright build named by
+  `STROBE_FIREFOX` warns `PatchedBrowser`, and the recording says so (`patched_browser`).
+  `--probes attribution` and `memory` refuse (`EngineUnsupported`): profilers, heap snapshots and the
+  census are Chromium's DevTools. An attached endpoint or an app takes no `--engine` (usage error).
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
@@ -401,7 +416,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
-             [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--json]
+             [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--engine chromium|firefox|webkit] [--headless] [--json]
 strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
@@ -460,13 +475,31 @@ on a check of one case answers from that recording (with several, it lists them)
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
 a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
 and prints its recording, to profile one build before there is anything to compare.
-`--check --headless` runs page (`web`, `url`) targets in a headless browser: it draws to no display,
-so it runs through a locked session or on a device without one, and keeps what needs no display
-(CPU, main-thread work, counters, phases, memory, milestones) while frames, input latencies,
-scrolling, canvas frames and GPU use are refused `NoPresentSource` ("the page ran headless"); a
-software rasterizer refuses nothing there. `--headless` with a timed mode, or on a native, app, exe
-or command target, is a usage error: no timed frame or latency verdict ever comes from a headless
-browser. `record --bench … --headless` is the same for one case.
+`--headless` (or a page target's `headless: true`) runs page (`web`, `url`) targets in a headless
+browser, in `--check` and in timed blocks alike: it draws to no display, so it runs through a locked
+session or on a device without one, and keeps what needs no display (CPU, main-thread work,
+counters, phases, memory, milestones, and strobe's own input pacing `input.rate` and `input.gap.p95`)
+while frames, input-to-screen latencies, scrolling, canvas frames, the display's rate, a launch's
+pixels (`launch.painted`, `launch.settled`) and GPU use are refused `Headless` ("the page ran
+headless"), each declared one (`--noworse` keys included); a software rasterizer refuses nothing
+there but GPU memory, which no GPU held. The report says "headless (no display)" where it would name
+the display's refresh, and the result has no `refresh_hz` when every series ran headless. A
+primary among them refuses the bench before anything builds (`Headless`, exit 4, naming CPU primaries
+to use instead): no frame or latency verdict ever comes from a headless browser, while a CPU verdict
+(`cpu.work`, `main.work`) of a headless page is a CPU verdict of that headless page, and the series and
+the ledger say headless (a change of a page's engine, browser or mode is listed among what changed
+between attempts). `--headless` on a native, app, exe or command target is a usage error, in `--plan` too.
+`record --bench … --headless` is the same for one case.
+`--engine <e>` picks the browser engine of page targets (§13.1): when the bench file declares targets
+of engine `e` (`web({ engine: "firefox" })`), only those run; otherwise every page target runs in
+`e`. A run that would include an app, exe, native, command or script target under `--engine` is a usage
+error (narrow it with `--target`). `webkit` refuses (`EngineUnsupported`: on Windows for good, no
+WebKit browser runs there for people; elsewhere not built yet). A primary the engine cannot measure
+refuses before anything builds (`EngineUnsupported`, with the closest metric it can), as does a launch
+case or `--probes attribution|memory` in another engine than Chromium; declared secondaries it cannot
+measure are refused per block. The engine, the browser's version and headless go into the rerun ledger's
+identity (§14.2) and track's fingerprints (§25): a run in another engine, version or mode is another
+experiment and another series.
 `--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
 their values, with nothing compared and nothing decided; the text gives the primary per block and the
 blocks' median with a Hodges–Lehmann interval over them. It is what `track` records for a commit
@@ -660,6 +693,16 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
 - **Budget**: the refresh interval of the display the window is on (§13.1). No display, no
   budget metrics (`NoDisplayForBudget`).
 - `requestAnimationFrame` gaps, when wanted, are a separate metric named `raf.gap.*`.
+- **Pages in another engine** (Firefox, headed): the browser reports no frames of its own to strobe,
+  so a page's frames are the OS's presents of its processes, exactly as a native app's (below and
+  §7.4): Windows gives intervals and drops, macOS and Linux X11 counts only. `frames.presented.p*`
+  (begin to screen) is refused `EngineUnsupported`. Its `interaction.*` and `scroll.latency.*` join
+  strobe's own inputs (a click's release, each key press, a scroll's first wheel step, host clock) to the
+  first present after them, counted only when the page changed within a second (a DOM mutation, an
+  `input` or `change` event, a scroll: an observer strobe installs only for a series that declares such
+  a metric; the page's epoch milliseconds, whole ones in Firefox, are mapped to the host clock and taken
+  as the end of their millisecond). Never the page's Event Timing, whose 16 ms threshold censors fast
+  inputs. Headless there are none: refused `Headless`.
 - **Native windows and any process from outside** (Windows): a frame is a present the OS put on the
   screen, from its present events (§8.1 `presents`): one record per present with its start, the
   screen time of its scanout (`displayed`), or `discarded` (replaced before scanout). "One present
@@ -976,7 +1019,10 @@ A counter is an exact metric per run, `count.<name>`. Two sources add to it:
   `Page.addScriptToEvaluateOnNewDocument` only in blocks of a series that declares a `count.*`
   metric, resets the totals before each run's start mark, and reads them after its end mark, so
   neither costs the run anything. A run that loads a page reads the departing document's totals
-  first, as for `main.work`.
+  first, as for `main.work`. In Firefox (§13.1) the global comes from a BiDi preload script and the
+  marks are strobe's own on the host clock, with no trace; the totals are read the same way, but a
+  document the page replaces by itself (a link, `location.assign`) rather than through `page.goto`
+  takes its uncounted totals with it.
 
 A counter the page never touched reads 0. Compare builds that both count: a base without the
 counter reads 0, not "unknown".
@@ -997,14 +1043,18 @@ declares a `canvas.*` metric. Each task that takes a texture is one frame, howev
 draws. `canvas.frames` is per run. The interval percentiles pool the gaps between consecutive
 frames over the measured runs, as `frames.interval` pools presented frames, and need their minimum
 n of gaps (`TailTooShort`). A gap never spans two documents. WebGPU canvases only for now: a WebGL
-or 2D canvas has no per-frame call to hook.
+or 2D canvas has no per-frame call to hook. A page without WebGPU (an engine or OS that does not ship
+it, or an origin that is not a secure context: no `GPUCanvasContext` in the page) refuses
+`canvas.*` (`EngineUnsupported`), never reads 0.
 
 **Network** (`net.requests`, `net.bytes`): the Network domain, enabled only for a series that
 declares a `net.*` metric. A request belongs to the run whose span it started in; its bytes on
 the wire (`loadingFinished.encodedDataLength`, else its chunks so far) may arrive after the run
 and still count for it. `data:` and `blob:` requests are not network requests. A glob without
 `://` matches the URL's path; `*` stays within a path segment, `**` crosses them, and the query
-string never takes part: `net.requests{/api/session/*/message}`.
+string never takes part: `net.requests{/api/session/*/message}`. Firefox: WebDriver BiDi's
+`network.beforeRequestSent` and `network.responseCompleted` (`bytesReceived`) of the page's browsing
+context, the same rules; never Resource Timing's `transferSize` (zero across origins).
 
 **Garbage collection** (`main.gc`): the summed duration of V8's top-level `V8.GC_*` slices on the
 renderer main thread in the run's span (a GC slice inside another counts once), the pauses a frame
@@ -1603,10 +1653,12 @@ export default bench({
   `env` and `files` (written into the home over the profile's), and every target `name` (what
   reports call it as a side) and `cwd` (another project's strobe.json for it), §9.10.
   `fixture(command, opts)` at the top level starts a process per block that both sides talk to
-  (§9.10).
+  (§9.10). `web()` and `url()` also take `engine` (`"chromium"`, the default, `"firefox"`,
+  `"webkit"`: §13.1, `--engine` above) and `headless` (§5.6).
 - `prepare(ctx)`: per block, before the first page load. The only place with Playwright
   (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
-  targets with a debug port. `ctx.url` is the URL strobe opens next; a production web build is
+  targets with a debug port: on a page in another engine reading `ctx.playwright` throws, typed as
+  `EngineUnsupported` (Playwright connects over CDP); `ctx.mock` works there. `ctx.url` is the URL strobe opens next; a production web build is
   its own server, so mock the API under `new URL(url).origin`. Playwright stays connected for the
   whole block, so routes and init scripts keep working. What `prepare` returns is
   `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
@@ -1663,6 +1715,13 @@ body? }` (text, bytes, or any other value as JSON) or `undefined` to let the req
 Patterns accumulate and the latest is asked first; `undefined` passes the request to earlier
 ones, as Playwright's `route` and `fallback` do, so existing route-based mocks port unchanged. Streams (an event source) are not mockable this
 way: serve them from a real local server and tear it down in `teardown`.
+On a Firefox page strobe holds the browser's one BiDi connection (Firefox takes no second one), so
+`mock` asks strobe: strobe adds a `network.addIntercept` and relays each paused request to the runner's
+handlers over a loopback socket of their own (a random token, one line each way), answering with
+`network.provideResponse` or letting it go (`continueRequest`); the HTTP cache stays on. BiDi's URL
+patterns have no wildcards, so the intercept is the glob's literal URL, else its literal origin, else
+every request of the page, and a paused request no glob matches goes on at once (one round trip in
+strobe). The handler's request has no `body` there (BiDi does not carry it).
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
 checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
@@ -2055,7 +2114,8 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. A start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
-| `EngineUnsupported` | a target, metric, probe or hook needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (13.8) |
+| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU), or an engine strobe cannot run here (`webkit`; on Windows for good): a primary refuses before anything builds, with the closest metric the engine has; a secondary is refused per block |
+| `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses before anything builds; a secondary is refused per block |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
@@ -2192,6 +2252,8 @@ lock when nothing it measures reaches a screen:
 
 - `script()` targets, and leak runs (`--probes memory`; a headed page's hidden state
   is not refused there);
+- headless pages (`--headless`, a target's `headless`), in any engine and any mode: they draw to no
+  display, and what would need one is refused `Headless`;
 - a native target with `window: false` (a tray app), or any native target under `--check` (it
   validates a bench file and gives no verdict), whose declared metrics are all `cpu.*`, `ui.*`,
   `memory.*`, `io.*`, `count.*`, `phase.*`, `energy.*`, GPU memory (`gpu.vram`, `gpu.shared`), `run.duration` and launch
@@ -2682,6 +2744,78 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 - Not marked as automated (`--disable-blink-features=AutomationControlled`): `navigator.webdriver`
   is false, as for a person. Apps branch on it (a game shell hid its menus and started muted under
   it), and a measurement of that mode is a measurement of strobe.
+
+**Other engines.** A page target runs in one engine (`model::WebEngine`): Chromium over CDP (the
+default), Firefox over WebDriver BiDi, WebKit (not built: refused `EngineUnsupported`, for good on
+Windows, where no WebKit browser runs for people). Every page caller (`driver`, `validity`, a block)
+drives `target::web::{WebBrowser, WebPage}`; what only CDP gives (the trace, the Performance domain,
+profilers, heap snapshots, the census, Playwright) asks for the Chromium side and is refused elsewhere.
+
+**Firefox** (`target::firefox`, `target::bidi`):
+
+- Its own remote agent, no geckodriver: `firefox -no-remote -profile <dir> --remote-debugging-port 0
+  --new-instance [-headless] about:blank` (`-wait-for-browser` on Windows, so the launcher process strobe
+  holds lives as long as the browser). Firefox writes `WebDriverBiDiServer.json` (`ws_port`) into the
+  profile, not a `DevToolsActivePort` file; strobe opens `ws://127.0.0.1:<port>/session` and one
+  session (`session.new`). Firefox takes one BiDi connection: a second to `/session/<id>` is refused.
+- Stock builds only, found in the standard locations (`%ProgramFiles%` and `%LOCALAPPDATA%\Mozilla
+  Firefox`, `/Applications/Firefox.app`, `/usr/lib/firefox`, `/usr/lib/firefox-esr`, `/snap/bin/firefox`,
+  Developer Edition and Nightly after release) or `STROBE_FIREFOX`; Playwright's patched Firefox changes
+  the process model and preferences and is never picked up (`status` names one `STROBE_FIREFOX` points
+  at). `status` and `up` show the Firefox found and its version (`application.ini`).
+- Isolated profile per launch (`<state>/run/profile-…`; Snap's AppArmor lets Snap Firefox read only its
+  own folders under the home, so there `~/snap/firefox/common/strobe/profile-…`, which strobe reaps as it
+  reaps `run/`), stamped with `STROBE_HOME` and `STROBE_OWNER` like every launch (§13.2). Its `user.js`
+  turns off what phones home or shows itself (telemetry, studies, Normandy, updates, Pocket, the new tab
+  feeds, Safe Browsing, captive portal and connectivity checks, push, remote settings, first-run and
+  default-browser pages, session restore) and mutes audio (`media.volume_scale` 0); everything that
+  shapes how a page runs stays Firefox's default. `remote.prefs.recommended` is off: the remote agent
+  would otherwise apply its test preferences (no process priority manager, no hang monitor, focus test
+  mode, no window occlusion tracking), which a person's Firefox does not run with (checked in
+  `RecommendedPreferences.sys.mjs`). `MOZ_REMOTE_ALLOW_SYSTEM_ACCESS=1` lets strobe read the chrome scope
+  (process roles, the compositor), nothing a page reaches; `MOZ_CRASHREPORTER_DISABLE=1`.
+- A preload script makes `navigator.webdriver` false (Firefox reports true under BiDi otherwise).
+- The window is sized and placed with `browser.setClientWindowState`, then refitted so the viewport is
+  the target's (no responsive-design override); on Windows it is kept on top without focus, as an
+  occluded Firefox window stops painting.
+- `SoftwareGpu`: the compositor (`windowUtils.layerManagerType`: WebRender on the GPU, or "Software")
+  and the adapter (`nsIGfxInfo`), read in the chrome scope.
+- Process roles (`cpu.renderer`, `cpu.gpu`, `cpu.browser`) from `ChromeUtils.requestProcInfo()`:
+  content processes are the renderer, the GPU process (Windows) the GPU; where Firefox composites in the
+  browser process there is no `cpu.gpu` (absent, never 0).
+- Input is `input.performActions`: a click as a native target's (§13.7): its modifiers go down once and
+  stay down over the move, every press and release; a press is held 60 ms (a frame between a double
+  click's presses; Firefox counts the clicks itself), and the input time is taken just before the last
+  release goes out. Chords are key actions around the key, a drag's moves posted unawaited and paced on
+  strobe's clock as over CDP, `scroll` wheel steps of the distance at its speed, one per display frame
+  (BiDi has no scroll gesture), `wheel` one step. Screenshots are `browsingContext.captureScreenshot`.
+- The profile folder (and Snap's `~/snap/firefox/common/strobe`) is the user's alone (`0700`): it names
+  the BiDi port, which allows chrome-scope scripts. `strobe leave` removes Snap's folder. `user.js` also
+  empties `media.gmp-manager.url`, so no codec plugin downloads into a fresh profile mid-block.
+  `STROBE_FIREFOX` naming Playwright's build warns `PatchedBrowser` in a bench and a record.
+- The BiDi connection is bounded: 10 s to connect and to finish the handshake, a reply strobe cannot
+  parse fails its command at once (its id read from the text), and a send that fails forgets its
+  command. A launch whose BiDi call timed out is retried as one whose CDP call did.
+- A block has no trace: its runs and phases are strobe's host-clock spans (as a native app's), warmup
+  waits for its processes' CPU per run to settle (no main-thread task counter; wall time where cycles
+  are not time), and `Throttled` compares its in-page speed check only with Firefox's own reference on
+  these CPUs (the median of its last 20 passing checks, `<state>/engine-speed.json`; a check while
+  other work kept those CPUs busy never joins it): JS engines differ, so checks are never compared
+  across engines. `cpu.work` is in every page block, Chromium's too, so one primary compares engines.
+  Its default secondaries are those of a page with `cpu.work` in place of `main.busy`.
+- Headed, frames are the OS's presents of its processes (§7.2), and `interaction.*` joins each input
+  to the first present after the page's next own change: a DOM mutation (in shadow roots too, by
+  wrapping `attachShadow`), an `input`, `change` or `scroll` event, at most one a millisecond, stamped
+  with `performance.now()` and mapped to the host clock by a read bracketed with two host-clock reads
+  (later bracket, plus the page clock's 1 ms coarsening, so a change never precedes its input). A
+  `page.goto` in a run reads the departing document's changes first. A kept block's recording holds
+  `presents.json.gz` and `frames.json`, which `query <rec> frames` reads as a native recording's.
+- `SoftwareGpu` and the browser version are read once per page target and mode (headed or headless),
+  not once per experiment: one file may run a headless Chromium target and a headed Firefox one. Each
+  block records what its browser was (`Block.browser`), a series the versions its blocks ran
+  (`series.browser`).
+- Not yet: attribution (the Gecko profiler, reflow and GC markers, about:memory), launch cases, leak
+  runs, `span.*`.
 
 ### 13.2 Electron apps: isolated launches and app profiles
 
@@ -3594,8 +3728,8 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | Tool | Input (beyond the CLI flags of the same name) | Output |
 |---|---|---|
 | `status` | `calibrate?`, `fast?` | §5.4 JSON |
-| `record` | `target` (not with `bench`), `for?`, `probes?`, `native?`, `app?`, `headless?`, `served?`, `style?`, `os-frames?`, `until-line?`, `stop-line?`, `bench?`, `head?`, `gpu-cache?`, `params?`, `runs?`, `pin?`, `power?`, `timeout?` | `{ handle, valid, summary, warnings }` (with `bench`: `{ recordings }`) |
-| `bench` | `file` (not with `stop`/`resume`), `head?`, `base?`, `aa?`, `check?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pilot?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `bisect?`, `pin?`, `power?`, `reserve-cpus?`, `why?`, `trace?`, `keep?`, `pixels?`, `pixels-only?`, `style?`, `max-time?`, `unlock-wait?`, `require-verdict?`, `stop?`, `resume?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
+| `record` | `target` (not with `bench`), `for?`, `probes?`, `native?`, `app?`, `headless?`, `engine?`, `served?`, `style?`, `os-frames?`, `until-line?`, `stop-line?`, `bench?`, `head?`, `gpu-cache?`, `params?`, `runs?`, `pin?`, `power?`, `timeout?` | `{ handle, valid, summary, warnings }` (with `bench`: `{ recordings }`) |
+| `bench` | `file` (not with `stop`/`resume`), `head?`, `base?`, `aa?`, `check?`, `headless?`, `engine?`, `blocks?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pilot?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `bisect?`, `pin?`, `power?`, `reserve-cpus?`, `why?`, `trace?`, `keep?`, `pixels?`, `pixels-only?`, `style?`, `max-time?`, `unlock-wait?`, `require-verdict?`, `stop?`, `resume?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
 | `query` | `handle`, `view?`, `sql?`, `by?`, `top?`, `reveal?`, `at?`, `native?`, `thread?`, `phase?`, `timeline?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
 | `report` | `handle`, `view?`, `format?`, `out?`, `theme?`, `update-pr?`, `repo?`, `force?`, `no-card?`, `badge-url?` | `{ path, bytes }` |
 
@@ -3715,7 +3849,7 @@ Phase 0 runs two tracks in parallel.
 
 ## 23. Out of scope for v1
 
-Uploading or sharing recordings · hosted dashboards · Firefox and Safari · mobile · GPU frame
+Uploading or sharing recordings · hosted dashboards · Safari and WebKit (Firefox is in: §13.1) · Firefox traces and profilers · mobile · GPU frame
 capture (RenderDoc or PIX level) · macOS deep mode · any automated tests.
 
 ## 24. As built (2026-11-05)
@@ -4069,6 +4203,38 @@ a web view app that exits mid-recording left no WebKit process behind before or 
 with the app), and `/usr/bin/sample` sampled the web content process (its WebCore and JavaScriptCore
 frames are 57% of an attribution recording's samples), so `Unsampled` stays for processes past the
 16 and for processes macOS does refuse it.
+
+Firefox pages (2026-11-06, engines phase 1: §13.1 Other engines, `--engine`, timed `--headless`). The
+design's claims were checked against Firefox 159 first: the BiDi port file is `WebDriverBiDiServer.json`
+(not `WebDriverBiDiActivePort`); a second connection to `/session/<id>` is refused, so `ctx.mock` is
+relayed through strobe's one connection; `navigator.webdriver` is true unless the preload sets it;
+`remote.prefs.recommended` defaults to off in that build's code but is set off in `user.js` anyway;
+chrome-scope reads need `MOZ_REMOTE_ALLOW_SYSTEM_ACCESS`; `nsIGfxInfo` is not on `Services` and macOS
+gives no adapter description; `ChromeUtils.requestProcInfo()` names content, GPU, socket, RDD, utility
+and extension processes. Checked (short smoke runs, not timed benches), with a local page bench of
+click, type, scroll, drag, a mocked fetch, a snapshot, and a click series for interaction:
+
+- adais (Windows 11, locked, Firefox 159.0): `record https://example.com --engine firefox --headless`
+  (cpu.app.total 10.1%); `bench --check --engine firefox --headless`: 6 of 6 pass (`count.adds` 1,
+  `phase.click` 15.6 ms, the mock answered, `net.requests` 2, `net.bytes` 49 KB of a 50,000-byte asset,
+  drag and scroll ran, ResetIncomplete passed the typed field's reset); the same file in headless
+  Chromium still passes, now with `cpu.work`; `--primary main.work` refused `EngineUnsupported` and
+  `--primary frames.interval.p95` refused `Headless` before anything built (exit 4); `--engine webkit`
+  refused `EngineUnsupported` (exit 4), `--engine safari` a usage error. A headless A/A of the click
+  case, 6 pairs on a busy shared machine: `cpu.work` −5.5% [−18 … +108], underpowered, no false verdict.
+- vps (Debian 13 VM, Firefox 159.0.1 from Mozilla's apt repository): the headless record and 7 of 7
+  check cases pass (`cpu.gpu` read 0.00% for its GPU process); headed on Xvfb Firefox draws with
+  WebRender (Software) on llvmpipe and refuses `SoftwareGpu`.
+- air (macOS 27, M4, AC, Firefox 159.0.1 from Homebrew's cask, headed): 7 of 7 pass; a page behind
+  another app reads `visibilityState` hidden, now `WindowHidden` (not active), so the bench waited about
+  4 minutes for the Mac's user to leave, activated Firefox and ran the block; the click series gave
+  `interaction.p50` 27.9 ms, `interaction.p95` 42.3 ms over 8 clicks, `frames.presented.count` 18,
+  `frames.interval.p95` refused (`NoPresentSource`: ScreenCaptureKit has no hand-over time), `cpu.gpu`
+  3.45%; `input.rate` 59.8/s and `input.gap.p95` 16.7 ms for the paced drag.
+- No Firefox process or profile folder was left on any device afterwards.
+
+Not checked yet: headed Firefox on Windows (the session stays locked: ETW presents, intervals and drops,
+`interaction.*`), Snap Firefox (no Snap on vps), headed X11 on a real GPU.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
@@ -4463,7 +4629,7 @@ alerts, and neither is retried by itself (`strobe track --confirm <chg_…>` run
 ```
 strobe track <file.bench.ts> [--ref <rev> | --range <a>..<b> [--every N]] [--filter …] [--target …] [--params …]
              [--blocks 6] [--no-confirm] [--again] [--alert regressions|all]
-             [--alert-command '<cmd>'] [--alert-webhook <url>] [bench flags: --pin --power --reserve-cpus --runs --primary --equivalence]
+             [--alert-command '<cmd>'] [--alert-webhook <url>] [bench flags: --pin --power --reserve-cpus --runs --primary --equivalence --engine --headless]
 strobe track <file.bench.ts> --ref <branch> --schedule commits|nightly|<period> [the same flags]
 strobe track --schedules | --unschedule <sch_…> | --confirm [<ser_…|chg_…>]
 ```
@@ -4551,7 +4717,8 @@ history/
 - **One device, one fingerprint, one series.** A series is (device, repository by its root commit,
   bench file, series label, primary metric) on one fingerprint: OS build, CPU, GPU adapters and
   driver versions, VM, strobe version, power plan used, battery, pinning, runs per block, session
-  lock state, console display state and target kind. A change of any of them starts a new series:
+  lock state, console display state and target kind; for a page, its engine, the browser versions its
+  blocks ran (`series.browser`) and whether it ran headless. A change of any of them starts a new series:
   points across it are never compared. Devices never mix (`--on` results stay with the device that
   ran them).
 - Events append; a change's state is its latest event's fields over the earlier ones. Points are in

@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Bench flags a track passes on to every bench it runs (points, confirmations, bisects).
-const PASS: &[&str] = &["filter", "target", "params", "pin", "power", "reserve-cpus", "runs", "primary", "equivalence", "trace"];
+const PASS: &[&str] = &["filter", "target", "params", "pin", "power", "reserve-cpus", "runs", "primary", "equivalence", "trace", "engine", "headless"];
 
 /// Blocks per point unless `--blocks`: the fewest whose interval reaches 95% (a signed-rank interval
 /// of 6 values covers 96.9%).
@@ -153,7 +153,7 @@ fn driver_versions() -> Vec<String> {
 }
 
 fn run_key(args: &Args, file: &Path, commit: &str, statics: &Value) -> Value {
-    let flags: Vec<Value> = ["filter", "target", "params", "primary", "blocks"].iter().map(|k| json!(args.get(k))).collect();
+    let flags: Vec<Value> = ["filter", "target", "params", "primary", "blocks", "engine", "headless"].iter().map(|k| json!(args.get(k))).collect();
     json!({ "file": file, "commit": commit, "flags": flags, "env": statics })
 }
 
@@ -226,6 +226,12 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
         // The OS updates its webview runtime under the app: another version is another series.
         if s["target_kind"] == "webview" {
             fingerprint["browser"] = r["browser"].clone();
+        }
+        // A page's engine, browser version and headless run split a series: never one history across them.
+        if s["engine"].is_string() {
+            fingerprint["engine"] = s["engine"].clone();
+            fingerprint["browser"] = s["browser"].clone();
+            fingerprint["headless"] = s["headless"].clone();
         }
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });
         let id = history::series_id(&family, &fingerprint);

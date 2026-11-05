@@ -1,8 +1,9 @@
 //! Validators (refuse, exit 4) and analysers (warn) — SPEC §10.
 
 use crate::host;
-use crate::model::{Error, Refusal, Result, ValidatorId};
-use crate::target::chromium::{Browser, Page};
+use crate::model::{Error, Hidden, Refusal, Result, ValidatorId, WebEngine};
+use crate::target::chromium::Gpu;
+use crate::target::web::WebPage as Page;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -21,8 +22,8 @@ pub fn info(id: &str, text: impl Into<String>) -> Warning {
     Warning { id: id.into(), level: "info".into(), text: text.into() }
 }
 
-pub fn software_gpu(browser: &Browser) -> Result<crate::target::chromium::Gpu> {
-    let gpu = browser.gpu()?;
+/// `SoftwareGpu` on what the browser said it draws with (`browser.gpu()`).
+pub fn software_gpu(gpu: Gpu) -> Result<Gpu> {
     if gpu.software {
         return Err(Refusal::new(ValidatorId::SoftwareGpu, format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing))
             .fix("run headed on a machine with a GPU; frame and GPU metrics from software rendering describe no real device")
@@ -42,8 +43,11 @@ pub fn is_software_gpu(name: &str) -> bool {
 pub fn window_visible(page: &Page) -> Result<()> {
     let state = page.eval("document.visibilityState")?;
     if state.as_str() != Some("visible") {
-        return Err(Refusal::new(ValidatorId::WindowHidden, format!("the page reports visibilityState={state}"))
-            .fix("keep the window visible and unminimized while strobe measures; Chromium throttles hidden windows")
+        // macOS: Firefox's window counts as hidden behind other apps' (occlusion tracking), and strobe makes
+        // it the active app only once nobody has used the Mac for a minute: a bench waits for that.
+        let hidden = if cfg!(target_os = "macos") && page.firefox().is_some() { Hidden::NotActive } else { Hidden::Other };
+        return Err(Refusal::window_hidden(hidden, format!("the page reports visibilityState={state}"))
+            .fix("keep the window visible and unminimized while strobe measures; browsers throttle hidden windows")
             .into());
     }
     Ok(())
@@ -285,6 +289,71 @@ pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
     saved[&key] = serde_json::json!({ "ms": kept });
     let _ = host::paths::write_atomic(&path, saved.to_string().as_bytes());
     Ok(ratio)
+}
+
+/// `Throttled` for a page in an engine other than Chromium (whose calibration is Chromium's): the
+/// in-page speed check against that engine's own reference on these CPUs, the median of its last 20
+/// passing checks (`<state>/engine-speed.json`, by engine and CPU mask; the first check sets it). JS
+/// engines differ in speed: a check is never compared across engines.
+/// `keep` false (other work kept the target's CPUs busy during the check) compares without adding the
+/// check to the reference.
+pub fn engine_throttled(engine: WebEngine, cpus: Option<u64>, ms: f64, keep: bool) -> Result<Option<f64>> {
+    if !ms.is_finite() || ms <= 0.0 {
+        return Ok(None);
+    }
+    let path = host::paths::state_dir().join("engine-speed.json");
+    let mut saved: Value = std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str(&t).ok()).filter(Value::is_object).unwrap_or_else(|| serde_json::json!({}));
+    let key = format!("{engine}:{}", cpus.map_or("all".to_string(), |m| format!("{m:#x}")));
+    let mut kept: Vec<f64> = saved[&key]["ms"].as_array().into_iter().flatten().filter_map(Value::as_f64).filter(|m| *m > 0.0).collect();
+    let reference = (!kept.is_empty()).then(|| {
+        let mut s = kept.clone();
+        s.sort_by(f64::total_cmp);
+        s[s.len() / 2]
+    });
+    let ratio = reference.map(|r| ms / r);
+    if let (Some(ratio), Some(r)) = (ratio, reference)
+        && ratio > 1.5
+    {
+        return Err(Refusal::new(ValidatorId::Throttled, format!("the page's speed check ran {ratio:.2}× slower than this device's reference for {engine} on these CPUs ({ms:.1} ms vs {r:.1} ms)"))
+            .fix(format!(
+                "remove CPU throttling, plug in power, leave power saving, let the machine cool down; a reference set by an unusually fast check goes with its entry {key:?} in {}",
+                path.display()
+            ))
+            .into());
+    }
+    if !keep {
+        return Ok(ratio);
+    }
+    kept.push(ms);
+    let drop = kept.len().saturating_sub(KEPT);
+    kept.drain(..drop);
+    saved[&key] = serde_json::json!({ "ms": kept });
+    let _ = host::paths::write_atomic(&path, saved.to_string().as_bytes());
+    Ok(ratio)
+}
+
+/// What a page engine has no way to measure (`EngineUnsupported`), with the closest metric it has.
+/// Firefox: the renderer main thread's task time and its parts, layouts and style counts, long tasks,
+/// layout shifts, GC and GPU compiles (Chromium's Performance domain and trace), the JS heap, the page's
+/// spans, and a frame's begin-to-screen cost (only a toolkit knows when it began a frame: Firefox's
+/// frames come from the OS's presents, §7.2).
+pub fn engine_refusal(engine: WebEngine, metric: &str) -> Option<Refusal> {
+    match engine {
+        WebEngine::Chromium => return None,
+        // Neither has Chromium's Performance domain or trace.
+        WebEngine::Firefox | WebEngine::Webkit => {}
+    }
+    let instead = match metric {
+        m if m.starts_with("main.") || matches!(m, "layout.count" | "style.count") => "cpu.work (the browser's processes' CPU per run) or cpu.renderer",
+        m if m.starts_with("frames.presented.") && m != "frames.presented.count" => "frames.interval.p95 (headed) or cpu.work",
+        "frames.partial" => "frames.dropped (headed)",
+        m if m.starts_with("js.heap.") => "memory.app.private",
+        "gpu.compile" => "gpu.process.3d",
+        "layout.shift" => "a count.<name> the page keeps",
+        m if m.starts_with("span.") => "phase.<name> around the same work in the case",
+        _ => return None,
+    };
+    Some(Refusal::new(ValidatorId::EngineUnsupported, format!("{metric}: {engine} gives strobe no way to read it (it comes from Chromium's Performance domain or trace)")).fix(format!("measure it in Chromium, or use {instead}")))
 }
 
 /// The speed baseline from calibration, if any.

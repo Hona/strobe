@@ -300,6 +300,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             process_set: Some(programs(&host::process_tree(pid))),
             fixture_connected: None,
             client: None,
+            browser: None,
         })
     })();
     host.into_inner().exit();

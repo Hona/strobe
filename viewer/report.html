@@ -1518,7 +1518,7 @@ function unitOf(name) {
   if (/^(span|phase|launch)\../.test(name)) return "ms";
   if (/^count\../.test(name)) return "count";
   if (name === "display.hz") return "Hz";
-  if (name === "run.duration" || name === "main.work" || name === "main.script" || name === "main.layout" || name === "main.style") return "ms";
+  if (name === "run.duration" || name === "cpu.work" || name === "main.work" || name === "main.script" || name === "main.layout" || name === "main.style") return "ms";
   if (/^(frames|interaction|scroll)\./.test(name) && /\.(p50|p90|p95|p99|max)$/.test(name)) return "ms";
   if (name === "frames.dropped.pct" || name === "main.busy" || name.startsWith("cpu.") || name === "gpu.process.3d") return "%";
   if (name === "js.heap.growth") return "MB/min";

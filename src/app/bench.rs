@@ -6,13 +6,14 @@ use crate::config;
 use crate::driver::Driver;
 use crate::host::{self, git};
 use crate::metrics;
-use crate::model::{self, Error, Hidden, MetricDef, Refusal, Result, ValidatorId, VerdictKind};
+use crate::model::{self, Error, Hidden, MetricDef, Refusal, Result, ValidatorId, VerdictKind, WebEngine};
 use crate::png;
 use crate::probe::{self, Set};
 use crate::runner::Runner;
 use crate::stats::{self, Comparison};
 use crate::store;
-use crate::target::chromium::{self, Page, Window};
+use crate::target::chromium::{self, Window};
+use crate::target::web::{self, WebBrowser, WebPage as Page};
 use crate::target::{electron, isolate};
 use crate::validity::{self, Warning};
 use serde::Serialize;
@@ -26,6 +27,7 @@ use std::time::{Duration, Instant};
 mod block;
 mod fixture;
 mod launch;
+mod mocks;
 mod native;
 pub mod plan;
 mod script;
@@ -323,9 +325,9 @@ const LAUNCH_RETRIES: u32 = 3;
 /// A launch or attach failure that another try can get past: the target never came up to talk to,
 /// as opposed to a run that failed or a validator that refused.
 fn transient(e: &Error) -> bool {
-    // Unreachable (255): no debugging port, a connection that closed. A timeout (124) only from CDP: a
-    // call with no reply; a hook or a wait that timed out is the bench's own.
-    e.validator().is_none() && (e.code == 255 || (e.code == 124 && e.message.starts_with("cdp ")))
+    // Unreachable (255): no debugging port, a connection that closed. A timeout (124) only from CDP or
+    // BiDi: a call with no reply; a hook or a wait that timed out is the bench's own.
+    e.validator().is_none() && (e.code == 255 || (e.code == 124 && (e.message.starts_with("cdp ") || e.message.starts_with("bidi "))))
 }
 
 /// Warmup runs at most, before strobe measures anyway and flags the block (`NotSteady`).
@@ -349,6 +351,9 @@ struct Run {
     ms: f64,
     cpu: f64,
     task: f64,
+    /// The target's processes' CPU in the run (ms, every thread): what warms up on an engine with no
+    /// main-thread task counter (Firefox), as for native targets.
+    work: f64,
     /// Per run, the Performance domain's other counters in `WORK_PARTS` order.
     parts: [f64; 5],
     /// CPU (% of a core) of the browser's renderer, GPU and browser processes, in `PROCESS_ROLES` order.
@@ -363,13 +368,12 @@ struct Run {
     counted: probe::wakes::Counted,
 }
 
-/// Chromium process types (`SystemInfo.getProcessInfo`) and the metric each one's CPU goes to.
-const PROCESS_ROLES: [(&str, &str); 3] = [("renderer", "cpu.renderer"), ("GPU", "cpu.gpu"), ("browser", "cpu.browser")];
+/// A browser's process roles (`WebBrowser::process_roles`) and the metric each one's CPU goes to.
+const PROCESS_ROLES: [(&str, &str); 3] = [("renderer", "cpu.renderer"), ("gpu", "cpu.gpu"), ("browser", "cpu.browser")];
 
-/// Each Chromium process's index in `PROCESS_ROLES`, by pid; empty where the browser does not say.
-fn process_roles(browser: &chromium::Browser) -> BTreeMap<u32, usize> {
-    let info = browser.cdp.send("SystemInfo.getProcessInfo", json!({}), None).unwrap_or(Value::Null);
-    info["processInfo"].as_array().into_iter().flatten().filter_map(|p| Some((p["id"].as_u64()? as u32, PROCESS_ROLES.iter().position(|(t, _)| p["type"].as_str() == Some(*t))?))).collect()
+/// Each browser process's index in `PROCESS_ROLES`, by pid; empty where the browser does not say.
+fn process_roles(browser: &WebBrowser) -> BTreeMap<u32, usize> {
+    browser.process_roles().into_iter().filter_map(|(pid, role)| Some((pid, PROCESS_ROLES.iter().position(|(r, _)| *r == role)?))).collect()
 }
 
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
@@ -426,6 +430,29 @@ struct Block {
     /// The main window's client area after the runs, in device-independent pixels, and its scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<[f64; 3]>,
+    /// A page's browser as this block launched it: its version, and whether it drew in software.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser: Option<BrowserSeen>,
+}
+
+/// What a page block's browser was (`Block::browser`): read once per target and headless mode, since
+/// two targets of one file may run two engines (or one headed and one headless).
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+struct BrowserSeen {
+    version: String,
+    software: bool,
+}
+
+/// The browsers a series' blocks ran, for its result and track's fingerprint (`a / b` when the sides
+/// of an implementation comparison ran two).
+fn series_browser(blocks: &[Block]) -> Value {
+    let mut seen: Vec<&str> = Vec::new();
+    for b in blocks.iter().filter_map(|b| b.browser.as_ref()) {
+        if !seen.contains(&b.version.as_str()) {
+            seen.push(&b.version);
+        }
+    }
+    if seen.is_empty() { Value::Null } else { json!(seen.join(" / ")) }
 }
 
 /// A window's client area in device-independent pixels, and its scale.
@@ -649,6 +676,8 @@ struct Ctx<'a> {
     pin: Option<u64>,
     gpu_checked: bool,
     gpu: Value,
+    /// Each page target's browser by target and headless mode (`BrowserSeen`), checked at its first block.
+    browsers: BTreeMap<String, BrowserSeen>,
     browser_version: String,
     baseline: Option<f64>,
     keep_all: bool,
@@ -1002,11 +1031,6 @@ pub fn run(args: &Args) -> Result<Output> {
         None if leak_run => Mode::Leak,
         None => Mode::Compare,
     };
-    // A headless browser presents nothing and paints off screen: a timed block there would put a
-    // number on a pipeline no person runs. It validates a file, as --check does, and nothing more.
-    if args.has("headless") && mode != Mode::Check {
-        return Err(Error::usage("--headless runs pages in a headless browser for --check only: no timed block runs headless (its frames reach no display)"));
-    }
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
     // Before it registers: a `--stop` that sees the registration must find its stop file kept.
@@ -1050,6 +1074,7 @@ pub fn run(args: &Args) -> Result<Output> {
         pin,
         gpu_checked: false,
         gpu: Value::Null,
+        browsers: BTreeMap::new(),
         browser_version: String::new(),
         baseline: validity::baseline(),
         keep_all: args.has("keep"),
@@ -1105,6 +1130,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let _ = store::write_json(&dir.join("state.json"), &ctx.saved);
     ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
+    apply_engines(&mut ctx.describe, args)?;
     if let Some(f) = args.get("filter") {
         let (text, err) = filter_report(&ctx.describe, f);
         if let Some(e) = err {
@@ -1131,6 +1157,16 @@ pub fn run(args: &Args) -> Result<Output> {
         };
     }
     ctx.fixture = fixture::Spec::from(&ctx.describe)?;
+    check_engines(&series, &ctx.describe, args)?;
+    let mut engines: Vec<WebEngine> = Vec::new();
+    for e in series.iter().map(|s| &ctx.describe["targets"][&s.target]).filter(|t| matches!(t["kind"].as_str(), Some("web" | "url"))).map(engine_of) {
+        if !engines.contains(&e) {
+            engines.push(e);
+        }
+    }
+    for why in engines.into_iter().filter_map(web::patched) {
+        ctx.warnings.push(validity::warn("PatchedBrowser", why));
+    }
     if busy > 0.10 {
         ctx.warnings.push(validity::warn("Background", format!("{:.0}% of all CPUs were busy before the run; close heavy apps for tighter intervals", busy * 100.0)));
     }
@@ -1172,7 +1208,23 @@ pub fn run(args: &Args) -> Result<Output> {
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
-    let ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config) } else { Value::Null };
+    let mut ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config) } else { Value::Null };
+    if compares {
+        // The browser a page ran in is part of what was measured: another engine, version or a headless
+        // run is another experiment, never the same one rerun.
+        let pages: BTreeMap<String, Value> = series
+            .iter()
+            .map(|s| &s.target)
+            .filter(|t| matches!(ctx.describe["targets"][*t]["kind"].as_str(), Some("web" | "url")))
+            .map(|t| {
+                let target = &ctx.describe["targets"][t];
+                (t.clone(), json!({ "engine": engine_of(target), "browser": web::browser_identity(engine_of(target)), "headless": target["headless"] == true }))
+            })
+            .collect();
+        if !pages.is_empty() {
+            ident["engines"] = json!(pages);
+        }
+    }
     let ledger = store::ledger::for_experiment(&exp, &super::record::now_iso(), &ident);
     if let Some(t) = ledger["text"].as_str() {
         progress(format!("ledger  {t}"));
@@ -1319,7 +1371,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let series_out_gaps = series_out.iter().filter(|s| s["kind"] == "gap").count();
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
-        "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window), "refresh_hz": refresh,
+        // A refresh only where some series drew to a display (a headless page has none).
+        "env": env, "browser": ctx.browser_version, "gpu": ctx.gpu, "window": ctx.used.as_ref().unwrap_or(&ctx.window),
+        "refresh_hz": refresh.filter(|_| series_out.iter().any(|s| s["headless"] != true)),
         "plan": {
             "pin": pin_label, "runs_per_block": ctx.runs, "aa": aa, "reserve": ctx.reserved, "reserve_mode": ctx.reserve, "gpu_cache": ctx.gpu_cache,
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
@@ -1421,7 +1475,11 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
     let mut attribution = Value::Null;
-    if passed && ctx.args.get("why") == Some("always") {
+    let profiled_engine = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) == WebEngine::Chromium;
+    if passed && ctx.args.get("why") == Some("always") && !profiled_engine {
+        ctx.warnings.push(validity::info("Attribution", format!("{}: {} pages have no profilers in strobe yet: no attribution block (profile it in Chromium)", s.label(), engine_of(&target))));
+    }
+    if passed && ctx.args.get("why") == Some("always") && profiled_engine {
         progress(format!("  attribution block ({}; not timed)", why_text(&target)));
         let v = &variants[0];
         // Warmed and run as in a bench (`--runs`, default 5): `--check`'s single cold run would start no
@@ -1443,7 +1501,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": ctx.headless, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead,
         "log": log, "log_path": ctx.runner.log,
     }))
@@ -1483,8 +1541,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!(
-                "pass  {}  {value}  {secs:.1} s{}{}\n",
+                "pass  {}  {value}  {secs:.1} s{}{}{}\n",
                 s["label"].as_str().unwrap_or(""),
+                s["engine"].as_str().filter(|e| *e != "chromium").map(|e| format!(" · {e}")).unwrap_or_default(),
                 if s["headless"] == true { " · headless" } else { "" },
                 if s["session_locked"] == true { " · session locked" } else { "" }
             );
@@ -1798,6 +1857,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
+        "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
@@ -1857,8 +1917,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
     }
     // Outside-in CPU (`cpu.work`) is a tested secondary where the target is measured from outside: a
-    // script, a native app, and both sides of an implementation comparison.
-    let script = target["kind"] == "script" || is_native(&target) || s.sides.is_some();
+    // script, a native app, both sides of an implementation comparison, and a page in an engine without
+    // the renderer's task time.
+    let script = target["kind"] == "script" || is_native(&target) || s.sides.is_some() || engine_of(&target) != WebEngine::Chromium;
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
     // Why the series ended early (a stop, or an error after some pairs), as the error to report.
@@ -2187,8 +2248,14 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // `--probes timing`) skips them.
     let mut recordings = json!({});
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
+    let profiled = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) == WebEngine::Chromium;
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
+        // Profilers are Chromium's DevTools: another engine's page gets none yet.
+        "always" | "auto" if !profiled => {
+            progress(format!("  no attribution blocks: {} pages have no profilers in strobe yet", engine_of(&target)));
+            false
+        }
         "always" => true,
         "never" => false,
         "auto" => differs,
@@ -2245,6 +2312,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut out = json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
+        "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
@@ -2694,14 +2762,14 @@ struct Foreign {
 }
 
 impl Foreign {
-    fn start(browser: &chromium::Browser) -> Foreign {
+    fn start(browser: &WebBrowser) -> Foreign {
         let mut idle = Vec::new();
         host::idle_cycles(&mut idle);
         Foreign { idle, tsc: host::tsc(), browser: browser.processes().iter().map(|p| p.cycles).sum(), procs: (host::now_ns(), host::all_processes()) }
     }
 
     /// Other work on `cpus` (all when unpinned) as % of one core, and the busiest outside processes.
-    fn stop(self, cpus: Option<u64>, browser: &chromium::Browser) -> (f64, Vec<(String, f64)>) {
+    fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> (f64, Vec<(String, f64)>) {
         let mut idle = Vec::new();
         let ok = host::idle_cycles(&mut idle);
         let (tsc, own) = (host::tsc(), browser.processes().iter().map(|p| p.cycles).sum::<u64>());
@@ -3027,7 +3095,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).inspect(|b| restate_recording(ctx, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).inspect(|b| restate_recording(ctx, s, b));
         // A timed or check block that refused its primary refuses the block, as a native one does:
         // pairs of nothing would end `unclear` instead of saying why.
         let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
@@ -3166,7 +3234,7 @@ fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
     match t["kind"].as_str().unwrap_or("") {
         "script" => true,
         // A headless page draws to no display: the lock screen covers nothing of it.
-        "web" | "url" if ctx.headless => true,
+        "web" | "url" if headless_of(ctx, s) => true,
         _ if x.set == Set::Memory => true,
         "native" if t["window"] == false || x.untimed || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => {
             !gpu_use(&s.primary) && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
@@ -3189,11 +3257,18 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
     b.locked = locked;
     if locked {
         b.values.retain(|k, _| !gpu_use(k));
-        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| gpu_use(m)) {
+        for m in declared_metrics(s).into_iter().filter(|m| gpu_use(m)) {
             b.refused.insert(m.clone(), Refusal::new(ValidatorId::SessionLocked, "the session was locked, so the compositor drew nothing and GPU use describes no screen"));
         }
     }
     b
+}
+
+/// What only a display shows (`Headless` refuses it of a headless page): frames, input-to-screen
+/// latencies, scrolling, canvas frames, the display's rate and a launch's pixels. Not strobe's own input
+/// pacing (`input.*`), which needs no display.
+pub(crate) fn display_metric(m: &str) -> bool {
+    ["frames.", "interaction.", "scroll.", "canvas.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
 }
 
 /// Frames on screen and input latencies: what background priority makes meaningless (SPEC §10.1
@@ -3206,30 +3281,31 @@ pub(crate) fn foreground_metric(m: &str) -> bool {
 /// A kept recording's values and refusals as the block ended with them: the block wrote its
 /// `meta.json` before `priority_state` and `headless_state` refused what the screen or the priority
 /// make meaningless, and the recording must not hold those values under its handle.
-fn restate_recording(ctx: &Ctx, b: &Block) {
+fn restate_recording(ctx: &Ctx, s: &Series, b: &Block) {
     let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) else { return };
     let Ok(mut meta) = store::read_json(&dir.join("meta.json")) else { return };
     meta["values"] = json!(b.values);
     meta["refused"] = refusal_map(&b.refused);
-    if ctx.headless {
+    if headless_of(ctx, s) {
         meta["headless"] = json!(true);
     }
     let _ = store::write_json(&dir.join("meta.json"), &meta);
 }
 
-/// `--headless`: what reached no display is not kept. Frames, input latencies, scrolling, canvas
-/// frames and GPU use go, and the declared ones show refused; CPU, main-thread work, counters,
-/// memory and milestones stay.
+/// A headless page (`--headless`, a target's `headless`): what reached no display is not kept. Frames,
+/// input-to-screen latencies, scrolling, canvas frames and GPU use go, and the declared ones show
+/// refused (`Headless`); CPU, main-thread work, counters, memory, milestones and strobe's own input
+/// pacing stay.
 fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
-    if !ctx.headless {
+    if !headless_of(ctx, s) {
         return b;
     }
-    // GPU memory too when the headless browser drew in software: no GPU held it.
-    let software = ctx.gpu["software"] == true;
-    let drawn = |m: &str| foreground_metric(m) || gpu_use(m) || (software && matches!(m, "gpu.vram" | "gpu.shared"));
+    // GPU memory too when this block's headless browser drew in software: no GPU held it.
+    let software = b.browser.as_ref().is_some_and(|br| br.software);
+    let drawn = |m: &str| display_metric(m) || gpu_use(m) || (software && matches!(m, "gpu.vram" | "gpu.shared"));
     b.values.retain(|k, _| !drawn(k));
-    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| drawn(m)) {
-        b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page ran headless (--headless), so nothing it drew reached a display")));
+    for m in declared_metrics(s).into_iter().filter(|m| drawn(m)) {
+        b.refused.insert(m.clone(), Refusal::new(ValidatorId::Headless, format!("{m}: the page ran headless, so nothing it drew reached a display")));
     }
     b
 }
@@ -3319,6 +3395,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
     let app = matches!(kind, "app" | "exe" | "webview" | "command");
+    let engine = engine_of(&target);
+    let headless = headless_of(ctx, s);
     // What the series declared beyond the default probes: counters, network counts, layout shift.
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
@@ -3350,9 +3428,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let quiet_ms = settled.elapsed().as_secs_f64() * 1e3;
     let launched = Instant::now();
     let mut guard = None;
-    let browser = if kind == "command" {
+    let browser: WebBrowser = if kind == "command" {
         let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
-        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), true, &window, ctx.pin)?.0
+        crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), true, &window, ctx.pin)?.0.into()
     } else if app {
         let launch = with_gpu_cache(ctx, s, v, &target, variant_app(v, &target, &ctx.config)?)?;
         if !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none() {
@@ -3361,26 +3439,53 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let seed = seed_dir(ctx, s, &target);
         let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
         guard = Some(g);
-        b
+        b.into()
     } else {
-        chromium::launch(&window, ctx.headless, ctx.pin, &[])?
+        web::launch(engine, &window, headless, ctx.pin)?
     };
     let steps = RefCell::new(vec![("quiet".to_string(), quiet_ms), ("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
-    ctx.target_qos = host::background_qos(Some(browser.pid));
+    ctx.target_qos = host::background_qos(Some(browser.pid()));
     let lapped = std::cell::Cell::new(Instant::now());
     let lap = |name: &str| {
         steps.borrow_mut().push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));
         lapped.set(Instant::now());
     };
     let result = (|| -> Result<Block> {
-        if !ctx.gpu_checked {
-            // Headless, a software rasterizer refuses nothing: frames and GPU use are refused anyway.
-            let gpu = if ctx.headless { browser.gpu()? } else { validity::software_gpu(&browser)? };
-            ctx.gpu = serde_json::to_value(&gpu)?;
-            ctx.browser_version = browser.version.clone();
-            ctx.gpu_checked = true;
+        // Once per target and mode: one file may run a headless Chromium target and a headed Firefox one.
+        let seen_key = format!("{}{}", s.target, if headless { ":headless" } else { "" });
+        let seen = match ctx.browsers.get(&seen_key) {
+            Some(b) => b.clone(),
+            None => {
+                // Headless, a software rasterizer refuses nothing: frames and GPU use are refused anyway.
+                let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
+                if !ctx.gpu_checked {
+                    ctx.gpu = serde_json::to_value(&gpu)?;
+                    ctx.browser_version = browser.version().to_string();
+                    ctx.gpu_checked = true;
+                }
+                let b = BrowserSeen { version: browser.version().to_string(), software: gpu.software };
+                ctx.browsers.insert(seen_key, b.clone());
+                b
+            }
+        };
+        let page: Page = match (&browser, app) {
+            (WebBrowser::Chromium(b), true) => electron::main_page(b)?.into(),
+            (WebBrowser::Chromium(_), false) | (WebBrowser::Firefox(_), _) => browser.page()?,
+        };
+        // No trace to carry runs, phases and frames: measured from outside (against a native
+        // implementation), or a page whose engine has none for strobe (Firefox).
+        let traceless = outside || page.cdp().is_none();
+        // Frames from the OS's presents: from outside, or headed in such an engine. Headed in such an
+        // engine, `interaction.*` too (a default secondary), from the page's own changes
+        // (`CHANGES_SCRIPT`, in every document from its start); from outside a run takes no input.
+        let os_frames_on = outside || (traceless && !headless && !x.counters && set != Set::Memory);
+        let changes = os_frames_on && !outside;
+        if changes {
+            page.add_init_script(CHANGES_SCRIPT)?;
+            page.eval(CHANGES_SCRIPT)?;
         }
-        let page = if app { electron::main_page(&browser)? } else { browser.page()? };
+        // The page's changes in the run so far, harvested before a `goto` takes the document with them.
+        let harvested: RefCell<Vec<u64>> = RefCell::new(Vec::new());
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
@@ -3389,20 +3494,27 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         // A webview app's window is placed like a native app's, and sized to the viewport; the block
         // records the page's own size, not the one asked for.
-        if browser.embedded {
-            ctx.used = Some(crate::target::webview::fit(&browser, &page, Some(&window), target.get("viewport").is_some_and(Value::is_object))?);
+        if let (WebBrowser::Chromium(b), Page::Chromium(p)) = (&browser, &page)
+            && b.embedded
+        {
+            ctx.used = Some(crate::target::webview::fit(b, p, Some(&window), target.get("viewport").is_some_and(Value::is_object))?);
         }
         // The driver's frame waits use the browser's own rAF, kept before the page's scripts can replace it.
-        page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": crate::driver::NATIVE_RAF }))?;
+        page.add_init_script(crate::driver::NATIVE_RAF)?;
         // `count.<name>` metrics: the page counts through a global installed in every document it loads.
         if !counted.is_empty() {
-            page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": COUNT_SCRIPT }))?;
+            page.add_init_script(COUNT_SCRIPT)?;
             page.eval(COUNT_SCRIPT)?;
         }
         if canvas {
-            page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": CANVAS_SCRIPT }))?;
+            page.add_init_script(CANVAS_SCRIPT)?;
             page.eval(CANVAS_SCRIPT)?;
         }
+        // Profilers, heap snapshots and the memory census are Chromium's DevTools: an attribution or memory
+        // block of another engine is refused before it launches (`engine_blocks`).
+        let no_cdp = || Error::refused("EngineUnsupported", format!("{engine} pages have no profilers, heap snapshots or memory census in strobe yet"), "attribute in Chromium");
+        let cp = || page.cdp().ok_or_else(no_cdp);
+        let cb = || browser.cdp().ok_or_else(no_cdp);
         lap("attach");
         let id = store::new_id("rec");
         let token = id.trim_start_matches("rec_").to_string();
@@ -3413,7 +3525,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let hooks = block::Hooks::new(ctx, || browser.processes().iter().map(|p| p.pid).collect());
         // TaskDuration (ms), then WORK_PARTS: cumulative per document (`Performance.enable` comes before the runs).
         let counters = || -> [f64; 6] {
-            let m = page.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null);
+            // Chromium's Performance domain; an engine without it has no such counters (NaN, never 0).
+            let m = page.cdp().map_or(Value::Null, |p| p.send("Performance.getMetrics", json!({})).unwrap_or(Value::Null));
             let get = |name: &str, scale: f64| m["metrics"].as_array().and_then(|a| a.iter().find(|x| x["name"] == name)).and_then(|x| x["value"].as_f64()).map_or(f64::NAN, |v| v * scale);
             let mut out = [get("TaskDuration", 1e3), 0.0, 0.0, 0.0, 0.0, 0.0];
             for (i, (_, name, scale)) in WORK_PARTS.iter().enumerate() {
@@ -3439,6 +3552,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // their document, so each `goto` (in a run or a reset) closes a segment and starts the next.
         let profiling = Cell::new(false);
         let segments: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
+        let mocks = mocks::Mocks::default();
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -3464,26 +3578,32 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                             hooks.add(&page_counts());
                         }
                         take_canvas();
+                        if changes {
+                            harvested.borrow_mut().extend(page_changes(&page));
+                        }
                     }
                     let segment = call == "goto" && profiling.get();
                     if segment {
-                        segments.borrow_mut().push((probe::cpu::stop(&page)?, probe::alloc::stop(&page)?));
+                        segments.borrow_mut().push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
                     }
                     let r = driver.dispatch(call, &args);
                     if segment {
-                        probe::cpu::start(&page)?;
-                        probe::alloc::start(&page)?;
+                        probe::cpu::start(cp()?)?;
+                        probe::alloc::start(cp()?)?;
                     }
                     r
                 }
+                // `ctx.mock` on an engine without the runner's CDP session: strobe answers through the page's
+                // network interception (`mocks`), asking the runner's handlers.
+                "mock" => mocks.add(&page, a),
                 "count" => {
                     hooks.count(a);
                     Ok(Value::Bool(true))
                 }
                 // A page's phases are marks in its own trace, read from there with the run's frames; from
-                // outside, strobe's own marks on the host clock.
+                // outside, or in an engine without that trace, strobe's own marks on the host clock.
                 "phase" => {
-                    if outside {
+                    if traceless {
                         hooks.phase(a);
                     } else if let Some(key) = hooks.phase_key(a) {
                         driver.mark(&key)?;
@@ -3495,13 +3615,18 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
         };
         let t = s.hook_timeout();
-        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root }), t, &serve)?;
+        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root, "engine": engine }), t, &serve)?;
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {
+            // Playwright connects over CDP: Chromium only (the runner's `playwright` throws elsewhere).
+            let (endpoint, target_id) = match (browser.cdp(), page.cdp()) {
+                (Some(b), Some(p)) => (json!(b.ws), json!(p.target)),
+                _ => (Value::Null, Value::Null),
+            };
             let r = ctx
                 .runner
-                .call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &serve)
+                .call("prepare", json!({ "endpoint": endpoint, "target": target_id, "engine": engine }), t, &serve)
                 .map_err(|e| crate::runner::incomplete("prepare", "prepare", e, "", "fix the target's prepare in the bench file"))?;
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 first = join_url(origin(&url), u);
@@ -3513,14 +3638,26 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         lap("load");
         validity::dev_build(&page)?;
-        let during = Foreign::start(&browser);
+        let mut during = Some(Foreign::start(&browser));
         let speed = validity::speed_check(&page)?;
-        let ratio = match validity::throttled(speed, ctx.baseline) {
+        // The calibration is Chromium's: another engine's JS speed is compared with its own reference
+        // only, which a check under other work never joins.
+        let mut loaded: Option<(f64, Vec<(String, f64)>)> = None;
+        let checked = match engine {
+            WebEngine::Chromium => validity::throttled(speed, ctx.baseline),
+            WebEngine::Firefox | WebEngine::Webkit => {
+                let f = during.take().map(|d| d.stop(ctx.pin, &browser)).unwrap_or_default();
+                let keep = f.0 < BACKGROUND_PCT;
+                loaded = Some(f);
+                validity::engine_throttled(engine, ctx.pin, speed, keep)
+            }
+        };
+        let ratio = match checked {
             // A slow check while other work kept the target's CPUs busy (the browser's own processes
             // not counted) is that work's doing, as for a native block: `Background`, which the bench
             // waits out, not `Throttled`.
             Err(e) => {
-                let (foreign, busiest) = during.stop(ctx.pin, &browser);
+                let (foreign, busiest) = loaded.or_else(|| during.map(|d| d.stop(ctx.pin, &browser))).unwrap_or_default();
                 return Err(if foreign >= BACKGROUND_PCT {
                     let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
                     Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {foreign:.0}% of a core busy ({})", e.message))
@@ -3542,6 +3679,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         hooks.check_fixture();
+        // A page without WebGPU (an engine or OS that does not ship it, or an origin that is not a secure
+        // context) draws no frame the canvas hook sees: canvas.* refused, never 0. Read on the page the
+        // runs start from, after setup.
+        let no_webgpu = canvas && page.eval("typeof GPUCanvasContext === 'undefined'")?.as_bool() == Some(true);
         let start = shown::page(ctx, s, v, pair, "start", &page);
         shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
         lap("setup");
@@ -3563,36 +3704,55 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         .collect();
         // A counter block traces nothing: its times are dropped, and tracing would add the browser's
         // own instructions to what the counters count.
-        let tracing = if set == Set::Memory || x.counters || outside { None } else { Some(probe::trace::start_with(&browser.cdp, set, &extra_categories)?) };
-        // From outside: what reached the screen, from the OS's present events of the browser's processes.
-        let presents = outside.then(|| {
-            probe::present::PresentCapture::start().map(|mut c| {
-                c.track(&browser.processes().iter().map(|p| p.pid).collect::<Vec<_>>());
-                c
-            })
-        });
-        let run_marks: RefCell<Vec<Vec<(String, u64)>>> = RefCell::new(Vec::new());
+        // Without a trace (`traceless`) the marks are strobe's own on the host clock, the frames the OS's.
+        let tracing = match browser.cdp() {
+            Some(b) if set != Set::Memory && !x.counters && !traceless => Some(probe::trace::start_with(&b.cdp, set, &extra_categories)?),
+            _ => None,
+        };
         // A kept recording is claimed for this block alone and discarded on any error before its meta.json.
         let mut draft: Option<store::Draft> = None;
         let mem_dir = if set == Set::Memory { Some(draft.insert(store::claim_recording(&id)?).dir().to_path_buf()) } else { None };
         // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
-        let sampler = probe::os::Sampler::start(browser.pid, browser.profile.clone());
+        let sampler = probe::os::Sampler::start(browser.pid(), browser.profile());
         let (sampled, runner_pid) = (Instant::now(), ctx.runner.pid());
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
-        page.send("Performance.enable", json!({}))?;
-        // `net.*` metrics: requests and bytes per run from the Network domain, on only for such series.
-        let net = if nets.is_empty() {
-            None
-        } else {
-            let rx = browser.cdp.events();
-            page.send("Network.enable", json!({}))?;
-            Some(RefCell::new(Net::new(rx, page.session.clone())))
+        if let Some(p) = page.cdp() {
+            p.send("Performance.enable", json!({}))?;
+        }
+        // `net.*` metrics: requests and bytes per run from the Network domain (Firefox: BiDi's network
+        // events), on only for such series.
+        let net = match (&browser, &page) {
+            _ if nets.is_empty() => None,
+            (WebBrowser::Chromium(b), Page::Chromium(p)) => {
+                let rx = b.cdp.events();
+                p.send("Network.enable", json!({}))?;
+                Some(RefCell::new(Net::new(rx, p.session.clone())))
+            }
+            (WebBrowser::Firefox(b), Page::Firefox(p)) => {
+                let rx = b.bidi.events();
+                p.enable_network()?;
+                Some(RefCell::new(Net::new(rx, p.context.clone())))
+            }
+            (WebBrowser::Chromium(_), Page::Firefox(_)) | (WebBrowser::Firefox(_), Page::Chromium(_)) => None,
         };
+        // What reached the screen comes from the OS's present events of the browser's processes (§7.2),
+        // as for a native app (`os_frames_on`). The capture follows the browser's windows (macOS and X11
+        // stream them by window).
+        let presents = os_frames_on.then(|| {
+            probe::present::PresentCapture::start().map(|mut c| {
+                c.track(&browser.pids());
+                c
+            })
+        });
         let run_counts: RefCell<Vec<BTreeMap<String, f64>>> = RefCell::new(Vec::new());
         let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
+        // Without a trace: each run's host-clock phase marks, and its inputs with the page's own changes,
+        // joined to the OS's presents after the runs.
+        let run_marks: RefCell<Vec<Vec<(String, u64)>>> = RefCell::new(Vec::new());
+        let run_inputs: RefCell<Vec<RunInputs>> = RefCell::new(Vec::new());
 
         let run_timeout = s.run_timeout();
         let perf = x.counters.then(probe::wakes::Perf::new);
@@ -3639,9 +3799,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             let c0 = counters();
             driver.drags.borrow_mut().clear();
+            driver.inputs.borrow_mut().clear();
+            if changes {
+                page_changes(&page);
+                harvested.borrow_mut().clear();
+            }
             // From outside the run is strobe's own span on the host clock, as a native app's: no page
             // mark, and no wait for the page's next frame.
-            if !outside {
+            if !traceless {
                 driver.mark(&format!("{key}:start"))?;
             }
             let listed = probe::wakes::wall_us();
@@ -3662,7 +3827,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
             let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
-            if !outside {
+            if !traceless {
                 driver.mark(&format!("{key}:end"))?;
             }
             roles.extend(process_roles(&browser));
@@ -3677,6 +3842,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             run_marks.borrow_mut().push(hooks.take_marks());
             let index = run_counts.borrow().len();
             run_counts.borrow_mut().push(hooks.counts());
+            if changes {
+                let mut seen = harvested.take();
+                seen.extend(page_changes(&page));
+                run_inputs.borrow_mut().push((driver.inputs.take(), seen));
+            }
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
@@ -3706,7 +3876,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 _ => f64::NAN,
             });
             let counted = probe::wakes::counted(&k0, &k1);
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted })
+            let work = cpu * wall / 1e6 / 100.0;
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], work, parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -3728,37 +3899,38 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
                 if let Some(dir) = &mem_dir {
-                    let mut c = probe::census::take(&browser, &page);
+                    let mut c = probe::census::take(cb()?, cp()?);
                     c["os_after_snapshot"] = json!(true);
                     let done = runs.len() - f;
                     if done == 2 * n {
-                        c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-s2.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                        c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s2.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
                     }
                     census.push(c);
                     if done == n {
-                        probe::heap::snapshot(&page, &dir.join("heap-s1.heapsnapshot.gz"))?;
+                        probe::heap::snapshot(cp()?, &dir.join("heap-s1.heapsnapshot.gz"))?;
                     }
                     if done == 2 * n {
-                        probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz"))?;
+                        probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz"))?;
                     }
                 }
                 continue;
             }
             // The work that must hold steady is the renderer's main-thread time. `--check` measures the
-            // first run: it asks whether a case works, not what it costs.
-            // From outside, the work is the processes' CPU, as a native app's.
-            let work: Vec<f64> = runs.iter().map(|r| if outside { r.cpu * r.ms / 100.0 } else { r.task }).collect();
+            // first run: it asks whether a case works, not what it costs. From outside or in an engine
+            // without that counter, the work is the processes' CPU, as a native app's; where this machine
+            // gives no CPU time (cycles refused), the run's wall time.
+            let work: Vec<f64> = runs.iter().map(|r| if !traceless { r.task } else if r.work.is_finite() { r.work } else { r.ms }).collect();
             if warmup.after(&work) && !x.untimed {
                 if set == Set::Attribution {
-                    probe::cpu::start(&page)?;
-                    probe::alloc::start(&page)?;
+                    probe::cpu::start(cp()?)?;
+                    probe::alloc::start(cp()?)?;
                     profiling.set(true);
                 }
                 if let Some(dir) = &mem_dir {
-                    let mut c = probe::census::take(&browser, &page);
-                    c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                    let mut c = probe::census::take(cb()?, cp()?);
+                    c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
                     census.push(c);
-                    probe::heap::snapshot(&page, &dir.join("heap-s0.heapsnapshot.gz"))?;
+                    probe::heap::snapshot(cp()?, &dir.join("heap-s0.heapsnapshot.gz"))?;
                 }
             }
         }
@@ -3812,8 +3984,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // What the page had to draw in: its viewport in CSS pixels (device-independent at zoom 1) and
         // its scale, compared with the other side's content area (`admit_window`).
         let content = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
-        let heap_mb = page.send("Runtime.getHeapUsage", json!({})).ok().and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
+        let heap_mb = page.cdp().and_then(|p| p.send("Runtime.getHeapUsage", json!({})).ok()).and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
+        // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
+        let presents = presents.map(|r| r.and_then(|c| c.stop()));
         let dir = match (&draft, keep) {
             (Some(d), _) => d.dir().to_path_buf(),
             (None, true) => draft.insert(store::claim_recording(&id)?).dir().to_path_buf(),
@@ -3824,7 +3998,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if set == Set::Attribution {
             profiling.set(false);
             let mut segments = segments.take();
-            segments.push((probe::cpu::stop(&page)?, probe::alloc::stop(&page)?));
+            segments.push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
             for (k, (profile, allocs)) in segments.iter().enumerate() {
                 store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
                 store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
@@ -3839,7 +4013,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 probe::symbols::urls(profile, &mut scripts);
                 probe::symbols::urls(allocs, &mut scripts);
             }
-            probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
+            probe::symbols::store_maps(cp()?, &scripts, &dir, served.as_deref())?;
             lap("maps");
         }
         let trace = dir.join("trace.pftrace");
@@ -3849,19 +4023,19 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         // `layout.shift`'s explanation: the largest shifts and what moved, named while the page is open.
         if set == Set::Attribution && shift {
-            match probe::shifts::largest(&trace, &token, &page, first, 5) {
+            match probe::shifts::largest(&trace, &token, cp()?, first, 5) {
                 Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
                 Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", v.role, e.message))),
             }
         }
         if set == Set::Attribution {
             // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
-            let mut c = probe::census::take(&browser, &page);
-            c["allocators"] = probe::census::allocators(&browser, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+            let mut c = probe::census::take(cb()?, cp()?);
+            c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
             census.push(c);
             // The live objects after the runs (post-GC), once no trace subscription copies every
             // snapshot chunk (SPEC §8.6).
-            if let Err(e) = probe::heap::snapshot(&page, &dir.join("heap-0.heapsnapshot.gz")) {
+            if let Err(e) = probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz")) {
                 ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", v.role, e.message)));
             }
             lap("heap");
@@ -3874,7 +4048,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         {
             ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
         }
-        let mut data = if set == Set::Memory || x.counters || outside { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
+        let mut data = if set == Set::Memory || x.counters || traceless { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
         lap("analyse");
         let mut extra = BTreeMap::new();
@@ -3886,15 +4060,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if !fixture_cpu.is_empty() {
             extra.insert("cpu.fixture".to_string(), fixture_cpu);
         }
-        // `phase.<name>`: the run's phase windows from the trace's marks; from outside, strobe's own.
+        // `phase.<name>`: the run's phase windows from the trace's marks, or (traceless) strobe's own.
         let run_marks = run_marks.into_inner();
-        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")).filter(|_| outside) {
-            let per: BTreeMap<String, f64> = (0..measured.len()).filter_map(|j| Some((key(j), phase_ms(run_marks.get(first + j)?, name))).filter(|(_, x)| x.is_finite())).collect();
-            extra.insert(format!("phase.{name}"), per);
-        }
-        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")).filter(|_| !outside) {
+        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")) {
             let per: BTreeMap<String, f64> = (0..measured.len())
                 .filter_map(|j| {
+                    if traceless {
+                        return Some((key(j), phase_ms(run_marks.get(first + j)?, name))).filter(|(_, ms)| ms.is_finite());
+                    }
                     let suffix = format!(":run:{}:phase:{name}", first + j);
                     let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0) as f64 / 1e6).collect();
                     (!spans.is_empty()).then(|| (key(j), spans.iter().sum()))
@@ -3902,6 +4075,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 .collect();
             extra.insert(format!("phase.{name}"), per);
         }
+        // The browser's processes' CPU per run: in every engine, so one primary compares across them.
+        extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.work.is_finite()).map(|(j, r)| (key(j), r.work)).collect());
         // `span.<name>`: the page's own performance.measure() spans per run, from the trace.
         for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("span.")) {
             if let Some(per) = data.span_per_run("run", name) {
@@ -3972,33 +4147,25 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             canvas_gaps.sort_by(f64::total_cmp);
         }
         let mut values = metrics::block_values(&data, "run", &extra);
-        // From outside: the frames the browser's processes put on the screen during the runs, read as a
-        // native app's are (SPEC §7.4), refused with the reason where this OS cannot tell.
-        let mut outside_refused: BTreeMap<String, Refusal> = BTreeMap::new();
-        if let Some(capture) = presents {
-            let pids: Vec<u32> = browser.processes().iter().map(|p| p.pid).collect();
-            let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
-            let host_spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
-            let frame = |m: &str| ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| m.starts_with(p));
-            match capture.and_then(|c| c.stop()) {
-                Ok(p) => {
-                    let f = probe::present::frames::native_values(&p, &pids, &host_spans, display.as_ref());
-                    match &f.refused {
-                        Some(why) => outside_refused.extend(declared.iter().filter(|m| frame(m.as_str())).map(|m| (m.to_string(), native::line(why)))),
-                        None => {
-                            values.extend(f.values.clone());
-                            outside_refused.extend(declared.iter().filter_map(|m| Some((m.to_string(), native::line(f.partial.get(m.as_str())?)))));
-                        }
-                    }
-                }
-                Err(e) => outside_refused
-                    .extend(declared.iter().filter(|m| frame(m.as_str())).map(|m| (m.to_string(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {}", e.message))))),
+        // Traceless, the frames are the OS's presents of the browser's processes (none headless), read
+        // as a native app's are (§7.4) and refused with the reason where this OS cannot tell; headed in
+        // another engine, `interaction.*` joins strobe's inputs to them (from outside a run takes none).
+        let mut os_refused: BTreeMap<String, Refusal> = BTreeMap::new();
+        let mut os_presents = None;
+        let run_inputs_kept = run_inputs.into_inner();
+        if traceless {
+            values.remove("frames.n");
+            if let Some(p) = presents {
+                let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
+                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &spans, run_inputs_kept.get(first..).unwrap_or_default(), &mut values, &mut os_refused);
             }
-            // No input in the runs reached the page from the OS yet: input latency from outside is phase 2.
-            for m in declared.iter().filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
-                outside_refused.entry(m.to_string()).or_insert_with(|| {
-                    Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page is measured from outside here (against a native implementation), and OS input to a page is not built yet"))
-                });
+            if outside {
+                // No input in the runs reached the page from the OS yet: input latency from outside is phase 2.
+                for m in declared.iter().filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
+                    os_refused.entry(m.to_string()).or_insert_with(|| {
+                        Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page is measured from outside here (against a native implementation), and OS input to a page is not built yet"))
+                    });
+                }
             }
         }
         if canvas {
@@ -4038,19 +4205,36 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         let mut refused = uncounted;
         refuse_not_on_this_os(s, &mut values, &mut refused);
-        for (m, r) in outside_refused {
+        for (m, r) in os_refused {
             values.remove(&m);
             refused.insert(m, r);
         }
+        for m in declared_metrics(s) {
+            let webgpu = (no_webgpu && m.starts_with("canvas."))
+                .then(|| Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: the page has no WebGPU here (no GPUCanvasContext: {engine} on this OS does not ship it, or the origin is not a secure context)")));
+            if let Some(r) = validity::engine_refusal(engine, m).or(webgpu) {
+                values.remove(m);
+                refused.insert(m.clone(), r);
+            }
+        }
+        if no_webgpu {
+            values.retain(|k, _| !k.starts_with("canvas."));
+        }
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
-        let intervals = metrics::run_intervals(&data);
-        // From outside there is no trace to keep: the block's numbers are in result.json.
+        // Traceless, the frame pacing per run (`intervals`) comes from the OS's presents where this OS
+        // tells when a frame was handed over (Windows).
+        let intervals = match (&os_presents, values.get("display.hz")) {
+            (Some(p), Some(hz)) if !p.no_begin => present_intervals(p, &browser.pids(), &measured.iter().map(|r| (r.t0, r.t1)).collect::<Vec<_>>(), 1000.0 / hz),
+            _ => metrics::run_intervals(&data),
+        };
+        // From outside there is no trace to keep: the block's numbers are in result.json. A Firefox block
+        // keeps its OS presents for `query <rec> frames`.
         let recording = if (keep && !outside) || set == Set::Memory {
             let mut meta = json!({
                 "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
-                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version, "background": background, "screen": screen,
+                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
             });
             if !census.is_empty() {
                 meta["census"] = json!(census);
@@ -4059,6 +4243,22 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // What `query leaks` reads, as for a memory recording.
                 meta["leaks"] = l["suspects"].clone();
                 meta["leak"] = json!({ "js_heap": l["js_heap"], "dom_nodes": l["dom_nodes"], "runs": l["runs"] });
+            }
+            // A traceless block's frames are its OS presents: kept as a native block keeps them, with the
+            // runs' spans, inputs and the page's changes, which `query <rec> frames` reads.
+            if let Some(p) = &os_presents {
+                crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
+                let inputs = &run_inputs_kept;
+                let per: serde_json::Map<String, Value> = measured
+                    .iter()
+                    .enumerate()
+                    .map(|(j, r)| {
+                        let (sent, changes) = inputs.get(first + j).cloned().unwrap_or_default();
+                        let sent: Vec<Value> = sent.iter().map(|&(t, scroll)| json!({ "t_ns": t, "kind": if scroll { "scroll" } else { "discrete" }, "first": true })).collect();
+                        (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
+                    })
+                    .collect();
+                store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "runs": per }))?;
             }
             store::write_json(&dir.join("meta.json"), &meta)?;
             if let Some(d) = draft.take() {
@@ -4094,6 +4294,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             process_set: Some(programs(&browser.processes())),
             fixture_connected: None,
             client: content,
+            browser: Some(seen),
         })
     })();
     lapped.set(Instant::now());
@@ -4113,7 +4314,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 /// `WindowHidden` when other apps' windows cover it or it is not the active app, which a bench waits
 /// out as for a native block. A key window can cost several times an inactive one, so both sides run
 /// in that one state. Elsewhere, and for builds of one target, nothing.
-fn front_page(s: &Series, browser: &chromium::Browser) -> Result<()> {
+fn front_page(s: &Series, browser: &WebBrowser) -> Result<()> {
     #[cfg(target_os = "macos")]
     if s.sides.is_some() {
         use crate::target::native::{COVERED, NOT_ACTIVE};
@@ -4189,14 +4390,9 @@ fn power_keep(args: &Args) -> Result<bool> {
 
 /// What the page showed when a step failed: its URL and a screenshot saved with the experiment.
 fn snapshot(page: &Page, exp: &str, step: &str) -> String {
-    use base64::Engine;
     let quick = Duration::from_secs(5);
     let url = page.eval_timeout("location.href", quick).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_else(|| "unresponsive".into());
-    let shot = page
-        .cdp
-        .send_timeout("Page.captureScreenshot", json!({ "format": "png" }), Some(&page.session), quick)
-        .ok()
-        .and_then(|r| r["data"].as_str().and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok()));
+    let shot = page.screenshot(quick).ok();
     let path = store::experiment_dir(exp).ok().map(|d| d.join(format!("failed-{step}-{}.png", store::new_id("shot").trim_start_matches("shot_"))));
     match (shot, path) {
         (Some(png), Some(path)) if std::fs::write(&path, &png).is_ok() => format!("\n  page: {url}\n  screenshot: {}", path.display()),
@@ -4652,6 +4848,234 @@ fn margins(v: &Value, primary: &str) -> std::result::Result<BTreeMap<String, f64
     Ok(out)
 }
 
+/// One run's inputs strobe sent (host clock, and whether each was a scroll) and the page's own changes
+/// (host clock), for input latency from the OS's presents.
+type RunInputs = (Vec<(u64, bool)>, Vec<u64>);
+
+/// The page engine a target runs in (`web`, `url`; `apply_engines` set it): Chromium unless it says.
+fn engine_of(target: &Value) -> WebEngine {
+    target["engine"].as_str().and_then(|e| WebEngine::parse(e).ok()).unwrap_or_default()
+}
+
+/// Whether a series' page runs headless: `--headless`, or its target's `headless`.
+fn headless_of(ctx: &Ctx, s: &Series) -> bool {
+    ctx.headless || ctx.describe["targets"][&s.target]["headless"] == true
+}
+
+/// `--engine` and the targets' own `engine` and `headless` (SPEC §9.6): every page target gets its engine
+/// (Chromium by default). `--engine e` keeps only the targets of engine `e` when the file has some, and
+/// otherwise runs every page target in `e`; either way a run that would include an app, exe, native,
+/// command or script target refuses (`check_engines`). WebKit refuses (`EngineUnsupported`).
+fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
+    let flag = args.get("engine").map(WebEngine::parse).transpose()?;
+    let page = |t: &Value| matches!(t["kind"].as_str(), Some("web" | "url"));
+    let Some(targets) = describe["targets"].as_object_mut() else { return Ok(()) };
+    for (name, t) in targets.iter() {
+        if let Some(e) = t["engine"].as_str() {
+            if !page(t) {
+                return Err(Error::usage(format!("target {name}: engine is for page targets (web, url); this is a {} target", t["kind"].as_str().unwrap_or("?"))));
+            }
+            WebEngine::parse(e).map_err(|e| Error::usage(format!("target {name}: {}", e.message)))?;
+        }
+    }
+    if let Some(e) = flag {
+        if !targets.values().any(page) {
+            return Err(Error::usage("--engine picks the browser of page targets (web, url); this bench file has none"));
+        }
+        let declared = targets.values().any(|t| t["engine"].as_str() == Some(e.name()));
+        if declared {
+            targets.retain(|_, t| t["engine"].as_str() == Some(e.name()));
+        } else {
+            for t in targets.values_mut().filter(|t| page(t)) {
+                t["engine"] = json!(e);
+            }
+        }
+    }
+    for t in targets.values_mut().filter(|t| page(t)) {
+        if t["engine"].is_null() {
+            t["engine"] = json!(WebEngine::Chromium);
+        }
+        if args.has("headless") {
+            t["headless"] = json!(true);
+        }
+    }
+    Ok(())
+}
+
+/// Before anything builds: `--engine` on a series that is no page; a primary the series' engine cannot
+/// measure (`EngineUnsupported`, with the closest one it can) or a headless page cannot show
+/// (`Headless`). Declared secondaries are refused per block instead.
+fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()> {
+    for s in series {
+        let t = &describe["targets"][&s.target];
+        let page = matches!(t["kind"].as_str(), Some("web" | "url"));
+        if args.get("engine").is_some() && !page {
+            return Err(Error::usage(format!("{}: --engine picks a page's browser; {} is a {} target (narrow the run with --target)", s.label(), s.target, t["kind"].as_str().unwrap_or("?"))));
+        }
+        if args.has("headless") && !page {
+            return Err(Error::usage(format!("{}: --headless runs pages in a headless browser; {} is a {} target, which opens its own window", s.label(), s.target, t["kind"].as_str().unwrap_or("?"))));
+        }
+        if !page {
+            continue;
+        }
+        let engine = engine_of(t);
+        if engine == WebEngine::Webkit {
+            return Err(web::webkit_refusal());
+        }
+        if engine != WebEngine::Chromium && s.launch.is_object() {
+            return Err(Error::refused("EngineUnsupported", format!("{}: launch cases time a launch through Chromium's DevTools; {engine} launch cases are not built yet", s.label()), "measure the launch in Chromium, or time the load in a run case (phase around page.goto)"));
+        }
+        if let Some(r) = validity::engine_refusal(engine, &s.primary) {
+            return Err(Refusal { summary: format!("{}: the primary {}", s.label(), r.summary), ..r }.into());
+        }
+        if (t["headless"] == true || args.has("headless")) && (display_metric(&s.primary) || gpu_use(&s.primary)) {
+            return Err(Refusal::new(ValidatorId::Headless, format!("{}: the primary {} needs a display, and the page runs headless: nothing it draws reaches one", s.label(), s.primary))
+                .fix("drop --headless (and the target's headless) to measure it on screen, or choose a CPU primary: cpu.work, cpu.app.total, run.duration or phase.<name> (main.work in Chromium)")
+                .into());
+        }
+        if engine != WebEngine::Chromium && matches!(args.get("probes"), Some("attribution" | "memory")) {
+            return Err(Error::refused("EngineUnsupported", format!("{}: --probes {}: profilers, heap snapshots and the memory census are Chromium's DevTools; {engine} has none in strobe yet", s.label(), args.get("probes").unwrap_or("")), "attribute or leak-check the page in Chromium"));
+        }
+    }
+    Ok(())
+}
+
+/// The page's own changes since the last read (`CHANGES_SCRIPT`), on the host clock. The read returns the
+/// page's monotonic clock with them, between two host-clock reads; each change goes back from the later
+/// one by its distance from that clock, plus the 1 ms the page's clock may be coarsened to, so that a
+/// change is never placed before the input that caused it (it can land up to the read's own length late).
+fn page_changes(page: &Page) -> Vec<u64> {
+    let h0 = host::now_ns();
+    let read: Vec<f64> = page
+        .eval("JSON.stringify([performance.now(), ...(globalThis.__strobeChanges?.splice(0) ?? [])])")
+        .ok()
+        .and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+        .unwrap_or_default();
+    let h1 = host::now_ns().max(h0) as f64;
+    let Some((&now, times)) = read.split_first() else { return Vec::new() };
+    times.iter().map(|t| (h1 - ((now - t - 1.0).max(0.0)) * 1e6).max(0.0) as u64).collect()
+}
+
+/// The page's own changes, for input latency where the browser reports none (Firefox): when the DOM
+/// changed (in open and closed shadow roots too), an input or change event fired, or the page scrolled.
+/// At most one entry per millisecond: a page that mutates in a tight loop fills nothing. Installed in
+/// every document of a headed series in such an engine.
+const CHANGES_SCRIPT: &str = r#"(() => {
+  if (globalThis.__strobeChangesOn) return
+  globalThis.__strobeChangesOn = true
+  globalThis.__strobeChanges ??= []
+  let last = -1
+  const at = () => {
+    const c = globalThis.__strobeChanges, t = performance.now()
+    if (c.length < 10000 && Math.floor(t) !== last) { last = Math.floor(t); c.push(t) }
+  }
+  const opts = { subtree: true, childList: true, attributes: true, characterData: true }
+  const observer = new MutationObserver(at)
+  observer.observe(document, opts)
+  const attach = Element.prototype.attachShadow
+  Element.prototype.attachShadow = function (init) {
+    const root = attach.call(this, init)
+    observer.observe(root, opts)
+    return root
+  }
+  for (const e of ["input", "change", "scroll"]) addEventListener(e, at, true)
+})()"#;
+
+/// A page's frames where the engine reports none of its own (Firefox, headed): the OS's presents of its
+/// processes in the measured runs (§7.2, as for a native app: on macOS and Linux X11 the intervals and
+/// drops are refused), and `interaction.*` / `scroll.latency.*` from strobe's inputs to the first frame
+/// shown after the page changed (§7.4).
+#[allow(clippy::too_many_arguments)]
+fn os_frames(
+    ctx: &mut Ctx,
+    s: &Series,
+    v: &Variant,
+    presents: Result<probe::present::Presents>,
+    pids: &[u32],
+    spans: &[(u64, u64)],
+    inputs: &[RunInputs],
+    values: &mut BTreeMap<String, f64>,
+    refused: &mut BTreeMap<String, Refusal>,
+) -> Option<probe::present::Presents> {
+    use probe::present::frames;
+    let declared: Vec<String> = declared_metrics(s).into_iter().cloned().collect();
+    let frame_metric = |m: &str| ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| m.starts_with(p));
+    let line = |why: &str| Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why));
+    let p = match presents {
+        Ok(p) => p,
+        Err(e) => {
+            for m in declared.iter().filter(|m| frame_metric(m)) {
+                refused.entry(m.clone()).or_insert_with(|| Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {}", e.message)));
+            }
+            return None;
+        }
+    };
+    let display = host::main_window(pids).and_then(|w| host::display_of(w.hwnd));
+    let f = frames::native_values(&p, pids, spans, display.as_ref());
+    let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
+    let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
+    let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
+    let whole = match overhead {
+        Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
+        _ => f.refused.clone().or_else(|| refresh.and_then(|ms| frames::unpaced(&p.presents, pids, spans, ms))),
+    };
+    if let Some(why) = whole {
+        for m in declared.iter().filter(|m| frame_metric(m)) {
+            refused.insert(m.clone(), line(&why));
+        }
+        return Some(p);
+    }
+    values.extend(f.values);
+    for m in &declared {
+        if let Some(w) = f.partial.get(m) {
+            refused.entry(m.clone()).or_insert_with(|| line(w));
+        }
+    }
+    if !inputs.is_empty() {
+        let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
+        let mut reactions = frames::Reactions::default();
+        for (sent, changes) in inputs {
+            let sent: Vec<frames::Sent> = sent.iter().map(|&(t_ns, scroll)| frames::Sent { t_ns, scroll }).collect();
+            let got = frames::reactions(&sent, changes, &p.presents, pids, quiet);
+            reactions.interaction.extend(got.interaction);
+            reactions.scroll.extend(got.scroll);
+            reactions.tried = (reactions.tried.0 + got.tried.0, reactions.tried.1 + got.tried.1);
+            reactions.busy = (reactions.busy.0 + got.busy.0, reactions.busy.1 + got.busy.1);
+            reactions.unshown = (reactions.unshown.0 + got.unshown.0, reactions.unshown.1 + got.unshown.1);
+            reactions.unchanged += got.unchanged;
+        }
+        let mut why = BTreeMap::new();
+        reactions.values(p.events_lost, values, &mut why);
+        for m in &declared {
+            if let Some(w) = why.get(m) {
+                refused.entry(m.clone()).or_insert_with(|| line(&w.replace("the app's accessibility tree", "the page").replace("app's tree", "page")));
+            }
+        }
+    }
+    if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
+        ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", v.role, p.events_lost)));
+    }
+    Some(p)
+}
+
+/// The gaps (ms, sorted) between the frames of `pids` shown in the runs while each next frame was handed
+/// over before the last one showed plus half a refresh (the app kept drawing, §7.2): a traceless block's
+/// frame pacing for reports, where the OS tells when a frame was handed over (Windows).
+fn present_intervals(p: &probe::present::Presents, pids: &[u32], runs: &[(u64, u64)], refresh_ms: f64) -> Vec<f64> {
+    let mut out = Vec::new();
+    for &(t0, t1) in runs {
+        let mut shown = probe::present::frames::from_presents(&p.presents, pids, t0, t1).shown;
+        shown.sort_by_key(|s| (s.stream, s.screen_ns));
+        for w in shown.windows(2).filter(|w| w[0].stream == w[1].stream) {
+            if w[1].screen_ns > w[0].screen_ns && (w[1].pending_ns as f64) <= w[0].screen_ns as f64 + refresh_ms * 1e6 / 2.0 {
+                out.push((w[1].screen_ns - w[0].screen_ns) as f64 / 1e6);
+            }
+        }
+    }
+    out.sort_by(f64::total_cmp);
+    out
+}
+
 /// Requests a page started per run and the bytes they received, from Network domain events read at run
 /// boundaries. A request belongs to the run it started in; its bytes may arrive after that run ends.
 struct Net {
@@ -4684,14 +5108,20 @@ impl Net {
         }
     }
 
+    /// CDP's Network events of the page's session, or BiDi's network events of the page's browsing context
+    /// (`session` is the context then): a request's id stays across its redirects in both.
     fn take(&mut self, ev: &Value, current: Option<usize>) {
-        if ev["sessionId"].as_str() != Some(self.session.as_str()) {
+        let p = &ev["params"];
+        if ev["sessionId"].as_str() != Some(self.session.as_str()) && p["context"].as_str() != Some(self.session.as_str()) {
             return;
         }
-        let p = &ev["params"];
-        let id = p["requestId"].as_str().unwrap_or("").to_string();
+        let id = p["requestId"].as_str().or(p["request"]["request"].as_str()).unwrap_or("").to_string();
         match ev["method"].as_str().unwrap_or("") {
-            "Network.requestWillBeSent" => {
+            // BiDi completes each hop of a redirect under the one id, each with its own bytes: summed.
+            "network.responseCompleted" if self.owner.contains_key(&id) => {
+                *self.finished.entry(id).or_default() += p["response"]["bytesReceived"].as_f64().unwrap_or(0.0);
+            }
+            "Network.requestWillBeSent" | "network.beforeRequestSent" => {
                 let url = p["request"]["url"].as_str().unwrap_or("");
                 if let Some(i) = current
                     && (url.starts_with("http") || url.starts_with("ws"))
@@ -5430,6 +5860,10 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     let values: Vec<f64> = s["blocks"].as_array().into_iter().flatten().filter_map(|b| b["values"][metric].as_f64()).filter(|v| v.is_finite()).collect();
     let blocks = s["blocks"].as_array().map_or(0, Vec::len);
     let mut out = format!("strobe bench {file} · {} · head {} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""), r["variants"][0]["label"].as_str().unwrap_or(""));
+    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), if s["headless"] == true { "headless (no display)" } else { "" }]);
+    if !engine.is_empty() {
+        out += &format!("env    {engine}\n");
+    }
     out += &format!("plan   {} · warmup until steady · {} runs per block\n", r["plan"]["pin"].as_str().unwrap_or(""), r["plan"]["runs_per_block"]);
     let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
     out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
@@ -5499,12 +5933,16 @@ fn render(r: &Value) -> String {
         out += &format!("env    {}\n", fmt::fields([env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), &cpus]));
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
         let window = Some(fmt::size(&r["window"])).filter(|s| !s.is_empty()).map(|s| format!("window {s}")).unwrap_or_default();
-        let refresh = r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default();
-        let display = fmt::fields([r["browser"].as_str().unwrap_or(""), gpu, &window, &refresh]);
+        // A headless page drew to no display: no refresh, no visibility to claim.
+        let headless = s["headless"] == true;
+        let refresh = if headless { "headless (no display)".to_string() } else { r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default() };
+        let browser = s["browser"].as_str().or(r["browser"].as_str()).unwrap_or("");
+        let display = fmt::fields([browser, gpu, &window, &refresh]);
         if !display.is_empty() {
             out += &format!("       {display}\n");
         }
         let screen = match s["session"].as_str() {
+            _ if headless => "headless (no display)",
             Some("locked") => "session locked (nothing measured needs a presenting window)",
             Some("mixed") => "session locked in some pairs only: nothing decided",
             _ => "visible",

@@ -172,7 +172,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let (ready_at, page) = match watch.ready(timeout) {
             Ok(found) => found,
             Err(e) => {
-                let shot = watch.any_page().map(|p| snapshot(&p, &ctx.exp, "launch")).unwrap_or_default();
+                let shot = watch.any_page().map(|p| snapshot(&p.into(), &ctx.exp, "launch")).unwrap_or_default();
                 return Err(Error::refused("RunIncomplete", format!("{} launch: {}{shot}", s.case, e.message), "the until selector never showed"));
             }
         };
@@ -191,13 +191,14 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                 "a target strobe reaches only after its first page loads cannot be timed to a selector",
             ));
         }
-        validity::window_visible(&page)?;
+        let shown_page: Page = page.clone().into();
+        validity::window_visible(&shown_page)?;
         // A webview app's launch is not moved or sized: the block records the window it opened.
         if browser.embedded {
             ctx.used = Some(crate::target::webview::fit(&browser, &page, None, false)?);
         }
         if !ctx.gpu_checked {
-            ctx.gpu = serde_json::to_value(if ctx.headless { browser.gpu()? } else { validity::software_gpu(&browser)? })?;
+            ctx.gpu = serde_json::to_value(if ctx.headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? })?;
             ctx.browser_version = browser.version.clone();
             ctx.gpu_checked = true;
         }
@@ -284,8 +285,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
         // What the launch ended on, once its values and profiles are taken.
-        let end = shown::page(ctx, s, v, pair, "end", &page);
-        shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| shown::page_shows(&page, sel))?;
+        let end = shown::page(ctx, s, v, pair, "end", &shown_page);
+        shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| shown::page_shows(&shown_page, sel))?;
         Ok(Block {
             shown: Some(shown::Shown { start: shown::Screen::default(), end }),
             variant: v.role.to_string(),
@@ -311,6 +312,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             process_set: Some(programs(&procs)),
             fixture_connected: None,
             client: None,
+            browser: None,
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may

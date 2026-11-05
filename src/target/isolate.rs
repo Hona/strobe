@@ -569,8 +569,9 @@ pub fn reap_dead_owners() -> Vec<String> {
             }
         })
         .collect();
-    let Ok(entries) = std::fs::read_dir(host::paths::run()) else { return lines };
-    for e in entries.flatten() {
+    // Snap Firefox's profiles live where its sandbox lets it read them (`firefox::snap_profiles`).
+    let entries: Vec<std::fs::DirEntry> = [host::paths::run(), super::firefox::snap_profiles()].iter().filter_map(|d| std::fs::read_dir(d).ok()).flat_map(|r| r.flatten()).collect();
+    for e in entries {
         let name = e.file_name().to_string_lossy().to_string();
         let Some(named) = name.strip_prefix("profile-").or_else(|| name.strip_prefix("home-")).and_then(|r| r.split('-').next()).and_then(|p| p.parse::<u32>().ok()) else { continue };
         let gone = match std::fs::read_to_string(e.path().join(OWNER_FILE)).ok().as_deref().and_then(parse_owner) {

@@ -6,6 +6,7 @@ pub mod config;
 pub mod driver;
 pub mod engine;
 pub mod etw;
+pub mod fmt;
 pub mod heapsnap;
 pub mod history;
 pub mod host;

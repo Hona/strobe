@@ -2,6 +2,7 @@
 //! dominator tree, detached DOM, shortest retainer paths, diffs and leak suspects (SPEC §8.6).
 //! The big integer arrays stream straight into columns: no per-node JSON values.
 
+use crate::fmt::bytes;
 use crate::model::{Error, Result};
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -726,7 +727,7 @@ fn portable_name(name: &str) -> String {
 
 /// A script URL as two launches or builds share it: the path without origin, query or the bundler's
 /// content hash (`/_assets/route-CN8YftxL.js` → `/_assets/route.js`).
-fn portable_url(url: &str) -> String {
+pub fn portable_url(url: &str) -> String {
     let path = url.split_once("://").map(|(_, r)| r.find('/').map_or("", |i| &r[i..])).unwrap_or(url);
     let path = path.split(['?', '#']).next().unwrap_or(path);
     let (dir, file) = path.rsplit_once('/').unwrap_or(("", path));
@@ -940,19 +941,6 @@ fn path_text(p: &Value) -> String {
         parts.extend(tail);
     }
     parts.join(" › ")
-}
-
-fn bytes(v: f64) -> String {
-    let a = v.abs();
-    if a >= 1024.0 * 1024.0 * 1024.0 {
-        format!("{:.2} GB", v / (1024.0 * 1024.0 * 1024.0))
-    } else if a >= 1024.0 * 1024.0 {
-        format!("{:.1} MB", v / (1024.0 * 1024.0))
-    } else if a >= 1024.0 {
-        format!("{:.0} KB", v / 1024.0)
-    } else {
-        format!("{v:.0} B")
-    }
 }
 
 fn signed_bytes(v: f64) -> String {

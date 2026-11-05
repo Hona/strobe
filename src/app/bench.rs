@@ -2986,18 +2986,19 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             std::thread::sleep(Duration::from_secs(3));
         }
         if host::session_locked() {
-            progress("  waiting: the session is locked; strobe resumes when it is unlocked");
+            let why = needs_screen(ctx, s, x).unwrap_or_else(|| "it met a hidden window".into());
+            progress(format!("  waiting: the session is locked and {} needs a presenting window: {why}; strobe resumes when it is unlocked", s.label()));
             // Nothing held while waiting: the user's power plan, sleep as they set it, and the slot, so
             // other benches run what needs no presenting window meanwhile.
             release_machine(ctx);
-            ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window", s.label(), v.role));
+            ctx.reg.set("waiting", format!("{} {} block: the session is locked and the series needs a presenting window ({why})", s.label(), v.role));
             let waiting = Instant::now();
             // `--unlock-wait`: how long one wait may last before the bench ends with what it finished.
             let limit = ctx.args.get("unlock-wait").map(duration_ms).transpose()?.map(Duration::from_millis);
             while host::session_locked() {
                 if let Some(l) = limit.filter(|l| waiting.elapsed() >= *l) {
                     ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
-                    return Err(Error::timeout(format!("the session stayed locked for {} (--unlock-wait), and the series needs a presenting window", fmt::ms_duration(l.as_millis() as u64)))
+                    return Err(Error::timeout(format!("the session stayed locked for {} (--unlock-wait), and the series needs a presenting window ({why})", fmt::ms_duration(l.as_millis() as u64)))
                         .hint(format!("strobe bench --resume {} once the session is unlocked", ctx.exp)));
                 }
                 nap(Duration::from_secs(2))?;
@@ -3291,21 +3292,36 @@ fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
 /// file), whose metrics are all CPU (`ui.*` too), memory (GPU memory too), IO, counters, its run
 /// time, GPU use as a secondary (refused while locked) and launch milestones (not pixels).
 fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
+    needs_screen(ctx, s, x).is_none()
+}
+
+/// What makes a series need a presenting window, said for the wait on a locked session (None: it runs
+/// locked, `runs_locked`). A metric a native app can never have (a browser engine's, frames of a
+/// windowless app) needs nothing: its block refuses it `NotForTarget`.
+fn needs_screen(ctx: &Ctx, s: &Series, x: &Exec) -> Option<String> {
     let t = &ctx.describe["targets"][&s.target];
     let offscreen = |m: &str| {
         ["cpu.", "ui.", "memory.", "io.", "count.", "gpu.", "phase.", "energy."].iter().any(|p| m.starts_with(p))
             || m == "run.duration"
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
+    let windowless = t["window"] == false || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless);
     match t["kind"].as_str().unwrap_or("") {
-        "script" | "cli" => true,
+        "script" | "cli" => None,
         // A headless page draws to no display: the lock screen covers nothing of it.
-        "web" | "url" if headless_of(ctx, s) => true,
-        _ if x.set == Set::Memory => true,
-        "native" if t["window"] == false || x.untimed || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => {
-            !gpu_use(&s.primary) && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
+        "web" | "url" if headless_of(ctx, s) => None,
+        _ if x.set == Set::Memory => None,
+        "native" if windowless || x.untimed => {
+            let on: Vec<&str> = std::iter::once(&s.primary)
+                .chain(&s.metrics)
+                .map(String::as_str)
+                .filter(|m| !native::browser_only(m) && !(windowless && native::on_screen_area(m)))
+                .filter(|m| !offscreen(m) || (*m == s.primary && gpu_use(m)))
+                .collect();
+            (!on.is_empty()).then(|| format!("it measures {} on screen", on.join(", ")))
         }
-        _ => false,
+        "web" | "url" => Some("a page draws in a browser window (--headless runs page cases without one)".into()),
+        _ => Some("its window is timed on screen".into()),
     }
 }
 

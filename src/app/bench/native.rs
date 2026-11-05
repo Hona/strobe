@@ -837,6 +837,17 @@ struct Have {
     pinned: bool,
 }
 
+/// A browser engine's metric, which a native app never has (`NotForTarget`).
+pub(super) fn browser_only(metric: &str) -> bool {
+    matches!(metric.split('.').next().unwrap_or(""), "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" | "leak")
+        || matches!(metric, "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser")
+}
+
+/// What reaches the screen, which an app without a window has none of (`NotForTarget`).
+pub(super) fn on_screen_area(metric: &str) -> bool {
+    matches!(metric.split('.').next().unwrap_or(""), "frames" | "interaction" | "scroll" | "display")
+}
+
 /// Why a declared metric has no value in a native run block: what this OS cannot read, what a native
 /// target has none of, or what the runs gave nothing for. Every declared metric ends with a value or
 /// one of these (SPEC §13.6), never as "no value".
@@ -845,6 +856,9 @@ fn missing(metric: &str, have: &Have) -> Refusal {
         return r;
     }
     let refuse = |v: ValidatorId, why: String| Refusal::new(v, format!("{metric}{why}"));
+    if browser_only(metric) {
+        return refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into());
+    }
     let area = metric.split('.').next().unwrap_or("");
     match area {
         "frames" if crate::metrics::split_metric(metric) => refuse(ValidatorId::NotForTarget, " splits a browser frame by its pipeline stages; the OS's present events carry none".into()),
@@ -857,12 +871,10 @@ fn missing(metric: &str, have: &Have) -> Refusal {
         "ui" if !have.ui_thread => refuse(ValidatorId::NotForTarget, " is the UI thread's, the thread of the main window; this target shows none".into()),
         "ui" if metric == "ui.cpu" || metric == "ui.wakes" => refuse(ValidatorId::RunIncomplete, ": the UI thread was not among the app's threads at the end of every run (did the window move to another thread?)".into()),
         "ui" => refuse(ValidatorId::NotForTarget, " is not measured: native apps have ui.cpu and ui.wakes".into()),
-        "canvas" | "main" | "layout" | "style" | "js" | "dom" | "net" | "leak" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
         "phase" => refuse(ValidatorId::NoPhase, format!(": no measured run entered phase(\"{}\")", &metric[6..])),
         "input" => refuse(ValidatorId::NoInput, ": no measured run dragged (page.drag, or moves while page.down(\"Mouse\") holds a button)".into()),
         "launch" => refuse(ValidatorId::NotForTarget, " is a launch case's: give the case `launch` to time the app's launch".into()),
         _ => match metric {
-            "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser" => refuse(ValidatorId::NotForTarget, " is a browser engine's; a native app has none".into()),
             "gpu.process.3d" | "gpu.vram" | "gpu.shared" if have.gpu.is_some() => super::super::outside::gpu_unread(metric, have.gpu.as_deref().unwrap_or(&[])),
             "cpu.fixture" => refuse(ValidatorId::NotForTarget, " is a fixture's CPU, and the bench file starts no fixture()".into()),
             "memory.app.pss" => refuse(ValidatorId::RunIncomplete, ": a process's smaps_rollup could not be read".into()),

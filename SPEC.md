@@ -3686,6 +3686,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   OS has it) once its milestones are collected, when the series declares them; app, exe and command
   launches read their window's pixels on every OS (macOS: with Screen Recording; a launch timed to
   `painted` or `settled` without it refuses `NoPresentSource` at once instead of waiting 120 s).
+  `ResetIncomplete` (§10.1) reads each run's start in native run blocks (`shown::native_start`, one
+  tree read through the case's session, which `driver::native::Session::tree` gives) and page blocks
+  (`shown::page_start`, one in-page script), before every run and once after the last reset, and
+  compares them with the first (`shown::Starts`); checked on adais (Character Map, locked: a typing run
+  without a reset refused, with one passed, Character Map's dev cases unchanged) and air (pages,
+  headless: a typing run and a check box click without a reset refused; a Meta+A reset that selected
+  nothing refused too, which is the page driver sending no editing command on macOS).
   Recordings a block or launch keeps are claimed with `store::new_recording` and held in a
   `store::Draft` until their meta.json is written, as `record` and `record pid:` do: a failed one
   leaves no folder.

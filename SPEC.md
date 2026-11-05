@@ -622,7 +622,8 @@ Each metric declares:
 
 The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`. Families resolve
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
-`net.bytes` with an optional `{<url glob>}` (§8.1), and `launch.<milestone>` (§9.6). Metrics a
+`net.bytes` with an optional `{<url glob>}` (§8.1), `phase.<name>` and `span.<name>` (§7.3), and
+`launch.<milestone>` (§9.6). Metrics a
 series declares beyond the defaults may switch on what measures them: `count.*` installs the page
 counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Dawn categories, `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
 `disabled-by-default-v8.gc` category. Only that series' blocks pay for it, base and head alike.
@@ -688,6 +689,13 @@ a span inside a run (a command to its reply, a request to the state it waits for
 a number of its own. A declared `phase.<name>` that no measured run entered is refused (`NoPhase`).
 On a locked session it is an offscreen metric, like `run.duration`.
 
+`span.<name>` is the app's own spans: the page's `performance.measure(name)` calls (pages and
+Electron apps) whose end falls in the run, summed per run (ms, timed, lower is better), 0 for a run
+that measured none. The browser timestamps them (`blink.user_timing`, already in the lean trace
+set, so declaring one costs nothing), so the bench file still cannot invent a number. A declared
+span that no measured run's page measured is refused (`NoSpan`), as is one on a target with no page
+(native, script).
+
 ### 7.4 Native apps
 
 What strobe reads from a native app (§13.7), per run:
@@ -708,7 +716,20 @@ What strobe reads from a native app (§13.7), per run:
   per second and CPU per run from the thread's cycle counter, named by `GetThreadDescription`, with
   the module it started in (its Win32 start address, `ThreadQuerySetWin32StartAddress`) and whose it
   is: `app`, `driver` (from the driver store, such as a GPU driver's workers) or `os` (the Windows
-  folder: its thread pool and services) (`query <rec> threads`). The `wakes-while-idle` insight
+  folder: its thread pool and services) (`query <rec> threads`). Linux keeps no start address: the
+  module is the first one named reading down from the top of the thread's stack (its oldest frames,
+  with glibc's thread descriptor and its start routine above them), past the C and C++ runtimes'
+  thread entry, through `/proc/<pid>/task/<tid>/syscall` (its stack pointer) and
+  `process_vm_readv`, which ptrace's rule allows for what strobe started; a main thread is its
+  executable's, and a thread on a CPU at the moment or a runtime with stacks of its own (Go) stays
+  unknown. `driver` there is a DRI, Vulkan, Mesa or NVIDIA library (`*_dri.so`, a `dri/` folder,
+  `libvulkan*`, `libgallium*`, `libEGL_mesa`, `libGLX_mesa`, `libnvidia*`, `libcuda*`, `libdrm*`)
+  and `os` the C runtime or a session service's client (GLib's and D-Bus's workers, PulseAudio,
+  PipeWire, ALSA, JACK, systemd). macOS keeps no start a user can read and counts wakes per process:
+  each process row is named by its executable, `driver` from `/System/Library/Extensions` or
+  `/Library/Extensions` and `os` from `/System`, `/usr/lib` or `/usr/libexec` (checked on vps: a
+  GLib daemon's `gmain`, `gdbus` and pool threads read `os`, a Bun app's threads `app`; on air,
+  Finder's row reads `os`). The `wakes-while-idle` insight
   counts the app's own threads and names driver and OS threads apart. Every adapter the app used is
   recorded (`ctx.gpu.devices`), each with its own engine use.
 - **A thread timeline** (native `record`, `record pid:`, and native bench blocks that are not timed:
@@ -766,6 +787,42 @@ What strobe reads from a native app (§13.7), per run:
     presents, all on the host clock, and `query <rec> frames` shows per run which inputs counted and
     why the others did not.
 - Every metric a native target cannot measure is listed refused with its reason, never dropped.
+
+### 7.5 Counters: energy, instructions, idle wakes
+
+What the OS counts per process beyond time, read beside the wakes at both ends of each run (summed
+over the target's processes, as `cpu.work` is). Never estimated: where the OS does not measure it per
+process, the metric is refused with the reason (`NoCounter`).
+
+| Metric | macOS | Linux | Windows |
+|---|---|---|---|
+| `energy.cpu` (mJ per run) | `proc_pid_rusage(RUSAGE_INFO_V6)` `ri_energy_nj`: the kernel's per-thread charge from Apple silicon's energy counters at each context switch; refused on an Intel Mac | refused: RAPL counts a whole package (every process on it, strobe too), so no share of it is the app's; strobe never multiplies CPU time by a power | refused: no per-process measurement an unprivileged process can read (E3's figures are a model's estimates) |
+| `cpu.instructions` (per run) | `ri_instructions` (user and kernel mode), always | `perf_event_open` `PERF_COUNT_HW_INSTRUCTIONS`, user mode only (what `perf_event_paranoid` 2 allows), opened only for a series that declares it | refused (the kernel trace's PMC counters on context switches would give it; not collected) |
+| `cpu.idle_wakes` (/s) | `ri_pkg_idle_wkups`: wakes of the CPU package from idle, what Activity Monitor's Energy Impact weighs | refused: no per-process count | refused |
+
+- **Whole runs or nothing.** macOS counts a process from its start: one started during the run counts
+  from zero, one that exited during it took its counts with it, and one that joined the set late (a
+  helper found in the app's home) was never read at the run's start. Either of the last two refuses
+  the run's counters (`NoCounter`, naming the process) instead of a short count.
+- **Linux perf events.** A counting event with `inherit` on each thread of each of the target's
+  processes when strobe first sees them (raising strobe's open-file limit to its hard limit), so the
+  threads and processes they start later count in them, live or exited: a process started by a
+  counted thread after its events opened counts in that group, never twice. A group stays open
+  between runs and closes with the last snapshot that holds it. Refused: `perf_event_paranoid` above
+  2 (the fix names the sysctl or CAP_PERFMON), a CPU with no hardware counter (a VM without a virtual
+  PMU), a process that refuses perf events (not dumpable: a sandboxed renderer), a process that joined
+  the set from outside the counted tree, and any run whose counters were multiplexed (time running
+  below time enabled): no count is ever scaled.
+- **Linux cost.** The events cost the target at each of its context switches (in a VM 4.4 µs a
+  switch: 2000 short sleeps cost 36.8 ms of CPU per run with them, 19.3 ms without), so only a
+  series that declares `cpu.instructions` opens them, base and head alike, and that series' time
+  metrics (ms, CPU shares, frames, input latency) are dropped and refused `OverheadBudget` where
+  declared: measure instructions in a case of their own. The count itself is user mode only, so the
+  switches' kernel work is not in it. macOS's counters cost the target nothing.
+- **Validated** (a script target's planted loop, 1× vs 2×; 8 pairs each): air (M4) `cpu.instructions`
+  +100% [+99 … +100], `energy.cpu` +99% [+93 … +106], `cpu.work` +101%; vps (2 vCPU VM)
+  `cpu.instructions` +100% [+100 … +100], `cpu.work` +104%. A/A per-block spread (CV over 16 blocks):
+  air instructions 0.095% vs `cpu.work` 0.43% (energy 1.3%); vps instructions 0.022% vs 0.56%.
 
 ## 8. Probes
 
@@ -1195,7 +1252,7 @@ flowchart LR
 |---|---|---|---|
 | pin the target's process tree to a CCD or CPU list (`--pin`) | process affinity, inherited by children | `sched_setaffinity` | not available: recorded as unpinned |
 | power plan: the fastest the device offers for every bench and timed recording (`--power high`, the default), the user's own back after it, also after a crash or kill; `--power keep` opts out; on battery the plan is kept. Either way the context notes say so | the active vendor's High performance scheme (AMD Ryzen Balanced → AMD Ryzen High Performance), else Windows' High performance, else Ultimate performance, else on a Balanced-only device Windows 11's Best performance power mode (`powercfg /setactive`, powrprof `PowerSetActiveOverlayScheme`); the scheme and power mode to restore are journaled in `<state>/power.json` first, and any strobe that starts restores a journal whose strobe is gone | the `performance` cpufreq governor on every policy, journaled and restored the same way; it needs root, so an unprivileged strobe keeps the governor and says why | nothing to switch: the env line shows Low Power Mode and a thermal state above nominal |
-| keep this user's other processes off the target's CPUs during each timed block (`--reserve-cpus`, below) | process default CPU sets, swept every 200 ms, journaled | not built | not built |
+| keep this user's other processes off the target's CPUs during each timed block (`--reserve-cpus`, below) | process default CPU sets, swept every 200 ms, journaled | each thread's affinity (`sched_setaffinity`, no root), swept every 200 ms, journaled | not available: no CPU affinity |
 | background load per core, before and during | PDH | `/proc/stat` | `host_processor_info` |
 | window visible and unoccluded, every block | `IsIconic`, `IsWindowVisible`, DWM cloak, `document.visibilityState` | X11 map state, `_NET_WM_STATE_HIDDEN`, coverage by windows above it; `visibilityState` | `kCGWindowIsOnscreen`, coverage by other apps' windows in front; `visibilityState` |
 | throttling | frequency below the expected range (PDH % of maximum frequency) | `cpuinfo_avg_freq` where the kernel has it | thermal state in the env line; analyser only |
@@ -1216,7 +1273,7 @@ experiment's env line and `report --format pr` footer.
 Builds run unpinned (strobe's own pin, which a build inherits, is lifted for them), and after a build
 strobe waits up to 30 s for the CPUs to go quiet before any timed block.
 
-**Reserved CPUs** (`--reserve-cpus auto|on|off`, Windows). Pinning keeps the target on its CPUs; it
+**Reserved CPUs** (`--reserve-cpus auto|on|off`, Windows and Linux). Pinning keeps the target on its CPUs; it
 does not keep anything else off them, and agents, builds and editors left to the scheduler land there.
 For the length of each timed block (`auto`, the default: A/B, A/A and bisect blocks; not `--check`,
 attribution, leak or pixels blocks; `on` adds those), strobe gives every other process of this user
@@ -1247,6 +1304,20 @@ block ends:
   them, and a `ReservedCpus` note (in the text result and `report --format pr`) says how many
   processes moved per block, which could not, and the sweep's cost; the PR footer says "other
   processes kept off CPUs <list>". An unpinned target (`--pin none`) reserves nothing and says so.
+- **Linux:** affinity is per thread and inherited, and `sched_setaffinity` needs only the same user
+  (root: every root process too). Each thread of this user's other processes that runs on the
+  target's CPUs and others gets its own mask without the target's CPUs; a thread pinned inside them
+  or already outside is left alone, as are kernel threads, PID 1, strobe's tree and other strobe
+  processes. Threads and processes a moved thread starts inherit the narrowed mask, so the sweep
+  (new PIDs in `/proc` every 200 ms; nothing else is read for a sweep that finds none) only has to
+  catch processes started from elsewhere. At the block's end each thread gets its own mask back where
+  it still has strobe's; a thread or process started during the block from a narrowed thread gets
+  the mask of the thread it came from. Journaled (each thread's mask and strobe's) before any change,
+  restored by the next strobe after a kill. Masks cover the first 64 CPUs: a machine with more
+  reserves nothing and says why. On vps (2 vCPU, root, `--pin 1`, a build running beside): 32–46
+  processes moved per block (93 more started during 24 blocks, moved within 200 ms), 4–9 ms before
+  each block, the sweep 0.16–0.22% of a core; every task's mask was back after `strobe run`, and
+  after a `kill -9` mid-block the next `strobe` put them back.
 
 `auto` is the default because the reservation changes nothing the target sees (its CPUs, its plan,
 its process tree) while it removes the largest source of noise on a shared machine, it lasts only
@@ -1764,12 +1835,14 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
 | `BackgroundPriority` | the target runs at background priority, inherited from strobe or its own: macOS `taskpolicy -b` (`PRIO_DARWIN_PROCESS`), Windows' idle priority class, efficiency mode (EcoQoS) or background mode (very low memory priority), Linux `SCHED_IDLE` or nice 19. The OS keeps it on efficiency cores, at low clocks or behind other work: an opencode drag read 83–91% dropped frames under `taskpolicy -b` against 0.4% at normal priority. Refuses frame and input-latency metrics (`frames.*`, `interaction.*`, `scroll.*`, `canvas.*`, `input.*`, `launch.painted`, `launch.settled`): a primary among them refuses the bench before anything builds (strobe's own priority) or at the block (the target's), a secondary shows refused, and `record` prints `frames refused`. CPU, memory and counters stay, with a warning to compare them only with runs at the same priority. Attribution and memory blocks are untimed and keep running. `record pid:` measures a process as its user runs it and is not checked |
 | `PresentsUnmatched` | over 5% of the inputs strobe sent a native app (those after which its accessibility tree changed) showed no frame within a second while the present session lost no events (refuses `interaction.*`, §7.4) |
-| `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
+| `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run; and a Linux series that opens perf events for `cpu.instructions`: its time metrics (§7.5) |
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
 | `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
 | `LiveChannel` | an app profile would launch the user's own running app, or a macOS app whose data lives in the user's Library (§13.2) |
 | `NoPhase`, `NoInput` | a declared `phase.<name>` no measured run entered; `input.*` with no drag in the runs (refuse that metric) |
+| `NoSpan` | a declared `span.<name>` no measured run's page measured, or a target with no page (§7.3) |
+| `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -2691,6 +2764,8 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | symbols (§12.2) | PDBs (local, Microsoft's server, `symbols.servers`) | DWARF of the module, its build-id file under `/usr/lib/debug`, or `.gnu_debuglink`; symbol tables (sized); `/proc/kallsyms` | DWARF of a dSYM beside the module or in strobe's cache, made with `dsymutil` from the objects a build left (a failed `dsymutil` leaves a `missing` marker for a day, as a PDB server's miss does); else the names and `file:line` `sample` printed |
 | adapter per window | D3DKMT + DXGI | — | — |
 | IO (`io.read`, `io.write`) | `NtQuerySystemInformation` transfer counts (every byte read and written, cached or not) | `/proc/<pid>/io` `rchar`/`wchar` (the same) | disk bytes only (`ri_diskio_bytesread`/`written`): macOS counts no cached IO per process |
+| energy, instructions, idle wakes (7.5) | refused: nothing per process an unprivileged process can read | instructions: per-thread perf counting events (user mode), for a series that declares them; energy and idle wakes refused | `proc_pid_rusage(RUSAGE_INFO_V6)`: `ri_energy_nj` (Apple silicon), `ri_instructions`, `ri_pkg_idle_wkups` |
+| thread origin (`app`, `driver`, `os`; 7.4) | the Win32 start address's module | the first module down from the top of the thread's stack (`process_vm_readv`) | per process only: its executable |
 | accessibility tree (§13.7) | UI Automation (COM) | AT-SPI over strobe's own D-Bus client: the registry's app roots by connection pid, a level per round trip | the AX API (`AXUIElementCopyMultipleAttributeValues`, one call per element; `AXObserver`), Accessibility permission |
 | input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events: keys posted to its process (`CGEventPostToPid`), pointer events to the session at the point (AppKit drops mouse events posted to a process), Accessibility permission |
 | top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So every block of a window case makes the app the active one (`AXFrontmost`), and only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block waits for them). It activates every block, not only a covered one, because the active app's key window is another state: a Rune window at rest cost 3× the CPU as the key window (920 vs 2780 ms per 10 s on an M4), and a series whose blocks were activated only when covered mixed the two (ui.cpu 206 ms in some blocks, 1250 ms in others) |
@@ -3071,7 +3146,8 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | thread timeline (`record`, `--check` and attribution blocks only, §7.4) | ≤ 1% of one core, in its own file (`cpu_ms`) |
 | OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
-| reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block) |
+| reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block; Linux on vps 0.16–0.22%) |
+| counters (§7.5) | macOS: one `proc_pid_rusage` per process at each end of a run, nothing in the target; Linux perf events: per context switch in the target (4.4 µs in a VM), so only a series that declares `cpu.instructions` opens them and its time metrics are refused |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
@@ -3453,6 +3529,22 @@ under their lock, windows are raised by process set, and variant servers and com
 owned (strobe no longer starts `taskkill`). A launcher target that starts an unstamped burner in its own
 group and exits at once read 99.8% on adais (the job), `—` on air and vps (no process found: unknown,
 not zero), and left nothing on all three; the cases above passed again on all three.
+
+New measurements (7.3, 7.4, 7.5, 9.4; 2026-11-06): `energy.cpu`, `cpu.instructions` and
+`cpu.idle_wakes` on page, native, script, `record` and `record pid:` targets, typed `NoCounter`
+refusals per OS (`probe::wakes::Uncounted`: no source, denied with its fix, partial, not opened);
+`span.<name>` from the page's `performance.measure()` spans (`NoSpan`); thread origins on Linux (the
+stack top) and macOS (process rows by executable), with Linux and macOS driver and system paths;
+`--reserve-cpus` on Linux. Checked: the planted 1× vs 2× loop and A/A numbers in §7.5 (air, vps);
+Windows refuses all three counters with the reason (adais, locked); a headless page's `span.work`
+read 50.6 ms per 1 s run on adais and 50.8 ms on air for ten 5 ms measures, `span.never` refused
+`NoSpan`, and on air the page's processes read 54.5 mJ and 554 M instructions per run; a native
+windowless app (a perl loop waking 100 times a second) read `energy.cpu` 33.7 mJ per 1 s run on air
+and 469–498 M instructions on air and vps; an unprivileged user at `perf_event_paranoid` 3 got
+`NoCounter` naming the sysctl; a Linux series with `cpu.instructions` and `cpu.work` refused the
+latter `OverheadBudget`; the reservation checks in §9.4 (vps). Not checked: multiplexed counters
+(nothing else used the PMU), a sandboxed renderer's refusal on Linux, Electron spans (same path as
+pages), thread origins of a real GPU driver's threads on Linux (vps has none).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

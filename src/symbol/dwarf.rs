@@ -43,7 +43,8 @@ pub fn resolve(path: &Path, offsets: &[u64]) -> Option<Vec<Vec<Located>>> {
     let debug_bytes = if obj.section_by_name(".debug_info").is_some() { None } else { debug_file(path, &obj).and_then(|p| std::fs::read(p).ok()) };
     let debug_obj = debug_bytes.as_deref().and_then(|b| object::File::parse(b).ok());
     let dwarf_obj = debug_obj.as_ref().unwrap_or(&obj);
-    let ctx = context(dwarf_obj);
+    let sections = sections(dwarf_obj);
+    let ctx = sections.as_ref().and_then(|s| context(s, dwarf_obj.is_little_endian()));
     Some(
         offsets
             .iter()
@@ -78,19 +79,15 @@ pub fn resolve(path: &Path, offsets: &[u64]) -> Option<Vec<Vec<Located>>> {
 
 type Slice<'a> = gimli::EndianSlice<'a, gimli::RunTimeEndian>;
 
-fn context<'a>(obj: &'a object::File<'a>) -> Option<addr2line::Context<Slice<'a>>> {
-    let endian = if obj.is_little_endian() { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
-    let load = |id: gimli::SectionId| -> Result<Slice<'a>, gimli::Error> {
-        let data = obj.section_by_name(id.name()).and_then(|s| s.uncompressed_data().ok()).unwrap_or(Cow::Borrowed(&[]));
-        // Compressed sections are decompressed once and kept for the context's life.
-        let data: &'a [u8] = match data {
-            Cow::Borrowed(b) => b,
-            Cow::Owned(v) => Box::leak(v.into_boxed_slice()),
-        };
-        Ok(gimli::EndianSlice::new(data, endian))
-    };
-    let dwarf = gimli::Dwarf::load(load).ok()?;
-    addr2line::Context::from_dwarf(dwarf).ok()
+/// A module's DWARF sections, compressed ones decompressed: owned by the caller for as long as its
+/// `context` lives, and freed with it (a daemon symbolizes many recordings).
+fn sections<'a>(obj: &'a object::File<'a>) -> Option<gimli::DwarfSections<Cow<'a, [u8]>>> {
+    gimli::DwarfSections::load(|id| -> Result<Cow<'a, [u8]>, gimli::Error> { Ok(obj.section_by_name(id.name()).and_then(|s| s.uncompressed_data().ok()).unwrap_or(Cow::Borrowed(&[]))) }).ok()
+}
+
+fn context<'a>(sections: &'a gimli::DwarfSections<Cow<'a, [u8]>>, little: bool) -> Option<addr2line::Context<Slice<'a>>> {
+    let endian = if little { gimli::RunTimeEndian::Little } else { gimli::RunTimeEndian::Big };
+    addr2line::Context::from_dwarf(sections.borrow(|s| gimli::EndianSlice::new(s, endian))).ok()
 }
 
 /// The separate file holding a module's DWARF, when there is one.
@@ -136,8 +133,10 @@ fn dsym(path: &Path, uuid: &[u8; 16]) -> Option<PathBuf> {
     if path.starts_with("/usr/lib") || path.starts_with("/System") {
         return None;
     }
+    // A build that left no objects to gather may leave them later, and a dsymutil that failed may be
+    // installed or fixed since: the marker holds for a day, as a PDB server's miss does.
     let missing = cached.with_extension("missing");
-    if missing.exists() {
+    if super::missed_recently(&missing) {
         return None;
     }
     let _ = std::fs::create_dir_all(cached.parent()?);

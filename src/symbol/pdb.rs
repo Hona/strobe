@@ -141,7 +141,7 @@ pub fn find(module: &Path, cv: &CodeView, servers: &[String]) -> Option<PathBuf>
         return Some(cached);
     }
     let missing = dir.join("missing");
-    if std::fs::metadata(&missing).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < 86_400) {
+    if super::missed_recently(&missing) {
         return None;
     }
     std::fs::create_dir_all(&dir).ok()?;

@@ -25,11 +25,17 @@ pub fn read_deep(dir: &Path) -> Result<Option<Deep>> {
     Ok(Some(serde_json::from_str(&text)?))
 }
 
+/// Writes `value` as gzipped JSON, whole or not at all (`store::write_atomic`).
 pub fn write_gz(path: &Path, value: &impl serde::Serialize) -> Result<()> {
-    let mut gz = flate2::write::GzEncoder::new(std::fs::File::create(path)?, flate2::Compression::fast());
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
     gz.write_all(&serde_json::to_vec(value)?)?;
-    gz.finish()?;
-    Ok(())
+    crate::store::write_atomic(path, &gz.finish()?)
+}
+
+/// Whether a `missing` marker (a lookup that found nothing) is younger than a day: until then the
+/// lookup is not tried again. An older one is retried, since a server or a tool may have it now.
+pub fn missed_recently(marker: &Path) -> bool {
+    std::fs::metadata(marker).and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() < 86_400)
 }
 
 /// Native samples ranked like a CPU profile: (stack root first, µs, samples), plus what resolved.

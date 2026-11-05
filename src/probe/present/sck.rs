@@ -23,7 +23,7 @@
 #![allow(non_upper_case_globals)]
 
 use super::{Live, Present, Presents, Unshared};
-use crate::host::macos::{CFTypeRef, CGRect, cf_array, cf_i64, cf_rect};
+use crate::host::macos::{CFTypeRef, CGRect, Cf, cf_array, cf_f64, cf_get, cf_i64, cf_rect};
 use crate::model::{Error, Result};
 use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
@@ -411,29 +411,80 @@ struct Watch {
     pids: Vec<u32>,
     /// Each window's span: first and last seen on screen (each within 500 ms of when it was).
     seen: HashMap<u32, Unshared>,
+    /// When the windows were last looked at (by the watcher or `track`).
+    looked: Option<Instant>,
     stop: bool,
 }
 
+/// How often the app's windows are looked at for excluded ones.
+const LOOK: Duration = Duration::from_millis(500);
+
+/// One on-screen window of the app as CoreGraphics lists it: id, owner, frame (points, as
+/// `TopWindow::rect`), and whether it lets other apps capture it (`kCGWindowSharingState` not 0).
+struct OnScreen {
+    id: u32,
+    pid: u32,
+    rect: (i32, i32, i32, i32),
+    shared: bool,
+}
+
+/// The app's normal on-screen windows, from one window list read: what `track` needs to tell new,
+/// moved and excluded windows apart.
+fn on_screen(pids: &[u32]) -> Vec<OnScreen> {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    unsafe extern "C" {
+        fn CGWindowListCopyWindowInfo(option: u32, relative: u32) -> CFTypeRef;
+    }
+    // kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements
+    let Some(list) = Cf::new(unsafe { CGWindowListCopyWindowInfo(1 | 16, 0) }) else { return Vec::new() };
+    cf_array(list.0)
+        .into_iter()
+        .filter_map(|d| {
+            let pid = cf_i64(cf_get(d, "kCGWindowOwnerPID"))? as u32;
+            let layer = cf_i64(cf_get(d, "kCGWindowLayer")).unwrap_or(0);
+            if !pids.contains(&pid) || !(0..1000).contains(&layer) || cf_f64(cf_get(d, "kCGWindowAlpha")).unwrap_or(1.0) <= 0.0 {
+                return None;
+            }
+            let b = cf_rect(cf_get(d, "kCGWindowBounds"))?;
+            let rect = (b.origin.x as i32, b.origin.y as i32, b.size.width as i32, b.size.height as i32);
+            Some(OnScreen { id: cf_i64(cf_get(d, "kCGWindowNumber"))? as u32, pid, rect, shared: cf_i64(cf_get(d, "kCGWindowSharingState")).unwrap_or(1) != 0 })
+        })
+        .collect()
+}
+
 impl Watch {
-    /// Notes which of the app's windows on screen it excludes from capture, and returns them.
-    fn look(&mut self) -> Vec<u32> {
+    /// Notes which of the app's windows on screen (`on`) it excludes from capture, and returns them.
+    fn note(&mut self, on: &[OnScreen]) -> Vec<u32> {
         let now = crate::host::now_ns();
-        let on = crate::host::macos::unshared_windows(&self.pids);
-        for &(id, pid) in &on {
-            self.seen.entry(id).or_insert(Unshared { pid, window: id as u64, first_ns: now, last_ns: now }).last_ns = now;
+        self.looked = Some(Instant::now());
+        let unshared: Vec<&OnScreen> = on.iter().filter(|w| !w.shared).collect();
+        for w in &unshared {
+            self.seen.entry(w.id).or_insert(Unshared { pid: w.pid, window: w.id as u64, first_ns: now, last_ns: now }).last_ns = now;
         }
-        on.into_iter().map(|w| w.0).collect()
+        unshared.into_iter().map(|w| w.id).collect()
+    }
+
+    fn look(&mut self) -> Vec<u32> {
+        let on = on_screen(&self.pids);
+        self.note(&on)
     }
 }
 
 type Watcher = Arc<(Mutex<Watch>, std::sync::Condvar)>;
 
+/// Looks at the app's windows every `LOOK`, unless `track` just did.
 fn watch_unshared(w: Watcher) {
     let (state, cv) = &*w;
     let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
     while !s.stop {
-        s.look();
-        s = cv.wait_timeout(s, Duration::from_millis(500)).unwrap_or_else(|e| e.into_inner()).0;
+        let since = s.looked.map_or(LOOK, |t| t.elapsed());
+        let wait = if since >= LOOK {
+            s.look();
+            LOOK
+        } else {
+            LOOK - since
+        };
+        s = cv.wait_timeout(s, wait).unwrap_or_else(|e| e.into_inner()).0;
     }
 }
 
@@ -572,22 +623,23 @@ impl Capture {
         self.pids = pids.to_vec();
         self.tracked = Some(Instant::now());
         let pool = unsafe { objc_autoreleasePoolPush() };
+        // One read of the window list tells new, moved and excluded windows apart.
+        let on = on_screen(pids);
         // A window the app excludes from screen capture gets no stream (one would hold none of its
         // pixels, and cost strobe a stream per refresh): `Presents::unshared` says it was there.
         let unshared = {
             let mut w = self.watch.0.lock().unwrap_or_else(|e| e.into_inner());
             w.pids = pids.to_vec();
-            w.look()
+            w.note(&on)
         };
         // A window that moved or resized gets a new stream: its source rectangle is the old frame.
-        let moved: Vec<u32> =
-            self.streams.iter().filter(|(id, s)| unshared.contains(id) || crate::host::window_state(**id as isize).is_some_and(|w| Some(w.rect) != s.rect)).map(|(id, _)| *id).collect();
+        let moved: Vec<u32> = self.streams.iter().filter(|(id, s)| unshared.contains(id) || on.iter().any(|w| w.id == **id && Some(w.rect) != s.rect)).map(|(id, _)| *id).collect();
         for id in moved {
             if let Some(s) = self.streams.remove(&id) {
                 self.drop_stream(s);
             }
         }
-        let ids: Vec<u32> = crate::host::top_windows(pids).into_iter().map(|w| w.0 as u32).filter(|id| !self.streams.contains_key(id) && !unshared.contains(id)).collect();
+        let ids: Vec<u32> = on.iter().map(|w| w.id).filter(|id| !self.streams.contains_key(id) && !unshared.contains(id)).collect();
         if ids.is_empty() {
             unsafe { objc_autoreleasePoolPop(pool) };
             return;

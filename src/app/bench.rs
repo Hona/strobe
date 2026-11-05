@@ -24,6 +24,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod block;
+mod cli;
 mod launch;
 mod native;
 pub mod plan;
@@ -156,6 +157,22 @@ enum Kind {
     Url(String),
     App(String),
     Exe(PathBuf),
+    /// `cmd:<line>`: a command line, for a `cli()` target (`strobe run --base … --head …`); it runs in
+    /// the folder strobe was started in.
+    Cmd(String),
+}
+
+impl Kind {
+    fn name(&self) -> &'static str {
+        match self {
+            Kind::Dir => "dir",
+            Kind::Git(_) => "git",
+            Kind::Url(_) => "url",
+            Kind::App(_) => "app",
+            Kind::Exe(_) => "exe",
+            Kind::Cmd(_) => "cmd",
+        }
+    }
 }
 
 struct Variant {
@@ -210,6 +227,7 @@ fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
         Kind::App(id) => format!("app:{id}{}", isolate::app(id, config).map(|a| stamp(&a.exe)).unwrap_or_default()),
         Kind::Exe(p) => format!("exe:{}{}", p.display(), stamp(p)),
         Kind::Url(h) => format!("url:{h}"),
+        Kind::Cmd(l) => format!("cmd:{l}"),
     }
 }
 
@@ -1153,7 +1171,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "file_repo": super::pr::repo_relative(&file.display().to_string()), "identity": ident, "ledger": ledger,
         "variants": variants.iter().map(|v| json!({
             "role": v.role, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
-            "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
+            "kind": v.kind.name(),
         })).collect::<Vec<_>>(),
         // The command line, for the rerun line under a PR table.
         "args": ctx.saved["args"],
@@ -1662,7 +1680,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if !pairs.is_empty() {
         progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
     }
-    let script = target["kind"] == "script" || is_native(&target);
+    let script = target["kind"] == "script" || target["kind"] == "cli" || is_native(&target);
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
     // Why the series ended early (a stop, or an error after some pairs), as the error to report.
@@ -1917,7 +1935,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut descriptive: Vec<Comparison> = Vec::new();
     // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
     let found: Vec<String> =
-        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
+        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || k.starts_with("metric.") || *k == "memory.peak" || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
         if name == s.primary || names.iter().any(|n| n == name) {
@@ -1980,6 +1998,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
+        // A command ends inside each run: there is nothing to profile it with.
+        _ if target["kind"] == "cli" => false,
         "always" => true,
         "never" => false,
         "auto" => differs,
@@ -2189,6 +2209,7 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
+        _ if metrics::split_metric(def.name) => ("frames.split.n", "frames with their stages"),
         _ => ("frames.n", "frames"),
     };
     let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
@@ -2480,7 +2501,7 @@ pub(crate) fn screen_line(s: &Value) -> Option<String> {
 
 /// The commit subject of a git variant, so a report still says what was compared days later.
 fn subject(v: &Variant) -> Option<String> {
-    let root = v.root.as_ref()?;
+    let root = v.root.as_ref().filter(|_| !matches!(v.kind, Kind::Cmd(_)))?;
     Some(git::subject(root, "HEAD")).filter(|s| !s.is_empty())
 }
 
@@ -2781,7 +2802,9 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
 /// One block of whatever kind the target and case are.
 fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let native = is_native(&ctx.describe["targets"][&s.target]);
-    if s.launch.is_object() && native {
+    if ctx.describe["targets"][&s.target]["kind"] == "cli" {
+        cli::block(ctx, s, v, pair, x)
+    } else if s.launch.is_object() && native {
         native::launch(ctx, s, v, pair, x)
     } else if s.launch.is_object() {
         launch::block(ctx, s, v, pair, x)
@@ -2825,7 +2848,7 @@ fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     match t["kind"].as_str().unwrap_or("") {
-        "script" => true,
+        "script" | "cli" => true,
         // A headless page draws to no display: the lock screen covers nothing of it.
         "web" | "url" if ctx.headless => true,
         _ if x.set == Set::Memory => true,
@@ -2903,7 +2926,7 @@ fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     if b.values.is_empty() {
         return b;
     }
-    let page = !is_native(&ctx.describe["targets"][&s.target]) && ctx.describe["targets"][&s.target]["kind"] != "script";
+    let page = !is_native(&ctx.describe["targets"][&s.target]) && !matches!(ctx.describe["targets"][&s.target]["kind"].as_str(), Some("script" | "cli"));
     for m in declared_metrics(s) {
         if b.values.get(m).is_some_and(|v| v.is_finite()) || b.refused.contains_key(m) {
             continue;
@@ -3604,6 +3627,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         let mut refused = uncounted;
         refuse_not_on_this_os(s, &mut values, &mut refused);
+        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
+            refused.insert(m.clone(), metrics::split_refusal(m, &values));
+        }
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         let intervals = metrics::run_intervals(&data);
@@ -4182,7 +4208,12 @@ fn glob(pattern: &str, text: &str) -> bool {
 }
 
 fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Value) -> Result<Variant> {
-    let (kind, label, root) = if let Some(href) = spec.strip_prefix("url:") {
+    let (kind, label, root) = if let Some(line) = spec.strip_prefix("cmd:") {
+        if line.trim().is_empty() {
+            return Err(Error::usage("cmd:<line> needs a command line"));
+        }
+        (Kind::Cmd(line.to_string()), line.to_string(), Some(std::env::current_dir()?))
+    } else if let Some(href) = spec.strip_prefix("url:") {
         (Kind::Url(href.to_string()), href.to_string(), None)
     } else if let Some(id) = spec.strip_prefix("app:") {
         // Fails early when the profile is missing or the app is not installed.
@@ -4346,7 +4377,14 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     }
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
     // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
-    if matches!(target["kind"].as_str(), Some("command") | Some("script")) {
+    if matches!(v.kind, Kind::Cmd(_)) && target["kind"] != "cli" {
+        return Err(Error::usage(format!("{}: a cmd:<line> variant is a command line, for a cli() target; this target is a {}", v.role, target["kind"].as_str().unwrap_or("?"))));
+    }
+    if matches!(target["kind"].as_str(), Some("command") | Some("script") | Some("cli")) {
+        // A command line runs as given, in the folder strobe started in: nothing to place or build.
+        if let Kind::Cmd(_) = &v.kind {
+            return Ok(());
+        }
         if let Kind::Git(r) = &v.kind
             && v.root.is_none()
         {

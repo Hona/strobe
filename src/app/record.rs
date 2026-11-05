@@ -109,7 +109,11 @@ pub fn run(args: &Args) -> Result<Output> {
         return super::outside::record(args, &target);
     }
 
-    let set = Set::parse(args.get("probes").unwrap_or("timing")).ok_or_else(|| Error::usage("--probes: timing, attribution or memory"))?;
+    // `waits`: a native app's attribution recording with its off-CPU waits.
+    let set = match args.get("probes").unwrap_or("timing") {
+        "waits" => Set::Attribution,
+        p => Set::parse(p).ok_or_else(|| Error::usage("--probes: timing, attribution, memory or waits (a native app's attribution with off-CPU waits)"))?,
+    };
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,
         None => 10_000,
@@ -377,7 +381,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+        let waits = args.get("probes") == Some("waits");
+        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), waits));
         let cycles = || -> (Cycles, Option<u64>) { (per_process(&n.processes()), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),

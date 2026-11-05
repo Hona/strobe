@@ -98,6 +98,7 @@ const context = () => ({
     void request("count", { name, n })
   },
   call: (name: string, ...args: unknown[]) => request("call", { name, args }),
+  exec: (line?: string) => request("exec", { line }),
   // The watch goes in at the call, before whatever the hook does next; then short polls, each answered
   // at once, so strobe serves the hook's other calls (a click) between them.
   async waitForLine(match: string | RegExp, opts: { in?: string; timeout?: number } = {}) {

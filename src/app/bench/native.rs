@@ -252,7 +252,7 @@ fn runs(
             Err(e) => presents_err = Some(e.message),
         }
     }
-    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+    let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), ctx.args.get("probes") == Some("waits")));
     let hooks = super::block::Hooks::default();
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
@@ -825,6 +825,7 @@ fn missing(metric: &str, have: &Have) -> Refusal {
     let refuse = |v: ValidatorId, why: String| Refusal::new(v, format!("{metric}{why}"));
     let area = metric.split('.').next().unwrap_or("");
     match area {
+        "frames" if crate::metrics::split_metric(metric) => refuse(ValidatorId::NotForTarget, " splits a browser frame by its pipeline stages; the OS's present events carry none".into()),
         "frames" if metric.starts_with("frames.presented.") && metric != "frames.presented.count" => refuse(
             ValidatorId::NoPresentSource,
             " is a frame's begin to its screen time; from outside strobe sees when a frame reached the screen, not when the app began it (frames.interval.*, frames.dropped and interaction.* it does see)".into(),
@@ -1009,7 +1010,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     unattributed(ctx, v, &n);
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
-    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+    let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), ctx.args.get("probes") == Some("waits")));
     let result = (|| -> Result<Block> {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = std::sync::mpsc::channel();

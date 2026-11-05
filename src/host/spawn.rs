@@ -190,6 +190,181 @@ impl Drop for Owned {
     }
 }
 
+/// What the OS counted for a command that ran to its exit, with what it started (SPEC §9.6 `cli()`).
+/// Each field is None where this OS does not count it for processes that have ended.
+#[derive(Clone, Debug, Default)]
+pub struct Usage {
+    pub code: i32,
+    /// When strobe saw it exit, before anything was read.
+    pub exited: Option<std::time::Instant>,
+    /// CPU time (user and kernel) of the command and what it started (ns).
+    pub cpu_ns: Option<u64>,
+    /// How the CPU time was counted, said beside it: exact, or the part read from clock ticks.
+    pub cpu_how: &'static str,
+    /// Context switches (voluntary and involuntary) of its threads.
+    pub switches: Option<u64>,
+    /// The most memory one of its processes held at once (bytes): Unix its peak resident set
+    /// (`ru_maxrss`), Windows its peak commit (`PeakProcessMemoryUsed`).
+    pub peak_bytes: Option<u64>,
+    pub read_bytes: Option<u64>,
+    pub write_bytes: Option<u64>,
+    /// Processes still running when the command exited (pid, name): strobe ended them, and what they
+    /// did is not the command's whole work.
+    pub left: Vec<(u32, String)>,
+}
+
+impl Owned {
+    /// Waits for the child to exit, reads what the OS counted for it and everything it started, ends
+    /// what is left of its group, and reaps it. On Unix the child stays a zombie while it is read
+    /// (its pid, the group's id, is not reused), and only processes its tree waited for count: one it
+    /// detached (a double fork) that ended before it is in no count.
+    pub fn run_to_exit(mut self) -> std::io::Result<Usage> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::System::JobObjects::{
+                JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAndIoAccountingInformation, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            };
+            use windows_sys::Win32::System::Threading::GetProcessTimes;
+            use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
+            let t0 = super::tsc();
+            let w0 = std::time::Instant::now();
+            let status = self.child.wait()?;
+            let exited = std::time::Instant::now();
+            let wall_ns = exited.duration_since(w0).as_nanos() as u64;
+            let h = self.child.as_raw_handle();
+            let job = self.group.as_ref().and_then(|g| g.job);
+            let mut usage = Usage { code: status.code().unwrap_or(-1), exited: Some(exited), cpu_how: "exact", ..Usage::default() };
+            // The child's own CPU from its cycle counter (exact); what it started from the job's
+            // clock-tick accounting, the only count Windows keeps of processes that ended.
+            let (mut cycles, mut child_100ns) = (0u64, None);
+            unsafe {
+                QueryProcessCycleTime(h, &mut cycles);
+                let (mut c, mut e, mut k, mut u) = (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+                if GetProcessTimes(h, &mut c, &mut e, &mut k, &mut u) != 0 {
+                    let t = |f: windows_sys::Win32::Foundation::FILETIME| (f.dwHighDateTime as u64) << 32 | f.dwLowDateTime as u64;
+                    child_100ns = Some(t(k) + t(u));
+                }
+            }
+            // The TSC's rate over the wait, as the script host's CPU is read (cycles are TSC units).
+            let hz = t0.zip(super::tsc()).filter(|(a, b)| b > a && wall_ns > 0).map(|(a, b)| (b - a) as f64 / (wall_ns as f64 / 1e9));
+            let child_ns = hz.filter(|_| cycles > 0).map(|hz| (cycles as f64 / hz * 1e9) as u64);
+            if let Some(j) = job {
+                let mut acct: JOBOBJECT_BASIC_AND_IO_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+                let ok = unsafe { QueryInformationJobObject(j as _, JobObjectBasicAndIoAccountingInformation, &mut acct as *mut _ as *mut _, std::mem::size_of_val(&acct) as u32, std::ptr::null_mut()) } != 0;
+                if ok {
+                    let job_100ns = (acct.BasicInfo.TotalUserTime + acct.BasicInfo.TotalKernelTime).max(0) as u64;
+                    let others_ns = job_100ns.saturating_sub(child_100ns.unwrap_or(0)) * 100;
+                    usage.cpu_ns = match child_ns {
+                        Some(c) => Some(c + others_ns),
+                        None => Some(job_100ns * 100),
+                    };
+                    usage.cpu_how = match (child_ns.is_some(), acct.BasicInfo.TotalProcesses > 1) {
+                        (true, false) => "exact",
+                        (true, true) => "the command's process exact, the processes it started from clock ticks",
+                        (false, _) => "clock ticks",
+                    };
+                    usage.read_bytes = Some(acct.IoInfo.ReadTransferCount);
+                    usage.write_bytes = Some(acct.IoInfo.WriteTransferCount);
+                    if acct.BasicInfo.ActiveProcesses > 0 {
+                        usage.left = job_pids(j).into_iter().map(|p| (p, super::exe_of(p).and_then(|e| e.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default())).collect();
+                    }
+                }
+                let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+                if unsafe { QueryInformationJobObject(j as _, JobObjectExtendedLimitInformation, &mut limits as *mut _ as *mut _, std::mem::size_of_val(&limits) as u32, std::ptr::null_mut()) } != 0 {
+                    usage.peak_bytes = Some(limits.PeakProcessMemoryUsed as u64);
+                }
+            } else {
+                // No job (strobe's own job refused a nested one): the child alone, and what it started is
+                // in no count.
+                usage.cpu_ns = child_ns.or(child_100ns.map(|t| t * 100));
+                usage.cpu_how = "the command's process only (no job to count what it started)";
+            }
+            self.end();
+            Ok(usage)
+        }
+        #[cfg(unix)]
+        unsafe {
+            let pid = self.child.id();
+            let mut info: libc::siginfo_t = std::mem::zeroed();
+            // Exited, not reaped: a zombie keeps its pid and the group's id while it is read.
+            while libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) != 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            let exited = std::time::Instant::now();
+            let mut usage = Usage { code: if info.si_code == libc::CLD_EXITED { info.si_status() } else { -1 }, exited: Some(exited), cpu_how: "exact", ..Usage::default() };
+            #[cfg(target_os = "linux")]
+            {
+                // The zombie's IO: its own and what its children (reaped by it) did.
+                if let Ok(io) = std::fs::read_to_string(format!("/proc/{pid}/io")) {
+                    let field = |k: &str| io.lines().find_map(|l| l.strip_prefix(k)).and_then(|v| v.trim().parse::<u64>().ok());
+                    usage.read_bytes = field("rchar:");
+                    usage.write_bytes = field("wchar:");
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // Disk bytes of the process alone: its reaped children's are in no count, so with
+                // children (their CPU time shows) IO is unknown.
+                let mut ri: libc::rusage_info_v4 = std::mem::zeroed();
+                if libc::proc_pid_rusage(pid as i32, libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t) == 0 && ri.ri_child_user_time + ri.ri_child_system_time == 0 {
+                    usage.read_bytes = Some(ri.ri_diskio_bytesread);
+                    usage.write_bytes = Some(ri.ri_diskio_byteswritten);
+                }
+            }
+            usage.left = group_members(pid).into_iter().filter(|(p, _)| *p != pid).collect();
+            if !usage.left.is_empty() {
+                libc::kill(-(pid as i32), libc::SIGKILL);
+            }
+            let mut status = 0;
+            let mut ru: libc::rusage = std::mem::zeroed();
+            while libc::wait4(pid as libc::pid_t, &mut status, 0, &mut ru) < 0 {
+                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            // Reaped here: nothing is left to end, and the group's id may name another process now.
+            self.group = None;
+            let tv = |t: libc::timeval| t.tv_sec as u64 * 1_000_000_000 + t.tv_usec as u64 * 1_000;
+            usage.cpu_ns = Some(tv(ru.ru_utime) + tv(ru.ru_stime));
+            usage.switches = Some(ru.ru_nvcsw as u64 + ru.ru_nivcsw as u64);
+            // Linux counts kilobytes, macOS bytes.
+            usage.peak_bytes = Some(if cfg!(target_os = "macos") { ru.ru_maxrss as u64 } else { ru.ru_maxrss as u64 * 1024 });
+            Ok(usage)
+        }
+    }
+}
+
+/// The processes in process group `pgid` now (pid, name).
+#[cfg(unix)]
+fn group_members(pgid: u32) -> Vec<(u32, String)> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+            let Some(pid) = e.file_name().to_str().and_then(|s| s.parse::<u32>().ok()) else { continue };
+            let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { continue };
+            // `pid (comm) state ppid pgrp …`: the name may hold spaces and parentheses.
+            let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else { continue };
+            let pgrp = stat[close + 1..].split_whitespace().nth(2).and_then(|s| s.parse::<u32>().ok());
+            if pgrp == Some(pgid) {
+                out.push((pid, stat[open + 1..close].to_string()));
+            }
+        }
+        out
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut buf = vec![0i32; 4096];
+        // PROC_PGRP_ONLY (2), which the libc crate does not name.
+        let n = unsafe { libc::proc_listpids(2, pgid, buf.as_mut_ptr() as *mut libc::c_void, (buf.len() * 4) as i32) };
+        buf.truncate((n.max(0) as usize / 4).min(buf.len()));
+        buf.into_iter().filter(|&p| p > 0).map(|p| (p as u32, super::exe_of(p as u32).and_then(|e| e.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default())).collect()
+    }
+}
+
 /// The processes of the groups launched for `dir` and still owned (Windows' jobs; none on Unix: the
 /// tree and the stamp find them there).
 pub fn group_pids(dir: &Path) -> Vec<u32> {

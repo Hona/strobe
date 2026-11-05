@@ -294,7 +294,12 @@ impl Top {
         }
         for g in &mut groups {
             g.cpus.retain(|&c| c < cores.len());
-            let n = g.cpus.len().max(1) as f64;
+            // A group with no CPU read has no load to show: `-`, never 0% (or -0%).
+            if g.cpus.is_empty() {
+                g.busy_pct = f64::NAN;
+                continue;
+            }
+            let n = g.cpus.len() as f64;
             g.busy_pct = g.cpus.iter().map(|&c| cores[c].busy_pct).sum::<f64>() / n;
             g.perf_pct = g.cpus.iter().map(|&c| cores[c].perf_pct).sum::<Option<f64>>().map(|s| s / n);
             g.mhz = mhz(g.perf_pct);
@@ -305,17 +310,18 @@ impl Top {
 
 fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, &Summary)>, live: bool) -> String {
     let mut t = String::new();
-    let busy = f.cores.iter().map(|c| c.busy_pct).sum::<f64>() / f.cores.len().max(1) as f64;
-    t += &format!("strobe top  {:.1} s  {}  {} logical CPUs  {:.0}% busy{}\n", f.elapsed_ms / 1000.0, cpu_name, topo.logical, busy, if live { "  (Ctrl+C quits)" } else { "" });
+    let pct = |v: f64| if v.is_finite() { format!("{:.0}%", v.max(0.0)) } else { "-".into() };
+    let busy = if f.cores.is_empty() { f64::NAN } else { f.cores.iter().map(|c| c.busy_pct).sum::<f64>() / f.cores.len() as f64 };
+    t += &format!("strobe top  {:.1} s  {}  {} logical CPUs  {} busy{}\n", f.elapsed_ms / 1000.0, cpu_name, topo.logical, pct(busy), if live { "  (Ctrl+C quits)" } else { "" });
     for g in &f.groups {
         let l3 = if g.l3_mb > 0 { format!("  {} MB L3", g.l3_mb) } else { String::new() };
         t += &format!(
-            "\n{}{}{}  {} CPUs  busy {:.0}%{}{}\n",
+            "\n{}{}{}  {} CPUs  busy {}{}{}\n",
             g.name,
             l3,
             if g.vcache { "  V-Cache" } else { "" },
             g.cpus.len(),
-            g.busy_pct,
+            pct(g.busy_pct),
             g.perf_pct.map(|p| format!("  freq {p:.0}%")).unwrap_or_default(),
             g.mhz.map(|m| format!(" ({:.2} GHz)", m / 1000.0)).unwrap_or_default()
         );

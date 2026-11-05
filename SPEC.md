@@ -3351,6 +3351,20 @@ case of a native app's idle bench went from 0.28-0.30% to 0.073% of a core in th
 counts at rest matched the old path (350-354 a 8 s window), and a Cocoa app's `ax.bench.ts --check`
 passed 8 of 8.
 
+Capture ownership (13.4, 4.2; 2026-11-05): each capture ends what it started when it is dropped as
+well as on `stop`: the raised profile interval and the kernel session (Windows), the perf reader
+and its events (Linux), the X Present thread, and ScreenCaptureKit streams (a start that times out
+included) and their queue (macOS); the helper and the runner's SDK are keyed by build; traces, heap
+snapshots, source maps, Perfetto traces and page snapshots are written whole or not at all through
+`store`. Checked on vps: a native `record` through `strobe mcp` whose app's output ended mid-run
+left one perf event and a `strobe-perf` thread in the process 20 s later before, none after; `record
+pid: --probes deep` sampled as before. On air (macOS 27, M4): Cocoa `ax.bench.ts --check` 8 of 8
+and an isolated native app's idle `--check` passed, each block making and dropping a capture, with
+no crash. On adais (locked, no helper): an attribution `record` of a page wrote its trace, heap
+snapshot and Perfetto trace with no temporary file left, `stacks-unprivileged` sampled, and a script
+bench's runner ran from `sdk/<build>/`. Not checked: the helper's `hello` refusal and the restored
+interval after a forced error (need the helper, one UAC prompt), a ScreenCaptureKit start timeout.
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).

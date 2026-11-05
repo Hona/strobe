@@ -111,11 +111,13 @@ fn webview2(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, 
         if let Some(t) = isolate::find(&data, "DevToolsActivePort", 3).into_iter().find_map(|p| std::fs::read_to_string(p).ok().filter(|t| t.lines().count() >= 2)) {
             break t;
         }
-        // A launcher stub that starts the real app and exits succeeds: a clean exit keeps waiting.
+        // A launcher stub that starts the real app and exits succeeds: a clean exit keeps waiting while
+        // something it launched runs.
         if let Some(code) = launching.child.as_mut().and_then(|c| c.exited())
-            && code != 0
+            && (code != 0 || crate::host::process_set(pid, Some(&prepared.dir)).is_empty())
         {
-            return Err(Error::unreachable(format!("{} exited (code {code}) before its webview opened a debugging port", app.exe.display())));
+            return Err(Error::unreachable(format!("{} exited (code {code}) before its webview opened a debugging port", app.exe.display()))
+                .hint(format!("a webview target is an app that embeds WebView2 and keeps running; for any other app, {NATIVE}")));
         }
         if Instant::now() > deadline {
             return Err(Error::unreachable(format!("{} opened no WebView2 debugging port in 60 s (none in {})", app.exe.display(), data.display()))
@@ -182,9 +184,9 @@ fn webkit(app: &App, seed: Option<&Path>, extra: &Extra) -> Error {
     }
     if inspector.is_some() {
         found.push(match seen.pages {
-            Some(n) if n > 0 => format!("its remote inspector lists {n} inspectable page{}", if n == 1 { "" } else { "s" }),
-            Some(_) => "its remote inspector lists no inspectable page (an app turns its webview's developer extras on only in debug builds)".into(),
-            None if seen.listening => "its remote inspector listens but answered nothing in 15 s (the webview is not inspectable: developer extras off)".into(),
+            Some(n) if n > 0 => format!("its remote inspector lists {n} inspectable page{} (WEBKIT_INSPECTOR_HTTP_SERVER), the way a WebKit driver will reach it", if n == 1 { "" } else { "s" }),
+            Some(_) => "its remote inspector lists no inspectable page".into(),
+            None if seen.listening => "its remote inspector listens but answered nothing in 15 s".into(),
             None => "it opened no remote inspector (WEBKIT_INSPECTOR_HTTP_SERVER): not a WebKitGTK webview, or one built without it".into(),
         });
     }

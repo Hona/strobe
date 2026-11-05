@@ -241,7 +241,8 @@ pub fn process_list() -> Vec<(u32, u32, u64)> {
 
 /// Ends a running process and every process of its tree now: Windows terminates each (when its
 /// creation time is still the snapshot's), Unix sends SIGKILL to the process group it leads (when it
-/// runs and leads one) and to each process of the tree, children first.
+/// runs and leads one) and to each process of the tree, children first. On macOS an exited, unreaped
+/// process still roots what it left running (`macos::kill_set`).
 pub fn kill_tree(pid: u32) {
     if pid == 0 {
         return;
@@ -250,6 +251,9 @@ pub fn kill_tree(pid: u32) {
     win::kill_tree(pid);
     #[cfg(unix)]
     {
+        #[cfg(target_os = "macos")]
+        let tree = macos::kill_set(pid);
+        #[cfg(not(target_os = "macos"))]
         let tree = tree_pids(pid);
         if tree.is_empty() {
             return;

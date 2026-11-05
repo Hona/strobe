@@ -111,6 +111,18 @@ struct Run {
     total: f64,
 }
 
+/// `Unattributed` (macOS, SPEC §13.2): a launch of an app bundle that did not become its own
+/// responsible process, so its XPC services are missing from the block's numbers. Said once per
+/// variant and reason.
+fn unattributed(ctx: &mut Ctx, v: &Variant, n: &Native) {
+    if let Some(why) = n.unattributed() {
+        let w = validity::warn("Unattributed", format!("{}: {why}; cpu, memory, wakes and GPU cover the app's own processes only", v.role));
+        if !ctx.warnings.iter().any(|x| x.text == w.text) {
+            ctx.warnings.push(w);
+        }
+    }
+}
+
 /// Metrics read from frames: refused together when the app spun unpaced.
 fn frame_metric(metric: &str) -> bool {
     ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
@@ -145,6 +157,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             return Err(e);
         }
     };
+    unattributed(ctx, v, &n);
     let drive = Drive { session: OnceCell::new(), pid: n.pid, home: home.dir.clone(), main: Cell::new(0) };
     ctx.target_qos = host::background_qos(Some(n.pid));
     // The per-thread timeline, from the launch to the last run's end, in untimed blocks (`--check`,
@@ -998,6 +1011,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             return Err(e);
         }
     };
+    unattributed(ctx, v, &n);
     // An attribution launch samples native stacks from right after the spawn (the session follows
     // the new tree) until ready, through the helper when it is installed.
     let mut stacks = (profile && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));

@@ -498,6 +498,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             // A debug build's times describe no build people run (`DevBuild`).
             "timing": if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
             "note": if set == Set::Attribution { format!("native attribution: OS samples; {stacks_note}") } else { String::new() },
+            // macOS: the app's XPC services are missing from every number (SPEC §13.2).
+            "unattributed": n.unattributed(),
         });
         for (k, x) in frame_values {
             meta["values"][k] = json!(x);
@@ -704,6 +706,9 @@ fn context_lines(meta: &Value) -> String {
     }
     if let (Some(fps), Some(hz)) = (meta["unpaced"]["fps"].as_f64(), meta["unpaced"]["hz"].as_f64()) {
         s += &format!("! UnpacedSpin  the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display, so it draws as fast as it can\n");
+    }
+    if let Some(why) = meta["unattributed"].as_str() {
+        s += &format!("! Unattributed  {why}: cpu, memory, wakes and GPU cover the app's own processes only\n");
     }
     s
 }

@@ -372,8 +372,10 @@ pub fn energy_counters() -> bool {
 /// runs nothing, and its children have left it. A process whose responsible process is in a tree
 /// joins it with its own tree (an XPC service launchd started for an app in it), when it started no
 /// earlier than that process; one responsible for itself or to anything outside the trees (another
-/// app, a shared system daemon, the terminal both were run from) never joins.
-fn tree_of(all: &[Bsd], roots: &[u32]) -> Vec<usize> {
+/// app, a shared system daemon, the terminal both were run from) never joins. `zombie_roots`: a
+/// root that exited and is not reaped yet still roots its tree (to end what it left: its children
+/// went to launchd, its services stay responsible to its pid), for `kill_set` alone.
+fn tree_of(all: &[Bsd], roots: &[u32], zombie_roots: bool) -> Vec<usize> {
     let mut children: HashMap<u32, Vec<usize>> = HashMap::new();
     for (i, p) in all.iter().enumerate() {
         if p.ppid != p.pid && !p.zombie {
@@ -398,7 +400,7 @@ fn tree_of(all: &[Bsd], roots: &[u32]) -> Vec<usize> {
         }
     };
     for &root in roots {
-        if let Some(r) = all.iter().position(|p| p.pid == root && !p.zombie) {
+        if let Some(r) = all.iter().position(|p| p.pid == root && (zombie_roots || !p.zombie)) {
             grow(r, &mut seen, &mut out);
         }
     }
@@ -431,10 +433,12 @@ fn responsible_for() -> Option<unsafe extern "C" fn(libc::pid_t) -> libc::pid_t>
 }
 
 /// Each process's responsible process, aligned with `all`: None when it is responsible for itself,
-/// launchd is, or the call fails. macOS sets it when a process starts, so it is read once per pid
-/// and start time.
+/// launchd is, or the call fails. macOS fixes it when a process starts, but the start time is the
+/// fork's, and a process may still change it at its exec (a disclaimed launch between fork and
+/// exec): so it is read again during a process's first 2 s, and a failed read is never kept.
 fn responsible_pids(all: &[Bsd]) -> Vec<Option<u32>> {
-    type Seen = HashMap<(u32, u64), Option<u32>>;
+    use std::time::{Duration, Instant};
+    type Seen = HashMap<(u32, u64), (Option<u32>, Instant)>;
     static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
     let Some(f) = responsible_for() else { return vec![None; all.len()] };
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -443,19 +447,38 @@ fn responsible_pids(all: &[Bsd]) -> Vec<Option<u32>> {
     let out = all
         .iter()
         .map(|p| {
-            let r = match old.get(&(p.pid, p.start)) {
-                Some(&r) => r,
-                None => {
-                    let r = unsafe { f(p.pid as libc::pid_t) };
-                    (r > 1 && r as u32 != p.pid).then_some(r as u32)
+            let first = match old.get(&(p.pid, p.start)) {
+                Some(&(r, first)) if first.elapsed() >= Duration::from_secs(2) => {
+                    now.insert((p.pid, p.start), (r, first));
+                    return r;
                 }
+                Some(&(_, first)) => first,
+                None => Instant::now(),
             };
-            now.insert((p.pid, p.start), r);
+            let r = unsafe { f(p.pid as libc::pid_t) };
+            if r < 0 {
+                return None;
+            }
+            let r = (r > 1 && r as u32 != p.pid).then_some(r as u32);
+            now.insert((p.pid, p.start), (r, first));
             r
         })
         .collect();
     *seen = Some(now);
     out
+}
+
+/// Why a launch `own_responsibility` was asked to make its own responsible process is not (its XPC
+/// services then go uncounted), read once the exec is done: None when it is.
+pub fn unattributed(pid: u32) -> Option<String> {
+    let Some(f) = responsible_for() else {
+        return Some("this macOS does not say which process is responsible for which (no responsibility_get_pid_responsible_for_pid), so the app's XPC services are not counted".into());
+    };
+    match unsafe { f(pid as libc::pid_t) } {
+        r if r as u32 == pid => None,
+        r if r < 0 => Some(format!("macOS did not say which process process {pid} is responsible to, so the app's XPC services are not counted")),
+        r => Some(format!("the app started responsible to process {r} (what strobe runs under), not to itself, so its XPC services (web content, GPU and network helpers) are not counted")),
+    }
 }
 
 /// Starts `cmd` as its own responsible process when its program is an app bundle's executable, as
@@ -466,21 +489,28 @@ fn responsible_pids(all: &[Bsd]) -> Vec<Option<u32>> {
 /// so no tree could tell its services apart. A bare executable keeps its parent's, as when a person
 /// runs it from a terminal. Between fork and exec, `posix_spawn` with `POSIX_SPAWN_SETEXEC` and the
 /// disclaim replaces the child in place (same pid, group and descriptors); if it fails, the
-/// ordinary exec follows.
-pub fn own_responsibility(cmd: &mut std::process::Command) {
+/// ordinary exec follows, so the caller checks the child (`unattributed`). Returns whether the
+/// program is an app bundle's executable (a relative path is one against the command's folder, its
+/// symlinks left as they are).
+pub fn own_responsibility(cmd: &mut std::process::Command) -> bool {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::process::CommandExt;
     type SetDisclaim = unsafe extern "C" fn(*mut libc::posix_spawnattr_t, libc::c_int) -> libc::c_int;
     static F: OnceLock<Option<SetDisclaim>> = OnceLock::new();
     let program = Path::new(cmd.get_program());
-    if !program.is_absolute() || !program.to_string_lossy().contains(".app/Contents/MacOS/") {
-        return;
+    // A name without a slash is looked up on PATH, never a bundle's executable.
+    if !program.as_os_str().as_bytes().contains(&b'/') {
+        return false;
+    }
+    let Ok(path) = std::path::absolute(cmd.get_current_dir().map(|d| d.join(program)).unwrap_or_else(|| program.to_path_buf())) else { return false };
+    if !path.to_string_lossy().contains(".app/Contents/MacOS/") {
+        return false;
     }
     let disclaim = *F.get_or_init(|| {
         let f = unsafe { libc::dlsym(libc::RTLD_DEFAULT, c"responsibility_spawnattrs_setdisclaim".as_ptr()) };
         (!f.is_null()).then(|| unsafe { std::mem::transmute::<*mut c_void, SetDisclaim>(f) })
     });
-    let Some(disclaim) = disclaim else { return };
+    let Some(disclaim) = disclaim else { return true };
     // The environment std's own exec would pass: strobe's, changed as `cmd` says.
     let mut env: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> = std::env::vars_os().collect();
     for (k, v) in cmd.get_envs() {
@@ -492,29 +522,31 @@ pub fn own_responsibility(cmd: &mut std::process::Command) {
     let cstr = |b: &[u8]| CString::new(b).ok();
     let argv = std::iter::once(program.as_os_str()).chain(cmd.get_args()).map(|a| cstr(a.as_bytes())).collect::<Option<Vec<_>>>();
     let envp = env.iter().map(|(k, v)| cstr(&[k.as_bytes(), b"=", v.as_bytes()].concat())).collect::<Option<Vec<_>>>();
-    let (Some(argv), Some(envp)) = (argv, envp) else { return };
+    let (Some(path), Some(argv), Some(envp)) = (cstr(path.as_os_str().as_bytes()), argv, envp) else { return true };
     let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
     if unsafe { libc::posix_spawnattr_init(&mut attr) } != 0 {
-        return;
+        return true;
     }
-    let exec = Disclaimed { argv_p: argv.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(), envp_p: envp.iter().map(|e| e.as_ptr()).chain([std::ptr::null()]).collect(), _argv: argv, _envp: envp, attr };
-    // The attribute is a pointer to libSystem's own state: these change what it points to.
     if unsafe { disclaim(&mut attr, 1) } != 0 || unsafe { libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short) } != 0 {
-        return;
+        unsafe { libc::posix_spawnattr_destroy(&mut attr) };
+        return true;
     }
+    let exec = Disclaimed { argv_p: argv.iter().map(|a| a.as_ptr()).chain([std::ptr::null()]).collect(), envp_p: envp.iter().map(|e| e.as_ptr()).chain([std::ptr::null()]).collect(), path, _argv: argv, _envp: envp, attr };
     // Only async-signal-safe work after fork: everything is built above.
     unsafe {
         cmd.pre_exec(move || {
             let mut pid: libc::pid_t = 0;
-            libc::posix_spawn(&mut pid, exec.argv_p[0], std::ptr::null(), &exec.attr, exec.argv_p.as_ptr() as *const *mut c_char, exec.envp_p.as_ptr() as *const *mut c_char);
+            libc::posix_spawn(&mut pid, exec.path.as_ptr(), std::ptr::null(), &exec.attr, exec.argv_p.as_ptr() as *const *mut c_char, exec.envp_p.as_ptr() as *const *mut c_char);
             Ok(())
         });
     }
+    true
 }
 
 /// What `own_responsibility`'s exec needs, built before fork. The pointers point into `argv` and
 /// `envp`, which never move once built.
 struct Disclaimed {
+    path: CString,
     _argv: Vec<CString>,
     _envp: Vec<CString>,
     argv_p: Vec<*const c_char>,
@@ -548,7 +580,7 @@ pub fn process_list() -> Vec<(u32, u32, u64)> {
 pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
     let all = all_bsd();
     let roots = roots(&all.iter().map(|b| (b.pid, b.ppid, b.start)).collect::<Vec<_>>());
-    tree_of(&all, &roots)
+    tree_of(&all, &roots, false)
         .into_iter()
         .map(|i| {
             let b = &all[i];
@@ -560,7 +592,16 @@ pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
 
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = all_bsd();
-    tree_of(&all, &[root]).into_iter().map(|i| all[i].pid).collect()
+    tree_of(&all, &[root], false).into_iter().map(|i| all[i].pid).collect()
+}
+
+/// What `host::kill_tree` ends: `tree_pids`, and when `root` has exited but is not reaped (a launch
+/// strobe still owns), what it left running: processes responsible to it (its XPC services, its
+/// children that went to launchd) that started no earlier than it. Its pid cannot name another
+/// process while it is unreaped.
+pub fn kill_set(root: u32) -> Vec<u32> {
+    let all = all_bsd();
+    tree_of(&all, &[root], true).into_iter().map(|i| all[i].pid).collect()
 }
 
 pub fn all_processes() -> Vec<ProcInfo> {

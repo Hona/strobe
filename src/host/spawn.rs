@@ -112,6 +112,9 @@ pub struct Owned {
     child: Child,
     /// Taken by `end`.
     group: Option<Group>,
+    /// macOS: why an app bundle's launch is not its own responsible process, so its XPC services
+    /// are not in its process set (`macos::unattributed`); None everywhere else.
+    pub unattributed: Option<String>,
 }
 
 struct Group {
@@ -257,7 +260,7 @@ pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Optio
         if let (Some(j), Some(h)) = (job, home) {
             JOBS.lock().unwrap_or_else(|e| e.into_inner()).push((home_key(h), j));
         }
-        Ok(Owned { child, group: Some(Group { job }) })
+        Ok(Owned { child, group: Some(Group { job }), unattributed: None })
     }
     #[cfg(not(windows))]
     {
@@ -265,17 +268,20 @@ pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Optio
         let _ = flags;
         cmd.process_group(0);
         pin(cmd, cpus);
-        // A target (a launch for a home) starts as its own responsible process, as a person starts
-        // an app bundle, so its XPC services join its process set.
+        // A target (a launch for a home) whose program is an app bundle's starts as its own
+        // responsible process, as a person starts an app, so its XPC services join its process set.
         #[cfg(target_os = "macos")]
-        if home.is_some() {
-            super::macos::own_responsibility(cmd);
-        }
+        let bundle = home.is_some() && super::macos::own_responsibility(cmd);
         #[cfg(not(target_os = "macos"))]
         let _ = home;
         let child = cmd.spawn()?;
         let pgid = child.id();
-        Ok(Owned { child, group: Some(Group { pgid }) })
+        // `spawn` returns once the exec is done: whether the disclaim took is known now.
+        #[cfg(target_os = "macos")]
+        let unattributed = if bundle { super::macos::unattributed(pgid) } else { None };
+        #[cfg(not(target_os = "macos"))]
+        let unattributed = None;
+        Ok(Owned { child, group: Some(Group { pgid }), unattributed })
     }
 }
 

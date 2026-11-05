@@ -112,7 +112,8 @@ fn content(exe: &Path) -> String {
     format!(
         "# Written by strobe up; strobe leave removes it.\n[Unit]\nDescription=strobe daemon (MCP and reports)\n\n[Service]\nExecStart={} daemon\nWorkingDirectory={}\nKillMode=process\n{env}\n[Install]\nWantedBy=default.target\n",
         quote(&exe.display().to_string()),
-        quote(&exe.parent().unwrap_or(Path::new("/")).display().to_string())
+        // WorkingDirectory takes the path as written (no quotes); only specifiers need escaping.
+        exe.parent().unwrap_or(Path::new("/")).display().to_string().replace('%', "%%")
     )
 }
 

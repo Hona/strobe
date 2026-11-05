@@ -811,7 +811,13 @@ none and refuses a declared one (`NoCounter`: counters are read around a case's 
   list, so a child started between the list and the read still counts), one that exited during it
   took its counts with it (XNU keeps no child instructions or energy), and one that joined the set
   late (a helper found in the app's home) was never read at the run's start. Either of the last two
-  refuses the run's counters (`NoCounter`, naming the process) instead of a short count.
+  refuses the run's counters (`NoCounter`, naming the process) instead of a short count. A child
+  that started and ended inside the run, seen by no snapshot, shows as its parent's reaped-child CPU
+  time growing (`ri_child_user_time`, `ri_child_system_time`): that refuses `cpu.instructions` and
+  `energy.cpu`, while `cpu.idle_wakes` adds the parent's `ri_child_pkg_idle_wkups` and stands (on
+  air a run that spawned one shell read 5.56 M instructions before this rule; Linux counted the same
+  run's shell in its parent's group: 2.32 G, A/A 0.0%). A child still unreaped (a zombie) at the
+  run's end is in no snapshot and not yet in its parent's child time: its counts are missed.
 - **Linux counter blocks.** The perf events cost the target at each of its context switches (in a VM
   4.4 µs a switch: 2000 short sleeps cost 36.8 ms of CPU per run with them, 19.3 ms without), so a
   timing block never opens them (rule 3). A series that declares `cpu.instructions` gets counter
@@ -846,6 +852,11 @@ none and refuses a declared one (`NoCounter`: counters are read around a case's 
   +100% [+99 … +100], `energy.cpu` +99% [+93 … +106], `cpu.work` +101%; vps (2 vCPU VM)
   `cpu.instructions` +100% [+100 … +100], `cpu.work` +104%. A/A per-block spread (CV over 16 blocks):
   air instructions 0.095% vs `cpu.work` 0.43% (energy 1.3%); vps instructions 0.022% vs 0.56%.
+  With counter blocks on vps: `cpu.instructions` primary with `cpu.work` (8 counter pairs, then 8
+  timing pairs) read +100% [+100 … +100] and `cpu.work` +104% [+103 … +105]; `cpu.work` primary with
+  `cpu.instructions` (8 timing pairs, then 8 counter pairs) +104% [+104 … +105] and +100%;
+  `--blocks 2` joined 480.3 and 480.2 M instructions to timing blocks of 70.3 and 70.1 ms; `--check`
+  of a series of both showed both.
 
 ## 8. Probes
 
@@ -3561,20 +3572,26 @@ group and exits at once read 99.8% on adais (the job), `—` on air and vps (no 
 not zero), and left nothing on all three; the cases above passed again on all three.
 
 New measurements (7.3, 7.4, 7.5, 9.4; 2026-11-06): `energy.cpu`, `cpu.instructions` and
-`cpu.idle_wakes` on page, native, script, `record` and `record pid:` targets, typed `NoCounter`
-refusals per OS (`probe::wakes::Uncounted`: no source, denied with its fix, partial, not opened);
-`span.<name>` from the page's `performance.measure()` spans (`NoSpan`); thread origins on Linux (the
-stack top) and macOS (process rows by executable), with Linux and macOS driver and system paths;
-`--reserve-cpus` on Linux. Checked: the planted 1× vs 2× loop and A/A numbers in §7.5 (air, vps);
-Windows refuses all three counters with the reason (adais, locked); a headless page's `span.work`
-read 50.6 ms per 1 s run on adais and 50.8 ms on air for ten 5 ms measures, `span.never` refused
-`NoSpan`, and on air the page's processes read 54.5 mJ and 554 M instructions per run; a native
-windowless app (a perl loop waking 100 times a second) read `energy.cpu` 33.7 mJ per 1 s run on air
-and 469–498 M instructions on air and vps; an unprivileged user at `perf_event_paranoid` 3 got
-`NoCounter` naming the sysctl; a Linux series with `cpu.instructions` and `cpu.work` refused the
-latter `OverheadBudget`; the reservation checks in §9.4 (vps). Not checked: multiplexed counters
-(nothing else used the PMU), a sandboxed renderer's refusal on Linux, Electron spans (same path as
-pages), thread origins of a real GPU driver's threads on Linux (vps has none).
+`cpu.idle_wakes` in page, native and script blocks and in native and `pid:` recordings, typed
+`NoCounter` refusals per OS (`probe::wakes::Uncounted`: no source, denied with its fix, partial, not
+opened); Linux counter blocks apart from timing blocks (`Exec::counters`, `Counting`), with perf
+groups owned by the block (`wakes::Perf`); `span.<name>` from the page's `performance.measure()`
+spans (`NoSpan`); thread origins on Linux (the stack top) and macOS (process rows by executable),
+with Linux and macOS driver and system paths; `--reserve-cpus` on Linux. A timed or check block
+that refuses its primary refuses the block (page, script and launch blocks had run every pair to
+`unclear`). Checked: the planted 1× vs 2× loop, A/A and counter-block numbers in §7.5 (air, vps);
+Windows refuses all three counters with the reason, and a `--check` whose primary is one fails
+(adais, locked); headless pages' spans (§7.3, adais and air), with the page's processes reading
+43.7–54.5 mJ per run on air; a native windowless app (a perl loop waking 100 times a second) read
+`energy.cpu` 32.2–33.7 mJ per 1 s run on air and 447–498 M instructions on air and vps; an
+unprivileged user at `perf_event_paranoid` 3 got `NoCounter` naming the sysctl; a run that started
+a child shell counted it in its parent's group on Linux (A/A 0.0%) and refused on macOS; the
+reservation checks in §9.4 (vps, as root before the root rule and as `nobody` after: the user's
+processes moved and back, root's untouched, restored after a `kill -9`). Not checked: multiplexed
+counters (nothing else used the PMU), a sandboxed renderer's refusal on Linux, Electron spans (same
+path as pages), thread origins of a real GPU driver's threads on Linux (vps has none), the
+reservation's last pass (a process started in a block's last 200 ms), counter blocks of a native
+app with a window.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

@@ -331,7 +331,11 @@ pub struct Counts {
     pub start_us: u64,
     pub instructions: u64,
     pub energy_nj: u64,
+    /// Its own package idle wakeups and its reaped children's (XNU keeps that for children).
     pub idle_wakes: u64,
+    /// CPU time of its children it reaped (Mach time): one that grew had a child run and end, whose
+    /// instructions and energy XNU keeps nowhere.
+    pub child_time: u64,
 }
 
 /// A process's `Counts` (this user's processes); Err with `errno` when `proc_pid_rusage` refuses v6
@@ -342,7 +346,14 @@ pub fn counts(pid: u32) -> Result<Counts, i32> {
         return Err(std::io::Error::last_os_error().raw_os_error().unwrap_or(0));
     }
     let b = bsd(pid).ok_or(libc::ESRCH)?;
-    Ok(Counts { name: b.name, start_us: b.start, instructions: ri.v4.ri_instructions, energy_nj: ri.ri_energy_nj, idle_wakes: ri.v4.ri_pkg_idle_wkups })
+    Ok(Counts {
+        name: b.name,
+        start_us: b.start,
+        instructions: ri.v4.ri_instructions,
+        energy_nj: ri.ri_energy_nj,
+        idle_wakes: ri.v4.ri_pkg_idle_wkups + ri.v4.ri_child_pkg_idle_wkups,
+        child_time: ri.v4.ri_child_user_time + ri.v4.ri_child_system_time,
+    })
 }
 
 /// Apple silicon: its cores have the energy counters `ri_energy_nj` reads.

@@ -341,8 +341,9 @@ struct Source {
     pid: u32,
     name: String,
     /// Instructions, CPU energy (nJ), package idle wakeups, and (Linux) the ns the counters were
-    /// enabled and running: a gap between the two is the CPU sharing them (multiplexing).
-    counts: [u64; 5],
+    /// enabled and running (a gap between the two is the CPU sharing them: multiplexing), and (macOS)
+    /// the CPU time of children it reaped.
+    counts: [u64; 6],
     /// macOS: when the process started (µs since the epoch), from which the kernel counts it.
     born_us: Option<u64>,
     #[cfg(target_os = "linux")]
@@ -416,7 +417,7 @@ impl Counters {
                         id: (pid as u64) << 32 | (k.start_us & 0xffff_ffff),
                         pid,
                         name: k.name,
-                        counts: [k.instructions, k.energy_nj, k.idle_wakes, 0, 0],
+                        counts: [k.instructions, k.energy_nj, k.idle_wakes, 0, 0, k.child_time],
                         born_us: Some(k.start_us),
                     }),
                     // Gone: a span that held it says so.
@@ -441,7 +442,7 @@ impl Counters {
                         for g in groups {
                             match g.read() {
                                 Some((n, enabled, running)) => {
-                                    c.sources.push(Source { id: std::sync::Arc::as_ptr(&g) as u64, pid: g.pid, name: g.name.clone(), counts: [n, 0, 0, enabled, running], born_us: None, group: g })
+                                    c.sources.push(Source { id: std::sync::Arc::as_ptr(&g) as u64, pid: g.pid, name: g.name.clone(), counts: [n, 0, 0, enabled, running, 0], born_us: None, group: g })
                                 }
                                 None => c.missing[0] = Some(Uncounted::Partial(format!("the counters of process {} ({}) could not be read", g.pid, g.name))),
                             }
@@ -463,9 +464,11 @@ impl Counters {
 /// counter the CPU multiplexed: refused, never scaled or left short.
 pub fn counted(a: &Counters, b: &Counters) -> Counted {
     let ms = b.at_ns.saturating_sub(a.at_ns) as f64 / 1e6;
-    let mut sum = [0u64; 5];
-    let mut partial: Option<String> = None;
-    let add = |sum: &mut [u64; 5], to: &[u64; 5], from: &[u64; 5]| {
+    let mut sum = [0u64; 6];
+    // Per metric, why some of the run went uncounted.
+    let mut partial: [Option<String>; 3] = Default::default();
+    let all = |p: &mut [Option<String>; 3], why: String| *p = std::array::from_fn(|_| Some(why.clone()));
+    let add = |sum: &mut [u64; 6], to: &[u64; 6], from: &[u64; 6]| {
         for ((s, t), f) in sum.iter_mut().zip(to).zip(from) {
             *s += t.saturating_sub(*f);
         }
@@ -473,26 +476,38 @@ pub fn counted(a: &Counters, b: &Counters) -> Counted {
     let before: std::collections::HashMap<u64, &Source> = a.sources.iter().map(|s| (s.id, s)).collect();
     for s in &b.sources {
         match before.get(&s.id) {
-            Some(s0) => add(&mut sum, &s.counts, &s0.counts),
-            None if s.born_us.is_some_and(|t| t >= a.wall_us) => add(&mut sum, &s.counts, &[0; 5]),
-            None => partial = Some(format!("process {} ({}) joined the target's processes during the run, uncounted before", s.pid, s.name)),
+            Some(s0) => {
+                add(&mut sum, &s.counts, &s0.counts);
+                // macOS: a child that started and ended inside the run left its CPU time with its
+                // parent, but its instructions and energy nowhere (its idle wakeups are kept).
+                if s.counts[5] > s0.counts[5] {
+                    let why = format!("process {} ({}) had a child process start and end during the run: macOS keeps no instructions or energy of an ended child", s.pid, s.name);
+                    partial[0] = Some(why.clone());
+                    partial[1] = Some(why);
+                }
+            }
+            None if s.born_us.is_some_and(|t| t >= a.wall_us) => add(&mut sum, &s.counts, &[0; 6]),
+            None => all(&mut partial, format!("process {} ({}) joined the target's processes during the run, uncounted before", s.pid, s.name)),
         }
     }
     let after: std::collections::HashSet<u64> = b.sources.iter().map(|s| s.id).collect();
     for s0 in a.sources.iter().filter(|s| !after.contains(&s.id)) {
         #[cfg(target_os = "linux")]
         if let Some((n, enabled, running)) = s0.group.read() {
-            add(&mut sum, &[n, 0, 0, enabled, running], &s0.counts);
+            add(&mut sum, &[n, 0, 0, enabled, running, 0], &s0.counts);
             continue;
         }
-        partial = Some(format!("process {} ({}) exited during the run, and its last counts went with it", s0.pid, s0.name));
+        all(&mut partial, format!("process {} ({}) exited during the run, and its last counts went with it", s0.pid, s0.name));
     }
     if sum[3] > sum[4] {
-        partial = Some(format!("the CPU's counters were shared with another perf user for {:.1}% of the time (multiplexed): the count missed part of the run", 100.0 * (sum[3] - sum[4]) as f64 / sum[3] as f64));
+        all(
+            &mut partial,
+            format!("the CPU's counters were shared with another perf user for {:.1}% of the time (multiplexed): the count missed part of the run", 100.0 * (sum[3] - sum[4]) as f64 / sum[3] as f64),
+        );
     }
     Counted {
         ms,
-        counts: std::array::from_fn(|i| match (&b.missing[i], &a.missing[i], &partial) {
+        counts: std::array::from_fn(|i| match (&b.missing[i], &a.missing[i], &partial[i]) {
             (Some(u), _, _) | (None, Some(u), _) => Err(u.clone()),
             (None, None, Some(why)) => Err(Uncounted::Partial(why.clone())),
             (None, None, None) => Ok(sum[i]),

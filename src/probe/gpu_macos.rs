@@ -26,7 +26,30 @@ unsafe extern "C" {
     fn IORegistryEntryGetChildIterator(entry: Io, plane: *const c_char, iter: *mut Io) -> i32;
     fn IORegistryEntryCreateCFProperty(entry: Io, key: CFTypeRef, alloc: CFTypeRef, options: u32) -> CFTypeRef;
     fn IORegistryEntryGetRegistryEntryID(entry: Io, id: *mut u64) -> i32;
+    fn IOObjectRetain(o: Io) -> i32;
 }
+
+/// IOKit objects kept between ticks (released on drop): matching the accelerators or walking their
+/// clients again each tick cost the sampler a round trip to the kernel per object.
+struct Held(Vec<Io>);
+
+impl Held {
+    fn keep(o: Io) -> Io {
+        unsafe { IOObjectRetain(o) };
+        o
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        for &o in &self.0 {
+            unsafe { IOObjectRelease(o) };
+        }
+    }
+}
+
+// IOKit object handles are mach ports, usable from any thread.
+unsafe impl Send for Held {}
 
 fn each(iter: Io, mut f: impl FnMut(Io)) {
     loop {
@@ -91,11 +114,28 @@ fn gpu_time(entry: Io) -> Option<u64> {
     Some(cf_array(usage.0).into_iter().filter_map(|d| cf_i64(cf_get(d, "accumulatedGPUTime"))).map(|v| v.max(0) as u64).sum())
 }
 
+/// The accelerators, each with its registry id, kept open.
+fn open_accelerators() -> (Held, Vec<u64>) {
+    let (mut held, mut ids) = (Held(Vec::new()), Vec::new());
+    accelerators(|acc| {
+        held.0.push(Held::keep(acc));
+        ids.push(entry_id(acc));
+    });
+    (held, ids)
+}
+
 pub struct Kmt {
     adapters: Vec<(u64, u16)>,
     engine: u16,
-    /// (accelerator id, client id) → creator pid, re-listed every second.
-    owners: HashMap<(u64, u64), u32>,
+    accs: (Held, Vec<u64>),
+    /// Every client seen, (accelerator id, client id) → its creator's pid: read once per client (a
+    /// registry id is never reused), dropped once the client is gone.
+    owners: HashMap<(u64, u64), Option<u32>>,
+    /// The clients of the pids asked for, kept open between lists: only their `AppUsage` is read
+    /// each tick. Every client is listed again each second and when the pids change.
+    tracked: Vec<(u64, u64)>,
+    tracked_held: Held,
+    tracked_pids: Vec<u32>,
     listed: Option<Instant>,
     prev: HashMap<(u64, u64), u64>,
     started: bool,
@@ -108,44 +148,49 @@ impl Kmt {
             return None;
         }
         let engine = super::gpu::intern(names, "3D");
-        Some(Kmt { adapters: adapters.iter().enumerate().map(|(i, a)| (a.luid, i as u16)).collect(), engine, owners: HashMap::new(), listed: None, prev: HashMap::new(), started: false, unreadable: Vec::new() })
+        Some(Kmt {
+            adapters: adapters.iter().enumerate().map(|(i, a)| (a.luid, i as u16)).collect(),
+            engine,
+            accs: open_accelerators(),
+            owners: HashMap::new(),
+            tracked: Vec::new(),
+            tracked_held: Held(Vec::new()),
+            tracked_pids: Vec::new(),
+            listed: None,
+            prev: HashMap::new(),
+            started: false,
+            unreadable: Vec::new(),
+        })
+    }
+
+    /// Lists every accelerator's clients again: those of `pids` are kept open in `tracked`.
+    fn list(&mut self, pids: &[u32]) {
+        let (mut tracked, mut held) = (Vec::new(), Held(Vec::new()));
+        let mut seen: HashMap<(u64, u64), Option<u32>> = HashMap::with_capacity(self.owners.len());
+        for (&acc, &a) in self.accs.0.0.iter().zip(&self.accs.1) {
+            clients(acc, |c| {
+                let key = (a, entry_id(c));
+                let pid = match self.owners.get(&key) {
+                    Some(&p) => p,
+                    None => creator_pid(c),
+                };
+                seen.insert(key, pid);
+                if pid.is_some_and(|p| pids.binary_search(&p).is_ok()) {
+                    tracked.push(key);
+                    held.0.push(Held::keep(c));
+                }
+            });
+        }
+        self.owners = seen;
+        (self.tracked, self.tracked_held, self.tracked_pids) = (tracked, held, pids.to_vec());
+        self.listed = Some(Instant::now());
     }
 
     pub fn read(&mut self, pids: &[u32], dt_ns: u64, nodes: bool, gpu: &mut Vec<EngineUse>, _vram: &mut Vec<VramUse>) {
-        let relist = self.listed.is_none_or(|t| t.elapsed() >= Duration::from_secs(1));
-        if relist {
-            self.owners.clear();
+        if self.listed.is_none_or(|t| t.elapsed() >= Duration::from_secs(1)) || self.tracked_pids != pids {
+            self.list(pids);
         }
-        let mut now: HashMap<(u64, u64), u64> = HashMap::new();
-        let owners = &mut self.owners;
-        accelerators(|acc| {
-            let a = entry_id(acc);
-            clients(acc, |c| {
-                let key = (a, entry_id(c));
-                let pid = if relist {
-                    match creator_pid(c) {
-                        Some(p) => {
-                            owners.insert(key, p);
-                            p
-                        }
-                        None => return,
-                    }
-                } else {
-                    match owners.get(&key) {
-                        Some(&p) => p,
-                        None => return,
-                    }
-                };
-                if pids.binary_search(&pid).is_ok()
-                    && let Some(t) = gpu_time(c)
-                {
-                    now.insert(key, t);
-                }
-            });
-        });
-        if relist {
-            self.listed = Some(Instant::now());
-        }
+        let now: HashMap<(u64, u64), u64> = self.tracked.iter().zip(&self.tracked_held.0).filter_map(|(&key, &c)| Some((key, gpu_time(c)?))).collect();
         for (key, &t) in &now {
             let base = match self.prev.get(key) {
                 Some(&p) => p,
@@ -154,7 +199,7 @@ impl Kmt {
             };
             if nodes && t > base && dt_ns > 0 {
                 let adapter = self.adapters.iter().find(|x| x.0 == key.0).map(|x| x.1).unwrap_or(0);
-                let pid = self.owners.get(key).copied().unwrap_or(0);
+                let pid = self.owners.get(key).copied().flatten().unwrap_or(0);
                 gpu.push(EngineUse { pid, adapter, engine: self.engine, pct: ((t - base) as f64 * 100.0 / dt_ns as f64) as f32 });
             }
         }
@@ -174,20 +219,21 @@ impl Kmt {
 /// The accelerator's own statistics, as a device.
 pub struct Nvml {
     pub devices: Vec<Device>,
+    accs: Held,
 }
 
 impl Nvml {
     pub fn load(adapters: &[Adapter]) -> Option<Nvml> {
         let devices: Vec<Device> = adapters.iter().enumerate().map(|(i, a)| Device { name: a.name.clone(), adapter: Some(i as u16), vram_total_mb: None }).collect();
-        (!devices.is_empty()).then_some(Nvml { devices })
+        (!devices.is_empty()).then(|| Nvml { devices, accs: open_accelerators().0 })
     }
 
     pub fn sample(&mut self, _t_ns: u64, _pcie: bool, out: &mut Vec<DeviceSample>) {
         out.clear();
-        accelerators(|acc| {
-            let Some(stats) = property(acc, "PerformanceStatistics") else { return };
+        for &acc in &self.accs.0 {
+            let Some(stats) = property(acc, "PerformanceStatistics") else { continue };
             let get = |k: &str| cf_i64(cf_get(stats.0, k)).map(|v| v as f64);
             out.push(DeviceSample { gpu_pct: get("Device Utilization %"), vram_used_mb: get("In use system memory").map(|b| b / (1 << 20) as f64), ..DeviceSample::default() });
-        });
+        }
     }
 }

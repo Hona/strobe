@@ -2381,9 +2381,12 @@ Strobe launches any Electron app the same way, with no change to the app:
   with the home, restores URL schemes, returns lent GPU caches, unlinks shared seeds and deletes the
   home. A dropped target deletes only a home made for that launch; a warm home stays for its caller.
   Windows ends a job when its last handle closes, so a strobe that dies takes its launches with it,
-  except what broke away from the job, which the next strobe ends by its stamp. A strobe counts as
-  gone once its process has exited, even while another process holds a handle to it (Windows) or has
-  not reaped it (a zombie).
+  except what broke away from the job, which the next strobe ends by its stamp. On Unix a strobe
+  that dies leaves its launches running, and the next strobe ends what carries its stamp; a process
+  started with a cleared environment outside the tree is not found then (no job holds it on Unix),
+  nor counted in the process set while strobe runs (its group still ends it on close). A strobe counts
+  as gone once its process has exited, even while another process holds a handle to it (Windows) or
+  has not reaped it (a zombie).
 - **GPU shader caches** (`gpuCache`, a case option over a native or app target option, else the
   app profile's; default `warm`; anything but `warm` or `cold` is a usage error before the bench
   takes the slot or builds). A GPU driver keeps the shaders it compiled under the per-user folders the home
@@ -3436,7 +3439,14 @@ ended by the next `look` or `record`. One process-set read on adais (405 process
 6.9 ms (15.6 ms cold), where the executable-path scan took 22.5 ms. On air, with two `Awake`s in one
 process and one dropped, `pmset -g assertions` listed strobe's 2 assertions (before: 0); the first
 of two samplers still read its thread's CPU after the second sampled (before: none); the
-timer-coalescing check took 43 ms once, then nothing (before: 42 ms each call).
+timer-coalescing check took 43 ms once, then nothing (before: 42 ms each call). After review: the
+child is an `Owned` that is never reaped before its group ends (on Unix a group kill after the
+leader was reaped could reach a process that took its pid), Windows tree kills check creation times,
+zombies are in no tree, a stamp missing in a process's first 2 s is read again, job lists are read
+under their lock, windows are raised by process set, and variant servers and command targets are
+owned (strobe no longer starts `taskkill`). A launcher target that starts an unstamped burner in its own
+group and exits at once read 99.8% on adais (the job), `—` on air and vps (no process found: unknown,
+not zero), and left nothing on all three; the cases above passed again on all three.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

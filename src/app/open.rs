@@ -229,15 +229,23 @@ fn start(trace: &Path, id: &str, ui_port: u16) -> Result<Session> {
         Ok(p) => (Some(p), None),
         Err(e) => (None, Some(format!("{}; the UI loads the trace itself", e.message))),
     };
+    // A session file is the key to its trace: the folder and the files are the user's alone.
     let dir = paths::run().join("perfetto");
     let _ = std::fs::create_dir_all(&dir);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+    }
     // Sessions from earlier days are gone; the traces stay in their recordings.
     for e in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
         if e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|age| age.as_secs() > 86_400) {
             let _ = std::fs::remove_file(e.path());
         }
     }
-    let _ = store::write_json(&dir.join(format!("{token}.json")), &json!({ "trace": trace.display().to_string(), "recording": id, "rpc_port": rpc }));
+    let file = dir.join(format!("{token}.json"));
+    store::write_json(&file, &json!({ "trace": trace.display().to_string(), "recording": id, "rpc_port": rpc }))?;
+    super::mcp::owner_only(&file);
     Ok(Session { token, rpc, note })
 }
 

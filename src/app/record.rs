@@ -21,6 +21,9 @@ use std::time::Duration;
 /// bench `--check` with an attribution block: setup, warmup until steady, then the measured runs under the
 /// profilers.
 fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
+    if args.has("gpu-cache") {
+        return Err(Error::usage("--gpu-cache is for a native app's record; with --bench the bench target's gpuCache decides (set it in the bench file)"));
+    }
     let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.

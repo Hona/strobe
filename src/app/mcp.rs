@@ -38,15 +38,15 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "status",
         description: "Environment, validity preflight (load, power, browser, engine, calibration) and recent recordings and experiments.",
-        args: &[("target", "optional target to check")],
+        args: &[],
         flags: &[("fast", "skip the 3 s idle-load sample"), ("calibrate", "run the full calibration")],
         required: &[],
         long: false,
     },
     Tool {
         name: "record",
-        description: "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), app:<id>, exe:<path>, cdp:<port>, pid:<n>, file:<path> (import). With bench (file#case), records that bench case (it drives the app) with the attribution probes; no target then.",
-        args: &[("target", "https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, pid:<n>, proc:<name>, or file:<path>; not with bench")],
+        description: "Record one target on one timeline. Returns a handle (rec_…) and headline frame, main-thread and CPU metrics. Targets: https://… (strobe launches Chromium), app:<id>, exe:<path>, cdp:<port>, pid:<n>, file:<path> (import). With bench (file#case), records that bench case (it drives the app) with the attribution probes; target then names one of the bench file's targets.",
+        args: &[("target", "https://…, app:<id> (a strobe.json profile, Electron or native), exe:<path>, cdp:<port>, pid:<n>, proc:<name>, or file:<path>; with bench: a target name from the bench file")],
         flags: &[
             ("for", "duration, e.g. 10s (default 10s)"),
             ("probes", "timing (default), attribution (CPU stacks, allocations, forced layouts, GC, a heap snapshot) or memory (a heap snapshot); pid:/proc: targets also deep"),
@@ -60,7 +60,7 @@ const TOOLS: &[Tool] = &[
             ("stop-line", "native app: stop recording when it prints a line matching this regex"),
             ("bench", "<file.bench.ts>#<case>: record that bench case (a case glob works) instead of a target"),
             ("head", "with bench: the variant to record (default .)"),
-            ("gpu-cache", "with bench, a native app: warm or cold GPU shader caches"),
+            ("gpu-cache", "a native app (not with bench, where the bench target's gpuCache decides): warm or cold GPU shader caches (default warm)"),
             ("params", "with bench: k=v,k2=v2"),
             ("runs", "with bench: measured runs (default 5)"),
             ("pin", "with bench: auto, none, ccdN or a CPU list"),
@@ -190,7 +190,13 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
     };
     let mut flags: Vec<String> = Vec::new();
     for (k, v) in obj {
-        if tool.args.iter().any(|(a, _)| a == k) || (tool.long && k == "timeout") {
+        if tool.long && k == "timeout" {
+            if !(v.is_null() || v.as_u64().is_some() || v.as_str().is_some_and(|s| s.trim().parse::<u64>().is_ok())) {
+                return Err(Error::usage(format!("{name}: timeout is a whole number of seconds, not {v}")));
+            }
+            continue;
+        }
+        if tool.args.iter().any(|(a, _)| a == k) {
             if !(v.is_string() || v.is_number() || v.is_null()) {
                 return Err(Error::usage(format!("{name}: {k} is a string")));
             }
@@ -222,16 +228,12 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
     let has = |k: &str| obj.get(k).is_some_and(|v| !v.is_null() && *v != Value::Bool(false));
     let mut pending_id = None;
     match name {
-        "status" => {
-            if let Some(t) = get("target") {
-                a.push(t);
-            }
-        }
         "record" => {
-            // A bench case is an experiment (`exp_…`) that keeps its recordings.
+            // A bench case is an experiment (`exp_…`) that keeps its recordings; `target` then picks
+            // one of the bench file's targets (`--target`).
             let id = if has("bench") {
-                if has("target") {
-                    return Err(Error::usage("record: bench names its own target (the bench file's); drop target"));
+                if let Some(t) = get("target") {
+                    a.extend(["--target".into(), t]);
                 }
                 store::new_id("exp")
             } else {
@@ -244,6 +246,9 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
         }
         "bench" => {
             if has("stop") || has("resume") {
+                if has("stop") && has("resume") {
+                    return Err(Error::usage("bench: stop or resume, not both"));
+                }
                 if has("file") {
                     return Err(Error::usage("bench: stop and resume take an experiment, not a file"));
                 }
@@ -283,7 +288,7 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
         _ => {}
     }
     a.extend(flags);
-    let timeout = obj.get("timeout").and_then(|v| v.as_u64().or_else(|| v.as_str()?.parse().ok())).unwrap_or(600);
+    let timeout = obj.get("timeout").and_then(|v| v.as_u64().or_else(|| v.as_str()?.trim().parse().ok())).unwrap_or(600);
     Ok((a, timeout, pending_id))
 }
 
@@ -336,6 +341,10 @@ pub fn handle(msg: &Value) -> Option<Value> {
             "instructions": instructions(),
         }),
         "ping" => json!({}),
+        // Never mid-bench: exiting would skip putting back the power plan and CPU sets it changed.
+        "strobe/quit" if super::bench::slot::daemon_benching() => {
+            return id.map(|id| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": -32000, "message": "a bench runs in the daemon: strobe bench --stop it first" } }));
+        }
         "strobe/quit" => {
             std::thread::spawn(|| {
                 std::thread::sleep(Duration::from_millis(100));
@@ -357,7 +366,7 @@ pub fn handle(msg: &Value) -> Option<Value> {
 }
 
 pub fn stdio() -> Result<()> {
-    unsafe { std::env::set_var("STROBE_QUIET", "1") };
+    super::QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
     for line in stdin.lock().lines().map_while(std::result::Result::ok) {
@@ -396,7 +405,7 @@ pub fn token() -> Result<String> {
 
 /// Owner-only permissions (0600) on a secret strobe wrote; on Windows the state folder's ACL is the
 /// user's alone already.
-fn owner_only(p: &std::path::Path) {
+pub(super) fn owner_only(p: &std::path::Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -445,7 +454,7 @@ pub fn daemon(_args: &Args) -> Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port)).map_err(|e| Error::msg(format!("port {port} is taken ({e}); is a strobe daemon already running?")))?;
     let log = paths::state_dir().join("log");
     let _ = std::fs::create_dir_all(&log);
-    unsafe { std::env::set_var("STROBE_QUIET", "1") };
+    super::QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
     super::DAEMON.store(true, std::sync::atomic::Ordering::Relaxed);
     // Tracked branches (`strobe track --schedule`): checked once a minute.
     std::thread::spawn(super::track::daemon_loop);

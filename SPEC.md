@@ -225,8 +225,11 @@ Global     --json  -q/--quiet  -v/--verbose  -h/--help  -V/--version  --progress
 ```
 
 Every flag strobe reads is in one table (`cli::FLAGS`, with whether it takes a value); any other
-flag is a usage error (exit 2) that names the closest one, never a setting silently ignored. MCP
-tool schemas take their types from the same table (§17).
+flag is a usage error (exit 2) that names the closest one, never a setting silently ignored, and
+so is an unknown short flag (`-x`; a negative number stays an argument). A switch takes
+`--name`, `--name=true` or `--name=false` (off), nothing else. MCP tool schemas take their types
+from the same table (§17). Durations take `500ms`, `10s`, `2m`, `2h`, `1d` or plain seconds; a
+negative or non-finite one is refused.
 
 Progress lines of long commands go to stderr (stdout stays the result); `--progress stdout` (or
 `STROBE_PROGRESS=stdout`) puts them on stdout, `off` drops them; with `--json` stdout never gets
@@ -306,8 +309,10 @@ strobe up · adais
 ### 5.4 `strobe status`
 
 ```
-strobe status [<target>] [--calibrate] [--json]
+strobe status [--calibrate] [--fast] [--json]
 ```
+
+It checks this device and takes no target (one is a usage error pointing at `look`).
 
 Reports: environment (§9.4 provenance fields), a validity preflight (idle load per core for
 3 s, power plan, battery, throttling, displays and the adapter driving each), daemon, helper,
@@ -328,7 +333,9 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
 - `--bench <file>#<case>` records a bench case (a case glob matches) on `--head` (default `.`),
   so a flow behind clicks or keys records as easily as a URL. It runs as `bench --check --why
   always`: setup, warmup until steady, then the measured runs under the attribution probes; it
-  prints the recording handle per matching series. No `<target>` is needed: the bench file names it.
+  prints the recording handle per matching series. No `<target>` is needed: the bench file names it
+  (`--target` picks one of its targets). `--gpu-cache` is refused there: the bench target's
+  `gpuCache` decides, as in a bench.
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
@@ -375,7 +382,10 @@ stop ends `track` and `bisect` (exit 130). Each invocation keeps its own progres
 (the daemon runs several at once); the daemon installs no signal handler, so SIGTERM ends it.
 `--unlock-wait <duration>` caps each wait for an unlock of a series that needs a presenting window:
 then the bench ends as a stop does, with exit 124 and a hint to resume once unlocked (checked on
-adais, locked: exit 124 after `--unlock-wait 10s`). On Windows and in a
+adais, locked: exit 124 after `--unlock-wait 10s`). Both keep the experiment's warm GPU cache
+stores for `--resume`, and `track` and `bisect` take a bench that ended either way as that error,
+never as a partial answer (a bisect step without its pairs would otherwise move `good`). `--stop`
+and `--resume` together are a usage error. On Windows and in a
 terminal the runner and the browser get the same Ctrl-C and end with it, so the block in flight is
 dropped. What finished stays: the half pair goes, the finished pairs of the running series get
 their comparison (no verdict unless a planned look had decided it), finished series keep theirs,
@@ -482,7 +492,8 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   runs it, whatever the new build's own install code does), then runs each new copy (`--version`,
   the build id checked): a copy that does not run once in the install folder (an antivirus
   quarantined or blocked it; Defender has flagged unsigned builds) puts every previous binary back
-  and fails with the reason and how to allow it (checked on vps with the install folder on a noexec
+  first, then fails with the reason, how to allow it, and what the rollback did (each binary that
+  could not go back is named) (checked on vps with the install folder on a noexec
   mount: the previous binary came back byte for byte). `up` installs the same way. It then stops
   the daemon unless the daemon is running a bench. Then the installed new build runs its own `up --skip calibrate`: it writes its
   skill and MCP registration, starts its daemon, and refreshes the deep-mode helper only where one
@@ -504,7 +515,8 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   a local build of the same version (other bytes), stays, with a usage error that says so: an
   update once put 0.4.0 over the main build another session's bench used, which then failed on an
   unknown metric. `--force` replaces it anyway.
-- `leave [--yes]`: undo `up`: MCP registration, autostart (it asks the daemon to quit first, then
+- `leave [--yes]`: undo `up` (refused while the daemon runs a bench: `bench --stop` it first): MCP
+  registration, autostart (it asks the daemon to quit and waits up to 5 s for it, then
   removes the Run key, boots out and deletes the LaunchAgent, or disables and deletes the systemd
   unit), skill folder, helper, state dir (recordings included, after confirmation). Leaves the
   binary. The MCP entry in opencode's config is found by parsing its JSONC (strings, comments,
@@ -2823,14 +2835,23 @@ bridges ──────┤ user-only bridge socket        apps connect out
   (`~/Library/LaunchAgents/dev.hona.strobe.daemon.plist`, `RunAtLoad`, `ProcessType Interactive` so
   its timers and its benches' are not coalesced, `AbandonProcessGroup`) on macOS; a systemd user unit
   (`strobe.service`, `WantedBy=default.target`, `KillMode=process`) on Linux. Both record the
-  `PATH`, `XDG_DATA_HOME` and (Linux) display variables of the shell `up` ran in, as a daemon
-  started from it had, and the install folder as the working folder. `up` starts the daemon through
-  launchd (`bootstrap`) or systemd (`restart`), else as a detached process, and says why. `status`
-  shows an `autostart` line from the registration itself (it exists, names an executable that
-  exists, and on Linux is enabled), never assumed.
+  `PATH` and `XDG_DATA_HOME` of the shell `up` ran in (where the daemon finds its tools and its
+  state) and the install folder as the working folder. The display comes from the session, as for
+  any user service: a systemd unit gets the user manager's environment (desktops import `DISPLAY`
+  at login), and `up` says so when the manager lacks a display this shell has, with the
+  `systemctl --user import-environment` that fixes it; nothing is baked in that a relogin changes.
+  `up` starts the daemon through launchd or systemd, else as a detached process, and says why: a
+  loaded LaunchAgent whose plist is unchanged is `kickstart -k`ed; a changed one is booted out,
+  waited for until launchd lets it go (bootout returns first), and bootstrapped. `status` shows an
+  `autostart` line from the registration itself (it exists, names an executable that exists, and
+  on Linux is enabled), never assumed.
 - Each invocation (an MCP call runs on its own thread) has its own progress log and stop files;
   nested ones (a bisect's steps, a track's benches) stack. Benches it runs register `daemon: true`
-  (§10.1): `up`, `update` and the daemon's own follow-up never restart a daemon mid-bench.
+  (§10.1), written whole (a temporary file renamed over it): `up`, `update` and the daemon's own
+  follow-up never restart a daemon mid-bench, `strobe/quit` refuses then (exiting would skip
+  putting back the power plan and CPU sets), and `leave` refuses with the `bench --stop` to run.
+  The daemon never changes its process's CPU affinity: a bench it runs pins its own thread (on
+  Linux what that thread starts inherits it), since other invocations share the process.
 - One per user: a starting daemon asks other builds' daemons to quit once idle.
 - Long work (bench, long records) runs in the daemon; CLI and MCP calls attach to it and can
   detach without stopping it.
@@ -2850,7 +2871,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 
 | Tool | Input (beyond the CLI flags of the same name) | Output |
 |---|---|---|
-| `status` | `target?`, `calibrate?` | §5.4 JSON |
+| `status` | `calibrate?`, `fast?` | §5.4 JSON |
 | `record` | `target` (not with `bench`), `for?`, `probes?`, `native?`, `app?`, `headless?`, `served?`, `style?`, `os-frames?`, `until-line?`, `stop-line?`, `bench?`, `head?`, `gpu-cache?`, `params?`, `runs?`, `pin?`, `power?`, `timeout?` | `{ handle, valid, summary, warnings }` (with `bench`: `{ recordings }`) |
 | `bench` | `file` (not with `stop`/`resume`), `head?`, `base?`, `aa?`, `check?`, `filter?`, `target?`, `params?`, `primary?`, `equivalence?`, `noworse?`, `plan?`, `effect?`, `pilot?`, `pairs?`, `runs?`, `probes?`, `repeat?`, `bisect?`, `pin?`, `power?`, `reserve-cpus?`, `why?`, `trace?`, `keep?`, `pixels?`, `pixels-only?`, `style?`, `max-time?`, `unlock-wait?`, `require-verdict?`, `stop?`, `resume?`, `timeout?` | result (§5.6) or `{ id, state: "running", progress }` |
 | `query` | `handle`, `view?`, `sql?`, `by?`, `top?`, `reveal?`, `at?`, `native?`, `thread?`, `phase?`, `timeline?`; `history`, `changes` or `ser_…` for tracked history (§25.5) | view JSON |
@@ -2861,10 +2882,12 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - Each tool lists its positional inputs and the CLI flags it takes; each flag's JSON type
   (boolean, number, string) comes from the CLI's flag table (§5), so the schemas cannot drift from
   the CLI. A call with an input the tool lacks, or of the wrong type, is refused (`isError`) naming
-  what it takes. `record` with `bench` (`<file>#<case>`) takes no `target` and returns an `exp_…`;
-  `bench` with `stop` or `resume` takes an experiment instead of `file`.
+  what it takes; `timeout` must be a whole number of seconds. `record` with `bench`
+  (`<file>#<case>`) returns an `exp_…`, and its `target` names one of the bench file's targets
+  (`--target`); `bench` with `stop` or `resume` (not both) takes an experiment instead of `file`.
 - The MCP token and `strobe open`'s session tokens come from the OS's secure random source
-  (BCryptGenRandom, `/dev/urandom`); the token file is written 0600 on Unix.
+  (BCryptGenRandom, `/dev/urandom`); the token file and each session file (the key to its trace)
+  are 0600, in folders only the user can enter, on Unix.
 - Output rules for agents: verdict first; handles instead of payloads; top-K and `max_bytes`
   (head and tail kept); provenance inline; a refusal names the validator and the fix.
 
@@ -3199,8 +3222,11 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   running an MCP bench kept it). The daemon autostarts from the HKCU Run key (Windows, not Task
   Scheduler), a LaunchAgent (macOS) or a systemd user unit (Linux), and `up` starts it through
   launchd or systemd; `status` checks the registration (§16). `strobe run` pins only its child
-  (`host::spawn_pinned`: created suspended on Windows, `sched_setaffinity` before exec on Linux;
-  macOS has no affinity); other affinity call sites still move strobe for a spawn. The CLI refuses
+  (`host::spawn_pinned`: created suspended on Windows with the caller's creation flags kept,
+  `sched_setaffinity` before exec on Linux over every configured CPU, not strobe's own set; macOS has
+  no affinity). The runner, Chromium, command, script and isolated launches still move strobe's
+  process for a spawn (outside the daemon only: inside it a bench pins its own thread); they move to
+  `spawn_pinned` with the process ownership work. The CLI refuses
   flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
   their types from that table (§17).
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.

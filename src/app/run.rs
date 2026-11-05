@@ -35,7 +35,7 @@ pub fn run(args: &Args) -> Result<Output> {
     awake.hold(true);
     progress(format!("strobe run · {pin_label} · power plan {}{}", power.used, if reserve.is_some() { " · others kept off those CPUs" } else { "" }));
     let started = Instant::now();
-    let spawned = host::spawn_pinned(Command::new(program).args(rest), pin);
+    let spawned = host::spawn_pinned(Command::new(program).args(rest), pin, 0);
     let status = spawned.map_err(|e| Error::msg(format!("run {program}: {e}"))).and_then(|mut c| c.wait().map_err(Error::from));
     let ms = started.elapsed().as_secs_f64() * 1e3;
     let report = reserve.map(host::reserve::Reserve::finish);

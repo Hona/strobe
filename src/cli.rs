@@ -184,6 +184,10 @@ impl Args {
                 // As gh names a repository (`report … --update-pr 12 -R owner/repo`).
                 "-R" => Some("repo".to_string()),
                 a if a.starts_with("--") && a.len() > 2 => Some(a[2..].to_string()),
+                // A short flag strobe does not have (a negative number stays an argument).
+                a if a.len() > 1 && a.starts_with('-') && !a[1..].starts_with(|c: char| c.is_ascii_digit() || c == '.') => {
+                    return Err(Error::usage(format!("unknown flag {a}")).hint("short flags: -h -V -q -v -R; strobe --help lists the rest"));
+                }
                 _ => None,
             };
             let Some(name) = name else {
@@ -191,8 +195,13 @@ impl Args {
                 continue;
             };
             if let Some((key, value)) = name.split_once('=') {
-                kind(key).ok_or_else(|| unknown_flag(key))?;
-                flags.insert(key.to_string(), value.to_string());
+                match (kind(key).ok_or_else(|| unknown_flag(key))?, value) {
+                    // `--check=false` is the switch off, not on.
+                    (Switch, "true") => flags.insert(key.to_string(), "true".to_string()),
+                    (Switch, "false") => flags.remove(key),
+                    (Switch, _) => return Err(Error::usage(format!("--{key} is a switch: --{key}, --{key}=true or --{key}=false, not --{key}={value}"))),
+                    _ => flags.insert(key.to_string(), value.to_string()),
+                };
                 continue;
             }
             if kind(&name).ok_or_else(|| unknown_flag(&name))? == Switch {
@@ -241,7 +250,7 @@ impl Args {
     }
 }
 
-/// Parses `10s`, `500ms`, `2m`, or plain seconds.
+/// Parses `500ms`, `10s`, `2m`, `2h`, `1d`, or plain seconds; a negative or non-finite one is refused.
 pub fn duration_ms(text: &str) -> Result<u64> {
     let t = text.trim();
     let (num, mult) = if let Some(n) = t.strip_suffix("ms") {
@@ -250,10 +259,17 @@ pub fn duration_ms(text: &str) -> Result<u64> {
         (n, 1000.0)
     } else if let Some(n) = t.strip_suffix('m') {
         (n, 60_000.0)
+    } else if let Some(n) = t.strip_suffix('h') {
+        (n, 3_600_000.0)
+    } else if let Some(n) = t.strip_suffix('d') {
+        (n, 86_400_000.0)
     } else {
         (t, 1000.0)
     };
-    num.parse::<f64>().map(|v| (v * mult) as u64).map_err(|_| Error::usage(format!("not a duration: {text}")))
+    match num.trim().parse::<f64>() {
+        Ok(v) if v.is_finite() && v >= 0.0 => Ok((v * mult) as u64),
+        _ => Err(Error::usage(format!("not a duration: {text} (500ms, 10s, 2m, 2h, 1d)"))),
+    }
 }
 
 pub const HELP: &str = "strobe — measure and explain performance
@@ -264,9 +280,9 @@ Use
   status                          environment, validity preflight, recent recordings and experiments
   record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>] [--style]
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
-  record --bench <file.bench.ts>#<case> [--head <variant>]
-                                  record one bench case (it drives the page: clicks, keys) with the attribution probes
                                   (a native app: --gpu-cache warm|cold, its GPU shader caches from earlier recordings of it)
+  record --bench <file.bench.ts>#<case> [--head <variant>] [--target <name>]
+                                  record one bench case (it drives the page: clicks, keys) with the attribution probes
   record pid:<n>|proc:<name> [--probes timing|deep|stacks-unprivileged] [--for 10s]
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)

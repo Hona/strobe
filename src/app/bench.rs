@@ -531,6 +531,9 @@ fn cpu_list(mask: u64) -> String {
 pub fn run(args: &Args) -> Result<Output> {
     // `--stop <exp>`: ask a running bench to stop once its block ends; it keeps its finished pairs.
     if let Some(exp) = args.get("stop") {
+        if args.has("resume") {
+            return Err(Error::usage("--stop or --resume, not both"));
+        }
         return slot::stop(exp);
     }
     // `--resume <exp>`: the same command line, from the pairs and series it had finished.
@@ -545,7 +548,10 @@ pub fn run(args: &Args) -> Result<Output> {
         resumed.set("id", &exp);
         resumed.remove("resume");
         RESUMED.with(|r| *r.borrow_mut() = Some(saved));
-        return run(&resumed);
+        let out = run(&resumed);
+        // Taken when the bench starts; a run that failed before that must not hand it to the next.
+        RESUMED.with(|r| r.borrow_mut().take());
+        return out;
     }
     if args.has("plan") {
         return plan::run(args);
@@ -598,7 +604,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut env = host::env();
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
-    let _own = OwnAffinity(runner_pin.and_then(host::set_affinity));
+    let _own = OwnAffinity::start(runner_pin);
     progress(format!("strobe bench {} · {exp} · {}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(), super::pr::version()));
     let busy = host::system_busy(1000);
     isolate::prune_gpu_caches();
@@ -820,8 +826,9 @@ pub fn run(args: &Args) -> Result<Output> {
     for home in std::mem::take(&mut ctx.homes).into_values() {
         let _ = std::fs::remove_dir_all(home);
     }
-    // The experiment's GPU cache stores go with it; a stopped one keeps them for `--resume`.
-    if halted.as_ref().is_none_or(|h| h.code != 130) && args.get("gpu-store") != Some("exe") {
+    // The experiment's GPU cache stores go with it; a stopped one (Ctrl-C, `--stop`, `--unlock-wait`)
+    // keeps them, so `--resume` launches as warm as the pairs it already has.
+    if halted.as_ref().is_none_or(|h| !matches!(h.code, 130 | 124)) && args.get("gpu-store") != Some("exe") {
         for v in variants.iter() {
             let _ = std::fs::remove_dir_all(gpu_store(&exp, v));
         }
@@ -2949,14 +2956,33 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, set: Set, keep
 
 /// Keeps strobe itself (the driver relay, samplers, CDP) off the measured CPUs for the bench (SPEC rule
 /// 2), on the runner's; the variant servers it spawns inherit that. The previous mask comes back on
-/// drop, since the daemon runs benches in its own process.
+/// drop. In the daemon, which runs other invocations in the same process, only this bench's thread
+/// moves (on Linux the threads and processes it starts inherit that), never the process.
 struct OwnAffinity(Option<u64>);
+
+thread_local! {
+    /// The CPUs this thread's bench keeps it on inside the daemon (`OwnAffinity`), for `Unpinned`.
+    static THREAD_PIN: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+impl OwnAffinity {
+    fn start(mask: Option<u64>) -> OwnAffinity {
+        let Some(m) = mask else { return OwnAffinity(None) };
+        if super::in_daemon() {
+            host::set_thread_affinity(m);
+            THREAD_PIN.with(|p| p.set(Some(m)));
+            return OwnAffinity(None);
+        }
+        OwnAffinity(host::set_affinity(m))
+    }
+}
 
 impl Drop for OwnAffinity {
     fn drop(&mut self) {
         if let Some(mask) = self.0 {
             host::set_affinity(mask);
         }
+        THREAD_PIN.with(|p| p.set(None));
     }
 }
 
@@ -3699,13 +3725,20 @@ fn build_time_key(build: &Value) -> String {
 }
 
 /// While alive, strobe (and what it starts) may use every CPU; dropping it restores strobe's pin and
-/// waits up to 30 s for the CPUs to go quiet (a build's last processes, a scan of what it wrote).
+/// waits up to 30 s for the CPUs to go quiet (a build's last processes, a scan of what it wrote). In
+/// the daemon only this bench's thread widens and comes back, as `OwnAffinity` pinned only it.
 struct Unpinned(Option<u64>);
 
 impl Unpinned {
     fn start() -> Unpinned {
         let n = host::topology().logical.min(64);
         let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        if super::in_daemon() {
+            if THREAD_PIN.with(|p| p.get()).is_some() {
+                host::set_thread_affinity(all);
+            }
+            return Unpinned(None);
+        }
         Unpinned(host::set_affinity(all))
     }
 }
@@ -3714,6 +3747,9 @@ impl Drop for Unpinned {
     fn drop(&mut self) {
         if let Some(mask) = self.0 {
             host::set_affinity(mask);
+        }
+        if let Some(mask) = THREAD_PIN.with(|p| p.get()).filter(|_| super::in_daemon()) {
+            host::set_thread_affinity(mask);
         }
         validity::wait_quiet(None, Duration::from_secs(30));
     }

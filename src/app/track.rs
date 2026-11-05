@@ -180,7 +180,7 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
     let depth: u64 = git(root, &["rev-list", "--count", commit]).ok().and_then(|s| s.trim().parse().ok()).unwrap_or(0);
     progress(format!("\n{} {subject} · {exp}", short(commit)));
     let a = point_args(args, file, commit, blocks, &exp)?;
-    let result = super::bench::run(&a).and_then(super::unless_stopped);
+    let result = super::bench::run(&a).and_then(super::unless_halted);
     let out = match result {
         Ok(o) => o,
         Err(e) => {
@@ -407,7 +407,7 @@ fn confirm(args: &Args, s: &history::Series, c: &Value) -> Result<(String, Value
     let mut a = series_args(args, s, &exp)?;
     a.set("base", &format!("git:{good}"));
     a.set("head", &format!("git:{bad}"));
-    let res = super::bench::run(&a).and_then(super::unless_stopped);
+    let res = super::bench::run(&a).and_then(super::unless_halted);
     let out = match res {
         Ok(o) => o,
         Err(e) => {
@@ -598,12 +598,6 @@ fn schedule(args: &Args, file: &Path, root: &Path, when: &str) -> Result<Output>
 }
 
 fn period_ms(d: &str) -> Result<u64> {
-    if let Some(h) = d.strip_suffix('h') {
-        return h.parse::<f64>().map(|h| (h * 3_600_000.0) as u64).map_err(|_| Error::usage(format!("--schedule: not a period: {d}")));
-    }
-    if let Some(days) = d.strip_suffix('d') {
-        return days.parse::<f64>().map(|x| (x * 86_400_000.0) as u64).map_err(|_| Error::usage(format!("--schedule: not a period: {d}")));
-    }
     crate::cli::duration_ms(d).map_err(|_| Error::usage(format!("--schedule commits, nightly or a period (6h, 1d), not {d}")))
 }
 

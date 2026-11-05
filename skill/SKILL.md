@@ -177,8 +177,32 @@ label them as noisy discovery evidence, or leave them out.
 - Timing and attribution are separate blocks; never read timing from a `mixed` recording.
 - `unclear` or `underpowered` means more pairs or a quieter machine, not "no change".
 - Heap snapshots and traces can hold user content; views redact strings unless `--reveal`.
-- Long benches keep running in the daemon: `query exp_… progress`. Ctrl-C, SIGTERM or `strobe bench --stop <exp>` (a unique prefix works; it says what the bench was doing) stops one after its block, or at once while it waits for an unlock or the slot, and writes what finished (exit 130; the PR table says incomplete); `strobe bench --resume <exp>` goes on from the last finished pair. `--unlock-wait 2h` caps how long a series that needs a presenting window waits for an unlock (then exit 124, resumable). Launches that fail under load (no debugging port, no DevTools reply) run again up to 3 times. A share primary stuck at its ceiling on both sides stops as `saturated`: choose another primary.
+- Long benches keep running in the daemon: `query exp_… progress`. Ctrl-C, SIGTERM or `strobe bench --stop
+  <exp>` (a unique prefix works; it says what the bench was doing) stops one after its block, or at once while
+  it waits for an unlock or the slot, and writes what finished (exit 130; the PR table says incomplete);
+  `strobe bench --resume <exp>` goes on from the last finished pair. `--unlock-wait 2h` caps how long a series
+  that needs a presenting window waits for an unlock (then exit 124, resumable). Launches that fail under load
+  (no debugging port, no DevTools reply) run again up to 3 times. A share primary stuck at its ceiling on both
+  sides stops as `saturated`: choose another primary.
 - If `strobe` isn't on PATH, use the CLI path from the MCP instructions.
 - Progress goes to stderr. Windows PowerShell 5.1 with `2>&1` or `*>` makes every stderr line an error and the shell exit 1 even when strobe exited 0: read `$LASTEXITCODE`, or pass `--progress stdout` (`STROBE_PROGRESS=stdout`).
 - Recordings and `--check` say what the screen was doing (`screen  display off · session locked · dwm.exe 0.4% of a core`) and which commit a folder variant was at; `UnpacedSpin` warns when a native app presents far faster than the display refreshes (pacing broken, such as composited while locked): its CPU then describes a spin.
-- Linux and macOS: frames on screen come from X Present (X11 on a real display, no compositing manager; Xvfb, compositors and Wayland are refused) and ScreenCaptureKit (needs Screen Recording); both give screen times only, so `frames.interval.*` and `frames.dropped*` are refused there while counts and `interaction.*` stand. Driving a native app needs, on macOS, the Accessibility permission for the app strobe runs under (`strobe status` names it: Terminal, the agent's app, or `~/.local/bin/mesh` remotely), and on Linux the session's accessibility bus (at-spi2-core) and an X11 display. Sandboxed Mac apps (TextEdit) are refused: their data lives in your `~/Library`. macOS counts wakes per process, IO as disk bytes, no VRAM per process, and samples stacks with `/usr/bin/sample` (untimed). Linux native stacks need `perf_event_paranoid` ≤ 2 or CAP_PERFMON; `status` says which. A macOS Cocoa app launches isolated only while its `~/Library` data does not exist (`LiveChannel` names the folder); a source build run as a bare executable with its data folder moved by an env var lists that folder in the profile's `moved`. macOS 27 names the Accessibility pane "Device Control and Data Access"; strobe's messages name the right pane with its URL. Never bench under `taskpolicy -b` (or nice 19, `SCHED_IDLE`, Windows' idle priority or efficiency mode): the target inherits background priority, so `BackgroundPriority` refuses frame and input-latency metrics (a frame primary refuses the bench up front); CPU metrics stay with a warning. On macOS, a strobe started by a launchd job whose plist sets no `ProcessType` (a remote shell's or agent's daemon) runs with coalesced timers, and so does the app it launches: `TimerCoalescing` warns and `status` shows a `timers` line; compare such runs only with runs started the same way, or run from a terminal. strobe's own daemon starts from a LaunchAgent with `ProcessType Interactive` (`strobe up`; Linux: a systemd user unit), so MCP benches do not have this.
+- Linux and macOS: frames on screen come from X Present (X11 on a real display, no compositing manager; Xvfb,
+  compositors and Wayland are refused) and ScreenCaptureKit (needs Screen Recording); both give screen times
+  only, so `frames.interval.*` and `frames.dropped*` are refused there while counts and `interaction.*` stand.
+  Driving a native app needs, on macOS, the Accessibility permission for the app strobe runs under (`strobe
+  status` names it: Terminal, the agent's app, or `~/.local/bin/mesh` remotely), and on Linux the session's
+  accessibility bus (at-spi2-core) and an X11 display. Sandboxed Mac apps (TextEdit) are refused: their data
+  lives in your `~/Library`. macOS counts wakes per process, IO as disk bytes, no VRAM per process, and
+  samples stacks with `/usr/bin/sample` (untimed). Linux native stacks need `perf_event_paranoid` ≤ 2 or
+  CAP_PERFMON; `status` says which. A macOS Cocoa app launches isolated only while its `~/Library` data does
+  not exist (`LiveChannel` names the folder); a source build run as a bare executable with its data folder
+  moved by an env var lists that folder in the profile's `moved`. macOS 27 names the Accessibility pane
+  "Device Control and Data Access"; strobe's messages name the right pane with its URL. Never bench under
+  `taskpolicy -b` (or nice 19, `SCHED_IDLE`, Windows' idle priority or efficiency mode): the target inherits
+  background priority, so `BackgroundPriority` refuses frame and input-latency metrics (a frame primary
+  refuses the bench up front); CPU metrics stay with a warning. On macOS, a strobe started by a launchd job
+  whose plist sets no `ProcessType` (a remote shell's or agent's daemon) runs with coalesced timers, and so
+  does the app it launches: `TimerCoalescing` warns and `status` shows a `timers` line; compare such runs only
+  with runs started the same way, or run from a terminal. strobe's own daemon starts from a LaunchAgent with
+  `ProcessType Interactive` (`strobe up`; Linux: a systemd user unit), so MCP benches do not have this.

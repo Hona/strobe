@@ -56,7 +56,9 @@ pub fn experiment(handle: &str) -> Result<(PathBuf, String)> {
 /// stops at once, which this waits a few seconds to see; one running a block stops once it ends.
 pub fn stop(handle: &str) -> Result<Output> {
     let (dir, exp) = experiment(handle)?;
-    let mine = |b: &Value| b["exp"].as_str().is_some_and(|e| e == exp || e.strip_prefix(exp.as_str()).is_some_and(|r| r.starts_with("_s")));
+    // The bench itself, or a step of a bisect (`<exp>_s<k>`).
+    let step = |r: &str| r.strip_prefix("_s").is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()));
+    let mine = |b: &Value| b["exp"].as_str().is_some_and(|e| e == exp || e.strip_prefix(exp.as_str()).is_some_and(step));
     let Some(b) = list().into_iter().find(mine) else {
         let result = store::read_json(&dir.join("result.json")).ok();
         let why = if let Some(stopped) = result.as_ref().map(|r| &r["stopped"]).filter(|s| s.is_object()) {
@@ -125,9 +127,22 @@ impl Registration {
         r
     }
 
+    /// Replaces the registration whole (a temporary file renamed over it): a reader never sees it
+    /// half written, so `daemon_benching` and the queue never miss a running bench.
     fn write(&self) {
         let e = self.0.entry.lock().unwrap().clone();
-        let _ = std::fs::write(&self.0.path, e.to_string());
+        let tmp = self.0.path.with_extension("json.tmp");
+        if std::fs::write(&tmp, e.to_string()).is_err() {
+            return;
+        }
+        // Windows refuses the rename while a reader has the file open: try again shortly.
+        for _ in 0..20 {
+            if std::fs::rename(&tmp, &self.0.path).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let _ = std::fs::remove_file(&tmp);
     }
 
     /// What the bench does now: `building`, `waiting` (with why), `queued`, `running`.
@@ -260,7 +275,7 @@ pub fn others_queued(exp: &str) -> bool {
 /// Every live bench on this device, oldest first: pid, exp, file, state, why, since.
 pub fn list() -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
-    for e in std::fs::read_dir(dir()).into_iter().flatten().flatten() {
+    for e in std::fs::read_dir(dir()).into_iter().flatten().flatten().filter(|e| e.path().extension().is_some_and(|x| x == "json")) {
         let Some(v) = std::fs::read_to_string(e.path()).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { continue };
         let pid = v["pid"].as_u64().unwrap_or(0) as u32;
         if pid == 0 || !alive(pid) {

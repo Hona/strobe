@@ -4,13 +4,16 @@ use super::Output;
 use crate::cli::Args;
 use crate::engine;
 use crate::host;
-use crate::model::Result;
+use crate::model::{Error, Result};
 use crate::runner;
 use crate::store;
 use crate::target::chromium;
 use serde_json::{Value, json};
 
 pub fn run(args: &Args) -> Result<Output> {
+    if let Some(p) = args.pos.first() {
+        return Err(Error::usage(format!("status takes no target ({p}): it checks this device; strobe look {p} checks that a target loads")));
+    }
     let env = host::env();
     let topo = host::topology();
     let busy = host::system_busy(if args.has("fast") { 300 } else { 3000 });

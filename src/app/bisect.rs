@@ -110,7 +110,7 @@ fn step(args: &Args, id: &str, root: &Path, k: usize, base: &str, head: &str) ->
         a.set("why", "never");
     }
     progress(format!("\nstep {k}  {} against {}", short(head), short(base)));
-    let out = super::bench::run(&a).and_then(super::unless_stopped)?;
+    let out = super::bench::run(&a).and_then(super::unless_halted)?;
     step_json(&out, root, k, base, head)
 }
 

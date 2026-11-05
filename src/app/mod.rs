@@ -162,6 +162,10 @@ pub fn experiment_scope(dir: &Path) -> Scope {
 
 static DAEMON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// No progress on stderr or stdout: the MCP servers (stdio carries JSON-RPC; the daemon has no
+/// console). An invocation's progress log still gets every line.
+static QUIET: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether this process is the daemon (`strobe daemon`), which runs MCP calls' benches.
 pub fn in_daemon() -> bool {
     DAEMON.load(std::sync::atomic::Ordering::Relaxed)
@@ -179,10 +183,19 @@ pub fn stop_error() -> Error {
     Error::new(130, "stopped (Ctrl-C, SIGTERM or strobe bench --stop)").hint("strobe bench --resume <exp> runs what is left")
 }
 
-/// A bench that a stop ended (exit 130, what it finished written) as the stop error, for callers that
-/// run several (track, bisect): a stop ends them too.
-pub fn unless_stopped(out: Output) -> Result<Output> {
-    if out.code == 130 { Err(stop_error()) } else { Ok(out) }
+/// A bench that ended before it finished, with what it finished written (a stop: exit 130; its
+/// `--unlock-wait` ran out: exit 124), as that error, for callers that run several (track, bisect):
+/// they must not read its partial result as an answer, and a stop ends them too.
+pub fn unless_halted(out: Output) -> Result<Output> {
+    match out.code {
+        130 => Err(stop_error()),
+        124 => Err(Error {
+            code: 124,
+            message: out.json["stopped"]["why"].as_str().unwrap_or("the bench ended before it finished").to_string(),
+            hint: out.json["id"].as_str().map(|id| format!("strobe bench --resume {id} goes on")),
+        }),
+        _ => Ok(out),
+    }
 }
 
 /// Where progress lines go (`--progress`, else `STROBE_PROGRESS`): `stderr` (default), `stdout` or `off`.
@@ -208,7 +221,7 @@ fn progress_mode(args: &Args) -> Result<()> {
 pub fn progress(msg: impl AsRef<str>) {
     match *PROGRESS.get().unwrap_or(&"stderr") {
         "off" => {}
-        _ if std::env::var_os("STROBE_QUIET").is_some() => {}
+        _ if QUIET.load(std::sync::atomic::Ordering::Relaxed) => {}
         "stdout" => println!("{}", msg.as_ref()),
         _ => eprintln!("{}", msg.as_ref()),
     }

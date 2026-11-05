@@ -204,6 +204,12 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
         let port = endpoint;
         let body = http_get(&format!("127.0.0.1:{port}"), "/json/version")?;
         let v: Value = serde_json::from_str(&body)?;
+        if v["Browser"].as_str().is_some_and(|b| b.starts_with("node.js")) {
+            return Err(Error::usage(format!(
+                "127.0.0.1:{port} is a Node inspector, not a browser: cdp:<port> records pages over Chromium's DevTools protocol. \
+                 Measure a Node workload with a bench script() target, or its process from outside with pid:<pid>"
+            )));
+        }
         v.get("webSocketDebuggerUrl").and_then(Value::as_str).ok_or_else(|| Error::unreachable("no webSocketDebuggerUrl"))?.to_string()
     };
     let cdp = Cdp::connect(&url)?;
@@ -211,14 +217,72 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
     Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, exe: PathBuf::new(), version, window: Window::default() })
 }
 
+/// One GET on a debugging port. Chrome and Node keep the connection open after the reply, even with
+/// `Connection: close`, so the body is read by its `Content-Length` (or chunks), not to the end of the stream.
 pub fn http_get(host: &str, path: &str) -> Result<String> {
-    use std::io::{Read, Write};
+    use std::io::Write;
     let mut s = std::net::TcpStream::connect(host).map_err(|e| Error::unreachable(format!("{host}: {e}")))?;
     s.set_read_timeout(Some(Duration::from_secs(5))).ok();
     write!(s, "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n")?;
-    let mut buf = String::new();
-    s.read_to_string(&mut buf)?;
-    Ok(buf.split_once("\r\n\r\n").map(|x| x.1.to_string()).unwrap_or_default())
+    read_reply(&mut s).map_err(|e| Error::unreachable(format!("{host}{path}: {e}")))
+}
+
+fn read_reply(s: &mut impl std::io::Read) -> std::io::Result<String> {
+    let bad = |m: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, m.to_string());
+    fn fill(s: &mut impl std::io::Read, buf: &mut Vec<u8>) -> std::io::Result<bool> {
+        let mut chunk = [0u8; 8192];
+        let n = s.read(&mut chunk)?;
+        buf.extend_from_slice(&chunk[..n]);
+        Ok(n > 0)
+    }
+    let mut buf = Vec::new();
+    let head_end = loop {
+        if let Some(i) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+            break i + 4;
+        }
+        if !fill(s, &mut buf)? {
+            return Err(bad("connection closed before the reply's headers"));
+        }
+    };
+    let head = String::from_utf8_lossy(&buf[..head_end]).to_ascii_lowercase();
+    let header = |name: &str| head.lines().find_map(|l| l.strip_prefix(name).map(|v| v.trim().to_string()));
+    let mut body = buf.split_off(head_end);
+    if let Some(len) = header("content-length:").and_then(|v| v.parse::<usize>().ok()) {
+        while body.len() < len {
+            if !fill(s, &mut body)? {
+                return Err(bad("connection closed before the reply's body"));
+            }
+        }
+        body.truncate(len);
+    } else if header("transfer-encoding:").is_some_and(|v| v.contains("chunked")) {
+        let mut out = Vec::new();
+        let mut at = 0;
+        loop {
+            let Some(eol) = body[at..].windows(2).position(|w| w == b"\r\n") else {
+                if !fill(s, &mut body)? {
+                    return Err(bad("connection closed inside a chunk"));
+                }
+                continue;
+            };
+            let size_text = String::from_utf8_lossy(&body[at..at + eol]).to_string();
+            let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16).map_err(|_| bad("bad chunk size"))?;
+            if size == 0 {
+                break;
+            }
+            let start = at + eol + 2;
+            while body.len() < start + size + 2 {
+                if !fill(s, &mut body)? {
+                    return Err(bad("connection closed inside a chunk"));
+                }
+            }
+            out.extend_from_slice(&body[start..start + size]);
+            at = start + size + 2;
+        }
+        body = out;
+    } else {
+        while fill(s, &mut body)? {}
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 impl Browser {
@@ -360,5 +424,43 @@ impl Page {
         }
         wait_event(&rx, "Page.loadEventFired", Some(&self.session), timeout)?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_reply;
+
+    /// A connection that stays open after its bytes, as Chrome's and Node's debugging ports do.
+    struct Open(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for Open {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.0.read(buf)? {
+                0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                n => Ok(n),
+            }
+        }
+    }
+
+    fn open(s: &str) -> Open {
+        Open(std::io::Cursor::new(s.as_bytes().to_vec()))
+    }
+
+    #[test]
+    fn reads_by_content_length_on_an_open_connection() {
+        let r = read_reply(&mut open("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 7\r\n\r\n{\"a\":1}")).unwrap();
+        assert_eq!(r, "{\"a\":1}");
+    }
+
+    #[test]
+    fn reads_chunks_on_an_open_connection() {
+        let r = read_reply(&mut open("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\n{\"a\"\r\n3;x=y\r\n:1}\r\n0\r\n\r\n")).unwrap();
+        assert_eq!(r, "{\"a\":1}");
+    }
+
+    #[test]
+    fn reads_to_the_end_without_a_length() {
+        let r = read_reply(&mut std::io::Cursor::new(b"HTTP/1.0 200 OK\r\n\r\nbody".to_vec())).unwrap();
+        assert_eq!(r, "body");
     }
 }

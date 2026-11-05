@@ -66,6 +66,13 @@ fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
 
 /// [`launch`], also returning the spawn time and, with `extra.output`, the app's output.
 pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option<u64>, extra: &Extra) -> Result<(Browser, Guard, Started)> {
+    if isolate::interpreter(&app.exe) {
+        return Err(Error::usage(format!(
+            "{} is a script runtime, not a Chromium or Electron app: an exe: or app: target launches with a debugging port (--remote-debugging-port) it does not take",
+            app.exe.display()
+        ))
+        .hint("measure a script with a bench script() target, or a running process from outside with strobe record pid:<pid>"));
+    }
     let guard = Guard::take(app);
     isolate::live(app, &guard)?;
     let prepared = match &extra.prepared {
@@ -79,7 +86,7 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     }
     args.push("--remote-debugging-port=0".into());
     let spawned = isolate::spawn(app, &prepared, &args, &[], extra.output, cpus)?;
-    let (child, pid, epoch, output) = (spawned.child, spawned.pid, spawned.epoch_ms, spawned.output);
+    let (mut child, pid, epoch, output) = (spawned.child, spawned.pid, spawned.epoch_ms, spawned.output);
     let mut launching = Launching { pid, home: Some(home.clone()) };
     let main = match extra.profile_main {
         Some(port) => Some(profile_from_start(port)?),
@@ -91,6 +98,14 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         guard.check("while the app started")?;
         if let Some(t) = isolate::find(&home, "DevToolsActivePort", 6).into_iter().find_map(|p| std::fs::read_to_string(p).ok().filter(|t| t.lines().count() >= 2)) {
             break t;
+        }
+        // A program that is not Chromium-based rejects the flag and fails: say so now, not in 60 s. A launcher
+        // stub that starts the real app and exits succeeds, so a clean exit keeps waiting for the port.
+        if let Ok(Some(status)) = child.try_wait()
+            && !status.success()
+        {
+            return Err(Error::unreachable(format!("{} exited ({status}) before it opened a debugging port", app.exe.display()))
+                .hint("exe: and app: targets are Chromium or Electron apps; for any other program use exe:<path> --native, or record a running process with pid:<pid>"));
         }
         if Instant::now() > deadline {
             return Err(Error::unreachable(format!("{} did not open a debugging port in 60 s", app.exe.display())));

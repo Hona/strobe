@@ -2963,8 +2963,12 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 ### 24.2 Where the code differs from the design
 
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.
-  `pid:`/`proc:` record only (`--probes timing|deep`). Variants also take `url:<href>` (an already
-  running origin).
+  `cdp:<port>` reads `/json/version` by its `Content-Length` (or chunks): Chrome and Node keep the
+  connection open after the reply. A Node inspector on that port is refused with a pointer to
+  `script()` and `pid:`. An `exe:` or `app:` target whose executable is a script runtime (`node`,
+  `bun`, `python3`, …) is refused before launch, and one that exits with a failure before it opens a
+  debugging port fails then, not after 60 s. `pid:`/`proc:` record only (`--probes timing|deep`).
+  Variants also take `url:<href>` (an already running origin).
 - Native targets: `cpu.work` with `cpu.app.total` tested by default, as for scripts; `cpu.wakes`,
   `io.*` and `ui.*` descriptive unless declared. Warmup compares the tree's CPU. The native `Throttled` baseline is the fastest native speed check this device ran, not
   the calibration. Declared metrics a native target cannot give are listed refused with their reason,

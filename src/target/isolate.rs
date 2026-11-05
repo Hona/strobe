@@ -811,6 +811,14 @@ pub fn find(dir: &Path, name: &str, depth: usize) -> Vec<PathBuf> {
         .collect()
 }
 
+/// A script runtime (`node`, `bun`, `python3.12`, …) rather than an app of its own.
+pub fn interpreter(exe: &Path) -> bool {
+    let stem = exe.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
+    ["python", "pythonw", "py", "node", "bun", "deno", "ruby", "perl", "sh", "bash", "java", "javaw", "pwsh", "powershell"]
+        .iter()
+        .any(|i| stem == *i || stem.strip_prefix(i).is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.')))
+}
+
 /// Refuses to launch an app the user is using: its executable is running, or a guarded process
 /// (such as the app's own background service) runs from its install folder or a folder named like
 /// it. Isolation should make it safe, but the user's own app is never the thing to experiment on.
@@ -818,11 +826,7 @@ pub fn live(app: &App, guard: &Guard) -> Result<()> {
     guard.unreadable()?;
     if !host::running(&app.exe).is_empty() {
         // An interpreter runs every script of its kind: a running one says nothing about the app.
-        let stem = app.exe.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
-        let interpreter = ["python", "pythonw", "py", "node", "bun", "deno", "ruby", "perl", "sh", "bash", "java", "javaw", "pwsh", "powershell"]
-            .iter()
-            .any(|i| stem == *i || stem.strip_prefix(i).is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.')));
-        if interpreter {
+        if interpreter(&app.exe) {
             return Err(Error::refused(
                 "LiveChannel",
                 format!("{} is running, and it is an interpreter: strobe cannot tell your app's copy from any other script it runs", app.exe.display()),

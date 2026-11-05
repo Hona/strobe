@@ -305,7 +305,9 @@ Use
                                   run an experiment; a verdict per series
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql
-                                  (a..b: heap memory; exp_…: summary progress insights; memory: --by process|layer|allocator --at <i>;
+                                  (a..b: hotspots alloc layout style threads frames summary heap memory, per-run deltas;
+                                  exp_…: summary progress insights, and those views as each series' base..head;
+                                  memory: --by process|layer|allocator --at <i>;
                                   threads --timeline: each thread's CPU per second from the launch, exited ones too)
   report experiment|recording <handle> [--format html|md|pr] [--out <path>] [--open]
                                   write a self-contained HTML (or markdown) report; pr: an experiment's tables for a PR body

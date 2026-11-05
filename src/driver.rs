@@ -235,7 +235,8 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
       if (!visible(el) || el.disabled || el.readOnly || el.getAttribute("aria-readonly") === "true" || el.closest("[inert], [aria-disabled=true]")) continue
       const label = el.getAttribute("aria-label")
       const key = el.id ? '#' + el.id : el.name ? el.localName + "[name=" + el.name + "]" : label ? (role || "editable") + " " + JSON.stringify(label) : role || "editable"
-      if (toggles.includes(role)) put(key, el.localName === "input" ? (el.checked ? "checked" : "unchecked") : (el.getAttribute("aria-checked") ?? "false"))
+      const aria = el.getAttribute("aria-checked") ?? "false"
+      if (toggles.includes(role)) put(key, el.localName === "input" ? (el.checked ? "checked" : "unchecked") : ({ true: "checked", false: "unchecked" })[aria] ?? aria)
       else if (el.type === "password") put(key, el.value.length + " characters")
       else if (typeof el.value === "string" && /^(input|textarea|select)$/.test(el.localName)) put(key, cut(el.value))
       else if (role === "slider" || role === "spinbutton") put(key, cut(el.getAttribute("aria-valuetext") ?? el.getAttribute("aria-valuenow")))

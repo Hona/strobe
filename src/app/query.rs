@@ -212,11 +212,12 @@ impl Rec {
         if profiles.is_empty() {
             return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
         }
-        let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Stacks::default();
         for p in profiles {
             let bytes = std::fs::read(&p)?;
             let prof: CpuProfile = parse(&bytes)?;
+            // Parsing runs beside other loads; symbolizing shares the recording's source maps.
+            let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
             let index: HashMap<u64, usize> = prof.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
             let mut parent = vec![usize::MAX; prof.nodes.len()];
             for (i, n) in prof.nodes.iter().enumerate() {
@@ -248,11 +249,11 @@ impl Rec {
         if profiles.is_empty() {
             return Err(Error::usage("this recording has no allocation profile; record with --probes attribution"));
         }
-        let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Stacks::default();
         for p in profiles {
             let bytes = std::fs::read(&p)?;
             let prof: AllocProfile = parse(&bytes)?;
+            let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
             let mut hits: HashMap<u64, u64> = HashMap::new();
             for s in &prof.samples {
                 *hits.entry(s.node_id).or_default() += 1;

@@ -31,6 +31,11 @@ fn run_with(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize, plan_runs: Op
                 "layout" => Kind::Layout,
                 _ => Kind::hotspots(a, b, args.has("native")),
             };
+            // Both sides' sources load at once.
+            std::thread::scope(|s| {
+                s.spawn(|| side(a, kind, plan_runs).is_ok());
+                let _ = side(b, kind, plan_runs);
+            });
             weighted(a, b, kind, by, plan_runs).map(|d| d.output(a, b, top))
         }
         "style" => style(a, b, top),

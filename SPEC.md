@@ -1935,10 +1935,11 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
   (`host::spawn_owned`, stamped with its own home: in neither side's process set), on strobe's own
   CPUs, waits for `ready` (a URL that answers, else the port accepting, `timeout` default 60 s), and
   ends it with the block; its output goes to the experiment's `fixture.log`. `{fixture.url}`
-  (`http://127.0.0.1:<port>`), `{fixture.port}` and `{fixture.pid}` are filled into the target's
+  (`http://127.0.0.1:<port>`), `{fixture.port}`, `{fixture.pid}` and `{fixture.home}` (its own
+  folder, where a service it starts may register itself) are filled into the target's
   `args`, `env`, `files` and `url` (a string that is exactly `{fixture.port}` or `{fixture.pid}`
   becomes a number), and
-  hooks get `ctx.fixture { url, port, pid }`. A fixture works in any bench, of builds too.
+  hooks get `ctx.fixture { url, port, pid, home }`. A fixture works in any bench, of builds too.
   - It runs on the CPUs the target is not pinned to, given to it at its spawn (not inherited: in the
     daemon only the bench's thread moves there).
   - `cpu.fixture` is the fixture's process tree's CPU per run (cycles where the OS has them), read at

@@ -3083,7 +3083,7 @@ fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     let unfilled = ctx.describe["targets"][&s.target].clone();
     ctx.describe["targets"][&s.target] = running.fill(&unfilled);
     ctx.fixture_running = Some(running.clone());
-    let info = json!({ "url": running.url(), "port": running.port, "pid": running.pid });
+    let info = json!({ "url": running.url(), "port": running.port, "pid": running.pid, "home": running.home() });
     let r = ctx.runner.call("fixture", info, Duration::from_secs(10), launch::no_page).and_then(|_| kind_block(ctx, s, v, pair, x));
     ctx.describe["targets"][&s.target] = unfilled;
     ctx.fixture_running = None;

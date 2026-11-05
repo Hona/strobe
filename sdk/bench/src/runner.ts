@@ -72,7 +72,7 @@ const state: {
   prepared: unknown
   mocks: { pattern: string; test: RegExp; handler: Function }[]
   session: any
-  fixture: { url: string; port: number; pid: number } | null
+  fixture: { url: string; port: number; pid: number; home: string } | null
 } = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null }
 
 const context = () => ({
@@ -245,7 +245,7 @@ async function handle(op: string, args: any) {
       return describe()
     // The block's fixture, before its `block`: hooks reach it as `ctx.fixture`.
     case "fixture":
-      state.fixture = { url: args.url, port: args.port, pid: args.pid }
+      state.fixture = { url: args.url, port: args.port, pid: args.pid, home: args.home }
       return true
     case "block":
       Object.assign(state, {

@@ -185,12 +185,17 @@ pub(super) struct Running {
 }
 
 impl Running {
+    pub(super) fn home(&self) -> &Path {
+        &self.home
+    }
+
     pub(super) fn url(&self) -> String {
         format!("http://127.0.0.1:{}", self.port)
     }
 
-    /// `{fixture.url}`, `{fixture.port}` and `{fixture.pid}` filled into every string of a target's
-    /// options (its args, env, files, url).
+    /// `{fixture.url}`, `{fixture.port}`, `{fixture.pid}` and `{fixture.home}` (its own folder, where
+    /// a service it starts may register itself) filled into every string of a target's options (its
+    /// args, env, files, url).
     pub(super) fn fill(&self, v: &Value) -> Value {
         match v {
             Value::String(s) if s.contains("{fixture.") => {
@@ -200,7 +205,12 @@ impl Running {
                     "{fixture.pid}" => return json!(self.pid),
                     _ => {}
                 }
-                json!(s.replace("{fixture.url}", &self.url()).replace("{fixture.port}", &self.port.to_string()).replace("{fixture.pid}", &self.pid.to_string()))
+                json!(
+                    s.replace("{fixture.url}", &self.url())
+                        .replace("{fixture.port}", &self.port.to_string())
+                        .replace("{fixture.pid}", &self.pid.to_string())
+                        .replace("{fixture.home}", &self.home.display().to_string())
+                )
             }
             Value::Array(a) => Value::Array(a.iter().map(|x| self.fill(x)).collect()),
             Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), self.fill(x))).collect()),

@@ -139,6 +139,8 @@ export interface FixtureInfo {
   url: string
   port: number
   pid: number
+  /** Its own folder (`{home}` in its command): where a service it starts registers itself. */
+  home: string
 }
 
 /** A request a `mock` handler answers. */

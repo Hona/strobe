@@ -47,11 +47,19 @@ pub fn path_at(path: &[(f64, f64)], t: f64) -> (f64, f64) {
     }
 }
 
-/// `page.drag`'s path from the runner: `[[dx, dy], …]` (a function's samples, or keyframes).
+/// `page.drag`'s path from the runner: `[[dx, dy], …]` (a function's samples, or keyframes), starting
+/// where the drag presses: offset (0, 0), put first when the path does not start there. Keyframes
+/// such as `[[300, 0], [300, 300], [0, 0]]` name where to go, so without it the press landed 300 px
+/// off the element and the drag moved nothing.
 pub fn parse_path(v: &serde_json::Value) -> Result<Vec<(f64, f64)>> {
     let pts: Option<Vec<(f64, f64)>> = v.as_array().map(|a| a.iter().map(|p| Some((p.get(0)?.as_f64()?, p.get(1)?.as_f64()?))).collect()).unwrap_or(None);
     match pts {
-        Some(p) if !p.is_empty() => Ok(p),
+        Some(mut p) if !p.is_empty() => {
+            if p[0] != (0.0, 0.0) {
+                p.insert(0, (0.0, 0.0));
+            }
+            Ok(p)
+        }
         _ => Err(Error::usage("page.drag(selector, path): path is [[dx, dy], …] (offsets in CSS or device-independent pixels from where the drag starts) or a function t => [dx, dy]")),
     }
 }
@@ -225,4 +233,19 @@ pub fn key_named(name: &str) -> Option<Key> {
 /// native app scrolls per notch is its own.
 pub fn notches(px: f64) -> f64 {
     px / 100.0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_drag_presses_where_it_starts() {
+        let keyframes = parse_path(&serde_json::json!([[300, 0], [300, 300], [0, 0]])).unwrap();
+        assert_eq!(path_at(&keyframes, 0.0), (0.0, 0.0));
+        assert_eq!(path_at(&keyframes, 1.0), (0.0, 0.0));
+        assert_eq!(path_at(&keyframes, 1.0 / 3.0), (300.0, 0.0));
+        let sampled = parse_path(&serde_json::json!([[0, 0], [10, 0]])).unwrap();
+        assert_eq!(sampled.len(), 2);
+    }
 }

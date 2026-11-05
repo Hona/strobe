@@ -147,9 +147,12 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         values.insert("gpu.shared".into(), v);
     }
     // Presents far faster than the display refreshes, locked or not (`UnpacedSpin`).
+    // The display the process shows on: its main window's, else any window's (an app that shows only
+    // an overlay, such as a dictation HUD, has no main window).
+    let display_of = |pids: &[u32]| host::main_window(pids).map(|w| w.hwnd).or_else(|| host::top_windows(pids).first().map(|w| w.0)).and_then(host::display_of);
     let unpaced = presents.as_ref().ok().and_then(|p| {
         let pids = host::tree_pids(root);
-        let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
+        let display = display_of(&pids);
         let hz = frames::refresh_ms(&p.vsyncs, t0, t1, display.as_ref()).map(|ms| 1000.0 / ms).or(display.map(|d| d.hz));
         frames::spin(&p.presents, &pids, &[(t0, t1)], hz)
     });
@@ -158,7 +161,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         _ if session_locked => Some("SessionLocked: the session was locked while strobe recorded, so nothing reached the display".to_string()),
         Ok(p) => {
             let pids = host::tree_pids(root);
-            let display = host::main_window(&pids).and_then(|w| host::display_of(w.hwnd));
+            let display = display_of(&pids);
             let f = frames::native_values(p, &pids, &[(t0, t1)], display.as_ref());
             match f.refused {
                 Some(why) if display.is_none() && why.contains("several displays") => {

@@ -33,6 +33,10 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(why) = &qos {
         problems.push(format!("strobe runs at {why}: what it launches inherits it, and frame and input-latency metrics are refused (BackgroundPriority)"));
     }
+    let timers = host::timer_coalescing();
+    if let Some(why) = &timers {
+        problems.push(format!("strobe has {why} (TimerCoalescing)"));
+    }
     let locked = host::session_locked();
     if locked {
         problems.push("the session is locked (benches wait for an unlock)".into());
@@ -79,7 +83,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "browser": browser, "bun": bun, "engine": { "installed": engine::installed(), "version": engine::VERSION, "path": engine::path() },
         "calibration": calibration, "recordings": recordings.iter().map(|r| &r.0).collect::<Vec<_>>(),
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
-        "session_locked": locked, "background_priority": qos, "valid": problems.is_empty(), "problems": problems,
+        "session_locked": locked, "background_priority": qos, "timer_coalescing": timers, "valid": problems.is_empty(), "problems": problems,
         "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill, "benches": benches,
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
         "native": { "ready": native_ok, "detail": native_text },
@@ -91,6 +95,9 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} power      {}{}\n", mark(!env.on_battery), env.power_plan, if env.on_battery { " · on battery" } else { "" });
     t += &format!("  {} load       {:.0}% of all CPUs busy\n", mark(busy <= 0.10), busy * 100.0);
     t += &format!("  {} priority   {}\n", mark(qos.is_none()), qos.as_ref().map(|w| format!("{w}: frame and input-latency metrics are refused (run strobe at normal priority)")).unwrap_or_else(|| "normal".into()));
+    if let Some(why) = &timers {
+        t += &format!("  ! timers     {why}: its waits and the app's timers fire late, and the app's wakes are not a terminal's (run strobe from a terminal, or give that job ProcessType Interactive in its launchd plist)\n");
+    }
     t += &format!("  {} screen     {}\n", mark(!locked), if locked { "locked: benches wait for an unlock" } else { "unlocked" });
     t += &format!("  {} browser    {}\n", mark(browser.is_some()), browser.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));

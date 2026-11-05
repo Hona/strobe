@@ -2126,6 +2126,7 @@ fn warning_name(id: &str) -> &str {
         "FewPairs" => "Few pairs",
         "UnpacedSpin" => "Unpaced frames",
         "BackgroundPriority" => "Background priority",
+        "TimerCoalescing" => "Timer coalescing",
         "StaleCalibration" => "Stale calibration",
         "VariantChanged" => "Variant changed",
         "ScreenChanged" => "Different screens",

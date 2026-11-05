@@ -559,9 +559,9 @@ fn runs(
                     }
                 }
                 None => {
-                    for (k, x) in f.values {
-                        values.entry(k).or_insert(x);
-                    }
+                    // The OS frames replace block_values' own (a native block has no Chrome
+                    // frames, so its frames.n is 0 there).
+                    values.extend(f.values);
                     for m in std::iter::once(&s.primary).chain(&s.metrics) {
                         if let Some(w) = f.partial.get(m) {
                             refused.entry(m.clone()).or_insert_with(|| w.clone());

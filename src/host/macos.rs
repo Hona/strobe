@@ -192,6 +192,15 @@ pub(crate) fn cf_get(dict: CFTypeRef, key: &str) -> CFTypeRef {
     unsafe { CFDictionaryGetValue(dict, k.0) }
 }
 
+/// A rectangle from its dictionary form (`CGRectCreateDictionaryRepresentation`).
+pub(crate) fn cf_rect(v: CFTypeRef) -> Option<CGRect> {
+    if v.is_null() || unsafe { CFGetTypeID(v) != CFDictionaryGetTypeID() } {
+        return None;
+    }
+    let mut r = CGRect::default();
+    (unsafe { CGRectMakeWithDictionaryRepresentation(v, &mut r) } != 0).then_some(r)
+}
+
 pub(crate) fn cf_array(v: CFTypeRef) -> Vec<CFTypeRef> {
     if v.is_null() || unsafe { CFGetTypeID(v) != CFArrayGetTypeID() } {
         return Vec::new();
@@ -801,6 +810,24 @@ pub fn background_qos(pid: u32) -> Option<String> {
     // (air, macOS 27), while its base priority was the background band's 4 (`ps -o pri`).
     let bg = unsafe { libc::getpriority(libc::PRIO_DARWIN_PROCESS, pid as libc::id_t) } > 0 || (pid != 0 && task_info(pid).is_some_and(|t| (1..=4).contains(&t.pti_priority)));
     bg.then(|| "background priority (taskpolicy -b, or a parent's)".to_string())
+}
+
+/// Whether macOS coalesces strobe's timers: a launchd job of ProcessType Standard or Background (a
+/// remote shell's or an agent's daemon, when its plist sets no ProcessType) and everything it starts
+/// wake from a 16 ms sleep 20 to 60 ms late (air, macOS 27; ProcessType Interactive: 1 to 4 ms), with
+/// no thread QoS, role or activity that strobe may set changing it. What strobe launches inherits
+/// it. Returns the median wake delay (ms) of a few short sleeps and the job's program, when late.
+pub fn timer_coalescing() -> Option<(f64, String)> {
+    let mut late: Vec<f64> = (0..7)
+        .map(|_| {
+            let t = std::time::Instant::now();
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            t.elapsed().as_secs_f64() * 1e3 - 5.0
+        })
+        .collect();
+    late.sort_by(f64::total_cmp);
+    let median = late[late.len() / 2];
+    (median > 5.0).then(|| (median, responsible_app()))
 }
 
 fn major_version() -> u32 {

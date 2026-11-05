@@ -335,6 +335,19 @@ mod imp {
                 seen = self.a11y.changes().count;
                 tree = self.snapshot(None)?;
             }
+            // AccessKit's first answer is a few nodes (Hex: 6 of over 100) and the rest comes a
+            // moment later, without a notification on macOS: read again until two reads 250 ms apart
+            // agree on the node count.
+            while Instant::now() < deadline {
+                self.a11y.wait_change(seen, (Instant::now() + Duration::from_millis(250)).min(deadline));
+                seen = self.a11y.changes().count;
+                let again = self.snapshot(None)?;
+                let settled = again.nodes.len() == tree.nodes.len();
+                tree = again;
+                if settled {
+                    break;
+                }
+            }
             let text = |i: usize| {
                 let n = &tree.nodes[i];
                 let s = if n.name.trim().is_empty() { n.value.clone().unwrap_or_default() } else { n.name.clone() };
@@ -459,11 +472,10 @@ mod imp {
             let steps = (duration / frame).ceil().max(1.0) as u32;
             let start = Instant::now();
             let mut last = 0;
+            let mut late = Duration::ZERO;
             for k in 1..=steps {
                 let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
-                if let Some(w) = due.checked_duration_since(Instant::now()) {
-                    std::thread::sleep(w);
-                }
+                crate::driver::pace(due, &mut late);
                 let (x, y) = point(k as f64 / steps as f64);
                 last = self.pointer_to(x, y, t0.moved(x, y))?;
             }

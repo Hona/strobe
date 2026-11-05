@@ -704,6 +704,13 @@ pub fn run(args: &Args) -> Result<Output> {
             format!("strobe runs at {why}, and the target inherits it: the OS keeps it on slow cores or behind other work, so frame and input-latency metrics are refused; CPU metrics are kept, but compare them only with runs at the same priority (run strobe at normal priority)"),
         ));
     }
+    if let Some(why) = host::timer_coalescing() {
+        // Every target inherits it: its timer-driven work and wakes are not a terminal-started app's.
+        ctx.warnings.push(validity::warn(
+            "TimerCoalescing",
+            format!("strobe has {why}; the target inherits it, so its timers fire late and its wakes are fewer than an app started from a terminal; compare only with runs started the same way (run strobe from a terminal, or give that job ProcessType Interactive)"),
+        ));
+    }
     if let Some(vm) = &env.virtual_machine {
         ctx.warnings.push(validity::warn("VirtualMachine", format!("running in a virtual machine ({vm}): its timings move with the host's load; prefer bare metal")));
     }

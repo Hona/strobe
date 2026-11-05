@@ -49,7 +49,11 @@ final class App: NSObject, NSApplicationDelegate, NSTextFieldDelegate, NSTableVi
         field.widthAnchor.constraint(equalToConstant: 300).isActive = true
         scroll.widthAnchor.constraint(equalTo: stack.widthAnchor, constant: -16).isActive = true
         window.contentView = stack
+        // No field focused at launch: macOS 26's caret animates every display frame, so a focused
+        // field keeps the app drawing and `until: "idle"` never comes.
+        window.initialFirstResponder = nil
         window.makeKeyAndOrderFront(nil)
+        window.makeFirstResponder(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 

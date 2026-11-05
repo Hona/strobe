@@ -762,6 +762,21 @@ pub fn background_qos(pid: Option<u32>) -> Option<String> {
     os::background_qos(pid.unwrap_or(0))
 }
 
+/// macOS: why strobe's timers (and those of what it launches) fire late, when they do: a launchd job
+/// whose ProcessType lets macOS coalesce them (SPEC §10.1 `TimerCoalescing`).
+pub fn timer_coalescing() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        os::timer_coalescing().map(|(ms, job)| {
+            format!("timers that wake about {ms:.0} ms late: it runs in a launchd job (its oldest ancestor: {job}) whose ProcessType lets macOS coalesce the timers of everything it starts")
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
 /// The executable path of a running process.
 pub fn exe_of(pid: u32) -> Option<PathBuf> {
     os::exe_of(pid)

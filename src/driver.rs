@@ -230,11 +230,10 @@ impl Driver {
         }
         let steps = (duration / frame).ceil().max(1.0) as u32;
         let start = std::time::Instant::now();
+        let mut late = Duration::ZERO;
         for k in 1..=steps {
             let due = start + Duration::from_secs_f64(frame * k as f64 / 1e3);
-            if let Some(w) = due.checked_duration_since(std::time::Instant::now()) {
-                std::thread::sleep(w);
-            }
+            pace(due, &mut late);
             let (dx, dy) = path_at(&path, k as f64 / steps as f64);
             self.pointer_move(x0 + dx, y0 + dy, true)?;
         }
@@ -585,6 +584,30 @@ fn cdp_button(name: &str) -> Option<(&'static str, i64)> {
         Button::Right => ("right", 2),
         Button::Middle => ("middle", 4),
     })
+}
+
+/// Waits until `due` for a drag's next move: sleeps while the OS's timers can be trusted to wake strobe
+/// in time and spins the rest. `late` is how late this drag's sleeps have woken so far: a process
+/// whose timers macOS coalesces (a launchd job of ProcessType Standard, such as a remote shell's
+/// daemon, and what it starts) woke 20 to 60 ms late from a 16 ms sleep, so its moves came in
+/// bursts; there the whole frame is spun.
+pub(crate) fn pace(due: std::time::Instant, late: &mut Duration) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Instant;
+    // The worst wake of every drag so far in this process, so a later drag starts from it.
+    static WORST_NS: AtomicU64 = AtomicU64::new(0);
+    *late = (*late).max(Duration::from_nanos(WORST_NS.load(Ordering::Relaxed)));
+    let margin = *late + Duration::from_millis(1);
+    if let Some(w) = due.checked_duration_since(Instant::now() + margin) {
+        let asked = Instant::now() + w;
+        std::thread::sleep(w);
+        // Remembers the worst wake so far: one late wake makes every later frame spin longer.
+        *late = (*late).max(Instant::now().saturating_duration_since(asked));
+        WORST_NS.fetch_max(late.as_nanos() as u64, Ordering::Relaxed);
+    }
+    while Instant::now() < due {
+        std::thread::yield_now();
+    }
 }
 
 /// `input.rate` and `input.gap.p95` (SPEC §9.6): pointer moves strobe sent per second while a button was

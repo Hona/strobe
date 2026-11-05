@@ -552,6 +552,8 @@ Fewer than 6 pairs never gets a verdict.
 - **When did it happen, and what ran beside it?** `strobe open <rec>` (or `<exp>/head`).
   - Perfetto shows a long task beside the presents it delayed, a driver thread compiling while the UI waits, and lets a person browse stacks (drag over a Callstacks track for the flame graph).
   - Numbers and verdicts still come from strobe's views (`hotspots`, `threads`, `frames`); Perfetto is for seeing and browsing.
+  - The track "strobe itself (its own process)" is strobe's own CPU, GPU and memory over the recording: check it before blaming the app for a busy moment.
+- **A native click's `until` never showed and the error says the element moved?** It moved or resized as strobe clicked (a panel resizing around it), so the click may have missed: wait for what moves it first (`until`, `page.idle()`).
 - **Writing the PR?** `report experiment <exp> --format pr --update-pr <n>` puts the experiment's block in the PR body, led by its result card (or paste stdout, text only).
 - **Is the rewrite faster?** One bench file, one target per implementation, the same cases (journeys) on both:
   - `bench <file> --base original --head rewrite` (`<target>[=<variant>]`: `rewrite=git:main`, `original=exe:/path`; `target:<name>` when a folder has the name).

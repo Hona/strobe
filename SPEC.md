@@ -1121,12 +1121,30 @@ page is open), shown by `query <rec> shifts` and in the bench's why lines.
 ### 8.5 OS and GPU sampling
 
 One sampler thread, 100 ms ticks: per-CPU busy, and GPU engine time and VRAM for the target's
-process tree. CPU frequency and Task Manager's utility once a second. The tree is re-read every
-second, or less often so the re-read stays under 0.2% of a core. Budget: 0.5% of one core, and
-the sampler measures its own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers
-read OS APIs directly and never spawn processes (§13.6). Bench blocks and recordings report
-`gpu.process.3d` (per run) and `gpu.vram` (after the runs); processes the sampler cannot open are
-listed, never counted as 0.
+process set (§13.2: its tree and everything launched for its home, so an app's detached service is
+counted). CPU frequency and Task Manager's utility once a second. The set is re-read every second,
+or less often so the re-read stays under 0.2% of a core. The first re-read waits 2.5 s: a process
+without a stamp is read again for 2 s after it is first seen (§13.2), and at the sampler's first read
+every process is new, so an earlier re-read read every process's environment again (on adais the
+sampler went from 0.17% to 1.0% of a core in a 5 s block). Budget: 0.5% of one core, and the sampler measures its
+own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers read OS APIs directly and never
+spawn processes (§13.6). On macOS the per-process GPU reader keeps the accelerators and the set's
+GPU clients open between ticks (each client's owner is read once, every client is listed again each
+second and when the set changes), so a tick reads only those clients' GPU time (about 25 µs on air,
+where matching the accelerators twice and walking all 71 GPU clients had cost 0.2 ms a tick, and
+every client's owner 0.3 ms a second). Bench blocks and
+recordings report `gpu.process.3d` (per run) and `gpu.vram` (after the runs); processes the sampler
+cannot open are listed, never counted as 0.
+
+The same sampler reads strobe's own process (rule 2): each tick every thread's CPU (% of one core,
+from the process's cycles against the TSC); once a second its GPU engine time (a per-process GPU
+reader of its own: on Windows a D3DKMT query per engine of every adapter strobe opened, which each
+tick had cost more than the rest of the tick) and its private memory as `memory.app.private` counts
+a target's (Windows' private commit, macOS's physical footprint, Linux's `smaps_rollup` private and
+swapped pages, 94 µs a read on vps). strobe's own process is never in the target's set. A recording
+keeps them under
+`os.strobe` in `meta.json` (means over the recording, peak memory, and each tick), and `strobe open
+--perfetto` draws them as the track "strobe itself (its own process)" (§11.4).
 
 ### 8.6 Memory: census and heap snapshots
 
@@ -1844,7 +1862,13 @@ On a native target strobe drives the app through the OS's accessibility tree and
 announces, at most once per 16 ms while changes come in a burst (an animation's every frame), since
 each read costs the app's own provider work; while the tree is a placeholder (a few elements per
 window: a lazy provider, which on macOS fills in without an event) it reads again
-every 50 ms. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
+every 50 ms. A read for a selector stops at its match in tree order (with the match's descendants
+when keys go to it: where focus is inside it), since nothing after it changes which element the
+selector means: on macOS, which reads the app element by element, a found element costs only the
+elements before it. A click whose `until` selector never shows, and whose element is no longer where
+strobe aimed (it moved or resized between the read that found it and the click, or as the click went
+in: a panel resizing around it), says the element moved, from where to where, instead of naming the
+key; strobe reads the element again only once the wait has failed. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
 says which kept it busy, with counts: the frames of the app that reached the screen in the last second
 (from the block's present events), its accessibility changes in that second and over the whole wait,
 and whether strobe's own input came then. `"frame"` is the next present of the app that reached the
@@ -2815,9 +2839,11 @@ protobuf written by hand (no generated code, no C):
   block's `frames.json`, with `runs.json` per run), `marks`, `inputs strobe sent`, `accessibility tree
   changes`, `OS presents` (every present by process as a slice named by its fate, the app's frames on
   screen, their interval in ms, vertical blanks per display path), `memory · <process>` (the readings
-  in MB), and per thread its CPU (% of a core) and wakes per second from the thread timeline (§7.4),
-  under the thread's own track when the recording has no Chrome trace. The OS sampler keeps window
-  averages, not ticks, so GPU engine use is an argument of `recording`, not a counter.
+  in MB), per thread its CPU (% of a core) and wakes per second from the thread timeline (§7.4),
+  under the thread's own track when the recording has no Chrome trace, and `strobe itself (its own
+  process)`: strobe's CPU (% of a core), GPU (% of an engine) and private memory (MB) per OS sampler
+  tick (§8.5, rule 2). For the target the OS sampler keeps window averages, not ticks, so its GPU
+  engine use is an argument of `recording`, not a counter.
 - One clock: strobe's packets carry the host's monotonic clock (`BUILTIN_CLOCK_MONOTONIC`, QPC on
   Windows, which V8's profile timestamps share), Chrome's clock snapshots map it; times strobe read
   from the Chrome trace by SQL go back on its own clock. A trace without a Chrome trace gets one
@@ -3536,7 +3562,12 @@ toolkit (rule 15).
   - macOS (`target/a11y/ax.rs`): the AX API. A snapshot reads each window the app's `AXWindows` lists
     (matched to its CoreGraphics window by frame: the AX API names no window id publicly) with one
     `AXUIElementCopyMultipleAttributeValues` per element (role, subrole, title, description, value,
-    `AXIdentifier`, position, size, focused, enabled, children, minimized), in points. The key is
+    `AXIdentifier`, position, size, focused, enabled, children, minimized), in points. Only the
+    processes that own a window asked for are asked for their windows, and a window's owner and its
+    AX element's CoreGraphics id are kept for the window's life: the window list and the windows'
+    frames are read only for a window not seen before (a snapshot had read the whole window list three
+    times, 0.2 ms of strobe's CPU each with 15 windows on screen on air, more on a busy desktop). The
+    key is
     `AXIdentifier` (AccessKit's author id); a name is the title, else the description; roles map to the
     same ARIA names. An `AXObserver` per process on a run-loop thread of its own hears focus, value,
     title, created and destroyed, layout, move, resize, selection, row, window and menu notifications
@@ -3967,7 +3998,10 @@ yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless
 0.61%; a script target's 30 ms runs 3–6%, which is strobe relaying each `ctx.call` between the
 runner and the script's host inside the run. Counted over the whole run loop instead, the same block
 read 40–80% (script) and 7% (native): strobe's own between-run reads, never inside a run. On air
-(M4) the OS sampler's thread read 0.85–1.2% of a core in `--check` blocks, over its 0.5% budget.
+(M4) the OS sampler's thread read 0.85–1.2% of a core in `--check` blocks, over its 0.5% budget,
+mostly IOKit reads of every GPU client each tick (§8.5); the present consumer read 0.6–1.6% on Hex,
+its time mostly in the IOSurface lock of each changed frame. Every recording also keeps strobe's own
+CPU, GPU and memory per tick (§8.5, `os.strobe`), the rule 2 track.
 
 ## 20. SDKs (TypeScript, `sdk/`)
 
@@ -4419,6 +4453,43 @@ click, type, scroll, drag, a mocked fetch, a snapshot, and a click series for in
 
 Not checked yet: headed Firefox on Windows (the session stays locked: ETW presents, intervals and drops,
 `interaction.*`), Snap Firefox (no Snap on vps), headed X11 on a real GPU.
+
+strobe's own overhead (2026-11-06; §8.5, §13.7, §19): the OS sampler reads the target's process set
+and strobe's own process (CPU each tick, GPU and private memory once a second) into `os.strobe` and
+the Perfetto track "strobe itself (its own process)"; the macOS GPU reader keeps the accelerators and
+the set's clients open; the macOS present session reads the window list once per track; a native wait's read for a selector stops at its match
+(macOS), macOS snapshots keep each window's owner and CoreGraphics id, the hit test and the pointer
+target make fewer reads of the app, and a key reads one window's entry for its owner; a click whose
+`until` selector never shows says when its element moved. Profiled first with `sample` on strobe's
+own process inside the measured runs of a Hex `history-search` block on air (15 runs): the present
+consumer's queue was in the IOSurface lock trap a fifth of the wall time, the main thread on CPU
+2.3% (process scans between runs, the shown screens, a key's `window_state`, snapshots), the sampler
+0.6% (the process tree scan and IOKit). Single reads on air: the whole on-screen window list 215 µs
+of CPU with 15 windows (one window's entry 42 µs); matching the accelerators 20 µs; walking 71 GPU
+clients 149 µs; every client's owner 296 µs; one client's `AppUsage` 4 µs; `PerformanceStatistics`
+13 µs; Linux's `smaps_rollup` for strobe 94 µs on vps against `statm` 17 µs. The head's profile of
+a `switch-panes` block then showed `rest` reading the whole live-present queue between sleeps (now
+each process's latest start is kept). On air (macOS 27, AC, `--check`, one cold run per case, so
+noisy; base 0.9.0, head this change, three head runs): strobe's process in the cocoa app's cases
+read chord 8.6% → 2.7–7.3%, click 5.2% → 2.6–2.9%, frames 2.3% → 1.3–1.5%, query (7 ms runs, a
+whole snapshot each) 21.9% → 11.2–17.7%, scroll 4.2% → 0.81–2.8%, toggle 4.4% → 0.79–3.2%, type
+4.9% → 1.4–4.6%, wheel 4.0% → 0.86–3.3%; the sampler 0.28–1.1% → 0.10–0.39%, the present consumer
+0.04–0.64% → 0.04–0.30%. Hex `switch-panes` 7.0% → 1.3% (twice), `history-scroll` 5.9% → 1.8–4.7%,
+its sampler 0.40–1.0% → 0.13–0.52%; the present consumer stayed 0.15–1.1% on Hex's redraws (it is
+the lock of each changed frame, which this change leaves alone). In 15-run blocks profiled with
+`sample` attached: `switch-panes` 4.8% → 4.0% with the app's own `ui.cpu` 157 → 130 ms a run (fewer
+reads of its tree), `history-scroll` 4.3% → 3.1%, query 16.2% → 14.1%. A Hex `model-picker` check
+failed with "The element clicked ("picker-back") moved: strobe aimed at it at (348, 215, 24 × 24) and
+it is now at (348, 130, 24 × 24)". Tried and dropped: locking frames with `kIOSurfaceLockAvoidSync`
+first (the lock trap kept its time, and whether such a lock sees a frame the GPU still writes was not
+shown). Windows (adais, locked,
+`fake-tray.bench.ts --check`, idle): sampler 0.17% before, 1.0–1.4% with the process set and strobe's
+own GPU read each tick, 0.19–0.25% after (the first re-read after 2.5 s, strobe's GPU once a second);
+strobe's process 1.0–1.1% before, 1.0–1.2% after. Linux (vps, Xvfb, `atspi.bench.ts --check`): 8 of
+8 cases passed before and after with the same overhead (the sampler 0.08–0.12% before, 0.10–0.13%
+after; single noisy runs on 2 cores). `record pid:` on adais and vps wrote `os.strobe` (31 ticks
+over 3 s) and `strobe open --no-browser` drew three "strobe itself" tracks, which trace_processor read
+back with no import errors.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

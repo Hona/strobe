@@ -49,6 +49,10 @@ impl Error {
     pub fn validator(&self) -> Option<ValidatorId> {
         self.refusal.as_ref().map(|r| r.validator)
     }
+    /// How the window was hidden, for a `WindowHidden` refusal whose producer said.
+    pub fn hidden(&self) -> Option<Hidden> {
+        self.refusal.as_ref().and_then(|r| r.hidden)
+    }
 }
 
 macro_rules! validators {
@@ -119,6 +123,20 @@ impl fmt::Display for ValidatorId {
     }
 }
 
+/// Why a window counted as hidden (`WindowHidden`), where a bench acts on the difference: on macOS
+/// it waits for a person to leave the Mac when the window is covered or the app is not the active
+/// one, and otherwise wakes the display once.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Hidden {
+    /// Other apps' windows cover it (macOS).
+    Covered,
+    /// Its app is not the active app, where strobe measures it active (macOS).
+    NotActive,
+    /// Closed, hidden, minimized, cloaked, or a page that is not visible.
+    Other,
+}
+
 /// Why a validator refused: a run (in an `Error`) or one metric (in a `Comparison`).
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Refusal {
@@ -131,11 +149,24 @@ pub struct Refusal {
     /// How to make the run valid.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
+    /// `WindowHidden` only, when the producer knows: how the window was hidden.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hidden: Option<Hidden>,
 }
 
 impl Refusal {
     pub fn new(validator: ValidatorId, summary: impl Into<String>) -> Self {
-        Refusal { validator, summary: summary.into(), detail: None, fix: None }
+        Refusal { validator, summary: summary.into(), detail: None, fix: None, hidden: None }
+    }
+    /// A `WindowHidden` refusal that says how the window was hidden.
+    pub fn window_hidden(hidden: Hidden, summary: impl Into<String>) -> Self {
+        Refusal { hidden: Some(hidden), ..Refusal::new(ValidatorId::WindowHidden, summary) }
+    }
+    /// A metric's refusal as a block's `refused` map writes it, `<validator>: <why>`, read back.
+    /// A line whose prefix is no validator is `None`.
+    pub fn from_line(line: &str) -> Option<Refusal> {
+        let (id, why) = line.split_once(": ").unwrap_or((line, ""));
+        Some(Refusal::new(ValidatorId::from_name(id)?, why))
     }
     pub fn detail(mut self, detail: impl Into<String>) -> Self {
         self.detail = Some(detail.into());
@@ -157,6 +188,24 @@ impl Refusal {
 impl From<Refusal> for Error {
     fn from(r: Refusal) -> Self {
         Error { code: 4, message: r.message(), hint: r.fix.clone(), refusal: Some(Box::new(r)) }
+    }
+}
+
+/// `#[serde(with = "refusal_lines")]` for a metric → `Refusal` map that result.json keeps as
+/// `"<metric>": "<validator>: <why>"`, as blocks have always written it (SPEC 10.1).
+pub mod refusal_lines {
+    use super::Refusal;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(map: &BTreeMap<String, Refusal>, s: S) -> std::result::Result<S::Ok, S::Error> {
+        s.collect_map(map.iter().map(|(k, r)| (k, r.message())))
+    }
+
+    /// Lines whose prefix is no validator (older results) are dropped.
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> std::result::Result<BTreeMap<String, Refusal>, D::Error> {
+        let lines = BTreeMap::<String, String>::deserialize(d)?;
+        Ok(lines.into_iter().filter_map(|(k, l)| Some((k, Refusal::from_line(&l)?))).collect())
     }
 }
 

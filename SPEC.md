@@ -1190,10 +1190,20 @@ they use from anywhere; `apps` merge per app.
 
 strobe.json is JSON with comments: `//` and `/* */` comments and trailing commas, outside strings.
 It is read strictly. A file that does not parse fails with its path, line and column (exit 2). So
-does a key strobe does not read, at the top level, in `build` (and its per-OS overlays), `serve`,
-`metrics`, `packages`, `symbols`, an app profile or one of its `guard` entries: a typo
-(`"gaurd"`) would otherwise drop the user's guard without a word. The message names the closest
-known key (`did you mean "guard"?`) and lists the keys there.
+do a key strobe does not read and a value of the wrong type, at the top level, in `build` (and its
+per-OS overlays), `serve`, `metrics`, `symbols`, an app profile or one of its `guard` entries: a
+typo (`"gaurd"`), a guard written as an object or without its `file`, `"build": "cargo build"`, an
+`env` value that is a number or an `exe` keyed `darwin` would otherwise be ignored without a word
+(an app launched unguarded, a variant not built). The message names the place (`apps.desk.guard[0]
+needs "file"`), the closest known key (`did you mean "guard"?`, `darwin` → `macos`) and the keys
+there, and says a key may have come with a newer strobe (`strobe update`). The line and column are
+those of the key itself, found along its path in the file (never a commented-out copy).
+
+The user's own `<state>/strobe.json` serves every repository on the machine, so it is read more
+gently: a problem in one of its app profiles fails only when that profile (or one extending it)
+is used, and a key it does not know outside `apps` only warns. Read-only views (`query`, `open`)
+never fail on a strobe.json: symbolization then goes without its `symbols.servers`. `benches` is
+reserved for tools that list a project's bench files; strobe does not read it yet.
 
 ```jsonc
 {
@@ -1211,8 +1221,7 @@ known key (`did you mean "guard"?`) and lists the keys there.
   },
   "apps": { "desktop": { "exe": { "windows": "%LOCALAPPDATA%/Programs/my-app/My App.exe" } } },
   "benches": ["packages/web/perf/**/*.bench.ts"],
-  "metrics": { "equivalence": "2%" },
-  "packages": { "groups": { "@radix-ui/*": "radix" } }
+  "metrics": { "equivalence": "2%" }
 }
 ```
 
@@ -1646,16 +1655,25 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `NoPhase`, `NoInput` | a declared `phase.<name>` no measured run entered; `input.*` with no drag in the runs (refuse that metric) |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
-`Refusal { validator, summary, detail, fix }`. A refused run's error carries it (exit 4; its
-message stays `<validator>: <summary>[; <detail>]`), so callers ask which validator refused and
-never match message text. `is_transient_environment()` names the ones that describe the machine's
-moment (`SessionLocked`, `WindowHidden`, `Background`), which a bench waits out or runs again. A
-name that is no validator is strobe's own bug and fails as an internal error (exit 1), never as a
-refusal. In result.json every comparison carries `verdict_kind` (`better`, `worse`, `same`,
-`no_worse`, `unclear`, `underpowered`, `saturated`, `stopped`, `refused`, `untested` for a
-secondary the gate did not test, `descriptive`) beside its `verdict` words, and a refused metric its
-`refusal` (`validator`, `summary`); readers use those, not the words (`stats::verdict_kind` reads
-the words of results from before them the same way). Schema: `schema/result.v1.json`.
+`Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
+its message stays `<validator>: <summary>[; <detail>]`), so callers ask which validator refused and
+never match message text. A native window's `WindowHidden` says how it was hidden (`hidden`:
+`covered` by other apps' windows, its app `not_active`, or `other`), which is what a macOS bench
+acts on. `is_transient_environment()` names the validators that describe the machine's moment
+(`SessionLocked`, `WindowHidden`, `Background`), which a bench waits out or runs again. A name that
+is no validator is strobe's own bug and fails as an internal error (exit 1), never as a refusal.
+
+A comparison's kind and refusal are fields set where its verdict is made (`stats::compare`, and
+`Comparison::set_verdict` and `refuse` when bench gates, describes, stops or refuses it), never read
+back from its words. In result.json every comparison carries `verdict_kind` (`better`, `worse`,
+`same`, `no_worse`, `unclear`, `underpowered`, `saturated`, `stopped`, `refused`, `untested` for a
+secondary the gate did not test, `descriptive`) beside its `verdict` words, and a refused metric
+its `refusal`; so do a leak series' growth verdicts (`worse` for a leak, `same` for no growth or
+growth that levels off), bisect steps, and a bisect (good against bad, or `unclear` while
+undecided steps may hide the culprit). Readers use those, not the words; `stats::verdict_kind` and
+`stats::refusal_of` read the words only of results written before them. A block's refused metrics
+keep result.json's `"<metric>": "<validator>: <why>"` form (`model::refusal_lines` reads and
+writes it as `Refusal`s). Schema: `schema/result.v1.json`.
 
 ### 10.2 Analysers (warn in the result)
 
@@ -2093,7 +2111,7 @@ browse stacks in a flame graph.
 - Release symbol store: a directory or a private release asset keyed by debug ID, never shipped
   to users. The build publishes, strobe fetches.
 - Each frame maps to file, line and column, then to a package (the nearest `package.json`) and
-  an optional owner group (`strobe.json` `packages.groups`).
+  an optional owner group (not built: strobe.json has no key for it yet).
 - Every hotspot view reports the share of samples that resolved.
 
 ### 12.2 Native
@@ -2697,10 +2715,13 @@ experiments/
   same build (matching versions: the UI shows no version dialog), §11.4.
 - One `trace_processor_shell server http` per `strobe open`, on `127.0.0.1` and a free port, with
   no trace loaded (the UI streams it in), ending itself after an hour without requests. Queries
-  (`query`, metrics) run one `trace_processor -q` each, with a deadline of two minutes plus a second
-  per 4 MB of trace: a query that outlives it is killed and fails (exit 124) with the trace's path,
-  so a hung trace_processor never holds a report or the daemon. The executable is unpacked whole or
-  not at all (a `.part` file renamed into place), since any file at its path counts as installed.
+  (`query`, metrics) run one `trace_processor -q` each (no console window on Windows), with a
+  deadline of two minutes plus a second per 4 MB of trace (a gzipped trace counts ten times its
+  size): a query that outlives it is killed and fails (exit 124) with the trace's path, so a hung
+  trace_processor never holds a report or the daemon. The download goes to a name of its own and is
+  renamed once its sha256 matches, and the executable is written whole and runnable or not at all
+  (`host::paths::write_executable`), since any file at its path counts as installed; one install
+  runs at a time in a process.
 - Ingest: Chrome's proto trace (`Tracing.start` with `streamFormat: "proto"`) with strobe's own
   packets (OS and GPU counters, census, phases when not in the trace) appended as counter and
   slice tracks with a `ClockSnapshot`. JSON for sources that only give JSON.
@@ -3131,14 +3152,19 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 - Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
   are kept topmost without focus, since an occluded Chromium window stops rendering.
 - Typed outcomes, crash-safe store and strict config (2026-11-05): validators are `ValidatorId`
-  and refusals `Refusal` values on the error (§10.1); comparisons serialize `verdict_kind` and
-  `refusal`. `bench`, `pr`, `card`, `track` and `bisect` still read the `verdict` words and error
-  messages; they move to the types next, and `Comparison::kind()` reads the words in one place
-  until bench sets the kind itself. The Chromium and native software-adapter checks keep their own
+  and refusals `Refusal` values on the error (§10.1); comparisons carry `kind` and `refusal`,
+  which bench sets with each verdict it writes. Still to move to the types: `bench`, `pr`, `card`,
+  `track` and `bisect` read the `verdict` words and error messages (bench's macOS waits still match
+  `COVERED`/`NOT_ACTIVE` in the message although the refusal now says `hidden`), and a block's
+  `refused` map is still `<validator>: <why>` strings built in bench, the native block and the
+  present frames, where `model::refusal_lines` is ready to type it. The Chromium and native software-adapter checks keep their own
   name lists until they call `validity::is_software_gpu`. Store writes outside `store` (probes,
   record, the experiment's own files) still use `std::fs` until they move to `store::write_atomic`
   and `store::new_recording`. Checked on adais: every consumer strobe.json on the machine (124
-  files) loads, and the schemas accept them and every local result.json (296); 20,000 ids in one
+  files) loads, and the schemas accept them and every local result.json (297) while refusing a
+  comparison with an unknown kind or key, a guard object, a guard without `file`, a string `build`,
+  an `exe` keyed `darwin` and `"1..2%"`; a broken profile in the user's own strobe.json fails only
+  the launch that uses it (or a profile extending it); 20,000 ids in one
   process were distinct; a reader racing 1,500 rewrites of a 200 KB result.json read 273 torn files
   with `std::fs::write` and none through `store::write_json`; a query whose deadline was cut to
   300 ms for the check was killed and left no trace_processor running. On vps (Linux) and air

@@ -19,7 +19,7 @@
   "files": ["dist", "bin", "schema", "README.md"],
   "sideEffects": false,
   "scripts": {
-    "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json && bun -e \"require('node:fs').cpSync('../../schema', 'schema', { recursive: true })\""
+    "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json && bun -e \"const fs = require('node:fs'); fs.rmSync('schema', { recursive: true, force: true }); fs.cpSync('../../schema', 'schema', { recursive: true })\""
   },
   "optionalDependencies": {
     "@hona/strobe-darwin-arm64": "0.7.3",

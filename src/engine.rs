@@ -46,41 +46,47 @@ pub fn download(name: &str, sha: &str) -> Result<PathBuf> {
     }
     let url = format!("https://github.com/google/perfetto/releases/download/{VERSION}/{name}");
     let curl = if cfg!(windows) { "curl.exe" } else { "curl" };
-    let status = Command::new(curl).args(["-fsSL", "--retry", "2", "-o"]).arg(&archive).arg(&url).status()?;
+    // Into a name of its own, checked, then renamed: another strobe downloading the same asset at
+    // the same time never reads half of this one.
+    let part = dir.join(format!("{name}.{}-{}.part", std::process::id(), host::paths::csprng_hex(4)?));
+    let status = Command::new(curl).args(["-fsSL", "--retry", "2", "-o"]).arg(&part).arg(&url).status()?;
     if !status.success() {
+        let _ = std::fs::remove_file(&part);
         return Err(Error::unreachable(format!("download {url} failed")));
     }
-    let got = sha256(&archive)?;
+    let got = sha256(&part)?;
     if got != sha {
-        let _ = std::fs::remove_file(&archive);
+        let _ = std::fs::remove_file(&part);
         return Err(Error::msg(format!("{name}: sha256 {got} does not match the pinned {sha}")));
     }
+    std::fs::rename(&part, &archive)?;
     Ok(archive)
 }
+
+/// One install at a time in this process: a report's views query in parallel, and each would
+/// download the engine on a new device.
+static INSTALL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn ensure() -> Result<PathBuf> {
     let exe = path();
     if exe.is_file() {
         return Ok(exe);
     }
+    let _one = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
+    if exe.is_file() {
+        return Ok(exe);
+    }
     let (name, sha) = asset().ok_or_else(|| Error::msg("no trace_processor build for this OS and CPU"))?;
     let archive = download(name, sha)?;
-    let bytes = std::fs::read(&archive)?;
+    let bytes = match std::fs::read(&archive) {
+        Ok(b) => b,
+        // Another strobe installed it and removed the archive meanwhile.
+        Err(_) if exe.is_file() => return Ok(exe),
+        Err(e) => return Err(e.into()),
+    };
     let body = unzip_one(&bytes, |n| n.ends_with(exe_name()))?.ok_or_else(|| Error::msg(format!("{name} has no {}", exe_name())))?;
-    // Whole or not at all: `installed` takes any file at this path for the engine.
-    let tmp = exe.with_extension("part");
-    {
-        use std::io::Write;
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(&body)?;
-        f.sync_all()?;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
-    }
-    std::fs::rename(&tmp, &exe)?;
+    // Whole and runnable or not at all: `installed` takes any file at this path for the engine.
+    host::paths::write_executable(&exe, &body).map_err(|e| Error::msg(format!("write {}: {e}", exe.display())))?;
     let _ = std::fs::remove_file(&archive);
     Ok(exe)
 }
@@ -92,6 +98,10 @@ pub fn ui_dir() -> PathBuf {
 
 pub fn ensure_ui() -> Result<PathBuf> {
     let dir = ui_dir();
+    if dir.join("index.html").is_file() {
+        return Ok(dir);
+    }
+    let _one = INSTALL.lock().unwrap_or_else(|e| e.into_inner());
     if dir.join("index.html").is_file() {
         return Ok(dir);
     }
@@ -216,10 +226,14 @@ impl Table {
     }
 }
 
-/// How long one query may take: two minutes, plus a second per 4 MB of trace to load. trace_processor
-/// loads well over that rate, so only a hung one meets it.
+/// How long one query may take: two minutes, plus a second per 4 MB of trace to load (a gzipped
+/// trace counted as ten times its size). trace_processor loads well over that rate, so only a hung
+/// one meets it.
 fn deadline(trace: &Path) -> Duration {
-    let mb = std::fs::metadata(trace).map(|m| m.len() / 1_000_000).unwrap_or(0);
+    let mut mb = std::fs::metadata(trace).map(|m| m.len() / 1_000_000).unwrap_or(0);
+    if trace.extension().is_some_and(|e| e == "gz") {
+        mb *= 10;
+    }
     Duration::from_secs(120 + mb / 4)
 }
 
@@ -251,6 +265,9 @@ pub fn query(trace: &Path, sql: &str) -> Result<Table> {
 /// Runs `cmd` to its end and returns its output, or kills it at `limit` and returns `None`. Its
 /// stdout and stderr are read on their own threads, so neither pipe fills while it runs.
 fn run_within(cmd: &mut Command, limit: Duration) -> Result<Option<Output>> {
+    // No console window from the daemon (strobew has none of its own to share).
+    #[cfg(windows)]
+    std::os::windows::process::CommandExt::creation_flags(cmd, 0x0800_0000);
     let mut child = cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
     let (mut out, mut err) = (child.stdout.take(), child.stderr.take());
     let err = std::thread::spawn(move || {

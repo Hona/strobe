@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "strobe.v1.json",
   "title": "strobe.json",
-  "description": "A project's strobe configuration (SPEC 9.5). JSON with // and /* */ comments and trailing commas. strobe refuses a key it does not read (exit 2, with the file, line and column).",
+  "description": "A project's strobe configuration (SPEC 9.5). JSON with // and /* */ comments and trailing commas. strobe refuses a key it does not read or a value of the wrong type (exit 2, with the file, line and column).",
   "type": "object",
   "additionalProperties": false,
   "properties": {
@@ -37,16 +37,11 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/definitions/app" }
     },
-    "benches": { "type": "array", "items": { "type": "string" }, "description": "Globs of the project's bench files." },
+    "benches": { "type": "array", "items": { "type": "string" }, "description": "Reserved: globs of the project's bench files, for tools. strobe does not read it yet." },
     "metrics": {
       "type": "object",
       "additionalProperties": false,
-      "properties": { "equivalence": { "type": "string", "pattern": "^[0-9.]+%$", "description": "The equivalence bound for same, such as 2%." } }
-    },
-    "packages": {
-      "type": "object",
-      "additionalProperties": false,
-      "properties": { "groups": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Owner groups by package glob." } }
+      "properties": { "equivalence": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+)?%?$", "description": "The equivalence bound for same, in percent: \"2%\" or \"2\"." } }
     },
     "harness": { "type": "array", "items": { "type": "string" }, "description": "Repository-relative paths copied into every variant before it builds (SPEC 9.5)." },
     "symbols": {

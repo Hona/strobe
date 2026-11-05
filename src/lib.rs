@@ -9,6 +9,7 @@ pub mod etw;
 pub mod heapsnap;
 pub mod history;
 pub mod host;
+pub mod jsonc;
 pub mod metrics;
 pub mod model;
 pub mod perfetto;

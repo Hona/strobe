@@ -4,7 +4,7 @@
 use super::chromium::Window;
 use super::isolate::{self, App, Guard, Home};
 use crate::host::{self, TopWindow};
-use crate::model::{Error, Result};
+use crate::model::{Error, Hidden, Refusal, Result};
 use std::path::PathBuf;
 use std::process::Child;
 use std::sync::mpsc::Receiver;
@@ -158,8 +158,13 @@ impl Native {
         let by = state.as_ref().filter(|_| why == Some(COVERED)).map(|s| host::macos::covering(s.hwnd)).filter(|c| !c.is_empty()).map(|c| format!("; in front of it: {}", c.join(", "))).unwrap_or_default();
         #[cfg(not(target_os = "macos"))]
         let by = String::new();
+        let hidden = match why {
+            Some(COVERED) => Hidden::Covered,
+            Some(NOT_ACTIVE) => Hidden::NotActive,
+            _ => Hidden::Other,
+        };
         match why {
-            Some(why) => Err(Error::refused("WindowHidden", format!("the app's {why}{by}"), "keep the window visible and unminimized while strobe measures; a hidden window may skip its frames")),
+            Some(why) => Err(Refusal::window_hidden(hidden, format!("the app's {why}{by}")).fix("keep the window visible and unminimized while strobe measures; a hidden window may skip its frames").into()),
             None => Ok(()),
         }
     }

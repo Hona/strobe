@@ -191,7 +191,7 @@ pub fn mvalue(values: &[f64]) -> Option<f64> {
 }
 
 /// The comparison of one metric between base and head over pairs.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize)]
 pub struct Comparison {
     pub metric: String,
     pub n: usize,
@@ -205,66 +205,46 @@ pub struct Comparison {
     pub confidence: f64,
     pub p: f64,
     pub bound: f64,
-    /// What it decided, in words (`faster (small)`, `refused (TailTooShort): …`). `kind` and
-    /// `refusal` read it, so whoever rewrites it keeps the three in step.
+    /// What it decided, in words for people (`faster (small)`, `refused (TailTooShort): …`).
+    /// `set_verdict` and `refuse` change it together with `kind` and `refusal`.
     pub verdict: String,
+    /// What it decided, for code and result.json readers.
+    #[serde(rename = "verdict_kind")]
+    pub kind: VerdictKind,
     pub decided: bool,
     pub needed_pairs: Option<usize>,
     /// A counter that held one value on each side in every block: compared exactly (SPEC §10.1).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub exact: bool,
     /// Non-inferiority (SPEC §9.3): the margin by which head may be worse (a fraction for ratio metrics,
     /// the metric's unit otherwise); `p` then tests the difference against the margin.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub noworse: Option<f64>,
+    /// The validator that refused this metric (`kind` is `Refused`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Refusal>,
 }
 
 impl Comparison {
-    /// What the verdict decided.
-    pub fn kind(&self) -> VerdictKind {
-        verdict_kind(&self.verdict, crate::model::metric(&self.metric))
+    /// Says what it decided, in words and as a kind at once (a gate, a stop, a descriptive metric).
+    pub fn set_verdict(&mut self, kind: VerdictKind, verdict: impl Into<String>) {
+        self.kind = kind;
+        self.verdict = verdict.into();
+        self.refusal = None;
     }
 
-    /// The validator that refused this metric, when one did.
-    pub fn refusal(&self) -> Option<Refusal> {
-        refusal_of(&self.verdict)
-    }
-}
-
-/// result.json's comparison: the fields above, plus `verdict_kind` and a refused metric's `refusal`.
-impl Serialize for Comparison {
-    fn serialize<S: serde::Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
-        use serde::ser::SerializeMap;
-        let mut m = s.serialize_map(None)?;
-        m.serialize_entry("metric", &self.metric)?;
-        m.serialize_entry("n", &self.n)?;
-        m.serialize_entry("base", &self.base)?;
-        m.serialize_entry("head", &self.head)?;
-        m.serialize_entry("estimate", &self.estimate)?;
-        m.serialize_entry("lo", &self.lo)?;
-        m.serialize_entry("hi", &self.hi)?;
-        m.serialize_entry("relative", &self.relative)?;
-        m.serialize_entry("confidence", &self.confidence)?;
-        m.serialize_entry("p", &self.p)?;
-        m.serialize_entry("bound", &self.bound)?;
-        m.serialize_entry("verdict", &self.verdict)?;
-        m.serialize_entry("verdict_kind", &self.kind())?;
-        m.serialize_entry("decided", &self.decided)?;
-        m.serialize_entry("needed_pairs", &self.needed_pairs)?;
-        if self.exact {
-            m.serialize_entry("exact", &true)?;
-        }
-        if let Some(margin) = self.noworse {
-            m.serialize_entry("noworse", &margin)?;
-        }
-        if let Some(r) = self.refusal() {
-            m.serialize_entry("refusal", &r)?;
-        }
-        m.end()
+    /// Refuses the metric: `refused (<validator>): <summary>`, undecided.
+    pub fn refuse(&mut self, r: Refusal) {
+        self.verdict = format!("refused ({}): {}", r.validator, r.summary);
+        self.kind = VerdictKind::Refused;
+        self.decided = false;
+        self.refusal = Some(r);
     }
 }
 
-/// What a verdict decided, from its words: the one place that reads them. `def` is the metric's
-/// (or its family's) definition, whose words say which direction is better; result.json files from
-/// before `verdict_kind` existed classify the same way.
+/// What a verdict decided, from its words, for result.json files from before `verdict_kind`: new
+/// comparisons carry their kind. `def` is the metric's (or its family's) definition, whose words
+/// say which direction is better.
 pub fn verdict_kind(verdict: &str, def: Option<&MetricDef>) -> VerdictKind {
     let v = verdict.trim();
     let first = v.split([' ', ':', ',']).next().unwrap_or("");
@@ -284,7 +264,8 @@ pub fn verdict_kind(verdict: &str, def: Option<&MetricDef>) -> VerdictKind {
     }
 }
 
-/// The refusal a `refused (<validator>): <why>` verdict names.
+/// The refusal a `refused (<validator>): <why>` verdict names, for result.json files from before
+/// `refusal`.
 pub fn refusal_of(verdict: &str) -> Option<Refusal> {
     let rest = verdict.trim().strip_prefix("refused (")?;
     let (id, why) = rest.split_once(')')?;
@@ -325,9 +306,12 @@ pub fn compare_noworse(name: &str, def: &MetricDef, pairs: &[(f64, f64)], margin
     // Oriented so that larger is worse.
     let (w_est, w_lo, w_hi) = if good_low { (c.estimate, c.lo, c.hi) } else { (-c.estimate, -c.hi, -c.lo) };
     if c.exact {
-        let (verdict, p) = if w_est <= margin_abs { (format!("no worse (≤{label}) (exact)"), 0.0) } else { (format!("worse (>{label}) (exact)"), 0.0) };
-        c.verdict = verdict;
-        c.p = p;
+        if w_est <= margin_abs {
+            c.set_verdict(VerdictKind::NoWorse, format!("no worse (≤{label}) (exact)"));
+        } else {
+            c.set_verdict(VerdictKind::Worse, format!("worse (>{label}) (exact)"));
+        }
+        c.p = 0.0;
         c.decided = true;
         return c;
     }
@@ -335,8 +319,8 @@ pub fn compare_noworse(name: &str, def: &MetricDef, pairs: &[(f64, f64)], margin
     c.p = wilcoxon_p(&d.iter().map(|x| x - shift).collect::<Vec<_>>());
     let covered = c.confidence + 1e-9 >= confidence;
     let n = d.len();
-    let (verdict, decided) = if n < 2 || !w_est.is_finite() || !covered {
-        ("unclear".to_string(), false)
+    let (kind, verdict) = if n < 2 || !w_est.is_finite() || !covered {
+        (VerdictKind::Unclear, "unclear".to_string())
     } else if w_hi < margin_abs {
         let tag = if w_hi < 0.0 {
             format!(", {}", def.words.0)
@@ -345,13 +329,14 @@ pub fn compare_noworse(name: &str, def: &MetricDef, pairs: &[(f64, f64)], margin
         } else {
             String::new()
         };
-        (format!("no worse (≤{label}{tag})"), true)
+        (VerdictKind::NoWorse, format!("no worse (≤{label}{tag})"))
     } else if w_lo > margin_abs {
-        (format!("worse (>{label})"), true)
+        (VerdictKind::Worse, format!("worse (>{label})"))
     } else {
-        ("unclear".to_string(), false)
+        (VerdictKind::Unclear, "unclear".to_string())
     };
-    c.verdict = verdict;
+    let decided = kind.decided();
+    c.set_verdict(kind, verdict);
     c.decided = decided;
     c.needed_pairs = (!decided && n >= 2).then(|| {
         let hw = (c.hi - c.lo) / 2.0;
@@ -412,7 +397,11 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
     if def.kind == Kind::Exact && finite.len() >= 2 && finite.iter().all(|p| p.0 == finite[0].0 && p.1 == finite[0].1) {
         let diff = head - base;
         let improved = (diff < 0.0) == (def.better == Better::Lower);
-        let verdict = if diff == 0.0 { "same (exact)".to_string() } else { format!("{} (exact)", if improved { def.words.0 } else { def.words.1 }) };
+        let (kind, verdict) = match (diff == 0.0, improved) {
+            (true, _) => (VerdictKind::Same, "same (exact)".to_string()),
+            (false, true) => (VerdictKind::Better, format!("{} (exact)", def.words.0)),
+            (false, false) => (VerdictKind::Worse, format!("{} (exact)", def.words.1)),
+        };
         let p = if diff == 0.0 { 1.0 } else { 0.0 };
         return Comparison {
             metric: name.to_string(),
@@ -427,10 +416,12 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
             p,
             bound: 0.0,
             verdict,
+            kind,
             decided: true,
             needed_pairs: None,
             exact: true,
             noworse: None,
+            refusal: None,
         };
     }
     let (est, lo, hi, achieved) = hodges_lehmann(&d, confidence);
@@ -441,18 +432,19 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
     let n = d.len();
     // Below 6 pairs no signed-rank interval reaches 95%: its [min, max] covers only 1 − 2^(1−n).
     let covered = achieved + 1e-9 >= confidence;
-    let (verdict, decided) = if n < 2 || !est.is_finite() || !covered {
-        ("unclear".to_string(), false)
+    let (kind, verdict) = if n < 2 || !est.is_finite() || !covered {
+        (VerdictKind::Unclear, "unclear".to_string())
     } else if hi < 0.0 || lo > 0.0 {
         let improved = (hi < 0.0) == good_low;
-        let word = if improved { def.words.0 } else { def.words.1 };
+        let (kind, word) = if improved { (VerdictKind::Better, def.words.0) } else { (VerdictKind::Worse, def.words.1) };
         let small = if hi < 0.0 { hi > -bound_abs } else { lo < bound_abs };
-        (if small { format!("{word} (small)") } else { word.to_string() }, true)
+        (kind, if small { format!("{word} (small)") } else { word.to_string() })
     } else if lo > -bound_abs && hi < bound_abs {
-        (format!("same (±{})", fmt_bound(bound, relative, bound_abs)), true)
+        (VerdictKind::Same, format!("same (±{})", fmt_bound(bound, relative, bound_abs)))
     } else {
-        ("unclear".to_string(), false)
+        (VerdictKind::Unclear, "unclear".to_string())
     };
+    let decided = kind.decided();
     let needed_pairs = (!decided && n >= 2).then(|| {
         let hw = (hi - lo) / 2.0;
         let dist_diff = est.abs();
@@ -461,7 +453,7 @@ pub fn compare(name: &str, def: &MetricDef, pairs: &[(f64, f64)], bound: f64, co
         let estimate = if dist <= 0.0 || hw <= 0.0 { usize::MAX } else { ((n as f64) * (hw / dist).powi(2)).ceil() as usize };
         estimate.max(min_pairs(confidence))
     });
-    Comparison { metric: name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, decided, needed_pairs, exact: false, noworse: None }
+    Comparison { metric: name.to_string(), n, base, head, estimate: est, lo, hi, relative, confidence: achieved, p, bound: bound_abs, verdict, kind, decided, needed_pairs, exact: false, noworse: None, refusal: None }
 }
 
 /// Pairs a verdict needs, projected from a robust spread of the differences so far (1.4826·MAD,

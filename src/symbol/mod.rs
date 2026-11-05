@@ -173,7 +173,8 @@ pub fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>>
             }
         }
     }
-    let servers: Vec<String> = crate::config::load(&crate::config::project_root(&std::env::current_dir().unwrap_or_default()))?["symbols"]["servers"]
+    // A view only reads: a strobe.json that does not load costs its symbol servers, not the view.
+    let servers: Vec<String> = crate::config::load(&crate::config::project_root(&std::env::current_dir().unwrap_or_default())).unwrap_or_default()["symbols"]["servers"]
         .as_array()
         .into_iter()
         .flatten()

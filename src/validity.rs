@@ -32,10 +32,11 @@ pub fn software_gpu(browser: &Browser) -> Result<crate::target::chromium::Gpu> {
 }
 
 /// `SoftwareGpu`'s one test, by adapter or renderer name: a software rasterizer (Microsoft Basic
-/// Render Driver, WARP, llvmpipe, lavapipe, softpipe, SwiftShader) describes no real device.
+/// Render Driver, WARP, llvmpipe, lavapipe, softpipe, SwiftShader, the Apple Software Renderer)
+/// describes no real device.
 pub fn is_software_gpu(name: &str) -> bool {
     let n = name.to_lowercase();
-    ["basic render", "warp", "llvmpipe", "lavapipe", "swiftshader", "softpipe"].iter().any(|s| n.contains(s))
+    ["basic render", "warp", "llvmpipe", "lavapipe", "swiftshader", "softpipe", "apple software renderer"].iter().any(|s| n.contains(s))
 }
 
 pub fn window_visible(page: &Page) -> Result<()> {

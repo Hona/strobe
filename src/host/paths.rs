@@ -44,21 +44,23 @@ pub fn sdk() -> PathBuf {
     sub("sdk")
 }
 
-/// Creates `dir` (and its parents) and makes it the user's alone on Linux and macOS, once per
-/// process: an older strobe made it with the umask's mode.
+/// Creates `dir` (its parents as the umask says) and makes it the user's alone on Linux and macOS:
+/// created `0700`, and an existing one (an older strobe made it with the umask's mode) that others
+/// may read is set to `0700` when it is seen.
 fn owner_only_dir(dir: &Path) {
-    let _ = std::fs::create_dir_all(dir);
     #[cfg(unix)]
     {
-        use std::collections::HashSet;
-        use std::os::unix::fs::PermissionsExt;
-        use std::sync::Mutex;
-        static DONE: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
-        let mut done = DONE.lock().unwrap_or_else(|e| e.into_inner());
-        if done.get_or_insert_with(HashSet::new).insert(dir.to_path_buf()) {
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        if let Some(parent) = dir.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::DirBuilder::new().mode(0o700).create(dir);
+        if std::fs::metadata(dir).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
             let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
         }
     }
+    #[cfg(not(unix))]
+    let _ = std::fs::create_dir_all(dir);
 }
 
 /// Writes `bytes` to `path` whole or not at all: into a temporary file beside it, flushed to disk,
@@ -66,16 +68,23 @@ fn owner_only_dir(dir: &Path) {
 /// On Windows a scanner that holds the old file open fails the rename for a moment: it is tried
 /// again for up to about 2.5 s.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    replace(path, bytes, false)
+    replace(path, bytes, 0o644)
 }
 
 /// `write_atomic` for a secret (a token): the file is `0600` from its creation on Linux and macOS.
 /// On Windows, files in the state folder inherit its user-only ACL.
 pub fn write_owner_only(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    replace(path, bytes, true)
+    replace(path, bytes, 0o600)
 }
 
-fn replace(path: &Path, bytes: &[u8], owner_only: bool) -> std::io::Result<()> {
+/// `write_atomic` for a program strobe runs (a downloaded engine): `0755` from its creation, so
+/// no moment exists where the file is there but cannot run.
+pub fn write_executable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    replace(path, bytes, 0o755)
+}
+
+/// `mode` is the Unix permission bits of the new file; Windows has none to set.
+fn replace(path: &Path, bytes: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let name = path.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
     let tmp = dir.join(format!(".{name}.{}-{}.tmp", std::process::id(), csprng_hex(4)?));
@@ -85,10 +94,10 @@ fn replace(path: &Path, bytes: &[u8], owner_only: bool) -> std::io::Result<()> {
         #[cfg(unix)]
         {
             use std::os::unix::fs::OpenOptionsExt;
-            o.mode(if owner_only { 0o600 } else { 0o644 });
+            o.mode(mode);
         }
         #[cfg(not(unix))]
-        let _ = owner_only;
+        let _ = mode;
         let mut f = o.open(&tmp)?;
         f.write_all(bytes)?;
         f.sync_all()

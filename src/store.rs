@@ -7,6 +7,7 @@ use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod ledger;
 
@@ -19,8 +20,10 @@ pub fn new_id(prefix: &str) -> String {
     let issued = issued.get_or_insert_with(HashSet::new);
     let roots = [paths::recordings(), paths::experiments()];
     loop {
-        // A counter stands in should the OS's random source ever fail: still unique in this process.
-        let hex = paths::csprng_hex(3).unwrap_or_else(|_| format!("{:06x}", (host::now_ns() as usize + issued.len()) & 0xFF_FFFF));
+        // A counter over the clock stands in should the OS's random source ever fail: each try draws
+        // another id, even within one clock tick.
+        static FALLBACK: AtomicU64 = AtomicU64::new(0);
+        let hex = paths::csprng_hex(3).unwrap_or_else(|_| format!("{:06x}", (host::now_ns() ^ FALLBACK.fetch_add(0x9E37_79B9, Ordering::Relaxed)) & 0xFF_FFFF));
         let id = format!("{prefix}_{hex}");
         if !roots.iter().any(|r| r.join(&id).exists()) && issued.insert(id.clone()) {
             return id;

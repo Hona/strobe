@@ -2,18 +2,25 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "result.v1.json",
   "title": "strobe experiment result.json",
-  "description": "experiments/<exp>/result.json and `strobe bench --json` (SPEC 14.2). strobe may add keys; readers ignore what they do not know. A verdict's words are for people: read verdict_kind and refusal.",
+  "description": "experiments/<exp>/result.json and `strobe bench --json` (SPEC 14.2). Comparisons and refusals are closed; elsewhere strobe may add keys and readers ignore what they do not know. A verdict's words are for people: read verdict_kind and refusal.",
   "type": "object",
   "required": ["id", "kind", "created"],
   "properties": {
     "id": { "type": "string", "description": "exp_ + 6 hex, or the name bench --id gave." },
     "kind": { "enum": ["experiment", "check", "pixels", "bisect"] },
     "file": { "type": "string", "description": "The bench file." },
+    "file_repo": { "type": ["string", "null"], "description": "The bench file's path in its repository." },
     "created": { "type": "string", "description": "ISO 8601 time, UTC." },
     "text": { "type": "string", "description": "The text output." },
+    "result": { "type": "string", "description": "--json only: the path of result.json." },
     "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
     "passed": { "type": "boolean", "description": "check: every case passed." },
     "env": { "type": "object", "description": "The device: OS, CPU, GPU, displays, power, strobe's build." },
+    "browser": { "type": ["string", "null"], "description": "The browser's version, for page targets." },
+    "gpu": { "type": ["object", "null"], "description": "The browser's GPU: devices, compositing, software." },
+    "window": { "type": ["object", "null"], "description": "The window's place and size: x, y, width, height." },
+    "refresh_hz": { "type": ["number", "null"] },
+    "args": { "type": ["object", "null"], "description": "The command line: command, flags, pos." },
     "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache." },
     "identity": { "type": ["object", "null"], "description": "What makes two experiments the same comparison (SPEC 14.2)." },
     "ledger": { "type": ["object", "null"], "description": "The other experiments on the same variants (SPEC 14.2)." },
@@ -25,6 +32,7 @@
           "role": { "enum": ["base", "head"] },
           "spec": { "type": "string" },
           "label": { "type": "string" },
+          "subject": {},
           "kind": { "enum": ["dir", "git", "url", "app", "exe"] },
           "commit": { "type": ["string", "null"] },
           "dirty": {}
@@ -41,9 +49,15 @@
       "description": "Why the bench ended early: its exit code (130 for a stop) and what did not run.",
       "properties": { "code": { "type": "integer" }, "why": { "type": "string" }, "not_run": { "type": "array", "items": { "type": "string" } } }
     },
+    "metric": { "type": "string", "description": "bisect: the primary it follows." },
+    "range": { "type": "string", "description": "bisect: good..bad as given." },
+    "good": { "type": "string", "description": "bisect: the first good commit." },
+    "commits": { "type": "array", "description": "bisect: the first-parent line from good to bad (commit, short, subject)." },
+    "remaining": { "type": ["object", "null"], "description": "bisect: where the culprit may still be (good, bad)." },
     "verdict": { "type": "string", "description": "bisect: found, no change, or unclear." },
+    "verdict_kind": { "$ref": "#/definitions/verdictKind", "description": "bisect: good against bad as step 0 found it, or unclear while undecided steps may hide the culprit." },
     "culprit": { "type": ["object", "null"], "description": "bisect: commit, short, subject." },
-    "steps": { "type": "array", "description": "bisect: one experiment per step." }
+    "steps": { "type": "array", "description": "bisect: one summary per step.", "items": { "$ref": "#/definitions/step" } }
   },
   "definitions": {
     "warning": {
@@ -84,20 +98,27 @@
         "NoInput"
       ]
     },
+    "verdictKind": {
+      "enum": ["better", "worse", "same", "no_worse", "unclear", "underpowered", "saturated", "stopped", "refused", "untested", "descriptive"],
+      "description": "untested: a secondary the gate did not test (shown as —); descriptive: shown, never decided (·). A leak verdict: worse leaks, same does not grow or levels off."
+    },
     "refusal": {
       "type": "object",
+      "additionalProperties": false,
       "required": ["validator", "summary"],
       "properties": {
         "validator": { "$ref": "#/definitions/validator" },
         "summary": { "type": "string" },
         "detail": { "type": "string" },
-        "fix": { "type": "string" }
+        "fix": { "type": "string" },
+        "hidden": { "enum": ["covered", "not_active", "other"], "description": "WindowHidden: how the window was hidden." }
       }
     },
     "comparison": {
       "description": "One metric, base against head over the pairs (SPEC 9.3).",
       "type": "object",
-      "required": ["metric", "n", "verdict", "verdict_kind", "decided"],
+      "additionalProperties": false,
+      "required": ["metric", "n", "base", "head", "estimate", "lo", "hi", "relative", "confidence", "p", "bound", "verdict", "verdict_kind", "decided", "needed_pairs"],
       "properties": {
         "metric": { "type": "string" },
         "n": { "type": "integer", "description": "Pairs compared." },
@@ -111,15 +132,54 @@
         "p": { "type": ["number", "null"] },
         "bound": { "type": ["number", "null"], "description": "The equivalence bound (or the no-worse margin), in the comparison's scale." },
         "verdict": { "type": "string", "description": "In words: faster (small), same (±2%), refused (TailTooShort): …" },
-        "verdict_kind": {
-          "enum": ["better", "worse", "same", "no_worse", "unclear", "underpowered", "saturated", "stopped", "refused", "untested", "descriptive"],
-          "description": "untested: a secondary the gate did not test (shown as —); descriptive: shown, never decided (·)."
-        },
+        "verdict_kind": { "$ref": "#/definitions/verdictKind" },
         "decided": { "type": "boolean" },
         "needed_pairs": { "type": ["integer", "null"] },
         "exact": { "const": true, "description": "A stable counter, compared exactly." },
         "noworse": { "type": "number", "description": "The no-worse margin." },
         "refusal": { "$ref": "#/definitions/refusal", "description": "When verdict_kind is refused: the validator and why." }
+      }
+    },
+    "leakPrimary": {
+      "description": "A leak series' primary: the head's growth verdict.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric", "verdict", "verdict_kind", "decided"],
+      "properties": {
+        "metric": { "enum": ["js.heap.growth", "memory.app.host"] },
+        "verdict": { "type": ["string", "null"] },
+        "verdict_kind": { "$ref": "#/definitions/verdictKind" },
+        "decided": { "type": ["boolean", "null"] }
+      }
+    },
+    "checkPrimary": {
+      "description": "A --check series' primary: only its name, since nothing is compared.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["metric"],
+      "properties": { "metric": { "type": "string" } }
+    },
+    "step": {
+      "description": "One bisect step: the experiment of commit against good, summarized.",
+      "type": "object",
+      "required": ["step", "good", "commit", "experiment", "metric", "verdict", "decided"],
+      "properties": {
+        "step": { "type": "integer" },
+        "good": { "type": "string" },
+        "commit": { "type": "string" },
+        "short": { "type": "string" },
+        "subject": { "type": "string" },
+        "experiment": { "type": "string" },
+        "series": { "type": "string" },
+        "metric": { "type": "string" },
+        "relative": { "type": ["boolean", "null"] },
+        "estimate": { "type": ["number", "null"] },
+        "lo": { "type": ["number", "null"] },
+        "hi": { "type": ["number", "null"] },
+        "verdict": { "type": "string" },
+        "verdict_kind": { "$ref": "#/definitions/verdictKind" },
+        "decided": { "type": "boolean" },
+        "pairs": { "type": ["integer", "null"] }
       }
     },
     "series": {
@@ -128,13 +188,10 @@
         "label": { "type": "string" },
         "case": { "type": "string" },
         "target": { "type": "string" },
-        "target_kind": { "type": "string" },
-        "kind": { "type": "string", "description": "runs or launch (a check or leak series says its own)." },
-        "params": { "type": "object" },
-        "primary": {
-          "description": "experiment: the primary's comparison; check: only its metric.",
-          "anyOf": [{ "$ref": "#/definitions/comparison" }, { "type": "object", "properties": { "metric": { "type": "string" } } }]
-        },
+        "target_kind": {},
+        "kind": { "type": "string", "description": "runs, launch or leak." },
+        "params": { "type": ["object", "null"] },
+        "primary": { "oneOf": [{ "$ref": "#/definitions/comparison" }, { "$ref": "#/definitions/leakPrimary" }, { "$ref": "#/definitions/checkPrimary" }] },
         "secondaries": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "descriptive": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "decided": { "type": "boolean" },
@@ -144,6 +201,12 @@
         "stopped": { "type": "string", "description": "Why the series ended: primary decided, max pairs, max time, …" },
         "bound": { "type": "number" },
         "noworse": { "type": "object", "additionalProperties": { "type": "number" } },
+        "holm_pairs": { "type": ["integer", "null"] },
+        "warmup_blocks": {},
+        "warmup_ms": {},
+        "steps": { "description": "Mean wall time per step of a block, in order." },
+        "elapsed_ms": { "type": "number" },
+        "waited_ms": { "type": "number" },
         "blocks": {
           "type": "array",
           "items": {
@@ -151,7 +214,7 @@
             "properties": {
               "variant": { "enum": ["base", "head"] },
               "pair": { "type": "integer" },
-              "values": { "type": "object", "additionalProperties": { "type": "number" } },
+              "values": { "type": "object", "additionalProperties": { "type": ["number", "null"] } },
               "refused": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Metrics the block refused: \"<validator>: <why>\"." },
               "recording": { "type": ["string", "null"] },
               "locked": { "type": "boolean" }
@@ -159,12 +222,24 @@
           }
         },
         "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
+        "attribution": { "type": ["object", "string", "null"], "description": "The attribution recording per variant (check: the one recording)." },
+        "timing_recordings": { "type": "array" },
+        "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base, head, changed." },
+        "pixels": { "description": "--pixels: per snapshot, whether base and head drew the same pixels." },
+        "leak": { "type": "object", "description": "A leak series: growth verdicts per variant (js_heap, dom_nodes or native_host, each with verdict and verdict_kind)." },
+        "runs_per_half": { "type": "integer" },
         "halt": { "type": ["object", "null"], "properties": { "code": { "type": "integer" }, "message": { "type": "string" } } },
+        "not_run": { "type": "boolean" },
         "passed": { "type": "boolean", "description": "check: the case ran." },
+        "declared": { "type": "array", "items": { "type": "string" }, "description": "check: the metrics the case declared." },
         "values": { "type": ["object", "null"], "description": "check: one run's values." },
-        "refused": { "type": ["object", "null"], "description": "check: metrics the run refused." },
+        "refused": { "type": ["object", "null"], "description": "check: metrics the run refused, \"<validator>: <why>\"." },
         "error": { "type": ["string", "null"] },
-        "hint": { "type": ["string", "null"] }
+        "hint": { "type": ["string", "null"] },
+        "log": { "type": "array", "items": { "type": "string" } },
+        "log_path": { "type": "string" },
+        "session_locked": { "type": "boolean" },
+        "screen": { "type": ["object", "null"] }
       }
     }
   }

@@ -746,7 +746,7 @@ fn runs(
 fn native_leak(readings: &[memory::Reading], n: usize) -> Value {
     let complete = readings.iter().all(memory::Reading::complete) && !readings.is_empty();
     if !complete {
-        return json!({ "native_host": { "verdict": format!("unclear: no complete memory reading ({})", memory::why_empty()), "decided": false }, "runs": 2 * n });
+        return json!({ "native_host": { "verdict": format!("unclear: no complete memory reading ({})", memory::why_empty()), "verdict_kind": crate::model::VerdictKind::Unclear, "decided": false }, "runs": 2 * n });
     }
     let host: Vec<f64> = readings.iter().map(|r| r.host() as f64).collect();
     let private: Vec<f64> = readings.iter().map(|r| r.processes.iter().map(|m| m.private).sum::<u64>() as f64).collect();

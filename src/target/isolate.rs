@@ -121,6 +121,7 @@ pub fn build_for_os(build: &Value) -> Value {
 
 /// The app profile `id` from `config["apps"]`, following `extends`.
 pub fn app(id: &str, config: &Value) -> Result<App> {
+    crate::config::check_app(config, id)?;
     let apps = config["apps"].as_object().cloned().unwrap_or_default();
     let known = || apps.keys().cloned().collect::<Vec<_>>().join(", ");
     let mut chain = vec![apps.get(id).cloned().ok_or_else(|| Error::usage(format!("no app profile \"{id}\" in strobe.json apps (known: {})", if apps.is_empty() { "none".into() } else { known() })))?];

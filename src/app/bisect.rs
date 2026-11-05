@@ -3,7 +3,7 @@
 use super::{Output, fmt, progress};
 use crate::cli::Args;
 use crate::config;
-use crate::model::{Error, Result};
+use crate::model::{Error, Result, VerdictKind};
 use crate::store;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -80,9 +80,11 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     };
     // Where the culprit may still be: from the first undecided step's `good` (or the last `good`) to `bad`.
     let remaining = culprit.as_ref().map(|_| json!({ "good": undecided.first().map_or(&good, |u| &u.1), "bad": bad }));
+    // Good against bad, as step 0 found it; a culprit that more pairs must still settle is unclear.
+    let verdict_kind = if culprit.is_some() && !undecided.is_empty() { json!(VerdictKind::Unclear) } else { steps[0]["verdict_kind"].clone() };
     let result = json!({
         "id": id, "kind": "bisect", "file": file, "range": range, "created": super::record::now_iso(),
-        "metric": steps[0]["metric"], "series": steps[0]["series"], "steps": steps, "culprit": culprit, "verdict": verdict,
+        "metric": steps[0]["metric"], "series": steps[0]["series"], "steps": steps, "culprit": culprit, "verdict": verdict, "verdict_kind": verdict_kind,
         "good": first_good, "commits": line, "remaining": remaining,
     });
     let text = text(&result);
@@ -123,7 +125,7 @@ fn step_json(out: &Output, root: &Path, k: usize, base: &str, head: &str) -> Res
     let s = json!({
         "step": k, "good": base, "commit": head, "short": short(head), "subject": subject(root, head),
         "experiment": out.json["id"], "series": series[0]["label"], "metric": p["metric"], "relative": p["relative"],
-        "estimate": p["estimate"], "lo": p["lo"], "hi": p["hi"], "verdict": p["verdict"], "decided": p["decided"], "pairs": series[0]["pairs"],
+        "estimate": p["estimate"], "lo": p["lo"], "hi": p["hi"], "verdict": p["verdict"], "verdict_kind": p["verdict_kind"], "decided": p["decided"], "pairs": series[0]["pairs"],
     });
     progress(format!("  {}  {}", change(&s), s["verdict"].as_str().unwrap_or("")));
     Ok(s)

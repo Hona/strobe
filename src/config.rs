@@ -1,8 +1,9 @@
 //! `strobe.json`: the project's file, over the user's own (SPEC §9.5). Read strictly: a file that
-//! does not parse, or a key strobe does not read (a typo would be silently ignored), fails with
-//! where it is.
+//! does not parse, a key strobe does not read, or a value of the wrong type (a typo or a guard
+//! written as an object would be silently ignored) fails with where it is.
 
 use crate::host;
+use crate::jsonc::{self, Seg};
 use crate::model::{Error, Result};
 use serde_json::{Map, Value};
 use std::path::{Path, PathBuf};
@@ -18,12 +19,38 @@ pub fn project_root(dir: &Path) -> PathBuf {
 }
 
 /// The project's strobe.json over the user's (`<state>/strobe.json`). `apps` merge per app, so a
-/// user can keep profiles for apps they measure from anywhere. Either file failing to parse, or
-/// naming a key strobe does not read, is a usage error (exit 2) with its path, line and column.
+/// user can keep profiles for apps they measure from anywhere. The project's file is checked whole:
+/// anything wrong in it is a usage error (exit 2) with its path, line and column. The user's file
+/// serves every repository on the machine, so a problem in one of its app profiles fails only when
+/// that profile is used (`check_app`), and a key it does not know elsewhere only warns.
 pub fn load(root: &Path) -> Result<Value> {
-    let user = read(&host::paths::state_dir().join("strobe.json"))?;
-    let project = read(&root.join("strobe.json"))?;
-    let mut out = user;
+    let user_path = host::paths::state_dir().join("strobe.json");
+    let (mut out, problems) = read(&user_path)?;
+    for p in problems {
+        match p.path.as_slice() {
+            [Seg::Key(apps), Seg::Key(id), ..] if apps == "apps" => {
+                if let Some(slot) = out.get_mut("apps").and_then(Value::as_object_mut).and_then(|a| a.get_mut(id)) {
+                    if !slot.is_object() {
+                        *slot = Value::Object(Map::new());
+                    }
+                    if slot.get(INVALID).is_none() {
+                        slot[INVALID] = Value::String(p.message);
+                    }
+                }
+            }
+            _ if p.unknown => eprintln!("strobe: warning: {}; strobe ignores it", p.message),
+            _ => return Err(p.error("")),
+        }
+    }
+    let (project, problems) = read(&root.join("strobe.json"))?;
+    let more = match problems.len() {
+        0 | 1 => String::new(),
+        2 => "; 1 more problem".to_string(),
+        n => format!("; {} more problems", n - 1),
+    };
+    if let Some(p) = problems.into_iter().next() {
+        return Err(p.error(&more));
+    }
     let mut apps = out.remove("apps").and_then(|a| a.as_object().cloned()).unwrap_or_default();
     for (k, v) in project {
         if k == "apps" {
@@ -36,112 +63,270 @@ pub fn load(root: &Path) -> Result<Value> {
     Ok(Value::Object(out))
 }
 
-/// One strobe.json, checked; an absent file is empty.
-fn read(path: &Path) -> Result<Map<String, Value>> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Ok(Map::new()) };
-    // Some Windows editors begin UTF-8 with a byte-order mark, which JSON does not allow.
-    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+/// Where `load` keeps a user profile's problem until the profile is used.
+const INVALID: &str = "$invalid";
+
+/// Fails when app profile `id`, or one it extends, came from the user's strobe.json with a problem.
+pub fn check_app(config: &Value, id: &str) -> Result<()> {
+    let mut at = id.to_string();
+    for _ in 0..9 {
+        let p = &config["apps"][&at];
+        if let Some(why) = p[INVALID].as_str() {
+            return Err(Error::usage(why.to_string()).hint(format!("fix app profile \"{at}\" in your own strobe.json, or run strobe update if strobe gained the key in a newer release")));
+        }
+        match p["extends"].as_str() {
+            Some(parent) => at = parent.to_string(),
+            None => break,
+        }
+    }
+    Ok(())
+}
+
+/// What is wrong at one place of a strobe.json, said with its path, line and column.
+struct Problem {
+    path: Vec<Seg>,
+    /// A key strobe does not read, rather than a value of the wrong type or a missing key.
+    unknown: bool,
+    message: String,
+    hint: Option<String>,
+}
+
+impl Problem {
+    fn error(self, more: &str) -> Error {
+        let e = Error::usage(format!("{}{more}", self.message));
+        match self.hint {
+            Some(h) => e.hint(h),
+            None => e,
+        }
+    }
+}
+
+/// One strobe.json, parsed; an absent file is empty. A file that does not parse fails here; what
+/// parses but is wrong comes back as problems, first in file order.
+fn read(path: &Path) -> Result<(Map<String, Value>, Vec<Problem>)> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Ok((Map::new(), Vec::new())) };
+    let json = jsonc::strip(&text);
     let at = |line: usize, col: usize| format!("{}:{line}:{col}", path.display());
-    let value: Value = serde_json::from_str(&strip_jsonc(text)).map_err(|e| {
+    let value: Value = serde_json::from_str(&json).map_err(|e| {
         let why = e.to_string();
         Error::usage(format!("{}: {}", at(e.line(), e.column()), why.split(" at line ").next().unwrap_or(&why)))
     })?;
-    let mut unknown = Vec::new();
-    check(&value, &TOP, "", &mut unknown);
+    let mut found = Vec::new();
+    check(&value, &TOP, &mut Vec::new(), &mut found);
+    let mut problems: Vec<(usize, Problem)> = found
+        .into_iter()
+        .map(|f| {
+            let offset = jsonc::offset(&json, &f.path).unwrap_or(0);
+            let (line, col) = jsonc::line_col(&json, offset);
+            let message = format!("{}: {}", at(line, col), f.what);
+            (offset, Problem { path: f.path, unknown: f.unknown, message, hint: (!f.hint.is_empty()).then_some(f.hint) })
+        })
+        .collect();
+    problems.sort_by_key(|p| p.0);
     let Value::Object(map) = value else { return Err(Error::usage(format!("{}: strobe.json is one JSON object", at(1, 1)))) };
-    if let Some((key, place, known)) = unknown.first() {
-        let (line, col) = locate(text, key);
-        let near = suggest(key, known).map(|k| format!(" (did you mean \"{k}\"?)")).unwrap_or_default();
-        let more = match unknown.len() - 1 {
-            0 => String::new(),
-            1 => "; 1 more unknown key".to_string(),
-            n => format!("; {n} more unknown keys"),
-        };
-        return Err(Error::usage(format!("{}: strobe reads no key \"{key}\" in {place}{near}{more}", at(line, col))).hint(format!("keys there: {}", known.join(", "))));
-    }
-    Ok(map)
+    Ok((map, problems.into_iter().map(|p| p.1).collect()))
 }
 
 /// What strobe reads at one place of strobe.json.
 enum Shape {
-    /// An object with these keys only.
+    /// An object with these keys only; `Req` marks the ones it must have.
     Keys(&'static [(&'static str, Shape)]),
     /// An object whose keys are names the user picks (app ids), each holding this shape.
     Named(&'static Shape),
     /// An array of this shape.
     List(&'static Shape),
-    /// A value strobe takes as a whole (a string, a path per OS, an env map, a seed file's contents).
-    Any,
+    Req(&'static Shape),
+    Str,
+    Bool,
+    /// An array of strings.
+    Strings,
+    /// An object of strings (an environment).
+    StrMap,
+    /// An object strobe takes whole (a home's seed files).
+    Object,
+    /// A path, or one per OS (`{ "windows": …, "macos": …, "linux": … }`).
+    PerOs,
+    Enum(&'static [&'static str]),
+    /// A percentage as text: `"2%"` or `"2"`.
+    Percent,
 }
 
-use Shape::{Any, Keys, List, Named};
+use Shape::{Bool, Enum, Keys, List, Named, Object, PerOs, Percent, Req, Str, StrMap, Strings};
 
-const BUILD_OS: Shape = Keys(&[("command", Any), ("cwd", Any), ("output", Any), ("env", Any)]);
-const GUARD: Shape = Keys(&[("file", Any), ("pid", Any), ("url", Any), ("os", Any)]);
+const OSES: &[&str] = &["windows", "macos", "linux"];
+const BUILD_OS: Shape = Keys(&[("command", Str), ("cwd", Str), ("output", PerOs), ("env", StrMap)]);
+const GUARD: Shape = Keys(&[("file", Req(&Str)), ("pid", Str), ("url", Str), ("os", Enum(OSES))]);
 const APP: Shape = Keys(&[
-    ("exe", Any),
-    ("extends", Any),
-    ("kind", Any),
-    ("env", Any),
-    ("unset", Any),
-    ("dirs", Any),
-    ("files", Any),
+    ("exe", PerOs),
+    ("extends", Str),
+    ("kind", Enum(&["electron", "native"])),
+    ("env", StrMap),
+    ("unset", Strings),
+    ("dirs", Strings),
+    ("files", Object),
     ("guard", List(&GUARD)),
-    ("protocols", Any),
-    ("args", Any),
-    ("window", Any),
-    ("moved", Any),
-    ("gpuCache", Any),
+    ("protocols", Strings),
+    ("args", Strings),
+    ("window", Bool),
+    ("moved", Strings),
+    ("gpuCache", Enum(&["warm", "cold"])),
 ]);
 const TOP: Shape = Keys(&[
-    ("$schema", Any),
-    ("build", Keys(&[("command", Any), ("cwd", Any), ("output", Any), ("env", Any), ("windows", BUILD_OS), ("macos", BUILD_OS), ("linux", BUILD_OS)])),
-    ("serve", Keys(&[("command", Any), ("cwd", Any), ("ready", Any), ("dir", Any)])),
+    ("$schema", Str),
+    ("build", Keys(&[("command", Str), ("cwd", Str), ("output", PerOs), ("env", StrMap), ("windows", BUILD_OS), ("macos", BUILD_OS), ("linux", BUILD_OS)])),
+    ("serve", Keys(&[("command", Str), ("cwd", Str), ("ready", Str), ("dir", Str)])),
     ("apps", Named(&APP)),
-    ("benches", Any),
-    ("metrics", Keys(&[("equivalence", Any)])),
-    ("packages", Keys(&[("groups", Any)])),
-    ("harness", Any),
-    ("symbols", Keys(&[("servers", Any)])),
+    // Reserved: the project's bench files, for tools; strobe does not read it yet (SPEC 9.5).
+    ("benches", Strings),
+    ("metrics", Keys(&[("equivalence", Percent)])),
+    ("harness", Strings),
+    ("symbols", Keys(&[("servers", Strings)])),
 ]);
 
-/// Collects `(key, where, the keys known there)` for every key `shape` does not have.
-fn check(v: &Value, shape: &Shape, place: &str, out: &mut Vec<(String, String, Vec<&'static str>)>) {
-    let here = |k: &str| if place.is_empty() { k.to_string() } else { format!("{place}.{k}") };
+struct Found {
+    path: Vec<Seg>,
+    unknown: bool,
+    what: String,
+    hint: String,
+}
+
+fn place(path: &[Seg]) -> String {
+    let mut s = String::new();
+    for seg in path {
+        match seg {
+            Seg::Key(k) if s.is_empty() => s += k,
+            Seg::Key(k) => s += &format!(".{k}"),
+            Seg::Index(i) => s += &format!("[{i}]"),
+        }
+    }
+    if s.is_empty() { "strobe.json".into() } else { s }
+}
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "true or false",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "an array",
+        Value::Object(_) => "an object",
+    }
+}
+
+fn expected(shape: &Shape) -> String {
+    match shape {
+        Keys(keys) => format!("an object ({})", keys.iter().map(|k| k.0).collect::<Vec<_>>().join(", ")),
+        Named(_) | Object => "an object".into(),
+        List(_) => "an array".into(),
+        Req(inner) => expected(inner),
+        Str => "a string".into(),
+        Bool => "true or false".into(),
+        Strings => "an array of strings".into(),
+        StrMap => "an object of strings".into(),
+        PerOs => "a path, or one per OS ({ \"windows\": …, \"macos\": …, \"linux\": … })".into(),
+        Enum(names) => format!("one of {}", names.iter().map(|n| format!("\"{n}\"")).collect::<Vec<_>>().join(", ")),
+        Percent => "a percentage such as \"2%\"".into(),
+    }
+}
+
+/// Collects every problem of `v` against `shape` at `path`.
+fn check(v: &Value, shape: &Shape, path: &mut Vec<Seg>, out: &mut Vec<Found>) {
+    let ok = match (shape, v) {
+        (Req(inner), _) => return check(v, inner, path, out),
+        (Keys(_) | Named(_) | Object | StrMap, Value::Object(_)) | (List(_) | Strings, Value::Array(_)) | (Str | Enum(_) | Percent, Value::String(_)) | (Bool, Value::Bool(_)) => true,
+        (PerOs, Value::String(_) | Value::Object(_)) => true,
+        _ => false,
+    };
+    if !ok {
+        return wrong(out, path, format!("{} must be {}, not {}", place(path), expected(shape), type_name(v)));
+    }
     match (shape, v) {
         (Keys(keys), Value::Object(m)) => {
             for (k, x) in m {
+                path.push(Seg::Key(k.clone()));
                 match keys.iter().find(|(name, _)| name == k) {
-                    Some((_, inner)) => check(x, inner, &here(k), out),
-                    None => out.push((k.clone(), if place.is_empty() { "strobe.json".into() } else { place.to_string() }, keys.iter().map(|(n, _)| *n).collect())),
+                    Some((_, inner)) => check(x, inner, path, out),
+                    None => unknown(k, &place(&path[..path.len() - 1]), &keys.iter().map(|k| k.0).collect::<Vec<_>>(), path, out),
+                }
+                path.pop();
+            }
+            for (name, inner) in keys.iter() {
+                if matches!(inner, Req(_)) && !m.contains_key(*name) {
+                    wrong(out, path, format!("{} needs \"{name}\"", place(path)));
                 }
             }
         }
-        (Named(inner), Value::Object(m)) => m.iter().for_each(|(k, x)| check(x, inner, &here(k), out)),
-        (List(inner), Value::Array(a)) => a.iter().enumerate().for_each(|(i, x)| check(x, inner, &format!("{place}[{i}]"), out)),
+        (Named(inner), Value::Object(m)) => m.iter().for_each(|(k, x)| {
+            path.push(Seg::Key(k.clone()));
+            check(x, inner, path, out);
+            path.pop();
+        }),
+        (List(inner), Value::Array(a)) => a.iter().enumerate().for_each(|(i, x)| {
+            path.push(Seg::Index(i));
+            check(x, inner, path, out);
+            path.pop();
+        }),
+        (Strings, Value::Array(a)) => {
+            if let Some(i) = a.iter().position(|x| !x.is_string()) {
+                path.push(Seg::Index(i));
+                wrong(out, path, format!("{} must be a string, not {}", place(path), type_name(&a[i])));
+                path.pop();
+            }
+        }
+        (StrMap, Value::Object(m)) => {
+            if let Some((k, x)) = m.iter().find(|(_, x)| !x.is_string()) {
+                path.push(Seg::Key(k.clone()));
+                wrong(out, path, format!("{} must be a string, not {}", place(path), type_name(x)));
+                path.pop();
+            }
+        }
+        (PerOs, Value::Object(m)) => {
+            for (k, x) in m {
+                path.push(Seg::Key(k.clone()));
+                if !OSES.contains(&k.as_str()) {
+                    unknown(k, &place(&path[..path.len() - 1]), OSES, path, out);
+                } else if !x.is_string() {
+                    wrong(out, path, format!("{} must be a path, not {}", place(path), type_name(x)));
+                }
+                path.pop();
+            }
+        }
+        (Enum(names), Value::String(s)) if !names.contains(&s.as_str()) => wrong(out, path, format!("{} must be {}, not \"{s}\"", place(path), expected(shape))),
+        (Percent, Value::String(s)) if !s.trim_end_matches('%').parse::<f64>().is_ok_and(|x| x.is_finite() && x >= 0.0) => {
+            wrong(out, path, format!("{} must be {}, not \"{s}\"", place(path), expected(shape)))
+        }
         _ => {}
     }
 }
 
-/// The line and column of `"key":` in the file, for the message (1, 1 when not found).
-fn locate(text: &str, key: &str) -> (usize, usize) {
-    let needle = serde_json::to_string(key).unwrap_or_default();
-    let mut from = 0;
-    while let Some(i) = text[from..].find(&needle).map(|i| i + from) {
-        if text[i + needle.len()..].trim_start().starts_with(':') {
-            let line = text[..i].matches('\n').count() + 1;
-            let col = i - text[..i].rfind('\n').map_or(0, |n| n + 1) + 1;
-            return (line, col);
-        }
-        from = i + needle.len();
-    }
-    (1, 1)
+fn wrong(out: &mut Vec<Found>, path: &[Seg], what: String) {
+    out.push(Found { path: path.to_vec(), unknown: false, what, hint: String::new() });
 }
 
-/// The known key closest to a mistyped one: other case, or at most two edits away.
+fn unknown(key: &str, place: &str, known: &[&str], path: &[Seg], out: &mut Vec<Found>) {
+    let near = suggest(key, known).map(|k| format!(" (did you mean \"{k}\"?)")).unwrap_or_default();
+    out.push(Found {
+        path: path.to_vec(),
+        unknown: true,
+        what: format!("strobe reads no key \"{key}\" in {place}{near}"),
+        hint: format!("keys there: {}; or run strobe update if the key came with a newer release", known.join(", ")),
+    });
+}
+
+/// The known key closest to a mistyped one: other case, an OS's other name, or at most two edits away.
 fn suggest<'a>(key: &str, known: &[&'a str]) -> Option<&'a str> {
     let lower = key.to_lowercase();
-    known.iter().map(|k| (if k.to_lowercase() == lower { 0 } else { edits(&lower, &k.to_lowercase()) }, *k)).filter(|(d, _)| *d <= 2).min_by_key(|(d, _)| *d).map(|(_, k)| k)
+    let alias = match lower.as_str() {
+        "darwin" | "mac" | "osx" => "macos",
+        "win32" | "win" | "win64" => "windows",
+        other => other,
+    };
+    known
+        .iter()
+        .map(|k| (if k.to_lowercase() == alias { 0 } else { edits(&lower, &k.to_lowercase()) }, *k))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
 }
 
 fn edits(a: &str, b: &str) -> usize {
@@ -157,60 +342,4 @@ fn edits(a: &str, b: &str) -> usize {
         }
     }
     row[b.len()]
-}
-
-/// JSON with comments: `//` and `/* */` comments and trailing commas become spaces, outside
-/// strings only, so line and column in a parse error are the file's own.
-fn strip_jsonc(t: &str) -> String {
-    let b = t.as_bytes();
-    let mut out = b.to_vec();
-    let blank = |out: &mut Vec<u8>, i: usize| {
-        if out[i] != b'\n' && out[i] != b'\r' {
-            out[i] = b' ';
-        }
-    };
-    let mut i = 0;
-    let mut in_string = false;
-    while i < b.len() {
-        let c = b[i];
-        if in_string {
-            match c {
-                b'\\' => i += 1,
-                b'"' => in_string = false,
-                _ => {}
-            }
-        } else if c == b'"' {
-            in_string = true;
-        } else if let Some(end) = skip_comment(b, i) {
-            for k in i..end {
-                blank(&mut out, k);
-            }
-            i = end;
-            continue;
-        } else if c == b',' {
-            // A comma whose next significant byte closes the object or array.
-            let mut k = i + 1;
-            while k < b.len() && (b[k].is_ascii_whitespace() || starts_comment(b, k)) {
-                k = skip_comment(b, k).unwrap_or(k + 1);
-            }
-            if matches!(b.get(k), Some(b'}' | b']')) {
-                out[i] = b' ';
-            }
-        }
-        i += 1;
-    }
-    // Only ASCII bytes were replaced, by ASCII: the text is still UTF-8.
-    String::from_utf8(out).unwrap_or_else(|_| t.to_string())
-}
-
-fn starts_comment(b: &[u8], i: usize) -> bool {
-    b[i] == b'/' && matches!(b.get(i + 1), Some(b'/' | b'*'))
-}
-
-/// The index after the comment starting at `i`.
-fn skip_comment(b: &[u8], i: usize) -> Option<usize> {
-    if !starts_comment(b, i) {
-        return None;
-    }
-    if b[i + 1] == b'/' { Some(b[i..].iter().position(|&c| c == b'\n').map_or(b.len(), |p| i + p)) } else { Some(b[i + 2..].windows(2).position(|w| w == b"*/").map_or(b.len(), |p| i + 2 + p + 2)) }
 }

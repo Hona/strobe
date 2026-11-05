@@ -6,7 +6,7 @@ use crate::config;
 use crate::driver::Driver;
 use crate::host;
 use crate::metrics;
-use crate::model::{self, Error, MetricDef, Result};
+use crate::model::{self, Error, MetricDef, Refusal, Result, ValidatorId, VerdictKind};
 use crate::png;
 use crate::probe::{self, Set};
 use crate::runner::Runner;
@@ -1104,7 +1104,7 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     let head = &leak["head"][part];
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak",
-        "primary": { "metric": metric, "verdict": head["verdict"], "decided": head["decided"] },
+        "primary": { "metric": metric, "verdict": head["verdict"], "verdict_kind": head["verdict_kind"], "decided": head["decided"] },
         "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
         "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
     }))
@@ -1406,23 +1406,28 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let primary_decided = stopped == "primary decided" && pairs.len() >= min_pairs;
     let mut primary = primary;
     if !primary_decided {
-        primary.verdict = match stopped.as_str() {
-            "saturated" => format!(
-                "saturated: base {} and head {} sit near the ceiling, where the builds cannot differ; choose another primary (main.work, cpu.work)",
-                fmt::value(primary.base, def.unit),
-                fmt::value(primary.head, def.unit)
+        let (kind, verdict) = match stopped.as_str() {
+            "saturated" => (
+                VerdictKind::Saturated,
+                format!(
+                    "saturated: base {} and head {} sit near the ceiling, where the builds cannot differ; choose another primary (main.work, cpu.work)",
+                    fmt::value(primary.base, def.unit),
+                    fmt::value(primary.head, def.unit)
+                ),
             ),
-            "stopped" => format!("stopped after {} pair{}: no verdict (resume to finish)", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
-            s if s.starts_with("failed") => format!("unclear: {} pair{}, then the bench failed", pairs.len(), if pairs.len() == 1 { "" } else { "s" }),
+            "stopped" => (VerdictKind::Stopped, format!("stopped after {} pair{}: no verdict (resume to finish)", pairs.len(), if pairs.len() == 1 { "" } else { "s" })),
+            s if s.starts_with("failed") => (VerdictKind::Unclear, format!("unclear: {} pair{}, then the bench failed", pairs.len(), if pairs.len() == 1 { "" } else { "s" })),
             "more pairs cannot decide it" | "max pairs" | "max time" => match primary.needed_pairs {
-                Some(n) if n != usize::MAX && n > pairs.len() => format!("underpowered: ~{n} pairs needed"),
-                _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => {
-                    format!("unclear after {} pairs, the last planned look: the difference sits on the {}", pairs.len(), if margin.is_some() { "margin" } else { "equivalence bound" })
-                }
-                _ => "unclear".into(),
+                Some(n) if n != usize::MAX && n > pairs.len() => (VerdictKind::Underpowered, format!("underpowered: ~{n} pairs needed")),
+                _ if stopped == "max pairs" && ctx.args.get("pairs").is_none() => (
+                    VerdictKind::Unclear,
+                    format!("unclear after {} pairs, the last planned look: the difference sits on the {}", pairs.len(), if margin.is_some() { "margin" } else { "equivalence bound" }),
+                ),
+                _ => (VerdictKind::Unclear, "unclear".into()),
             },
-            _ => "unclear".into(),
+            _ => (VerdictKind::Unclear, "unclear".into()),
         };
+        primary.set_verdict(kind, verdict);
     }
     // Tail percentiles need enough frames in every block.
     let primary = tail_check(def, &blocks, primary);
@@ -1459,7 +1464,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let directional = if c.noworse.is_some() { c.decided } else { c.lo > 0.0 || c.hi < 0.0 };
         let keep = primary_decided && ((rej && directional) || c.verdict.starts_with("same"));
         if !keep {
-            c.verdict = "—".into();
+            c.set_verdict(VerdictKind::Untested, "—");
             c.decided = false;
         }
     }
@@ -1481,7 +1486,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
         let mut c = tail_check(d, &blocks, stats::compare(name, d, &pp, bound, 0.95));
         if !c.verdict.starts_with("refused") {
-            c.verdict = "·".into();
+            c.set_verdict(VerdictKind::Descriptive, "·");
         }
         c.decided = false;
         descriptive.push(c);
@@ -1501,13 +1506,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut primary = primary;
     let mut primary_decided = primary_decided;
     if session == "mixed" {
-        let why = format!("refused (SessionLocked): {locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len());
-        primary.verdict = why.clone();
-        primary.decided = false;
+        let why = Refusal::new(ValidatorId::SessionLocked, format!("{locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len()));
+        primary.refuse(why.clone());
         primary_decided = false;
         for c in secondaries.iter_mut().chain(descriptive.iter_mut()) {
-            c.verdict = why.clone();
-            c.decided = false;
+            c.refuse(why.clone());
         }
         warnings.push(validity::warn("SessionLocked", format!("{locked_pairs} of {} pairs ran on a locked screen and the rest unlocked: nothing is decided; rerun in one state", pairs.len())));
     } else if session == "locked" {
@@ -1706,8 +1709,7 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
     if def.min_n > 1 {
         let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
         if least < def.min_n {
-            c.verdict = format!("refused (TailTooShort): {least} {what} < {}", def.min_n);
-            c.decided = false;
+            c.refuse(Refusal::new(ValidatorId::TailTooShort, format!("{least} {what} < {}", def.min_n)));
         }
     }
     c
@@ -1734,9 +1736,14 @@ fn why_view(kind: &Value) -> &'static str {
 /// A metric a block refused: `why` is "<validator>: <reason>".
 fn refused(name: &str, def: &MetricDef, why: &str) -> Comparison {
     let mut c = stats::compare(name, def, &[], 0.0, 0.95);
-    let (id, text) = why.split_once(": ").unwrap_or((why, ""));
-    c.verdict = format!("refused ({id}): {text}");
-    c.decided = false;
+    match Refusal::from_line(why) {
+        Some(r) => c.refuse(r),
+        None => {
+            let (id, text) = why.split_once(": ").unwrap_or((why, ""));
+            c.set_verdict(VerdictKind::Refused, format!("refused ({id}): {text}"));
+            c.decided = false;
+        }
+    }
     c
 }
 
@@ -1877,20 +1884,21 @@ fn leak_analysis(census: &[Value], dir: &Path, n: usize) -> Result<Value> {
 /// Growth per run of one census series against `bound` (per run): "leaks" when the whole interval
 /// is above it and the last N runs still grow; "grows, then levels off" when only the first N do.
 fn growth(ys: &[f64], n: usize, bound: f64, show: &dyn Fn(f64) -> String) -> Value {
-    let Some((slope, lo, hi)) = stats::theil_sen(ys, 0.95) else { return json!({ "verdict": "unclear: too few censuses", "decided": false }) };
+    let Some((slope, lo, hi)) = stats::theil_sen(ys, 0.95) else { return json!({ "verdict": "unclear: too few censuses", "verdict_kind": VerdictKind::Unclear, "decided": false }) };
     let mid = n.min(ys.len().saturating_sub(1));
     let half = |h: &[f64]| stats::theil_sen(h, 0.95).map_or(f64::NAN, |x| x.0);
     let (first, second) = (half(&ys[..=mid]), half(&ys[mid..]));
-    let (verdict, decided) = if lo > bound && second > bound {
-        (format!("leaks {}/run", show(slope)), true)
+    // As kinds: a leak is worse; no growth, or growth that levels off, is the same (not a leak).
+    let (kind, verdict) = if lo > bound && second > bound {
+        (VerdictKind::Worse, format!("leaks {}/run", show(slope)))
     } else if lo > bound {
-        (format!("grows, then levels off ({}/run in the first {n} runs, {}/run in the last {n}): a cache filling up, not a leak so far", show(first), show(second)), true)
+        (VerdictKind::Same, format!("grows, then levels off ({}/run in the first {n} runs, {}/run in the last {n}): a cache filling up, not a leak so far", show(first), show(second)))
     } else if lo >= -bound && hi <= bound {
-        (format!("no growth (within ±{}/run)", show(bound).trim_start_matches('+')), true)
+        (VerdictKind::Same, format!("no growth (within ±{}/run)", show(bound).trim_start_matches('+')))
     } else {
-        (format!("unclear: {} … {}/run; more runs (--repeat) narrow it", show(lo), show(hi)), false)
+        (VerdictKind::Unclear, format!("unclear: {} … {}/run; more runs (--repeat) narrow it", show(lo), show(hi)))
     };
-    json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "decided": decided })
+    json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "verdict_kind": kind, "decided": kind.decided() })
 }
 
 /// The three busiest processes outside strobe's own tree (the target, runner and servers) between two

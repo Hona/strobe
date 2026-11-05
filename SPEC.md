@@ -113,7 +113,8 @@ assets/fonts/   Inter Regular and SemiBold (Latin subset, SIL OFL 1.1, OFL.txt) 
 sdk/            TypeScript: @hona/strobe (the CLI launcher and bench SDK), @hona/strobe-web, @hona/strobe-electron, @hona/strobe-playwright
                 (one Bun workspace)
 skill/SKILL.md  the built-in skill, embedded (include_str!)
-schema/         strobe.v1.json (project config), result.v1.json, bridge.v1.json
+schema/         strobe.v1.json (project config), result.v1.json (experiment results); both shipped
+                in @hona/strobe (`schema/`). bridge.v1.json comes with the bridge (§24.1, 0b)
 install.sh  install.ps1
 .github/workflows/release.yml   build + release only, no tests
 SPEC.md  AGENTS.md  README.md
@@ -122,7 +123,11 @@ SPEC.md  AGENTS.md  README.md
 ### 4.2 Local state (per device, never in a repo)
 
 State dir: `~/.local/share/strobe/` (respect `XDG_DATA_HOME`) on Linux and macOS;
-`%LOCALAPPDATA%\strobe\` on Windows. Created `0700` / user-only ACL.
+`%LOCALAPPDATA%\strobe\` on Windows. Created `0700` / user-only ACL; `run/` too. Secrets (tokens) are
+written `0600` from their creation (`host::paths::write_owner_only`). Every file strobe keeps is
+written whole or not at all: into a temporary file beside it, flushed to disk, then renamed over it
+(`host::paths::write_atomic`; on Windows a rename that a scanner holds up is tried again for about
+2.5 s). Random ids and tokens come from the OS's random source (`host::paths::csprng_hex`).
 
 ```
 state.json          { "mcp_port", "helper", "engine", "last_calibration" }
@@ -1192,7 +1197,7 @@ known key (`did you mean "guard"?`) and lists the keys there.
 
 ```jsonc
 {
-  "$schema": "https://raw.githubusercontent.com/Hona/strobe/main/schema/strobe.v1.json",
+  "$schema": "./node_modules/@hona/strobe/schema/strobe.v1.json",
   "build": {
     "command": "bun run build",
     "cwd": "packages/web",
@@ -1637,6 +1642,20 @@ series' verdict; `--pixels-only` checks it with no timed pairs at all.
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
 | `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
+| `LiveChannel` | an app profile would launch the user's own running app, or a macOS app whose data lives in the user's Library (§13.2) |
+| `NoPhase`, `NoInput` | a declared `phase.<name>` no measured run entered; `input.*` with no drag in the runs (refuse that metric) |
+
+Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
+`Refusal { validator, summary, detail, fix }`. A refused run's error carries it (exit 4; its
+message stays `<validator>: <summary>[; <detail>]`), so callers ask which validator refused and
+never match message text. `is_transient_environment()` names the ones that describe the machine's
+moment (`SessionLocked`, `WindowHidden`, `Background`), which a bench waits out or runs again. A
+name that is no validator is strobe's own bug and fails as an internal error (exit 1), never as a
+refusal. In result.json every comparison carries `verdict_kind` (`better`, `worse`, `same`,
+`no_worse`, `unclear`, `underpowered`, `saturated`, `stopped`, `refused`, `untested` for a
+secondary the gate did not test, `descriptive`) beside its `verdict` words, and a refused metric its
+`refusal` (`validator`, `summary`); readers use those, not the words (`stats::verdict_kind` reads
+the words of results from before them the same way). Schema: `schema/result.v1.json`.
 
 ### 10.2 Analysers (warn in the result)
 
@@ -2629,7 +2648,11 @@ recordings/rec_3f9a1c/
 A native recording's stacks go to `deep.json.gz` beside these, symbolized against the variant's
 executable and `.pdb` that §9.5 copies (the module's own CodeView path finds it).
 
-- Handles: `rec_` + 6 hex; any unique prefix works.
+- Handles: `rec_` + 6 hex from the OS's random source; any unique prefix works. An id is never one
+  this process handed out before or a folder that exists (`store::new_id`); `store::new_recording`
+  and `new_experiment` claim the folder itself and draw again on a clash with another process.
+- Every file is written whole or not at all (§4.2): `store::write_json`, `store::write_atomic` and
+  the gzipped files (`symbol::write_gz`). A crash or a reader never sees half a `result.json`.
 - Retention: default cap 20 GB; oldest unpinned first. `--pin` keeps a recording.
 
 ### 14.2 Experiments
@@ -3107,6 +3130,18 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `trace_processor -q` per query, and one `server http` per `strobe open`.
 - Every launch reaps leftovers (browsers and homes) of strobe processes that died. Target windows
   are kept topmost without focus, since an occluded Chromium window stops rendering.
+- Typed outcomes, crash-safe store and strict config (2026-11-05): validators are `ValidatorId`
+  and refusals `Refusal` values on the error (§10.1); comparisons serialize `verdict_kind` and
+  `refusal`. `bench`, `pr`, `card`, `track` and `bisect` still read the `verdict` words and error
+  messages; they move to the types next, and `Comparison::kind()` reads the words in one place
+  until bench sets the kind itself. The Chromium and native software-adapter checks keep their own
+  name lists until they call `validity::is_software_gpu`. Store writes outside `store` (probes,
+  record, the experiment's own files) still use `std::fs` until they move to `store::write_atomic`
+  and `store::new_recording`. Checked on adais: every consumer strobe.json on the machine (124
+  files) loads, and the schemas accept them and every local result.json (296); 20,000 ids in one
+  process were distinct; a reader racing 1,500 rewrites of a 200 KB result.json read 273 torn files
+  with `std::fs::write` and none through `store::write_json`; a query whose deadline was cut to
+  300 ms for the check was killed and left no trace_processor running.
 - The metric catalog is `src/model.rs`. Comparisons are ratios unless the unit is `count` or
   `score`, the kind is `exact`, or a value is at most 0 (then differences, with the bound
   max(bound × base, 0.5)). Stable exact counters skip the test entirely (§9.3).

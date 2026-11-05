@@ -64,6 +64,8 @@ On Windows, OS present events (what reached the screen, for any native or Chromi
 
 Exit codes: `0` · `1` error · `2` usage · `3` needs a human · `4` refused (invalid; the reason is in the result) · `5` inconclusive · `124` timeout · `255` unreachable
 
+In result.json (`--json`), read each comparison's `verdict_kind` (`better`, `worse`, `same`, `no_worse`, `unclear`, `underpowered`, `refused`, `untested`, …) and a refused metric's `refusal.validator`, not the `verdict` words. Schema: `node_modules/@hona/strobe/schema/result.v1.json`.
+
 ## A bench file
 
     import { bench, web, app } from "@hona/strobe"

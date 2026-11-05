@@ -1,0 +1,171 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "result.v1.json",
+  "title": "strobe experiment result.json",
+  "description": "experiments/<exp>/result.json and `strobe bench --json` (SPEC 14.2). strobe may add keys; readers ignore what they do not know. A verdict's words are for people: read verdict_kind and refusal.",
+  "type": "object",
+  "required": ["id", "kind", "created"],
+  "properties": {
+    "id": { "type": "string", "description": "exp_ + 6 hex, or the name bench --id gave." },
+    "kind": { "enum": ["experiment", "check", "pixels", "bisect"] },
+    "file": { "type": "string", "description": "The bench file." },
+    "created": { "type": "string", "description": "ISO 8601 time, UTC." },
+    "text": { "type": "string", "description": "The text output." },
+    "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
+    "passed": { "type": "boolean", "description": "check: every case passed." },
+    "env": { "type": "object", "description": "The device: OS, CPU, GPU, displays, power, strobe's build." },
+    "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache." },
+    "identity": { "type": ["object", "null"], "description": "What makes two experiments the same comparison (SPEC 14.2)." },
+    "ledger": { "type": ["object", "null"], "description": "The other experiments on the same variants (SPEC 14.2)." },
+    "variants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "role": { "enum": ["base", "head"] },
+          "spec": { "type": "string" },
+          "label": { "type": "string" },
+          "kind": { "enum": ["dir", "git", "url", "app", "exe"] },
+          "commit": { "type": ["string", "null"] },
+          "dirty": {}
+        }
+      }
+    },
+    "series": {
+      "description": "One entry per series; bisect: the label of the series it bisects.",
+      "oneOf": [{ "type": "array", "items": { "$ref": "#/definitions/series" } }, { "type": "string" }]
+    },
+    "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
+    "stopped": {
+      "type": ["object", "null"],
+      "description": "Why the bench ended early: its exit code (130 for a stop) and what did not run.",
+      "properties": { "code": { "type": "integer" }, "why": { "type": "string" }, "not_run": { "type": "array", "items": { "type": "string" } } }
+    },
+    "verdict": { "type": "string", "description": "bisect: found, no change, or unclear." },
+    "culprit": { "type": ["object", "null"], "description": "bisect: commit, short, subject." },
+    "steps": { "type": "array", "description": "bisect: one experiment per step." }
+  },
+  "definitions": {
+    "warning": {
+      "type": "object",
+      "required": ["id", "level", "text"],
+      "properties": {
+        "id": { "type": "string", "description": "An analyser (SPEC 10.2) or validator id." },
+        "level": { "enum": ["warn", "info"] },
+        "text": { "type": "string" }
+      }
+    },
+    "validator": {
+      "description": "A validator (SPEC 10.1).",
+      "enum": [
+        "SoftwareGpu",
+        "DevBuild",
+        "DebuggerAttached",
+        "WindowHidden",
+        "WrongScreen",
+        "UnpacedSpin",
+        "NoPresentSource",
+        "AmbiguousInteraction",
+        "PatternInput",
+        "SessionLocked",
+        "ConcurrentBench",
+        "VariantMismatch",
+        "RunIncomplete",
+        "Throttled",
+        "Background",
+        "BackgroundPriority",
+        "PresentsUnmatched",
+        "OverheadBudget",
+        "NoDisplayForBudget",
+        "TailTooShort",
+        "ClockUnsynced",
+        "LiveChannel",
+        "NoPhase",
+        "NoInput"
+      ]
+    },
+    "refusal": {
+      "type": "object",
+      "required": ["validator", "summary"],
+      "properties": {
+        "validator": { "$ref": "#/definitions/validator" },
+        "summary": { "type": "string" },
+        "detail": { "type": "string" },
+        "fix": { "type": "string" }
+      }
+    },
+    "comparison": {
+      "description": "One metric, base against head over the pairs (SPEC 9.3).",
+      "type": "object",
+      "required": ["metric", "n", "verdict", "verdict_kind", "decided"],
+      "properties": {
+        "metric": { "type": "string" },
+        "n": { "type": "integer", "description": "Pairs compared." },
+        "base": { "type": ["number", "null"] },
+        "head": { "type": ["number", "null"] },
+        "estimate": { "type": ["number", "null"], "description": "Relative change when relative, else head minus base in the metric's unit." },
+        "lo": { "type": ["number", "null"] },
+        "hi": { "type": ["number", "null"] },
+        "relative": { "type": "boolean" },
+        "confidence": { "type": ["number", "null"], "description": "The interval's achieved coverage." },
+        "p": { "type": ["number", "null"] },
+        "bound": { "type": ["number", "null"], "description": "The equivalence bound (or the no-worse margin), in the comparison's scale." },
+        "verdict": { "type": "string", "description": "In words: faster (small), same (±2%), refused (TailTooShort): …" },
+        "verdict_kind": {
+          "enum": ["better", "worse", "same", "no_worse", "unclear", "underpowered", "saturated", "stopped", "refused", "untested", "descriptive"],
+          "description": "untested: a secondary the gate did not test (shown as —); descriptive: shown, never decided (·)."
+        },
+        "decided": { "type": "boolean" },
+        "needed_pairs": { "type": ["integer", "null"] },
+        "exact": { "const": true, "description": "A stable counter, compared exactly." },
+        "noworse": { "type": "number", "description": "The no-worse margin." },
+        "refusal": { "$ref": "#/definitions/refusal", "description": "When verdict_kind is refused: the validator and why." }
+      }
+    },
+    "series": {
+      "type": "object",
+      "properties": {
+        "label": { "type": "string" },
+        "case": { "type": "string" },
+        "target": { "type": "string" },
+        "target_kind": { "type": "string" },
+        "kind": { "type": "string", "description": "runs or launch (a check or leak series says its own)." },
+        "params": { "type": "object" },
+        "primary": {
+          "description": "experiment: the primary's comparison; check: only its metric.",
+          "anyOf": [{ "$ref": "#/definitions/comparison" }, { "type": "object", "properties": { "metric": { "type": "string" } } }]
+        },
+        "secondaries": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
+        "descriptive": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
+        "decided": { "type": "boolean" },
+        "session": { "enum": ["unlocked", "locked", "mixed"] },
+        "pairs": { "type": "integer" },
+        "launches": { "type": "integer" },
+        "stopped": { "type": "string", "description": "Why the series ended: primary decided, max pairs, max time, …" },
+        "bound": { "type": "number" },
+        "noworse": { "type": "object", "additionalProperties": { "type": "number" } },
+        "blocks": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "variant": { "enum": ["base", "head"] },
+              "pair": { "type": "integer" },
+              "values": { "type": "object", "additionalProperties": { "type": "number" } },
+              "refused": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Metrics the block refused: \"<validator>: <why>\"." },
+              "recording": { "type": ["string", "null"] },
+              "locked": { "type": "boolean" }
+            }
+          }
+        },
+        "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
+        "halt": { "type": ["object", "null"], "properties": { "code": { "type": "integer" }, "message": { "type": "string" } } },
+        "passed": { "type": "boolean", "description": "check: the case ran." },
+        "values": { "type": ["object", "null"], "description": "check: one run's values." },
+        "refused": { "type": ["object", "null"], "description": "check: metrics the run refused." },
+        "error": { "type": ["string", "null"] },
+        "hint": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

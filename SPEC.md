@@ -2444,13 +2444,15 @@ toolkit (rule 15).
   MTA thread that owns the client, the last snapshot's elements and the event handlers). A snapshot
   reads every window of the app (the main one first, then its other visible top-level windows:
   popups, overlays) in one cached request per window (raw view: AutomationId, name, control type,
-  bounds, focus, enabled, offscreen, value, toggle state, heading level, dialog, available patterns),
-  in physical screen pixels (the thread is per-monitor DPI aware). The app's structure, property and
+  bounds, focus, enabled, offscreen, value, toggle state, heading level, ARIA role, dialog, available
+  patterns), in physical screen pixels (the thread is per-monitor DPI aware). The app's structure, property and
   focus events wake waiters: a wait re-reads the tree on each change the app announces, never on a
   timer, except while a window has not answered for its tree yet (re-read every 50 ms). A provider
   that answers first with a placeholder root and builds its tree a turn later (lazy providers, such
   as AccessKit's) raises a structure change then; strobe registers for events again when a window's
-  root element changes.
+  root element changes. An element is a heading when it has a HeadingLevel, or when its ARIA role or
+  localized control type is "heading": AccessKit's Windows adapter exposes a heading as a Text
+  element with the ARIA role "heading" and no HeadingLevel, as the macOS reader counts AXHeading.
   - macOS (`target/a11y/ax.rs`): the AX API. A snapshot reads each window the app's `AXWindows` lists
     (matched to its CoreGraphics window by frame: the AX API names no window id publicly) with one
     `AXUIElementCopyMultipleAttributeValues` per element (role, subrole, title, description, value,
@@ -2978,6 +2980,10 @@ Live on macOS with Screen Recording (2026-11-05, air, macOS 27, through a remote
   heading }` passed): AccessKit's first answer held 6 nodes and the rest came a moment later
   without a notification. The screen read now waits until two reads 250 ms apart agree on the
   node count (`headings General · Permissions needed`).
+- On Windows (2026-11-05, adais, session locked), `look exe:` of Hex said `headings none` while macOS
+  read `General`: AccessKit's Windows adapter gives a heading the ARIA role "heading" and no
+  HeadingLevel, and the reader counted only HeadingLevel. It now reads the ARIA role too (`headings
+  General · Status`), for `look`, `expect.heading`, `role=heading` and the screen read alike.
 - The Perfetto UI's JavaScript flame graph of a range on a Callstacks track drew in about 4 s in a
   headed Edge (`strobe open` of an attribution recording of a page drag); "Computing graph" stayed
   only headless.

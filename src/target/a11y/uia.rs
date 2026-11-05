@@ -101,6 +101,7 @@ const PROPS: &[UIA_PROPERTY_ID] = &[
     UIA_NativeWindowHandlePropertyId,
     UIA_ValueValuePropertyId,
     UIA_HeadingLevelPropertyId,
+    UIA_AriaRolePropertyId,
     UIA_IsDialogPropertyId,
     UIA_ToggleToggleStatePropertyId,
     UIA_SelectionItemIsSelectedPropertyId,
@@ -359,6 +360,12 @@ fn bool_of(e: &IUIAutomationElement, p: UIA_PROPERTY_ID) -> bool {
     unsafe { e.GetCachedPropertyValue(p) }.ok().and_then(|v| bool::try_from(&v).ok()).unwrap_or(false)
 }
 
+/// A heading has a HeadingLevel, or says so by its ARIA role or localized control type: some
+/// providers expose a heading as a Text element with the role "heading" and no HeadingLevel.
+fn is_heading(level: Option<i32>, aria_role: &str, localized: &str) -> bool {
+    level.is_some_and(|l| l != HeadingLevel_None.0 && l != 0) || aria_role.eq_ignore_ascii_case("heading") || localized.eq_ignore_ascii_case("heading")
+}
+
 /// One element's cached properties.
 unsafe fn read(e: &IUIAutomationElement, parent: Option<usize>, window: usize) -> Node {
     unsafe {
@@ -373,7 +380,10 @@ unsafe fn read(e: &IUIAutomationElement, parent: Option<usize>, window: usize) -
             | pattern(UIA_IsSelectionItemPatternAvailablePropertyId, PATTERN_SELECT)
             | pattern(UIA_IsScrollPatternAvailablePropertyId, PATTERN_SCROLL)
             | pattern(UIA_IsScrollItemPatternAvailablePropertyId, PATTERN_SCROLL_ITEM);
-        let heading = e.GetCachedPropertyValue(UIA_HeadingLevelPropertyId).ok().and_then(|v| i32::try_from(&v).ok()).is_some_and(|l| l != HeadingLevel_None.0 && l != 0);
+        let role_text = s(e.CachedLocalizedControlType());
+        let level = e.GetCachedPropertyValue(UIA_HeadingLevelPropertyId).ok().and_then(|v| i32::try_from(&v).ok());
+        let aria_role = e.GetCachedPropertyValue(UIA_AriaRolePropertyId).ok().and_then(|v| BSTR::try_from(&v).ok()).map(|b| b.to_string()).unwrap_or_default();
+        let heading = is_heading(level, &aria_role, &role_text);
         let role = e.CachedControlType().map(|c| c.0).unwrap_or(0);
         let toggled = if patterns & PATTERN_TOGGLE != 0 {
             Some(e.GetCachedPropertyValue(UIA_ToggleToggleStatePropertyId).ok().and_then(|v| i32::try_from(&v).ok()) == Some(ToggleState_On.0))
@@ -385,7 +395,7 @@ unsafe fn read(e: &IUIAutomationElement, parent: Option<usize>, window: usize) -
             id: s(e.CachedAutomationId()),
             name: s(e.CachedName()),
             role,
-            role_text: s(e.CachedLocalizedControlType()),
+            role_text,
             value: value.filter(|_| patterns & PATTERN_VALUE != 0),
             rect: [r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64],
             focused: e.CachedHasKeyboardFocus().is_ok_and(|b| b.as_bool()),
@@ -439,5 +449,22 @@ impl Accessibility for Uia {
 
     fn set_pids(&self, pids: &[u32]) {
         *self.signal.pids.lock().unwrap_or_else(|e| e.into_inner()) = pids.to_vec();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn heading_by_level_or_role() {
+        assert!(is_heading(Some(HeadingLevel1.0), "", "text"));
+        // A Text element with the role "heading" and no HeadingLevel.
+        assert!(is_heading(None, "heading", "text"));
+        assert!(is_heading(Some(HeadingLevel_None.0), "heading", "text"));
+        assert!(is_heading(None, "", "Heading"));
+        assert!(!is_heading(Some(HeadingLevel_None.0), "", "text"));
+        assert!(!is_heading(Some(0), "", "text"));
+        assert!(!is_heading(None, "button", "button"));
     }
 }

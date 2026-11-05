@@ -264,7 +264,8 @@ pub(crate) fn repeated_p_at(nominal: f64, n: usize, looks: &[usize]) -> f64 {
     if at.len() == 1 {
         return nominal;
     }
-    let c = normal_quantile(1.0 - nominal / 2.0);
+    // From the lower tail: 1 − p/2 rounds to 1 once p is tiny (n ≥ 54 pairs all one way).
+    let c = -normal_quantile(nominal / 2.0);
     crossing(c, &at).max(nominal).min(1.0)
 }
 
@@ -289,13 +290,15 @@ pub struct Journey {
     pub gap: bool,
 }
 
-/// What a family of journeys supports (SPEC §9.3). `better` counts journeys decided better on their
-/// own whose repeated p also clears Holm across the compared journeys at 5%, so "better in K of M"
-/// holds as a family claim; one better on its own but not after Holm counts as `unclear`. `worse`
-/// counts every journey decided worse on its own: Holm never hides a regression. `all_no_worse`
-/// (non-inferiority) is an intersection–union claim: every compared journey `no worse` at its own
-/// 2.5% one-sided, which needs no multiplicity correction (Berger 1982); a gap leaves it standing
-/// over the journeys that were compared, and names itself beside it.
+/// What a family of journeys supports (SPEC §9.3). A journey decided better or worse on its own
+/// counts that way only when its repeated p also clears Holm across the compared journeys at 5%, the
+/// same rule both ways, so swapping the sides swaps `better` and `worse`; one that does not clear it
+/// counts as `unclear` (`better_alone`, `worse_alone`), and reports still list an unconfirmed
+/// regression as one. A single compared journey has no family: its own verdict stands. `same` counts
+/// `same` and `no worse`. `all_no_worse` (non-inferiority) is an intersection–union claim: every
+/// compared journey `no worse` at its own 2.5% one-sided, which needs no multiplicity correction
+/// (Berger 1982); a gap leaves it standing over the journeys that were compared, and names itself
+/// beside it. `better + same + worse + unclear == compared`.
 #[derive(Clone, Debug, Serialize)]
 pub struct Family {
     pub journeys: usize,
@@ -305,12 +308,14 @@ pub struct Family {
     pub worse: usize,
     pub unclear: usize,
     pub gaps: usize,
-    /// Better on their own, not after Holm.
+    /// Better on their own, not after Holm (counted in `unclear`).
     pub better_alone: usize,
+    /// Worse on their own, not after Holm (counted in `unclear`).
+    pub worse_alone: usize,
     pub family: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub all_no_worse: Option<bool>,
-    /// Per journey, in order: decided better after Holm.
+    /// Per journey, in order: its better or worse verdict confirmed across the family.
     #[serde(skip)]
     pub holm: Vec<bool>,
 }
@@ -319,15 +324,17 @@ pub fn family(js: &[Journey], noworse: bool) -> Family {
     let compared: Vec<usize> = (0..js.len()).filter(|&i| !js[i].gap).collect();
     let ps: Vec<f64> = compared.iter().map(|&i| if js[i].p.is_finite() { js[i].p } else { 1.0 }).collect();
     let rejected = holm(&ps, 0.05);
-    let mut holm_ok = vec![false; js.len()];
+    let directional = |i: usize| matches!(js[i].kind, VerdictKind::Better | VerdictKind::Worse);
+    let mut confirmed = vec![false; js.len()];
     for (&i, r) in compared.iter().zip(rejected) {
-        holm_ok[i] = r && js[i].kind == VerdictKind::Better;
+        confirmed[i] = directional(i) && (r || compared.len() == 1);
     }
     let count = |f: &dyn Fn(usize) -> bool| compared.iter().filter(|&&i| f(i)).count();
-    let better = count(&|i| holm_ok[i]);
-    let better_alone = count(&|i| js[i].kind == VerdictKind::Better && !holm_ok[i]);
+    let better = count(&|i| confirmed[i] && js[i].kind == VerdictKind::Better);
+    let worse = count(&|i| confirmed[i] && js[i].kind == VerdictKind::Worse);
+    let better_alone = count(&|i| !confirmed[i] && js[i].kind == VerdictKind::Better);
+    let worse_alone = count(&|i| !confirmed[i] && js[i].kind == VerdictKind::Worse);
     let same = count(&|i| matches!(js[i].kind, VerdictKind::Same | VerdictKind::NoWorse));
-    let worse = count(&|i| js[i].kind == VerdictKind::Worse);
     Family {
         journeys: js.len(),
         compared: compared.len(),
@@ -337,9 +344,10 @@ pub fn family(js: &[Journey], noworse: bool) -> Family {
         unclear: compared.len() - better - same - worse,
         gaps: js.len() - compared.len(),
         better_alone,
+        worse_alone,
         family: "holm",
         all_no_worse: noworse.then(|| !compared.is_empty() && compared.iter().all(|&i| js[i].kind == VerdictKind::NoWorse)),
-        holm: holm_ok,
+        holm: confirmed,
     }
 }
 

@@ -764,6 +764,8 @@ fn strip(svg: &mut Svg, x: f32, y: f32, w: f32, t: &Tile, r: f32, colour: bool) 
     let lo = t.dots.iter().cloned().fold(b_lo * 1.5, f64::min).min(0.0);
     let hi = t.dots.iter().cloned().fold(b_hi * 1.5, f64::max).max(0.0);
     let pad = (hi - lo) * 0.06;
+    // A band of 0 and pairs that all read no change leave no width: give it some, not NaN.
+    let pad = if hi - lo < 1e-9 { 0.01 } else { pad };
     let (lo, hi) = (lo - pad, hi + pad);
     let px = |v: f64| x + r + ((v - lo) / (hi - lo)) as f32 * (w - 2.0 * r);
     svg.rect(px(b_lo), y, (px(b_hi) - px(b_lo)).max(1.0), h, Ink::Band);

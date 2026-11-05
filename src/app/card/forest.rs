@@ -80,8 +80,8 @@ fn lead_of(r: &Value, s: &Value, multi: bool) -> Lead {
     tile.amount = cl.amount.clone();
     let m = metric(c);
     let unit = unit_of(m);
-    let scope = c["care_note"].as_str().map(|n| format!("{}: {n}, per run", capitalize(&short(m).0))).unwrap_or_default();
-    let range = if c["relative"] == true { format!("{} to {}", pr::factor_or_pct(f(&c["lo"])), pr::factor_or_pct(f(&c["hi"]))) } else { String::new() };
+    let scope = c["care_note"].as_str().map(|n| format!("{}: {n}", capitalize(&short(m).0))).unwrap_or_default();
+    let range = if c["relative"] == true { pr::range_x(c).replace('\u{a0}', " ") } else { String::new() };
     let tally = fmt_join([tile.tally.clone(), range]);
     let checks: Vec<String> = s["equivalence"].as_array().into_iter().flatten().filter(|e| e["ok"] == true).filter_map(|e| e["selector"].as_str().map(str::to_string)).collect();
     let same = if checks.is_empty() { String::new() } else { format!("same {} on both after every run", checks.join(", ")) };
@@ -103,8 +103,9 @@ fn fmt_join<const N: usize>(parts: [String; N]) -> String {
 pub(super) fn build(r: &Value) -> Forest {
     let (bn, hn) = pr::side_names(r);
     let series: Vec<&Value> = r["series"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
-    let fam = family::of(r);
-    let hero = family::hero(r, &fam);
+    let board = family::Board::of(r);
+    let fam = &board.family;
+    let hero = board.hero;
     let multi = series.len() > 1;
     let metrics: Vec<&str> = series.iter().filter(|s| !family::gap(s)).map(|s| metric(&s["primary"])).collect();
     let mixed = metrics.windows(2).any(|w| w[0] != w[1]);
@@ -114,14 +115,15 @@ pub(super) fn build(r: &Value) -> Forest {
         let name = title(s, &[]);
         let gap = family::gap(s);
         let o = primary_out(s, false);
-        let counted = fam.holm.get(i).copied().unwrap_or(false);
+        // Green and red only for a verdict confirmed across the family; one on its own stays grey.
+        let change = if c["relative"] == true { pr::factor_or_pct(f(&c["estimate"])) } else { tile(s, c, String::new()).delta };
         let (tone, value) = if gap {
             (Tone::Plain, "gap".to_string())
         } else {
             match o {
-                Out::Better if counted || fam.compared < 2 => (Tone::Ok, pr::factor_or_pct(f(&c["estimate"]))),
-                Out::Better => (Tone::Plain, pr::factor_or_pct(f(&c["estimate"]))),
-                Out::Worse => (Tone::Err, if c["relative"] == true { pr::factor_or_pct(f(&c["estimate"])) } else { tile(s, c, String::new()).delta }),
+                Out::Better | Out::Worse if board.alone(i) => (Tone::Plain, change),
+                Out::Better => (Tone::Ok, change),
+                Out::Worse => (Tone::Err, change),
                 Out::Same => (Tone::Plain, "same".into()),
                 Out::NotRun => (Tone::Plain, "not run".into()),
                 Out::Refused => (Tone::Plain, "refused".into()),
@@ -186,14 +188,8 @@ pub(super) fn build(r: &Value) -> Forest {
         hidden = keep.iter().filter(|k| !**k).count();
         rows = rows.into_iter().zip(keep).filter(|(_, k)| *k).map(|(r, _)| r).collect();
     }
-    let lead = hero.map(|i| lead_of(r, series[i], multi)).or_else(|| {
-        // No counted win: the biggest regression leads, in red; never a calm card over a regression.
-        series
-            .iter()
-            .filter(|s| !family::gap(s) && primary_out(s, false) == Out::Worse)
-            .max_by(|a, b| family::magnitude(&a["primary"]).total_cmp(&family::magnitude(&b["primary"])))
-            .map(|s| lead_of(r, s, multi))
-    });
+    // Without a confirmed win the biggest confirmed regression leads, in red.
+    let lead = hero.or(board.worst).map(|i| lead_of(r, series[i], multi));
     let calm = if lead.is_some() {
         (String::new(), String::new())
     } else if series.iter().all(|s| family::gap(s)) {
@@ -211,26 +207,13 @@ pub(super) fn build(r: &Value) -> Forest {
         let compared: Vec<&&Value> = series.iter().filter(|s| !family::gap(s) && s["not_run"] != true).collect();
         compared.iter().find(|s| primary_out(s, false) == Out::Unclear).or(compared.first()).map(|s| lead_of(r, s, multi)).filter(|l| !l.tile.dots.is_empty())
     };
-    let journeys = |n: usize| if n == 1 { "journey" } else { "journeys" };
-    let mut score_parts = match fam.all_no_worse {
-        Some(true) => vec![format!("No worse in all {}", fam.compared)],
-        Some(false) => vec![format!("Not no worse in all {}", fam.compared)],
-        None => vec![format!("Better in {} of {}", fam.better, fam.compared)],
-    };
-    if fam.worse > 0 {
-        score_parts.push(format!("worse in {}", fam.worse));
-    }
-    if fam.unclear > 0 {
-        score_parts.push(format!("unclear in {}", fam.unclear));
-    }
+    let (head, rest) = board.counts();
+    let mut score_parts = vec![head];
+    score_parts.extend(rest);
     if fam.gaps > 0 {
         score_parts.push(format!("{} gap{}", fam.gaps, if fam.gaps == 1 { "" } else { "s" }));
     }
-    let score2 = match fam.all_no_worse {
-        Some(_) if fam.compared > 1 => "each journey at its own 2.5% (intersection–union)".to_string(),
-        None if fam.compared > 1 => format!("Holm-adjusted across {} compared {}", fam.compared, journeys(fam.compared)),
-        _ => String::new(),
-    };
+    let score2 = capitalize(&board.correction());
     let (f1, f2) = pr::fairness(r, &series);
     let foot = (super::super::fmt::fields(f1), super::super::fmt::fields(f2));
     let file = r["file_repo"].as_str().or(r["file"].as_str()).unwrap_or("").replace('\\', "/");
@@ -242,7 +225,7 @@ pub(super) fn build(r: &Value) -> Forest {
     };
     let alt = format!("{lead_alt}; {}.", lower_first(&score_parts.join(", ")));
     // The equivalence bound the rows share: the first compared journey's (±2% by default).
-    let band = series.iter().find(|s| !family::gap(s) && s["primary"]["relative"] == true).and_then(|s| s["primary"]["bound"].as_f64()).filter(|b| b.is_finite() && *b > 0.0).unwrap_or(0.02);
+    let band = series.iter().find(|s| !family::gap(s) && s["primary"]["relative"] == true).and_then(|s| s["primary"]["bound"].as_f64()).filter(|b| b.is_finite() && *b >= 0.0).unwrap_or(0.02);
     let badges: Vec<(String, String, String, Tone)> = series.iter().map(|s| badge_of(s, false)).collect();
     let sb_value = match fam.all_no_worse {
         Some(true) => format!("no worse in all {}", fam.compared),
@@ -257,6 +240,8 @@ pub(super) fn build(r: &Value) -> Forest {
             v
         }
     };
+    // Red for a confirmed regression, green only with no regression and nothing unclear (an
+    // unconfirmed regression is unclear: grey).
     let sb_tone = if fam.worse > 0 || fam.all_no_worse == Some(false) {
         Tone::Err
     } else if fam.unclear == 0 && fam.compared > 0 && (fam.better > 0 || fam.all_no_worse == Some(true)) {
@@ -409,8 +394,10 @@ fn forest_svg(svg: &mut Svg, card: &Forest, top: f32, bottom: f32) {
     let rows = &card.rows;
     // One axis for every row, wide enough for every interval (a regression is never cut off), with
     // room on both sides of no change.
-    let band = ((1.0 - card.band).ln(), (1.0 + card.band).ln());
-    let (mut lo, mut hi) = rows.iter().filter_map(|r| r.ci).fold((band.0 * 3.0, band.1 * 3.0), |(l, h), (a, _, b)| (l.min(a), h.max(b)));
+    // `--equivalence 0` draws no band; 100% or more one that stops short of minus infinity.
+    let band = ((1.0 - card.band).max(1e-3).ln(), (1.0 + card.band).ln());
+    // At least ±5% wide, so a band of 0 and rows that all read no change still make an axis.
+    let (mut lo, mut hi) = rows.iter().filter_map(|r| r.ci).fold(((band.0 * 3.0).min(-0.05), (band.1 * 3.0).max(0.05)), |(l, h), (a, _, b)| (l.min(a), h.max(b)));
     let span = hi - lo;
     lo = lo.min(-0.16 * span);
     hi = hi.max(0.16 * span);

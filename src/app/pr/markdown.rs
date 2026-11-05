@@ -604,11 +604,7 @@ impl<'a> Doc<'a> {
         let foreign = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "cpu.foreign.max").is_finite()));
         let frames = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "frames.n") > 0.0 && bv(p.base, "frames.interval.max").is_finite()));
         let metric = if self.multi() { "Main metric".to_string() } else { noun(all[0].0["primary"]["metric"].as_str().unwrap_or("")) };
-        let (b, h) = match self.r["comparison"] == "implementations" {
-            true => self.sides(),
-            false => ("before".to_string(), "this PR".to_string()),
-        };
-        let mut t = format!("#### Pairs\n\n| Pair | {}, {} → {} | Change |", cell(&metric), cell(&b), cell(&h));
+        let mut t = format!("#### Pairs\n\n| Pair | {}, {} → {} | Change |", cell(&metric), self.side_word(true), self.side_word(false));
         let mut sep = String::from("|:---|---:|---:|");
         if frames {
             t += " Longest frame gap |";
@@ -682,7 +678,8 @@ impl<'a> Doc<'a> {
                 t += "\n";
             }
         }
-        let mut foot = vec!["Each pair launched both builds fresh, in alternating order (AB or BA). Change: the main metric.".to_string()];
+        let both = if crate::app::family::implementations(self.r) { "both implementations" } else { "both builds" };
+        let mut foot = vec![format!("Each pair launched {both} fresh, in alternating order (AB or BA). Change: the main metric.")];
         if foreign {
             let who = top_procs(&busy, 3);
             foot.push(format!(
@@ -711,7 +708,7 @@ impl<'a> Doc<'a> {
             (Some(lo), Some(hi)) => format!("; the middle 80% of their changes ran from {} to {}", nb(&show_change(lo, ratio, m)), nb(&show_change(hi, ratio, m))),
             _ => String::new(),
         };
-        format!("The … row{who} sums up {which}: this PR did better in {w} of {n}{spread}.")
+        format!("The … row{who} sums up {which}: {} did better in {w} of {n}{spread}.", self.side_word(false))
     }
 
     /// Frame pacing, for series that drew frames.

@@ -2321,22 +2321,30 @@ function renderImplPanel(r, baseVar, headVar) {
     const m = c.metric || "";
     const cl = classify(c, m, false);
     const gap = isGap(s);
+    // Green and red only for a verdict confirmed across the family (`holm_decided`).
     const counted = c.holm_decided === true;
-    const tone = gap ? "" : cl.tone === "loss" ? "loss" : cl.tone === "win" && (counted || (sb.compared || 0) < 2) ? "win" : "";
+    const tone = gap || !counted ? "" : cl.tone === "loss" ? "loss" : cl.tone === "win" ? "win" : "";
     // An increase of 2× or more reads as a factor, as in the PR block and card.
     const change = c.relative !== false && finite(c.estimate) && c.estimate >= 1 ? `${(1 + c.estimate).toFixed(1 + c.estimate >= 10 ? 0 : 1)}×` : fmtDelta(c.estimate, c, unitOf(m));
     const what = gap ? (s.gap?.missing ? `gap: no ${s.gap.missing}` : "gap") : cl.kind === "same" ? "same" : cl.tone === "neutral" ? "unclear" : change;
-    return h("button", { type: "button", class: `impl-pill ${tone}`, title: gap ? s.gap?.reason || "" : `${labelOf(m)}${finite(c.p_repeated) ? ` · repeated p ${fmtP(c.p_repeated)}` : ""}${cl.tone === "win" && !counted ? " · not after Holm" : ""}`, onclick: () => selectSeries(i) },
+    return h("button", { type: "button", class: `impl-pill ${tone}`, title: gap ? s.gap?.reason || "" : `${labelOf(m)}${finite(c.p_repeated) ? ` · repeated p ${fmtP(c.p_repeated)}` : ""}${(cl.tone === "win" || cl.tone === "loss") && !counted ? ` · ${cl.tone === "win" ? "better" : "worse"} on its own, not after Holm` : ""}`, onclick: () => selectSeries(i) },
       `${capFirst(s.case || s.label)} · ${what}${s.headline ? " · headline" : ""}`);
   });
   const parts = [];
   if (sb.all_no_worse === true) parts.push(`No worse than ${bn} in all ${sb.compared} compared journeys`);
   else if (sb.all_no_worse === false) parts.push(`Not no worse in all ${sb.compared} compared journeys`);
   else parts.push(`Better in ${sb.better ?? 0} of ${sb.compared ?? 0} compared journeys`);
+  if (sb.all_no_worse != null && sb.better) parts.push(`better in ${sb.better}`);
   if (sb.worse) parts.push(`worse in ${sb.worse}`);
+  if (sb.same && sb.all_no_worse !== true) parts.push(`${sb.all_no_worse != null ? "no worse" : "the same"} in ${sb.same}`);
   if (sb.unclear) parts.push(`unclear in ${sb.unclear}`);
   if (sb.gaps) parts.push(`${sb.gaps} not comparable`);
-  const note = (sb.compared || 0) > 1 ? (sb.all_no_worse != null ? "each journey at its own 2.5% (intersection–union)" : `Holm-adjusted across ${sb.compared} journeys on repeated-interval p-values; every regression counts`) : "";
+  const alone = [[sb.better_alone, "better"], [sb.worse_alone, "worse"]].filter(([n]) => n > 0).map(([n, w]) => `${n} ${w}`);
+  const note = (sb.compared || 0) > 1
+    ? (sb.all_no_worse != null
+      ? "each journey at its own 2.5% (intersection–union)"
+      : `Holm-adjusted across ${sb.compared} journeys on repeated-interval p-values, wins and regressions alike${alone.length ? `; ${alone.join(" and ")} on ${sb.better_alone + sb.worse_alone === 1 ? "its" : "their"} own did not clear it` : ""}`)
+    : "";
   const f = r.fairness || {};
   const w = f.window || {};
   const fx = r.fixture;
@@ -2396,6 +2404,14 @@ function renderImplSeries(r, s, baseVar, headVar) {
       h("p", { class: "sec-sub" }, s.gap?.reason || `no ${s.gap?.missing || "step"} in ${s.gap?.side === "base" ? bn : hn}`)
     ));
     return out;
+  }
+  // A Care metric is comparable only as a total of each side's processes: say what it sums.
+  const care = allComparisons(s).filter((x) => x.c.care_note && x.role !== "descriptive");
+  if (care.length) {
+    out.push(h("section", { class: "card-surface card-bd" },
+      h("h2", { class: "sec-title" }, "What each number sums"),
+      h("div", { class: "impl-kv", style: "margin-top:8px" }, care.flatMap((x) => [h("span", {}, labelOf(x.c.metric)), h("span", {}, x.c.care_note)]))
+    ));
   }
   const sh = s.shown || {};
   const thumbs = ["base", "head"].flatMap((role) => {
@@ -6598,6 +6614,11 @@ function renderBisect(r) {
 {
   const hashMatch = /series=(\d+)/.exec(location.hash || "") || /series=(\d+)/.exec(location.search || "");
   if (hashMatch) state.series = +hashMatch[1];
+  // Two implementations open on the headline journey, as the card and PR block lead with it.
+  else if (isImpl(STROBE?.data)) {
+    const i = (STROBE.data.series || []).findIndex((s) => s.headline);
+    if (i >= 0) state.series = i;
+  }
   render();
 }
 

@@ -109,7 +109,8 @@ strobe report experiment <exp> --format card|badge [--out <file.png|file.svg>] [
   - Headline: the case marked `hero: true`, else the biggest win that counts after Holm across journeys.
   - Card: that journey large on the left, every journey on a forest plot on the right, the scoreboard.
   - `--format badge --scoreboard`: `vs <base> | better in 4/5 · 1 gap`.
-  - "Better in K of M" counts a win only after Holm; every regression counts; gaps are never compared.
+  - "Better in K of M" and "worse in K" count only after Holm across journeys; an unconfirmed
+    regression is still listed in the caution. Gaps are never compared.
 
 ### `strobe track`
 

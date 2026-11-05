@@ -15,7 +15,7 @@ mod markdown;
 use extract::*;
 use github::*;
 pub use github::{Updated, hero_level, relevel, splice, update_pr};
-pub use implementations::{claim, factor_or_pct, fairness};
+pub use implementations::{claim, factor_or_pct, fairness, range_x};
 use markdown::*;
 use crate::model::{self, Better, Error, Result, VerdictKind};
 use crate::stats;

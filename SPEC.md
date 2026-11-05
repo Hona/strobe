@@ -1301,14 +1301,17 @@ flowchart LR
     motion seen at the looks' pairs, summed crossing by crossing, Simpson's rule on 161 points,
     ~2 ms), with the stop counted as a look of its own when it is not one. One look (`--pairs N`): α
     is the nominal p. The five looks at nominal 1.58% come to 5.1% overall (their spacing is uneven).
-  - **Holm** across the compared journeys at 5% on the repeated p: a journey decided better on its
-    own counts as `better` only when Holm rejects it, else as `unclear` ("better on its own, not after
-    Holm"). Every journey decided `worse` on its own counts as `worse`: Holm never hides a regression.
-    Gaps are counted apart and never compared.
-  - **family_min_pairs(M)**: the fewest pairs at which n-of-n wins clear Holm's first step across M
-    journeys (`stats::family_min_pairs`: 9 pairs for M = 2–3, 10 for 4–6, 11 for 7–12, 12 for 13–16;
-    8 of 8 pairs has repeated p 2.7%, enough for one journey only). A journey decided at an earlier
-    look runs on to it, like `holm_pairs` for secondaries.
+  - **Holm** across the compared journeys at 5% on the repeated p, the same rule both ways: a
+    journey decided better (worse) on its own counts as `better` (`worse`) only when Holm rejects it,
+    else as `unclear` (`better_alone`, `worse_alone`), so swapping the sides swaps the counts. An
+    unconfirmed regression still stands in the report's caution, labelled "Unconfirmed regression
+    (this journey alone, not after Holm across M)". One compared journey has no family: its own
+    verdict counts. `same` counts `same` and `no worse`; better + worse + same + unclear = compared.
+    Gaps are counted apart and never compared. A stable counter compared exactly has p 0 when decided.
+  - **family_min_pairs(M)**: the fewest pairs at which n-of-n pairs one way clear Holm's first step
+    across M journeys (`stats::family_min_pairs`: 9 pairs for M = 2–3, 10 for 4–6, 11 for 7–12, 12
+    for 13–16; 8 of 8 pairs has repeated p 2.7%, enough for one journey only). A journey decided
+    better or worse at an earlier look runs on to it, like `holm_pairs` for secondaries.
   - **No worse in all** (`--noworse X%` on every journey): an intersection–union claim, every compared
     journey `no worse` at its own 2.5% one-sided, with no multiplicity correction (Berger 1982).
   - **Checked** (simulation of the real `stats.rs`, 2,000 families per row, normal and t₃ log-ratio
@@ -2460,46 +2463,54 @@ An implementation comparison (`comparison: "implementations"`, two targets) read
 implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/implementations.rs`,
 `app/card/forest.rs`):
 
-- **Headline:** the journey whose case says `hero: true` when its win counts on the scoreboard (9.3),
-  else the biggest counted win, by the size of its primary's log ratio (`|ln(head / base)|`; the
-  first in the file on a tie): `# Rewrite uses 83% less CPU time than Original · idle`.
+- **Headline:** the journey whose case says `hero: true` when its win is confirmed across the family
+  (9.3), else the biggest confirmed win, by the size of its primary's log ratio (`|ln(head / base)|`;
+  the first in the file on a tie): `# Rewrite uses 83% less CPU time than Original · idle`.
   Verbs follow the metric (`uses … less`, `opens … faster`, `responds … faster`, `takes … less
   time`, `has … fewer`). An increase of 2× or more reads as a factor (`2.4× more app memory`, ranges
-  `2.3× to 2.5×`), never `+140%`. Without a counted win the biggest main-metric regression leads
-  (`# Regression: …`), else a calm line (`No measurable difference from Original`, `Not decided yet`).
-- **PR block:** every regression in one `> [!CAUTION]` (main and tested metrics), the scoreboard line
-  (`**Better in 4 of 5 compared journeys** · worse in 1 · not comparable: 1 (Find in session: no
-  `@find` in Rewrite). Holm-adjusted across 5 journeys.`, or the no-worse family claim), one
-  line per journey (`Same `@topRow` after every run.` from `expect.same`; a win Holm did not count
-  says so), a fairness line (machine, window, same server and data, OS input, what CPU summed on each
-  side, pairs), Details (Metrics with side-name columns; Per implementation, not compared, from
+  `2.3× to 2.5×`, two decimals when one would print one number twice), never `+140%`. Without a
+  confirmed win the biggest confirmed main-metric regression leads (`# Regression: …`), else a calm
+  line (`No measurable difference from Original`, `Not decided yet`).
+- **PR block:** every regression in one `> [!CAUTION]`: a main metric confirmed across the family as
+  `Regression:`, one worse on its own only as `Unconfirmed regression (this journey alone, not after
+  Holm across M):`, and tested metrics worse within their series. Then the scoreboard line
+  (`**Better in 4 of 5 compared journeys** · worse in 1 · the same in 1 · unclear in 1 · not
+  comparable: 1 (Find in session: no `@find` in Rewrite). Holm-adjusted across 5 journeys.`, or the
+  no-worse family claim), one line per journey (`Same `@topRow` after every run.` from `expect.same`;
+  a verdict Holm did not keep says so), a fairness line (machine, window, same server and data, OS
+  input, what CPU summed on each side, pairs), the Care notes of non-CPU main metrics in a line of
+  their own, Details (Metrics with side-name columns and a footnote whose confidence comes from the
+  comparisons and the plan's looks; Pairs; Per implementation, not compared, from
   `series[].per_side`; Equivalence checked; Where each spends its time, each side's profiled threads,
-  never a diff; How it was measured: both identities, machine, window, input and observer, fixture,
-  what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original --head
-  rewrite=<commit>`). Shedding drops Where each spends its time, then the per-side table, then the
-  equivalence table; never a journey's line, the caution or the scoreboard.
+  never a diff; How it was measured: both identities, machine, window, input, observer and frame
+  source, fixture, what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original
+  --head rewrite=<commit>`). Shedding drops Where each spends its time, then the per-side table, then
+  the Pairs and equivalence tables; never a journey's line, the caution or the scoreboard.
 - **Card** (1200×630, the same visual system): header `Rewrite vs Original · <file>` and the
   id; left, the headline journey (title, its change very large in its tone, the words with the
   comparator, the Care note of its metric, both medians named, the pairs' log-ratio strip, the tally
-  and interval, the equivalence checks); a 1px rule; right, a forest plot of every journey on one
-  log-ratio axis oriented better-left (a higher-is-better metric plotted negated; tick labels only
-  when no row is), wide enough for every interval, the bound shaded, each row's interval and estimate
-  in green (a counted win), red (worse) or grey, its change at the right, a gap row's
-  `not comparable: no @find`; every journey while 24 px rows fit (14), else every regression and the
-  headline stay and `and K more in the report`; the scoreboard and its Holm line under it. Footer:
-  two lines, machine · OS · window @scale, Hz · same server and data · OS input to both, and what
-  CPU summed on each side · pairs. One journey: the headline across the card.
+  and interval, the equivalence checks), or a calm heading with the first undecided journey's pairs
+  in grey; a 1px rule; right, a forest plot of every journey on one log-ratio axis oriented
+  better-left (a higher-is-better metric plotted negated; tick labels only when no row is), wide
+  enough for every interval, the bound shaded, each row's interval and estimate in green or red only
+  when confirmed across the family, else grey, its change at the right, a gap row's `not comparable:
+  no @find`; every journey while 24 px rows fit (14), else every journey decided worse and the
+  headline stay and `and K more in the report`; the scoreboard (every count, so they add up to the
+  compared journeys) and its Holm line under it. Footer: two lines, machine · OS · window @scale, Hz
+  · same server and data · OS input to both, and what CPU summed on each side · pairs. One journey:
+  the headline across the card.
 - **Badges:** per journey as for builds; `--format badge --scoreboard` draws `vs Original | better in
-  4/5 · worse in 1 · 1 gap` (green with no worse or unclear journey, red with a worse one, else grey);
-  `--scoreboard` on anything else is a usage error.
-- **HTML:** scoreboard pills (one per journey; the headline marked; a win Holm did not count in
-  grey), a panel of what was held the same (window, GPU, input, GPU caches, priority, fixture and
-  seed) and each side's identity, engine, process set, observer reads and fixture link and CPU; per
-  journey the usual verdict and pairs, then each side's start and end thumbnails above the
-  equivalence table, and each implementation on its own: its per-side numbers and its profiled
-  threads as bars on one ms-per-run scale for both. No function, flame or heap diffs: two
-  implementations share no code. `report` adds `scoreboard`, `p_repeated`, `holm_decided` and
-  `headline` to the page's payload (`app/family.rs`), the same reading the block and card use.
+  4/5 · worse in 1 · 1 gap` (red with a confirmed regression, green with none and nothing unclear,
+  else grey: an unconfirmed regression is unclear); `--scoreboard` on anything else is a usage error.
+- **HTML:** opens on the headline journey; scoreboard pills (one per journey; the headline marked;
+  green or red only when confirmed across the family) with every count; a panel of what was held the
+  same (window, GPU, input, GPU caches, priority, fixture and seed) and each side's identity,
+  engine, process set, observer reads and fixture link and CPU; per journey the usual verdict and
+  pairs, what each Care number sums, each side's start and end thumbnails above the equivalence
+  table, and each implementation on its own: its per-side numbers and its profiled threads as bars
+  on one ms-per-run scale for both. No function, flame or heap diffs: two implementations share no
+  code. `report` adds `scoreboard`, `p_repeated`, `holm_decided` and `headline` to the page's payload
+  (`app/family.rs`), the same reading the block and card use.
 
 Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
 stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed

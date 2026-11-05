@@ -81,8 +81,9 @@ pub fn claim(c: &Value) -> Claim {
     mk(verb.into(), dir, thing, "")
 }
 
-/// `−66% to −58%`, `2.2× to 2.6×`: a likely range as `factor_or_pct` words it.
-fn range_x(c: &Value) -> String {
+/// `−66% to −58%`, `2.2× to 2.6×` (`2.36× to 2.44×` when one decimal would print one number twice):
+/// a likely range as `factor_or_pct` words it.
+pub fn range_x(c: &Value) -> String {
     if c["relative"] != true {
         return range(c);
     }
@@ -90,7 +91,11 @@ fn range_x(c: &Value) -> String {
     if !lo.is_finite() || !hi.is_finite() {
         return "—".into();
     }
-    nb(&format!("{} to {}", factor_or_pct(lo), factor_or_pct(hi)))
+    let (a, b) = (factor_or_pct(lo), factor_or_pct(hi));
+    if a == b && lo >= 1.0 && hi > lo {
+        return nb(&format!("{:.2}× to {:.2}×", 1.0 + lo, 1.0 + hi));
+    }
+    nb(&format!("{a} to {b}"))
 }
 
 fn change_x(c: &Value) -> String {
@@ -172,52 +177,62 @@ impl<'a> Doc<'a> {
     pub(super) fn render_implementations(&self) -> String {
         let r = self.r;
         let (bn, hn) = side_names(r);
-        let fam = family::of(r);
-        let hero = family::hero(r, &fam);
+        let board = family::Board::of(r);
+        let fam = &board.family;
         let mut out = String::new();
         if let Some(url) = r["card"]["url"].as_str() {
             let alt = r["card"]["alt"].as_str().unwrap_or("");
             let digest = r["card"]["digest"].as_str().map(|d| format!(" <!-- strobe:card {d} -->")).unwrap_or_default();
             out += &format!("![{}]({url}){digest}\n\n", alt.replace(['[', ']'], ""));
         }
-        // The headline: the journey the file marks `hero`, else the biggest win the scoreboard counts.
-        let regs = self.implementation_regressions();
-        let heading = match hero {
-            Some(i) => {
-                let s = self.series[i];
-                format!("{} {} than {} · {}", cell(&hn), claim(&s["primary"]).pr(false), cell(&bn), lc(&cell(&self.title(s))))
-            }
-            None => match regs.first() {
-                Some((s, c)) if std::ptr::eq(*c, &s["primary"]) => format!("Regression: {} {} than {} · {}", cell(&hn), claim(c).pr(false), cell(&bn), lc(&cell(&self.title(s)))),
-                _ => self.calm_implementations(&bn),
-            },
+        // The headline: the journey the file marks `hero`, else the biggest confirmed win; without one
+        // the biggest confirmed regression.
+        let journey = |i: usize| {
+            let s = self.series[i];
+            format!("{} {} than {} · {}", cell(&hn), claim(&s["primary"]).pr(false), cell(&bn), lc(&cell(&self.title(s))))
+        };
+        let heading = match (board.hero, board.worst) {
+            (Some(i), _) => journey(i),
+            (None, Some(i)) => format!("Regression: {}", journey(i)),
+            _ => self.calm_implementations(&bn),
         };
         out += &format!("# {heading}\n\n");
+        let regs = self.implementation_regressions(&board);
         if !regs.is_empty() {
             out += "> [!CAUTION]\n";
             let lines: Vec<String> = regs
                 .iter()
-                .map(|(s, c)| {
+                .map(|(s, c, confirmed)| {
                     let (w, n) = wins(&pairs(s), c["metric"].as_str().unwrap_or(""));
                     let what = if std::ptr::eq(*c, &s["primary"]) { String::new() } else { format!(" ({})", lc(&noun(c["metric"].as_str().unwrap_or("")))) };
-                    format!("> **Regression:** {}{what}: {} {} than {} (medians {}, worse in {} of {n} pairs).", cell(&self.title(s)), cell(&hn), claim(c).pr(false), cell(&bn), before_after(c), n - w)
+                    let label = if *confirmed { "**Regression:**".to_string() } else { format!("**Unconfirmed regression** (this journey alone, not after Holm across {}):", fam.compared) };
+                    format!("> {label} {}{what}: {} {} than {} (medians {}, worse in {} of {n} pairs).", cell(&self.title(s)), cell(&hn), claim(c).pr(false), cell(&bn), before_after(c), n - w)
                 })
                 .collect();
             out += &lines.join("\n");
             out += "\n\n";
         }
-        out += &format!("{}\n\n", self.scoreboard_line(&fam, &bn));
+        out += &format!("{}\n\n", self.scoreboard_line(&board, &bn));
         for (i, s) in self.series.iter().enumerate() {
-            out += &format!("- **{}:** {}\n", cell(&self.title(s)), self.journey_line(s, fam.holm.get(i).copied().unwrap_or(false), fam.compared));
+            out += &format!("- **{}:** {}\n", cell(&self.title(s)), self.journey_line(s, board.alone(i), fam.compared));
         }
         out += "\n";
         let (a, b) = fairness(r, &self.series);
         out += &format!("{}.\n\n", cell(&fmt::fields(a.into_iter().chain(b))));
+        // What a Care metric other than CPU sums on each side, where every reader sees it (the fairness
+        // line says it for CPU).
+        let notes = self.care_notes(true);
+        if !notes.is_empty() {
+            out += &format!("{}\n\n", notes.iter().map(|(m, n)| format!("{}: {}.", noun(m), cell(n.trim_end_matches('.')))).collect::<Vec<_>>().join(" "));
+        }
         if let Some(n) = self.note() {
             out += &format!("{n}\n\n");
         }
         let mut d = String::new();
-        d += &self.implementation_metrics();
+        d += &self.implementation_metrics(&board);
+        if self.level < 6 {
+            d += &self.pairs_section();
+        }
         if self.level < 4 {
             d += &self.per_side_section();
         }
@@ -233,20 +248,39 @@ impl<'a> Doc<'a> {
         out
     }
 
-    /// Everything decidedly worse in head than base: each journey's main metric, then its tested
-    /// metrics, in the file's order.
-    fn implementation_regressions(&self) -> Vec<(&'a Value, &'a Value)> {
+    /// Everything decidedly worse in head than base, in the file's order: each journey's main metric
+    /// (confirmed across the family, or worse on its own only), then its tested metrics (Holm within
+    /// the series already).
+    fn implementation_regressions(&self, board: &family::Board) -> Vec<(&'a Value, &'a Value, bool)> {
         let mut out = Vec::new();
-        for s in self.series.iter().copied() {
+        for (i, s) in self.series.iter().copied().enumerate() {
             if s["not_run"] == true || family::gap(s) {
                 continue;
             }
             if self.primary_out(s) == Out::Worse {
-                out.push((s, &s["primary"]));
+                out.push((s, &s["primary"], !board.alone(i)));
             }
-            out.extend(tested(s).into_iter().skip(1).filter(|c| outcome(c, false) == Out::Worse).map(|c| (s, c)));
+            out.extend(tested(s).into_iter().skip(1).filter(|c| outcome(c, false) == Out::Worse).map(|c| (s, c, true)));
         }
         out
+    }
+
+    /// The Care notes of the compared journeys' tested metrics, each once: (metric, note). `visible`
+    /// leaves out CPU time, which the fairness line already scopes.
+    fn care_notes(&self, visible: bool) -> Vec<(String, String)> {
+        let mut care: Vec<(String, String)> = Vec::new();
+        for s in self.series.iter().filter(|s| !family::gap(s) && s["not_run"] != true) {
+            for c in if visible { vec![&s["primary"]] } else { tested(s) } {
+                let m = c["metric"].as_str().unwrap_or("");
+                if let Some(note) = c["care_note"].as_str()
+                    && !(visible && m.starts_with("cpu."))
+                    && !care.iter().any(|(n, x)| n == m && x == note)
+                {
+                    care.push((m.to_string(), note.to_string()));
+                }
+            }
+        }
+        care
     }
 
     /// The heading without a counted win or a regression of a main metric.
@@ -270,48 +304,33 @@ impl<'a> Doc<'a> {
 
     /// `**Better in 4 of 5 compared journeys** · worse in 1 · not comparable: 1 (…). Holm-adjusted
     /// across 5 journeys.`
-    fn scoreboard_line(&self, fam: &stats::Family, base: &str) -> String {
-        let mut parts = Vec::new();
-        let journeys = |n: usize| if n == 1 { "journey" } else { "journeys" };
-        match fam.all_no_worse {
+    fn scoreboard_line(&self, board: &family::Board, base: &str) -> String {
+        let fam = &board.family;
+        let journeys = if fam.compared == 1 { "journey" } else { "journeys" };
+        let (head, rest) = board.counts();
+        let head = match fam.all_no_worse {
             Some(true) => {
                 let margin = self.series.iter().find(|s| !family::gap(s)).map(|s| margin_text(&s["primary"])).unwrap_or_default();
-                parts.push(format!("**No worse than {} ({margin}) in all {} compared {}**", cell(base), fam.compared, journeys(fam.compared)))
+                format!("**No worse than {} ({margin}) in all {} compared {journeys}**", cell(base), fam.compared)
             }
-            Some(false) => parts.push(format!("**Not no worse in all {} compared {}**", fam.compared, journeys(fam.compared))),
-            None => parts.push(format!("**Better in {} of {} compared {}**", fam.better, fam.compared, journeys(fam.compared))),
-        }
-        if fam.all_no_worse.is_some() && fam.better > 0 {
-            parts.push(format!("better in {}", fam.better));
-        }
-        if fam.worse > 0 {
-            parts.push(format!("worse in {}", fam.worse));
-        }
-        let same_word = if fam.all_no_worse.is_some() { "no worse" } else { "the same" };
-        if fam.same > 0 && fam.all_no_worse != Some(true) {
-            parts.push(format!("{same_word} in {}", fam.same));
-        }
-        if fam.unclear > 0 {
-            parts.push(format!("unclear in {}", fam.unclear));
-        }
+            _ => format!("**{head} compared {journeys}**"),
+        };
+        let mut parts = vec![head];
+        parts.extend(rest);
         if fam.gaps > 0 {
             let list: Vec<String> = self.series.iter().filter(|s| family::gap(s)).map(|s| format!("{}: {}", cell(&self.title(s)), gap_text(self, s))).collect();
             parts.push(format!("not comparable: {} ({})", fam.gaps, list.join("; ")));
         }
+        let correction = board.correction();
         let mut line = format!("{}.", parts.join(" · "));
-        if fam.all_no_worse.is_some() && fam.compared > 1 {
-            line += " Each journey at its own 2.5%: all of them no worse needs no correction (intersection–union).";
-        } else if fam.compared > 1 {
-            line += &format!(" Holm-adjusted across {} journeys.", fam.compared);
-            if fam.better_alone > 0 {
-                line += &format!(" {} better on {} own did not clear it.", fam.better_alone, if fam.better_alone == 1 { "its" } else { "their" });
-            }
+        if !correction.is_empty() {
+            line += &format!(" {}.", capitalize(&correction));
         }
         line
     }
 
-    /// One journey's proof line.
-    fn journey_line(&self, s: &Value, counted: bool, compared: usize) -> String {
+    /// One journey's proof line; `alone`: better or worse on its own, not across the family.
+    fn journey_line(&self, s: &Value, alone: bool, compared: usize) -> String {
         if family::gap(s) {
             return format!("not compared: {}.", gap_text(self, s));
         }
@@ -327,7 +346,7 @@ impl<'a> Doc<'a> {
                 let cl = claim(c);
                 let metric = if matches!(cl.verb.as_str(), "uses" | "has") { String::new() } else { format!("{}, ", lc(&thing)) };
                 let (k, word) = if o == Out::Better { (w, "better") } else { (n - w, "worse") };
-                let alone = if o == Out::Better && !counted && compared > 1 { format!("; better on its own, not after Holm across {compared} journeys") } else { String::new() };
+                let alone = if alone { format!("; {word} on its own, not after Holm across {compared} journeys") } else { String::new() };
                 format!("{} ({metric}{medians}), {word} in {k} of {n} pairs, likely {}{alone}.", cl.pr(true), range_x(c))
             }
             Out::Same => format!("{thing} the same within {} ({medians}).", bound_text(c)),
@@ -343,11 +362,10 @@ impl<'a> Doc<'a> {
     }
 
     /// Every tested metric, columns named by implementation.
-    fn implementation_metrics(&self) -> String {
+    fn implementation_metrics(&self, board: &family::Board) -> String {
         let (bn, hn) = side_names(self.r);
         let mut t = format!("#### Metrics\n\n| Journey / metric | {} | {} | Change | Likely range | Verdict |\n|:---|---:|---:|---:|---:|:---|\n", cell(&bn), cell(&hn));
-        let fam = family::of(self.r);
-        let mut care: Vec<(String, String)> = Vec::new();
+        let (mut conf_main, mut conf_rest) = (String::new(), String::new());
         for (si, s) in self.series.iter().enumerate() {
             if family::gap(s) || s["not_run"] == true {
                 let why = if family::gap(s) { format!("not compared <sub>{}</sub>", gap_text(self, s)) } else { "not run".into() };
@@ -365,21 +383,31 @@ impl<'a> Doc<'a> {
                     (if marked(c, o) { format!("**{d}**") } else { d }, range_x(c))
                 };
                 let mut verdict = verdict_text(c, o, s, false);
-                if i == 0 && o == Out::Better && !fam.holm.get(si).copied().unwrap_or(false) && fam.compared > 1 {
+                if i == 0 && board.alone(si) {
                     verdict += " <sub>not after Holm</sub>";
                 }
                 t += &format!("{}| {name} | {} | {} | {chg} | {rng} | {verdict} |\n", self.series_cell(s, i), nb(&value(c, "base")), nb(&value(c, "head")));
-                if let Some(note) = c["care_note"].as_str()
-                    && !care.iter().any(|(n, x)| n == m && x == note)
-                {
-                    care.push((m.to_string(), note.to_string()));
+                if i == 0 && conf_main.is_empty() {
+                    conf_main = conf(c);
+                } else if i > 0 && conf_rest.is_empty() {
+                    conf_rest = conf(c);
                 }
             }
         }
-        let mut foot = String::from(
-            "Likely range: 98.4% confidence for each main metric (five planned looks, 95% overall), 95% for the others. Change: the median of the pairs' own changes; an increase of 2× or more as a factor.",
-        );
-        for (m, note) in care {
+        // How sure each range is, from the comparisons themselves and the plan's looks.
+        let looks: Vec<String> = self.r["plan"]["looks"].as_array().into_iter().flatten().map(|x| x.to_string()).collect();
+        let at = match looks.len() {
+            0 => String::new(),
+            1 => format!(" (one look at {} pairs)", looks[0]),
+            _ => format!(" (checked at {} pairs, 95% over all of them)", looks.join(", ")),
+        };
+        let mut foot = match (conf_main.is_empty(), conf_rest.is_empty()) {
+            (true, _) => String::new(),
+            (false, true) => format!("Likely range: {conf_main} confidence for each main metric{at}. "),
+            (false, false) => format!("Likely range: {conf_main} confidence for each main metric{at}, {conf_rest} for the others. "),
+        };
+        foot += "Change: the median of the pairs' own changes; an increase of 2× or more as a factor.";
+        for (m, note) in self.care_notes(false) {
             foot += &format!(" {}: {}.", noun(&m), cell(note.trim_end_matches('.')));
         }
         t + &format!("\n<sub>{foot}</sub>\n\n")

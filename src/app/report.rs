@@ -42,16 +42,11 @@ pub fn run(args: &Args) -> Result<Output> {
         // Two implementations: the journeys' scoreboard and each one's repeated p and Holm standing,
         // as the PR block and card read them (`family`), for the viewer to show the same.
         if super::family::implementations(&data) {
-            let (board, per) = super::family::scoreboard(&data);
-            let hero = super::family::hero(&data, &super::family::of(&data));
-            data["scoreboard"] = board;
+            let board = super::family::Board::of(&data);
+            board.write(&mut data);
             if let Some(series) = data["series"].as_array_mut() {
-                for (i, (s, (holm, p))) in series.iter_mut().zip(per).enumerate() {
-                    s["primary"]["holm_decided"] = json!(holm);
-                    if p.is_finite() {
-                        s["primary"]["p_repeated"] = json!(p);
-                    }
-                    s["headline"] = json!(hero == Some(i));
+                for (i, s) in series.iter_mut().enumerate() {
+                    s["headline"] = json!(board.hero == Some(i));
                 }
             }
         }

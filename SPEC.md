@@ -529,12 +529,13 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
 
 ### 5.12 `strobe look`
 
-`look <url | file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000]
+`look <url | file> [--until <selector>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000]
 [--full] [--headed] [--timeout 30s]`: a page in a fresh headless Chromium (strobe's usual flags and a
 throwaway profile), nothing measured, for checking that a UI loads and says what it should (an
-agent on a locked session, a report or tool page) without writing a browser script. After the load
-event (and `--until`'s element visible, then `--wait`) it prints the title, the address, the visible
-headings and dialogs, the console messages and uncaught exceptions with where they came from, the
+agent on a locked session, a report or tool page) without writing a browser script. `--until` takes
+the page selector grammar (§9.6) and waits as `waitFor` does. After the load event (and `--until`'s
+element visible, then `--wait`) it prints the title, the address, the open dialogs and headings a
+case's `expect.heading` checks (the same probe, §9.6), the console messages and uncaught exceptions with where they came from, the
 page's visible text (`innerText`, the first `--chars`), and writes a screenshot (`--full`: the whole
 page). A local file opens as `file://`. Exit 124 when the load event or `--until` never came; the
 page's own errors are listed, not an exit code. It is a CLI command only, not an MCP tool (§17): it
@@ -547,7 +548,9 @@ answers no measurement question.
 window names, open dialogs and headings (what a case's `expect: { title, heading }` matches, read the
 same way, §9.6), and the visible elements that carry a key, with role and name. The tree reads on a
 locked session too (pixels and input do not), so an `expect` can be checked before an unlock. Exit
-124 when the tree or `--until` could not be read.
+124 when the tree or `--until` could not be read. When the executable is missing it says so and
+names the newest build of it a bench made (a directory or git-ref variant's output in strobe's
+`builds/out`), with the `look exe:<path> --app <id>` that opens it.
 
 ## 6. Clock
 
@@ -1449,36 +1452,61 @@ renders into one (a diff or code viewer) counts as a change.
 | Call | Does |
 |---|---|
 | `goto(url, opts?)` | navigate and wait for load; a relative path resolves against the page |
-| `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre |
+| `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre; `opts.button` (`left`, `right`, `middle`), `opts.modifiers` (`["Shift"]`, `["ControlOrMeta"]`) held around it, and `opts.count` 2 or 3 for a double or triple click (each press carries its count), on pages and native apps alike. A native click holds the button about 60 ms on every OS, as a person does |
 | `hover(selector, opts?)` | the pointer moves to the element's centre, no click: reveals hover-only controls |
 | `move(x, y, opts?)` | the pointer moves to a viewport point: parks it away from anything that reacts to hover (an app that prefetches what the pointer rests on); while `down` holds a mouse button it drags (the move carries the button, and a native app gets it in the window the button went down in, as pointer capture does) |
-| `drag(selector, path, opts?)` | presses at the element's centre (where the pointer is with `""`), moves along `path` and releases (`opts.button`: `left`, `right`, `middle`). `path` is offsets `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps): keyframes spread evenly over `opts.duration` (ms, default 1000), straight between them, or a function of `t` from 0 to 1, which the runner samples every 4 ms (`t => [40 * Math.sin(t * 12 * Math.PI), 0]` wiggles). One move per display frame, paced on strobe's clock: the period is the median of ten of the page's own animation frames (a native app: its display's refresh), and each move goes out at its deadline without waiting for the last one's reply. strobe sleeps toward a deadline only as long as its timers have proved they wake in time and spins the rest: under a launchd job whose timers macOS coalesces (`TimerCoalescing`, §10.2) a 16 ms sleep woke 20 to 60 ms late and the moves came in bursts (`input.gap.p95` 66 to 75 ms at 59 moves a second; 16.7 ms spinning). The path starts at offset `[0, 0]`, put first when it does not: keyframes `[[300, 0], [300, 300], [0, 0]]` had pressed 300 px off the element. `page.move` awaits `Input.dispatchMouseEvent`'s reply, which comes once the renderer handled the event, so on a slow main thread a drag of awaited moves sent input at the renderer's rate, and dropped frames partly meant "no new input came". A native app's moves are posted (no reply to wait for). A button `down` already holds stays held. `input.rate` (moves sent per second over the drags' time) and `input.gap.p95` (the 95th percentile gap between consecutive moves) sit beside the frame metrics, so input that starved (a busy machine, strobe at background priority) is visible instead of passing for dropped frames |
-| `type(selector, text, opts?)` | clicks the element unless focus is already inside it, then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
-| `press(key, opts?)` | `Input.dispatchKeyEvent`; chords such as `Control+a`, `ControlOrMeta+Shift+P`; native apps: `opts.selector` sends it to that element (clicked into focus first, as `type` does) |
+| `drag(selector, path, opts?)` | presses at the element's centre (where the pointer is with `""`), moves along `path` and releases (`opts.button`: `left`, `right`, `middle`). `path` is offsets `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps): keyframes spread evenly over `opts.duration` (ms, default 1000), straight between them, or a function of `t` from 0 to 1, which the runner samples every 4 ms (`t => [40 * Math.sin(t * 12 * Math.PI), 0]` wiggles). One move per display frame, paced on strobe's clock: the period is the median of ten of the page's own animation frames (a native app: its display's refresh), and each move goes out at its deadline without waiting for the last one's reply. strobe sleeps toward a deadline only as long as its timers have proved they wake in time and spins the rest. Each driver keeps its own record of how late its sleeps woke: the lead it spins grows to the latest wake, shrinks by an eighth with each wake in time and a sixteenth with each frame it spun whole, and never passes one frame, so one late wake no longer makes every later drag of a long-lived process (the daemon) spin. Under a launchd job whose timers macOS coalesces (`TimerCoalescing`, §10.2) a 16 ms sleep woke 20 to 60 ms late and the moves came in bursts (`input.gap.p95` 66 to 75 ms at 59 moves a second; 16.7 ms spinning). The path starts at offset `[0, 0]`, put first when it does not: keyframes `[[300, 0], [300, 300], [0, 0]]` had pressed 300 px off the element. `page.move` awaits `Input.dispatchMouseEvent`'s reply, which comes once the renderer handled the event, so on a slow main thread a drag of awaited moves sent input at the renderer's rate, and dropped frames partly meant "no new input came". A native app's moves are posted (no reply to wait for). A button `down` already holds stays held. `input.rate` (moves sent per second over the drags' time) and `input.gap.p95` (the 95th percentile gap between consecutive moves) sit beside the frame metrics, so input that starved (a busy machine, strobe at background priority) is visible instead of passing for dropped frames |
+| `type(selector, text, opts?)` | clicks the element unless focus is already inside it (`""`: types where focus is), then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
+| `press(key, opts?)` | `Input.dispatchKeyEvent`; Playwright's key names (`Enter`, `F9`, `PageUp`, `Delete`, `Insert`, `+`) and chords (`Control+a`, `Control++`, `ControlOrMeta+Shift+P`); `opts.selector` sends it to that element (clicked into focus first, as `type` does). Keys come from one table for every target (`keys::dom`: the page's `key` and `code`, the Windows virtual key that is also its `keyCode`, the text it types): a named key is that key, and only a single character types text (`F9` had typed the text "F9"). On a page a chord's modifiers mark the key's events, as CDP takes them, rather than going down as keys of their own, so a chord is one interaction. Shift types what a US keyboard's key types with it (`Shift+a` is `A`, `Shift+1` is `!`) on a page and on macOS, where the character is set on the event (it had typed `a`); Windows and X11 make it from the key state |
 | `down(key, opts?)`, `up(key, opts?)` | one key held across other calls until its `up` (a game's `w`); a held `Shift`, `Control`, `Alt` or `Meta` marks the key events sent while it is down. No auto-repeat: Chromium's input sends none. A mouse button: `Mouse` (left), `MouseRight`, `MouseMiddle`, pressed where the pointer is, or first at `opts.at` (a selector, or `[x, y]` in the viewport or the main window's client area); `move` then drags until `up`. A block that ends with a button held releases it |
 | `snapshot(name)` | the page's pixels as `name`, for `--pixels` (§9.9); nothing outside a pixels block, so timed runs never pay for it |
 | `scroll(selector, { by, speed? }, opts?)` | `Input.synthesizeScrollGesture` over the element |
-| `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too. While a CSS animation or transition runs it also checks once per frame: a fade in from `opacity: 0` makes an element visible on a frame, not on a mutation (a game menu's buttons were seen only at the next unrelated DOM change, 13 ms late on one build and not the other). Frame waits use the browser's own rAF, kept before the page's scripts run, so a page that replaces rAF (a frame pacer) does not set strobe's clock |
+| `waitFor(selector, { text?, exact?, timeout? })` | resolves when a visible element matches (the selector grammar below; `text` and `exact` add to it) (containing `text`, or with exactly that trimmed text when `exact`), through one in-page `MutationObserver` plus `focusin`/`focusout` listeners: focus moves without a mutation, so `:focus` selectors resolve too. While a CSS animation or transition runs it also checks once per frame: a fade in from `opacity: 0` makes an element visible on a frame, not on a mutation (a game menu's buttons were seen only at the next unrelated DOM change, 13 ms late on one build and not the other). Frame waits use the browser's own rAF, kept before the page's scripts run, so a page that replaces rAF (a frame pacer) does not set strobe's clock |
 | `idle(opts?)` | the `"idle"` wait below, on its own |
 | `wait(ms)` | a plain wait |
 | `eval(fn, ...args)` | `Runtime.evaluate`; only in `prepare`, `setup` and `reset` |
-| `wheel(selector, { dx?, dy? }, opts?)` | one mouse-wheel event over the element (the viewport's centre with `""`) |
+| `wheel(selector, { dx?, dy? }, opts?)` | one mouse-wheel event over the element (the viewport's centre with `""`), carrying the keys and buttons `down` holds (`down("Control")` then a wheel: a zoom) |
 | `window(action, opts?)` | native apps: `show`, `hide`, `minimize`, `focus` or `close` a window (`opts.window`: a title, or part of one; default the main window) |
-| `act(selector, action, opts?)` | native apps: an accessibility action (`invoke`, `toggle`, `setValue` with `opts.value`, `expand`, `collapse`, `select`, `scrollIntoView`, `focus`); never an input latency |
+| `act(selector, action, opts?)` | native apps: an accessibility action (`invoke`, `toggle`, `setValue` with `opts.value`, a string or a number, `expand`, `collapse`, `select`, `scrollIntoView`, `focus`); never an input latency. `setValue` reads the element's value back from the app (not a snapshot), on its change events for up to a second, and fails when it never holds the value (the same text trimmed, or the same number, also shown with a unit: `0.5` and `"0.50 ×"`): a bench that set a value the app ignored would measure something else |
 | `query(selector, opts?)` | native apps: the visible elements it matches now, with key path, role, name, value, screen rect, focus, enabled and checked (a toggle's or radio's state, else null) |
+
+**Selectors** are one grammar on pages and native apps, parsed once by strobe (`a11y::Selector`) and
+handed to the page's helper or matched against the accessibility tree: a base, then filters.
+
+- The base: on a page a CSS selector (`>>>` crosses shadow roots); on a native app an accessibility id,
+  an element key (AutomationId, AXIdentifier, AccessibleId) or key path (`"slider/knob"`: earlier
+  segments are the ids of the element's nearest ancestors that have one). No base: every element.
+- `role=<role>`: ARIA's role names (`button`, `textbox`, `checkbox`, `switch`, `heading`, `dialog`, …).
+  A native app's control type maps to them (an unknown role is a usage error there); a page's element
+  has its `role` attribute's first token, else the role its HTML implies (`h2` heading, `a[href]` link,
+  `input[type=checkbox]` checkbox, …).
+- `text=<text>`: a substring of the element's name or value (a page: its text, `aria-label` or value);
+  quoted, `text="General"`, the whole of it, trimmed. On a page only the innermost matches count, since
+  every ancestor's text holds the text too.
+- `index=<n>`: that match, 0-based in tree order, among identical ones (six check boxes all named
+  "checkbutton"); `nth=` says to use `index=`.
+- a `:focus` suffix: the focused element.
+
+`role=heading text="General"`, `.row text=Draft index=1`, `slider/knob:focus`. The base comes first;
+a filter given twice, an unknown `x=` or an unclosed quote is a usage error that quotes the grammar. Every
+call takes the object form too, `{ selector, role, text, exact, index, focus }`, its `selector` in the
+string grammar. `until`, `waitFor`, `expect.visible`, `look --until` and a native launch's `until` take
+the same selectors. Only visible elements match (a page: a box, and not hidden by `visibility`,
+`opacity: 0` or `content-visibility`; a native app: bounds inside their clipping ancestors, not
+offscreen); the first in tree order wins, a native app's searching the main window, then its other
+windows.
 
 On a native target strobe drives the app through the OS's accessibility tree and its message loop
 (§13.7), for any app with an accessibility tree: every call above but `goto` and `eval`, with the same
-`until` and `timeout` options plus `window`. Selectors are accessibility ids: an element key
-(AutomationId) or key path (`"slider/knob"`: earlier segments are the ids of the element's nearest
-ancestors that have one), `role=<role>` (control type; ARIA's names: `button`, `textbox`, `checkbox`,
-`switch`, `heading`, `dialog`, …), `text=<text>` (the name or a text field's value, substring unless
-`exact`), each with a `:focus` suffix. Every call takes the object form too, `{ selector, text?,
-exact?, index? }`, where `index` takes that match (0-based in tree order) among identical ones (six
-check boxes all named "checkbutton"); a page's selector stays a CSS string and an object says so.
-Only visible elements match (bounds inside their clipping ancestors, not offscreen); the first in
-tree order wins, searching the main window, then the app's other windows. `until: "idle"` is no present of the app and no accessibility change for 300 ms;
-`"frame"` is the next present of the app that reached the screen.
+`until` and `timeout` options plus `window`. A wait reads the tree again on each change the app
+announces, at most once per 16 ms while changes come in a burst (an animation's every frame), since
+each read costs the app's own provider work; while the tree is a placeholder (a few elements per
+window: a lazy provider such as AccessKit, which on macOS fills in without an event) it reads again
+every 50 ms. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
+says which kept it busy, with counts: the frames of the app that reached the screen in the last second
+(from the block's present events), its accessibility changes in that second and over the whole wait,
+and whether strobe's own input came then. `"frame"` is the next present of the app that reached the
+screen.
 
 `opts.until`: `"idle"` (no DOM mutation and no long animation frame for 300 ms, watched by one
 in-page `MutationObserver` and `PerformanceObserver`: event-driven, never polling; a page that never
@@ -1737,7 +1765,7 @@ said for every series, declared frame metrics or not, with the session and displ
 what it showed before its warmup runs and after its measured runs (a launch: once it was ready),
 outside every timed span and after the probes stop: the app's visible windows' titles, the open
 dialogs and headings of its accessibility tree (a page: `document.title`, its address, open dialogs
-and `h1`/`h2` headings), and a 64-bit difference hash of the window's pixels (`PrintWindow`, X11
+by their heading, then `h1`, `h2` and level 1 or 2 `role=heading`, its default), and a 64-bit difference hash of the window's pixels (`PrintWindow`, X11
 `GetImage`, `CGWindowListCreateImage` with Screen Recording; a page's screenshot). The tree is read
 before the runs only when setup already drove the app, since a connected client makes a lazy
 provider build and keep its tree; after the runs it is always read. What cannot be read says why
@@ -1746,7 +1774,15 @@ provider build and keep its tree; after the runs it is always read. What cannot 
 hash (20 of 64 bits or more) differs from it. Blocks keep `shown { start, end }`; a series keeps
 `shown { base, head, changed }` with the screen most blocks ended on (`'Hex Settings · General'`:
 the first title, then up to two headings), the other screens and how many blocks showed each, and
-the first block's thumbnail inline. Base and head on different labels (or, with no text read,
+the first block's thumbnail inline. A page's screen, `expect.visible`, `look` and the driver's
+selectors and waits read the page through one in-page probe (`driver::HELPER`: `screen`, `find`,
+`waitFor`), so `look` lists exactly the headings `expect.heading` checks and an `expect.visible` matches
+what a `waitFor` would; a native app's go through the one `Session::screen`. The probe is installed
+once per document (a page call sends only its own call, and the helper only when the document lacks
+it: sending all of it with each call made the page parse it on its main thread every time), its
+`find` stops at the match it needs, and its work inside a run, a wait's checks, is named in profiles by
+its source URL, `strobe-driver.js` (30 clicks each waiting on a selector: 5 ms of the page's main
+thread over five runs, 0.2% of its samples, on an M4). Base and head on different labels (or, with no text read,
 hashes 20 bits apart), or blocks of one variant on several, warn `ScreenChanged`. Text output prints
 `shown  'X'` per series (`--check`: per case, with what could not be read and the thumbnail's path),
 the PR block an `On screen:` line under each series' caption (`bench::shown_line`) and an alert, and
@@ -3325,8 +3361,10 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   end of every run (a process born during a run counts from zero). Descriptive unless declared:
   they say where `cpu.app.total` goes (an idle page drawing at 30 fps spent most of it in the GPU
   process, not the renderer).
-- `interaction.*` and `scroll.latency.p95` come from Chromium's `EventLatency` slices, not the
-  driver's dispatch times; `display.hz` comes from vsync spacing in the trace.
+- `interaction.*` and `scroll.latency.p50|p95` come from Chromium's `EventLatency` slices, not the
+  driver's dispatch times; `display.hz` comes from vsync spacing in the trace. A page gives every
+  percentile with `scroll.n` as a native app does, so too few updates refuse `scroll.latency.p95`
+  `TailTooShort` against its minimum n of 20 instead of leaving it out.
 - `--pin auto` pins to the V-Cache CCD when one exists, else nothing; `--power high` (the default)
   switches plans with `powercfg` and power modes with powrprof (§9.4).
 - The native speed check's slow results on this machine came from the seed copy, not the CPU: a
@@ -3389,6 +3427,25 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   on a real display (counts and intervals against Chromium's own frames with `record --os-frames`,
   a native flip-model window), the helper's install, task start and pipe, the kernel's sampled
   profile and its rundown, and the session's CPU cost on a busy desktop.
+- One driver contract (9.6): one key table (`keys::dom`), one selector grammar (`a11y::Selector`,
+  pages and native apps), one page probe (`driver::HELPER`) for the driver, a block's screen,
+  `expect.visible` and `look`; page clicks with `button`, `modifiers` and `count`; wheels with the
+  held keys; a per-driver drag `Pacer`; pages' `scroll.latency.p50`; native waits that read a
+  placeholder tree again every 50 ms and any tree at most once per 16 ms in a burst; `idle` timeouts
+  with counts; `setValue` read back. Checked with `--check` cases that assert what the target saw:
+  a page (macOS, Edge): `F9`, `Delete`, `PageUp`, `Insert`, `Control++`, `Shift+a`, `Space` and
+  `ControlOrMeta+Shift+P` as those keys with their codes and key codes, `type` of `aB+ é`, a
+  double click with Shift and a right click, held `Control` on a wheel, `role=`, `text=`,
+  `index=`, `>>>` and object selectors, and each malformed selector's usage error; Windows
+  (Character Map, locked): `type`, chords and `setValue` read back through UI Automation; macOS
+  (a Cocoa app) and Linux (a GTK app on Xvfb, AT-SPI and XTest): the grammar, `Shift+a`, `F5`,
+  `PageDown`, `setValue` read back, clicks and drags (`input.gap.p95` 16.7 ms at 60 moves a second
+  on the M4); an always-animating window's `idle` timeout said "it kept drawing … 54 frames reached
+  the screen and its tree changed 0 times". `look` of a page listed the open dialog, the `h1` and a
+  level-2 `role=heading`, not an `h3` or an `opacity: 0` heading. Not done: `Driver::release_all`
+  between runs needs a call in the block loop (`bench.rs`), and a key-only fast path for tree reads
+  (a key path and visibility need the ancestors' ids and bounds, so the read stays whole; the
+  burst limit bounds its cost).
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

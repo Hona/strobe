@@ -291,12 +291,13 @@ impl Poster {
         crate::host::window_state(top).map(|w| w.pid).ok_or_else(|| Error::msg("the app's window closed"))
     }
 
-    /// The key code, the modifiers it needs and the character it types.
+    /// The key code, the modifiers it needs and the character it types. The character is set on the
+    /// event, so a chord's Shift changes it as the keyboard would (`Shift+a` types `A`).
     fn resolve(key: Key, mods: Mods) -> Result<(u16, Mods, Option<char>)> {
         match key {
             Key::Named(n) => Ok((named_code(n), mods, None)),
             Key::Char(c) => match u8::try_from(c).ok().filter(u8::is_ascii).and_then(ascii_code) {
-                Some((code, shift)) => Ok((code, mods.or(Mods { shift, ..Mods::default() }), Some(c))),
+                Some((code, shift)) => Ok((code, mods.or(Mods { shift, ..Mods::default() }), Some(if mods.shift { super::keys::us_shifted(c) } else { c }))),
                 // Any other character: the key event carries it as its text.
                 None => Ok((0, mods, Some(c))),
             },

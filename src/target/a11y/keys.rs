@@ -298,13 +298,23 @@ pub fn dom_char(c: char) -> Dom {
     Dom { key: c.to_string(), code, vk, text: Some(c.to_string()) }
 }
 
+/// A US keyboard's shifted characters and the key's own.
+const SHIFTED: &[(char, char)] = &[
+    ('!', '1'), ('@', '2'), ('#', '3'), ('$', '4'), ('%', '5'), ('^', '6'), ('&', '7'), ('*', '8'), ('(', '9'), (')', '0'), ('_', '-'), ('+', '='),
+    ('{', '['), ('}', ']'), ('|', '\\'), (':', ';'), ('"', '\''), ('<', ','), ('>', '.'), ('?', '/'), ('~', '`'),
+];
+
+/// What a US keyboard types on a character's key with Shift held: `a` is `A`, `1` is `!`.
+pub fn us_shifted(c: char) -> char {
+    match c {
+        c if c.is_ascii_lowercase() => c.to_ascii_uppercase(),
+        c => SHIFTED.iter().find(|s| s.1 == c).map_or(c, |s| s.0),
+    }
+}
+
 /// The key a US keyboard types a printable ASCII character with (that key's unshifted character),
 /// and whether it takes Shift.
 pub fn us_key(c: char) -> Option<(char, bool)> {
-    const SHIFTED: &[(char, char)] = &[
-        ('!', '1'), ('@', '2'), ('#', '3'), ('$', '4'), ('%', '5'), ('^', '6'), ('&', '7'), ('*', '8'), ('(', '9'), (')', '0'), ('_', '-'), ('+', '='),
-        ('{', '['), ('}', ']'), ('|', '\\'), (':', ';'), ('"', '\''), ('<', ','), ('>', '.'), ('?', '/'), ('~', '`'),
-    ];
     match c {
         c if c.is_ascii_uppercase() => Some((c.to_ascii_lowercase(), true)),
         c if c.is_ascii_graphic() || c == ' ' => Some(SHIFTED.iter().find(|s| s.0 == c).map_or((c, false), |s| (s.1, true))),

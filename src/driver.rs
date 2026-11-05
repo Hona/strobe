@@ -17,7 +17,8 @@ pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFram
 /// Installed lazily in the page (it disappears on navigation): the one DOM probe every page reader uses (the
 /// driver's selectors and waits, `look`, a block's screen and `expect`), so they agree on what is visible, what a
 /// selector matches and what the headings are. Observers only: nothing polls, except a check per frame while a CSS
-/// animation or transition runs, since those change what is visible without a mutation.
+/// animation or transition runs, since those change what is visible without a mutation. Its work during a run (a
+/// wait's checks) is the bench's own and shows in a profile under `strobe-driver.js`, its source URL.
 const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
   const raf = window.__strobeRaf ?? window.requestAnimationFrame.bind(window)
@@ -89,18 +90,21 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   const has = (el, text, exact) => text == null || [el.textContent ?? "", el.getAttribute("aria-label") ?? "", typeof el.value === "string" ? el.value : ""].some((t) => (exact ? t.trim() === text.trim() : t.includes(text)))
   const up = (el) => el.parentElement ?? el.getRootNode().host ?? null
   // A selector as strobe parsed it (`{ css, role, text, exact, index, focus }`): CSS (every element without), then
-  // its filters. With a text, only the innermost matches count: every ancestor's text holds it too.
-  s.all = (q) => {
+  // its filters, the cheap ones first. With a text, only the innermost matches count: every ancestor's text holds it
+  // too. It runs on the page's main thread inside a run whenever a wait checks, so it stops at the match it needs and
+  // measures the layout of no element past it.
+  s.find = (q) => {
     let found = query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
-      .filter((el) => (q.role == null || isRole(el, q.role)) && has(el, q.text, q.exact) && (!q.focus || el.matches(":focus")))
+      .filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact))
     if (q.text != null) {
       const outer = new Set()
       for (const el of found) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
       found = found.filter((el) => !outer.has(el))
     }
-    return found.filter(visible)
+    let left = q.index ?? 0
+    for (const el of found) if (visible(el) && left-- === 0) return el
+    return null
   }
-  s.find = (q) => s.all(q)[q.index ?? 0] ?? null
   s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
   s.box = (q) => {
     const el = s.find(q)
@@ -196,27 +200,34 @@ const HELPER: &str = r#"window.__strobe ??= (() => {
   s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))
   s.nodes = () => document.getElementsByTagName("*").length
   return s
-})(), true"#;
+})(), true
+//# sourceURL=strobe-driver.js"#;
 
-/// Installs the page's helper (`HELPER`) if this document lacks it.
-pub fn helper(page: &Page) -> Result<()> {
-    page.eval(HELPER).map(|_| ())
+/// Evaluates a helper call (`__strobe.…`), installing the helper first only when this document lacks
+/// it (a navigation drops it). Page calls run inside measured runs: sending the whole helper with
+/// each one made the page parse it on its main thread every call.
+fn helped(page: &Page, expr: &str, timeout: Duration) -> Result<Value> {
+    match page.eval_timeout(expr, timeout) {
+        Err(e) if e.message.contains("__strobe is not defined") => {
+            page.eval_timeout(HELPER, timeout)?;
+            page.eval_timeout(expr, timeout)
+        }
+        r => r,
+    }
 }
 
 /// What the page shows (`__strobe.screen`): its title, address, open dialogs and top headings (at most
 /// `max`), and its visible text (at most `chars` of it).
 pub fn screen(page: &Page, max: usize, chars: usize, timeout: Duration) -> Result<Value> {
-    page.eval_timeout(HELPER, timeout)?;
-    let v = page.eval_timeout(&format!("__strobe.screen({max}, {chars})"), timeout)?;
+    let v = helped(page, &format!("__strobe.screen({max}, {chars})"), timeout)?;
     v.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(|| Error::msg("the page's screen did not read"))
 }
 
 /// Whether a visible element matches `sel` within `timeout`, re-checked on each DOM and focus change
 /// as `waitFor` does.
 pub fn shows(page: &Page, sel: &Selector, timeout: Duration) -> Result<bool> {
-    page.eval_timeout(HELPER, timeout)?;
     let expr = format!("__strobe.waitFor({}, {}, {}).then(() => true, () => false)", sel.page_spec(), timeout.as_millis(), json!(sel.source));
-    Ok(page.eval_timeout(&expr, timeout + Duration::from_secs(5))? == Value::Bool(true))
+    Ok(helped(page, &expr, timeout + Duration::from_secs(5))? == Value::Bool(true))
 }
 
 /// A selector argument with a call's `{ text, exact }` options added (`waitFor(sel, { text })`).
@@ -378,16 +389,14 @@ impl Driver {
     }
 
     fn call(&self, expr: &str) -> Result<Value> {
-        helper(&self.page)?;
-        self.page.eval(expr)
+        helped(&self.page, expr, Duration::from_secs(60))
     }
 
     /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
     fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
-        helper(&self.page)?;
         // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
         // a destroyed context, which says nothing about what happened to the page.
-        self.page.eval_timeout(expr, timeout + Duration::from_secs(10)).map_err(|e| {
+        helped(&self.page, expr, timeout + Duration::from_secs(10)).map_err(|e| {
             if e.message.contains("Promise was collected") || e.message.contains("context was destroyed") {
                 Error::msg(format!("the page reloaded or navigated away while strobe waited ({expr}): the app replaced the document on its own"))
             } else {
@@ -628,14 +637,16 @@ impl Driver {
     }
 
     /// One key going down or up, from the key table: its `key`, `code` and virtual key, and its text only
-    /// while no Control, Alt or Meta is down (Shift makes a letter's capital).
+    /// while no Control, Alt or Meta is down (Shift types what a US keyboard's key types with it: `A`, `!`).
     fn key_event(&self, key: Key, down: bool, modifiers: i64) -> Result<()> {
         let mut d = match key {
             Key::Named(n) => keys::dom(n),
             Key::Char(c) => keys::dom_char(c),
         };
-        if modifiers & 8 != 0 && d.key.len() == 1 && d.key.as_bytes()[0].is_ascii_lowercase() {
-            d.key = d.key.to_ascii_uppercase();
+        if modifiers & 8 != 0
+            && let Some(c) = d.text.as_deref().and_then(|t| t.chars().next()).filter(|c| d.key.chars().count() == 1 && c.is_ascii_graphic())
+        {
+            d.key = keys::us_shifted(c).to_string();
             d.text = Some(d.key.clone());
         }
         let text = d.text.filter(|_| down && modifiers & 0b0111 == 0);

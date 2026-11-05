@@ -4370,6 +4370,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
+                "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)),
             });
             if !census.is_empty() {
                 meta["census"] = json!(census);

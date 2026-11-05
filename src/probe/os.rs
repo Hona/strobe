@@ -19,11 +19,13 @@ use std::time::{Duration, Instant};
 pub const INTERVAL: Duration = Duration::from_millis(100);
 /// How often the costlier readings are taken: PDH frequency (~0.25 ms), NVML PCIe (~0.1 ms).
 const SLOW_NS: u64 = 950_000_000;
-/// The sampler re-reads which PIDs belong to the tree at most this often, and less often when
-/// the system snapshot is expensive (it costs ~7 ms with 1,000 processes): see `run`.
-const TREE_REFRESH: Duration = Duration::from_secs(1);
-/// The tree refresh may use at most 1/500 of the sampler's time (0.2% of a core).
-const TREE_SHARE: u32 = 500;
+/// The sampler re-reads which PIDs belong to the target's process set at most this often, and less
+/// often when the system snapshot is expensive (it costs ~7 ms with 1,000 processes): see `run`.
+const SET_REFRESH: Duration = Duration::from_secs(1);
+/// The set refresh may use at most 1/500 of the sampler's time (0.2% of a core).
+const SET_SHARE: u32 = 500;
+/// When the first re-read of the set comes: see `run`.
+const STAMPS_SETTLE: Duration = Duration::from_millis(2500);
 const MB: f64 = 1024.0 * 1024.0;
 
 /// Everything one collection produced.
@@ -40,6 +42,105 @@ pub struct Tick {
     /// About once a second.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub freq: Option<Freq>,
+    /// strobe's own process over the tick (a `Sampler`'s ticks only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub own: Option<Own>,
+}
+
+/// strobe's own process over a tick (SPEC rule 2: its CPU, GPU and memory are a track in every
+/// recording): every thread's CPU, % of one core; its GPU engine time, % of one engine, over the last
+/// second (None without a per-process GPU source); its private memory, MB, read at most a second ago.
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub struct Own {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memory_mb: Option<f32>,
+}
+
+/// Reads strobe's own process, one process and no system snapshot: its CPU so far
+/// (`host::process_cycles`, against the TSC) every tick, and once a second its private memory and
+/// its GPU engine time, with a per-process GPU reader of its own: on Windows that is a D3DKMT query
+/// per engine of every adapter (strobe opens them all to read the target's), which every tick cost
+/// the sampler more than the rest of its tick, and Linux's private memory walks the process's
+/// mappings (`smaps_rollup`, 94 µs on vps).
+struct OwnReader {
+    pid: u32,
+    last: Option<(u64, u64)>,
+    gpu: Option<gpu::Kmt>,
+    slow_ns: u64,
+    gpu_pct: Option<f32>,
+    memory_mb: Option<f32>,
+}
+
+impl OwnReader {
+    fn new(adapters: &[Adapter]) -> OwnReader {
+        let gpu = gpu::Kmt::new(adapters, &mut Vec::new());
+        let mut r = OwnReader { pid: std::process::id(), last: None, gpu, slow_ns: 0, gpu_pct: None, memory_mb: None };
+        r.cpu();
+        r.slow(host::now_ns());
+        r
+    }
+
+    /// CPU % of one core since the last read.
+    fn cpu(&mut self) -> Option<f32> {
+        let now = host::process_cycles(self.pid).zip(host::tsc());
+        let pct = self.last.zip(now).filter(|(a, b)| b.1 > a.1 && b.0 >= a.0).map(|(a, b)| (100.0 * (b.0 - a.0) as f64 / (b.1 - a.1) as f64) as f32);
+        self.last = now.or(self.last);
+        pct
+    }
+
+    /// Memory, and GPU % of one engine over the last second (the first read is the GPU's baseline),
+    /// read again once `SLOW_NS` passed.
+    fn slow(&mut self, t: u64) {
+        if self.slow_ns != 0 && t - self.slow_ns < SLOW_NS {
+            return;
+        }
+        if let Some(k) = self.gpu.as_mut() {
+            let (mut rows, mut vram) = (Vec::new(), Vec::new());
+            let dt = if self.slow_ns == 0 { 0 } else { t - self.slow_ns };
+            k.read(&[self.pid], dt, true, &mut rows, &mut vram);
+            self.gpu_pct = (dt > 0).then(|| rows.iter().map(|e| e.pct).sum());
+        }
+        self.memory_mb = own_private_bytes().map(|b| (b as f64 / MB) as f32);
+        self.slow_ns = t;
+    }
+
+    fn read(&mut self, t: u64) -> Own {
+        self.slow(t);
+        Own { cpu_pct: self.cpu(), gpu_pct: self.gpu_pct, memory_mb: self.memory_mb }
+    }
+}
+
+/// strobe's own private memory, as `memory.app.private` counts a target's: Windows' private commit,
+/// macOS's physical footprint (what Activity Monitor shows), Linux's pages no other process maps
+/// (resident and swapped).
+fn own_private_bytes() -> Option<u64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+        let mut m: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        m.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        (unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut m as *mut _ as *mut PROCESS_MEMORY_COUNTERS, m.cb) } != 0).then_some(m.PrivateUsage as u64)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let mut ri: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
+        (unsafe { libc::proc_pid_rusage(std::process::id() as i32, libc::RUSAGE_INFO_V4, &mut ri as *mut _ as *mut libc::rusage_info_t) } == 0).then_some(ri.ri_phys_footprint)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/self/smaps_rollup").ok()?;
+        let kb: u64 = text
+            .lines()
+            .filter(|l| l.starts_with("Private_Clean:") || l.starts_with("Private_Dirty:") || l.starts_with("Swap:"))
+            .filter_map(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .sum();
+        Some(kb * 1024)
+    }
 }
 
 /// PDH `Processor Information` per logical CPU, averaged over `(t_ns - dt_ns, t_ns]`.
@@ -258,24 +359,21 @@ fn cpu_index(name: &[u16]) -> Option<usize> {
     Some(num(&name[..comma])? * 64 + num(&name[comma + 1..])?)
 }
 
-/// Samples a process tree on a background thread until `stop`.
+/// Samples a target's process set, and strobe's own process, on a background thread until `stop`.
 pub struct Sampler {
     stop: mpsc::Sender<()>,
     thread: std::thread::JoinHandle<Samples>,
 }
 
 impl Sampler {
-    /// Samples the process set of `root_pid` and the launch `home` (`host::process_set`: its tree
-    /// and what was launched for the home) every 100 ms (0: no process rows, only CPUs and devices).
-    /// Returns after the baseline collection, so ticks cover everything from the return on.
+    /// Samples every 100 ms the process set of `root_pid` (its tree and everything launched for
+    /// `home`, SPEC §13.2: an app's detached service is the app's; 0: no process rows, only CPUs,
+    /// devices and strobe itself). Returns after the baseline collection, so ticks cover everything
+    /// from the return on.
     pub fn start(root_pid: u32, home: Option<std::path::PathBuf>) -> Sampler {
-        Sampler::every(root_pid, home, INTERVAL)
-    }
-
-    pub fn every(root_pid: u32, home: Option<std::path::PathBuf>, interval: Duration) -> Sampler {
         let (stop, stop_rx) = mpsc::channel();
         let (ready, ready_rx) = mpsc::channel();
-        let thread = std::thread::Builder::new().name("strobe-sampler".into()).spawn(move || run(root_pid, home, interval, stop_rx, ready)).expect("spawn the sampler thread");
+        let thread = std::thread::Builder::new().name("strobe-sampler".into()).spawn(move || run(root_pid, home, INTERVAL, stop_rx, ready)).expect("spawn the sampler thread");
         let _ = ready_rx.recv();
         Sampler { stop, thread }
     }
@@ -290,16 +388,17 @@ impl Sampler {
 
 fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mpsc::Receiver<()>, ready: mpsc::Sender<()>) -> Samples {
     let (k0, tsc0, ns0) = (host::thread_cycles(), host::tsc(), host::now_ns());
-    // The process set, not the tree alone: a launcher that exits leaves the app outside the tree.
-    let tree = || {
-        let mut p: Vec<u32> = if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).collect() };
-        p.sort_unstable();
-        p
-    };
-    let started = Instant::now();
-    let mut pids = tree();
-    let mut refresh = TREE_REFRESH.max(started.elapsed() * TREE_SHARE);
+    let me = std::process::id();
+    // Sorted; strobe's own process is never the target's, though it launched it.
+    let set = || -> Vec<u32> { if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).filter(|&p| p != me).collect() } };
+    // The first read of the set reads every process's stamp (cached by pid and start time), and a
+    // process without one is read again for 2 s after it is first seen (`host::spawn::stamped`): at
+    // the first read every process is new, so a re-read within 2 s reads every process again (30 ms
+    // on adais, which made the sampler 1% of a core in a 5 s block). The first re-read waits past it.
+    let mut pids = set();
+    let mut refresh = STAMPS_SETTLE;
     let mut probe = Probe::new(false, &pids);
+    let mut own = OwnReader::new(&probe.adapters);
     let mut refreshed = Instant::now();
     let setup = host::thread_cycles() - k0;
     let _ = ready.send(());
@@ -314,11 +413,13 @@ fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mp
         }
         if root != 0 && refreshed.elapsed() >= refresh {
             let t = Instant::now();
-            pids = tree();
-            refresh = TREE_REFRESH.max(t.elapsed() * TREE_SHARE);
+            pids = set();
+            refresh = SET_REFRESH.max(t.elapsed() * SET_SHARE);
             refreshed = Instant::now();
         }
-        ticks.push(probe.tick(&pids));
+        let mut tick = probe.tick(&pids);
+        tick.own = Some(own.read(tick.t_ns));
+        ticks.push(tick);
         last = Instant::now();
         if done {
             break;
@@ -351,7 +452,7 @@ fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mp
 /// What a sampler collected. Ticks index into `adapters`, `engines` and `devices`.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Samples {
-    /// Root PID of the tracked tree; 0 = none (CPUs and devices only).
+    /// Root PID of the tracked process set; 0 = none (CPUs, devices and strobe itself only).
     pub root: u32,
     pub interval_ms: u64,
     /// Nominal (base) CPU frequency; a CPU's MHz is `nominal_mhz * perf / 100`.
@@ -369,9 +470,9 @@ pub struct Samples {
     pub cpu_ms: Option<f64>,
     /// CPU time to open PDH, enumerate adapters and initialize NVML.
     pub setup_cpu_ms: Option<f64>,
-    /// How often the tree's PIDs were re-read at the end (1 s, longer when the system snapshot
-    /// is expensive). A child is tracked from the next refresh after it starts; its GPU engine
-    /// time still counts from its start.
+    /// How often the process set's PIDs were re-read at the end (1 s, longer when the system
+    /// snapshot is expensive). A process is tracked from the next refresh after it starts; its GPU
+    /// engine time still counts from its start.
     pub tree_refresh_ms: Option<f64>,
 }
 
@@ -406,7 +507,24 @@ pub struct Summary {
     /// NVML averages for the device behind `gpu_adapter` (the first device when the tree used
     /// none); `vram_used_mb` is the last value.
     pub device: Option<DeviceAvg>,
+    /// strobe's own process over the window (rule 2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub strobe: Option<OwnTrack>,
 }
+
+/// strobe's own process over a window: its CPU (% of one core) and GPU (% of one engine), weighted
+/// like the rest, its peak private memory (MB), and each tick's reading, for the recording's track
+/// (`strobe open --perfetto`): (end of the tick, its length, CPU %, GPU %, memory MB).
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct OwnTrack {
+    pub cpu_pct: Option<f64>,
+    pub gpu_pct: Option<f64>,
+    pub memory_mb: Option<f64>,
+    pub ticks: Vec<OwnTick>,
+}
+
+/// One tick of strobe's own process: (end, length, CPU %, GPU %, memory MB).
+pub type OwnTick = (u64, u64, Option<f32>, Option<f32>, Option<f32>);
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CoreAvg {
@@ -447,6 +565,8 @@ impl Samples {
         let mut engines: BTreeMap<(u16, u16), f64> = BTreeMap::new();
         let mut devices: Vec<[(f64, f64); 9]> = vec![[(0.0, 0.0); 9]; self.devices.len()];
         let mut last: Option<&Tick> = None;
+        let mut own = OwnTrack::default();
+        let mut own_acc = [(0.0, 0.0); 2];
         for t in &self.ticks {
             if let Some(f) = &t.freq {
                 let w = overlap(t.t_ns, f.dt_ns, t0, t1);
@@ -463,6 +583,15 @@ impl Samples {
             total += w;
             last = Some(t);
             add(&mut busy, &t.busy, w);
+            if let Some(o) = t.own {
+                own.ticks.push((t.t_ns, t.dt_ns, o.cpu_pct, o.gpu_pct, o.memory_mb));
+                for (a, v) in own_acc.iter_mut().zip([o.cpu_pct, o.gpu_pct]) {
+                    if let Some(v) = v {
+                        (a.0, a.1) = (a.0 + w * v as f64, a.1 + w);
+                    }
+                }
+                own.memory_mb = o.memory_mb.map(|m| own.memory_mb.unwrap_or(0.0).max(m as f64)).or(own.memory_mb);
+            }
             for e in &t.gpu {
                 *engines.entry((e.adapter, e.engine)).or_default() += w * e.pct as f64;
             }
@@ -476,6 +605,10 @@ impl Samples {
             }
         }
         let Some(last) = last else { return s };
+        if !own.ticks.is_empty() {
+            [own.cpu_pct, own.gpu_pct] = own_acc.map(|(sum, w)| (w > 0.0).then(|| sum / w));
+            s.strobe = Some(own);
+        }
         s.covered_ms = total / 1e6;
         let avg = |acc: &Vec<(f64, f64)>, i: usize| acc.get(i).filter(|a| a.1 > 0.0).map(|a| a.0 / a.1);
         s.cores = (0..busy.len().max(perf.len()))

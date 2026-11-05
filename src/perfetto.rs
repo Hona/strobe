@@ -1,7 +1,8 @@
 //! A recording as one Perfetto trace (SPEC §11.4): the Chrome trace as it is, with strobe's own data
 //! appended on the same clock: CPU profiles and native stacks as stack samples (the Perfetto UI's
-//! flame graphs), runs and phases, marks, inputs, OS presents, threads' CPU and wakes, memory, and
-//! the recording's validity and context. Protobuf by hand: only the fields written here.
+//! flame graphs), runs and phases, marks, inputs, OS presents, threads' CPU and wakes, memory,
+//! strobe's own CPU, GPU and memory, and the recording's validity and context. Protobuf by hand: only
+//! the fields written here.
 
 use crate::model::Result;
 use crate::probe::symbols::{Frame, Symbolizer};
@@ -114,6 +115,7 @@ pub fn build(dir: &Path, out: &Path) -> Result<Built> {
     b.timeline(dir, &threads);
     b.presents(dir, &meta);
     b.memory(dir);
+    b.strobe_itself(&meta);
     b.js(dir, &page, &meta);
     b.native(dir);
     b.summary(&meta);
@@ -712,6 +714,33 @@ impl Builder {
         }
     }
 
+    /// strobe's own process over the recording (SPEC rule 2), from the OS sampler's ticks: its CPU (%
+    /// of one core) and GPU (% of one engine) over each tick, from the tick's start, and its private
+    /// memory at the tick's end.
+    fn strobe_itself(&mut self, meta: &Value) {
+        let Some(own) = meta["os"].get("strobe").and_then(|o| serde_json::from_value::<crate::probe::os::OwnTrack>(o.clone()).ok()).filter(|o| !o.ticks.is_empty()) else { return };
+        type Part = fn(&crate::probe::os::OwnTick) -> Option<f32>;
+        let parts: [(&str, &str, Part, bool); 3] = [("CPU % of a core", "%", |t| t.2, true), ("GPU % of an engine", "%", |t| t.3, true), ("private memory (MB)", "MB", |t| t.4, false)];
+        let group = self.track("strobe itself (its own process)", 40, None);
+        for (name, unit, get, rate) in parts {
+            if !own.ticks.iter().any(|t| get(t).is_some()) {
+                continue;
+            }
+            let track = self.track_under(Some(group), name, 0, Some(unit));
+            for t in &own.ticks {
+                let Some(v) = get(t) else { continue };
+                let at = if rate { t.0.saturating_sub(t.1) } else { t.0 };
+                self.counter(track, MONOTONIC, at, f64::from(v));
+                self.seen(at);
+            }
+            if let (true, Some(last)) = (rate, own.ticks.last()) {
+                self.counter(track, MONOTONIC, last.0, 0.0);
+                self.seen(last.0);
+            }
+            self.count("strobe itself");
+        }
+    }
+
     /// The recording as one slice over everything it holds: its validity, timing, probes, note,
     /// warnings, environment, values and OS averages as arguments.
     fn summary(&mut self, meta: &Value) {
@@ -722,7 +751,7 @@ impl Builder {
             (None, None) => return,
         };
         let mut args = Vec::new();
-        flatten("", meta, &["os.cores", "census", "token", "background"], &mut args);
+        flatten("", meta, &["os.cores", "os.strobe.ticks", "census", "token", "background"], &mut args);
         let track = self.track("recording", -1, None);
         let name = format!("{} · {}{}", meta["id"].as_str().unwrap_or("recording"), if meta["valid"] == false { "invalid" } else { "valid" }, meta["timing"].as_str().map(|t| format!(" · timing {t}")).unwrap_or_default());
         self.slice(track, clock, lo, hi, &name, &args);

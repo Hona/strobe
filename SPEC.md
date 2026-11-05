@@ -279,7 +279,8 @@ Steps (each checks first, prints ✓ / ! / ✗):
 3. **Helper** — deep mode (§13.4): one UAC or sudo. Skippable (`--skip deep`). On Windows the one
    elevated step adds the user to Performance Log Users (present events in strobe's own process from
    the next logon) and installs the helper (present events until then, and native stacks).
-4. **Daemon** — autostart registered, this build's daemon running (§16).
+4. **Daemon** — autostart registered, this build's daemon running, started through that service
+   manager where there is one (§16). The line says how it starts at login, or why it does not.
 5. **MCP** — register `strobe` in opencode's global config and make it live in every loaded
    location, exactly as mesh does (`opencode mcp add`, then `opencode api experimental.mcp.add`),
    with the token read from `{file:<state>/mcp-token}`.
@@ -478,8 +479,12 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   package `@hona/strobe` installs), its tarball checked against the registry's sha512 integrity.
   The running strobe copies each binary beside the installed one and swaps it in by rename (Windows
   lets a running executable be renamed, not overwritten; the old copy stays as `*.old` until nothing
-  runs it, whatever the new build's own install code does) and stops the daemon unless it is
-  running a bench. Then the installed new build runs its own `up --skip calibrate`: it writes its
+  runs it, whatever the new build's own install code does), then runs each new copy (`--version`,
+  the build id checked): a copy that does not run once in the install folder (an antivirus
+  quarantined or blocked it; Defender has flagged unsigned builds) puts every previous binary back
+  and fails with the reason and how to allow it (checked on vps with the install folder on a noexec
+  mount: the previous binary came back byte for byte). `up` installs the same way. It then stops
+  the daemon unless the daemon is running a bench. Then the installed new build runs its own `up --skip calibrate`: it writes its
   skill and MCP registration, starts its daemon, and refreshes the deep-mode helper only where one
   is installed (its UAC prompt only when it is out of date). The same build already installed
   (the same build id, below; the same bytes for copies without one): nothing to do. A daemon left
@@ -499,8 +504,12 @@ engines and VRAM, the focused target's frames when attached. Same samplers as th
   a local build of the same version (other bytes), stays, with a usage error that says so: an
   update once put 0.4.0 over the main build another session's bench used, which then failed on an
   unknown metric. `--force` replaces it anyway.
-- `leave [--yes]`: undo `up`: MCP registration, autostart, skill folder, helper, state dir
-  (recordings included, after confirmation). Leaves the binary.
+- `leave [--yes]`: undo `up`: MCP registration, autostart (it asks the daemon to quit first, then
+  removes the Run key, boots out and deletes the LaunchAgent, or disables and deletes the systemd
+  unit), skill folder, helper, state dir (recordings included, after confirmation). Leaves the
+  binary. The MCP entry in opencode's config is found by parsing its JSONC (strings, comments,
+  trailing commas) as `mcp.strobe`, and cut or given `"oauth": false` in place; a `"strobe"`
+  anywhere else is left alone.
 
 ### 5.11 `strobe daemon` / `strobe mcp` / `strobe helper` (hidden)
 
@@ -2810,7 +2819,18 @@ bridges ──────┤ user-only bridge socket        apps connect out
   with a user-only DACL; unix `<state>/daemon-<build>.sock`.
 - The bridge socket name is stable across builds, so apps find any build's daemon.
 - MCP: `127.0.0.1:<port>` (default 47575, or the next free one up to +99, kept once chosen).
-- Autostart: Task Scheduler (`strobew.exe daemon`, at logon), systemd user unit, LaunchAgent.
+- Autostart: the HKCU Run key (`strobew.exe daemon`, at logon) on Windows; a LaunchAgent
+  (`~/Library/LaunchAgents/dev.hona.strobe.daemon.plist`, `RunAtLoad`, `ProcessType Interactive` so
+  its timers and its benches' are not coalesced, `AbandonProcessGroup`) on macOS; a systemd user unit
+  (`strobe.service`, `WantedBy=default.target`, `KillMode=process`) on Linux. Both record the
+  `PATH`, `XDG_DATA_HOME` and (Linux) display variables of the shell `up` ran in, as a daemon
+  started from it had, and the install folder as the working folder. `up` starts the daemon through
+  launchd (`bootstrap`) or systemd (`restart`), else as a detached process, and says why. `status`
+  shows an `autostart` line from the registration itself (it exists, names an executable that
+  exists, and on Linux is enabled), never assumed.
+- Each invocation (an MCP call runs on its own thread) has its own progress log and stop files;
+  nested ones (a bisect's steps, a track's benches) stack. Benches it runs register `daemon: true`
+  (§10.1): `up`, `update` and the daemon's own follow-up never restart a daemon mid-bench.
 - One per user: a starting daemon asks other builds' daemons to quit once idle.
 - Long work (bench, long records) runs in the daemon; CLI and MCP calls attach to it and can
   detach without stopping it.
@@ -3169,6 +3189,20 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 
 ### 24.2 Where the code differs from the design
 
+- Daemon and CLI safety: each invocation has its own scope (`app::RunScope`, thread-local and
+  nested): its progress log and its stop files, so two benches the daemon runs at once never write
+  into each other's `progress.log` and `bench --stop` reaches only its own (checked on adais: two
+  benches in one MCP process, each log held only its own lines, stopping one left the other
+  waiting). Ctrl-C is never reset per bench: a stop ends `track` and `bisect` too (exit 130). Bench
+  registrations carry `daemon: true`, so `up`, `update` and the daemon's follow-up keep a daemon
+  mid-bench on every OS, not only a Windows `strobew` (checked on vps: `up` over a stale daemon
+  running an MCP bench kept it). The daemon autostarts from the HKCU Run key (Windows, not Task
+  Scheduler), a LaunchAgent (macOS) or a systemd user unit (Linux), and `up` starts it through
+  launchd or systemd; `status` checks the registration (§16). `strobe run` pins only its child
+  (`host::spawn_pinned`: created suspended on Windows, `sched_setaffinity` before exec on Linux;
+  macOS has no affinity); other affinity call sites still move strobe for a spawn. The CLI refuses
+  flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
+  their types from that table (§17).
 - Targets: `cdp:ws://…` and bare `ws://…` attach; `node:`, `bun:` and `@device` are not built.
   `cdp:<port>` reads `/json/version` by its `Content-Length` (or chunks): Chrome and Node keep the
   connection open after the reply. A Node inspector on that port is refused with a pointer to

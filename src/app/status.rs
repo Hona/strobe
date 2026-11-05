@@ -54,6 +54,7 @@ pub fn run(args: &Args) -> Result<Output> {
     // unlock, building.
     let benches = super::bench::slot::list();
     let daemon = super::mcp::running();
+    let autostart = super::up::autostart::state();
     let skill = super::up::skill_state();
     let deep = crate::etw::access();
     #[cfg(windows)]
@@ -84,7 +85,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "calibration": calibration, "recordings": recordings.iter().map(|r| &r.0).collect::<Vec<_>>(),
         "experiments": experiments.iter().map(|r| &r.0).collect::<Vec<_>>(), "disk_bytes": disk,
         "session_locked": locked, "background_priority": qos, "timer_coalescing": timers, "valid": problems.is_empty(), "problems": problems,
-        "daemon": { "running": daemon, "port": super::mcp::port() }, "skill": skill, "benches": benches,
+        "daemon": { "running": daemon, "port": super::mcp::port(), "autostart": { "registered": autostart.0, "detail": autostart.1 } }, "skill": skill, "benches": benches,
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
         "native": { "ready": native_ok, "detail": native_text },
     });
@@ -123,6 +124,7 @@ pub fn run(args: &Args) -> Result<Output> {
             "not running: strobe up starts it (MCP calls need it)".into()
         }
     );
+    t += &format!("  {} autostart  {}\n", mark(autostart.0), autostart.1);
     t += &format!(
         "  {} skill      {}\n",
         mark(skill == "current"),

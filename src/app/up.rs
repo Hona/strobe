@@ -18,6 +18,7 @@ use std::time::Duration;
 
 const SKILL: &str = include_str!("../../skill/SKILL.md");
 const CALIBRATION: &str = include_str!("../../calibration/index.html");
+#[cfg(windows)]
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 
 /// Setup steps, printed to stderr as each finishes (some take seconds); the command's own output is
@@ -136,39 +137,75 @@ fn install_self(s: &mut Steps) -> Result<(PathBuf, bool)> {
     Ok((dir, changed))
 }
 
-/// Puts the strobe binaries in `from` over those in `dir`; says whether any changed.
+/// Puts the strobe binaries in `from` over those in `dir`, then runs each new copy (`--version`). A
+/// copy that does not run (an antivirus quarantined or blocked it once it landed in the install
+/// folder) puts every previous binary back and fails with what happened. Says whether any changed.
 pub(super) fn replace_binaries(from: &Path, dir: &Path) -> Result<bool> {
-    let mut changed = false;
-    for name in ["strobe", "strobew"] {
-        let src = from.join(exe(name));
-        let dst = dir.join(exe(name));
-        if !src.is_file() {
-            // A build without strobew: an older strobew left here would run the daemon.
-            if dst.exists() {
-                set_aside(dir, name)?;
-                changed = true;
+    // (installed path, the previous copy set aside, whether a new copy took its place)
+    let mut swaps: Vec<(PathBuf, Option<PathBuf>, bool)> = Vec::new();
+    let result = (|| -> Result<()> {
+        for name in ["strobe", "strobew"] {
+            let src = from.join(exe(name));
+            let dst = dir.join(exe(name));
+            if !src.is_file() {
+                // A build without strobew: an older strobew left here would run the daemon.
+                if dst.exists() {
+                    swaps.push((dst, Some(set_aside(dir, name)?), false));
+                }
+                continue;
             }
-            continue;
+            if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
+                continue;
+            }
+            // Copy beside it, then swap: a running binary (the daemon, the strobe running `update`)
+            // can be renamed on Windows but not overwritten.
+            let new = dir.join(format!("{}.new", exe(name)));
+            std::fs::copy(&src, &new)?;
+            let aside = if dst.exists() { Some(set_aside(dir, name)?) } else { None };
+            swaps.push((dst.clone(), aside, true));
+            std::fs::rename(&new, &dst)?;
         }
-        if std::fs::read(&src).ok() == std::fs::read(&dst).ok() {
-            continue;
+        let build = super::mcp::file_build(&from.join(exe("strobe")));
+        for (dst, _, _) in swaps.iter().filter(|s| s.2) {
+            let ran = Command::new(dst).arg("--version").stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).output();
+            let why = match &ran {
+                Err(e) => Some(format!("it did not start: {e}")),
+                Ok(o) if !o.status.success() => Some(format!("strobe --version exited {}", o.status.code().unwrap_or(-1))),
+                Ok(o) if build.as_ref().is_some_and(|b| !String::from_utf8_lossy(&o.stdout).contains(b.as_str())) => {
+                    Some(format!("it reports another build ({})", String::from_utf8_lossy(&o.stdout).trim()))
+                }
+                Ok(_) => None,
+            };
+            if let Some(why) = why {
+                return Err(Error::msg(format!("the new {} did not run once it was in {} ({why}): an antivirus may have quarantined or blocked it; the previous build is back", dst.display(), dir.display())).hint(
+                    if cfg!(windows) {
+                        "Windows Defender has flagged unsigned strobe builds (Trojan:Win32/Bearfoos.A!ml): allow strobe in Windows Security › Protection history (or exclude its install folder), then run the update again"
+                    } else {
+                        "allow strobe in the antivirus or security tool that blocked it, then run the update again"
+                    },
+                ));
+            }
         }
-        // Copy beside it, then swap: a running binary (the daemon, the strobe running `update`)
-        // can be renamed on Windows but not overwritten.
-        let new = dir.join(format!("{}.new", exe(name)));
-        std::fs::copy(&src, &new)?;
-        if dst.exists() {
-            set_aside(dir, name)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        for (dst, aside, placed) in swaps.iter().rev() {
+            if *placed {
+                let _ = std::fs::remove_file(dst);
+            }
+            if let Some(a) = aside {
+                let _ = std::fs::rename(a, dst);
+            }
         }
-        std::fs::rename(&new, &dst)?;
-        changed = true;
+        let _ = std::fs::remove_file(dir.join(format!("{}.new", exe("strobe"))));
+        let _ = std::fs::remove_file(dir.join(format!("{}.new", exe("strobew"))));
     }
-    Ok(changed)
+    result.map(|_| !swaps.is_empty())
 }
 
 /// Moves `name` out of the way as `name.old` (or `.old1`, … while an older one still runs), after
-/// removing the old copies nothing runs any more.
-fn set_aside(dir: &Path, name: &str) -> Result<()> {
+/// removing the old copies nothing runs any more; returns where it went.
+fn set_aside(dir: &Path, name: &str) -> Result<PathBuf> {
     let file = exe(name);
     for entry in std::fs::read_dir(dir)?.flatten() {
         let n = entry.file_name().to_string_lossy().to_string();
@@ -178,8 +215,8 @@ fn set_aside(dir: &Path, name: &str) -> Result<()> {
     }
     let free = (0..100).map(|i| dir.join(if i == 0 { format!("{file}.old") } else { format!("{file}.old{i}") })).find(|p| !p.exists());
     let to = free.ok_or_else(|| Error::msg(format!("{}: 100 old copies still running", dir.join(&file).display())))?;
-    std::fs::rename(dir.join(&file), to)?;
-    Ok(())
+    std::fs::rename(dir.join(&file), &to)?;
+    Ok(to)
 }
 
 fn path_has(dir: &Path) -> bool {
@@ -211,15 +248,17 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
     }
     mcp::token()?;
     let daemon_exe = if dir.join(exe("strobew")).is_file() { dir.join(exe("strobew")) } else { dir.join(exe("strobe")) };
-    #[cfg(windows)]
-    host::win::set_user_value(RUN_KEY, "strobe", Some(&format!("\"{}\" daemon", daemon_exe.display())), false);
-    let _ = RUN_KEY;
+    let autostart = autostart::install(&daemon_exe);
+    let login = match &autostart {
+        Ok(what) => format!("starts at login ({what})"),
+        Err(why) => format!("no autostart: {why}"),
+    };
     // The daemon runs MCP calls in its own process: a new build only counts once it restarts.
     let installed = mcp::file_build(&daemon_exe).unwrap_or_else(|| mcp::file_id(&daemon_exe));
     let stale = mcp::running() && (updated || mcp::daemon_build().is_some_and(|b| b != installed));
     if stale {
         if daemon_benching() {
-            s.line("i", "daemon", "keeps the previous build until its bench finishes, then restarts as this one by itself (within a minute)");
+            s.line("i", "daemon", format!("keeps the previous build until its bench finishes, then restarts as this one by itself (within a minute) · {login}"));
             return Ok(());
         }
         let _ = quit_daemon();
@@ -230,21 +269,232 @@ fn daemon_up(s: &mut Steps, dir: &Path, updated: bool) -> Result<()> {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
+    let mut note = String::new();
     if !mcp::running() {
-        spawn_detached(&daemon_exe, &["daemon"])?;
-        for _ in 0..30 {
+        // Through the service manager where autostart registered it (its own job: launchd's
+        // ProcessType Interactive, systemd's lifetime), else as a detached process.
+        let started = if autostart.is_ok() { autostart::start(&daemon_exe) } else { Err("no autostart".into()) };
+        if let Err(why) = started {
+            if autostart.is_ok() {
+                note = format!(" · started directly ({why})");
+            }
+            spawn_detached(&daemon_exe, &["daemon"])?;
+        }
+        for _ in 0..50 {
             if mcp::running() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
         }
     }
-    if mcp::running() {
-        s.line("✓", "daemon", format!("running on 127.0.0.1:{} · starts at login", mcp::port()));
-    } else {
-        s.line("✗", "daemon", "did not start; run `strobe daemon` to see why");
+    match (mcp::running(), autostart.is_ok()) {
+        (true, true) => s.line("✓", "daemon", format!("running on 127.0.0.1:{} · {login}{note}", mcp::port())),
+        (true, false) => s.line("!", "daemon", format!("running on 127.0.0.1:{} · {login}", mcp::port())),
+        (false, _) => s.line("✗", "daemon", format!("did not start; run `strobe daemon` to see why · {login}")),
     }
     Ok(())
+}
+
+/// The daemon's start at login (SPEC §16): the HKCU Run key (Windows), a LaunchAgent with ProcessType
+/// Interactive (macOS: its timers fire on time, as a terminal's do), a systemd user unit (Linux). A
+/// daemon restart ends the daemon only, not the tracks it started (AbandonProcessGroup, KillMode).
+/// Each records the environment `up` ran in that decides where the daemon finds its tools and state
+/// (`PATH`, `XDG_DATA_HOME`, and the display on Linux), as a daemon started from that shell had.
+pub(super) mod autostart {
+    use crate::host;
+    use std::path::{Path, PathBuf};
+    #[cfg(unix)]
+    use std::process::{Command, Stdio};
+
+    #[cfg(target_os = "macos")]
+    const LABEL: &str = "dev.hona.strobe.daemon";
+
+    /// Runs a service manager command; its error text when it fails.
+    #[cfg(unix)]
+    fn run(program: &str, args: &[&str]) -> Result<(), String> {
+        let out = Command::new(program).args(args).stdin(Stdio::null()).output().map_err(|e| format!("{program}: {e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(format!("{program} {} failed: {}", args.first().copied().unwrap_or(""), if err.is_empty() { format!("exit {}", out.status.code().unwrap_or(-1)) } else { err }))
+    }
+
+    #[cfg(unix)]
+    fn captured(names: &[&str]) -> Vec<(String, String)> {
+        names.iter().filter_map(|n| std::env::var(n).ok().filter(|v| !v.is_empty()).map(|v| (n.to_string(), v))).collect()
+    }
+
+    /// Where the registration lives.
+    pub fn path() -> PathBuf {
+        #[cfg(target_os = "macos")]
+        {
+            host::home().join("Library").join("LaunchAgents").join(format!("{LABEL}.plist"))
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| host::home().join(".config")).join("systemd").join("user").join("strobe.service")
+        }
+        #[cfg(windows)]
+        {
+            PathBuf::from(format!(r"HKCU\{}\strobe", super::RUN_KEY))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn content(exe: &Path) -> String {
+        let x = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;");
+        let env: String = captured(&["PATH", "XDG_DATA_HOME"]).iter().map(|(k, v)| format!("\n    <key>{}</key><string>{}</string>", x(k), x(v))).collect();
+        format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Written by strobe up; strobe leave removes it. -->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{LABEL}</string>
+  <key>ProgramArguments</key><array><string>{}</string><string>daemon</string></array>
+  <key>WorkingDirectory</key><string>{}</string>
+  <key>RunAtLoad</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>AbandonProcessGroup</key><true/>
+  <key>EnvironmentVariables</key><dict>{env}
+  </dict>
+</dict>
+</plist>
+"#,
+            x(&exe.display().to_string()),
+            x(&exe.parent().unwrap_or(Path::new("/")).display().to_string())
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn content(exe: &Path) -> String {
+        let q = |s: &str| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('%', "%%"));
+        let env: String = captured(&["PATH", "XDG_DATA_HOME", "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY"]).iter().map(|(k, v)| format!("Environment={}\n", q(&format!("{k}={v}")))).collect();
+        format!(
+            "# Written by strobe up; strobe leave removes it.\n[Unit]\nDescription=strobe daemon (MCP and reports)\n\n[Service]\nExecStart={} daemon\nWorkingDirectory={}\nKillMode=process\n{env}\n[Install]\nWantedBy=default.target\n",
+            q(&exe.display().to_string()),
+            q(&exe.parent().unwrap_or(Path::new("/")).display().to_string())
+        )
+    }
+
+    /// Registers the daemon to start at login; says how, or why it could not.
+    pub fn install(exe: &Path) -> Result<String, String> {
+        #[cfg(windows)]
+        {
+            let cmd = format!("\"{}\" daemon", exe.display());
+            host::win::set_user_value(super::RUN_KEY, "strobe", Some(&cmd), false);
+            if host::win::user_value(super::RUN_KEY, "strobe").as_deref() == Some(cmd.as_str()) { Ok("HKCU Run key".into()) } else { Err(format!("could not write {}", path().display())) }
+        }
+        #[cfg(unix)]
+        {
+            let p = path();
+            let text = content(exe);
+            let changed = std::fs::read_to_string(&p).ok().as_deref() != Some(text.as_str());
+            if changed {
+                std::fs::create_dir_all(p.parent().unwrap_or(Path::new("."))).map_err(|e| format!("{}: {e}", p.display()))?;
+                std::fs::write(&p, &text).map_err(|e| format!("{}: {e}", p.display()))?;
+            }
+            #[cfg(target_os = "linux")]
+            {
+                if changed {
+                    run("systemctl", &["--user", "daemon-reload"])?;
+                }
+                if !wants().exists() {
+                    run("systemctl", &["--user", "enable", "strobe.service"])?;
+                }
+            }
+            Ok(format!("{} {}", if cfg!(target_os = "macos") { "LaunchAgent" } else { "systemd user unit" }, p.display()))
+        }
+    }
+
+    /// The `default.target.wants` link `systemctl --user enable` makes.
+    #[cfg(target_os = "linux")]
+    fn wants() -> PathBuf {
+        path().parent().unwrap_or(Path::new(".")).join("default.target.wants").join("strobe.service")
+    }
+
+    /// Starts the daemon through its service manager (only called while none answers); Windows has
+    /// none for it, so it starts there as a detached process, as at login.
+    pub fn start(exe: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        let _ = exe;
+        #[cfg(target_os = "macos")]
+        {
+            let domain = format!("gui/{}", unsafe { libc::getuid() });
+            let target = format!("{domain}/{LABEL}");
+            // Loaded but not running (it quit for an update): load it again, so the plist's current
+            // contents apply; RunAtLoad starts it.
+            if run("launchctl", &["print", &target]).is_ok() {
+                let _ = run("launchctl", &["bootout", &target]);
+            }
+            run("launchctl", &["bootstrap", &domain, &path().display().to_string()])
+        }
+        #[cfg(target_os = "linux")]
+        {
+            run("systemctl", &["--user", "restart", "strobe.service"])
+        }
+        #[cfg(windows)]
+        {
+            super::spawn_detached(exe, &["daemon"]).map_err(|e| e.message)
+        }
+    }
+
+    /// Whether the daemon starts at login, and the detail (`strobe status`): checked, not assumed.
+    pub fn state() -> (bool, String) {
+        let exists = |p: &Path| p.is_file();
+        #[cfg(windows)]
+        {
+            match host::win::user_value(super::RUN_KEY, "strobe") {
+                Some(cmd) => {
+                    let exe = cmd.trim_start_matches('"').split('"').next().unwrap_or("").to_string();
+                    if exists(Path::new(&exe)) { (true, format!("starts at login (HKCU Run: {cmd})")) } else { (false, format!("the Run key names {exe}, which is gone: strobe up")) }
+                }
+                None => (false, "does not start at login: strobe up".into()),
+            }
+        }
+        #[cfg(unix)]
+        {
+            let p = path();
+            let Ok(text) = std::fs::read_to_string(&p) else { return (false, "does not start at login: strobe up".into()) };
+            #[cfg(target_os = "macos")]
+            let exe = text.split("<array><string>").nth(1).and_then(|r| r.split("</string>").next()).unwrap_or("").replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&");
+            #[cfg(target_os = "linux")]
+            let exe = text.lines().find_map(|l| l.strip_prefix("ExecStart=\"")).and_then(|r| r.split('"').next()).unwrap_or("").to_string();
+            if !exists(Path::new(&exe)) {
+                return (false, format!("{} names {exe}, which is gone: strobe up", p.display()));
+            }
+            #[cfg(target_os = "linux")]
+            if !wants().exists() {
+                return (false, format!("{} is not enabled: strobe up", p.display()));
+            }
+            (true, format!("starts at login ({})", p.display()))
+        }
+    }
+
+    /// Removes the registration (`strobe leave`); a daemon its service manager runs stops with it.
+    pub fn remove() -> String {
+        #[cfg(windows)]
+        {
+            host::win::set_user_value(super::RUN_KEY, "strobe", None, false);
+            "removed the HKCU Run key".into()
+        }
+        #[cfg(unix)]
+        {
+            let p = path();
+            #[cfg(target_os = "macos")]
+            let _ = run("launchctl", &["bootout", &format!("gui/{}/{LABEL}", unsafe { libc::getuid() })]);
+            #[cfg(target_os = "linux")]
+            let _ = run("systemctl", &["--user", "disable", "strobe.service"]);
+            let existed = p.is_file();
+            let _ = std::fs::remove_file(&p);
+            #[cfg(target_os = "linux")]
+            if existed {
+                let _ = run("systemctl", &["--user", "daemon-reload"]);
+            }
+            if existed { format!("removed {}", p.display()) } else { "none registered".into() }
+        }
+    }
 }
 
 pub(super) fn spawn_detached(exe: &Path, args: &[&str]) -> Result<()> {
@@ -295,7 +545,7 @@ fn mcp_up(s: &mut Steps) {
     let token_file = mcp::token_path().display().to_string().replace('\\', "/");
     let config = global_config();
     let existing = std::fs::read_to_string(&config).unwrap_or_default();
-    if !existing.contains("\"strobe\"") {
+    if jsonc::entry(&existing).is_none() {
         let ok = Command::new(&oc)
             .args(["mcp", "add", "strobe", "--global", "--url", &url, "--header", &format!("Authorization=Bearer {{file:{token_file}}}")])
             .stdin(Stdio::null())
@@ -310,11 +560,8 @@ fn mcp_up(s: &mut Steps) {
     }
     // `mcp add` has no flag for oauth; strobe's own entry gets "oauth": false, as mesh's does.
     if let Ok(text) = std::fs::read_to_string(&config)
-        && let Some(i) = text.find("\"strobe\": {")
-        && !text[i..].split('}').next().unwrap_or("").contains("oauth")
+        && let Some(next) = jsonc::set_oauth_off(&text)
     {
-        let at = i + "\"strobe\": {".len();
-        let next = format!("{}\"oauth\": false, {}", &text[..at], &text[at..]);
         let _ = std::fs::write(&config, next);
     }
     // Live in every loaded location, no reload.
@@ -458,17 +705,16 @@ pub fn leave(args: &Args) -> Result<Output> {
     #[cfg(windows)]
     host::win::private_std_handles();
     let mut s = Steps::new("strobe leave");
-    #[cfg(windows)]
-    host::win::set_user_value(RUN_KEY, "strobe", None, false);
-    s.line("✓", "autostart", "removed");
+    // Asked to quit first: removing a service manager's registration would end it mid-write.
     if mcp::running() {
         let _ = quit_daemon();
     }
-    s.line("✓", "daemon", "stopped");
+    s.line("✓", "autostart", autostart::remove());
+    s.line(if mcp::running() { "!" } else { "✓" }, "daemon", if mcp::running() { "still answers: stop it by hand" } else { "stopped" });
     // MCP: cut our own entry from the global config, then remove it live.
     let config = global_config();
     if let Ok(text) = std::fs::read_to_string(&config)
-        && let Some(cut) = cut_entry(&text, "strobe")
+        && let Some(cut) = jsonc::cut_entry(&text)
     {
         std::fs::write(&config, cut)?;
     }
@@ -535,34 +781,137 @@ pub(super) fn quit_daemon() -> Result<()> {
     Ok(())
 }
 
-/// Removes `"name": { … }` (and a trailing comma) from JSONC text, leaving every other byte.
-fn cut_entry(text: &str, name: &str) -> Option<String> {
-    let key = format!("\"{name}\":");
-    let start = text.find(&key)?;
-    let open = start + text[start..].find('{')?;
-    let mut depth = 0;
-    let mut end = None;
-    for (i, c) in text[open..].char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(open + i + 1);
-                    break;
-                }
+/// strobe's entry in opencode's global config (`mcp.strobe`), found by parsing the JSONC (strings,
+/// escapes, comments and trailing commas) and edited in place: every other byte stays as the user wrote
+/// it. A `"strobe"` anywhere else (another section, a string, a comment) is not strobe's entry.
+mod jsonc {
+    /// After whitespace and comments from `i`.
+    fn skip(t: &[u8], mut i: usize) -> usize {
+        loop {
+            while t.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
             }
-            _ => {}
+            if t[i.min(t.len())..].starts_with(b"//") {
+                while t.get(i).is_some_and(|c| *c != b'\n') {
+                    i += 1;
+                }
+            } else if t[i.min(t.len())..].starts_with(b"/*") {
+                i = t[i + 2..].windows(2).position(|w| w == b"*/").map_or(t.len(), |p| i + 2 + p + 2);
+            } else {
+                return i;
+            }
         }
     }
-    let mut end = end?;
-    let rest = &text[end..];
-    if let Some(comma) = rest.find(',')
-        && rest[..comma].trim().is_empty()
-    {
-        end += comma + 1;
+
+    /// The end (exclusive) of the string that opens at `i`.
+    fn string_end(t: &[u8], i: usize) -> Option<usize> {
+        let mut j = i + 1;
+        while let Some(&c) = t.get(j) {
+            match c {
+                b'\\' => j += 2,
+                b'"' => return Some(j + 1),
+                _ => j += 1,
+            }
+        }
+        None
     }
-    let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
-    let prefix = if text[line_start..start].trim().is_empty() { line_start } else { start };
-    Some(format!("{}{}", &text[..prefix], text[end..].trim_start_matches([' ', '\t']).trim_start_matches(['\r', '\n'])))
+
+    /// One member of an object: its key, where the key starts, and its value's span.
+    struct Member {
+        key: String,
+        key_start: usize,
+        start: usize,
+        end: usize,
+    }
+
+    /// An object's members and its end (exclusive), when an object opens at `i`.
+    fn members(t: &[u8], i: usize) -> Option<(Vec<Member>, usize)> {
+        if t.get(i) != Some(&b'{') {
+            return None;
+        }
+        let mut out = Vec::new();
+        let mut j = skip(t, i + 1);
+        loop {
+            match t.get(j)? {
+                b'}' => return Some((out, j + 1)),
+                b'"' => {
+                    let k_end = string_end(t, j)?;
+                    let key = serde_json::from_slice::<String>(&t[j..k_end]).ok()?;
+                    let colon = skip(t, k_end);
+                    (t.get(colon) == Some(&b':')).then_some(())?;
+                    let v = skip(t, colon + 1);
+                    let v_end = value_end(t, v)?;
+                    out.push(Member { key, key_start: j, start: v, end: v_end });
+                    j = skip(t, v_end);
+                    if t.get(j) == Some(&b',') {
+                        j = skip(t, j + 1);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    }
+
+    /// The end (exclusive) of the value that starts at `i`.
+    fn value_end(t: &[u8], i: usize) -> Option<usize> {
+        match t.get(i)? {
+            b'"' => string_end(t, i),
+            b'{' => members(t, i).map(|m| m.1),
+            b'[' => {
+                let mut j = skip(t, i + 1);
+                loop {
+                    if t.get(j)? == &b']' {
+                        return Some(j + 1);
+                    }
+                    j = skip(t, value_end(t, j)?);
+                    if t.get(j) == Some(&b',') {
+                        j = skip(t, j + 1);
+                    }
+                }
+            }
+            _ => {
+                let n = t[i..].iter().position(|c| matches!(c, b',' | b'}' | b']' | b'/') || c.is_ascii_whitespace()).unwrap_or(t.len() - i);
+                (n > 0).then_some(i + n)
+            }
+        }
+    }
+
+    /// `mcp.strobe`: its key's start, and its value's start and end.
+    pub fn entry(text: &str) -> Option<(usize, usize, usize)> {
+        let t = text.as_bytes();
+        let (top, _) = members(t, skip(t, 0))?;
+        let mcp = top.iter().find(|m| m.key == "mcp")?;
+        let (servers, _) = members(t, mcp.start)?;
+        servers.iter().find(|m| m.key == "strobe").map(|m| (m.key_start, m.start, m.end))
+    }
+
+    /// The text with `"oauth": false` added to strobe's entry, when it has no `oauth` yet.
+    pub fn set_oauth_off(text: &str) -> Option<String> {
+        let t = text.as_bytes();
+        let (_, value, _) = entry(text)?;
+        let (fields, _) = members(t, value)?;
+        if fields.iter().any(|f| f.key == "oauth") {
+            return None;
+        }
+        let at = value + 1;
+        Some(format!("{}\"oauth\": false{}{}", &text[..at], if fields.is_empty() { "" } else { ", " }, &text[at..]))
+    }
+
+    /// The text without strobe's entry (and the comma that separated it), leaving every other byte.
+    pub fn cut_entry(text: &str) -> Option<String> {
+        let t = text.as_bytes();
+        let (start, _, end) = entry(text)?;
+        let after = skip(t, end);
+        let end = if t.get(after) == Some(&b',') {
+            after + 1
+        } else if let Some(b) = text[..start].trim_end().strip_suffix(',') {
+            // The last member: the comma before it goes instead, with the line break after it.
+            return Some(format!("{}{}", b, &text[end..]));
+        } else {
+            end
+        };
+        let line_start = text[..start].rfind('\n').map(|i| i + 1).unwrap_or(start);
+        let prefix = if text[line_start..start].trim().is_empty() { line_start } else { start };
+        Some(format!("{}{}", &text[..prefix], text[end..].trim_start_matches([' ', '\t']).trim_start_matches(['\r', '\n'])))
+    }
 }

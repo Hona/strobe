@@ -19,7 +19,7 @@ pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFram
 /// selector matches and what the headings are. Observers only: nothing polls, except a check per frame while a CSS
 /// animation or transition runs, since those change what is visible without a mutation. Its work during a run (a
 /// wait's checks) is the bench's own and shows in a profile under `strobe-driver.js`, its source URL.
-const HELPER: &str = r#"window.__strobe ??= (() => {
+pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
   const raf = window.__strobeRaf ?? window.requestAnimationFrame.bind(window)
   // What a person could see: a box, and not hidden by `visibility`, `opacity: 0` or `content-visibility` on it or an ancestor.

@@ -71,6 +71,13 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         _ => return Err(Error::usage("look app:<id> or exe:<path>")),
     };
     app.kind = "native".into();
+    // `--build`: this checkout's own build of the app (strobe.json `build`), as a bench of it runs.
+    if args.has("build") {
+        if target.starts_with("exe:") {
+            return Err(Error::usage("--build builds the app of an app:<id> profile from this checkout; exe:<path> names the executable already"));
+        }
+        app = app.with_exe(&super::bench::build_native(&std::env::current_dir()?)?);
+    }
     if !app.exe.is_file() {
         return Err(missing(&app, target.strip_prefix("app:").or(args.get("app"))));
     }

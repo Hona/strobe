@@ -132,7 +132,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let home = isolate::prepare_home(&app, seed_dir(ctx, s, &target).as_deref(), None)?;
     crate::target::a11y::prepare();
     let launched = Instant::now();
-    let (mut n, guard) = match nt::launch(&app, &home, &[], false, ctx.pin) {
+    // Its output is read (not discarded) for `ctx.waitForLine`.
+    let (mut n, guard) = match nt::launch(&app, &home, &[], true, ctx.pin) {
         Ok(x) => x,
         Err(e) => {
             isolate::release_home(&home.dir);
@@ -245,8 +246,11 @@ fn runs(
     let counts: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
     let marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
     let pixels = x.pixels.clone();
+    let lines = RefCell::new(super::launch::Lines::default());
+    let output = n.output.take();
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
+            "line" => lines.borrow_mut().serve(output.as_ref(), &home.dir, a),
             "driver" => {
                 let call = a["call"].as_str().unwrap_or("");
                 let args = a["args"].as_array().cloned().unwrap_or_default();
@@ -324,20 +328,24 @@ fn runs(
         }
         counts.borrow_mut().clear();
         marks.borrow_mut().clear();
+        // One read of the app's processes per end of a run: what the session follows, what the
+        // snapshot covers, and (at the end) the cycles.
+        let pids = n.pids();
         if let Some(se) = drive.session.get() {
-            se.set_pids(&n.pids());
+            se.set_pids(&pids);
             se.take_log();
         }
         *current.borrow_mut() = format!("run:{i}");
-        let snap0 = Snapshot::take(&n.pids());
+        let snap0 = Snapshot::take(&pids);
         let c0 = cycles(n);
         let t0 = host::now_ns();
         ctx.runner
             .call("run", json!({ "case": s.case }), run_timeout, &serve)
             .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
         let t1 = host::now_ns();
-        let c1 = cycles(n);
-        let snap1 = Snapshot::take(&n.pids());
+        let procs1 = n.processes();
+        let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
+        let snap1 = Snapshot::take(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>());
         current.borrow_mut().clear();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(marks.borrow_mut().drain(..));

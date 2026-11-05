@@ -112,6 +112,7 @@ pub const FLAGS: &[(&str, Kind)] = &[
     ("keys", Number),
     ("full", Switch),
     ("headed", Switch),
+    ("build", Switch),
     ("timeout", Value),
     // status, top.
     ("calibrate", Switch),
@@ -330,7 +331,7 @@ Use
   history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits
                                   (query history|changes, query <ser_…> history|changes; report history <ser_…|file>)
   look <url|file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000] [--full] [--headed]
-  look app:<id> | exe:<path> [--app <id>] [--until <selector>] [--wait 2s] [--keys 40]
+  look app:<id> | exe:<path> [--app <id>] [--build] [--until <selector>] [--wait 2s] [--keys 40]
                                   a page in a headless browser, nothing measured: title, address, headings, visible text,
                                   console messages and uncaught errors, and a screenshot (exit 124 when it never loads)
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM

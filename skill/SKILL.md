@@ -51,7 +51,7 @@ strobe records a target on one timeline and answers with verdicts and handles (`
     strobe history [<ser_…|file>]    tracked series: points, sparkline, changes, culprits (query history|changes; report history <ser_…>)
     strobe look <url|file> [--until <selector>] [--wait 1s] [--out shot.png]   a page in a headless browser, nothing measured: title,
         the headings `expect` checks, visible text, console messages and errors, a screenshot (check a UI loads instead of writing a browser script)
-    strobe look app:<id> | exe:<path> [--until <selector>]   a native app launched isolated, then closed: window titles, the
+    strobe look app:<id> | exe:<path> [--build] [--until <selector>]   a native app launched isolated (--build: this checkout's build), then closed: window titles, the
         tree's dialogs and headings (what `expect` matches) and keyed elements; works on a locked session, so check `expect` with it
     strobe update [<version>] [--from <path>] [--check]   the latest npm release (or a local build) over the installed copy
 
@@ -96,6 +96,8 @@ More in a bench file:
 - `launch: { until, milestones?, profile?, before?, inspect? }` instead of `run`: one cold launch per block, timed from spawn to `until` (`launch.ready`); milestones `{ match: "text" | /re/, in: "output" | "page" | "<log glob under the home>" }` become `launch.<name>`; `launch.painted`/`launch.settled` from the window's pixels.
 - `command("bun run dev:desktop", { cwd, env: { X: "{home}" }, unset: ["APP_*"] })`: an app started by a dev command, attached where it prints `DevTools listening on ws://…`; `before(ctx)` deletes caches for a cold start.
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
+- Native targets: `const saved = ctx.waitForLine(/saved/, { in: "output" | "<log glob under the home>" }); await page.click("save"); await saved`
+  waits for a line the app writes (`{ line, at }`, `at` on strobe's clock). A case's `gpuCache: "cold"` overrides its target's.
 - `native("my-app")` (a strobe.json profile with `kind: "native"`) or `native("C:/…/app.exe")`: a native app (no browser), isolated like an Electron app,
   measured from outside: `cpu.work`, `ui.cpu` (CPU of the main window's thread: the primary for "does it cost less"), `cpu.wakes` (thread wakes/s;
   `query <rec> threads` names the threads), `io.read`, `gpu.process.3d`, `gpu.vram`,
@@ -133,7 +135,7 @@ More in a bench file:
 - `bun add -d @hona/strobe` pins strobe for the project: `bunx strobe …` runs that version, and editors and
   `tsc` get the bench types. strobe runs a bench file with its own SDK copy either way.
 
-Primary metric: `main.work` for "does this cost less" (continuous; durations move in whole vsyncs; a native app's is `ui.cpu` or `cpu.work`, and `cpu.wakes` when idle), `main.busy` for scrolling and streaming, `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop, `launch.ready` for launches, `cpu.work` for scripts. Fewer than 6 pairs never gets a verdict. Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
+Primary metric: `main.work` for "does this cost less" (continuous; durations move in whole vsyncs; a native app's is `ui.cpu` or `cpu.work`, and `cpu.wakes` when idle), `main.busy` for scrolling and streaming, `interaction.p95` for typing and clicks, `frames.dropped.pct` when frames do drop, `launch.ready` for launches, `cpu.work` for scripts. Fewer than 6 pairs never gets a verdict. Validate a new file with `--check` first: each case once, pass or fail with a screenshot. No display (locked, a server)? `--check --headless` checks page cases with frame and latency metrics refused. `--blocks N` times one build alone (what `track` records).
 
 Everything about the app under test lives in its repo's `strobe.json`: `build` and `serve` for web targets, and `apps` profiles for Electron and native apps (`kind: "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`). Strobe itself knows no product. If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile. strobe.json takes `//` comments and trailing commas; a key strobe does not read or a value of the wrong type fails (exit 2) with its line and the key it meant (a problem in a profile of your own `<state>/strobe.json` fails only the launch that uses it). `"$schema": "./node_modules/@hona/strobe/schema/strobe.v1.json"` gives an editor the keys.
 

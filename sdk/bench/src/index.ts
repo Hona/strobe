@@ -106,6 +106,14 @@ export interface Context<P> {
   count(name: string, n?: number): void
   /** Calls an export of a `script()` target's module in its process and returns what it returned (JSON). */
   call<T = unknown>(name: string, ...args: unknown[]): Promise<T>
+  /**
+   * Native targets: resolves with the first line matching `match` that the app writes after the call, from its
+   * output (`in: "output"`, the default) or from files under its home matching a glob (`in: "logs/*.log"`), and
+   * when strobe read it on its host clock (`at`, ns: the clock of phase marks and presented frames). Start the wait
+   * before what makes the app write: `const saved = ctx.waitForLine(/saved/); await page.click("Save"); await saved`.
+   * Fails after `timeout` ms (default 30000).
+   */
+  waitForLine(match: string | RegExp, opts?: { in?: string; timeout?: number }): Promise<{ line: string; at: number }>
   params: P
   target: string
   variant: "base" | "head"
@@ -226,6 +234,8 @@ interface CaseBase {
   noworse?: string | number | Record<string, string | number>
   /** What each block must show (over its target's `expect`); a block on another screen is refused `WrongScreen` instead of timed. */
   expect?: Expect
+  /** App, exe and native targets: this case's GPU shader caches, over its target's and its app profile's `gpuCache`. */
+  gpuCache?: GpuCache
 }
 
 /**

@@ -216,6 +216,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 Ok(Value::Bool(true))
             }
             "driver" => Err(Error::msg("a script target has no page: call its exports with ctx.call(name, ...args)")),
+            "line" => Err(Error::usage("waitForLine reads a native app's output or log files; a script target's calls return what they return")),
             other => Err(Error::msg(format!("unknown runner request {other}"))),
         }
     };

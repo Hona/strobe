@@ -122,6 +122,8 @@ struct Series {
     /// What the block must show (`expect`: the target's, with the case's keys over it): a block on
     /// another screen is refused `WrongScreen`.
     expect: Value,
+    /// The case's `gpuCache` (`warm` or `cold`), over its target's and its app profile's.
+    gpu_cache: Option<String>,
 }
 
 impl Series {
@@ -448,6 +450,8 @@ struct Ctx<'a> {
     gpu_cache: BTreeMap<String, String>,
     /// What the experiment does, fixed when it starts.
     mode: Mode,
+    /// `--check --headless`: pages run in a headless browser, which draws nothing to a display.
+    headless: bool,
     /// A native target's GPU adapter and window scale per variant (`VariantMismatch`).
     native_setup: BTreeMap<String, String>,
     /// The bench's harness, overlaid on every variant's folder (`overlay_harness`).
@@ -640,6 +644,11 @@ pub fn run(args: &Args) -> Result<Output> {
         None if leak_run => Mode::Leak,
         None => Mode::Compare,
     };
+    // A headless browser presents nothing and paints off screen: a timed block there would put a
+    // number on a pipeline no person runs. It validates a file, as --check does, and nothing more.
+    if args.has("headless") && mode != Mode::Check {
+        return Err(Error::usage("--headless runs pages in a headless browser for --check only: no timed block runs headless (its frames reach no display)"));
+    }
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
     // Before it registers: a `--stop` that sees the registration must find its stop file kept.
@@ -702,6 +711,7 @@ pub fn run(args: &Args) -> Result<Output> {
         homes: BTreeMap::new(),
         gpu_cache: BTreeMap::new(),
         mode,
+        headless: args.has("headless"),
         native_setup: BTreeMap::new(),
         // Per bench: a long-lived daemon runs benches of several repositories.
         harness: harness(&file, &project, &config),
@@ -780,6 +790,7 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(b) => vec![resolve_variant("base", b, &project, &config)?, resolve_variant("head", &head_spec, &project, &config)?],
         None => vec![resolve_variant("head", &head_spec, &project, &config)?],
     };
+    preflight(&series, &ctx.describe, &variants, &config, ctx.headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
@@ -1023,7 +1034,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
+        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": ctx.headless, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
         "recording": recording, "screen": screen, "shown": shown,
         "log": log, "log_path": ctx.runner.log,
     }))
@@ -1062,7 +1073,12 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             .join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
-            text += &format!("pass  {}  {value}  {secs:.1} s{}\n", s["label"].as_str().unwrap_or(""), if s["session_locked"] == true { " · session locked" } else { "" });
+            text += &format!(
+                "pass  {}  {value}  {secs:.1} s{}{}\n",
+                s["label"].as_str().unwrap_or(""),
+                if s["headless"] == true { " · headless" } else { "" },
+                if s["session_locked"] == true { " · session locked" } else { "" }
+            );
             if let Some(rec) = s["recording"].as_str() {
                 text += &format!("      rec  {rec} · strobe query {rec} {}\n", if s["target_kind"] == "native" { "threads" } else { "summary" });
             }
@@ -2322,7 +2338,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b));
         let Some(report) = reserve.map(host::reserve::Reserve::finish) else { return r };
         ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
         r.map(|mut b| {
@@ -2409,6 +2425,8 @@ fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
     };
     match t["kind"].as_str().unwrap_or("") {
         "script" => true,
+        // A headless page draws to no display: the lock screen covers nothing of it.
+        "web" | "url" if ctx.headless => true,
         _ if x.set == Set::Memory => true,
         "native" if t["window"] == false || x.untimed || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless) => {
             !gpu_use(&s.primary) && std::iter::once(&s.primary).chain(&s.metrics).all(|m| offscreen(m))
@@ -2443,6 +2461,21 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
 /// normal priority.
 pub(crate) fn foreground_metric(m: &str) -> bool {
     ["frames.", "interaction.", "scroll.", "canvas.", "input."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+}
+
+/// `--headless`: what reached no display is not kept. Frames, input latencies, scrolling, canvas
+/// frames and GPU use go, and the declared ones show refused; CPU, main-thread work, counters,
+/// memory and milestones stay.
+fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
+    if !ctx.headless {
+        return b;
+    }
+    let drawn = |m: &str| foreground_metric(m) || gpu_use(m);
+    b.values.retain(|k, _| !drawn(k));
+    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| drawn(m)) {
+        b.refused.insert(m.clone(), Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page ran headless (--headless), so nothing it drew reached a display")));
+    }
+    b
 }
 
 fn background_refusal(why: &str, what: &str) -> Error {
@@ -2492,6 +2525,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     }
     window.scale = target["scale"].as_f64();
     ctx.used = Some(window.clone());
+    // As before a native block's speed check: a timed block launches once the target's CPUs are quiet
+    // (the last block's browser still frees its memory and GPU objects there), waiting at most 10 s.
+    let settled = Instant::now();
+    if x.measures_time() {
+        validity::wait_quiet(ctx.pin, Duration::from_secs(10));
+    }
+    let quiet_ms = settled.elapsed().as_secs_f64() * 1e3;
     let launched = Instant::now();
     let mut guard = None;
     let browser = if kind == "command" {
@@ -2504,9 +2544,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         guard = Some(g);
         b
     } else {
-        chromium::launch(&window, false, ctx.pin, &[])?
+        chromium::launch(&window, ctx.headless, ctx.pin, &[])?
     };
-    let steps = RefCell::new(vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
+    let steps = RefCell::new(vec![("quiet".to_string(), quiet_ms), ("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
     ctx.target_qos = host::background_qos(Some(browser.pid));
     let lapped = std::cell::Cell::new(Instant::now());
     let lap = |name: &str| {
@@ -2515,7 +2555,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     };
     let result = (|| -> Result<Block> {
         if !ctx.gpu_checked {
-            let gpu = validity::software_gpu(&browser)?;
+            // Headless, a software rasterizer refuses nothing: frames and GPU use are refused anyway.
+            let gpu = if ctx.headless { browser.gpu()? } else { validity::software_gpu(&browser)? };
             ctx.gpu = serde_json::to_value(&gpu)?;
             ctx.browser_version = browser.version.clone();
             ctx.gpu_checked = true;
@@ -2622,6 +2663,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     }
                     Ok(Value::Bool(true))
                 }
+                "line" => Err(Error::usage("waitForLine reads a native app's output or the log files under its home; a page has neither (wait for the page instead: page.waitFor)")),
                 other => Err(Error::msg(format!("unknown runner request {other}"))),
             }
         };
@@ -2645,7 +2687,22 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         lap("load");
         validity::dev_build(&page)?;
         let speed = validity::speed_check(&page)?;
-        let ratio = validity::throttled(speed, ctx.baseline)?;
+        let ratio = match validity::throttled(speed, ctx.baseline) {
+            // A slow check while other work keeps the target's CPUs busy is that work's doing, as for a
+            // native block: `Background`, which the bench waits out, not `Throttled`.
+            Err(e) => {
+                let (_, top) = validity::wait_quiet(ctx.pin, Duration::ZERO);
+                return Err(if top >= BACKGROUND_PCT {
+                    Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs busy ({})", e.message))
+                        .detail(format!("the busiest of them {top:.0}% busy after it"))
+                        .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
+                        .into()
+                } else {
+                    e
+                });
+            }
+            Ok(r) => r,
+        };
         // A leak run reads heaps, not pixels: on a locked screen the hidden page is still measured.
         let hidden_ok = set == Set::Memory && host::session_locked();
         if !hidden_ok {
@@ -2698,8 +2755,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let began = Instant::now();
             *current.borrow_mut() = key.to_string();
             // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
-            // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between.
-            let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+            // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between. One read of the
+            // target's processes at each end of the run gives its cycles, times and roles.
+            let read = || {
+                let procs = browser.processes();
+                let tsc = host::tsc();
+                let (cycles, cpu) = procs.iter().fold((0u64, 0u64), |(c, t), p| (c + p.cycles, t + p.cpu_ns));
+                (procs, cycles, tsc, cpu)
+            };
             let by_role = |procs: &[host::ProcTimes], roles: &BTreeMap<u32, usize>| -> [u64; 3] {
                 let mut out = [0u64; 3];
                 for p in procs {
@@ -2710,9 +2773,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 out
             };
             let mut roles = process_roles(&browser);
-            let procs_start = browser.processes();
-            let (cyc0, tsc0) = cycles();
-            let cpu0: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
+            let (procs_start, cyc0, tsc0, cpu0) = read();
             *carried.borrow_mut() = [0.0; 6];
             counts.borrow_mut().clear();
             if !counted.is_empty() {
@@ -2737,8 +2798,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
-            let (cyc1, tsc1) = cycles();
-            let procs_end = browser.processes();
+            let (procs_end, cyc1, tsc1, cpu1) = read();
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
@@ -2751,7 +2811,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
-            let cpu1: u64 = browser.processes().iter().map(|p| p.cpu_ns).sum();
             current.borrow_mut().clear();
             // A key or button the run left held would be down in the next one: let go, outside its span.
             driver.release_all()?;
@@ -3186,13 +3245,20 @@ fn gpu_store(exp: &str, v: &Variant) -> PathBuf {
     host::paths::sub("gpu-cache").join(format!("{exp}-{}", v.role))
 }
 
-/// The target's `gpuCache` (else its app profile's; default `warm`) set on `app`: `warm` lends each
+/// The `gpuCache` a series' launches take: its case's, else its target's, else its app profile's
+/// (`app`), default `warm`.
+fn gpu_cache_mode<'a>(s: &'a Series, target: &'a Value, app: Option<&'a isolate::App>) -> &'a str {
+    s.gpu_cache.as_deref().or(target["gpuCache"].as_str()).or(app.and_then(|a| a.gpu_cache_mode.as_deref())).unwrap_or("warm")
+}
+
+/// The series' `gpuCache` (`gpu_cache_mode`) set on `app`: `warm` lends each
 /// launch the GPU shader caches the variant's earlier launches compiled (its own store, never the
 /// other variant's or the user's), as a person's machine has them; `cold` starts every launch
 /// without any. `--check` has no discarded block: its first launch per variant is cold, the next
-/// (the next case, `--why always`'s attribution block) warm. Noted per target for the plan.
+/// (the next case, `--why always`'s attribution block) warm. Noted per target for the plan (per
+/// series when a case sets its own).
 fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut app: isolate::App) -> Result<isolate::App> {
-    let mode = target["gpuCache"].as_str().or(app.gpu_cache_mode.as_deref()).unwrap_or("warm").to_string();
+    let mode = gpu_cache_mode(s, target, Some(&app)).to_string();
     let note = match mode.as_str() {
         _ if cfg!(target_os = "macos") => "os: macOS keeps Metal's compiled shaders per app in the user's own cache folder, which a launch cannot move: warm, and shared by both variants",
         "warm" if ctx.args.get("gpu-store") == Some("exe") => {
@@ -3206,7 +3272,8 @@ fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut ap
         "cold" => "cold: every launch compiles its shaders again (gpuCache: \"cold\")",
         other => return Err(Error::usage(format!("{}: gpuCache is warm or cold, not {other}", s.target))),
     };
-    ctx.gpu_cache.entry(s.target.clone()).or_insert_with(|| note.to_string());
+    let key = if s.gpu_cache.is_some() { s.label() } else { s.target.clone() };
+    ctx.gpu_cache.entry(key).or_insert_with(|| note.to_string());
     Ok(app)
 }
 
@@ -3217,13 +3284,42 @@ fn gpu_warming(ctx: &Ctx, s: &Series, target: &Value) -> Result<bool> {
     if !matches!(ctx.mode, Mode::Compare | Mode::Blocks(_)) || cfg!(target_os = "macos") || !s.launch.is_null() || !matches!(kind, "native" | "app" | "exe") {
         return Ok(false);
     }
-    let profile = match kind {
-        "native" => target["app"].as_str(),
+    let profile = profile_of(target).and_then(|id| isolate::app(id, &ctx.config).ok());
+    Ok(gpu_cache_mode(s, target, profile.as_ref()) == "warm")
+}
+
+/// The app profile a target launches from: `native(appId)`, `app(id)`, `exe(path, { app })`.
+fn profile_of(target: &Value) -> Option<&str> {
+    match target["kind"].as_str()? {
         "app" => target["id"].as_str(),
-        _ => target["app"].as_str(),
-    };
-    let from_profile = profile.and_then(|id| isolate::app(id, &ctx.config).ok()).and_then(|a| a.gpu_cache_mode);
-    Ok(target["gpuCache"].as_str().map(str::to_string).or(from_profile).as_deref().unwrap_or("warm") == "warm")
+        "native" | "exe" => target["app"].as_str(),
+        _ => None,
+    }
+}
+
+/// What a bench can tell is wrong before it waits for the slot or builds anything: an app profile that
+/// does not resolve, a guarded file strobe may not read, a `gpuCache` that is neither warm nor cold.
+fn preflight(series: &[Series], describe: &Value, variants: &[Variant], config: &Value, headless: bool) -> Result<()> {
+    for s in series {
+        let target = &describe["targets"][&s.target];
+        if headless && !matches!(target["kind"].as_str(), Some("web" | "url")) {
+            return Err(Error::usage(format!("{}: --headless runs pages in a headless browser; this target is a {} target, which opens its own window", s.label(), target["kind"].as_str().unwrap_or("?"))));
+        }
+        let apps = profile_of(target).into_iter().chain(variants.iter().filter_map(|v| if let Kind::App(id) = &v.kind { Some(id.as_str()) } else { None }));
+        let mut profiles = Vec::new();
+        for id in apps {
+            let app = isolate::app(id, config).map_err(|e| Error { message: format!("{}: {}", s.label(), e.message), ..e })?;
+            isolate::Guard::take(&app).unreadable()?;
+            profiles.push(app);
+        }
+        for app in profiles.iter().map(Some).chain(std::iter::once(None)) {
+            let mode = gpu_cache_mode(s, target, app);
+            if !matches!(mode, "warm" | "cold") {
+                return Err(Error::usage(format!("{}: gpuCache is warm or cold, not {mode}", s.label())));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// What an app target launches for a variant. `app:<id>` is that app's own profile; `exe:<path>` is
@@ -3355,6 +3451,7 @@ fn expand(describe: &Value, args: &Args) -> Result<Vec<Series>> {
                     reset: c["reset"].as_bool().unwrap_or(false),
                     launch: c["launch"].clone(),
                     timeout: c["timeout"].as_u64(),
+                    gpu_cache: c["gpuCache"].as_str().map(str::to_string),
                 });
             }
         }
@@ -3667,6 +3764,18 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
         }
     }
     out
+}
+
+/// `look app:<id> --build`: the native executable strobe.json's `build` makes of the checkout `dir`
+/// is in, built as a bench of that directory builds it (unchanged since the last build: reused),
+/// as strobe's own copy.
+pub(crate) fn build_native(dir: &Path) -> Result<PathBuf> {
+    let project = config::project_root(dir);
+    let config = config::load(&project)?;
+    let mut v = resolve_variant("head", &dir.display().to_string(), &project, &config)?;
+    let root = v.root.clone().ok_or_else(|| Error::usage(format!("{} is not a folder to build", dir.display())))?;
+    prepare_variant(&mut v, &json!({ "kind": "native" }), &config, &Harness { from: root, paths: Vec::new() }, &project)?;
+    v.exe.take().ok_or_else(|| Error::usage(format!("strobe.json has no build.command for {} in {}: nothing to build", isolate::os(), project.display())))
 }
 
 /// Builds and serves a variant for `web` targets (once per experiment).
@@ -4125,7 +4234,8 @@ fn render(r: &Value) -> String {
         let reserved = r["plan"]["reserve"]["cpus"].as_u64().map(|c| format!("others kept off CPUs {}", cpu_list(c))).unwrap_or_default();
         let power = format!("power plan {}", env["power_plan"].as_str().filter(|p| !p.is_empty()).unwrap_or("?"));
         out += &format!("plan   {}\n", fmt::fields([r["plan"]["pin"].as_str().unwrap_or(""), &reserved, &power, &format!("{screen}, unthrottled")]));
-        if let Some(gpu) = r["plan"]["gpu_cache"][s["target"].as_str().unwrap_or("")].as_str() {
+        let cache = &r["plan"]["gpu_cache"];
+        if let Some(gpu) = cache[s["label"].as_str().unwrap_or("")].as_str().or(cache[s["target"].as_str().unwrap_or("")].as_str()) {
             out += &format!("gpu    shader caches {gpu}\n");
         }
         let per_block = if s["kind"] == "launch" {

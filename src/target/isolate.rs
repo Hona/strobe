@@ -311,8 +311,9 @@ impl Guard {
     }
 
     /// A guarded file strobe may not read (macOS 27 denies reading another developer's app data
-    /// without a prompt): it could change unseen, so nothing launches.
-    fn unreadable(&self) -> Result<()> {
+    /// without a prompt): it could change unseen, so nothing launches. A bench asks before it waits
+    /// for the slot or builds.
+    pub fn unreadable(&self) -> Result<()> {
         let Some(c) = self.checks.iter().find(|c| c.before.as_deref() == Some(UNREADABLE)) else { return Ok(()) };
         Err(Error::refused(
             "LiveChannel",

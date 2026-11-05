@@ -335,7 +335,8 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   always`: setup, warmup until steady, then the measured runs under the attribution probes; it
   prints the recording handle per matching series. No `<target>` is needed: the bench file names it
   (`--target` picks one of its targets). `--gpu-cache` is refused there: the bench target's
-  `gpuCache` decides, as in a bench.
+  `gpuCache` decides, as in a bench. `--headless` runs a page case in a headless browser, as
+  `bench --check --headless` does (§5.6): no display needed, frame and latency metrics refused.
 - `--ring 30s` starts a flight recorder in the daemon (a ring buffer of the last 30 s, timing
   probes only) and returns its id; `strobe record ring:<id>` dumps it into a recording.
 - `file:<path>` imports (§8.7).
@@ -424,6 +425,13 @@ on a check of one case answers from that recording (with several, it lists them)
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
 a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
 and prints its recording, to profile one build before there is anything to compare.
+`--check --headless` runs page (`web`, `url`) targets in a headless browser: it draws to no display,
+so it runs through a locked session or on a device without one, and keeps what needs no display
+(CPU, main-thread work, counters, phases, memory, milestones) while frames, input latencies,
+scrolling, canvas frames and GPU use are refused `NoPresentSource` ("the page ran headless"); a
+software rasterizer refuses nothing there. `--headless` with a timed mode, or on a native, app, exe
+or command target, is a usage error: no timed frame or latency verdict ever comes from a headless
+browser. `record --bench … --headless` is the same for one case.
 `--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
 their values, with nothing compared and nothing decided; the text gives the primary per block and the
 blocks' median with a Hodges–Lehmann interval over them. It is what `track` records for a commit
@@ -545,7 +553,7 @@ page). A local file opens as `file://`. Exit 124 when the load event or `--until
 page's own errors are listed, not an exit code. It is a CLI command only, not an MCP tool (§17): it
 answers no measurement question.
 
-`look app:<id> | exe:<path> [--app <id>] [--until <selector>] [--wait 2s] [--keys 40] [--timeout
+`look app:<id> | exe:<path> [--app <id>] [--build] [--until <selector>] [--wait 2s] [--keys 40] [--timeout
 60s]`: a native app launched in an isolated home as a bench block launches it (its profile from
 `strobe.json`), nothing measured, then closed with its home: after its main window opens (and
 `--until`'s element shows, then `--wait`) it prints the windows' titles, the accessibility tree's
@@ -554,7 +562,9 @@ same way, §9.6), and the visible elements that carry a key, with role and name.
 locked session too (pixels and input do not), so an `expect` can be checked before an unlock. Exit
 124 when the tree or `--until` could not be read. When the executable is missing it says so and
 names the newest build of it a bench made (a directory or git-ref variant's output in strobe's
-`builds/out`), with the `look exe:<path> --app <id>` that opens it.
+`builds/out`), with the `look exe:<path> --app <id>` that opens it. `--build` (with `app:<id>`) first
+builds the checkout strobe runs in with strobe.json's `build`, as a bench of that folder builds it
+(an unchanged one is reused), and looks at that executable.
 
 ## 6. Clock
 
@@ -1429,7 +1439,12 @@ export default bench({
   showed, §10.2).
 
 **`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
-targets), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
+targets), `waitForLine(match, { in, timeout })` (native targets: the first line matching a string or
+RegExp that the app writes after the call, from its output, which native blocks read for it, or from
+files under its home matching a glob `in`; it resolves with the line and `at`, when strobe read it on
+the host clock in ns, the clock of phase marks and presents, and fails after `timeout`, default 30 s;
+the call registers its watch at once and then waits, so `const saved = ctx.waitForLine(/saved/);
+await page.click(…); await saved` misses nothing), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
 `playwright` and `mock(pattern, handler)`.
@@ -1446,7 +1461,9 @@ way: serve them from a real local server and tear it down in `teardown`.
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
 checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
-ancestor hide it, as they hide it from a person. `until` selectors and `waitFor` use the same test.
+ancestor hide it, as they hide it from a person. `until` selectors and `waitFor` use the same test:
+a page launch's `until` takes the one selector grammar (`role=heading text="Hello"`, the object
+form, `>>>`) and is found by the page probe itself, installed in each document before the observer.
 Selectors cross shadow roots with `>>>` (`[data-component=file] >>> [data-line="11"]`), and `idle` and
 `waitFor` observe every shadow root in the page, including ones attached later, so what a component
 renders into one (a diff or code viewer) counts as a change.
@@ -2315,8 +2332,9 @@ Strobe launches any Electron app the same way, with no change to the app:
   Otherwise the refusal names the running pids and the command that closes them.
 - On close, every process running from the home is killed (detached children outlive the tree),
   then the home is deleted.
-- **GPU shader caches** (`gpuCache`, a native or app target option, else the app profile's;
-  default `warm`). A GPU driver keeps the shaders it compiled under the per-user folders the home
+- **GPU shader caches** (`gpuCache`, a case option over a native or app target option, else the
+  app profile's; default `warm`; anything but `warm` or `cold` is a usage error before the bench
+  takes the slot or builds). A GPU driver keeps the shaders it compiled under the per-user folders the home
   redirects (NVIDIA `%LOCALAPPDATA%\NVIDIA\DXCache` and `GLCache`, `D3DSCache`, AMD `DxCache`,
   `DxcCache`, `VkCache`, `OglCache`, Intel `LocalLow\Intel\ShaderCache`; Mesa
   `$XDG_CACHE_HOME/mesa_shader_cache`, NVIDIA's Linux `$XDG_CACHE_HOME/nvidia` and `~/.nv`), and
@@ -2335,7 +2353,8 @@ Strobe launches any Electron app the same way, with no change to the app:
   per variant is cold, the next warm. `record` and `record --bench` share one store per
   executable (`gpu-cache/rec-<hash>`): the first recording of a build is cold, later ones warm
   (`--gpu-cache cold` keeps a recording cold). `cold` starts every launch without: the first launch
-  after an install or a driver update. The plan (`plan.gpu_cache`) says which per target, and each
+  after an install or a driver update. The plan (`plan.gpu_cache`) says which per target (per series
+  where a case sets its own), and each
   kept recording whether its launch found caches (`gpu_cache`). Killing the tree loses nothing:
   the driver's cache files are written as it compiles (memory-mapped, flushed at the process's
   end). macOS keeps Metal's compiled shaders per app in the per-user cache folder the OS assigns
@@ -3518,6 +3537,19 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   through `host::git` (bench, bisect, track, plan, script targets); `pr.rs` is split into
   `pr/extract.rs` (what a result says), `pr/markdown.rs` (the document) and `pr/github.rs` (markers,
   splicing, `gh`).
+- Blocks ask the OS less and fail sooner (2026-11-05): a page run reads its target's processes once
+  at each end (cycles, CPU time and per-role cycles from one read; it read them six times), a native
+  run three times (five). A timed page block waits up to 10 s for quiet CPUs before its launch, as a
+  native block does before its speed check, and a slow page speed check while other work keeps the
+  target's CPUs busy is `Background` (waited out) rather than `Throttled`. App profiles, unreadable
+  guarded files and `gpuCache` values (now settable per case) are checked before the bench takes the
+  slot or builds: a profile error had waited for the slot first. `bench --check --headless` and
+  `record --bench … --headless` check page cases with no display (adais, locked: a page case's
+  `main.work`, `count.*` and `phase.*` read, `frames.interval.p95` and `interaction.p95` refused
+  "the page ran headless"); `ctx.waitForLine` (native: output, as native blocks now read it, or log
+  files under the home; checked with a fake tray app's `tick` lines and a log glob); a page launch's
+  `until` in the shared grammar (`role=heading text="Later"` timed a heading that appears after
+  1.5 s at 1533 ms, headless); `look app:<id> --build`.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

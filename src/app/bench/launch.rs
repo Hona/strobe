@@ -123,11 +123,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
             command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), &window, ctx.pin)?
         }
-        _ if web => (chromium::launch(&window, false, ctx.pin, &[])?, Started { epoch_ms: 0.0, output: None, main: None }),
+        _ if web => (chromium::launch(&window, ctx.headless, ctx.pin, &[])?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
     let result = (|| -> Result<Block> {
-        let watch = Watch::start(&browser.cdp, observer(&spec["until"]), profile)?;
+        let watch = Watch::start(&browser.cdp, observer(&spec["until"])?, profile)?;
         let stop = Arc::new(AtomicBool::new(false));
         let pid = browser.pid;
         // An app's windows stay on top without focus (an occluded window never paints); `screen` also
@@ -186,7 +186,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         validity::window_visible(&page)?;
         if !ctx.gpu_checked {
-            ctx.gpu = serde_json::to_value(validity::software_gpu(&browser)?)?;
+            ctx.gpu = serde_json::to_value(if ctx.headless { browser.gpu()? } else { validity::software_gpu(&browser)? })?;
             ctx.browser_version = browser.version.clone();
             ctx.gpu_checked = true;
         }
@@ -319,18 +319,110 @@ pub(super) fn milestones(spec: &Value) -> Result<Vec<Milestone>> {
         .into_iter()
         .flatten()
         .map(|(name, d)| {
-            let pattern = match (&d["match"], &d["regex"]) {
-                (Value::String(text), _) => regex_lite::escape(text),
-                (_, r) if r.is_object() => format!("{}{}", if r["flags"].as_str().unwrap_or("").contains('i') { "(?i)" } else { "" }, r["source"].as_str().unwrap_or("")),
-                _ => return Err(Error::usage(format!("launch milestone {name}: `match` is a string or a RegExp"))),
-            };
             if ["ready", "painted", "settled"].contains(&name.as_str()) || name.starts_with("node.") {
                 return Err(Error::usage(format!("launch milestone {name}: launch.{name} is strobe's own; name it something else")));
             }
-            let pattern = regex_lite::Regex::new(&pattern).map_err(|e| Error::usage(format!("launch milestone {name}: {e}")))?;
+            let pattern = pattern(d, &format!("launch milestone {name}"))?;
             Ok(Milestone { name: name.clone(), pattern, source: d["in"].as_str().unwrap_or("output").to_string() })
         })
         .collect()
+}
+
+/// A line pattern as the bench file gives it: `match` (a string, matched as is) or `regex` (a RegExp's
+/// source and flags).
+pub(super) fn pattern(d: &Value, what: &str) -> Result<regex_lite::Regex> {
+    let source = match (&d["match"], &d["regex"]) {
+        (Value::String(text), _) => regex_lite::escape(text),
+        (_, r) if r.is_object() => format!("{}{}", if r["flags"].as_str().unwrap_or("").contains('i') { "(?i)" } else { "" }, r["source"].as_str().unwrap_or("")),
+        _ => return Err(Error::usage(format!("{what}: `match` is a string or a RegExp"))),
+    };
+    regex_lite::Regex::new(&source).map_err(|e| Error::usage(format!("{what}: {e}")))
+}
+
+/// `ctx.waitForLine(match, { in, timeout })` in a block's hooks: each call first registers a watch
+/// (`watch`), then waits on it (`wait`) for the first line matching it that the app wrote after the
+/// watch, from its output (`in: "output"`, the default) or from files under its home matching a glob.
+/// A line carries when strobe read it on the host clock (ns), the clock of phase marks and presents.
+#[derive(Default)]
+pub(super) struct Lines {
+    /// The app's output so far: when strobe read each line (host clock) and the line.
+    output: Vec<(u64, String)>,
+    watches: Vec<LineWatch>,
+}
+
+struct LineWatch {
+    pattern: regex_lite::Regex,
+    source: String,
+    /// Output: the first line it may match. Files: each file's read offset and unfinished line.
+    from: usize,
+    files: BTreeMap<PathBuf, (u64, String)>,
+}
+
+impl Lines {
+    /// Moves what the app has written into `output`, stamped on the host clock.
+    fn pull(&mut self, rx: Option<&Receiver<(f64, String)>>) {
+        let Some(rx) = rx else { return };
+        while let Ok((at, line)) = rx.try_recv() {
+            let ago = ((epoch_ms() - at).max(0.0) * 1e6) as u64;
+            self.output.push((host::now_ns().saturating_sub(ago), line));
+        }
+    }
+
+    pub(super) fn serve(&mut self, rx: Option<&Receiver<(f64, String)>>, home: &Path, a: &Value) -> Result<Value> {
+        self.pull(rx);
+        if a["step"] == "watch" {
+            let source = a["in"].as_str().unwrap_or("output").to_string();
+            if source == "output" && rx.is_none() {
+                return Err(Error::usage("waitForLine: strobe does not read this target's output; give `in` a glob of log files under its home"));
+            }
+            let files = if source == "output" { BTreeMap::new() } else { matching(home, &source).into_iter().map(|p| (p.clone(), (std::fs::metadata(&p).map_or(0, |m| m.len()), String::new()))).collect() };
+            self.watches.push(LineWatch { pattern: pattern(a, "waitForLine")?, source, from: self.output.len(), files });
+            return Ok(json!(self.watches.len() - 1));
+        }
+        let id = a["id"].as_u64().unwrap_or(u64::MAX) as usize;
+        let timeout = Duration::from_millis(a["timeout"].as_u64().unwrap_or(30_000));
+        let deadline = Instant::now() + timeout;
+        loop {
+            self.pull(rx);
+            let w = self.watches.get_mut(id).ok_or_else(|| Error::msg("waitForLine: no such watch"))?;
+            let found = if w.source == "output" {
+                self.output[w.from.min(self.output.len())..].iter().find(|(_, l)| w.pattern.is_match(l)).cloned()
+            } else {
+                read_new(home, w)
+            };
+            if let Some((at, line)) = found {
+                return Ok(json!({ "line": line, "at": at }));
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::timeout(format!("waitForLine: no line matching {} in {} in {:.1} s", w.pattern.as_str(), w.source, timeout.as_secs_f64())));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// What files matching a watch's glob gained since it last read them: the first line that matches.
+fn read_new(home: &Path, w: &mut LineWatch) -> Option<(u64, String)> {
+    use std::io::{Read, Seek, SeekFrom};
+    for path in matching(home, &w.source) {
+        let entry = w.files.entry(path.clone()).or_insert((0, String::new()));
+        let Ok(mut f) = std::fs::File::open(&path) else { continue };
+        let mut buf = Vec::new();
+        if f.seek(SeekFrom::Start(entry.0)).is_err() || f.read_to_end(&mut buf).is_err() {
+            continue;
+        }
+        entry.0 += buf.len() as u64;
+        entry.1.push_str(&String::from_utf8_lossy(&buf));
+        let at = host::now_ns();
+        while let Some(i) = entry.1.find('\n') {
+            let line = isolate::strip_ansi(entry.1[..i].trim_end_matches('\r'));
+            entry.1.drain(..=i);
+            if w.pattern.is_match(&line) {
+                return Some((at, line));
+            }
+        }
+    }
+    None
 }
 
 pub(super) fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
@@ -338,29 +430,27 @@ pub(super) fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn
 }
 
 /// The init script that resolves `window.__strobeLaunch` with the epoch time `until` first showed, and
-/// returns whether it already shows (a late install).
-fn observer(until: &Value) -> String {
-    let (selector, text, exact) = match until {
-        Value::String(s) => (s.clone(), Value::Null, false),
-        o => (o["selector"].as_str().unwrap_or("").to_string(), o.get("text").cloned().unwrap_or(Value::Null), o["exact"] == true),
-    };
-    format!(
-        r#"(() => {{
+/// returns whether it already shows (a late install). `until` is a selector in the one grammar pages
+/// and native apps share (`a11y::Selector`), found by the page probe (`driver::HELPER`) that `expect`,
+/// `waitFor` and `look` use, which goes in first.
+fn observer(until: &Value) -> Result<String> {
+    let q = crate::target::a11y::Selector::parse(until, crate::target::a11y::Dialect::Page).map_err(|e| Error::usage(format!("launch.until: {}", e.message)))?.page_spec();
+    Ok(format!(
+        r#"{helper}
+;(() => {{
   if (window.__strobeLaunch) return false
-  const sel = {sel}, text = {text}, exact = {exact}
-  const visible = (el) => {{ const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0 && (el.checkVisibility?.({{ checkOpacity: true, checkVisibilityCSS: true }}) ?? true) }}
-  const has = (el) => text == null || (exact ? (el.textContent ?? "").trim() === text : (el.textContent ?? "").includes(text))
+  const q = {q}
   let done
   window.__strobeLaunch = new Promise((resolve) => (done = resolve))
-  const shows = () => [...document.querySelectorAll(sel)].some((el) => visible(el) && has(el))
+  const shows = () => !!window.__strobe.find(q)
   const already = document.documentElement != null && shows()
   const mo = new MutationObserver(() => {{ if (shows()) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }} }})
   mo.observe(document, {{ subtree: true, childList: true, attributes: true, characterData: true }})
   if (already) {{ mo.disconnect(); done(performance.timeOrigin + performance.now()) }}
   return already
 }})()"#,
-        sel = json!(selector),
-    )
+        helper = crate::driver::HELPER,
+    ))
 }
 
 /// Every page of the launch, from its first script: browser-wide auto-attach pauses each new page

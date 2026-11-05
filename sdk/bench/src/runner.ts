@@ -98,6 +98,12 @@ const context = () => ({
     void request("count", { name, n })
   },
   call: (name: string, ...args: unknown[]) => request("call", { name, args }),
+  // The watch goes in at the call, before whatever the hook does next; the wait follows.
+  async waitForLine(match: string | RegExp, opts: { in?: string; timeout?: number } = {}) {
+    const pattern = match instanceof RegExp ? plain(match) : { match }
+    const id = await request("line", { step: "watch", ...pattern, in: opts.in ?? "output" })
+    return request("line", { step: "wait", id, timeout: opts.timeout ?? 30_000 })
+  },
 })
 
 const prepareContext = () => ({
@@ -137,6 +143,7 @@ function describe() {
         targets: c.targets,
         timeout: c.timeout,
         noworse: c.noworse,
+        gpuCache: c.gpuCache,
         expect: c.expect && plain(c.expect),
         launch: c.launch && {
           ...plain(c.launch),

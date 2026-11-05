@@ -28,7 +28,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.
     b.set("gpu-store", "exe");
-    for k in ["target", "params", "id", "pin", "power", "runs", "style"] {
+    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }

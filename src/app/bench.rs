@@ -373,6 +373,9 @@ struct Block {
     /// What the window or page showed before the runs and after them (`shown`).
     #[serde(skip_serializing_if = "Option::is_none")]
     shown: Option<shown::Shown>,
+    /// What strobe itself cost over the runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overhead: Option<Overhead>,
 }
 
 /// What an experiment does, decided from its flags before anything runs and never changed.
@@ -558,6 +561,118 @@ impl ReserveTotal {
             self.overhead_pct_max
         );
         t
+    }
+}
+
+/// What strobe itself cost over a block's runs (rule 2, SPEC §19), each as % of one core: its own
+/// process (every thread: DevTools, samplers, accessibility events, the reservation sweep), the
+/// bench runner that runs the file's hooks, and the parts that measure themselves.
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+#[serde(default)]
+struct Overhead {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    strobe_pct: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    runner_pct: Option<f64>,
+    /// The OS and GPU sampler's thread (§19: 0.5%).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sampler_pct: Option<f64>,
+    /// The OS present session's consumer (§19: 0.5%).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    present_pct: Option<f64>,
+    /// The reserved-CPU sweep (§19: 5%, on strobe's own CPUs).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reserve_pct: Option<f64>,
+}
+
+impl Overhead {
+    /// `strobe 1.2% · runner 0.3% · sampler 0.08% of a core`.
+    fn text(&self) -> String {
+        let parts: Vec<String> = [("strobe", self.strobe_pct), ("runner", self.runner_pct), ("sampler", self.sampler_pct), ("presents", self.present_pct), ("reserve", self.reserve_pct)]
+            .into_iter()
+            .filter_map(|(n, p)| Some(format!("{n} {}", pct_of_core(p?))))
+            .collect();
+        if parts.is_empty() { String::new() } else { format!("{} of a core", parts.join(" · ")) }
+    }
+
+    /// Where a part went over its §19 budget: (part, its share, the budget).
+    fn over(&self) -> Vec<(&'static str, f64, f64)> {
+        [("the sampler", self.sampler_pct, 0.5), ("the present session's consumer", self.present_pct, 0.5), ("the reserved-CPU sweep", self.reserve_pct, 5.0)]
+            .into_iter()
+            .filter_map(|(n, p, b)| p.filter(|p| *p > b).map(|p| (n, p, b)))
+            .collect()
+    }
+}
+
+/// The blocks' overhead, each part's mean over the blocks that measured it.
+fn mean_overhead(blocks: &[Block]) -> Option<Overhead> {
+    let all: Vec<&Overhead> = blocks.iter().filter_map(|b| b.overhead.as_ref()).collect();
+    let mean = |f: fn(&Overhead) -> Option<f64>| {
+        let v: Vec<f64> = all.iter().filter_map(|o| f(o)).filter(|x| x.is_finite()).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    };
+    (!all.is_empty()).then(|| Overhead {
+        strobe_pct: mean(|o| o.strobe_pct),
+        runner_pct: mean(|o| o.runner_pct),
+        sampler_pct: mean(|o| o.sampler_pct),
+        present_pct: mean(|o| o.present_pct),
+        reserve_pct: mean(|o| o.reserve_pct),
+    })
+}
+
+fn pct_of_core(p: f64) -> String {
+    if p < 1.0 { format!("{p:.2}%") } else { format!("{p:.1}%") }
+}
+
+/// One run: its span (TSC units, or ns), strobe's and the runner's CPU in it (the same units).
+type RunCost = (u64, Option<u64>, Option<u64>);
+
+/// strobe's own process and the runner's CPU inside the runs only (rule 2): read just before each
+/// run begins and just after it ends, so the work strobe does between runs (reading the target's
+/// processes, snapshots, resets) is never counted, and the share is over the measured runs' time.
+/// Each read is of the one process (`host::process_cycles`), not a list of the system's.
+struct SelfCost {
+    runner: u32,
+    open: Option<(u64, Option<u64>, Option<u64>)>,
+    runs: Vec<RunCost>,
+}
+
+impl SelfCost {
+    fn new(runner: u32) -> SelfCost {
+        SelfCost { runner, open: None, runs: Vec::new() }
+    }
+
+    fn read(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
+        (host::process_cycles(std::process::id()), host::process_cycles(self.runner), host::tsc())
+    }
+
+    /// A run begins now.
+    fn start(&mut self) {
+        let (strobe, runner, tsc) = self.read();
+        self.open = tsc.map(|t| (t, strobe, runner));
+    }
+
+    /// The run that began ended now.
+    fn end(&mut self) {
+        let (strobe, runner, tsc) = self.read();
+        let Some((t0, s0, r0)) = self.open.take() else {
+            self.runs.push((0, None, None));
+            return;
+        };
+        let span = tsc.map_or(0, |t| t.saturating_sub(t0));
+        let delta = |a: Option<u64>, b: Option<u64>| a.zip(b).filter(|(a, b)| b >= a).map(|(a, b)| b - a);
+        self.runs.push((span, delta(s0, strobe), delta(r0, runner)));
+    }
+
+    /// strobe's and the runner's share of one core over the runs from `first` on.
+    fn share(&self, first: usize) -> (Option<f64>, Option<f64>) {
+        let runs = &self.runs[first.min(self.runs.len())..];
+        let span: u64 = runs.iter().map(|r| r.0).sum();
+        let part = |f: fn(&RunCost) -> Option<u64>| {
+            let used: Option<u64> = runs.iter().map(f).sum();
+            used.filter(|_| span > 0).map(|u| 100.0 * u as f64 / span as f64)
+        };
+        (part(|r| r.1), part(|r| r.2))
     }
 }
 
@@ -1001,6 +1116,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         .ok()
         .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
         .unwrap_or_default();
+    let overhead = r.as_ref().ok().and_then(|b| b.overhead.clone());
     let (passed, error, hint, values, refused, locked, recording, screen, shown) = match r {
         Ok(b) => {
             let shown = shown::summarize(std::slice::from_ref(&b)).0;
@@ -1035,7 +1151,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": ctx.headless, "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"],
-        "recording": recording, "screen": screen, "shown": shown,
+        "recording": recording, "screen": screen, "shown": shown, "overhead": overhead,
         "log": log, "log_path": ctx.runner.log,
     }))
 }
@@ -1084,6 +1200,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
             if let Some(line) = screen_line(&s["screen"]) {
                 text += &format!("      screen  {line}\n");
+            }
+            if let Some(o) = serde_json::from_value::<Overhead>(s["overhead"].clone()).ok().map(|o| o.text()).filter(|t| !t.is_empty()) {
+                text += &format!("      self  {o}\n");
             }
             let missing: Vec<&str> = s["shown"]["head"]["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|m| !m.contains("before the runs")).collect();
             match shown_line(s) {
@@ -1361,6 +1480,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
+        "overhead": mean_overhead(&blocks),
         "blocks": blocks, "warnings": warnings, "attribution": {}, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
@@ -1749,6 +1869,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
+        "overhead": mean_overhead(&blocks),
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
@@ -2339,12 +2460,24 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
         let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b));
-        let Some(report) = reserve.map(host::reserve::Reserve::finish) else { return r };
-        ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
-        r.map(|mut b| {
-            b.reserve = Some(json!({ "moved": report.moved_total(), "started": report.started, "failed": report.failed.len(), "restored": report.restored, "overhead_pct": report.overhead_pct, "setup_ms": report.setup_ms }));
-            b
-        })
+        let r = match reserve.map(host::reserve::Reserve::finish) {
+            Some(report) => {
+                ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
+                r.map(|mut b| {
+                    b.reserve = Some(json!({ "moved": report.moved_total(), "started": report.started, "failed": report.failed.len(), "restored": report.restored, "overhead_pct": report.overhead_pct, "setup_ms": report.setup_ms }));
+                    b.overhead.get_or_insert_with(Overhead::default).reserve_pct = Some(report.overhead_pct);
+                    b
+                })
+            }
+            None => r,
+        };
+        // A part of strobe over its §19 budget competes with the app it measures: said once.
+        if let Some((part, pct, budget)) = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).and_then(|o| o.over().into_iter().next())
+            && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
+        {
+            ctx.warnings.push(validity::warn("OverheadBudget", format!("{} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", v.role, pct_of_core(pct))));
+        }
+        r
     })
 }
 
@@ -2736,6 +2869,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let measured_runs = if set == Set::Memory { 2 * n } else { n };
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
         let sampler = probe::os::Sampler::start(browser.pid);
+        let (sampled, runner_pid) = (Instant::now(), ctx.runner.pid());
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
         page.send("Performance.enable", json!({}))?;
@@ -2751,6 +2885,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let run_canvas: RefCell<Vec<Vec<Vec<f64>>>> = RefCell::new(Vec::new());
 
         let run_timeout = s.run_timeout();
+        let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
             *current.borrow_mut() = key.to_string();
@@ -2789,12 +2924,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let c0 = counters();
             driver.drags.borrow_mut().clear();
             driver.mark(&format!("{key}:start"))?;
+            cost.start();
             let t0 = host::now_ns();
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
             driver.dispatch("frame", &[])?;
             let t1 = host::now_ns();
+            cost.end();
             let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
             driver.mark(&format!("{key}:end"))?;
@@ -2910,7 +3047,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
         let nodes = nodes_all[first.min(nodes_all.len())..].to_vec();
         let warm = runs[..first].to_vec();
+        let (strobe_pct, runner_pct) = cost.share(first);
         let samples = sampler.stop();
+        let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
         let procs1 = (host::now_ns(), host::all_processes());
         let gpu_runs: Vec<_> = spans.iter().map(|(k, t0, t1)| (k.clone(), samples.window(*t0, *t1))).collect();
         // Other work on the CPUs the target is pinned to, per run (% of one core): their busy time beyond
@@ -3145,6 +3284,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             screen: Some(screen),
             reserve: None,
             shown: Some(shown::Shown { start, end }),
+            overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, ..Overhead::default() }),
         })
     })();
     lapped.set(Instant::now());
@@ -4159,6 +4299,14 @@ fn leak_text(r: &Value, s: &Value, file: &str) -> String {
     out
 }
 
+/// `self   strobe 1.2% · runner 0.3% … of a core (mean over the blocks' runs)`, when the series measured it.
+fn self_line(s: &Value) -> String {
+    match serde_json::from_value::<Overhead>(s["overhead"].clone()).ok().map(|o| o.text()).filter(|t| !t.is_empty()) {
+        Some(t) => format!("self   {t} (mean over the blocks' runs)\n"),
+        None => String::new(),
+    }
+}
+
 /// A `--blocks` series' text: the primary in each block, and the blocks' median with a 95% interval
 /// (Hodges–Lehmann over the blocks; log scale when every value is positive). Nothing is compared.
 fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
@@ -4170,6 +4318,7 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     out += &format!("plan   {} · warmup until steady · {} runs per block\n", r["plan"]["pin"].as_str().unwrap_or(""), r["plan"]["runs_per_block"]);
     let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
     out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
+    out += &self_line(s);
     let ratio = def.is_none_or(|d| d.kind != model::Kind::Exact && d.unit != "count" && d.unit != "score") && !values.is_empty() && values.iter().all(|v| *v > 0.0);
     if values.len() >= 2 {
         let (lo, hi, conf) = if ratio {
@@ -4246,6 +4395,7 @@ fn render(r: &Value) -> String {
         out += &format!("blocks {} pairs ({} fresh launches) · {per_block} · stopped: {}\n", s["pairs"], s["launches"], s["stopped"].as_str().unwrap_or(""));
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
+        out += &self_line(&s);
         if let Some(line) = shown_line(&s) {
             out += &format!("shown  {line}{}\n", if s["shown"]["changed"] == true { "  ! different screens (ScreenChanged)" } else { "" });
         }

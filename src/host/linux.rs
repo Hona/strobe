@@ -21,6 +21,11 @@ pub fn now_ns() -> u64 {
 /// CPU time of a whole process (every thread, live or exited) in ns, from its CPU clock:
 /// `MAKE_PROCESS_CPUCLOCK(pid, CPUCLOCK_SCHED)`. Reading another process's clock needs no
 /// permission (the kernel looks the process up for `clock_gettime` without a check).
+/// One process's CPU ns (`super::process_cycles`).
+pub fn process_cycles(pid: u32) -> Option<u64> {
+    process_cpu_ns(pid)
+}
+
 fn process_cpu_ns(pid: u32) -> Option<u64> {
     clock(((!(pid as libc::clockid_t)) << 3) | 2)
 }

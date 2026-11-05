@@ -82,6 +82,11 @@ pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     out
 }
 
+/// One process's CPU cycles (`super::process_cycles`).
+pub fn process_cycles(pid: u32) -> Option<u64> {
+    Some(proc_times(pid).1).filter(|c| *c > 0)
+}
+
 /// CPU time (ns), CPU cycles, private bytes and working set of one process.
 fn proc_times(pid: u32) -> (u64, u64, u64, u64) {
     unsafe {

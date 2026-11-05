@@ -309,6 +309,8 @@ fn runs(
     }
     let procs0 = (host::now_ns(), host::all_processes());
     let sampler = probe::os::Sampler::start(n.pid);
+    let sampled = Instant::now();
+    let mut cost = SelfCost::new(ctx.runner.pid());
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
     let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
     let run_timeout = s.run_timeout();
@@ -338,11 +340,13 @@ fn runs(
         *current.borrow_mut() = format!("run:{i}");
         let snap0 = Snapshot::take(&pids);
         let c0 = cycles(n);
+        cost.start();
         let t0 = host::now_ns();
         ctx.runner
             .call("run", json!({ "case": s.case }), run_timeout, &serve)
             .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
         let t1 = host::now_ns();
+        cost.end();
         let procs1 = n.processes();
         let c1 = (procs1.iter().map(|p| p.cycles).sum(), host::tsc());
         let snap1 = Snapshot::take(&procs1.iter().map(|p| p.pid).collect::<Vec<_>>());
@@ -395,7 +399,9 @@ fn runs(
     for r in &mut runs {
         r.changes = changes.iter().copied().filter(|&c| c >= r.t0 && c <= r.t1 + 1_000_000_000).collect();
     }
+    let (strobe_pct, runner_pct) = cost.share(first);
     let samples = sampler.stop();
+    let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
     let presents = presents.borrow_mut().take().map(|c| c.stop());
     let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
     let procs1 = (host::now_ns(), host::all_processes());
@@ -517,6 +523,7 @@ fn runs(
     // Presented frames from the OS, and input latency from strobe's own inputs to them.
     let pids = n.pids();
     let mut reactions = frames::Reactions::default();
+    let mut present_pct = None;
     match &presents {
         Some(Ok(p)) => {
             let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
@@ -538,6 +545,7 @@ fn runs(
             // with the app it measures, and its frames describe a disturbed run.
             let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
             let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
+            present_pct = overhead;
             if let Some(o) = overhead.filter(|o| *o > 0.5)
                 && !ctx.warnings.iter().any(|w| w.id == "OverheadBudget")
             {
@@ -753,6 +761,7 @@ fn runs(
         leak: leak_result,
         screen: Some(screen),
         shown,
+        overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
         ..Block::default()
     })
 }

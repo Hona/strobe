@@ -2988,6 +2988,18 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | OS present session (timing blocks that declare frame metrics) | ≤ 0.5% of one core in strobe's consumer, measured per recording (`consumer_cpu_ms`); a bench block over it warns (`OverheadBudget`), over 2% refuses its frame metrics |
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block) |
+
+Every page, native and script block records what strobe cost inside its measured runs in
+`overhead`, as % of one core: strobe's own process (every thread) and the bench runner, each read
+from that one process just before a run begins and just after it ends, so strobe's work between runs
+(reading the target's processes, snapshots, resets, warmup runs) is not in it; and the parts that
+measure themselves over the block (`sampler_pct`, `present_pct`, `reserve_pct`). `--check` prints it
+per case (`self  strobe 0.81% · runner 0.40% · sampler 0.16% of a core`), a bench per series (the
+blocks' mean); a part over its budget above warns `OverheadBudget` once. strobe's own process has no
+budget yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless page's click
+run 0.61%; a script target's 30 ms runs 3–6%, which is strobe relaying each `ctx.call` between the
+runner and the script's host inside the run. Counted over the whole run loop instead, the same
+block read 40–80% (script) and 7% (native): strobe's own between-run reads, never inside a run.
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
@@ -3549,7 +3561,9 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   "the page ran headless"); `ctx.waitForLine` (native: output, as native blocks now read it, or log
   files under the home; checked with a fake tray app's `tick` lines and a log glob); a page launch's
   `until` in the shared grammar (`role=heading text="Later"` timed a heading that appears after
-  1.5 s at 1533 ms, headless); `look app:<id> --build`.
+  1.5 s at 1533 ms, headless); `look app:<id> --build`. Each block's `overhead` (§19); not yet: a
+  track of strobe's own CPU over time in `perfetto.pftrace` (it needs the sampler to sample strobe
+  too).
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

@@ -171,6 +171,12 @@ pub struct ProcTimes {
 }
 
 /// Every process in the tree rooted at `root`, with CPU times.
+/// One process's CPU so far in `ProcTimes::cycles` units (TSC cycles on Windows x64, CPU ns
+/// elsewhere), read without listing the system's processes: cheap enough at a run's two ends.
+pub fn process_cycles(pid: u32) -> Option<u64> {
+    os::process_cycles(pid)
+}
+
 pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     #[cfg(windows)]
     {

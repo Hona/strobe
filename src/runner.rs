@@ -198,6 +198,11 @@ impl Runner {
         }
     }
 
+    /// The runner's process, for its CPU in a block's overhead.
+    pub fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     pub fn describe(&mut self) -> Result<Describe> {
         self.call("describe", json!({}), Duration::from_secs(60), |_, _| Err(Error::msg("no driver during describe")))
     }

@@ -325,6 +325,11 @@ fn all_bsd() -> Vec<Bsd> {
     all_pids().into_iter().filter_map(bsd).collect()
 }
 
+/// One process's CPU ns (`super::process_cycles`).
+pub fn process_cycles(pid: u32) -> Option<u64> {
+    rusage(pid).map(|r| r.0)
+}
+
 pub fn process_tree(root: u32) -> Vec<ProcTimes> {
     let all = all_bsd();
     tree_of(&all, root)

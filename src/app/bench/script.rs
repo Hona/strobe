@@ -230,15 +230,19 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         lapped = Instant::now();
         let measured_runs = x.runs;
         let mut runs: Vec<ScriptRun> = Vec::new();
+        let mut cost = SelfCost::new(ctx.runner.pid());
         let mut first: Option<usize> = None;
         while first.is_none_or(|f| runs.len() < f + measured_runs) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
             counts.borrow_mut().clear();
             marks.borrow_mut().clear();
             counting.set(true);
-            let (c0, t0) = (cpu(pid), Instant::now());
+            let c0 = cpu(pid);
+            cost.start();
+            let t0 = Instant::now();
             ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out"))?;
             let wall = t0.elapsed().as_secs_f64() * 1e3;
+            cost.end();
             let used = cpu_ms(c0, cpu(pid), wall);
             counting.set(false);
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
@@ -261,6 +265,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             }
         }
         let first = first.unwrap_or(0);
+        let (strobe_pct, runner_pct) = cost.share(first);
         steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
         let measured = &runs[first..];
         let key = |j: usize| format!("run:{}", first + j);
@@ -305,6 +310,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             screen: None,
             reserve: None,
             shown: None,
+            overhead: Some(Overhead { strobe_pct, runner_pct, ..Overhead::default() }),
         })
     })();
     host.into_inner().exit();

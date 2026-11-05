@@ -341,6 +341,13 @@ fn runs(
     if x.untimed && starts.on() && !windowless && drive.session.get().is_none() {
         let _ = drive.get();
     }
+    // A lazy provider answers strobe's first read with a placeholder and builds the rest a moment
+    // later: the first start is read from the tree it built (`screen` waits that out).
+    if starts.on()
+        && let Some(se) = drive.session.get()
+    {
+        let _ = se.screen(Duration::from_secs(5));
+    }
     let changes_seen = Cell::new(0u64);
     let read_start = || drive.session.get().and_then(shown::native_start).map(|(st, seen)| {
         changes_seen.set(seen);

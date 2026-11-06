@@ -477,7 +477,10 @@ impl<'a> Doc<'a> {
                 return None;
             }
             xs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            Some(xs.iter().take(n).map(|(name, ms)| format!("{} {:.0}%", if quote { code(name) } else { cell(name) }, 100.0 * ms / total)).collect::<Vec<_>>().join(" · "))
+            // Parts under half a percent read as 0%: left out.
+            let shown: Vec<String> =
+                xs.iter().take(n).filter(|x| x.1 / total >= 0.005).map(|(name, ms)| format!("{} {:.0}%", if quote { code(name) } else { cell(name) }, 100.0 * ms / total)).collect();
+            (!shown.is_empty()).then(|| shown.join(" · "))
         };
         let threads = |s: &Value, k: &str| -> Option<String> {
             let rows: Vec<Value> = s["hotspots"][k]["threads"]["threads"].as_array()?.iter().map(|x| json!({ "name": x["name"].as_str().unwrap_or("(unnamed)"), "ms": x["cpu_ms_per_run"] })).collect();

@@ -2244,6 +2244,18 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 - **macOS.** A page or Electron side's window is brought to the front (as a native block's, after a
   minute without input) and must be the active app and uncovered at the start and end of the runs
   (`WindowHidden`, which a bench waits out), so both sides run as the key window.
+- **Where each spends its time** (`--why`, rule 3): each side gets its own attribution block,
+  profiled with its own engine's tools: a page or Electron side with Chromium's (CPU and allocation
+  profiles, forced layouts, GC, a heap snapshot, the memory census), a native side with native stacks,
+  its threads' CPU and wakes and its memory by part. A side strobe has no profiler for (a page in
+  another engine, a command) gets none and says why (`Attribution`, info), and the other side keeps
+  its own. `Unresolved` warns per side, by name, below 95% of script samples source-mapped or of
+  native samples symbolized. The sides are never diffed: `query a..b` of two implementations'
+  recordings and `query <exp> <view>` of an implementation comparison are refused `NotComparable`
+  (exit 2) with each recording's own view, and the report reads each side on its own (§11.2).
+- **Screens.** Base and head show two apps, so `ScreenChanged` compares only blocks of one side;
+  `expect.same` compares the sides. Each side keeps its first block's start and end thumbnails
+  (`shown.<side>.thumb_start`, `thumb_end`).
 - **result.json** (`schema/result.v1.json`): `comparison` (`builds` | `implementations`),
   `variants[].{name, target, target_kind, engine, repo, process_set {median_count, by_program}}`,
   `fixture`, `fairness { window {client_dip, scale, display, hz}, adapter, input, frames, gpu_cache,
@@ -2357,7 +2369,7 @@ provider build and keep its tree; after the runs it is always read. What cannot 
 hash (20 of 64 bits or more) differs from it. Blocks keep `shown { start, end }`; a series keeps
 `shown { base, head, changed }` with the screen most blocks ended on (`'Hex Settings · General'`:
 the first title, then up to two headings), the other screens and how many blocks showed each, and
-the first block's thumbnail inline. A page's screen, `expect.visible`, `look` and the driver's
+the first block's start and end thumbnails inline (`thumb_start`, `thumb_end`). A page's screen, `expect.visible`, `look` and the driver's
 selectors and waits read the page through one in-page probe (`driver::HELPER`: `screen`, `find`,
 `waitFor`), so `look` lists exactly the headings `expect.heading` checks and an `expect.visible` matches
 what a `waitFor` would; a native app's go through the one `Session::screen`. The probe is installed
@@ -2502,7 +2514,9 @@ session.
 
 `a..b` works with `hotspots`, `alloc`, `layout`, `style`, `threads`, `frames`, `summary`, `memory`
 and `heap`; `query exp_… <view>` runs the same views on each series' base and head attribution
-recordings. Every row is per measured run on each side (each side's own run count) when both sides
+recordings. Never across implementations (§9.10): two recordings of an implementation
+comparison's two sides (each recording names its experiment and side), or `query exp_… <view>` of
+such an experiment, are refused `NotComparable` (exit 2), naming each recording's own view. Every row is per measured run on each side (each side's own run count) when both sides
 know their runs; otherwise neither side is divided and the header says per recording. Native samples
 without times (macOS `sample`) cover the whole capture, launch, warmups and resets included: never
 divided by runs, and they name no insight movers. Two recordings are two launches, often two builds
@@ -2781,8 +2795,11 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   input, what CPU summed on each side, pairs), the Care notes of non-CPU main metrics in a line of
   their own, Details (Metrics with side-name columns and a footnote whose confidence comes from the
   comparisons and the plan's looks; Pairs; Per implementation, not compared, from
-  `series[].per_side`; Equivalence checked; Where each spends its time, each side's profiled threads,
-  never a diff; How it was measured: both identities, machine, window, input, observer and frame
+  `series[].per_side`; Equivalence checked; Where each spends its time, from each side's profiled
+  launch, never a diff: CPU per run, its share by process (a browser's renderer, GPU process, browser
+  and the rest; a native app's programs), by whose threads (app, driver, os: native sides), the
+  busiest threads, the top packages or crates by their share of the side's sampled time, and how much
+  of its samples were named; How it was measured: both identities, machine, window, input, observer and frame
   source, fixture, what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original
   --head rewrite=<commit>`). Shedding drops Where each spends its time, then the per-side table, then
   the Pairs and equivalence tables; never a journey's line, the caution or the scoreboard.
@@ -2807,10 +2824,20 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   same (window, GPU, input, GPU caches, priority, fixture and seed) and each side's identity,
   engine, process set, observer reads and fixture link and CPU; per journey the usual verdict and
   pairs, what each Care number sums, each side's start and end thumbnails above the equivalence
-  table, and each implementation on its own: its per-side numbers and its profiled threads as bars
-  on one ms-per-run scale for both. No function, flame or heap diffs: two implementations share no
-  code. `report` adds `scoreboard`, `p_repeated`, `holm_decided` and `headline` to the page's payload
-  (`app/family.rs`), the same reading the block and card use.
+  table, its per-side numbers, and Where each spends its time: two columns, one per implementation,
+  each side's profiled launch read on its own (`hotspots.<side>.side` and `.tree` in the payload,
+  `report::side_attribution`): how it was profiled and how much of its samples were named, CPU per
+  run by process and by whose threads, the busiest threads, its call tree as an icicle (CPU time,
+  or allocations; click to zoom), its top functions and packages by self time, and its memory by
+  part, every list on one scale for both columns (ms per run, bytes), so a bar's length compares
+  across them; an icicle is as wide as its side's sampled time against the larger side's. Untimed
+  native samples (macOS `sample`) cover the whole capture: that side's sampled lists and icicle
+  keep a scale of their own, marked. Each column gives `strobe open <exp>/<side>` and its
+  recording's own view. The verdict panel names the sides (`Rewrite uses 62% less CPU time than
+  Original`, `Better than Original`, or `Better on its own · not after Holm`). No function, flame or
+  heap diffs: two implementations share no code. `report` adds `scoreboard`, `p_repeated`,
+  `holm_decided`, `headline` and each journey's `claim` to the page's payload (`app/family.rs`), the
+  same reading the block and card use.
 
 Markdown (`md` and `pr`) is for pasting: the command prints it to stdout and the file's path to
 stderr (JSON: `markdown` beside `path`). Every report is written to a temporary file and renamed

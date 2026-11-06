@@ -567,6 +567,9 @@ Fewer than 6 pairs never gets a verdict.
   - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case (a parity gap: listed, never run).
   - Give the app under test its own bundle id (macOS) through its build's own config overrides, so strobe may launch it beside your installed copy (`LiveChannel`).
   - `--noworse 5%` asks "no worse anywhere"; `--check --head <target>` runs one side's cases once.
+  - Where each spends its time: `--why always` profiles each side once with its own engine's tools.
+  - Read each side alone (`query <rec> threads`, `hotspots --by package`); `query a..b` across implementations is refused (`NotComparable`).
+  - `report experiment <exp> --open`: both sides in two columns on one ms-per-run scale.
 
 ## Every performance claim in a PR comes from strobe
 

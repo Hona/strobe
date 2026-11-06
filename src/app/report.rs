@@ -375,7 +375,10 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
             .collect();
         procs.sort_by(|a, b| b["ms"].as_f64().unwrap_or(0.0).total_cmp(&a["ms"].as_f64().unwrap_or(0.0)));
         side["processes"] = json!(procs);
-        side["origins"] = json!(["app", "driver", "os", "unknown"].iter().filter_map(|o| Some(json!({ "name": o, "ms": origins.get(*o)? }))).collect::<Vec<_>>());
+        // macOS keeps no thread's start module: its threads' origins are unknown, so none are listed.
+        if origins.keys().any(|o| o != "unknown") {
+            side["origins"] = json!(["app", "driver", "os", "unknown"].iter().filter_map(|o| Some(json!({ "name": o, "ms": origins.get(*o)? }))).collect::<Vec<_>>());
+        }
     }
     // Memory by part: a native app's by what holds it (host, GPU mapped, …), a browser's by allocator
     // layer across its processes.

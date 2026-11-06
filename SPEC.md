@@ -4948,8 +4948,8 @@ from about:blank late (its session had the Page domain off), so an `until` alrea
 - vps (Debian 13, Firefox 159.0.1, Chromium, headless): the same 2 of 2 (2 refused) and 4 of 4.
 
 Not checked: a comparison's exit with `--require-verdict` on a refused series (needs a timed bench), WebKit
-(`addInitScript` there lands with the WebKit driver), headed Firefox, an Electron launch case after the
-Page-domain change.
+(`addInitScript` after the first document's own scripts, the `InitScript` note, a later `page.goto`
+refused), headed Firefox, an Electron launch case after the Page-domain change.
 
 strobe's own overhead (2026-11-06; §8.5, §13.7, §19): the OS sampler reads the target's process set
 and strobe's own process (CPU each tick, GPU and private memory once a second) into `os.strobe` and

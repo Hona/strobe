@@ -168,7 +168,11 @@ impl Live {
         let deadline = std::time::Instant::now() + wait;
         let mut q = self.presents.lock().unwrap_or_else(|e| e.into_inner());
         loop {
-            let next = if after == u64::MAX { None } else { q.all.iter().filter(|p| pids.contains(&p.0) && p.1 > after && p.2 > 0).min_by_key(|p| p.1).copied() };
+            // From the newest back to presents that started over a second before `after`: they come
+            // in as they complete, so one that started after `after` is behind those only if it
+            // completed before a present that had started a second earlier.
+            let recent = q.all.iter().rev().take_while(|p| p.1.saturating_add(1_000_000_000) > after);
+            let next = if after == u64::MAX { None } else { recent.filter(|p| pids.contains(&p.0) && p.1 > after && p.2 > 0).min_by_key(|p| p.1).copied() };
             let last = pids.iter().filter_map(|p| q.last.get(p)).copied().max().unwrap_or(0);
             let left = deadline.saturating_duration_since(std::time::Instant::now());
             if next.is_some() || left.is_zero() {

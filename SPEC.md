@@ -1123,10 +1123,11 @@ page is open), shown by `query <rec> shifts` and in the bench's why lines.
 One sampler thread, 100 ms ticks: per-CPU busy, and GPU engine time and VRAM for the target's
 process set (§13.2: its tree and everything launched for its home, so an app's detached service is
 counted). CPU frequency and Task Manager's utility once a second. The set is re-read every second,
-or less often so the re-read stays under 0.2% of a core. The first re-read waits 2.5 s: a process
-without a stamp is read again for 2 s after it is first seen (§13.2), and at the sampler's first read
-every process is new, so an earlier re-read read every process's environment again (on adais the
-sampler went from 0.17% to 1.0% of a core in a 5 s block). Budget: 0.5% of one core, and the sampler measures its
+or less often so the re-read stays under 0.2% of a core (the first read, which reads every
+process's stamp once, does not set the pace). A process without a stamp is read again only while it
+is under 2 s old by its own start time (§13.2): read again for 2 s after strobe first saw it, every
+process that ran before the first scan was read again at the next one, which had made the sampler 1.0%
+of a core instead of 0.17% in a 5 s block on adais. Budget: 0.5% of one core, and the sampler measures its
 own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers read OS APIs directly and never
 spawn processes (§13.6). On macOS the per-process GPU reader keeps the accelerators and the set's
 GPU clients open between ticks (each client's owner is read once, every client is listed again each
@@ -1137,14 +1138,16 @@ recordings report `gpu.process.3d` (per run) and `gpu.vram` (after the runs); pr
 cannot open are listed, never counted as 0.
 
 The same sampler reads strobe's own process (rule 2): each tick every thread's CPU (% of one core,
-from the process's cycles against the TSC); once a second its GPU engine time (a per-process GPU
-reader of its own: on Windows a D3DKMT query per engine of every adapter strobe opened, which each
-tick had cost more than the rest of the tick) and its private memory as `memory.app.private` counts
-a target's (Windows' private commit, macOS's physical footprint, Linux's `smaps_rollup` private and
-swapped pages, 94 µs a read on vps). strobe's own process is never in the target's set. A recording
-keeps them under
-`os.strobe` in `meta.json` (means over the recording, peak memory, and each tick), and `strobe open
---perfetto` draws them as the track "strobe itself (its own process)" (§11.4).
+from the process's cycles against the TSC); about once a second, and at its last tick, its GPU engine
+time over the span since the last such reading (a per-process GPU reader of its own: on Windows a
+D3DKMT query per engine of every adapter strobe opened, which each tick had cost more than the rest of
+the tick) and its private memory as `memory.app.private` counts a target's (Windows' private commit,
+macOS's physical footprint, Linux's `smaps_rollup` private and swapped pages, 94 µs a read on vps).
+Each reading stays on the tick that took it, with the span it covers; a window weights each by its
+overlap. strobe's own process is in no target's set (`host::process_set` leaves it out unless it is
+the root). A recording keeps them under `os.strobe` in `meta.json` (means over the recording, peak
+memory, and each tick), and `strobe open` draws them as the track "strobe itself (its own process)"
+(§11.4).
 
 ### 8.6 Memory: census and heap snapshots
 
@@ -1865,10 +1868,16 @@ window: a lazy provider, which on macOS fills in without an event) it reads agai
 every 50 ms. A read for a selector stops at its match in tree order (with the match's descendants
 when keys go to it: where focus is inside it), since nothing after it changes which element the
 selector means: on macOS, which reads the app element by element, a found element costs only the
-elements before it. A click whose `until` selector never shows, and whose element is no longer where
-strobe aimed (it moved or resized between the read that found it and the click, or as the click went
-in: a panel resizing around it), says the element moved, from where to where, instead of naming the
-key; strobe reads the element again only once the wait has failed. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
+elements before it. An `until` selector returns once the element is visible and a frame of the app
+that started after the input and after the last accessibility change has reached the screen (at most
+300 ms more, for a change that draws nothing; at once without present events): what the next input
+measures then does not depend on how fast strobe read the tree, since a read that stops at its match
+can return within a millisecond of the change, while the app's frame is still on its way. A click
+whose `until` selector never shows, while the clicked element is still visible with its visible part
+somewhere else than where strobe aimed (it moved or resized between the read that found it and the
+click, or as the click went in: a panel resizing around it), says the element moved, from where to
+where, instead of naming the key; an element that is gone was likely clicked, and the error is the
+`until`'s own. strobe reads the element again only once the wait has failed. `until: "idle"` is no present of the app and no accessibility change for 300 ms; a timeout
 says which kept it busy, with counts: the frames of the app that reached the screen in the last second
 (from the block's present events), its accessibility changes in that second and over the whole wait,
 and whether strobe's own input came then. `"frame"` is the next present of the app that reached the
@@ -3085,8 +3094,8 @@ Strobe launches any Electron app the same way, with no change to the app:
   strobe's responsible process, as when a person runs it from a terminal: its XPC services are
   responsible to that process, shared with everything else run from there, so no set can tell them
   apart and they are not counted. A process's stamp is read once per pid and start time; one that shows none is read
-  again for 2 s after it was first seen (a process that has just started may not have its
-  environment yet). The set is what `cpu.work`, `cpu.app.total`, `memory.*`, a native target's
+  again while it is under 2 s old by its own start time (a process that has just started may not
+  have its environment yet; one that ran before strobe looked is read once). The set is what `cpu.work`, `cpu.app.total`, `memory.*`, a native target's
   wakes, threads and IO, its windows (found, placed, raised, checked), its accessibility session and
   its present events read, and so do native stacks (the helper gets the set from strobe and follows
   its children), a launch's screen pixels (`launch.painted`, `launch.settled`) and `record
@@ -4484,12 +4493,32 @@ it is now at (348, 130, 24 × 24)". Tried and dropped: locking frames with `kIOS
 first (the lock trap kept its time, and whether such a lock sees a frame the GPU still writes was not
 shown). Windows (adais, locked,
 `fake-tray.bench.ts --check`, idle): sampler 0.17% before, 1.0–1.4% with the process set and strobe's
-own GPU read each tick, 0.19–0.25% after (the first re-read after 2.5 s, strobe's GPU once a second);
+own GPU read each tick, 0.19–0.25% with the first re-read after 2.5 s and strobe's GPU once a second
+(that pause was dropped in review: see below);
 strobe's process 1.0–1.1% before, 1.0–1.2% after. Linux (vps, Xvfb, `atspi.bench.ts --check`): 8 of
 8 cases passed before and after with the same overhead (the sampler 0.08–0.12% before, 0.10–0.13%
 after; single noisy runs on 2 cores). `record pid:` on adais and vps wrote `os.strobe` (31 ticks
 over 3 s) and `strobe open --no-browser` drew three "strobe itself" tracks, which trace_processor read
 back with no import errors.
+After review: a Hex `switch-panes` check had read `interaction.p50` 15.8 ms on the base and 43.6 and
+77.2 ms on the head; `query <rec> frames` showed a cold-run artifact over which of its three clicks
+counted (base: one counted at 15.8 ms, the slow History click dropped as mid-drawing; head: 31.5 and
+55.8 ms counted, or one at 77.2 ms). It also showed what a read that stops at its match changes: an
+`until` selector could return before the app's frame and post the next input while that frame was on
+its way, so `until: <selector>` now also waits for the app's next frame after the input and the last
+accessibility change (above). Warmed blocks of `switch-panes` (10 runs, the 0.10.0 base and this head
+in turn, base–head–head–base–base–head, with someone using the Mac between blocks, so noisy):
+`interaction.p50` base 64.8, 64.3 ms and once refused, head 16.4 ms and twice refused
+(AmbiguousInteraction); `ui.cpu` base 254, 120, 222 ms, head 47, 186, 190 ms; strobe's process base
+7.3, 3.8, 6.8%, head 1.4, 5.1, 5.2%. The head's 5% blocks spent it in that frame wait, which read the
+whole live-present queue at every present; it now reads back only to presents that started a second
+before the time asked. Also after review: a stamp is read again only while its process is under 2 s
+old (no 2.5 s pause before the sampler's first re-read: a process set's first refresh now lands inside
+a short block, 9.4 ms on adais, so a 1 s `--check` run reads the sampler at 1.1–1.3% of a core while
+`SET_SHARE` keeps a longer block at 0.2%; on vps 0.21–0.62% in 3 s check blocks); strobe's GPU and
+memory stay on the tick that read them; a GPU client that names no creator yet is asked again;
+`host::process_set` leaves strobe out; the moved-element error compares visible parts and stays the
+`until`'s own when the element is gone.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

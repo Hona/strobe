@@ -58,8 +58,6 @@ mod imp {
         log: RefCell<Log>,
         /// Change counts at the start of the run, for the per-run list of change times.
         last_input: Cell<u64>,
-        /// The tree's size at the last snapshot (`StateDrift` reads it at each run's end).
-        size: Cell<Option<usize>>,
         /// Whether the OS cursor could be parked on the pointer's point (false on a locked session).
         parked: Cell<Option<bool>>,
         /// Where the pointer last went (screen point and where it landed), and the mouse button
@@ -78,7 +76,6 @@ mod imp {
                 main: Cell::new(main),
                 log: RefCell::new(Log::default()),
                 last_input: Cell::new(0),
-                size: Cell::new(None),
                 parked: Cell::new(None),
                 pointer: Cell::new(None),
                 pressed: Cell::new(None),
@@ -135,11 +132,6 @@ mod imp {
             self.log.borrow_mut().marks.push((name.to_string(), host::now_ns()));
         }
 
-        /// Elements in the app's windows at the last snapshot.
-        pub fn elements(&self) -> Option<usize> {
-            self.size.get()
-        }
-
         pub fn release_all(&self) {
             if let Some((b, _)) = self.pressed.get() {
                 let _ = self.pointer_button(b, false);
@@ -179,9 +171,7 @@ mod imp {
         }
 
         fn snapshot(&self, window: Option<&str>) -> Result<Tree> {
-            let t = self.a11y.snapshot(&self.windows(window)?)?;
-            self.size.set(Some(t.nodes.len()));
-            Ok(t)
+            self.a11y.snapshot(&self.windows(window)?)
         }
 
         /// A read of the tree inside a wait (`reads`: how many it took so far, and when the last
@@ -299,8 +289,25 @@ mod imp {
             match u.as_str() {
                 Some("idle") => self.idle(after, t, presents).map(|_| ()),
                 Some("frame") => self.frame(after, t, presents).map(|_| ()),
-                _ => self.find(&parse_sel(u)?, opts["window"].as_str(), t).map(|_| ()),
+                _ => {
+                    self.find(&parse_sel(u)?, opts["window"].as_str(), t)?;
+                    self.shown(after.max(self.a11y.changes().last_ns), presents)
+                }
             }
+        }
+
+        /// After an `until` selector showed: until a frame of the app that started after `since` (the
+        /// input, and the last accessibility change when the read found it) reached the screen, so the
+        /// next input is not posted while the frame that shows the element is still on its way (a
+        /// read that stops at its match can return within a millisecond of the change, before the
+        /// app's frame), and what the next input measures does not depend on how fast strobe read.
+        /// A change that draws nothing gets 300 ms; without present events there is nothing to wait
+        /// for.
+        fn shown(&self, since: u64, presents: &RefCell<Option<PresentCapture>>) -> Result<()> {
+            if let Some(p) = presents.borrow_mut().as_mut() {
+                p.live(&self.pids.borrow(), since, Duration::from_nanos(IDLE_NS))?;
+            }
+            Ok(())
         }
 
         /// The first present of the app that started after `after` and reached the screen.
@@ -629,7 +636,7 @@ mod imp {
         fn click(&self, sel: &Value, opts: &Value, presents: &RefCell<Option<PresentCapture>>, kind: &'static str) -> Result<()> {
             let selector = parse_sel(sel)?;
             let (tree, i) = self.find_enabled(&selector, opts["window"].as_str(), timeout(opts))?;
-            let aimed = tree.nodes[i].rect;
+            let aimed = tree.visible_rect(i).unwrap_or(tree.nodes[i].rect);
             let (x, y, t) = self.aim(&tree, i)?;
             let b = Button::parse(opts["button"].as_str())?;
             let mods = Mods::parse_list(&opts["modifiers"])?;
@@ -655,23 +662,24 @@ mod imp {
             self.until(opts, last, presents).map_err(|e| self.moved(e, &selector, opts, aimed))
         }
 
-        /// A click's `until` selector that never showed: when the clicked element is no longer where
-        /// strobe aimed (it moved or resized between the read that found it and the click, or as the
-        /// click went in: a panel resizing around it), say so, since the click may have landed beside
-        /// it. Read only once the wait has failed, so a click that works costs no extra read.
+        /// A click's `until` selector that never showed: when the clicked element is still visible but
+        /// no longer where strobe aimed (it moved or resized between the read that found it and the
+        /// click, or as the click went in: a panel resizing around it), say so, since the click may have
+        /// landed beside it. An element that is gone was likely clicked, and `until` names the wrong
+        /// thing: the error stays as it was. Read only once the wait has failed, so a click that works
+        /// costs no extra read.
         fn moved(&self, e: Error, sel: &Selector, opts: &Value, aimed: [f64; 4]) -> Error {
-            let waited_for_selector = opts["until"].as_str().is_none_or(|u| u != "idle" && u != "frame");
-            if e.code != 124 || !waited_for_selector {
+            let selector = opts.get("until").filter(|u| !u.is_null()).is_some_and(|u| !matches!(u.as_str(), Some("idle" | "frame")));
+            if e.code != 124 || !selector {
                 return e;
             }
             let Ok(tree) = self.read_for(opts["window"].as_str(), sel, false) else { return e };
+            let Some(now) = tree.find(sel).first().and_then(|&k| tree.visible_rect(k)) else { return e };
+            if now.iter().zip(aimed).all(|(a, b)| (a - b).abs() < 1.0) {
+                return e;
+            }
             let rect = |r: [f64; 4]| format!("({:.0}, {:.0}, {:.0} × {:.0})", r[0], r[1], r[2], r[3]);
-            let now = match tree.find(sel).first() {
-                Some(&k) if tree.nodes[k].rect.iter().zip(aimed).all(|(a, b)| (a - b).abs() < 1.0) => return e,
-                Some(&k) => format!("is now at {}", rect(tree.nodes[k].rect)),
-                None => "is no longer visible".to_string(),
-            };
-            Error::timeout(format!("{}. The element clicked ({:?}) moved: strobe aimed at it at {} and it {now}, so the click may have landed beside it", e.message, sel.source, rect(aimed)))
+            Error::timeout(format!("{}. The element clicked ({:?}) moved: its visible part was at {} when strobe aimed and is at {} now, so the click may have landed beside it", e.message, sel.source, rect(aimed), rect(now)))
                 .hint("click once the element settles (until: what moves it, or page.idle() first), or click an element that stays put")
         }
     }

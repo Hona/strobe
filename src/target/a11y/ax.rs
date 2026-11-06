@@ -222,19 +222,28 @@ fn ax_windows(pid: u32) -> Result<Vec<Cf>> {
 }
 
 /// The CoreGraphics window an AX window is, matched by frame (the AX API names no window id
-/// publicly): two reads of the app.
-fn match_frame(w: &Cf, cg: &[(u32, u32, CGRect)]) -> Option<u32> {
+/// publicly): two reads of the app. A window already matched (`taken`) is not matched again: two
+/// windows with one frame each get one.
+fn match_frame(w: &Cf, cg: &[(u32, u32, CGRect)], taken: &[u32]) -> Option<u32> {
     let p = copy(w.0, "AXPosition").and_then(|v| point(v.0))?;
     let s = copy(w.0, "AXSize").and_then(|v| size(v.0))?;
     let near = |a: f64, b: f64| (a as i32 - b as i32).abs() <= 1;
-    cg.iter().find(|(_, _, r)| near(r.origin.x, p.x) && near(r.origin.y, p.y) && near(r.size.width, s.width) && near(r.size.height, s.height)).map(|w| w.0)
+    cg.iter().filter(|w| !taken.contains(&w.0)).find(|(_, _, r)| near(r.origin.x, p.x) && near(r.origin.y, p.y) && near(r.size.width, s.width) && near(r.size.height, s.height)).map(|w| w.0)
 }
 
 /// The AX element of a CoreGraphics window, for window actions.
 pub fn window_element(id: isize) -> Option<(Cf, u32)> {
     let pid = crate::host::window_state(id)?.pid;
     let cg = cg_windows(&[pid]);
-    ax_windows(pid).ok()?.into_iter().find(|w| match_frame(w, &cg) == Some(id as u32)).map(|w| (w, pid))
+    let mut taken = Vec::new();
+    for w in ax_windows(pid).ok()? {
+        match match_frame(&w, &cg, &taken) {
+            Some(m) if m == id as u32 => return Some((w, pid)),
+            Some(m) => taken.push(m),
+            None => {}
+        }
+    }
+    None
 }
 
 /// Whether the app is the active one (`AXFrontmost`).
@@ -499,10 +508,14 @@ impl Worker {
                 all.push((w, id));
             }
         }
-        if windows.iter().any(|w| !all.iter().any(|a| a.1 == Some(*w as u32))) {
+        // The window list is read only when an AX window has no id yet and a window asked for has
+        // no AX window.
+        if all.iter().any(|a| a.1.is_none()) && windows.iter().any(|w| !all.iter().any(|a| a.1 == Some(*w as u32))) {
             let cg = cg.unwrap_or_else(|| cg_windows(&self.pids));
+            let mut taken: Vec<u32> = all.iter().filter_map(|a| a.1).collect();
             for a in all.iter_mut().filter(|a| a.1.is_none()) {
-                a.1 = match_frame(&a.0, &cg);
+                a.1 = match_frame(&a.0, &cg, &taken);
+                taken.extend(a.1);
             }
         }
         self.known = all.iter().filter_map(|(w, id)| Some((Cf(unsafe { CFRetain(w.0) }), (*id)?))).collect();

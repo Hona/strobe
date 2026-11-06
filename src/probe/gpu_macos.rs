@@ -128,9 +128,10 @@ pub struct Kmt {
     adapters: Vec<(u64, u16)>,
     engine: u16,
     accs: (Held, Vec<u64>),
-    /// Every client seen, (accelerator id, client id) → its creator's pid: read once per client (a
-    /// registry id is never reused), dropped once the client is gone.
-    owners: HashMap<(u64, u64), Option<u32>>,
+    /// Every client seen with its creator, (accelerator id, client id) → the creator's pid: read once
+    /// per client (a registry id is never reused), dropped once the client is gone. A client that
+    /// names no creator yet (one just opened) is asked again at the next list.
+    owners: HashMap<(u64, u64), u32>,
     /// The clients of the pids asked for, kept open between lists: only their `AppUsage` is read
     /// each tick. Every client is listed again each second and when the pids change.
     tracked: Vec<(u64, u64)>,
@@ -166,16 +167,13 @@ impl Kmt {
     /// Lists every accelerator's clients again: those of `pids` are kept open in `tracked`.
     fn list(&mut self, pids: &[u32]) {
         let (mut tracked, mut held) = (Vec::new(), Held(Vec::new()));
-        let mut seen: HashMap<(u64, u64), Option<u32>> = HashMap::with_capacity(self.owners.len());
+        let mut seen: HashMap<(u64, u64), u32> = HashMap::with_capacity(self.owners.len());
         for (&acc, &a) in self.accs.0.0.iter().zip(&self.accs.1) {
             clients(acc, |c| {
                 let key = (a, entry_id(c));
-                let pid = match self.owners.get(&key) {
-                    Some(&p) => p,
-                    None => creator_pid(c),
-                };
+                let Some(pid) = self.owners.get(&key).copied().or_else(|| creator_pid(c)) else { return };
                 seen.insert(key, pid);
-                if pid.is_some_and(|p| pids.binary_search(&p).is_ok()) {
+                if pids.binary_search(&pid).is_ok() {
                     tracked.push(key);
                     held.0.push(Held::keep(c));
                 }
@@ -199,7 +197,7 @@ impl Kmt {
             };
             if nodes && t > base && dt_ns > 0 {
                 let adapter = self.adapters.iter().find(|x| x.0 == key.0).map(|x| x.1).unwrap_or(0);
-                let pid = self.owners.get(key).copied().flatten().unwrap_or(0);
+                let pid = self.owners.get(key).copied().unwrap_or(0);
                 gpu.push(EngineUse { pid, adapter, engine: self.engine, pct: ((t - base) as f64 * 100.0 / dt_ns as f64) as f32 });
             }
         }

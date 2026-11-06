@@ -715,27 +715,32 @@ impl Builder {
     }
 
     /// strobe's own process over the recording (SPEC rule 2), from the OS sampler's ticks: its CPU (%
-    /// of one core) and GPU (% of one engine) over each tick, from the tick's start, and its private
-    /// memory at the tick's end.
+    /// of one core) over each tick and GPU (% of one engine) over each GPU reading, from the start of
+    /// what they cover, and its private memory where it was read.
     fn strobe_itself(&mut self, meta: &Value) {
         let Some(own) = meta["os"].get("strobe").and_then(|o| serde_json::from_value::<crate::probe::os::OwnTrack>(o.clone()).ok()).filter(|o| !o.ticks.is_empty()) else { return };
-        type Part = fn(&crate::probe::os::OwnTick) -> Option<f32>;
-        let parts: [(&str, &str, Part, bool); 3] = [("CPU % of a core", "%", |t| t.2, true), ("GPU % of an engine", "%", |t| t.3, true), ("private memory (MB)", "MB", |t| t.4, false)];
+        // Each part's value on a tick and the span it covers before the tick's end (0: a reading
+        // at the end, not a rate): CPU every tick, GPU and memory on the ticks that read them.
+        type Part = fn(&crate::probe::os::OwnTick) -> Option<(f32, u64)>;
+        let parts: [(&str, &str, Part); 3] = [
+            ("CPU % of a core", "%", |t| Some((t.2?, t.1))),
+            ("GPU % of an engine", "%", |t| Some((t.3?, t.4))),
+            ("private memory (MB)", "MB", |t| Some((t.5?, 0))),
+        ];
         let group = self.track("strobe itself (its own process)", 40, None);
-        for (name, unit, get, rate) in parts {
-            if !own.ticks.iter().any(|t| get(t).is_some()) {
-                continue;
-            }
+        for (name, unit, get) in parts {
+            let points: Vec<(u64, u64, f32)> = own.ticks.iter().filter_map(|t| get(t).map(|(v, span)| (t.0, span, v))).collect();
+            let Some(&(end, span, _)) = points.last() else { continue };
             let track = self.track_under(Some(group), name, 0, Some(unit));
-            for t in &own.ticks {
-                let Some(v) = get(t) else { continue };
-                let at = if rate { t.0.saturating_sub(t.1) } else { t.0 };
+            for &(t, span, v) in &points {
+                let at = t.saturating_sub(span);
                 self.counter(track, MONOTONIC, at, f64::from(v));
                 self.seen(at);
             }
-            if let (true, Some(last)) = (rate, own.ticks.last()) {
-                self.counter(track, MONOTONIC, last.0, 0.0);
-                self.seen(last.0);
+            // A rate holds until its last reading's end.
+            if span > 0 {
+                self.counter(track, MONOTONIC, end, 0.0);
+                self.seen(end);
             }
             self.count("strobe itself");
         }

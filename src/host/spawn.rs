@@ -52,9 +52,11 @@ pub fn stamp_of(pid: u32) -> Option<Stamp> {
 
 /// Every running process strobe stamped, but this strobe: (pid, parent, stamp). A process's
 /// environment is read once (a process is its pid and start time), so a scan reads only the
-/// processes that started since the last one. A process that shows no stamp is read again for 2 s
-/// after it was first seen: one that has just started may not have its environment yet (a Windows
-/// process before its parameters are written, a Unix one between fork and exec).
+/// processes that started since the last one. A process that shows no stamp is read again while it
+/// is under 2 s old (by its own start time): one that has just started may not have its environment
+/// yet (a Windows process before its parameters are written, a Unix one between fork and exec). The
+/// processes that ran before strobe first looked are read once: re-reading every one of them for 2 s
+/// after the first scan had made the OS sampler 1% of a core in a 5 s block on adais.
 pub fn stamped() -> Vec<(u32, u32, Stamp)> {
     stamped_in(&super::process_list())
 }
@@ -62,9 +64,8 @@ pub fn stamped() -> Vec<(u32, u32, Stamp)> {
 /// `stamped` over a process list (pid, parent, start time) already taken.
 pub(super) fn stamped_in(list: &[(u32, u32, u64)]) -> Vec<(u32, u32, Stamp)> {
     use std::collections::HashMap;
-    use std::time::{Duration, Instant};
-    /// Each process's stamp (or none), and when it was first seen, by its pid and start time.
-    type Seen = HashMap<(u32, u64), (Option<Stamp>, Instant)>;
+    /// Each process's stamp (or none), by its pid and start time.
+    type Seen = HashMap<(u32, u64), Option<Stamp>>;
     static SEEN: std::sync::Mutex<Option<Seen>> = std::sync::Mutex::new(None);
     let me = std::process::id();
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
@@ -76,17 +77,45 @@ pub(super) fn stamped_in(list: &[(u32, u32, u64)]) -> Vec<(u32, u32, Stamp)> {
             continue;
         }
         let entry = match old.get(&(pid, start)) {
-            Some((None, first)) if first.elapsed() < Duration::from_secs(2) => (stamp_of(pid), *first),
+            Some(None) if age(start).is_some_and(|a| a < std::time::Duration::from_secs(2)) => stamp_of(pid),
             Some(e) => e.clone(),
-            None => (stamp_of(pid), Instant::now()),
+            None => stamp_of(pid),
         };
-        if let Some(s) = &entry.0 {
+        if let Some(s) = &entry {
             out.push((pid, parent, s.clone()));
         }
         now.insert((pid, start), entry);
     }
     *seen = Some(now);
     out
+}
+
+/// How long ago a process started, from its start time in `process_list`'s units: Windows' creation
+/// time (100 ns since 1601), macOS's start (µs since 1970), Linux's start (clock ticks since boot).
+fn age(start: u64) -> Option<std::time::Duration> {
+    use std::time::Duration;
+    #[cfg(windows)]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_nanos() as u64 / 100 + 116_444_736_000_000_000;
+        Some(Duration::from_nanos(now.checked_sub(start)?.saturating_mul(100)))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_micros() as u64;
+        Some(Duration::from_micros(now.checked_sub(start)?))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut ts: libc::timespec = unsafe { std::mem::zeroed() };
+        if unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut ts) } != 0 {
+            return None;
+        }
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+        let now = ts.tv_sec as u64 * hz + ts.tv_nsec as u64 * hz / 1_000_000_000;
+        Some(Duration::from_secs_f64(now.checked_sub(start)? as f64 / hz as f64))
+    }
 }
 
 /// The processes launched for `dir` (stamped with it), whoever launched them.

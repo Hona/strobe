@@ -24,8 +24,6 @@ const SLOW_NS: u64 = 950_000_000;
 const SET_REFRESH: Duration = Duration::from_secs(1);
 /// The set refresh may use at most 1/500 of the sampler's time (0.2% of a core).
 const SET_SHARE: u32 = 500;
-/// When the first re-read of the set comes: see `run`.
-const STAMPS_SETTLE: Duration = Duration::from_millis(2500);
 const MB: f64 = 1024.0 * 1024.0;
 
 /// Everything one collection produced.
@@ -48,39 +46,42 @@ pub struct Tick {
 }
 
 /// strobe's own process over a tick (SPEC rule 2: its CPU, GPU and memory are a track in every
-/// recording): every thread's CPU, % of one core; its GPU engine time, % of one engine, over the last
-/// second (None without a per-process GPU source); its private memory, MB, read at most a second ago.
+/// recording): every thread's CPU, % of one core; on the ticks that read them (about once a second),
+/// its GPU engine time, % of one engine over the `gpu_dt_ns` before the tick's end (None without a
+/// per-process GPU source), and its private memory, MB.
 #[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Own {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cpu_pct: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_pct: Option<f32>,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub gpu_dt_ns: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mb: Option<f32>,
 }
 
+fn is_zero(v: &u64) -> bool {
+    *v == 0
+}
+
 /// Reads strobe's own process, one process and no system snapshot: its CPU so far
-/// (`host::process_cycles`, against the TSC) every tick, and once a second its private memory and
-/// its GPU engine time, with a per-process GPU reader of its own: on Windows that is a D3DKMT query
-/// per engine of every adapter (strobe opens them all to read the target's), which every tick cost
-/// the sampler more than the rest of its tick, and Linux's private memory walks the process's
-/// mappings (`smaps_rollup`, 94 µs on vps).
+/// (`host::process_cycles`, against the TSC) every tick, and once a second (and at the last tick) its
+/// private memory and its GPU engine time, with a per-process GPU reader of its own: on Windows that
+/// is a D3DKMT query per engine of every adapter (strobe opens them all to read the target's), which
+/// every tick cost the sampler more than the rest of its tick, and Linux's private memory walks the
+/// process's mappings (`smaps_rollup`, 94 µs on vps).
 struct OwnReader {
     pid: u32,
     last: Option<(u64, u64)>,
     gpu: Option<gpu::Kmt>,
     slow_ns: u64,
-    gpu_pct: Option<f32>,
-    memory_mb: Option<f32>,
 }
 
 impl OwnReader {
     fn new(adapters: &[Adapter]) -> OwnReader {
-        let gpu = gpu::Kmt::new(adapters, &mut Vec::new());
-        let mut r = OwnReader { pid: std::process::id(), last: None, gpu, slow_ns: 0, gpu_pct: None, memory_mb: None };
+        let mut r = OwnReader { pid: std::process::id(), last: None, gpu: gpu::Kmt::new(adapters, &mut Vec::new()), slow_ns: 0 };
         r.cpu();
-        r.slow(host::now_ns());
         r
     }
 
@@ -92,25 +93,23 @@ impl OwnReader {
         pct
     }
 
-    /// Memory, and GPU % of one engine over the last second (the first read is the GPU's baseline),
-    /// read again once `SLOW_NS` passed.
-    fn slow(&mut self, t: u64) {
-        if self.slow_ns != 0 && t - self.slow_ns < SLOW_NS {
-            return;
+    /// The tick ending at `t`; it reads memory and GPU when `SLOW_NS` passed since they were last
+    /// read, or `last` (the sampler's final tick). The first GPU read is the baseline.
+    fn read(&mut self, t: u64, last: bool) -> Own {
+        let mut own = Own { cpu_pct: self.cpu(), ..Own::default() };
+        if self.slow_ns == 0 || t - self.slow_ns >= SLOW_NS || last {
+            if let Some(k) = self.gpu.as_mut() {
+                let (mut rows, mut vram) = (Vec::new(), Vec::new());
+                let dt = if self.slow_ns == 0 { 0 } else { t - self.slow_ns };
+                k.read(&[self.pid], dt, true, &mut rows, &mut vram);
+                if dt > 0 {
+                    (own.gpu_pct, own.gpu_dt_ns) = (Some(rows.iter().map(|e| e.pct).sum()), dt);
+                }
+            }
+            own.memory_mb = own_private_bytes().map(|b| (b as f64 / MB) as f32);
+            self.slow_ns = t;
         }
-        if let Some(k) = self.gpu.as_mut() {
-            let (mut rows, mut vram) = (Vec::new(), Vec::new());
-            let dt = if self.slow_ns == 0 { 0 } else { t - self.slow_ns };
-            k.read(&[self.pid], dt, true, &mut rows, &mut vram);
-            self.gpu_pct = (dt > 0).then(|| rows.iter().map(|e| e.pct).sum());
-        }
-        self.memory_mb = own_private_bytes().map(|b| (b as f64 / MB) as f32);
-        self.slow_ns = t;
-    }
-
-    fn read(&mut self, t: u64) -> Own {
-        self.slow(t);
-        Own { cpu_pct: self.cpu(), gpu_pct: self.gpu_pct, memory_mb: self.memory_mb }
+        own
     }
 }
 
@@ -388,15 +387,12 @@ impl Sampler {
 
 fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mpsc::Receiver<()>, ready: mpsc::Sender<()>) -> Samples {
     let (k0, tsc0, ns0) = (host::thread_cycles(), host::tsc(), host::now_ns());
-    let me = std::process::id();
-    // Sorted; strobe's own process is never the target's, though it launched it.
-    let set = || -> Vec<u32> { if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).filter(|&p| p != me).collect() } };
-    // The first read of the set reads every process's stamp (cached by pid and start time), and a
-    // process without one is read again for 2 s after it is first seen (`host::spawn::stamped`): at
-    // the first read every process is new, so a re-read within 2 s reads every process again (30 ms
-    // on adais, which made the sampler 1% of a core in a 5 s block). The first re-read waits past it.
+    // Sorted, without strobe itself (`host::process_set`).
+    let set = || -> Vec<u32> { if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).collect() } };
+    // The first read of the set reads every process's stamp once (cached by pid and start time), so
+    // it does not set the refresh; later reads do.
     let mut pids = set();
-    let mut refresh = STAMPS_SETTLE;
+    let mut refresh = SET_REFRESH;
     let mut probe = Probe::new(false, &pids);
     let mut own = OwnReader::new(&probe.adapters);
     let mut refreshed = Instant::now();
@@ -409,6 +405,11 @@ fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mp
         let done = !matches!(stop.recv_timeout(next.saturating_duration_since(Instant::now())), Err(mpsc::RecvTimeoutError::Timeout));
         // A stop right after a tick leaves nothing worth a reading (rates over a few µs).
         if done && last.elapsed() < Duration::from_millis(5) {
+            // strobe's memory and GPU are read at the end too: onto the last tick.
+            if let Some(o) = ticks.last_mut().and_then(|t: &mut Tick| t.own.as_mut()).filter(|o| o.memory_mb.is_none()) {
+                let end = own.read(host::now_ns(), true);
+                (o.gpu_pct, o.gpu_dt_ns, o.memory_mb) = (end.gpu_pct, end.gpu_dt_ns, end.memory_mb);
+            }
             break;
         }
         if root != 0 && refreshed.elapsed() >= refresh {
@@ -418,7 +419,7 @@ fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mp
             refreshed = Instant::now();
         }
         let mut tick = probe.tick(&pids);
-        tick.own = Some(own.read(tick.t_ns));
+        tick.own = Some(own.read(tick.t_ns, done));
         ticks.push(tick);
         last = Instant::now();
         if done {
@@ -512,9 +513,9 @@ pub struct Summary {
     pub strobe: Option<OwnTrack>,
 }
 
-/// strobe's own process over a window: its CPU (% of one core) and GPU (% of one engine), weighted
-/// like the rest, its peak private memory (MB), and each tick's reading, for the recording's track
-/// (`strobe open --perfetto`): (end of the tick, its length, CPU %, GPU %, memory MB).
+/// strobe's own process over a window: its CPU (% of one core) and GPU (% of one engine), each
+/// weighted by its reading's overlap with the window, its peak private memory (MB), and each tick's
+/// readings, for the recording's track (`strobe open`).
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
 pub struct OwnTrack {
     pub cpu_pct: Option<f64>,
@@ -523,8 +524,9 @@ pub struct OwnTrack {
     pub ticks: Vec<OwnTick>,
 }
 
-/// One tick of strobe's own process: (end, length, CPU %, GPU %, memory MB).
-pub type OwnTick = (u64, u64, Option<f32>, Option<f32>, Option<f32>);
+/// One tick of strobe's own process: (end, length, CPU % over the length, GPU % over the GPU
+/// reading's length, that length (0: no GPU reading on this tick), memory MB at the end).
+pub type OwnTick = (u64, u64, Option<f32>, Option<f32>, u64, Option<f32>);
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct CoreAvg {
@@ -575,6 +577,14 @@ impl Samples {
                     add(&mut util, &f.util, w);
                 }
             }
+            // strobe's GPU reading covers its own span (about a second), which may reach into the
+            // window from a tick past it.
+            if let Some((pct, dt)) = t.own.and_then(|o| Some((o.gpu_pct?, o.gpu_dt_ns))) {
+                let gw = overlap(t.t_ns, dt, t0, t1);
+                if gw > 0.0 {
+                    (own_acc[1].0, own_acc[1].1) = (own_acc[1].0 + gw * pct as f64, own_acc[1].1 + gw);
+                }
+            }
             let w = overlap(t.t_ns, t.dt_ns, t0, t1);
             if w <= 0.0 {
                 continue;
@@ -584,11 +594,9 @@ impl Samples {
             last = Some(t);
             add(&mut busy, &t.busy, w);
             if let Some(o) = t.own {
-                own.ticks.push((t.t_ns, t.dt_ns, o.cpu_pct, o.gpu_pct, o.memory_mb));
-                for (a, v) in own_acc.iter_mut().zip([o.cpu_pct, o.gpu_pct]) {
-                    if let Some(v) = v {
-                        (a.0, a.1) = (a.0 + w * v as f64, a.1 + w);
-                    }
+                own.ticks.push((t.t_ns, t.dt_ns, o.cpu_pct, o.gpu_pct, o.gpu_dt_ns, o.memory_mb));
+                if let Some(v) = o.cpu_pct {
+                    (own_acc[0].0, own_acc[0].1) = (own_acc[0].0 + w * v as f64, own_acc[0].1 + w);
                 }
                 own.memory_mb = o.memory_mb.map(|m| own.memory_mb.unwrap_or(0.0).max(m as f64)).or(own.memory_mb);
             }

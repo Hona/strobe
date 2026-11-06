@@ -656,12 +656,16 @@ pub fn ctrl_c() -> &'static std::sync::atomic::AtomicBool {
 
 /// The tree rooted at `root` plus everything launched for `home` and their trees: every process
 /// stamped with it (an app's detached background service, a double-forked daemon: outside the tree,
-/// but the target's) and, on Windows, every process in its launch's job. Sorted by pid.
+/// but the target's) and, on Windows, every process in its launch's job. Sorted by pid. strobe's own
+/// process is in no target's set (it launched the target, and samples itself apart), unless it is
+/// the root.
 pub fn process_set(root: u32, home: Option<&Path>) -> Vec<ProcTimes> {
     let mut set = trees(&[root], &|list| match home {
         Some(h) => spawn::pids_in(list, h).into_iter().chain(spawn::group_pids(h)).collect(),
         None => Vec::new(),
     });
+    let me = std::process::id();
+    set.retain(|p| p.pid != me || root == me);
     set.sort_by_key(|p| p.pid);
     set
 }

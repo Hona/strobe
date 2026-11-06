@@ -93,21 +93,21 @@ fn tree_of(all: &[SysProc], roots: &[u32]) -> Vec<usize> {
 /// One process's CPU cycles (`super::process_cycles`): the cycle count alone, and strobe's own through
 /// its pseudo handle, so a reading at a measured window's edge costs as little as it can.
 pub fn process_cycles(pid: u32) -> Option<u64> {
-    use windows_sys::Win32::System::Threading::GetCurrentProcess;
     let mut cycles = 0u64;
-    unsafe {
+    let ok = unsafe {
         if pid == std::process::id() {
-            QueryProcessCycleTime(GetCurrentProcess(), &mut cycles);
+            QueryProcessCycleTime(GetCurrentProcess(), &mut cycles) != 0
         } else {
             let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
             if h.is_null() {
                 return None;
             }
-            QueryProcessCycleTime(h, &mut cycles);
+            let ok = QueryProcessCycleTime(h, &mut cycles) != 0;
             CloseHandle(h);
+            ok
         }
-    }
-    Some(cycles).filter(|c| *c > 0)
+    };
+    Some(cycles).filter(|c| ok && *c > 0)
 }
 
 /// Every process: (pid, parent, creation time), from one system snapshot.

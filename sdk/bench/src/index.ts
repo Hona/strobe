@@ -627,7 +627,8 @@ export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"
 
 /**
  * A command run to its exit per `ctx.exec()` (a CLI, a compiler, a test binary), measured from outside: `cpu.work`
- * (its CPU with everything it starts), `run.duration` (spawn to exit), `cpu.wakes`, `memory.peak`, `io.read`,
+ * (its CPU with everything it starts), `run.duration` (spawn to exit), `cli.launch` (the OS starting it, on
+ * strobe's thread), `cpu.wakes`, `memory.peak`, `io.read`,
  * `io.write`, and `metric.<name>` from its `strobe:metric <name>=<value> [lower|higher]` lines (default lower is
  * better; every command of a run must print each name it prints, in one direction). Cases: `run: (ctx) => ctx.exec()`.
  */

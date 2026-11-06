@@ -2497,13 +2497,20 @@ them by. Output goes to the experiment's `cli.log`.
     Linux and macOS: `wait4`'s rusage of the child, which includes every descendant its tree waited
     for (exact: the kernel's per-task runtime). Windows: the command's own process from its cycle
     counter (exact; where cycles are not time, refused `NotOnThisOs` as for script targets, never
-    replaced by clock ticks), plus the processes it started from the job's clock-tick times (sampled
+    replaced by clock ticks) over the cycle clock's rate from just before the child first ran to its
+    exit, both clocks read together at each end, plus the processes it started from the job's clock-tick times (sampled
     at the timer interrupt, 15.6 ms a tick). A run whose commands started any process (a shell around
     the program, a `.cmd`, a child) gets `cpu.work` only when that part is 64 ticks (1 s) a run or
     more, said once per experiment as a share of `cpu.work` (`TickSampledCpu`); below, `cpu.work` and
     `cpu.app.total` are refused (`NotOnThisOs`: one tick more or less, or work under a tick that reads
     0, is several percent of the run), and `run.duration` still compares. Without a job of its own
     (strobe's own job refused a nested one) nothing counts the processes it started, so refused too.
+  - `cli.launch`: the CPU of the OS creating each command's process, on strobe's launching thread
+    (its cycle counter, read just before and after the spawn), summed per run in ms. Windows does
+    most of a process's creation in the launcher (5–7 ms a launch on adais, for any launcher); on
+    Unix it is the fork, the exec running in the child. It is in `run.duration` and not in
+    `cpu.work`, and out of strobe's own share (§19). Refused (`NotOnThisOs`) where thread cycles are
+    not time. Compared with care: it grows with the program's executable and what loads with it.
   - `cpu.wakes`: the command's context switches (voluntary and involuntary, rusage) per second of
     its wall time. Refused on Windows (`NotOnThisOs`): a job counts no context switches, and an ended
     process's are gone.
@@ -2520,7 +2527,9 @@ them by. Output goes to the experiment's `cli.log`.
     that printed none is not 0); lines, runs or base and head that disagree on its direction refuse it
     `NoMetric`, as does a line strobe cannot read. Compared across implementations (`compared`).
 - **Not counted:** on Unix a process the command detached (a double fork) that ended before it,
-  which no one in its tree waited for; on Windows a process that broke away from the job. Counters
+  which no one in its tree waited for; on Windows a process that broke away from the job; on macOS an
+  XPC service launchd started for it (a command is not its own responsible process, and the service
+  is neither in its group nor stamped), which is not ended either. Counters
   (`energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`) are refused (`NoCounter`): a command ends
   inside the run. Nothing of strobe runs in the command: the runner and strobe's reader threads stay
   on the other CPUs.
@@ -4905,7 +4914,8 @@ launch's return to the command's exit, since its values are the commands' (`run.
 their spawn-to-exit times): the launch itself and the accounting after each exit sit outside. The
 launch is the OS creating the process, which Windows charges to the launcher (5–7 ms of CPU per
 launch on adais, for strobe and for Bun's `spawnSync` alike); it stays in `run.duration` as the
-command's start. Each edge reads strobe's own cycles right beside the clock and the runner's beyond
+command's start and is a metric of its own, `cli.launch` (§9.6). A run that counted no time adds
+nothing to the share. Each edge reads strobe's own cycles right beside the clock and the runner's beyond
 them, so reading the runner is not in strobe's count. `--check` prints it per case (`self  strobe 0.81% · runner 0.40% ·
 sampler 0.16% of a core`), a bench per series (the blocks' mean); in a timed block a part over its
 budget above warns `OverheadBudget`, once per series and part. strobe's own process has no budget
@@ -5047,7 +5057,12 @@ leaves the stop list before its reap, whose pid may be reused): three `bun --ver
 (adais) and 4–8% (vps), a 300 ms command 0.16% and 0.06–0.11%. Unchanged, on adais and vps: a
 script target's 3 ms calls 7% (the relay of each `ctx.call`), a headless page's click 0.5% and 2–3%,
 a windowless native app's idle run 0.3%. A command that ends within microseconds of its launch
-reads a share of a span that short.
+reads a share of a span that short. After review: the launch is `cli.launch` (adais: 5.2–5.7 ms a
+`bun --version` launch, one cold launch 92 ms; it was nowhere before), and Windows' `cpu.work` of a
+command takes the cycle clock's rate from just before the child ran to its exit, both clocks read
+together: before, the span began when strobe began to wait, so a command that had already exited
+(strobe 50 ms late in a debug build) read 0.04–0.11 ms of `cpu.work` against 6–8 ms (a rate of
+315–614 GHz for a 4.3 GHz clock), and on time it read 1.5% low (4.37 GHz); now 4300 MHz in every run.
 
 Press edge and untimed stretches (2026-11-06, §7.4, §9.6; `scripts/dev/press.bench.ts` with
 `scripts/dev/press-app.swift`, `--check`). On air, unlocked, two clicks a run, each followed by an

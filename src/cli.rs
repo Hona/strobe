@@ -404,7 +404,7 @@ Use
   run --base \"<command>\" --head \"<command>\" [--aa] [--check] [--primary cpu.work] [--metrics metric.<name>,…] [--pairs auto|N]
       [--runs 5] [--noworse 2%] [--pin …] [--reserve-cpus auto|on|off] [--power high|keep] [--require-verdict]
                                   a paired A/B of two commands, as a bench (verdicts, report, PR block): each run starts the
-                                  command and waits for its exit; cpu.work, run.duration, cpu.wakes, memory.peak, io.*, and
+                                  command and waits for its exit; cpu.work, run.duration, cli.launch, cpu.wakes, memory.peak, io.*, and
                                   metric.<name> from `strobe:metric <name>=<value>` lines it prints (--aa --head: an A/A)
 
 Setup

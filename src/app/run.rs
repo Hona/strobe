@@ -86,7 +86,7 @@ fn paired(args: &Args) -> Result<Output> {
     }
     let metrics: Vec<String> = args.get("metrics").unwrap_or("").split(',').map(str::trim).filter(|m| !m.is_empty()).map(str::to_string).collect();
     if let Some(bad) = metrics.iter().find(|m| crate::model::metric(m).is_none()) {
-        return Err(Error::usage(format!("--metrics: {bad} is no metric (a command gives cpu.work, run.duration, cpu.wakes, memory.peak, io.read, io.write and metric.<name>)")));
+        return Err(Error::usage(format!("--metrics: {bad} is no metric (a command gives cpu.work, run.duration, cli.launch, cpu.wakes, memory.peak, io.read, io.write and metric.<name>)")));
     }
     let text = bench_file(&metrics);
     use sha2::Digest;

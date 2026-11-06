@@ -22,12 +22,14 @@ impl Direction {
     }
 }
 
-/// One command run: wall ms (spawn to exit), what the OS counted, and the metrics it printed with
-/// their directions (a name printed in both directions is `None`).
+/// One command run: wall ms (spawn to exit), what the OS counted, the metrics it printed with
+/// their directions (a name printed in both directions is `None`), and its launch's CPU on strobe's
+/// thread (ms, NaN where thread cycles are not time).
 struct Ran {
     wall: f64,
     usage: host::spawn::Usage,
     metrics: BTreeMap<String, (f64, Option<Direction>)>,
+    launch: f64,
 }
 
 /// A run's commands summed, or None when one of them has no value.
@@ -117,7 +119,8 @@ struct Spawn<'a> {
 }
 
 /// Runs one command to its exit, its output read line by line (into the experiment's cli.log). With
-/// `cost`, strobe's own CPU counts while the command runs: from its launch's return to its exit.
+/// `cost`, strobe's own CPU counts while the command runs: from just after its launch (its pipes
+/// handed to the readers) to its exit.
 fn exec(line: &str, at: &Spawn, cost: Option<&SelfCost>) -> Result<(Ran, String)> {
     // The two readers start before the command and wait for its pipes, so creating their threads is
     // strobe's work before the command runs, not beside it.
@@ -136,30 +139,34 @@ fn exec(line: &str, at: &Spawn, cost: Option<&SelfCost>) -> Result<(Ran, String)
             (tx, reader)
         })
         .unzip();
-    let start = |shell: bool| -> std::io::Result<(host::spawn::Owned, Instant)> {
+    // The launch's CPU on this thread (`cli.launch`): the OS creating the process, which Windows does
+    // in the launcher. NaN where thread cycles are not time.
+    let start = |shell: bool| -> std::io::Result<(host::spawn::Owned, Instant, f64)> {
         let mut cmd = command(line, shell);
         for (k, val) in at.target["env"].as_object().into_iter().flatten() {
             cmd.env(k, val.as_str().unwrap_or(""));
         }
         cmd.env(host::spawn::HOME_VAR, at.stamp).env(host::spawn::OWNER_VAR, host::spawn::owner_stamp());
         cmd.current_dir(at.root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
-        let t0 = Instant::now();
-        host::spawn_owned(&mut cmd, at.cpus, 0, None).map(|c| (c, t0))
+        let (c0, k0, t0) = (host::thread_cycles(), host::tsc(), Instant::now());
+        let child = host::spawn_owned(&mut cmd, at.cpus, 0, None)?;
+        let (t1, k1, c1) = (Instant::now(), host::tsc(), host::thread_cycles());
+        Ok((child, t0, super::script::cpu_ms((c0, k0), (c1, k1), t1.duration_since(t0).as_secs_f64() * 1e3)))
     };
     // Windows: a word that is no executable (NotFound), or a script `raw_arg` cannot pass (InvalidInput).
-    let (mut child, t0) = match start(false) {
+    let (mut child, t0, launch) = match start(false) {
         Err(e) if cfg!(windows) && matches!(e.kind(), std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput) => start(true),
         r => r,
     }
     .map_err(|e| Error::msg(format!("start `{line}`: {e}")))?;
-    if let Some(c) = cost {
-        c.resume();
-    }
     let (out, err) = child.output();
     for (tx, pipe) in pipes.into_iter().zip([out.map(|o| Box::new(o) as Pipe), err.map(|e| Box::new(e) as Pipe)]) {
         if let Some(p) = pipe {
             let _ = tx.send(p);
         }
+    }
+    if let Some(c) = cost {
+        c.resume();
     }
     let exited = || {
         if let Some(c) = cost {
@@ -214,7 +221,7 @@ fn exec(line: &str, at: &Spawn, cost: Option<&SelfCost>) -> Result<(Ran, String)
     }
     let output: String = lines.join("\n");
     let output = if output.len() > 64 * 1024 { output[output.floor_char_boundary(output.len() - 64 * 1024)..].to_string() } else { output };
-    Ok((Ran { wall, usage, metrics }, output))
+    Ok((Ran { wall, usage, metrics, launch }, output))
 }
 
 /// Child processes' CPU from Windows' clock ticks needs this many ticks (15.6 ms each) per run before
@@ -319,6 +326,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         }
     };
     put("run.duration", per(&|r| Some(wall(r))), &|| Refusal::new(ValidatorId::RunIncomplete, "run.duration: a run had no command"));
+    put("cli.launch", per(&|r| sum_of(r, |x| Some(x.launch).filter(|l| l.is_finite()))), &|| {
+        Refusal::new(ValidatorId::NotOnThisOs, format!("cli.launch: {}", host::cycles_refused().unwrap_or_else(|| "strobe's thread cycles over the cycle clock gave no time for a launch".into())))
+    });
     // Windows: children's CPU from clock ticks stands only with enough ticks per run.
     let ticks_ms: Vec<f64> = measured.iter().map(|r| r.0.iter().map(|x| x.usage.ticks_ns as f64 / 1e6).sum()).collect();
     let tick_ms = 15.625;
@@ -394,7 +404,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         let r = if probe::wakes::COUNTER_METRICS.contains(&m.as_str()) {
             Refusal::new(ValidatorId::NoCounter, format!("{m}: a command's counters are not read (it ends inside the run)"))
         } else {
-            Refusal::new(ValidatorId::NotForTarget, format!("{m}: a cli target is measured from outside its commands (cpu.work, run.duration, cpu.wakes, memory.peak, io.*, metric.<name>)"))
+            Refusal::new(ValidatorId::NotForTarget, format!("{m}: a cli target is measured from outside its commands (cpu.work, run.duration, cli.launch, cpu.wakes, memory.peak, io.*, metric.<name>)"))
         };
         refused.insert(m.clone(), r);
     }

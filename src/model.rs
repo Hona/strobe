@@ -397,6 +397,7 @@ const CARE_PRIVATE: &str = "the OS's private memory of every process of each app
 const CARE_HOST: &str = "what every process of each app allocated in its own address space, without GPU memory";
 const CARE_GPU_MEMORY: &str = "GPU memory of every process of each app";
 const CARE_FRAMES: &str = "descriptive: more frames can mean smoother or wasteful";
+const CARE_LAUNCH: &str = "the OS's work creating each command's process, which grows with its executable and what loads with it, not with what it then does";
 const CARE_PEAK: &str = "the largest of each command's processes at its peak (a resident set on Linux and macOS, a commit on Windows), not their sum";
 
 const TIME: (&str, &str) = ("faster", "slower");
@@ -937,6 +938,16 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         across: Across::Compared,
         about: "times per second the target's processes woke the CPU package from idle during runs (macOS: what Activity Monitor's Energy Impact weighs); refused where the OS does not count them per process",
+    },
+    MetricDef {
+        name: "cli.launch",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Care(CARE_LAUNCH),
+        about: "cli targets: CPU time of the OS creating each command's process per run, on strobe's launching thread (Windows does most of it in the launcher, often several ms; elsewhere the fork, with the exec in the child), from its cycle counter; in run.duration, not in cpu.work",
     },
     MetricDef {
         name: "memory.peak",

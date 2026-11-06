@@ -88,7 +88,7 @@ strobe run --base "<command>" --head "<command>" [--aa | --check] [--primary cpu
 - `-- <command>`: your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs.
 - `--base … --head …`: a paired A/B of two commands, a full bench (verdict, `report`, PR block).
   - Each run starts the command and waits for its exit, measured from outside with what it starts.
-  - `cpu.work` (primary), `run.duration`, `cpu.wakes` (not Windows), `memory.peak`, `io.read`, `io.write`.
+  - `cpu.work` (primary), `run.duration`, `cli.launch` (the OS starting each command, on strobe's thread; not in `cpu.work`), `cpu.wakes` (not Windows), `memory.peak`, `io.read`, `io.write`.
   - A line `strobe:metric <name>=<value>` it prints adds to `metric.<name>` (lower is better; end the line with `higher` for a rate or score).
   - Declare one with `--metrics metric.parse_ms` to test it; every command of every run must print it, in one direction (`NoMetric`).
   - A simple command runs under `exec`; pipes, `;`, `&&`, redirects or `VAR=x cmd` run as a shell line.
@@ -347,7 +347,7 @@ export default bench({
   - `before(ctx)` deletes caches for a cold start.
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
 - `cli("./target/release/tool input.txt")`: a command run to its exit per `ctx.exec()` (`run: (ctx) => ctx.exec()`) in the variant's folder, measured from outside.
-  - `cpu.work`, `run.duration`, `cpu.wakes`, `memory.peak`, `io.*`, `metric.<name>` from its `strobe:metric` lines; a nonzero exit fails the run.
+  - `cpu.work`, `run.duration`, `cli.launch`, `cpu.wakes`, `memory.peak`, `io.*`, `metric.<name>` from its `strobe:metric` lines; a nonzero exit fails the run.
   - No attribution blocks (the command ends inside each run).
 - `params: { files: { run: [100, 10_000], more: [1, 1_000] } }`: `more` only with `--params all`.
 - `targets: ["web"]` on a case limits where it runs.

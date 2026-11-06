@@ -147,7 +147,15 @@ pub struct Owned {
     /// The child's start time, read at the launch: what roots its leftovers once it exited (macOS
     /// gives no information of an exited, unreaped process).
     start: Option<u64>,
+    #[cfg(windows)]
+    started: Started,
 }
+
+/// Windows: the cycle clock and the wall clock, read together just before the child first runs.
+/// `run_to_exit` measures the cycle clock's rate from here to the exit, a span as long as the child's
+/// life even when it exited before strobe began to wait.
+#[cfg(windows)]
+type Started = (Option<u64>, std::time::Instant);
 
 struct Group {
     #[cfg(windows)]
@@ -309,7 +317,9 @@ impl Owned {
     /// `setsid` daemon or a job breakaway), and reaps it. On Unix the child stays a zombie while it is
     /// read (its pid, the group's id, is not reused), and only processes its tree waited for count: one
     /// it detached that ended before it is in no count. `on_exit` runs as soon as the child has exited
-    /// (or its deadline ended it), before any of that is read.
+    /// (or its deadline ended it), before any of that is read. A launch with no home (a `cli()`
+    /// command's) is not its own responsible process on macOS, so an XPC service launchd starts for it
+    /// is neither in its group nor stamped: in no count, and not ended.
     pub fn run_to_exit(mut self, deadline: std::time::Duration, stamp: Option<&Path>, on_exit: impl FnOnce()) -> std::io::Result<Usage> {
         let stamped = |me: u32| -> Vec<(u32, String)> {
             stamp
@@ -324,12 +334,12 @@ impl Owned {
             };
             use windows_sys::Win32::System::Threading::{GetExitCodeProcess, GetProcessTimes, WaitForSingleObject};
             use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
-            let t0 = super::tsc();
-            let w0 = std::time::Instant::now();
+            let (t0, w0) = self.started;
             let h = self.child.as_raw_handle();
             let ms = deadline.as_millis().min(u32::MAX as u128 - 1) as u32;
             let waited = unsafe { WaitForSingleObject(h as _, ms) };
-            let exited = std::time::Instant::now();
+            // Both clocks together, before anything else runs: the rate below divides one by the other.
+            let (exited, t1) = (std::time::Instant::now(), super::tsc());
             on_exit();
             if waited != 0 {
                 self.end();
@@ -351,8 +361,9 @@ impl Owned {
                     child_100ns = Some(t(k) + t(u));
                 }
             }
-            // The cycle clock's rate over the wait (cycles are its units; None where they are not time).
-            let hz = t0.zip(super::tsc()).filter(|(a, b)| b > a && wall_ns > 0).map(|(a, b)| (b - a) as f64 / (wall_ns as f64 / 1e9));
+            // The cycle clock's rate over the child's life (cycles are its units; None where they are
+            // not time), both ends read with the wall clock.
+            let hz = t0.zip(t1).filter(|(a, b)| b > a && wall_ns > 0).map(|(a, b)| (b - a) as f64 / (wall_ns as f64 / 1e9));
             let child_ns = hz.filter(|_| cycles > 0).map(|hz| (cycles as f64 / hz * 1e9) as u64);
             if child_ns.is_none() {
                 usage.cpu_refused = Some(super::cycles_refused().unwrap_or_else(|| "the command's process gave no cycles over the cycle clock".into()));
@@ -411,9 +422,10 @@ impl Owned {
             let mut info: libc::siginfo_t = std::mem::zeroed();
             // Exited, not reaped: a zombie keeps its pid and the group's id while it is read.
             while libc::waitid(libc::P_PID, pid as libc::id_t, &mut info, libc::WEXITED | libc::WNOWAIT) != 0 {
-                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
                     let _ = stop.send(());
-                    return Err(std::io::Error::last_os_error());
+                    return Err(e);
                 }
             }
             let exited = std::time::Instant::now();
@@ -466,8 +478,12 @@ impl Owned {
             let mut status = 0;
             let mut ru: libc::rusage = std::mem::zeroed();
             while libc::wait4(pid as libc::pid_t, &mut status, 0, &mut ru) < 0 {
-                if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                    return Err(std::io::Error::last_os_error());
+                let e = std::io::Error::last_os_error();
+                if e.raw_os_error() != Some(libc::EINTR) {
+                    // Not ours to reap (ECHILD: reaped already), so its pid and group id may name
+                    // another process now: the drop must not end the group.
+                    self.group = None;
+                    return Err(e);
                 }
             }
             // Reaped here: nothing is left to end, and the group's id may name another process now.
@@ -544,7 +560,7 @@ pub fn group_pids(dir: &Path) -> Vec<u32> {
 pub fn spawn_pinned(cmd: &mut Command, cpus: Option<u64>, flags: u32) -> std::io::Result<Child> {
     #[cfg(windows)]
     {
-        windows(cmd, cpus, flags, None).map(|(child, _)| child)
+        windows(cmd, cpus, flags, None).map(|(child, _, _)| child)
     }
     #[cfg(not(windows))]
     {
@@ -581,7 +597,7 @@ fn spawn_group(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&P
             }
             set.then_some(j as isize)
         };
-        let (child, assigned) = match windows(cmd, cpus, flags, job) {
+        let (child, assigned, started) = match windows(cmd, cpus, flags, job) {
             Ok(x) => x,
             Err(e) => {
                 if let Some(j) = job {
@@ -601,7 +617,7 @@ fn spawn_group(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&P
         if let (Some(j), Some(h)) = (job, home) {
             JOBS.lock().unwrap_or_else(|e| e.into_inner()).push((home_key(h), j));
         }
-        Ok(Owned { child, group: Some(Group { job }), unattributed: None, start: None })
+        Ok(Owned { child, group: Some(Group { job }), unattributed: None, start: None, started })
     }
     #[cfg(not(windows))]
     {
@@ -693,17 +709,19 @@ fn nt_resume() -> Option<unsafe extern "system" fn(*mut std::ffi::c_void) -> i32
 }
 
 /// Created suspended, put in `job` and given the mask, then resumed: its first instruction already
-/// runs there. Returns whether the job took it.
+/// runs there. Returns whether the job took it, and the clocks just before it ran.
 #[cfg(windows)]
-fn windows(cmd: &mut Command, cpus: Option<u64>, flags: u32, job: Option<isize>) -> std::io::Result<(Child, bool)> {
+fn windows(cmd: &mut Command, cpus: Option<u64>, flags: u32, job: Option<isize>) -> std::io::Result<(Child, bool, Started)> {
     use std::os::windows::io::AsRawHandle;
     use std::os::windows::process::CommandExt;
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next};
     use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
     use windows_sys::Win32::System::Threading::{CREATE_SUSPENDED, GetProcessAffinityMask, OpenThread, ResumeThread, SetProcessAffinityMask, THREAD_SUSPEND_RESUME};
+    let clocks = || (super::tsc(), std::time::Instant::now());
     if cpus.is_none() && job.is_none() {
-        return Ok((cmd.creation_flags(flags).spawn()?, false));
+        let started = clocks();
+        return Ok((cmd.creation_flags(flags).spawn()?, false, started));
     }
     let mut child = cmd.creation_flags(flags | CREATE_SUSPENDED).spawn()?;
     let h = child.as_raw_handle();
@@ -721,6 +739,7 @@ fn windows(cmd: &mut Command, cpus: Option<u64>, flags: u32, job: Option<isize>)
         // A process created suspended has its one thread: resume it. `NtResumeProcess` takes
         // microseconds, where a system-wide thread snapshot to find that thread took milliseconds,
         // which a launch's time would count.
+        let started = clocks();
         let mut resumed = nt_resume().is_some_and(|resume| resume(h) >= 0);
         let snap = if resumed { INVALID_HANDLE_VALUE } else { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
         if snap != INVALID_HANDLE_VALUE {
@@ -744,6 +763,6 @@ fn windows(cmd: &mut Command, cpus: Option<u64>, flags: u32, job: Option<isize>)
             let _ = child.wait();
             return Err(std::io::Error::other("could not resume the child"));
         }
-        Ok((child, assigned))
+        Ok((child, assigned, started))
     }
 }

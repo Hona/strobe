@@ -1183,10 +1183,11 @@ impl SelfCost {
         self.sum.set(Some((sum.0 + span, delta(s0, strobe, sum.1), delta(r0, runner, sum.2))));
     }
 
-    /// The run that began ended now.
+    /// The run that began ended now. A run that counted no time (all of it untimed) adds nothing to
+    /// the share; with no cycle clock no run counts any, and the share is None.
     fn end(&self) {
         self.pause();
-        let run = self.sum.take().map_or((0, None, None), |s| if s.0 == 0 { (0, None, None) } else { s });
+        let run = self.sum.take().map_or((0, None, None), |s| if s.0 == 0 { (0, Some(0), Some(0)) } else { s });
         self.runs.borrow_mut().push(run);
     }
 
@@ -2623,9 +2624,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // Smallest n whose exact signed-rank test can clear Holm's first step across the tested set.
     let holm = holm_pairs(tested.len());
     let mut descriptive: Vec<Comparison> = Vec::new();
-    // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
-    let found: Vec<String> =
-        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || k.starts_with("metric.") || *k == "memory.peak" || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
+    // A launch's milestones and CPU, a process's CPU, and a command's launch, are context like the fixed list.
+    let found: Vec<String> = blocks
+        .first()
+        .map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || k.starts_with("metric.") || *k == "memory.peak" || *k == "cpu.work" || *k == "cli.launch" || (*k == "cpu.app.total" && rate_context)).cloned().collect())
+        .unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
         if name == s.primary || names.iter().any(|n| n == name) || s.per_side(name) {

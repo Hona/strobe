@@ -1131,8 +1131,10 @@ type RunCost = (u64, Option<u64>, Option<u64>);
 /// strobe's own process and the runner's CPU inside the runs only (rule 2): read just before each
 /// run begins and just after it ends, so the work strobe does between runs (reading the target's
 /// processes, snapshots, resets) is never counted, and the share is over the measured runs' time;
-/// a run's `ctx.untimed` stretches pause it (`pause`, `resume`). Each read is of the one process
-/// (`host::process_cycles`), not a list of the system's.
+/// a run's `ctx.untimed` stretches pause it (`pause`, `resume`). A `cli()` run counts only while its
+/// commands run (`begin`, then `resume` at each spawn and `pause` at its exit): its measured values
+/// are the commands', and strobe's launch and accounting of each sit outside them. Each read is of
+/// the one process (`host::process_cycles`), not a list of the system's.
 struct SelfCost {
     runner: u32,
     /// The readings when the run (or its stretch after a pause) began: the cycle clock, strobe's and
@@ -1148,30 +1150,34 @@ impl SelfCost {
         SelfCost { runner, open: Cell::new(None), sum: Cell::new(None), runs: RefCell::new(Vec::new()) }
     }
 
-    fn read(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
-        (host::process_cycles(std::process::id()), host::process_cycles(self.runner), host::tsc())
-    }
-
     /// A run begins now.
     fn start(&self) {
-        self.sum.set(Some((0, Some(0), Some(0))));
+        self.begin();
         self.resume();
     }
 
-    /// A run's untimed stretch ends now: the run counts again.
+    /// A run begins now, counting nothing until `resume`.
+    fn begin(&self) {
+        self.open.set(None);
+        self.sum.set(Some((0, Some(0), Some(0))));
+    }
+
+    /// A run's untimed stretch ends now: the run counts again. strobe's own process is read last here
+    /// and first in `pause`, so reading the runner is not in its count.
     fn resume(&self) {
-        let (strobe, runner, tsc) = self.read();
+        let runner = host::process_cycles(self.runner);
+        let tsc = host::tsc();
+        let strobe = host::process_cycles(std::process::id());
         self.open.set(tsc.map(|t| (t, strobe, runner)));
     }
 
     /// A run's untimed stretch begins now: what the run used so far is kept, and nothing until `resume`.
+    /// Paused already (or no cycle clock, so nothing opened): nothing to add.
     fn pause(&self) {
-        let (strobe, runner, tsc) = self.read();
-        let Some(sum) = self.sum.get() else { return };
-        let Some((t0, s0, r0)) = self.open.take() else {
-            self.sum.set(Some((sum.0, None, None)));
-            return;
-        };
+        let (Some(sum), Some((t0, s0, r0))) = (self.sum.get(), self.open.take()) else { return };
+        let strobe = host::process_cycles(std::process::id());
+        let tsc = host::tsc();
+        let runner = host::process_cycles(self.runner);
         let span = tsc.map_or(0, |t| t.saturating_sub(t0));
         let delta = |a: Option<u64>, b: Option<u64>, so_far: Option<u64>| a.zip(b).filter(|(a, b)| b >= a).and_then(|(a, b)| Some(so_far? + b - a));
         self.sum.set(Some((sum.0 + span, delta(s0, strobe, sum.1), delta(r0, runner, sum.2))));

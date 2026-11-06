@@ -116,8 +116,26 @@ struct Spawn<'a> {
     timeout: Duration,
 }
 
-/// Runs one command to its exit, its output read line by line (into the experiment's cli.log).
-fn exec(line: &str, at: &Spawn) -> Result<(Ran, String)> {
+/// Runs one command to its exit, its output read line by line (into the experiment's cli.log). With
+/// `cost`, strobe's own CPU counts while the command runs: from its launch's return to its exit.
+fn exec(line: &str, at: &Spawn, cost: Option<&SelfCost>) -> Result<(Ran, String)> {
+    // The two readers start before the command and wait for its pipes, so creating their threads is
+    // strobe's work before the command runs, not beside it.
+    type Pipe = Box<dyn std::io::Read + Send>;
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (pipes, readers): (Vec<_>, Vec<_>) = (0..2)
+        .map(|_| {
+            let (tx, rx) = std::sync::mpsc::channel::<Pipe>();
+            let lines = lines.clone();
+            let reader = std::thread::spawn(move || {
+                let Ok(r) = rx.recv() else { return };
+                for l in BufReader::new(r).lines().map_while(std::result::Result::ok) {
+                    lines.lock().unwrap_or_else(|e| e.into_inner()).push(l);
+                }
+            });
+            (tx, reader)
+        })
+        .unzip();
     let start = |shell: bool| -> std::io::Result<(host::spawn::Owned, Instant)> {
         let mut cmd = command(line, shell);
         for (k, val) in at.target["env"].as_object().into_iter().flatten() {
@@ -134,21 +152,21 @@ fn exec(line: &str, at: &Spawn) -> Result<(Ran, String)> {
         r => r,
     }
     .map_err(|e| Error::msg(format!("start `{line}`: {e}")))?;
+    if let Some(c) = cost {
+        c.resume();
+    }
     let (out, err) = child.output();
-    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
-    let readers: Vec<_> = [out.map(|o| Box::new(o) as Box<dyn std::io::Read + Send>), err.map(|e| Box::new(e) as Box<dyn std::io::Read + Send>)]
-        .into_iter()
-        .flatten()
-        .map(|r| {
-            let lines = lines.clone();
-            std::thread::spawn(move || {
-                for l in BufReader::new(r).lines().map_while(std::result::Result::ok) {
-                    lines.lock().unwrap_or_else(|e| e.into_inner()).push(l);
-                }
-            })
-        })
-        .collect();
-    let usage = child.run_to_exit(at.timeout, Some(at.stamp)).map_err(|e| Error::msg(format!("`{line}`: {e}")))?;
+    for (tx, pipe) in pipes.into_iter().zip([out.map(|o| Box::new(o) as Pipe), err.map(|e| Box::new(e) as Pipe)]) {
+        if let Some(p) = pipe {
+            let _ = tx.send(p);
+        }
+    }
+    let exited = || {
+        if let Some(c) = cost {
+            c.pause();
+        }
+    };
+    let usage = child.run_to_exit(at.timeout, Some(at.stamp), exited).map_err(|e| Error::msg(format!("`{line}`: {e}")))?;
     let wall = usage.exited.unwrap_or_else(Instant::now).duration_since(t0).as_secs_f64() * 1e3;
     // What it left running was ended with it, so its pipes are closed.
     for r in readers {
@@ -227,10 +245,11 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 // `{fixture.url}` and the like, in a line the call or the variant gave (the target's
                 // own `run` and `env` are filled with the block).
                 let line = fixture.as_ref().and_then(|f| f.fill(&json!(line)).as_str().map(str::to_string)).unwrap_or(line);
-                let (r, output) = exec(&line, &at)?;
-                let code = r.usage.code;
                 // Only a run's commands count; setup's and reset's prepare, as do a run's untimed ones.
-                if hooks.in_run() && !hooks.untimed_now() {
+                let counted = hooks.in_run() && !hooks.untimed_now();
+                let (r, output) = exec(&line, &at, counted.then_some(&cost))?;
+                let code = r.usage.code;
+                if counted {
                     ran.borrow_mut().push(r);
                 }
                 Ok(json!({ "code": code, "output": output }))
@@ -240,15 +259,9 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 Ok(Value::Bool(true))
             }
             "phase" => hooks.phase(a),
-            // Commands in an untimed stretch are not the run's (above): a cli run's totals are its commands'.
-            "untimed" => hooks.untimed(a, |start, _| {
-                if start {
-                    cost.pause()
-                } else {
-                    cost.resume()
-                }
-                Ok(())
-            }),
+            // Commands in an untimed stretch are not the run's (above): a cli run's totals are its
+            // commands', and strobe's cost counts only while a counted one runs.
+            "untimed" => hooks.untimed(a, |_, _| Ok(())),
             "call" => Err(Error::usage("ctx.call is a script() target's; a cli target runs commands with ctx.exec()")),
             "driver" => Err(Error::msg("a cli target has no page: run its commands with ctx.exec()")),
             "line" => Err(Error::usage("waitForLine reads a native app's output; ctx.exec() resolves with the command's output")),
@@ -271,7 +284,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let cpu = |r: &[Ran]| sum_of(r, |x| x.usage.cpu_ns.map(|c| c as f64 / 1e6));
     while warmup.more(runs.len()) {
         hooks.begin(&format!("run:{}", runs.len()));
-        cost.start();
+        cost.begin();
         let t0 = host::now_ns();
         let r = ctx.runner.call("run", json!({ "case": s.case }), t, &serve);
         let t1 = host::now_ns();

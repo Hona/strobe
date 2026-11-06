@@ -208,6 +208,13 @@ impl Owned {
         }
     }
 
+    /// Takes the launch off the list a stop ends (`end_launches`), so neither a stop nor `end` ends
+    /// its tree: for a child that exited and whose leftovers were already read and ended.
+    fn unlist(&self) {
+        let pid = self.child.id();
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).retain(|(p, _)| *p != pid);
+    }
+
     /// Ends the child's tree (read first: ending the group orphans it), its group, then the child,
     /// and reaps it. Idempotent.
     pub fn end(&mut self) {
@@ -301,8 +308,9 @@ impl Owned {
     /// its group and of the processes stamped with `stamp` (`HOME_VAR`: what left the group, a
     /// `setsid` daemon or a job breakaway), and reaps it. On Unix the child stays a zombie while it is
     /// read (its pid, the group's id, is not reused), and only processes its tree waited for count: one
-    /// it detached that ended before it is in no count.
-    pub fn run_to_exit(mut self, deadline: std::time::Duration, stamp: Option<&Path>) -> std::io::Result<Usage> {
+    /// it detached that ended before it is in no count. `on_exit` runs as soon as the child has exited
+    /// (or its deadline ended it), before any of that is read.
+    pub fn run_to_exit(mut self, deadline: std::time::Duration, stamp: Option<&Path>, on_exit: impl FnOnce()) -> std::io::Result<Usage> {
         let stamped = |me: u32| -> Vec<(u32, String)> {
             stamp
                 .map(|h| pids_in_home(h).into_iter().filter(|p| *p != me).map(|p| (p, super::exe_of(p).and_then(|e| e.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default())).collect())
@@ -320,11 +328,13 @@ impl Owned {
             let w0 = std::time::Instant::now();
             let h = self.child.as_raw_handle();
             let ms = deadline.as_millis().min(u32::MAX as u128 - 1) as u32;
-            if unsafe { WaitForSingleObject(h as _, ms) } != 0 {
+            let waited = unsafe { WaitForSingleObject(h as _, ms) };
+            let exited = std::time::Instant::now();
+            on_exit();
+            if waited != 0 {
                 self.end();
                 return Ok(Usage { timed_out: true, ..Usage::default() });
             }
-            let exited = std::time::Instant::now();
             let wall_ns = exited.duration_since(w0).as_nanos() as u64;
             let mut code = 0u32;
             unsafe { GetExitCodeProcess(h as _, &mut code) };
@@ -379,6 +389,9 @@ impl Owned {
             for (p, _) in &usage.left {
                 super::kill_tree(*p);
             }
+            // What it left was read and ended above, and an exited process is in no snapshot, so
+            // ending its tree again (a snapshot of every process, 5 ms on adais) finds nothing.
+            self.unlist();
             self.end();
             Ok(usage)
         }
@@ -404,6 +417,7 @@ impl Owned {
                 }
             }
             let exited = std::time::Instant::now();
+            on_exit();
             let _ = stop.send(());
             let _ = watchdog.join();
             if timed_out.load(std::sync::atomic::Ordering::SeqCst) {
@@ -447,6 +461,8 @@ impl Owned {
                     super::kill_tree(*p);
                 }
             }
+            // Off the list a stop ends before the reap: its pid may name another process after it.
+            self.unlist();
             let mut status = 0;
             let mut ru: libc::rusage = std::mem::zeroed();
             while libc::wait4(pid as libc::pid_t, &mut status, 0, &mut ru) < 0 {

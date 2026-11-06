@@ -524,8 +524,14 @@ file run on Firefox) is listed, never run, and the rest of the file runs: `--che
 (exit 0 when the rest pass); a comparison lists it `not run: <validator>: <why> · fix: …` with its
 primary refused (`verdict_kind: refused`, the refusal in `primary.refusal`, series `kind: "refused"`),
 undecided, and exits 0 unless `--require-verdict`, which exits 4 on it as on a parity gap; `--plan`
-lists it with no time. When every series is refused, the run is refused (exit 4) with the first
-series' refusal. The engine, the browser's version and headless go into the rerun ledger's
+lists it with no time. Its result keeps the series' `headless`, `engine`, `target_kind`, `journey` and
+`side_name`; the summary leaves out the series' label, which every listing prints beside it. In an
+implementation comparison both sides' targets are checked (the summary names the side) and a refused
+journey is not compared: it counts toward neither side nor the family's Holm denominator, as a gap.
+The parity matrix shows `refused <validator>`, reports `Not run (<validator>)` with the summary and the
+fix (and no pair panels), a heading of "Not measured" only when no series decided, and `track` records
+no point for it. Gaps are not checked. When every series is refused, the run is refused (exit 4) with
+the first series' refusal, its label in front. The engine, the browser's version and headless go into the rerun ledger's
 identity (§14.2) and track's fingerprints (§25): a run in another engine, version or mode is another
 experiment and another series.
 `--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
@@ -1867,10 +1873,15 @@ export default bench({
   `page.addInitScript` through strobe's own connection: every new document of the block's page runs
   the script before its own (Chromium `Page.addScriptToEvaluateOnNewDocument`, Firefox BiDi
   `script.addPreloadScript`; a launch case's page too). A function is sent as its source and called
-  with `arg` as JSON; a string runs as it is (a string with an argument is an error). The document
-  already loaded does not run it. WebKit (WebDriver Classic) has no preload script: there the script
-  runs after the first document's own scripts, the block says so (`InitScript`, info), and a
-  `page.goto` after it is refused (`EngineUnsupported`: the new document's scripts would run first).
+  with `arg` as JSON; a string runs as a function's body in every engine (a string with an argument
+  is an error). The document already loaded does not run it. WebKit (WebDriver Classic) has no
+  preload script: there the script runs after the first document's own scripts and only from
+  `prepare` (in `setup` the first document has loaded: refused), the block says so (`InitScript`,
+  info), and a document loaded after the first (a `goto`, a click that navigates, the page's own
+  navigation: strobe's count of documents grew, read after each driver call and each run) refuses the
+  block (`EngineUnsupported`: that document's own scripts ran first). In a web launch case `prepare`
+  gets the variant's URL as `ctx.url`, and the pages already open when strobe attaches get the launch
+  observer (with the Page domain on) before strobe navigates one.
 - On app and exe targets, `setup`, `run`, `reset` and `teardown` also get `ctx.home` (the launch's
   private home), `ctx.env` (the environment it launched with) and `ctx.exe` (the variant's
   executable), the same as a launch's `before`. A bench drives the copy through the app's own CLI
@@ -4946,6 +4957,13 @@ from about:blank late (its session had the Page domain off), so an `until` alrea
   no time and exits 4 only when `--filter` leaves refused series alone; `ctx.playwright` on Firefox fails
   `EngineUnsupported` with the fix naming `ctx.addInitScript` and `ctx.mock`.
 - vps (Debian 13, Firefox 159.0.1, Chromium, headless): the same 2 of 2 (2 refused) and 4 of 4.
+
+After review (adais): a two-target `--check` (Chromium and Firefox pages) prints the parity matrix with
+`refused  EngineUnsupported` in the Firefox column; `plan --base <firefox target> --head <chromium target>`
+refuses the base side's `main.work` and launch journeys, naming the side; results written with a refused
+series render as `Not run (EngineUnsupported)` with the summary and fix in report.html (no pair panels),
+in the PR block's metrics table and an implementation scoreboard (`Better in 1 of 1 compared journey ·
+not comparable: 1`), and the card footer says `8 pairs` (`1 not run` on an implementation card).
 
 Not checked: a comparison's exit with `--require-verdict` on a refused series (needs a timed bench), WebKit
 (`addInitScript` after the first document's own scripts, the `InitScript` note, a later `page.goto`

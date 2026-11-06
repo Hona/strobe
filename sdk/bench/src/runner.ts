@@ -234,7 +234,9 @@ const context = (): any => ({
 // A function is sent as its source, called with `arg` (JSON), as Playwright's page.addInitScript does.
 function addInitScript(script: string | Function, arg?: unknown) {
   if (typeof script === "string" && arg !== undefined) throw new Error("addInitScript: a string script takes no argument; pass a function")
-  const source = typeof script === "function" ? `(${script.toString()})(${arg === undefined ? "" : JSON.stringify(arg)})` : String(script)
+  // A string runs as a function's body in every engine (Firefox's preload scripts are functions), so its
+  // top-level declarations stay its own wherever it runs.
+  const source = typeof script === "function" ? `(${script.toString()})(${arg === undefined ? "" : JSON.stringify(arg)})` : `(() => {\n${script}\n})()`
   return request("init", { source }).then(() => undefined)
 }
 
@@ -389,6 +391,11 @@ async function cdpSession(endpoint: string, target: string) {
     }
     if (m.method && m.sessionId === sessionId) for (const f of listeners.get(m.method) ?? []) f(m.params)
   }
+  // The browser went away (the block closed it): no reply will come to what still waits.
+  ws.onclose = () => {
+    for (const w of waiting.values()) w.reject(new Error("cdp: the DevTools connection closed"))
+    waiting.clear()
+  }
   const send = (method: string, params: object = {}, session = sessionId) =>
     new Promise<any>((resolve, reject) => {
       const id = ++seq
@@ -454,22 +461,14 @@ async function answer(session: any, event: any) {
   const req = { url: r.url, method: r.method, headers, body, json: () => JSON.parse(body ?? "null") }
   try {
     // The latest pattern answers first, and `undefined` passes to earlier ones, as Playwright's routes do.
-    for (const m of state.mocks.toReversed()) {
-      if (!m.test.test(r.url)) continue
-      const res = await m.handler(req)
-      if (res === undefined) continue
-      const raw = res.body
-      const json = raw !== undefined && typeof raw !== "string" && !(raw instanceof Uint8Array)
-      const bytes = raw === undefined ? new Uint8Array() : raw instanceof Uint8Array ? raw : new TextEncoder().encode(json ? JSON.stringify(raw) : raw)
-      const out = { ...(json ? { "content-type": "application/json" } : {}), ...res.headers }
-      return await session.send("Fetch.fulfillRequest", {
-        requestId,
-        responseCode: res.status ?? 200,
-        responseHeaders: Object.entries(out).map(([name, value]) => ({ name, value: String(value) })),
-        body: Buffer.from(bytes).toString("base64"),
-      })
-    }
-    await session.send("Fetch.continueRequest", { requestId })
+    const res = await respond(req)
+    if (!res) return await session.send("Fetch.continueRequest", { requestId })
+    await session.send("Fetch.fulfillRequest", {
+      requestId,
+      responseCode: res.status,
+      responseHeaders: res.headers.map(([name, value]) => ({ name, value })),
+      body: Buffer.from(res.body).toString("base64"),
+    })
   } catch (error) {
     console.error(`mock ${r.method} ${r.url}: ${error instanceof Error ? error.stack : error}`)
     await session.send("Fetch.failRequest", { requestId, errorReason: "Failed" }).catch(() => {})

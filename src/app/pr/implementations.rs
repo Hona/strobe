@@ -118,9 +118,9 @@ fn same_line(s: &Value) -> String {
     format!(" Same {} after every run.", join_and(&sel))
 }
 
-/// A gap series' reason: `no `@find` in Rewrite`.
+/// A gap series' reason: `no `@find` in Rewrite`; a series refused before it ran, its validator and why.
 fn gap_text(d: &Doc, s: &Value) -> String {
-    let text = cell(&family::gap_reason(d.r, s));
+    let text = cell(&family::not_compared_reason(d.r, s));
     // The missing step as code: `no `@find` in …`.
     match s["gap"]["missing"].as_str() {
         Some(missing) => text.replacen(&cell(missing), &code(missing), 1),
@@ -130,7 +130,7 @@ fn gap_text(d: &Doc, s: &Value) -> String {
 
 /// How many pairs the compared journeys ran: `11 alternating pairs`, `11–12 …`.
 fn pairs_span(series: &[&Value]) -> String {
-    let ns: Vec<u64> = series.iter().filter(|s| !family::gap(s)).filter_map(|s| s["pairs"].as_u64()).filter(|n| *n > 0).collect();
+    let ns: Vec<u64> = series.iter().filter(|s| !family::not_compared(s)).filter_map(|s| s["pairs"].as_u64()).filter(|n| *n > 0).collect();
     match (ns.iter().min(), ns.iter().max()) {
         (Some(a), Some(b)) if a == b => format!("{a} alternating pair{}", if *a == 1 { "" } else { "s" }),
         (Some(a), Some(b)) => format!("{a}–{b} alternating pairs"),
@@ -275,7 +275,7 @@ impl<'a> Doc<'a> {
     fn implementation_regressions(&self, board: &family::Board) -> Vec<(&'a Value, &'a Value, bool)> {
         let mut out = Vec::new();
         for (i, s) in self.series.iter().copied().enumerate() {
-            if s["not_run"] == true || family::gap(s) {
+            if s["not_run"] == true || family::not_compared(s) {
                 continue;
             }
             if self.primary_out(s) == Out::Worse {
@@ -290,7 +290,7 @@ impl<'a> Doc<'a> {
     /// leaves out CPU time, which the fairness line already scopes.
     fn care_notes(&self, visible: bool) -> Vec<(String, String)> {
         let mut care: Vec<(String, String)> = Vec::new();
-        for s in self.series.iter().filter(|s| !family::gap(s) && s["not_run"] != true) {
+        for s in self.series.iter().filter(|s| !family::not_compared(s) && s["not_run"] != true) {
             for c in if visible { vec![&s["primary"]] } else { tested(s) } {
                 let m = c["metric"].as_str().unwrap_or("");
                 if let Some(note) = c["care_note"].as_str()
@@ -306,7 +306,7 @@ impl<'a> Doc<'a> {
 
     /// The heading without a counted win or a regression of a main metric.
     fn calm_implementations(&self, base: &str) -> String {
-        let outs: Vec<Out> = self.series.iter().filter(|s| !family::gap(s)).map(|s| self.primary_out(s)).collect();
+        let outs: Vec<Out> = self.series.iter().filter(|s| !family::not_compared(s)).map(|s| self.primary_out(s)).collect();
         if outs.is_empty() {
             return "Not compared: every journey is a parity gap".into();
         }
@@ -332,7 +332,7 @@ impl<'a> Doc<'a> {
         let (head, rest) = board.counts();
         let head = match fam.all_no_worse {
             Some(true) => {
-                let margin = self.series.iter().find(|s| !family::gap(s)).map(|s| margin_text(&s["primary"])).unwrap_or_default();
+                let margin = self.series.iter().find(|s| !family::not_compared(s)).map(|s| margin_text(&s["primary"])).unwrap_or_default();
                 format!("**No worse than {} ({margin}) in all {} compared {journeys}**", cell(base), fam.compared)
             }
             _ => format!("**{head} compared {journeys}**"),
@@ -340,7 +340,7 @@ impl<'a> Doc<'a> {
         let mut parts = vec![head];
         parts.extend(rest);
         if fam.gaps > 0 {
-            let list: Vec<String> = self.series.iter().filter(|s| family::gap(s)).map(|s| format!("{}: {}", cell(&self.title(s)), gap_text(self, s))).collect();
+            let list: Vec<String> = self.series.iter().filter(|s| family::not_compared(s)).map(|s| format!("{}: {}", cell(&self.title(s)), gap_text(self, s))).collect();
             parts.push(format!("not comparable: {} ({})", fam.gaps, list.join("; ")));
         }
         let correction = board.correction();
@@ -353,7 +353,7 @@ impl<'a> Doc<'a> {
 
     /// One journey's proof line; `alone`: better or worse on its own, not across the family.
     fn journey_line(&self, s: &Value, alone: bool, compared: usize) -> String {
-        if family::gap(s) {
+        if family::not_compared(s) {
             return format!("not compared: {}.", gap_text(self, s));
         }
         let c = &s["primary"];
@@ -389,8 +389,8 @@ impl<'a> Doc<'a> {
         let mut t = format!("#### Metrics\n\n| Journey / metric | {} | {} | Change | Likely range | Verdict |\n|:---|---:|---:|---:|---:|:---|\n", cell(&bn), cell(&hn));
         let (mut conf_main, mut conf_rest) = (String::new(), String::new());
         for (si, s) in self.series.iter().enumerate() {
-            if family::gap(s) || s["not_run"] == true {
-                let why = if family::gap(s) { format!("not compared <sub>{}</sub>", gap_text(self, s)) } else { "not run".into() };
+            if family::not_compared(s) || s["not_run"] == true {
+                let why = if family::not_compared(s) { format!("not compared <sub>{}</sub>", gap_text(self, s)) } else { "not run".into() };
                 t += &format!("{}| {} | | | | | {why} |\n", self.series_cell(s, 0), cell(&noun(s["primary"]["metric"].as_str().unwrap_or(""))));
                 continue;
             }

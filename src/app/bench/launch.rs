@@ -111,7 +111,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let env = app.as_ref().zip(prepared.as_ref()).map(|(a, h)| h.environment(a));
     let root = v.root.as_ref().map(|r| r.display().to_string());
     let exe = app.as_ref().map(|a| a.exe.display().to_string());
-    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root, "home": home, "env": env, "exe": exe }), t, &no_page)?;
+    // A page's `prepare` mocks its API under the URL strobe opens (`ctx.url`), as in a run case.
+    let url = if web { variant_url(v, &target)? } else { String::new() };
+    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": root, "home": home, "env": env, "exe": exe }), t, &no_page)?;
     if spec["before"] == true {
         ctx.runner
             .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
@@ -668,6 +670,19 @@ struct Watch {
     pages: Arc<Mutex<Vec<(String, String)>>>,
 }
 
+/// A page's observer (with the Page domain on: without it, the script missed the document an already
+/// open page navigated to, and the observer went in late) and, for attribution, its CPU profiler.
+fn arm(cdp: &Cdp, session: &str, observer: &str, profile: bool) {
+    let send = |method: &str, params: Value| cdp.send_timeout(method, params, Some(session), Duration::from_secs(10));
+    let _ = send("Page.enable", json!({}));
+    let _ = send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": observer }));
+    if profile {
+        let _ = send("Profiler.enable", json!({}));
+        let _ = send("Profiler.setSamplingInterval", json!({ "interval": probe::cpu::INTERVAL_US }));
+        let _ = send("Profiler.start", json!({}));
+    }
+}
+
 impl Watch {
     fn start(cdp: &Arc<Cdp>, observer: String, profile: bool) -> Result<Watch> {
         let events = cdp.events();
@@ -676,10 +691,16 @@ impl Watch {
         let late = Arc::new(AtomicBool::new(false));
         let pages = Arc::new(Mutex::new(Vec::new()));
         cdp.send("Target.setAutoAttach", json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }), None)?;
-        // Pages that already ran when strobe connected (a browser opens its first page at startup).
+        // Pages that already ran when strobe connected (a browser opens its first page at startup): armed
+        // here, before strobe navigates one, not when the thread below gets to their attach event.
+        let mut armed = std::collections::BTreeSet::new();
         let running = cdp.send("Target.getTargets", json!({}), None)?;
         for t in running["targetInfos"].as_array().into_iter().flatten().filter(|t| is_page(t)) {
-            let _ = cdp.send("Target.attachToTarget", json!({ "targetId": t["targetId"], "flatten": true }), None);
+            let attached = cdp.send("Target.attachToTarget", json!({ "targetId": t["targetId"], "flatten": true }), None);
+            if let Some(session) = attached.ok().as_ref().and_then(|a| a["sessionId"].as_str()) {
+                arm(cdp, session, &observer, profile);
+                armed.insert(t["targetId"].as_str().unwrap_or("").to_string());
+            }
         }
         let watch = Watch { cdp: cdp.clone(), found, stop: stop.clone(), late: late.clone(), pages: pages.clone() };
         let (cdp, stop2, late2, pages2) = (cdp.clone(), stop, late, pages);
@@ -697,14 +718,8 @@ impl Watch {
                 let send = |method: &str, params: Value| cdp.send_timeout(method, params, Some(&session), Duration::from_secs(10));
                 let target = info["targetId"].as_str().unwrap_or("").to_string();
                 if is_page(info) && seen.insert(target.clone()) {
-                    // Without the Page domain on, a session's init script missed the document a page that
-                    // was already open navigated to (about:blank to the launch's URL): the observer went in late.
-                    let _ = send("Page.enable", json!({}));
-                    let _ = send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": observer }));
-                    if profile {
-                        let _ = send("Profiler.enable", json!({}));
-                        let _ = send("Profiler.setSamplingInterval", json!({ "interval": probe::cpu::INTERVAL_US }));
-                        let _ = send("Profiler.start", json!({}));
+                    if !armed.contains(&target) {
+                        arm(&cdp, &session, &observer, profile);
                     }
                     pages2.lock().unwrap().push((session.clone(), target.clone()));
                     let (cdp, tx, stop, late, observer) = (cdp.clone(), tx.clone(), stop2.clone(), late2.clone(), observer.clone());

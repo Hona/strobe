@@ -20,6 +20,36 @@ pub fn gap(s: &Value) -> bool {
     s["kind"] == "gap" || s["gap"].is_object() || s["primary"]["refusal"]["validator"] == "ParityGap"
 }
 
+/// A series that is not one of the compared journeys: a gap, or one refused before it ran (an engine
+/// without its primary on a side, `kind: "refused"`), which counts toward neither side.
+pub fn not_compared(s: &Value) -> bool {
+    gap(s) || s["kind"] == "refused"
+}
+
+/// Why a series was not compared: a gap's reason, or a refused series' `not run (<validator>): <why>`.
+pub fn not_compared_reason(r: &Value, s: &Value) -> String {
+    if s["kind"] == "refused" {
+        let x = &s["primary"]["refusal"];
+        return format!("not run ({}): {}", x["validator"].as_str().unwrap_or(""), x["summary"].as_str().unwrap_or(""));
+    }
+    gap_reason(r, s)
+}
+
+/// The not-compared journeys in words: `1 gap`, `2 not run`, both, or none.
+pub fn not_compared_counts(r: &Value) -> Vec<String> {
+    let series = r["series"].as_array().map(Vec::as_slice).unwrap_or_default();
+    let refused = series.iter().filter(|s| s["kind"] == "refused").count();
+    let gaps = series.iter().filter(|s| s["kind"] != "refused" && gap(s)).count();
+    let mut out = Vec::new();
+    if gaps > 0 {
+        out.push(format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" }));
+    }
+    if refused > 0 {
+        out.push(format!("{refused} not run"));
+    }
+    out
+}
+
 /// Why a gap series was not compared, in a few words: `no @find in <name>` when the side lacked a
 /// named step, else `<name> cannot run it: <reason>`.
 pub fn gap_reason(r: &Value, s: &Value) -> String {
@@ -105,10 +135,10 @@ impl Board {
     pub fn of(r: &Value) -> Board {
         let series: Vec<&Value> = r["series"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
         let kinds: Vec<VerdictKind> = series.iter().map(|s| if s["not_run"] == true { VerdictKind::Stopped } else { stats::kind_of(&s["primary"]) }).collect();
-        let p: Vec<f64> = series.iter().map(|s| if gap(s) || s["not_run"] == true { f64::NAN } else { p_repeated(r, s) }).collect();
-        let js: Vec<Journey> = series.iter().enumerate().map(|(i, s)| Journey { kind: kinds[i], p: if p[i].is_finite() { p[i] } else { 1.0 }, gap: gap(s) }).collect();
+        let p: Vec<f64> = series.iter().map(|s| if not_compared(s) || s["not_run"] == true { f64::NAN } else { p_repeated(r, s) }).collect();
+        let js: Vec<Journey> = series.iter().enumerate().map(|(i, s)| Journey { kind: kinds[i], p: if p[i].is_finite() { p[i] } else { 1.0 }, gap: not_compared(s) }).collect();
         // Non-inferiority: every compared journey's primary was tested against a margin.
-        let noworse = series.iter().any(|s| !gap(s)) && series.iter().filter(|s| !gap(s)).all(|s| s["primary"]["noworse"].is_number());
+        let noworse = series.iter().any(|s| !not_compared(s)) && series.iter().filter(|s| !not_compared(s)).all(|s| s["primary"]["noworse"].is_number());
         let family = stats::family(&js, noworse);
         let biggest = |of: VerdictKind| {
             (0..series.len()).filter(|&i| family.holm[i] && kinds[i] == of).fold(None, |best: Option<usize>, i| match best {

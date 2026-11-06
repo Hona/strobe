@@ -59,7 +59,7 @@ async function visible(name: string) {
   const viewed = (await $`npm view ${`${name}@${version}`} version --prefer-online`.quiet().nothrow()).stdout.toString().trim() === version
   if (!viewed) return false
   const url = `https://registry.npmjs.org/${name.replace("/", "%2f")}`
-  const doc = await fetch(url, { headers: { accept: "application/vnd.npm.install-v1+json" } }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
+  const doc = await fetch(url, { headers: { accept: "application/vnd.npm.install-v1+json" }, cache: "no-store" }).then((r) => (r.ok ? r.json() : null)).catch(() => null)
   return !!doc?.versions?.[version]
 }
 
@@ -84,7 +84,7 @@ for (const [i, stage] of stages.entries()) {
   if (values.publish && i > 0) await waitVisible(stages[i - 1])
   for (const dir of stage) {
     const { name } = await Bun.file(join(root, dir, "package.json")).json()
-    const published = (await $`npm view ${`${name}@${version}`} version`.quiet().nothrow()).stdout.toString().trim() === version
+    const published = (await $`npm view ${`${name}@${version}`} version --prefer-online`.quiet().nothrow()).stdout.toString().trim() === version
     if (published) {
       console.log(`${name}@${version}: already on npm`)
       continue

@@ -238,7 +238,8 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
     let mut text = String::new();
     let mut points = Vec::new();
     let warns: Vec<Value> = r["warnings"].as_array().into_iter().flatten().map(|w| json!(format!("{}: {}", w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or("")))).collect();
-    for s in r["series"].as_array().into_iter().flatten() {
+    // A series refused before it ran (an engine without its primary) is no point of the history.
+    for s in r["series"].as_array().into_iter().flatten().filter(|s| s["kind"] != "refused") {
         let metric = s["primary"]["metric"].as_str().unwrap_or("").to_string();
         let label = s["label"].as_str().unwrap_or("").to_string();
         let blocks_v: Vec<&Value> = s["blocks"].as_array().into_iter().flatten().collect();

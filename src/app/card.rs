@@ -496,7 +496,8 @@ fn build(r: &Value) -> Card {
         1 | 2 => titles.join(" · "),
         _ => file.rsplit('/').next().unwrap_or("").to_string(),
     };
-    let ns: Vec<u64> = shown.iter().filter_map(|s| s["pairs"].as_u64()).collect();
+    // Series that ran pairs: one refused before it ran, or a gap, has none.
+    let ns: Vec<u64> = shown.iter().filter_map(|s| s["pairs"].as_u64()).filter(|n| *n > 0).collect();
     let pairs_text = match (ns.iter().min(), ns.iter().max()) {
         (Some(a), Some(b)) if a == b => format!("{a} pair{}", if *a == 1 { "" } else { "s" }),
         (Some(a), Some(b)) => format!("{a}–{b} pairs"),

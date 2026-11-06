@@ -364,11 +364,13 @@ impl<'a> Doc<'a> {
             let need = outs.iter().filter_map(|(_, s)| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000)).max();
             return need.map(|n| format!("Not decided yet: needs ~{n} pairs")).unwrap_or_else(|| "Not decided yet".into());
         }
-        if outs.iter().any(|(o, _)| *o == Out::Refused) {
-            return "Not measured".into();
-        }
+        // A refused series (one refused before it ran, an engine without its primary) says nothing about the
+        // series that decided.
         if outs.iter().any(|(o, _)| matches!(o, Out::Same | Out::NoWorse | Out::NoWorseSlower)) {
             return if self.aa { "Identical builds matched".into() } else { "No measurable change".into() };
+        }
+        if outs.iter().any(|(o, _)| *o == Out::Refused) {
+            return "Not measured".into();
         }
         "No answer yet".into()
     }
@@ -483,6 +485,20 @@ impl<'a> Doc<'a> {
                 t += &format!("{}| {} | | | | | {} |\n", self.series_cell(s, 0), if s["kind"] == "leak" { "Memory growth per run" } else { "Not run" }, cell(verdict(&s["primary"])));
                 continue;
             }
+            // Refused before it ran (an engine without its primary): the validator, why, and the primary to use.
+            if s["kind"] == "refused" {
+                let r = &s["primary"]["refusal"];
+                let fix = r["fix"].as_str().map(|f| format!("; fix: {f}")).unwrap_or_default();
+                t += &format!(
+                    "{}| {} <sub>main</sub> | | | | | Not run ({}): {}{} |\n",
+                    self.series_cell(s, 0),
+                    cell(&noun(s["primary"]["metric"].as_str().unwrap_or(""))),
+                    r["validator"].as_str().unwrap_or(""),
+                    cell(r["summary"].as_str().unwrap_or("")),
+                    cell(&fix)
+                );
+                continue;
+            }
             for (i, c) in tested(s).into_iter().enumerate() {
                 let m = c["metric"].as_str().unwrap_or("");
                 let o = if i == 0 { self.primary_out(s) } else { outcome(c, self.aa) };
@@ -516,7 +532,7 @@ impl<'a> Doc<'a> {
         let (mut any, mut zeros, mut held) = (false, Vec::<String>::new(), Vec::<(String, String)>::new());
         let mut odd: Vec<(&Value, &Value)> = Vec::new();
         for s in &self.series {
-            if s["not_run"] == true || s["kind"] == "leak" {
+            if s["not_run"] == true || s["kind"] == "leak" || s["kind"] == "refused" {
                 continue;
             }
             let (rows, z) = context(s);

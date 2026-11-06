@@ -121,18 +121,18 @@ pub(super) fn build(r: &Value) -> Forest {
     let fam = &board.family;
     let hero = board.hero;
     let multi = series.len() > 1;
-    let metrics: Vec<&str> = series.iter().filter(|s| !family::gap(s)).map(|s| metric(&s["primary"])).collect();
+    let metrics: Vec<&str> = series.iter().filter(|s| !family::not_compared(s)).map(|s| metric(&s["primary"])).collect();
     let mixed = metrics.windows(2).any(|w| w[0] != w[1]);
     let mut rows: Vec<Row> = Vec::new();
     for (i, s) in series.iter().enumerate() {
         let c = &s["primary"];
         let name = title(s, &[]);
-        let gap = family::gap(s);
+        let gap = family::not_compared(s);
         let o = primary_out(s, false);
         // Green and red only for a verdict confirmed across the family; one on its own stays grey.
         let change = if c["relative"] == true { pr::factor_or_pct(f(&c["estimate"])) } else { tile(s, c, String::new()).delta };
         let (tone, value) = if gap {
-            (Tone::Plain, "gap".to_string())
+            (Tone::Plain, if s["kind"] == "refused" { "not run" } else { "gap" }.to_string())
         } else {
             match o {
                 Out::Better | Out::Worse if board.alone(i) => (Tone::Plain, change),
@@ -152,7 +152,9 @@ pub(super) fn build(r: &Value) -> Forest {
                 (a.min(b), e, a.max(b))
             })
             .filter(|(a, b, d)| a.is_finite() && b.is_finite() && d.is_finite());
-        let note = if gap {
+        let note = if s["kind"] == "refused" {
+            format!("not run: {}", s["primary"]["refusal"]["validator"].as_str().unwrap_or(""))
+        } else if gap {
             let g = &s["gap"];
             match (g["missing"].as_str(), g["reason"].as_str().filter(|x| !x.is_empty())) {
                 (Some(missing), _) => format!("not comparable: no {missing}"),
@@ -206,9 +208,9 @@ pub(super) fn build(r: &Value) -> Forest {
     let lead = hero.or(board.worst).map(|i| lead_of(r, series[i], multi));
     let calm = if lead.is_some() {
         (String::new(), String::new())
-    } else if series.iter().all(|s| family::gap(s)) {
-        ("Not comparable".into(), series.first().map(|s| format!("{}: {}", title(s, &[]), family::gap_reason(r, s))).unwrap_or_default())
-    } else if series.iter().filter(|s| !family::gap(s)).all(|s| primary_out(s, false) == Out::Same) {
+    } else if series.iter().all(|s| family::not_compared(s)) {
+        ("Not comparable".into(), series.first().map(|s| format!("{}: {}", title(s, &[]), family::not_compared_reason(r, s))).unwrap_or_default())
+    } else if series.iter().filter(|s| !family::not_compared(s)).all(|s| primary_out(s, false) == Out::Same) {
         (format!("No measurable difference from {cb}"), format!("every compared journey within its bound in {}", pr_pairs(&series)))
     } else {
         // Only a count past the pairs already run: "~6 pairs" after 8 reads as a contradiction.
@@ -219,15 +221,13 @@ pub(super) fn build(r: &Value) -> Forest {
     let calm_pairs = if lead.is_some() {
         None
     } else {
-        let compared: Vec<&&Value> = series.iter().filter(|s| !family::gap(s) && s["not_run"] != true).collect();
+        let compared: Vec<&&Value> = series.iter().filter(|s| !family::not_compared(s) && s["not_run"] != true).collect();
         compared.iter().find(|s| primary_out(s, false) == Out::Unclear).or(compared.first()).map(|s| lead_of(r, s, multi)).filter(|l| !l.tile.dots.is_empty())
     };
     let (head, rest) = board.counts();
     let mut score_parts = vec![head];
     score_parts.extend(rest);
-    if fam.gaps > 0 {
-        score_parts.push(format!("{} gap{}", fam.gaps, if fam.gaps == 1 { "" } else { "s" }));
-    }
+    score_parts.extend(family::not_compared_counts(r));
     let score2 = capitalize(&board.correction());
     let (f1, f2) = pr::fairness(r, &series, (&cb, &ch));
     let foot = (super::super::fmt::fields(f1), super::super::fmt::fields(f2));
@@ -240,7 +240,7 @@ pub(super) fn build(r: &Value) -> Forest {
     };
     let alt = format!("{lead_alt}; {}.", lower_first(&score_parts.join(", ")));
     // The equivalence bound the rows share: the first compared journey's (±2% by default).
-    let band = series.iter().find(|s| !family::gap(s) && s["primary"]["relative"] == true).and_then(|s| s["primary"]["bound"].as_f64()).filter(|b| b.is_finite() && *b >= 0.0).unwrap_or(0.02);
+    let band = series.iter().find(|s| !family::not_compared(s) && s["primary"]["relative"] == true).and_then(|s| s["primary"]["bound"].as_f64()).filter(|b| b.is_finite() && *b >= 0.0).unwrap_or(0.02);
     let badges: Vec<(String, String, String, Tone)> = series.iter().map(|s| badge_of(s, false)).collect();
     let sb_value = match fam.all_no_worse {
         Some(true) => format!("no worse in all {}", fam.compared),
@@ -249,8 +249,8 @@ pub(super) fn build(r: &Value) -> Forest {
             if fam.worse > 0 {
                 v += &format!(" · worse in {}", fam.worse);
             }
-            if fam.gaps > 0 {
-                v += &format!(" · {} gap{}", fam.gaps, if fam.gaps == 1 { "" } else { "s" });
+            for part in family::not_compared_counts(r) {
+                v += &format!(" · {part}");
             }
             v
         }

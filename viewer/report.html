@@ -2055,7 +2055,7 @@ function renderExperiment(r) {
   // Two implementations share no code: no function diffs, flame diffs or heap diffs, only each side
   // on its own (SPEC §11.2).
   if (impl) {
-    const gap = isGap(s);
+    const gap = isGap(s) || isUpfront(s);
     const impactI = gap ? null : buildImpactModel(r, s);
     appendKids(shell, [
       renderImplPanel(r, baseVar, headVar),
@@ -2070,6 +2070,11 @@ function renderExperiment(r) {
       gap ? null : renderPlanVsActual(r, s),
       gap ? null : renderRigFooter(r, s, impactI),
     ]);
+    return;
+  }
+
+  if (isUpfront(s)) {
+    appendKids(shell, [seriesList.length > 1 ? renderScorecard(seriesList, aa) : null, renderUpfrontRefusal(s)]);
     return;
   }
 
@@ -2147,6 +2152,13 @@ function renderScorecard(seriesList, aa) {
       const m = c.metric || "";
       const u = unitOf(m);
       const cl = classify(c, m, aa);
+      if (isUpfront(sr)) {
+        return h("button", { type: "button", class: "sc-item", "aria-selected": String(i === state.series), onclick: () => selectSeries(i) },
+          h("div", { class: "sc-top" }, h("span", { class: "sc-name" }, capFirst(sr.case || sr.label || `Case ${i + 1}`)), h("span", { class: "sc-dot neutral" })),
+          h("div", { class: "sc-verdict neutral" }, `Not run (${c.refusal?.validator || "refused"})`),
+          h("div", { class: "sc-sub" }, labelOf(m))
+        );
+      }
       const summary = shortSeriesOutcome(c, m, u, cl, aa);
       return h("button", {
         type: "button",
@@ -2239,7 +2251,7 @@ function buildHeroProse(r, s, c, cl, aa) {
   const workComp = allComparisons(s).find((x) => x.c.metric === "main.work")?.c;
 
   if (cl.kind === "refused") {
-    return h("p", { class: "hero-prose" }, `Measurement refused (${String(c.verdict).replace(/^refused:\s*/, "")}).`);
+    return h("p", { class: "hero-prose" }, `Measurement refused (${String(c.verdict).replace(/^refused(\s*\([^)]*\))?:\s*/, "")}).`);
   }
   if (aa && cl.kind === "aa-fp") {
     return h("p", { class: "hero-prose" },
@@ -2328,6 +2340,17 @@ function sideWord(role, cap) {
   return cap ? capFirst(w) : w;
 }
 const isGap = (s) => !!s?.gap || s?.primary?.refusal?.validator === "ParityGap";
+// Refused before it ran (an engine without its primary): no pairs, nothing compared.
+const isUpfront = (s) => s?.kind === "refused";
+// A refused series' panel: the validator, what it said, and the fix (the closest primary to use).
+function renderUpfrontRefusal(s) {
+  const ref = s.primary?.refusal || {};
+  return h("section", { class: "card-surface card-bd" },
+    h("h2", { class: "sec-title" }, `${capFirst(s.case || s.label)}: Not run (${ref.validator || "refused"})`),
+    h("p", { class: "sec-sub" }, ref.summary || ""),
+    ref.fix ? h("p", { class: "sec-sub" }, `Fix: ${ref.fix}`) : null
+  );
+}
 
 // The scoreboard as pills (one per journey, in the bench file's order), the family's count, and what
 // was held the same for both: window, GPU, input, fixture, and each side's process set.
@@ -2338,14 +2361,15 @@ function renderImplPanel(r, baseVar, headVar) {
     const c = s.primary || {};
     const m = c.metric || "";
     const cl = classify(c, m, false);
-    const gap = isGap(s);
+    const up = isUpfront(s);
+    const gap = isGap(s) || up;
     // Green and red only for a verdict confirmed across the family (`holm_decided`).
     const counted = c.holm_decided === true;
     const tone = gap || !counted ? "" : cl.tone === "loss" ? "loss" : cl.tone === "win" ? "win" : "";
     // An increase of 2× or more reads as a factor, as in the PR block and card.
     const change = c.relative !== false && finite(c.estimate) && c.estimate >= 1 ? `${(1 + c.estimate).toFixed(1 + c.estimate >= 10 ? 0 : 1)}×` : fmtDelta(c.estimate, c, unitOf(m));
-    const what = gap ? (s.gap?.missing ? `gap: no ${s.gap.missing}` : "gap") : cl.kind === "same" ? "same" : cl.tone === "neutral" ? "unclear" : change;
-    return h("button", { type: "button", class: `impl-pill ${tone}`, title: gap ? s.gap?.reason || "" : `${labelOf(m)}${finite(c.p_repeated) ? ` · repeated p ${fmtP(c.p_repeated)}` : ""}${(cl.tone === "win" || cl.tone === "loss") && !counted ? ` · ${cl.tone === "win" ? "better" : "worse"} on its own, not after Holm` : ""}`, onclick: () => selectSeries(i) },
+    const what = up ? `not run (${c.refusal?.validator || "refused"})` : gap ? (s.gap?.missing ? `gap: no ${s.gap.missing}` : "gap") : cl.kind === "same" ? "same" : cl.tone === "neutral" ? "unclear" : change;
+    return h("button", { type: "button", class: `impl-pill ${tone}`, title: up ? c.refusal?.summary || "" : gap ? s.gap?.reason || "" : `${labelOf(m)}${finite(c.p_repeated) ? ` · repeated p ${fmtP(c.p_repeated)}` : ""}${(cl.tone === "win" || cl.tone === "loss") && !counted ? ` · ${cl.tone === "win" ? "better" : "worse"} on its own, not after Holm` : ""}`, onclick: () => selectSeries(i) },
       `${capFirst(s.case || s.label)} · ${what}${s.headline ? " · headline" : ""}`);
   });
   const parts = [];
@@ -2416,6 +2440,7 @@ function renderImplPanel(r, baseVar, headVar) {
 function renderImplSeries(r, s, baseVar, headVar) {
   const bn = sideName(baseVar, "base"), hn = sideName(headVar, "head");
   const out = [];
+  if (isUpfront(s)) return [renderUpfrontRefusal(s)];
   if (isGap(s)) {
     out.push(h("section", { class: "card-surface card-bd" },
       h("h2", { class: "sec-title" }, `${capFirst(s.case || s.label)}: not compared`),

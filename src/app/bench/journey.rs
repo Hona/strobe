@@ -359,6 +359,7 @@ pub(super) fn matrix(series: &mut [Value]) -> Option<String> {
         for (t, _) in &targets {
             let cell = match idx.iter().map(|&i| &series[i]).find(|s| s["target"].as_str() == Some(t.as_str())) {
                 Some(s) if s["kind"] == "gap" => format!("gap  {}", s["gap"]["missing"].as_str().map(|m| format!("no {m}")).unwrap_or_else(|| s["gap"]["reason"].as_str().unwrap_or("").to_string())),
+                Some(s) if s["kind"] == "refused" => format!("refused  {}", s["primary"]["refusal"]["validator"].as_str().unwrap_or("")),
                 Some(s) if s["passed"] == true => {
                     let p = s["primary"]["metric"].as_str().unwrap_or("");
                     format!("ok  {p} {}", s["values"][p].as_f64().map_or("—".into(), |v| fmt::value(v, model::metric(p).map_or("", |d| d.unit))))

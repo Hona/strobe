@@ -98,7 +98,7 @@ fn start(p: &crate::target::firefox::Page) -> Result<Relay> {
             let headers: serde_json::Map<String, Value> = q["request"]["headers"].as_array().into_iter().flatten().filter_map(|h| Some((h["name"].as_str()?.to_lowercase(), h["value"]["value"].clone()))).collect();
             let mut ask = json!({ "id": id, "url": url, "method": q["request"]["method"], "headers": headers });
             // A request with a body (`bodySize` > 0) gets it as base64, read from the collector.
-            if let Some(c) = collector.as_deref().filter(|_| q["request"]["bodySize"].as_u64().is_some_and(|n| n > 0)) {
+            if let Some(c) = collector.as_deref().filter(|_| q["request"]["bodySize"].as_u64().is_some_and(|n| n > 0 && n <= BODY_MAX)) {
                 let data = bidi.send_timeout("network.getData", json!({ "dataType": "request", "request": id, "collector": c, "disown": true }), Duration::from_secs(5));
                 if let Ok(d) = data {
                     let bytes = &d["bytes"];
@@ -147,7 +147,9 @@ fn ask_runner(listener: &TcpListener, conn: &mut Option<(TcpStream, BufReader<Tc
             let mut first = String::new();
             let said = reader.by_ref().take(256).read_line(&mut first).is_ok() && first.trim() == token;
             if said {
+                // On the reader's own handle too: on Windows a cloned socket kept the 2 s timeout.
                 stream.set_read_timeout(Some(Duration::from_secs(60))).ok();
+                reader.get_ref().set_read_timeout(Some(Duration::from_secs(60))).ok();
                 break Some((stream, reader));
             }
         };
@@ -155,7 +157,10 @@ fn ask_runner(listener: &TcpListener, conn: &mut Option<(TcpStream, BufReader<Tc
     let (stream, reader) = conn.as_mut()?;
     let ok = writeln!(stream, "{ask}").is_ok();
     let mut line = String::new();
-    if !ok || reader.read_line(&mut line).ok()? == 0 {
+    // One line, at most 64 MiB (a body as base64). A failed, empty or cut-off answer leaves the
+    // connection mid-line: the next request starts on a new one.
+    let read = if ok { reader.by_ref().take(64 << 20).read_line(&mut line).ok() } else { None };
+    if read.is_none_or(|n| n == 0) || !line.ends_with('\n') {
         *conn = None;
         return None;
     }

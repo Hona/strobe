@@ -205,7 +205,7 @@ export interface PrepareContext<P> {
 
 /**
  * Runs `script` in every new document of the block's page before the page's own scripts (Playwright's
- * `page.addInitScript`, in any engine): a function is called with `arg` (JSON), a string is evaluated as is. Not in
+ * `page.addInitScript`, in any engine): a function is called with `arg` (JSON), a string runs as a function's body. Not in
  * the document already loaded. WebKit has no preload: there the script runs after the first document's own scripts,
  * and a block that loads another document is refused (EngineUnsupported).
  */

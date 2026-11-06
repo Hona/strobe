@@ -601,33 +601,52 @@ pub fn release_home(home: &Path) {
     let_go(home);
 }
 
-/// While alive, a stop of strobe (Ctrl-C, SIGINT, SIGTERM) ends what runs from `home`, removes it when
-/// `prepare_home` made it now, and exits 130, for a command with no stop points of its own (`look`):
-/// it leaves nothing running for the next strobe to reap. Dropped, it watches no more.
-pub struct EndOnStop(std::sync::Arc<std::sync::atomic::AtomicBool>);
+/// While alive, a stop of strobe (Ctrl-C, SIGINT, SIGTERM) ends every launch it owns (each one's tree
+/// and group or job: `spawn::end_launches`), then what still runs from `home` (stamped with it),
+/// removes that home when `prepare_home` made it now, and exits 130: for a command with no stop
+/// points of its own (`look`), which leaves nothing running for the next strobe to reap. A browser's
+/// profile goes with the next strobe's `reap_dead_owners`. Dropped (before the command closes what
+/// it launched), the watcher has ended: a stop that came first finished its work and exited.
+pub struct EndOnStop {
+    done: std::sync::Arc<std::sync::Mutex<bool>>,
+    watcher: Option<std::thread::JoinHandle<()>>,
+}
 
-pub fn end_on_stop(home: &Home) -> EndOnStop {
+pub fn end_on_stop(home: Option<&Home>) -> EndOnStop {
     use std::sync::atomic::Ordering;
-    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let (flag, watching, dir, fresh) = (host::ctrl_c(), done.clone(), home.dir.clone(), home.fresh);
-    std::thread::spawn(move || {
-        while !watching.load(Ordering::SeqCst) {
-            if flag.load(Ordering::SeqCst) {
-                release_home(&dir);
-                if fresh {
-                    remove_home(&dir);
+    let done = std::sync::Arc::new(std::sync::Mutex::new(false));
+    let (flag, state, home) = (host::ctrl_c(), done.clone(), home.map(|h| (h.dir.clone(), h.fresh)));
+    let watcher = std::thread::spawn(move || {
+        loop {
+            {
+                let done = state.lock().unwrap_or_else(|e| e.into_inner());
+                if *done {
+                    return;
                 }
-                std::process::exit(130);
+                // Under the lock: the command cannot start closing meanwhile.
+                if flag.load(Ordering::SeqCst) {
+                    host::spawn::end_launches();
+                    if let Some((dir, fresh)) = &home {
+                        release_home(dir);
+                        if *fresh {
+                            remove_home(dir);
+                        }
+                    }
+                    std::process::exit(130);
+                }
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
     });
-    EndOnStop(done)
+    EndOnStop { done, watcher: Some(watcher) }
 }
 
 impl Drop for EndOnStop {
     fn drop(&mut self) {
-        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        *self.done.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        if let Some(w) = self.watcher.take() {
+            let _ = w.join();
+        }
     }
 }
 

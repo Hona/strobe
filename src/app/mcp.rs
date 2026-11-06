@@ -312,15 +312,37 @@ fn need_head(obj: &serde_json::Map<String, Value>) -> Result<()> {
     if let Some(f) = file.filter(|f| relative(f)) {
         return Err(Error::usage(format!("bench file {f:?} is relative, which the daemon would read from its own working folder: give the absolute path")));
     }
-    match obj.get("head").and_then(Value::as_str) {
-        None | Some("") => Err(Error::usage(
-            "bench needs head through the daemon: the variant under test as an absolute directory, a git ref (git:<ref>), exe:<path>, app:<id> or url:<href>; the daemon's working folder is not your project",
-        )),
-        Some(h) if h == "." || h.starts_with("./") || h.starts_with("..") || (relative(h) && !h.contains(':') && std::path::Path::new(h).is_dir()) => {
-            Err(Error::usage(format!("head {h:?} is a relative folder, which the daemon would read from its own working folder: give the absolute path")))
-        }
-        Some(_) => Ok(()),
+    if obj.get("head").and_then(Value::as_str).is_none_or(str::is_empty) {
+        return Err(Error::usage(
+            "bench needs head through the daemon: the variant under test as an absolute directory, a git ref (git:<ref>), exe:<absolute path>, app:<id>, url:<href> or a target of the file; the daemon's working folder is not your project",
+        ));
     }
+    for side in ["head", "base"] {
+        let Some(spec) = obj.get(side).and_then(Value::as_str) else { continue };
+        if let Some(path) = relative_variant(spec) {
+            return Err(Error::usage(format!("{side} {spec:?} names {path:?}, a relative path the daemon would read from its own working folder: give the absolute path")));
+        }
+    }
+    Ok(())
+}
+
+/// The relative path a variant spec names, if it names one: a folder (`.`, `..`, `./x`, `.\x`, or a
+/// relative folder that exists from here) or `exe:<relative>`, also after `<target>=`. A git ref, a
+/// target's name, `app:`, `url:` and `git:` name no path.
+fn relative_variant(spec: &str) -> Option<&str> {
+    // `<target>=<variant>`: a target's name holds no `:` or slash (a URL's query may hold `=`).
+    let v = match spec.split_once('=') {
+        Some((t, v)) if !t.contains([':', '/', '\\']) => v,
+        _ => spec,
+    };
+    if let Some(exe) = v.strip_prefix("exe:") {
+        return std::path::Path::new(exe).is_relative().then_some(exe);
+    }
+    if ["url:", "git:", "app:", "target:"].iter().any(|p| v.starts_with(p)) {
+        return None;
+    }
+    let dotted = v == "." || v == ".." || ["./", ".\\", "../", "..\\"].iter().any(|p| v.starts_with(p));
+    (dotted || (std::path::Path::new(v).is_relative() && std::path::Path::new(v).is_dir())).then_some(v)
 }
 
 fn result(out: Output) -> Value {

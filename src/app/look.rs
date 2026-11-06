@@ -96,13 +96,16 @@ fn native(args: &Args, target: &str) -> Result<Output> {
     }
     let home = isolate::prepare_home(&app, args.get("home").map(Path::new), None)?;
     // A look stopped midway (Ctrl-C, SIGTERM) closes the app instead of leaving it running.
-    let _stop = isolate::end_on_stop(&home);
+    let stop = isolate::end_on_stop(Some(&home));
     progress(format!("look: launching {} in an isolated home", app.exe.display()));
     let (mut n, guard) = match nt::launch(&app, &home, &[], false, None) {
         Ok(x) => x,
         Err(e) => {
+            drop(stop);
             isolate::release_home(&home.dir);
-            isolate::remove_home(&home.dir);
+            if home.fresh {
+                isolate::remove_home(&home.dir);
+            }
             return Err(e);
         }
     };
@@ -176,7 +179,9 @@ fn native(args: &Args, target: &str) -> Result<Output> {
         }
         Ok(o)
     })();
-    n.close(true);
+    // The stop watcher ends first: a stop now no longer races this close.
+    drop(stop);
+    n.close(home.fresh);
     result
 }
 
@@ -184,6 +189,9 @@ pub fn run(args: &Args) -> Result<Output> {
     let target = args.pos.first().ok_or_else(|| Error::usage("look needs a page or an app: strobe look <url | file | app:<id> | exe:<path>> [--until <css>] [--wait 2s] [--out shot.png]"))?;
     if target.starts_with("app:") || target.starts_with("exe:") {
         return native(args, target);
+    }
+    if args.has("full") && args.has("element") {
+        return Err(Error::usage("--full shoots the whole page and --element one element of it: give one"));
     }
     for app_only in ["keys", "build", "app", "home"] {
         if args.has(app_only) {
@@ -205,6 +213,8 @@ pub fn run(args: &Args) -> Result<Output> {
     for l in crate::target::isolate::reap_dead_owners() {
         progress(l);
     }
+    // A look stopped midway ends the browser it launched (its profile goes with the next strobe).
+    let stop = crate::target::isolate::end_on_stop(None);
     let browser = chromium::launch(&window, !args.has("headed"), None, &[])?;
     let result = (|| -> Result<Output> {
         let page = browser.page()?;
@@ -254,16 +264,10 @@ pub fn run(args: &Args) -> Result<Output> {
         let clip = match args.get("element") {
             Some(sel) => {
                 let sel = Selector::parse(&Value::String(sel.to_string()), Dialect::Page)?;
-                let expr = format!(
-                    "(() => {{ const el = __strobe.find({}); if (!el) return null; const r = el.getBoundingClientRect(); return JSON.stringify({{ x: r.left + scrollX, y: r.top + scrollY, width: r.width, height: r.height }}) }})()",
-                    sel.page_spec()
-                );
-                let rect = page.eval_timeout(&expr, Duration::from_secs(10))?;
-                let r: Value = rect.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or(Value::Null);
-                match (r["x"].as_f64(), r["y"].as_f64(), r["width"].as_f64(), r["height"].as_f64()) {
-                    (Some(x), Some(y), Some(w), Some(h)) if w >= 1.0 && h >= 1.0 => Some(json!({ "x": x, "y": y, "width": w, "height": h, "scale": 1 })),
-                    (Some(_), _, _, _) => return Err(Error::usage(format!("--element {:?}: the element has no size to show (0×0)", sel.source))),
-                    _ => return Err(Error::usage(format!("--element {:?}: no visible element matches it", sel.source)).hint("strobe look <page> lists the headings and text; a selector is CSS, then role=, text=, index=")),
+                match crate::driver::element_box(&page, &sel, Duration::from_secs(10))? {
+                    Some([x, y, w, h]) if w >= 1.0 && h >= 1.0 => Some(json!({ "x": x, "y": y, "width": w, "height": h, "scale": 1 })),
+                    Some(_) => return Err(Error::usage(format!("--element {:?}: the element has no size to show (0×0)", sel.source))),
+                    None => return Err(Error::usage(format!("--element {:?}: no visible element matches it", sel.source)).hint("strobe look <page> lists the headings and text; a selector is CSS, then role=, text=, index=")),
                 }
             }
             None => None,
@@ -324,6 +328,7 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         Ok(o)
     })();
+    drop(stop);
     browser.close();
     result
 }

@@ -128,6 +128,25 @@ struct Group {
     pgid: u32,
 }
 
+/// Every `Owned` launch not yet ended, by its child's pid and start time: what `end_launches` ends on a
+/// stop. A launch registers while this is held from its spawn on, and `end` takes it out under it, so
+/// a stop and a close never race over one launch.
+static LIVE: std::sync::Mutex<Vec<(u32, Option<u64>)>> = std::sync::Mutex::new(Vec::new());
+
+/// Ends every launch this strobe still owns (each one's tree, then its group; Windows ends the jobs
+/// itself when strobe exits): for a stop of a command that then exits (`isolate::end_on_stop`). The
+/// launches stay ended: their `end` only reaps them.
+pub fn end_launches() {
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    for (pid, start) in live.drain(..) {
+        super::kill_launch(pid, start);
+        #[cfg(unix)]
+        unsafe {
+            libc::kill(-(pid as i32), libc::SIGKILL);
+        }
+    }
+}
+
 /// Jobs by the folder their launch was for (Windows), for `group_pids`.
 #[cfg(windows)]
 static JOBS: std::sync::Mutex<Vec<(String, isize)>> = std::sync::Mutex::new(Vec::new());
@@ -164,7 +183,13 @@ impl Owned {
     /// and reaps it. Idempotent.
     pub fn end(&mut self) {
         let Some(group) = self.group.take() else { return };
-        super::kill_launch(self.child.id(), self.start);
+        // Held while ending: a stop's `end_launches` either ended this launch already or waits.
+        let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+        let pid = self.child.id();
+        if let Some(i) = live.iter().position(|(p, _)| *p == pid) {
+            live.remove(i);
+            super::kill_launch(pid, self.start);
+        }
         #[cfg(windows)]
         if let Some(job) = group.job {
             use windows_sys::Win32::System::JobObjects::TerminateJobObject;
@@ -179,6 +204,7 @@ impl Owned {
         unsafe {
             libc::kill(-(group.pgid as i32), libc::SIGKILL);
         }
+        drop(live);
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
@@ -486,6 +512,14 @@ pub fn spawn_pinned(cmd: &mut Command, cpus: Option<u64>, flags: u32) -> std::io
 /// `spawn_pinned` as an `Owned` launch, which strobe ends whole when it is done with it; `home` is the
 /// folder the launch is for (its stamp, set by the caller).
 pub fn spawn_owned(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&Path>) -> std::io::Result<Owned> {
+    // Held from before the spawn until the launch is listed: a stop in between ends it too.
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    let owned = spawn_group(cmd, cpus, flags, home)?;
+    live.push((owned.child.id(), owned.start));
+    Ok(owned)
+}
+
+fn spawn_group(cmd: &mut Command, cpus: Option<u64>, flags: u32, home: Option<&Path>) -> std::io::Result<Owned> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::CloseHandle;

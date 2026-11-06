@@ -2830,25 +2830,49 @@ impl Foreign {
         Foreign { idle, tsc: host::tsc(), browser: browser.processes().iter().map(|p| p.cycles).sum(), procs: (host::now_ns(), host::all_processes()) }
     }
 
-    /// Other work on `cpus` (all when unpinned) as % of one core, and the busiest outside processes.
-    fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> (f64, Vec<(String, f64)>) {
+    /// Other work on `cpus` (all when unpinned) as % of one core (None: the idle counters or the time
+    /// stamp counter could not be read), and the busiest processes on the machine outside strobe's
+    /// tree and the target browser, as % of one core: their cycles over the span's time stamp counter,
+    /// a process that started meanwhile counted from zero.
+    fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> (Option<f64>, Vec<(String, f64)>) {
         let mut idle = Vec::new();
         let ok = host::idle_cycles(&mut idle);
-        let (tsc, own) = (host::tsc(), browser.processes().iter().map(|p| p.cycles).sum::<u64>());
-        let busiest = busiest_others(&self.procs, &(host::now_ns(), host::all_processes()));
+        let theirs = browser.processes();
+        let (tsc, now) = (host::tsc(), (host::now_ns(), host::all_processes()));
+        let own = theirs.iter().map(|p| p.cycles).sum::<u64>();
         let span = match (self.tsc, tsc) {
-            (Some(a), Some(b)) if b > a && ok && idle.len() == self.idle.len() => (b - a) as f64,
-            _ => return (0.0, busiest),
+            (Some(a), Some(b)) if b > a => Some((b - a) as f64),
+            _ => None,
         };
-        let busy: f64 = self
-            .idle
-            .iter()
-            .zip(&idle)
-            .enumerate()
-            .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
-            .map(|(_, (a, b))| (100.0 * (1.0 - b.saturating_sub(*a) as f64 / span)).clamp(0.0, 100.0))
-            .sum();
-        ((busy - 100.0 * own.saturating_sub(self.browser) as f64 / span).max(0.0), busiest)
+        let busiest = match span {
+            Some(span) => {
+                let skip: std::collections::BTreeSet<u32> = host::tree_pids(std::process::id()).into_iter().chain(theirs.iter().map(|p| p.pid)).collect();
+                let before: BTreeMap<u32, u64> = self.procs.1.iter().map(|p| (p.pid, p.cycles)).collect();
+                let mut out: Vec<(String, f64)> = now
+                    .1
+                    .iter()
+                    .filter(|p| p.pid != 0 && !skip.contains(&p.pid))
+                    .map(|p| (format!("{} ({})", p.name, p.pid), 100.0 * p.cycles.saturating_sub(before.get(&p.pid).copied().unwrap_or(0)) as f64 / span))
+                    .filter(|(_, pct)| *pct >= 5.0)
+                    .collect();
+                out.sort_by(|x, y| y.1.total_cmp(&x.1));
+                out.truncate(3);
+                out
+            }
+            None => busiest_others(&self.procs, &now),
+        };
+        let foreign = span.filter(|_| ok && idle.len() == self.idle.len()).map(|span| {
+            let busy: f64 = self
+                .idle
+                .iter()
+                .zip(&idle)
+                .enumerate()
+                .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
+                .map(|(_, (a, b))| (100.0 * (1.0 - b.saturating_sub(*a) as f64 / span)).clamp(0.0, 100.0))
+                .sum();
+            (busy - 100.0 * own.saturating_sub(self.browser) as f64 / span).max(0.0)
+        });
+        (foreign, busiest)
     }
 }
 
@@ -3306,14 +3330,18 @@ fn needs_screen(ctx: &Ctx, s: &Series, x: &Exec) -> Option<String> {
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     let windowless = t["window"] == false || t["app"].as_str().and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless);
+    // A pixels block compares what the window shows; only a headless page draws it without a screen.
+    if x.pixels.is_some() && !(matches!(t["kind"].as_str(), Some("web" | "url")) && headless_of(ctx, s)) {
+        return Some("it compares the case's snapshots (--pixels), which are pixels on screen".into());
+    }
     match t["kind"].as_str().unwrap_or("") {
         "script" | "cli" => None,
         // A headless page draws to no display: the lock screen covers nothing of it.
         "web" | "url" if headless_of(ctx, s) => None,
         _ if x.set == Set::Memory => None,
         "native" if windowless || x.untimed => {
-            let on: Vec<&str> = std::iter::once(&s.primary)
-                .chain(&s.metrics)
+            let on: Vec<&str> = declared_metrics(s)
+                .into_iter()
                 .map(String::as_str)
                 .filter(|m| !native::browser_only(m) && !(windowless && native::on_screen_area(m)))
                 .filter(|m| !offscreen(m) || (*m == s.primary && gpu_use(m)))
@@ -3732,12 +3760,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let speed = validity::speed_check(&page)?;
         // The calibration is Chromium's: another engine's JS speed is compared with its own reference
         // only, which a check under other work never joins.
-        let mut loaded: Option<(f64, Vec<(String, f64)>)> = None;
+        let mut loaded: Option<(Option<f64>, Vec<(String, f64)>)> = None;
         let checked = match engine {
             WebEngine::Chromium => validity::throttled(speed, ctx.baseline),
             WebEngine::Firefox | WebEngine::Webkit => {
                 let f = during.take().map(|d| d.stop(ctx.pin, &browser)).unwrap_or_default();
-                let keep = f.0 < BACKGROUND_PCT;
+                // Only a check known to have run without other work joins the engine's reference.
+                let keep = f.0.is_some_and(|x| x < BACKGROUND_PCT);
                 loaded = Some(f);
                 validity::engine_throttled(engine, ctx.pin, speed, keep)
             }
@@ -3749,18 +3778,22 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             Err(e) => {
                 let (foreign, busiest) = loaded.or_else(|| during.map(|d| d.stop(ctx.pin, &browser))).unwrap_or_default();
                 let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
-                let who = if who.is_empty() { "none named (system work)".to_string() } else { who };
-                return Err(if foreign >= BACKGROUND_PCT {
-                    Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {foreign:.0}% of a core busy ({})", e.message))
-                        .detail(format!("busiest processes (% of a core): {who}"))
-                        .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
-                        .into()
-                } else {
-                    // Too little other work to be the cause, but named, so a reader can tell.
-                    match e.refusal {
-                        Some(r) => (*r).detail(format!("other work on the target's CPUs meanwhile: {foreign:.0}% of a core; busiest processes (% of a core): {who}")).into(),
-                        None => e,
+                return Err(match foreign {
+                    Some(f) if f >= BACKGROUND_PCT => {
+                        Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {f:.0}% of a core busy ({})", e.message))
+                            .detail(format!("busiest processes on the machine (% of a core): {}", if who.is_empty() { "none named (system work)" } else { &who }))
+                            .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
+                            .into()
                     }
+                    // Too little other work to be the cause (or none readable), but named, so a reader can tell.
+                    _ => match e.refusal {
+                        Some(r) => {
+                            let on_cpus = foreign.map_or("could not be read".to_string(), |f| format!("{f:.0}% of a core"));
+                            let busiest = if who.is_empty() { "nothing outside strobe".to_string() } else { format!("busiest processes on the machine (% of a core): {who}") };
+                            (*r).detail(format!("other work on the target's CPUs meanwhile: {on_cpus}; {busiest}")).into()
+                        }
+                        None => e,
+                    },
                 });
             }
             Ok(r) => r,

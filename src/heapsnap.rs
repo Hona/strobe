@@ -645,24 +645,36 @@ pub fn summary(s: &Snapshot, top: usize, reveal: bool) -> Value {
 /// objects only `head` has: by node id when both come from one process (ids are stable within one
 /// V8 heap), else the classes `base` lacks.
 pub fn diff(base: &Snapshot, head: &Snapshot, same_process: bool, top: usize, reveal: bool) -> Value {
-    // Several classes can share a portable key (same name in one chunk): their stats add up.
-    let index = |s: &Snapshot| -> HashMap<String, Vec<usize>> {
+    // Several classes can share a key (one name in one chunk, a name with a node id in it): counts and
+    // self sizes add up, and the retained size is the key's own, without nested instances twice
+    // (`exclusive` over the classes mapped to their key, once per snapshot).
+    let index = |s: &Snapshot| -> (HashMap<String, Vec<usize>>, HashMap<String, u64>) {
         let mut m: HashMap<String, Vec<usize>> = HashMap::new();
         for c in 0..s.classes.len() {
             m.entry(s.class_key(c, !same_process)).or_default().push(c);
         }
-        m
+        let mut group = vec![NONE; s.classes.len()];
+        let keys: Vec<&String> = m.keys().collect();
+        for (g, k) in keys.iter().enumerate() {
+            for &c in &m[*k] {
+                group[c] = g as u32;
+            }
+        }
+        let retained = s.exclusive(keys.len(), |v| s.class.get(v).filter(|c| **c != NONE).map_or(NONE, |&c| group[c as usize]));
+        let by_key = keys.iter().zip(retained).map(|(k, r)| ((*k).clone(), r)).collect();
+        (m, by_key)
     };
-    let (bi, hi) = (index(base), index(head));
+    let ((bi, bret), (hi, hret)) = (index(base), index(head));
     let keys: Vec<&String> = hi.keys().chain(bi.keys().filter(|k| !hi.contains_key(*k))).collect();
-    let stats = |s: &Snapshot, cs: Option<&Vec<usize>>| {
-        cs.into_iter().flatten().map(|&c| &s.classes[c]).fold((0i64, 0i64, 0i64), |a, k| (a.0 + k.count as i64, a.1 + k.self_size as i64, a.2 + k.retained as i64))
+    let stats = |s: &Snapshot, retained: &HashMap<String, u64>, key: &String, cs: Option<&Vec<usize>>| {
+        let (count, own) = cs.into_iter().flatten().map(|&c| &s.classes[c]).fold((0i64, 0i64), |a, k| (a.0 + k.count as i64, a.1 + k.self_size as i64));
+        (count, own, retained.get(key).copied().unwrap_or(0) as i64)
     };
     let mut rows: Vec<(i64, i64, i64, Value)> = keys
         .into_iter()
         .filter_map(|key| {
             let (bcs, hcs) = (bi.get(key), hi.get(key));
-            let ((bc, bs, br), (hc, hs, hr)) = (stats(base, bcs), stats(head, hcs));
+            let ((bc, bs, br), (hc, hs, hr)) = (stats(base, &bret, key, bcs), stats(head, &hret, key, hcs));
             let (b, h) = (bcs.and_then(|v| v.first()).map(|&c| &base.classes[c]), hcs.and_then(|v| v.first()).map(|&c| &head.classes[c]));
             if (bc, bs, br) == (hc, hs, hr) {
                 return None;
@@ -968,12 +980,14 @@ fn path_text(p: &Value) -> String {
 }
 
 fn signed_bytes(v: f64) -> String {
-    if v > 0.0 {
-        format!("+{}", bytes(v))
-    } else if v < 0.0 {
-        format!("−{}", bytes(-v))
+    let body = bytes(v.abs());
+    // One that shows as zero has no sign.
+    if body == bytes(0.0) || v.is_nan() {
+        body
+    } else if v > 0.0 {
+        format!("+{body}")
     } else {
-        "0 B".into()
+        format!("−{body}")
     }
 }
 

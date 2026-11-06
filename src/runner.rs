@@ -25,15 +25,16 @@ pub fn sdk_dir() -> Result<PathBuf> {
     let root = paths::sdk();
     let dir = root.join(env!("STROBE_BUILD_ID"));
     std::fs::create_dir_all(&dir)?;
+    // Marked used before anything else, so another strobe's prune never takes a folder being filled.
+    let now = std::time::SystemTime::now();
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".used")) {
+        let _ = f.set_modified(now);
+    }
     for (name, body) in [("index.ts", INDEX), ("runner.ts", RUNNER), ("preload.ts", PRELOAD), ("host.mjs", HOST)] {
         let p = dir.join(name);
         if std::fs::read_to_string(&p).ok().as_deref() != Some(body) {
             paths::write_atomic(&p, body.as_bytes())?;
         }
-    }
-    let now = std::time::SystemTime::now();
-    if let Ok(f) = std::fs::OpenOptions::new().create(true).truncate(false).write(true).open(dir.join(".used")) {
-        let _ = f.set_modified(now);
     }
     for other in std::fs::read_dir(&root).into_iter().flatten().flatten().map(|e| e.path()).filter(|p| p.is_dir() && *p != dir) {
         // A folder from before `.used` counts from when it was written.

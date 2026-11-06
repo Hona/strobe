@@ -145,14 +145,7 @@ impl Kind {
     }
 
     fn signed(self, v: f64) -> String {
-        let s = self.show(v.abs());
-        if v > 0.0 {
-            format!("+{s}")
-        } else if v < 0.0 {
-            format!("−{s}")
-        } else {
-            s
-        }
+        signed(v, &|x| self.show(x))
     }
 }
 

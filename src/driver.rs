@@ -301,6 +301,17 @@ pub fn shows(page: &Page, sel: &Selector, timeout: Duration) -> Result<bool> {
     Ok(helped(page, &expr, timeout + Duration::from_secs(5))? == Value::Bool(true))
 }
 
+/// The first visible element `sel` matches, as its box on the document in CSS pixels (x, y, width,
+/// height), by the driver's own probe; None when nothing matches.
+pub fn element_box(page: &Page, sel: &Selector, timeout: Duration) -> Result<Option<[f64; 4]>> {
+    let expr = format!(
+        "(() => {{ const el = __strobe.find({}); if (!el) return null; const r = el.getBoundingClientRect(); return JSON.stringify([r.left + scrollX, r.top + scrollY, r.width, r.height]) }})()",
+        sel.page_spec()
+    );
+    let v = helped(page, &expr, timeout)?;
+    Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+}
+
 /// A selector argument with a call's `{ text, exact }` options added (`waitFor(sel, { text })`).
 pub(crate) fn with_text(sel: &Value, o: &Value) -> Value {
     if o.get("text").is_none() && o.get("exact").is_none() {

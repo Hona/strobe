@@ -229,7 +229,10 @@ fn parse(text: &str, pid: u32, t0: u64, deep: &mut Deep, index: &mut HashMap<Vec
             let (id, label) = l.name.split_once(|c: char| c == ':' || c.is_whitespace()).unwrap_or((&l.name, ""));
             let id = id.trim_start_matches("Thread_").parse::<u64>().unwrap_or(0);
             tid = id as u32;
-            if let Some(name) = thread_name(pid, id, label) {
+            // The first name a thread got stays: a later tree of it may name only a queue it ran.
+            if !deep.threads.contains_key(&tid)
+                && let Some(name) = thread_name(pid, id, label)
+            {
                 deep.threads.insert(tid, name);
             }
             path.clear();

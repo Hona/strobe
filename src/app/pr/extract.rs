@@ -649,7 +649,10 @@ pub(super) fn disp(v: f64, unit: &str) -> String {
 
 pub(super) fn signed_disp(v: f64, unit: &str) -> String {
     let body = disp(v.abs(), unit);
-    if v < 0.0 {
+    // One that shows as zero has no sign.
+    if body == disp(0.0, unit) {
+        body
+    } else if v < 0.0 {
         format!("−{body}")
     } else if v > 0.0 {
         format!("+{body}")

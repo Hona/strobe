@@ -309,28 +309,47 @@ impl Starts {
         Starts { first: None, live: Default::default(), on: s.reset_check && !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none() }
     }
 
-    /// The first start, read until it holds still: read again every 300 ms until two reads agree (for
-    /// up to 3 s), so a tree a lazy provider is still building, a toggle whose state it has not read
-    /// yet, or a page still filling in is not what every run is held to (an idle case refused a switch
-    /// that was "not there" before run 1 and there after it). A control that appears meanwhile was
-    /// filling in and is compared; one whose value changed from one read to the next, with no input,
-    /// is live (`live`) and left out.
-    fn reference(&mut self, read: &dyn Fn() -> Option<Start>) -> Option<Start> {
-        let deadline = Instant::now() + Duration::from_secs(3);
+    /// The first start, read until it holds still, so a tree a lazy provider is still building, a
+    /// toggle whose state the app has not read yet, or a page still filling in is not what every run is
+    /// held to (an idle case refused a switch that was "not there" before run 1 and there after it).
+    /// Read every 200 ms until every control has held its value (or absence) for `HOLD` since it last
+    /// changed, for at least `HOLD` and at most `SETTLE_MAX`. With `find_live` (before run 1 only: no
+    /// run has left anything running yet), a control whose value changed by itself in two different
+    /// intervals is live (`live`: a level meter, a clock in a field) and left out. One change is
+    /// hydration or a debounced update, not a live control: it is read on until it holds, and compared.
+    fn reference(&mut self, read: &dyn Fn() -> Option<Start>, find_live: bool) -> Option<Start> {
+        // Longer than a 1 Hz field takes to tick twice.
+        const HOLD: Duration = Duration::from_millis(1200);
+        const SETTLE_MAX: Duration = Duration::from_secs(4);
+        let started = Instant::now();
         let mut now = read()?;
-        while Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(300));
-            let Some(again) = read() else { break };
-            for (k, v) in &now {
-                if again.get(k).is_some_and(|w| w != v) {
-                    self.live.insert(k.clone());
-                }
-            }
-            let agreed = again.iter().filter(|(k, _)| !self.live.contains(*k)).eq(now.iter().filter(|(k, _)| !self.live.contains(*k)));
-            now = again;
-            if agreed {
+        let mut changed_at: BTreeMap<String, Instant> = BTreeMap::new();
+        let mut changes: BTreeMap<String, u32> = BTreeMap::new();
+        loop {
+            let held = changed_at.iter().all(|(k, t)| self.live.contains(k) || t.elapsed() >= HOLD);
+            if (held && started.elapsed() >= HOLD) || started.elapsed() >= SETTLE_MAX {
                 break;
             }
+            std::thread::sleep(Duration::from_millis(200));
+            let Some(again) = read() else { break };
+            let keys: std::collections::BTreeSet<&String> = now.keys().chain(again.keys()).collect();
+            for k in keys {
+                let (a, b) = (now.get(k), again.get(k));
+                if a == b {
+                    continue;
+                }
+                changed_at.insert(k.clone(), Instant::now());
+                // A value that became another value (not one that appeared or went) is the app's own
+                // change; twice is live.
+                if find_live && a.is_some() && b.is_some() {
+                    let n = changes.entry(k.clone()).or_default();
+                    *n += 1;
+                    if *n >= 2 {
+                        self.live.insert(k.clone());
+                    }
+                }
+            }
+            now = again;
         }
         Some(now)
     }
@@ -350,13 +369,13 @@ impl Starts {
     /// again at each change (and at least every 250 ms, for a value set without an event) for up to a
     /// second, then refuses the block; a read that fails there counts as differing. A start that cannot
     /// be read before any was is skipped: the first start read (`reference`) is what the others are
-    /// compared with, without its live controls.
+    /// compared with, without its live controls (found only when that read is before run 1).
     pub(super) fn check(&mut self, run: usize, after: bool, read: &dyn Fn() -> Option<Start>, wait: &dyn Fn(Duration)) -> Result<()> {
         if !self.on {
             return Ok(());
         }
         if self.first.is_none() {
-            if let Some(now) = self.reference(read) {
+            if let Some(now) = self.reference(read, run == 1 && !after) {
                 self.first = Some((format!("run {run}"), self.held(&now)));
             }
             return Ok(());

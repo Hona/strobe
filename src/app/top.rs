@@ -123,7 +123,8 @@ struct GroupRow {
     cpus: Vec<usize>,
     l3_mb: u32,
     vcache: bool,
-    busy_pct: f64,
+    /// None: no CPU of the group was read.
+    busy_pct: Option<f64>,
     perf_pct: Option<f64>,
     mhz: Option<f64>,
 }
@@ -285,7 +286,7 @@ impl Top {
             .enumerate()
             .map(|(i, g)| (format!("CCD{i}"), (0..64).filter(|b| g.mask & (1u64 << b) != 0).collect::<Vec<usize>>(), g.l3_mb, vcache == Some(g.mask)))
             .chain(std::iter::once(("CPUs".to_string(), Vec::new(), 0, false)))
-            .map(|(name, cpus, l3_mb, vcache)| GroupRow { name, cpus, l3_mb, vcache, busy_pct: 0.0, perf_pct: None, mhz: None })
+            .map(|(name, cpus, l3_mb, vcache)| GroupRow { name, cpus, l3_mb, vcache, busy_pct: None, perf_pct: None, mhz: None })
             .collect();
         if groups.len() == 1 {
             groups[0].cpus = (0..cores.len()).collect();
@@ -296,11 +297,10 @@ impl Top {
             g.cpus.retain(|&c| c < cores.len());
             // A group with no CPU read has no load to show: `-`, never 0% (or -0%).
             if g.cpus.is_empty() {
-                g.busy_pct = f64::NAN;
                 continue;
             }
             let n = g.cpus.len() as f64;
-            g.busy_pct = g.cpus.iter().map(|&c| cores[c].busy_pct).sum::<f64>() / n;
+            g.busy_pct = Some(g.cpus.iter().map(|&c| cores[c].busy_pct).sum::<f64>() / n);
             g.perf_pct = g.cpus.iter().map(|&c| cores[c].perf_pct).sum::<Option<f64>>().map(|s| s / n);
             g.mhz = mhz(g.perf_pct);
         }
@@ -310,8 +310,8 @@ impl Top {
 
 fn render(f: &Frame, topo: &Topology, cpu_name: &str, target: Option<(&Samples, &Summary)>, live: bool) -> String {
     let mut t = String::new();
-    let pct = |v: f64| if v.is_finite() { format!("{:.0}%", v.max(0.0)) } else { "-".into() };
-    let busy = if f.cores.is_empty() { f64::NAN } else { f.cores.iter().map(|c| c.busy_pct).sum::<f64>() / f.cores.len() as f64 };
+    let pct = |v: Option<f64>| v.map_or("-".into(), |v| format!("{:.0}%", v.max(0.0)));
+    let busy = (!f.cores.is_empty()).then(|| f.cores.iter().map(|c| c.busy_pct).sum::<f64>() / f.cores.len() as f64);
     t += &format!("strobe top  {:.1} s  {}  {} logical CPUs  {} busy{}\n", f.elapsed_ms / 1000.0, cpu_name, topo.logical, pct(busy), if live { "  (Ctrl+C quits)" } else { "" });
     for g in &f.groups {
         let l3 = if g.l3_mb > 0 { format!("  {} MB L3", g.l3_mb) } else { String::new() };

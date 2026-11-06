@@ -114,10 +114,12 @@ pub fn run(args: &Args) -> Result<Output> {
     // a progress line on stderr that reads like an error.
     let power = if args.get("probes").unwrap_or("timing") == "timing" { Some(super::bench::power_quiet(args)?) } else { None };
     let mut out = recorded(args, target)?;
-    if let Some(p) = power.filter(|p| p.switched())
+    // The user's plan is put back (the guard dropped) before the result says so.
+    let switched = power.filter(|p| p.switched()).map(|p| p.used.clone());
+    if let Some(used) = switched
         && !out.text.is_empty()
     {
-        out.text += &format!("power    {} for this recording; the user's own plan is back\n", p.used);
+        out.text += &format!("power    {used} for this recording; the user's own plan is back\n");
     }
     Ok(out)
 }

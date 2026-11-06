@@ -359,10 +359,17 @@ fn runs(
     };
     while warmup.more(runs.len()) {
         let i = runs.len();
-        let began = Instant::now();
         if !windowless {
             n.raise();
         }
+        // What the run starts from, read (and settled) before anything of the run is listed or timed.
+        if starts.on()
+            && let Some(se) = drive.session.get()
+        {
+            se.set_pids(&n.pids());
+            starts.check(i + 1, false, &read_start, &wait_start)?;
+        }
+        let began = Instant::now();
         // One read of the app's processes per end of a run: what the session follows, what the
         // snapshot covers, and (at the end) the cycles.
         let listed = wakes::wall_us();
@@ -371,7 +378,6 @@ fn runs(
             se.set_pids(&pids);
             se.take_log();
         }
-        starts.check(i + 1, false, &read_start, &wait_start)?;
         hooks.begin(&format!("run:{i}"));
         // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
         let running = n.exited().is_none();
@@ -843,9 +849,10 @@ pub(super) fn browser_only(metric: &str) -> bool {
         || matches!(metric, "gpu.compile" | "cpu.renderer" | "cpu.gpu" | "cpu.browser")
 }
 
-/// What reaches the screen, which an app without a window has none of (`NotForTarget`).
+/// What reaches the screen, which an app without a window has none of (`NotForTarget`): frames and
+/// what they time, and a launch timed to its window's pixels.
 pub(super) fn on_screen_area(metric: &str) -> bool {
-    matches!(metric.split('.').next().unwrap_or(""), "frames" | "interaction" | "scroll" | "display")
+    matches!(metric.split('.').next().unwrap_or(""), "frames" | "interaction" | "scroll" | "display") || matches!(metric, "launch.painted" | "launch.settled")
 }
 
 /// Why a declared metric has no value in a native run block: what this OS cannot read, what a native

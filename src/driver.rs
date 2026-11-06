@@ -77,11 +77,30 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   const attach = Element.prototype.attachShadow
   Element.prototype.attachShadow = function (init) { const root = attach.call(this, init); watch(root); return root }
   const observe = (fn, opts) => {
-    const o = { mo: new MutationObserver(fn), opts }
+    const o = { mo: new MutationObserver(fn), opts, fn }
     o.mo.observe(document, opts)
     for (const r of roots) o.mo.observe(r, opts)
     observers.add(o)
     return () => { o.mo.disconnect(); observers.delete(o) }
+  }
+  // Declarative shadow roots: the parser attaches them without attachShadow. While the document still loads (the
+  // helper went in from its first script: a launch's observer), each batch of parsed nodes is looked at for roots,
+  // with the node before it (a host whose template has just been parsed), and the whole document once more when it
+  // has loaded. A root found counts as a change to every observer.
+  if (document.readyState === "loading") {
+    const adopt = (n, deep) => {
+      if (n?.nodeType !== 1) return
+      if (n.shadowRoot) watch(n.shadowRoot)
+      if (deep) for (const el of n.querySelectorAll("*")) if (el.shadowRoot) watch(el.shadowRoot)
+    }
+    const found = (scan) => {
+      const before = roots.size
+      scan()
+      if (roots.size > before) for (const o of observers) o.fn([])
+    }
+    const parsed = new MutationObserver((records) => found(() => { for (const r of records) { adopt(r.previousSibling, false); for (const n of r.addedNodes) adopt(n, true) } }))
+    parsed.observe(document, { childList: true, subtree: true })
+    document.addEventListener("DOMContentLoaded", () => { parsed.disconnect(); found(() => adopt(document.documentElement, true)) }, { once: true })
   }
   const query = (root, [first, ...rest]) => {
     const found = [...root.querySelectorAll(first)]
@@ -166,46 +185,91 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     for (const el of shown) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
     return shown.filter((el) => !outer.has(el)).at(left) ?? null
   }
-  s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
-  // The part of an element a person could see, in viewport CSS pixels: its box clipped by the viewport (without its
-  // scroll bars) and by every ancestor that clips its overflow. An absolutely positioned element is clipped only from
-  // its containing block up, a fixed one only by the viewport unless a transform, filter or containment holds it. The
-  // root and body clip as the viewport does. `by`: the ancestor that left none of it, if one did.
-  const shownPart = (el) => {
+  const focusedIn = (el) => el.contains(document.activeElement) || el.matches(":focus-within")
+  s.focused = (q) => { const el = s.find(q); return !!el && focusedIn(el) }
+  // The flat tree's parent, which layout follows: a slotted element's slot, else its parent, else a shadow root's host.
+  const flatUp = (el) => el.assignedSlot ?? el.parentElement ?? el.getRootNode().host ?? null
+  // Whether an element is a containing block for fixed descendants (and so for absolute ones).
+  const holds = (cs) => cs.transform !== "none" || cs.perspective !== "none" || cs.filter !== "none" || (cs.backdropFilter ?? "none") !== "none"
+    || (cs.translate ?? "none") !== "none" || (cs.scale ?? "none") !== "none" || (cs.rotate ?? "none") !== "none"
+    || /paint|layout|strict|content/.test(cs.contain) || (cs.containerType ?? "normal") !== "normal"
+    || /transform|perspective|filter|translate|scale|rotate|contain/.test(cs.willChange)
+  // What clips an element, in viewport CSS pixels: the viewport without its scroll bars, and each ancestor in the flat
+  // tree whose overflow clips it, per axis (an absolutely positioned element from its containing block up, a fixed one
+  // only by the viewport unless an ancestor holds it). A box with no overflow of its own (inline, `display: contents`)
+  // clips nothing; the root's overflow is the viewport's, and the body's too while the root's is visible. A transformed
+  // or zoomed clipper's client box is scaled with it; an SVG clipper clips by its box. `by`: the ancestor that left
+  // none of the element, if one did.
+  const clipOf = (el) => {
+    const de = document.documentElement, vp = document.compatMode === "BackCompat" && document.body ? document.body : de
+    const c = { x0: 0, y0: 0, x1: vp?.clientWidth || innerWidth, y1: vp?.clientHeight || innerHeight, by: null }
     const r = el.getBoundingClientRect()
-    const root = document.compatMode === "BackCompat" && document.body ? document.body : document.documentElement
-    let x0 = Math.max(r.left, 0), y0 = Math.max(r.top, 0)
-    let x1 = Math.min(r.right, root?.clientWidth || innerWidth), y1 = Math.min(r.bottom, root?.clientHeight || innerHeight)
-    let pos = getComputedStyle(el).position, by = null
-    for (let p = up(el); p && p !== document.body && p !== document.documentElement; p = up(p)) {
+    const rs = getComputedStyle(de), rootVisible = rs.overflowX === "visible" && rs.overflowY === "visible"
+    let pos = getComputedStyle(el).position
+    for (let p = flatUp(el); p && p !== de; p = flatUp(p)) {
       const cs = getComputedStyle(p)
-      const holder = cs.transform !== "none" || cs.filter !== "none" || cs.perspective !== "none" || /paint|layout|strict|content/.test(cs.contain)
+      const holder = holds(cs)
       if (pos === "fixed" ? !holder : pos === "absolute" ? cs.position === "static" && !holder : false) continue
       pos = cs.position
-      if (cs.overflowX === "visible" && cs.overflowY === "visible") continue
-      const b = p.getBoundingClientRect(), left = b.left + p.clientLeft, top = b.top + p.clientTop
-      x0 = Math.max(x0, left); y0 = Math.max(y0, top); x1 = Math.min(x1, left + p.clientWidth); y1 = Math.min(y1, top + p.clientHeight)
-      if (!by && (x1 - x0 < 1 || y1 - y0 < 1)) by = p
+      if (cs.display === "contents" || cs.display === "inline" || (p === document.body && rootVisible)) continue
+      const cx = cs.overflowX !== "visible", cy = cs.overflowY !== "visible"
+      if (!cx && !cy) continue
+      const b = p.getBoundingClientRect()
+      let left = b.left, top = b.top, w = b.width, h = b.height
+      if (p instanceof HTMLElement && p.offsetWidth > 0 && p.offsetHeight > 0) {
+        const sx = b.width / p.offsetWidth, sy = b.height / p.offsetHeight
+        left += p.clientLeft * sx; top += p.clientTop * sy; w = p.clientWidth * sx; h = p.clientHeight * sy
+      }
+      if (cx) { c.x0 = Math.max(c.x0, left); c.x1 = Math.min(c.x1, left + w) }
+      if (cy) { c.y0 = Math.max(c.y0, top); c.y1 = Math.min(c.y1, top + h) }
+      if (!c.by && (Math.min(r.right, c.x1) - Math.max(r.left, c.x0) < 1 || Math.min(r.bottom, c.y1) - Math.max(r.top, c.y0) < 1)) c.by = p
     }
-    return x1 - x0 >= 1 && y1 - y0 >= 1 ? { x: (x0 + x1) / 2, y: (y0 + y1) / 2 } : { by }
+    return c
   }
-  // Where input aims at an element: the centre of its visible part (a box taller than the viewport, a long editor,
-  // is aimed at the middle of what shows of it, never at its own centre off the screen), scrolled into view at once
-  // when none of it shows. Without a visible part even then: no point, and why.
-  s.box = (q) => {
-    const el = s.find(q)
-    if (!el) return null
-    let part = shownPart(el)
-    if (part.x == null) {
-      // At once: a page's `scroll-behavior: smooth` would leave the box where the scroll began.
-      try { el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" }) } catch { el.scrollIntoView({ block: "nearest", inline: "nearest" }) }
-      part = shownPart(el)
+  const cut = (r, c) => ({ x0: Math.max(r.left, c.x0), y0: Math.max(r.top, c.y0), x1: Math.min(r.right, c.x1), y1: Math.min(r.bottom, c.y1) })
+  const shows = (a) => a.x1 - a.x0 >= 1 && a.y1 - a.y0 >= 1
+  // A part's centre, strictly inside the viewport (a WebDriver browser refuses a point on its edge).
+  const mid = (a) => [Math.min(Math.max((a.x0 + a.x1) / 2, 0), innerWidth - 1), Math.min(Math.max((a.y0 + a.y1) / 2, 0), innerHeight - 1)]
+  const partOf = (el) => cut(el.getBoundingClientRect(), clipOf(el))
+  // At once: a page's `scroll-behavior: smooth` would leave the box where the scroll began.
+  const bring = (el, at) => { const o = { block: at, inline: at }; try { el.scrollIntoView({ ...o, behavior: "instant" }) } catch { el.scrollIntoView(o) } }
+  // What input at a viewport point reaches, through open shadow roots, and whether that is `el`: the element there or one
+  // of its flat-tree ancestors, or a label of it.
+  const under = (x, y) => { let h = document.elementFromPoint(x, y); while (h?.shadowRoot) { const i = h.shadowRoot.elementFromPoint(x, y); if (!i || i === h) break; h = i } return h }
+  const reaches = (el, x, y) => {
+    const h = under(x, y)
+    if (h && h.control === el) return null
+    for (let p = h; p; p = flatUp(p)) if (p === el) return null
+    return h ?? document.documentElement
+  }
+  // Where input aims at an element (one rule in every engine): the centre of its visible part, so a box taller than the
+  // viewport (a long editor) is aimed at the middle of what shows of it, scrolled into view first when none of it shows
+  // (`scrolled`). The point must reach the element (hit-tested): while something covers it, each of its line boxes (a
+  // link wrapped over two lines has a gap at its box's centre), then the element centred in the viewport, then the
+  // centres of its visible part's quarters. Else no point, and why (`hidden`: nothing shows; `covered`: what covers it).
+  s.box = (el) => {
+    let scrolled = false, part = partOf(el)
+    if (!shows(part)) { bring(el, "nearest"); scrolled = true; part = partOf(el) }
+    const r = el.getBoundingClientRect(), box = { w: r.width, h: r.height }
+    if (!shows(part)) {
+      const at = Math.round(r.width) + "x" + Math.round(r.height) + " at (" + Math.round(r.left) + ", " + Math.round(r.top) + ")"
+      const by = clipOf(el).by
+      return { ...box, scrolled, x: null, y: null, hidden: "its box (" + at + ") shows nowhere in the " + innerWidth + "x" + innerHeight + " viewport even scrolled into view" + (by ? ": " + name(by) + " clips it away" : "") }
     }
-    const r = el.getBoundingClientRect()
-    const box = { w: r.width, h: r.height }
-    if (part.x != null) return { ...box, x: part.x, y: part.y }
-    const at = Math.round(r.width) + "x" + Math.round(r.height) + " at (" + Math.round(r.left) + ", " + Math.round(r.top) + ")"
-    return { ...box, x: null, y: null, hidden: "its box (" + at + ") shows nowhere in the " + innerWidth + "x" + innerHeight + " viewport even scrolled into view" + (part.by ? ": " + name(part.by) + " clips it away" : "") }
+    const clip = clipOf(el)
+    let cover = null
+    for (const [x, y] of [mid(part), ...[...el.getClientRects()].map((q) => cut(q, clip)).filter(shows).map(mid)]) {
+      const h = reaches(el, x, y)
+      if (!h) return { ...box, scrolled, x, y }
+      cover ??= h
+    }
+    bring(el, "center"); scrolled = true
+    const p = partOf(el)
+    if (shows(p)) {
+      const [x, y] = mid(p), qx = (p.x1 - p.x0) / 4, qy = (p.y1 - p.y0) / 4
+      for (const [ax, ay] of [[x, y], [x - qx, y - qy], [x + qx, y - qy], [x - qx, y + qy], [x + qx, y + qy]]) if (!reaches(el, ax, ay)) return { ...box, scrolled, x: ax, y: ay }
+    }
+    return { ...box, scrolled, x: null, y: null, covered: name(cover) }
   }
   // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
   // `:focus` selector would otherwise never resolve.
@@ -214,10 +278,16 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   s.spent = 0
   const lookup = s.find
   s.find = (q) => { const t = performance.now(); try { return lookup(q) } finally { s.spent += performance.now() - t } }
-  s.waitFor = (q, timeout, label) => new Promise((resolve, reject) => {
-    if (s.find(q)) return resolve(true)
+  // The element, once it shows (`waitFor` without the element).
+  s.waitEl = (q, timeout, label) => new Promise((resolve, reject) => {
+    const now = s.find(q)
+    if (now) return resolve(now)
     let done = false
-    const check = () => { if (!done && s.find(q)) { stop(); clearTimeout(t); resolve(true) } }
+    const check = () => {
+      if (done) return
+      const el = s.find(q)
+      if (el) { stop(); clearTimeout(t); resolve(el) }
+    }
     // A fade in (opacity from 0) makes an element visible on a frame, not on a mutation: while any animation or
     // transition runs, check each frame.
     let ticking = false
@@ -238,6 +308,7 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     animating()
     const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + label)) }, timeout)
   })
+  s.waitFor = (q, timeout, label) => s.waitEl(q, timeout, label).then(() => true)
   // What a person sees at the top of the page: its title and address, its open dialogs (by their heading), then
   // its top headings (h1, h2, and role=heading at aria-level 1 or 2, its default), at most `max`; and its visible
   // text, at most `chars` of it (none read when 0).
@@ -333,10 +404,10 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   })
   // An input's whole look at the page in one call (`driver.reads` counts it once): wait for the element,
   // then its centre (scrolled into view) and whether focus is in it; the wait's timeout rejects.
-  s.aim = (q, timeout, label) => s.waitFor(q, timeout, label).then(() => { const b = s.box(q); return b && { ...b, focused: s.focused(q) } })
+  // With `focus` (a click into a field before typing), a field focus is already in is not aimed at: no click goes there.
+  s.aim = (q, timeout, label, focus) => s.waitEl(q, timeout, label).then((el) => (focus && focusedIn(el) ? { focused: true } : { ...s.box(el), focused: focusedIn(el) }))
   // What `expect.same` compares: a field's value, else the element's text; null when it never showed.
-  s.text = (q, timeout) => s.waitFor(q, timeout, "").then(() => {
-    const el = s.find(q)
+  s.text = (q, timeout) => s.waitEl(q, timeout, "").then((el) => {
     const v = !el ? null : /^(input|textarea|select)$/.test(el.localName) ? el.value : (el.innerText ?? el.textContent)
     return v == null ? null : String(v).trim().replace(/\s+/g, " ")
   }, () => null)
@@ -803,7 +874,7 @@ impl Driver {
             return self.settle(Duration::ZERO).map(drop);
         }
         let sel = Self::sel(sel)?;
-        let (x, y, focused) = self.aim(&sel, o)?;
+        let (x, y, focused) = self.aim_for(&sel, o, true)?;
         if focused {
             return self.settle(Duration::ZERO).map(drop);
         }
@@ -1010,15 +1081,42 @@ impl Driver {
 
     /// `locate`, and whether focus is in the element: one look at the page (`__strobe.aim`).
     fn aim(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64, bool)> {
+        self.aim_for(sel, opts, false)
+    }
+
+    /// `aim`; with `focus`, a field focus is already in is not aimed at (`focused`, no point): the
+    /// click into it is never sent. The same rule in every engine (`__strobe.box`): the centre of the
+    /// element's visible part where a hit test finds the element, never a point outside the viewport
+    /// (where input lands on nothing, or a WebDriver browser refuses it) or on what covers it. An element
+    /// strobe scrolled into view is aimed at again once a frame drew the scroll, and the page rests two
+    /// refreshes, so the scroll's frames are neither taken as the input's reaction nor keep it busy.
+    fn aim_for(&self, sel: &Selector, opts: &Value, focus: bool) -> Result<(f64, f64, bool)> {
         let t = self.timeout(opts);
-        let b = self.read(&format!("__strobe.aim({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)?;
+        let expr = format!("__strobe.aim({}, {}, {}, {focus})", sel.page_spec(), t.as_millis(), json!(sel.source));
+        let mut b = self.read(&expr, t)?;
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
-        // The same rule in every engine: the centre of the element's visible part (`__strobe.box`), never a point
-        // outside the viewport, where an input lands on nothing (or a WebDriver browser refuses it).
+        if focus && b["focused"] == true && b["x"].is_null() {
+            return Ok((0.0, 0.0, true));
+        }
+        if b["scrolled"] == true {
+            self.call("__strobe.frame()")?;
+            b = self.read(&expr, t)?;
+            let frames = self.refresh.get() * 2;
+            match self.os.get() {
+                Some(os) => os.rest_frames()?,
+                None => self.settle(frames)?,
+            };
+        }
         match (b["x"].as_f64(), b["y"].as_f64()) {
             (Some(x), Some(y)) => Ok((x, y, b["focused"] == true)),
+            _ if b["covered"].is_string() => Err(Refusal::new(
+                ValidatorId::Covered,
+                format!("{}: {} covers it wherever it shows, even scrolled to the middle of the viewport, so input there would reach that instead", sel.source, b["covered"].as_str().unwrap_or("")),
+            )
+            .fix("wait until it is uncovered (until: a selector after what closes the cover), or close what covers it")
+            .into()),
             _ => Err(Refusal::new(ValidatorId::OutOfView, format!("{}: {}, so input there would land beside it", sel.source, b["hidden"].as_str().unwrap_or("no part of it shows")))
                 .fix("aim at what a person would click: an element with a part on the screen (a person could not reach this one either)")
                 .into()),

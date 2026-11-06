@@ -382,8 +382,9 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   `bench --check --headless` does (§5.6): no display needed, frame and latency metrics refused.
   `record app:<id> --headless` (or `exe:`) is a usage error: an app draws its own window, and the
   flag once only skipped the lock check on it.
-  `--engine` passes on as in a bench; a Firefox case gets no attribution block (no profilers yet), only
-  its check run.
+  `--engine` passes on as in a bench. A case its engine has no profiler for in strobe (a Firefox launch
+  case, any WebKit case) runs its check and then refuses `EngineUnsupported` (exit 4) with why: there is
+  no recording.
 - `--engine firefox [--headless]` (or `webkit`: Safari headed only, WPE headless on Linux) records a
   page in that engine (§13.1) from outside: its processes' CPU
   in cycles (`cpu.app.total`, `cpu.work`), GPU use and VRAM from the OS sampler, private memory, DOM
@@ -2120,18 +2121,33 @@ Selectors cross shadow roots with `>>>` (`[data-component=file] >>> [data-line="
 renders into one (a diff or code viewer) counts as a change.
 
 **Where input aims** (every engine, one rule in the page probe, `__strobe.box`): at the centre of the
-element's visible part, in viewport CSS pixels, as on native apps (13.7). The visible part is its box
-clipped by the viewport without its scroll bars and by every ancestor that clips its overflow (an
-absolutely positioned element only from its containing block up, a fixed one only by the viewport
-unless a transform, filter or containment holds it; the root and body clip as the viewport). An
-element of which nothing shows is first scrolled into view at once (`behavior: "instant"`: a page's
-smooth scrolling would leave the box where the scroll began), nearest edge. A box taller or wider than
-the viewport (a long editor) is aimed at the middle of what shows of it: aiming at its own centre had
-sent a click far outside the window (Firefox refused it: `Move target (720, 1105) is out of bounds of
-viewport dimensions (1440, 900)`; Chromium dispatched it to nothing). When nothing of the element shows
-even scrolled into view (an `overflow: clip` box, a sliver under a pixel), the call refuses
-`OutOfView`, naming the ancestor that clips it away. Clicks, hovers, drags, scrolls, wheels, `down`'s
-`at` and the click that focuses for `type` and `press` all aim this way.
+element's visible part, in viewport CSS pixels, as on native apps (13.7), where a hit test finds the
+element. The visible part is its box clipped by the viewport without its scroll bars and by every
+ancestor in the flat tree (slots and shadow hosts, as layout follows it) that clips its overflow, per
+axis (`overflow-x`, `overflow-y`). An absolutely positioned element is clipped only from its containing
+block up, a fixed one only by the viewport unless an ancestor holds it (a transform, perspective,
+filter, backdrop filter, `translate`, `scale` or `rotate`, containment, a size container, or
+`will-change` naming one of them). A box with no overflow of its own (inline, `display: contents`)
+clips nothing; the root's overflow is the viewport's, and the body's too while the root's is visible.
+A transformed or zoomed clipper's client box is scaled with it (its box over its layout size); an SVG
+clipper clips by its box. The point is kept strictly inside `innerWidth` by `innerHeight` (a WebDriver
+browser refuses a point on the edge). An element of which nothing shows is first scrolled into view at
+once (`behavior: "instant"`: a page's smooth scrolling would leave the box where the scroll began),
+nearest edge. A box taller or wider than the viewport (a long editor) is aimed at the middle of what
+shows of it: aiming at its own centre had sent a click far outside the window (Firefox refused it:
+`Move target (720, 1105) is out of bounds of viewport dimensions (1440, 900)`; Chromium dispatched it
+to nothing). The point must reach the element: `elementFromPoint` there (through open shadow roots)
+must be the element or inside it in the flat tree, or a label of it (`control`). While something else
+is there, strobe tries each of the element's line boxes (a link wrapped over two lines has a gap at its
+box's centre), then scrolls it to the middle of the viewport and tries the centre of its visible part
+and the centres of its quarters. After any scroll strobe waits for a frame, aims again, and lets the
+page rest two refreshes (on its presents where strobe follows them), so the scroll's frames are neither
+taken as the input's reaction nor keep it busy. When nothing of the element shows even scrolled into
+view (an `overflow: clip` box, a sliver under a pixel), the call refuses `OutOfView`, naming the
+ancestor that clips it away; when something covers it at every point tried, `Covered`, naming what
+covers it. Clicks, hovers, drags, scrolls, wheels, `down`'s `at` and the click that focuses for `type`
+and `press` all aim this way; `type` and `press` into a field focus is already in aim at nothing (no
+click goes there).
 
 **`page` driver** (strobe's own, over CDP or the bridge, so it works on Stable):
 
@@ -2243,15 +2259,30 @@ discarded first, so the OS has read the build from disk before any timed launch.
   in every top-level browsing context, in every document from its first script, added before strobe
   navigates (`browsingContext.navigate`, `wait: "none"`), and it answers over a BiDi channel
   (`script.message`): nothing polls the page, and no document can load before it. `prepare` gets
-  `ctx.addInitScript` and `ctx.mock` (through strobe, 9.6) in both. The page's time must fall between
-  strobe's send and when strobe heard of it, give or take 2 ms (Firefox coarsens the page's clock to
-  1 ms), or the launch refuses `ClockUnsynced`. `launch.painted` and `launch.settled` are refused for a
+  `ctx.addInitScript` and `ctx.mock` (through strobe, 9.6) in both. Every launch timed in a page
+  (an app's page too) checks the page's clock against the host's, give or take 2 ms (Firefox coarsens
+  the page's clock to 1 ms), or refuses `ClockUnsynced`: the page's time for `until` falls between the
+  start and when strobe heard of it (stamped as the observer's answer arrives), and once ready the
+  page's `performance.timeOrigin + performance.now()`, read between two reads of the host's wall
+  clock, falls between them. A page mark taken for a milestone more than that before the start
+  refuses too; within it, `launch.ready` and page milestones are never negative. In Chromium the
+  launch's auto-attach takes pages only, so no frame from another site and no worker is held paused
+  while it waits for strobe. `launch.painted` and `launch.settled` are refused for a
   page in every engine alike (`NoPresentSource`, or `Headless`): its launch is timed in the page, and
   strobe reads no window pixels for it; a paint time the page reports about itself is not when its
   frame reached the screen, so none stands in. A Firefox launch has no
   attribution block yet (its profile names the page by strobe's run marks, which no document carries
   from the navigation). WebKit (WebDriver Classic) has no preload script: its launch cases refuse
-  `EngineUnsupported`.
+  `EngineUnsupported`. `profile: "warm"` on a page is a usage error: a page's launch is always a first
+  visit (a returning visit is a run case, `page.goto` after its warmup).
+- **What a launch spans** (so two kinds are never compared as one, 9.10 "Launches"):
+
+  | Target | Starts | Caches | Ends (`launch.ready`) | Presentation |
+  |---|---|---|---|---|
+  | `native` | process spawn, host clock | fresh home (or `warm`); GPU caches per `gpuCache` | `until` in the accessibility tree, at the screen time of the frame that first showed it; a window condition; or a milestone | included (OS present events; window pixels for `painted`, `settled`) |
+  | `app`, `exe`, `webview`, `command` | process spawn, host clock | fresh home (or `warm`); GPU caches per `gpuCache` | `until` in a page, on the page's clock; a window condition; or a milestone | `until`: not included (the DOM shows it); window conditions: included (pixels) |
+  | `web`, `url` in Chromium or Firefox | strobe's navigation command, in a browser already running | fresh browser profile every launch | `until` in the page's top document, on the page's clock | not included (refused `launch.painted`, `launch.settled`) |
+  | `web`, `url` in WebKit | refused `EngineUnsupported` | | | |
 - **Window conditions** (`until: { window: "visible" | "painted" | "settled" }`): an app, exe or
   command target's launch may end on its window, as a native app's does: the window's 16x16
   pixels and its process set's CPU cycles every 30 ms (`native::watch`, the same reads for both
@@ -2588,6 +2619,10 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   A file whose targets run on different engines checks its pages from outside with OS input, as a
   timed block does; pages in several browsers and no other target are no such file, and each checks
   in its own engine.
+- **Launches** across kinds: a launch case whose sides are a page (`web`, `url`) and a spawned app
+  (`app`, `exe`, `webview`, `command`, `native`) is a usage error before anything builds (exit 2,
+  `NotComparable`): the page's launch is a navigation in a browser already running, timed in the
+  page, the app's a process spawn timed to its window or tree (9.6 "What a launch spans").
 - **Comparability** (`MetricDef.across`, §7.1). Between sides of one engine (two pages in one
   browser, two native apps) every metric compares. Between engines (Chromium, Firefox, WebKit,
   native, script: a page's own `engine`, and `app`, `exe` and `command` are Chromium), the sides are
@@ -2793,6 +2828,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `Untimed` | a run total strobe cannot take a `ctx.untimed` stretch out of, in a block whose measured runs used one: `gpu.process.3d`, `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.*`, `canvas.*`, `js.heap.retained` (refuses that metric; §9.6) |
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 | `OutOfView` | a page input's element (a click, hover, drag, scroll, wheel or `down` at it, the click that focuses for `type` or `press`) shows no part in the viewport even scrolled into view: an ancestor clips it away (`overflow: clip`), or what shows is under a pixel. Input aimed there would land beside it; the message names the clipping ancestor (9.6 "Where input aims") |
+| `Covered` | a page input's element shows, but another element is where strobe would aim at every point it tries (its centre, its line boxes, then scrolled to the middle of the viewport, the centre and the centres of its visible part's quarters): a click there would reach that instead, as for a person. The message names the covering element; not transient (an overlay that stays). A native app's covered window is `WindowHidden` (9.6 "Where input aims") |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -5364,6 +5400,21 @@ launch case passed in Chromium and Firefox (`launch.ready` 221-349 ms with `laun
 own mark when it showed `#ready`, within 1 ms of it; `launch.init`, the init script's mark, before
 `launch.booted`), `launch.painted` refused `Headless` or `NoPresentSource`, and Safari refused the
 launch case `EngineUnsupported`.
+After review: the page's clock read bracketed by two host reads, page milestones checked and never
+negative; a page's launch against an app's refuses `NotComparable`; `engine()` names a page's own
+engine; `profile: "warm"` on a page is a usage error; SoftwareGpu per target and mode, the block's
+browser, `BackgroundPriority` and `DevBuild` in page launches; pages-only auto-attach in Chromium
+launches; declarative shadow roots watched while a document loads; aiming through the flat tree, per
+axis, with every containing-block trigger and scaled clippers; a hit test (`Covered`); a frame and two
+refreshes of rest after strobe scrolls. The dev bench grew a launch whose `until` shows only inside a
+declarative shadow root, and click cases for an overlay (`Covered`, naming `div.cover`), a badge over
+the centre (a quarter), a wrapped link, an element slotted into a shadow root's scroller and one in a
+clipper scaled to half; all passed on adais (Chromium and Firefox headless), vps (both headless) and
+air (Firefox, Safari, Chromium headed; Safari refuses both launch cases). A click that strobe scrolled
+into view costs the run that frame and the rest: 70-90 ms headless on vps, 300-370 ms headed Firefox
+on air (near the settle's 300 ms cap: the window kept presenting after the scroll; why not checked). `bench --plan --base <page>
+--head <native app>` of a launch case exits 2 `NotComparable`; `record --bench` of a Firefox launch
+case refuses `EngineUnsupported` after its check.
 
 Isolation, viewports, fixtures and launch ends (2026-11-06, issues-1: 9.10, 13.2). An isolated launch on
 macOS sets `CFFIXED_USER_HOME` (Cocoa's home and `NSSearchPath…` folders in the home) and an Electron

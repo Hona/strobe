@@ -1,7 +1,8 @@
 <!doctype html>
 <!-- Where input aims: a composer taller than the viewport whose top shows (its centre is far below the window),
-an element below the fold, one half off the right edge, and one an `overflow: clip` box leaves nothing of. An
-element is marked data-clicked only when a click lands on it. -->
+an element below the fold, one half off the right edge, one an `overflow: clip` box leaves nothing of, one an
+overlay covers, one whose centre a badge covers, a link wrapped over two lines, an element slotted into a shadow
+root's scroller, and one in a scaled-down clipper. An element is marked data-clicked only when a click lands on it. -->
 <html>
   <head>
     <meta charset="utf-8" />
@@ -15,6 +16,13 @@ element is marked data-clicked only when a click lands on it. -->
       #below { height: 80px; background: #dec; }
       #box { overflow: clip; height: 40px; width: 200px; position: relative; }
       #clipped { position: absolute; top: 60px; height: 40px; width: 200px; background: #edc; }
+      .stack { position: relative; width: 300px; height: 120px; margin: 20px 0; }
+      #covered, #badged { width: 300px; height: 120px; background: #cdd; }
+      .cover { position: absolute; inset: 0; background: rgb(0 0 0 / 0.1); }
+      .badge { position: absolute; left: 110px; top: 40px; width: 80px; height: 40px; background: #fc8; }
+      #para { width: 220px; }
+      #scaler { transform: scale(0.5); transform-origin: 0 0; overflow: hidden; width: 400px; height: 100px; }
+      #scaled { height: 600px; background: #ccf; }
     </style>
   </head>
   <body>
@@ -24,10 +32,17 @@ element is marked data-clicked only when a click lands on it. -->
     <div style="height: 1500px"></div>
     <div id="below">below the fold</div>
     <div id="box"><div id="clipped">clipped</div></div>
+    <div class="stack"><div id="covered">covered</div><div class="cover"></div></div>
+    <div class="stack"><div id="badged">badged</div><div class="badge"></div></div>
+    <p id="para">Some words before it, then <a id="wrapped" href="#" onclick="return false">a link that wraps</a> onto the next line.</p>
+    <div id="host"><div id="slotted" style="height: 300px; background: #dfd">slotted</div></div>
+    <div id="scaler"><div id="scaled">scaled</div></div>
     <div style="height: 400px"></div>
     <script>
+      const root = document.getElementById("host").attachShadow({ mode: "open" })
+      root.innerHTML = '<div style="height: 60px; overflow: auto; border: 1px solid #888"><slot></slot></div><div style="height: 200px">after the scroller</div>'
       document.addEventListener("click", (e) => {
-        for (const id of ["composer", "wide", "below", "clipped"]) {
+        for (const id of ["composer", "wide", "below", "clipped", "covered", "badged", "wrapped", "slotted", "scaled"]) {
           const el = document.getElementById(id)
           if (el.contains(e.target)) el.dataset.clicked = String(Number(el.dataset.clicked ?? 0) + 1)
         }

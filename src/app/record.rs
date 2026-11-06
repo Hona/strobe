@@ -47,6 +47,11 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         .flatten()
         .filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"] })))
         .collect();
+    // A case that ran but whose engine strobe has no profiler for (a Firefox launch, a WebKit page) says so.
+    let unprofiled = out.json["warnings"].as_array().into_iter().flatten().find(|w| w["id"] == "Attribution" && w["text"].as_str().is_some_and(|t| t.contains("no attribution block")));
+    if let (true, Some(w)) = (recordings.is_empty(), unprofiled) {
+        return Err(Error::refused("EngineUnsupported", format!("{case}: no recording: {}", w["text"].as_str().unwrap_or("")), "record the case in Chromium (--engine chromium)"));
+    }
     if recordings.is_empty() {
         return Err(Error::msg(format!("{case}: no recording (the case failed or matched nothing):\n{}", out.text)));
     }

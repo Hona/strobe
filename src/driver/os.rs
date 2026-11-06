@@ -268,6 +268,11 @@ impl OsInput {
         super::settle(&self.presents, &self.pids.borrow(), min, refresh)
     }
 
+    /// After strobe scrolled an element into view: two refreshes, then until the page rests.
+    pub(super) fn rest_frames(&self) -> Result<bool> {
+        self.rest(self.frame() * 2, self.frame())
+    }
+
     /// Lets go of a held button and keys (between runs).
     pub fn release_all(&self) {
         if let Some(b) = self.pressed.get() {

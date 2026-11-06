@@ -589,6 +589,7 @@ impl<'a> Doc<'a> {
         if fair["input"].is_string() {
             let obs = |k: &str| match fair["observer"][k].as_str() {
                 Some("devtools") => "DevTools (its DOM)",
+                Some("webdriver") => "WebDriver (its DOM)",
                 Some("accessibility") => "the accessibility tree",
                 Some(o) => o,
                 None => "",

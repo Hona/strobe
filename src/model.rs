@@ -119,6 +119,7 @@ validators!(
     NotEquivalent,
     Untimed,
     OutOfView,
+    Covered,
 );
 
 impl ValidatorId {
@@ -136,7 +137,7 @@ impl ValidatorId {
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
             | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless | NoMetric | NoWaits | NotEquivalent
-            | Untimed | OutOfView => false,
+            | Untimed | OutOfView | Covered => false,
         }
     }
 }

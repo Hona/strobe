@@ -111,6 +111,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     // so caches and state from the discarded first launch are there, as for a person's second launch.
     let warm = match spec["profile"].as_str().unwrap_or("fresh") {
         "fresh" => false,
+        "warm" if web => return Err(warm_page(&s.case)),
         "warm" => true,
         other => return Err(Error::usage(format!("{}: launch.profile is fresh or warm, not {other}", s.case))),
     };
@@ -185,6 +186,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         _ if web => (web::launch(engine, &window, headless_of(ctx, s), ctx.pin)?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
+    // A launched target inherits strobe's priority, or sets its own (`BackgroundPriority`).
+    ctx.target_qos = host::background_qos(Some(browser.pid()));
     let result = (|| -> Result<Block> {
         // Timed to the window, the pages still start paused for their profilers, with an observer that
         // never resolves.
@@ -283,18 +286,17 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                 Ok((at, received, page)) => {
                     let cycles = cpu_now();
                     // The page's time is on its own clock (`performance.timeOrigin`, which Firefox coarsens to
-                    // 1 ms): it must fall between strobe's send and when strobe heard of it.
+                    // 1 ms): it must fall between strobe's start and when strobe heard of it, and the page's
+                    // clock must read the host's wall clock now, within a read bracketed on both sides.
+                    let clock = |what: String| Error::from(Refusal::new(ValidatorId::ClockUnsynced, format!("{} launch: {what}: the page's clock does not match the host's", s.case)));
                     if at < started_ms - CLOCK_SLACK_MS || at > received + CLOCK_SLACK_MS {
-                        return Err(Refusal::new(
-                            ValidatorId::ClockUnsynced,
-                            format!(
-                                "{} launch: the page says until showed {:+.1} ms from strobe's navigation, which strobe heard of at {:+.1} ms: the page's clock does not match the host's",
-                                s.case,
-                                at - started_ms,
-                                received - started_ms
-                            ),
-                        )
-                        .into());
+                        return Err(clock(format!("the page says until showed {:+.1} ms from the start, which strobe heard of at {:+.1} ms", at - started_ms, received - started_ms)));
+                    }
+                    let c0 = epoch_ms();
+                    let now = page.eval("performance.timeOrigin + performance.now()")?.as_f64().unwrap_or(f64::NAN);
+                    let c1 = epoch_ms();
+                    if !(now >= c0 - CLOCK_SLACK_MS && now <= c1 + CLOCK_SLACK_MS) {
+                        return Err(clock(format!("the page's clock read {:+.1} ms from the host's wall clock in a read that took {:.1} ms", now - c0, c1 - c0)));
                     }
                     (at, page, cycles)
                 }
@@ -326,11 +328,13 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         {
             ctx.used = Some(crate::target::webview::fit(b, p, None, false)?);
         }
-        if !ctx.gpu_checked {
-            ctx.gpu = serde_json::to_value(if headless_of(ctx, s) { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? })?;
-            ctx.browser_version = browser.version().to_string();
-            ctx.gpu_checked = true;
+        // A timed launch of a dev build is refused, as a run block's page is (an app's executable was
+        // checked before its launch).
+        if !profile {
+            validity::dev_build(&shown_page)?;
         }
+        let headless = headless_of(ctx, s);
+        let seen = browser_seen(ctx, s, headless, &browser)?;
         // Milestones may land after ready (a service that comes up behind the window), and the screen
         // settles after it: lines are collected for 1 s, and up to 3 s while a milestone is missing.
         let mut lines: Vec<Line> = Vec::new();
@@ -370,7 +374,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             f.check(&procs.iter().map(|p| p.pid).collect::<Vec<_>>());
         }
         let mut values = BTreeMap::new();
-        let ready_ms = ready_at - started_ms;
+        // Within the clock's slack (checked above): never a negative duration.
+        let ready_ms = (ready_at - started_ms).max(0.0);
         values.insert("launch.ready".to_string(), ready_ms);
         if cpu_ms.is_finite() {
             values.insert("cpu.work".to_string(), cpu_ms);
@@ -384,8 +389,17 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                 .filter_map(|(at, l, _)| m.pattern.captures(l).map(|c| c.name("at").and_then(|v| v.as_str().parse::<f64>().ok()).filter(|v| *v > 1e12).unwrap_or(*at)))
                 .min_by(f64::total_cmp);
             match first {
+                // A page's mark is on the page's clock, checked against the host's above: one before the
+                // navigation by more than its slack is a clock that does not match, never a negative time.
+                Some(at) if m.source == "page" && at < started_ms - CLOCK_SLACK_MS => {
+                    return Err(Refusal::new(
+                        ValidatorId::ClockUnsynced,
+                        format!("{} launch: the page marked {} {:.1} ms before strobe's navigation: the page's clock does not match the host's", s.case, m.name, started_ms - at),
+                    )
+                    .into());
+                }
                 Some(at) => {
-                    values.insert(format!("launch.{}", m.name), at - started_ms);
+                    values.insert(format!("launch.{}", m.name), if m.source == "page" { (at - started_ms).max(0.0) } else { at - started_ms });
                 }
                 None if s.primary == format!("launch.{}", m.name) || s.metrics.iter().any(|x| *x == format!("launch.{}", m.name)) => {
                     return Err(Error::refused("RunIncomplete", format!("{} launch: milestone {} never matched in {}", s.case, m.name, m.source), "check the milestone's match and where it looks"));
@@ -456,7 +470,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             process_set: Some(programs(&procs)),
             fixture_connected: None,
             client,
-            browser: None,
+            browser: Some(seen),
             directions: BTreeMap::new(),
             ..Block::default()
         })
@@ -517,6 +531,14 @@ pub(super) fn refusals(s: &Series, values: &BTreeMap<String, f64>, pixels: &str,
         out.insert(m.clone(), r);
     }
     out
+}
+
+/// `launch.profile: "warm"` on a page: its launch is a fresh browser and profile each time (a first
+/// visit), with no home kept between launches.
+pub(super) fn warm_page(case: &str) -> Error {
+    Error::usage(format!(
+        "{case}: launch.profile warm keeps an app's home between launches; a page's launch is a first visit in a fresh browser profile every time (a returning visit is a run case: page.goto after a warmup)"
+    ))
 }
 
 /// Whether the series declares a metric starting with `prefix` (its primary or a secondary).
@@ -752,7 +774,9 @@ fn observer(until: &Value) -> Result<String> {
 /// launch has no valid end (`late`).
 struct Watch {
     cdp: Arc<Cdp>,
-    found: Receiver<(f64, String, String)>,
+    /// When `until` showed (the page's clock, epoch ms), when strobe heard of it (epoch ms), and the
+    /// page's session and target.
+    found: Receiver<(f64, f64, String, String)>,
     stop: Arc<AtomicBool>,
     late: Arc<AtomicBool>,
     /// (session, target) of every page seen.
@@ -779,7 +803,16 @@ impl Watch {
         let stop = Arc::new(AtomicBool::new(false));
         let late = Arc::new(AtomicBool::new(false));
         let pages = Arc::new(Mutex::new(Vec::new()));
-        cdp.send("Target.setAutoAttach", json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true }), None)?;
+        // Pages only: a frame from another site (its own target) or a worker is never held paused during the
+        // timed launch. A Chromium without target filters attaches (and resumes) everything.
+        let attach = |filter: bool| {
+            let mut p = json!({ "autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true });
+            if filter {
+                p["filter"] = json!([{ "type": "page", "exclude": false }]);
+            }
+            cdp.send("Target.setAutoAttach", p, None)
+        };
+        attach(true).or_else(|_| attach(false))?;
         // Pages that already ran when strobe connected (a browser opens its first page at startup): armed
         // here, before strobe navigates one, not when the thread below gets to their attach event.
         let mut armed = std::collections::BTreeSet::new();
@@ -820,7 +853,7 @@ impl Watch {
                         while !stop.load(Ordering::Relaxed) {
                             match eval("window.__strobeLaunch", true) {
                                 Ok(r) if r["result"]["value"].is_number() => {
-                                    let _ = tx.send((r["result"]["value"].as_f64().unwrap_or(0.0), session, target));
+                                    let _ = tx.send((r["result"]["value"].as_f64().unwrap_or(0.0), epoch_ms(), session, target));
                                     return;
                                 }
                                 // A document that loaded before the init script was in: the observer goes in
@@ -847,9 +880,9 @@ impl Watch {
     }
 
     /// The epoch time `until` first showed and the page it showed in.
-    fn ready(&self, timeout: Duration) -> Result<(f64, chromium::Page)> {
-        let (at, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error::timeout(format!("not visible in {} s", timeout.as_secs())))?;
-        Ok((at, chromium::Page { cdp: self.cdp.clone(), session, target }))
+    fn ready(&self, timeout: Duration) -> Result<(f64, f64, chromium::Page)> {
+        let (at, received, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error::timeout(format!("not visible in {} s", timeout.as_secs())))?;
+        Ok((at, received, chromium::Page { cdp: self.cdp.clone(), session, target }))
     }
 
     /// A page by its target, through the session the watch attached.
@@ -895,7 +928,7 @@ impl Observer {
     /// The epoch time `until` first showed, when strobe heard of it (epoch ms), and the page it showed in.
     fn ready(&self, timeout: Duration) -> Result<(f64, f64, Page)> {
         match self {
-            Observer::Cdp(w) => w.ready(timeout).map(|(at, page)| (at, epoch_ms(), page.into())),
+            Observer::Cdp(w) => w.ready(timeout).map(|(at, received, page)| (at, received, page.into())),
             Observer::Bidi(p) => p.ready(timeout),
         }
     }

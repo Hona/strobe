@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- A launch whose until shows inside a declarative shadow root (the parser attaches it, not attachShadow), and
+only there: after the page loads, nothing outside the root changes. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>launch in a declarative shadow root</title>
+  </head>
+  <body>
+    <section id="app">
+      <template shadowrootmode="open"><div id="slot">loading</div></template>
+    </section>
+    <script>
+      setTimeout(() => {
+        const main = document.createElement("main")
+        main.id = "ready"
+        main.textContent = "ready"
+        document.getElementById("app").shadowRoot.append(main)
+        performance.mark("shown")
+      }, 200)
+    </script>
+  </body>
+</html>

@@ -513,6 +513,26 @@ struct BrowserSeen {
     software: bool,
 }
 
+/// What a page block's browser is, read once per target and mode (`ctx.browsers`): one file may run a
+/// headless Chromium target and a headed Firefox one. Headed, a software rasterizer refuses the block
+/// (`SoftwareGpu`); headless refuses nothing (frames and GPU use are refused anyway). The first one read
+/// is the experiment's GPU and browser.
+fn browser_seen(ctx: &mut Ctx, s: &Series, headless: bool, browser: &WebBrowser) -> Result<BrowserSeen> {
+    let key = format!("{}{}", s.target, if headless { ":headless" } else { "" });
+    if let Some(b) = ctx.browsers.get(&key) {
+        return Ok(b.clone());
+    }
+    let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
+    if !ctx.gpu_checked {
+        ctx.gpu = serde_json::to_value(&gpu)?;
+        ctx.browser_version = browser.version().to_string();
+        ctx.gpu_checked = true;
+    }
+    let b = BrowserSeen { version: browser.version().to_string(), software: gpu.software };
+    ctx.browsers.insert(key, b.clone());
+    Ok(b)
+}
+
 /// The browsers a series' blocks ran, for its result and track's fingerprint (`a / b` when the sides
 /// of an implementation comparison ran two).
 fn series_browser(blocks: &[Block]) -> Value {
@@ -657,7 +677,8 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
         "X11 Present"
     };
     let observer = |v: Option<&Variant>| match v.and_then(|v| v.target.as_deref()).map(|t| engine(&ctx.describe["targets"][t])) {
-        Some("chromium" | "firefox" | "webkit") => "devtools",
+        Some("chromium") => "devtools",
+        Some("firefox" | "webkit") => "webdriver",
         Some("native") => "accessibility",
         _ => "none",
     };
@@ -4009,23 +4030,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         lapped.set(Instant::now());
     };
     let result = (|| -> Result<Block> {
-        // Once per target and mode: one file may run a headless Chromium target and a headed Firefox one.
-        let seen_key = format!("{}{}", s.target, if headless { ":headless" } else { "" });
-        let seen = match ctx.browsers.get(&seen_key) {
-            Some(b) => b.clone(),
-            None => {
-                // Headless, a software rasterizer refuses nothing: frames and GPU use are refused anyway.
-                let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
-                if !ctx.gpu_checked {
-                    ctx.gpu = serde_json::to_value(&gpu)?;
-                    ctx.browser_version = browser.version().to_string();
-                    ctx.gpu_checked = true;
-                }
-                let b = BrowserSeen { version: browser.version().to_string(), software: gpu.software };
-                ctx.browsers.insert(seen_key, b.clone());
-                b
-            }
-        };
+        let seen = browser_seen(ctx, s, headless, &browser)?;
         let page: Page = match (&browser, app) {
             (WebBrowser::Chromium(b), true) => electron::main_page(b)?.into(),
             (WebBrowser::Chromium(_), false) | (WebBrowser::Firefox(_) | WebBrowser::Webkit(_), _) => browser.page()?,
@@ -5467,6 +5472,24 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
     let (Some(b), Some(h)) = (variants[0].target.as_deref(), variants.get(1).and_then(|v| v.target.as_deref())) else { return Ok(()) };
     let (tb, th) = (&describe["targets"][b], &describe["targets"][h]);
     let cross = engine(tb) != engine(th);
+    // A page's launch is a navigation in a browser strobe started before it, timed in the page; an app's
+    // is a process spawn timed to its window or tree (SPEC 9.6 "What a launch spans"): no one span.
+    let page = |t: &Value| matches!(t["kind"].as_str(), Some("web" | "url"));
+    if page(tb) != page(th)
+        && let Some(s) = series.iter().find(|s| s.gap.is_none() && s.refused.is_none() && s.launch.is_object())
+    {
+        let (p, a) = if page(tb) { (&variants[0].name, &variants[1].name) } else { (&variants[1].name, &variants[0].name) };
+        return Err(Error::usage_refused(
+            Refusal::new(
+                ValidatorId::NotComparable,
+                format!(
+                    "{}: {p}'s launch is a navigation in a browser that was already running, timed to its page, and {a}'s a process spawn timed to its window or tree: the two launches span different work",
+                    s.case
+                ),
+            )
+            .fix("compare the launch of two apps (a webview or app target for the page) or of two pages, or compare work after the launch in a run case"),
+        ));
+    }
     for s in series.iter().filter(|s| s.gap.is_none() && s.refused.is_none() && cross) {
         if let Some(d) = model::metric(&s.primary).filter(|d| d.across == model::Across::PerSide) {
             let why = format!(
@@ -5794,6 +5817,9 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
     }
     if !page {
         return Ok(None);
+    }
+    if s.launch["profile"] == "warm" {
+        return Err(launch::warm_page(&s.case));
     }
     let engine = engine_of(t);
     // On one side of an implementation comparison, the side named.

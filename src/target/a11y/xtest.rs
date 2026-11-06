@@ -47,6 +47,16 @@ impl Target {
     pub fn moved(self, x: f64, y: f64) -> Target {
         Target { x: x.round() as i32, y: y.round() as i32, ..self }
     }
+
+    /// The top-level window the point hit-tested to.
+    pub fn top(&self) -> isize {
+        self.win
+    }
+
+    /// The root point, in whole pixels.
+    pub fn point(&self) -> (i64, i64) {
+        (self.x as i64, self.y as i64)
+    }
 }
 
 /// The X server knows which button XTest holds: motion carries it without a flag.
@@ -204,6 +214,12 @@ impl Poster {
         let (ox, oy) = crate::host::x11::client_origin(top).ok_or_else(|| Error::msg("the app's window closed"))?;
         let scale = crate::host::window_state(top).map_or(1.0, |w| w.scale());
         Ok((ox as f64 + x * scale, oy as f64 + y * scale))
+    }
+
+    /// `top`'s frame on the root window (x, y, width, height), in pixels.
+    pub fn frame(&self, top: isize) -> Result<(f64, f64, f64, f64)> {
+        let r = crate::host::window_state(top).ok_or_else(|| Error::msg("the app's window closed"))?.rect;
+        Ok((r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64))
     }
 
     /// On X11 the pointer's move is the real cursor's: this only remembers where the user left it.

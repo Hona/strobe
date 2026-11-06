@@ -71,6 +71,16 @@ impl Target {
     pub fn moved(self, x: f64, y: f64) -> Target {
         Target { x, y, ..self }
     }
+
+    /// The window the point hit-tested to.
+    pub fn top(&self) -> isize {
+        self.window as isize
+    }
+
+    /// The point, in whole points.
+    pub fn point(&self) -> (i64, i64) {
+        (self.x.round() as i64, self.y.round() as i64)
+    }
 }
 
 /// macOS tracks the held button itself (`move_to` sends drags while it is down).
@@ -171,6 +181,7 @@ impl Poster {
     }
 
     fn post(&self, pid: u32, e: Cf) -> u64 {
+        crate::host::macos::note_posted();
         let at = crate::host::now_ns();
         unsafe { CGEventPostToPid(pid as i32, e.0) };
         at
@@ -178,6 +189,7 @@ impl Poster {
 
     /// A pointer event, into the session's event stream at its location.
     fn post_pointer(&self, e: Cf) -> u64 {
+        crate::host::macos::note_posted();
         let at = crate::host::now_ns();
         unsafe { CGEventPost(SESSION_TAP, e.0) };
         at
@@ -224,12 +236,23 @@ impl Poster {
 
     /// The window of `pids` at (x, y) in points, or why a click there would reach something else:
     /// what the window server hit-tests there (which honours click-through overlays) must be the app's.
+    /// An app whose accessibility implements no hit test there (Safari's web content, kept in another
+    /// process, answered `kAXErrorNotImplemented` on air) is hit-tested by the window list instead: the
+    /// frontmost window at the point, at any level, which must be the app's. Every other accessibility
+    /// error stays one.
     pub fn target(&self, pids: &[u32], x: f64, y: f64) -> Result<Target> {
-        let (pid, at) = super::ax::app_at(x, y)?;
-        if !pids.contains(&pid) {
-            let what = super::ax::describe(&at);
-            return Err(Error::refused("WindowHidden", format!("another app's window covers the point ({x:.0}, {y:.0}): {what} of process {pid}"), "keep the app's window uncovered while strobe drives it"));
-        }
+        let covered = |what: String, pid: u32| -> Error {
+            Error::refused("WindowHidden", format!("another app's window covers the point ({x:.0}, {y:.0}): {what} of process {pid}"), "keep the app's window uncovered while strobe drives it")
+        };
+        let pid = match super::ax::app_at(x, y)? {
+            Some((pid, at)) if !pids.contains(&pid) => return Err(covered(super::ax::describe(&at), pid)),
+            Some((pid, _)) => pid,
+            None => match crate::host::macos::front_window_at(x, y) {
+                Some((pid, _, owner)) if !pids.contains(&pid) => return Err(covered(format!("a window of {owner}"), pid)),
+                Some((pid, window, _)) => return Ok(Target { pid, window, x, y }),
+                None => return Err(Error::msg(format!("no window at ({x:.0}, {y:.0}), and the app there answers no accessibility hit test"))),
+            },
+        };
         let window = crate::host::macos::window_at(&[pid], x, y).ok_or_else(|| Error::msg(format!("no window of the app at ({x:.0}, {y:.0})")))?;
         Ok(Target { pid, window, x, y })
     }
@@ -240,6 +263,12 @@ impl Poster {
         Ok((w.rect.0 as f64 + x, w.rect.1 as f64 + y))
     }
 
+    /// `top`'s frame (x, y, width, height), in points.
+    pub fn frame(&self, top: isize) -> Result<(f64, f64, f64, f64)> {
+        let r = crate::host::window_state(top).ok_or_else(|| Error::msg("the app's window closed"))?.rect;
+        Ok((r.0 as f64, r.1 as f64, r.2 as f64, r.3 as f64))
+    }
+
     /// Moves the real cursor onto the point without an event: true when it got there.
     pub fn park(&self, x: f64, y: f64) -> Result<bool> {
         let mut st = self.st();
@@ -248,6 +277,7 @@ impl Poster {
         {
             st.cursor0 = Some(unsafe { CGEventGetLocation(e.0) });
         }
+        crate::host::macos::note_posted();
         Ok(unsafe { CGWarpMouseCursorPosition(CGPoint { x, y }) } == 0)
     }
 
@@ -387,6 +417,7 @@ impl Poster {
             }
         }
         if let Some(p) = st.cursor0.take() {
+            crate::host::macos::note_posted();
             unsafe { CGWarpMouseCursorPosition(p) };
         }
     }

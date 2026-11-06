@@ -71,11 +71,13 @@ pub fn refresh_ms(vsyncs: &[(u64, u32)], t0: u64, t1: u64, display: Option<&crat
     periods.values().all(|p| (p - first).abs() <= first * 0.02).then_some(first)
 }
 
-/// Per run window: displayed frames and discarded presents.
+/// Per run window: displayed frames, discarded presents, and presents whose way to the screen the OS's
+/// events lost (Windows: a DirectComposition surface's, whose composition they do not show).
 #[derive(Default)]
 pub struct RunFrames {
     pub shown: Vec<Shown>,
     pub discarded: usize,
+    pub lost: usize,
 }
 
 /// The displayed and discarded presents of `pids` started in `[t0, t1)`.
@@ -92,6 +94,7 @@ pub fn from_timed(presents: &[Present], pids: &[u32], run: &Timed) -> RunFrames 
             match p.state.as_str() {
                 "displayed" => out.shown.push(Shown { stream: stream(p), pending_ns: p.start_ns, screen_ns: p.screen_ns, seg }),
                 "discarded" => out.discarded += 1,
+                "lost" => out.lost += 1,
                 _ => {}
             }
         }
@@ -119,6 +122,16 @@ pub fn native_values(p: &Presents, pids: &[u32], timed: &[Timed], display: Optio
     let refresh = refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000, display);
     let frames: Vec<RunFrames> = timed.iter().map(|r| from_timed(&p.presents, pids, r)).collect();
     let mut out = NativeFrames { values: values(&frames, refresh), ..NativeFrames::default() };
+    // A present whose way to the screen was lost may have shown a frame: counted with none, the frames
+    // would read short (Firefox's DirectComposition surfaces on Windows read 0), so none are given.
+    let lost: usize = frames.iter().map(|f| f.lost).sum();
+    if lost > 0 {
+        out.refused = Some(format!(
+            "NoPresentSource: the OS's present events lost the way to the screen of {lost} of the app's presents in the measured runs (a DirectComposition surface's composition is not in them), so its frames would read short"
+        ));
+        out.values.clear();
+        return out;
+    }
     if refresh.is_none() && !p.vsyncs.is_empty() && display.is_none() {
         out.refused = Some("NoPresentSource: several displays run at different refresh rates and the target's window is unknown, so its refresh period is too".into());
         out.values.clear();

@@ -110,6 +110,16 @@ impl Target {
         let (x, y) = (x.round() as i32, y.round() as i32);
         Target { hwnd: self.hwnd, client: (self.client.0 + x - self.screen.0, self.client.1 + y - self.screen.1), screen: (x, y) }
     }
+
+    /// The top-level window the point hit-tested to (the window, or the root of the child it found).
+    pub fn top(&self) -> isize {
+        unsafe { GetAncestor(self.hwnd as HWND, GA_ROOT) as isize }
+    }
+
+    /// The screen point, in whole physical pixels.
+    pub fn point(&self) -> (i64, i64) {
+        (self.screen.0 as i64, self.screen.1 as i64)
+    }
 }
 
 /// The button flag (`MK_*`) a move carries while `b` is held.
@@ -186,6 +196,17 @@ impl Poster {
             // Physical pixels per device-independent one: the monitor's DPI over 96.
             let px = windows_sys::Win32::UI::HiDpi::GetDpiForWindow(h).max(96) as f64 / 96.0 / window_scale(h).max(0.01);
             Ok((o.x as f64 + x * px, o.y as f64 + y * px))
+        })
+    }
+
+    /// `top`'s frame on the screen (x, y, width, height), in this thread's physical pixels.
+    pub fn frame(&self, top: isize) -> Result<(f64, f64, f64, f64)> {
+        self.call(move |_| {
+            let mut r: windows_sys::Win32::Foundation::RECT = unsafe { std::mem::zeroed() };
+            if unsafe { GetWindowRect(top as HWND, &mut r) } == 0 {
+                return Err(Error::msg("the app's window closed"));
+            }
+            Ok((r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64))
         })
     }
 

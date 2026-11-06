@@ -1,18 +1,20 @@
-//! OS input to a page measured from outside (SPEC §9.10, §13.6): against a native implementation a
-//! page gets the input the native side gets, from the OS's own posters (`a11y::input`: posted window
-//! messages on Windows, Quartz events on macOS, XTest on X11), never DevTools. Elements are still
-//! found through the page probe; their page point goes to the screen through a map strobe measures
-//! at the block's start, from where two posted pointer moves landed in the page (which also proves
-//! posted input reaches it). Each kind of input is checked again as the block goes: a key, button or
-//! wheel strobe posted that no trusted event in the page matched refuses the block `InputMismatch`
-//! instead of timing input the page never got. Interaction latency then follows the native rule
-//! (SPEC §7.4), with the page's own changes (`CHANGES_SCRIPT`: DOM mutations, input and scroll
-//! events) standing in for an accessibility tree's. Chromium pages only for now.
+//! OS input to a page measured from outside (SPEC §9.10, §13.6): against a native implementation or a
+//! page in another engine a page gets the input the native side gets, from the OS's own posters
+//! (`a11y::input`: posted window messages on Windows, Quartz events on macOS, XTest on X11), never
+//! DevTools or WebDriver. Every engine the same way: elements are still found through the page probe;
+//! their page point goes to the screen through a map strobe measures at the block's start, from where
+//! posted pointer moves landed in the page (which also proves posted input reaches it), never from an
+//! engine's own idea of where its viewport is. The map holds while the window and the page's viewport
+//! stay where they were: checked after every run and reset (`placed`). Each kind of input is checked
+//! again as the block goes: a key, button or wheel strobe posted that no trusted event in the page
+//! matched refuses the block `InputMismatch` instead of timing input the page never got. Interaction
+//! latency then follows the native rule (SPEC §7.4), with the page's own changes (`CHANGES_SCRIPT`: DOM
+//! mutations, input and scroll events) standing in for an accessibility tree's.
 
 use super::{Driver, no_selector};
 use crate::driver::native::{Input, Log};
 use crate::host;
-use crate::model::{Error, Refusal, Result, ValidatorId};
+use crate::model::{Error, Refusal, Result, ValidatorId, WebEngine};
 use crate::probe::present::PresentCapture;
 use crate::target::a11y::input::{self, Button, Key, Mods, Named, Poster, Target};
 use crate::target::a11y::keys;
@@ -28,30 +30,50 @@ pub type Presents = Rc<RefCell<Option<PresentCapture>>>;
 /// The page calls that give input: through the OS in this mode.
 pub const INPUT: &[&str] = &["click", "hover", "move", "type", "press", "down", "up", "drag", "scroll", "wheel"];
 
-/// Installed in every document before its scripts: counts the trusted keys, presses and wheel turns
-/// that reached the page, and keeps the first pointer moves (where a posted move landed). Listeners
-/// only, passive, at the window's capture phase ahead of the page's own.
+/// Installed in every document before its scripts: counts the trusted inputs that reached the page in
+/// `COUNTED`'s order (key downs and ups, button presses and releases, wheel turns, pointer moves), keeps
+/// the first pointer moves (where a posted move landed), and counts what moves or resizes the viewport
+/// (`resize`, `fullscreenchange`, the visual viewport's `resize`). Listeners only, passive, at the
+/// window's capture phase ahead of the page's own.
 const SCRIPT: &str = r#"window.__strobeOs ??= (() => {
-  const s = { keys: 0, presses: 0, wheels: 0, moves: [] }
-  const on = (e, f) => addEventListener(e, f, { capture: true, passive: true })
-  on("keydown", (e) => { if (e.isTrusted) s.keys++ })
-  on("pointerdown", (e) => { if (e.isTrusted) s.presses++ })
-  on("wheel", (e) => { if (e.isTrusted) s.wheels++ })
-  on("pointermove", (e) => { if (e.isTrusted && s.moves.length < 16) s.moves.push([e.clientX, e.clientY]) })
+  const s = { n: [0, 0, 0, 0, 0, 0], moves: [], viewport: 0 }
+  const on = (t, e, f) => t?.addEventListener(e, f, { capture: true, passive: true })
+  ;["keydown", "keyup", "pointerdown", "pointerup", "wheel", "pointermove"].forEach((e, i) => on(window, e, (ev) => { if (ev.isTrusted) s.n[i]++ }))
+  on(window, "pointermove", (e) => { if (e.isTrusted && s.moves.length < 16) s.moves.push([e.clientX, e.clientY]) })
+  for (const [t, e] of [[window, "resize"], [window, "fullscreenchange"], [window.visualViewport, "resize"]]) on(t, e, () => { s.viewport++ })
   return s
 })(), true
 //# sourceURL=strobe-os-input.js"#;
 
+/// What `SCRIPT` counts, by index into its `n` and `OsInput::posted`: each kind's name, and whether
+/// every one posted must arrive (a discrete key or button edge) or at least one (a continuous kind
+/// the browser or the OS coalesces: wheel turns and pointer moves).
+const COUNTED: [(&str, bool); 6] = [("key downs", true), ("key ups", true), ("button presses", true), ("button releases", true), ("wheel turns", false), ("pointer moves", false)];
+const KEY_DOWN: usize = 0;
+const KEY_UP: usize = 1;
+const PRESS: usize = 2;
+const RELEASE: usize = 3;
+const WHEEL: usize = 4;
+const MOVE: usize = 5;
+
 /// A window's frame and client size.
 type Geometry = ((i32, i32, i32, i32), (i32, i32));
+
+/// Where the page sees its viewport: the window's place on the screen, the viewport's size, the device
+/// pixels per CSS pixel (which a page zoom changes), the window's outer size (what a toolbar above the
+/// page adds), and the visual viewport's scale and offsets (a pinch zoom). Read in every engine the
+/// same way.
+const VIEWPORT: &str = "JSON.stringify([screenX, screenY, innerWidth, innerHeight, devicePixelRatio, outerWidth, outerHeight, visualViewport?.scale ?? 1, visualViewport?.offsetLeft ?? 0, visualViewport?.offsetTop ?? 0])";
 
 pub struct OsInput {
     poster: Poster,
     pids: RefCell<Vec<u32>>,
-    /// The browser's window (keys go to it), and its frame and client size when strobe last mapped
-    /// the page onto the screen: a window that moved, resized or was replaced is mapped again.
+    /// The browser's window (keys go to it), its frame and client size, and the page's viewport
+    /// (`VIEWPORT`) when strobe last mapped the page onto the screen: after setup a window or viewport
+    /// that moved, resized, zoomed or was replaced is mapped again; after a run or reset it refuses.
     top: Cell<isize>,
     geometry: Cell<Geometry>,
+    viewport: RefCell<Vec<f64>>,
     /// Screen = origin + page point × scale (screen units: physical pixels, points on macOS).
     origin: Cell<(f64, f64)>,
     scale: Cell<(f64, f64)>,
@@ -63,9 +85,13 @@ pub struct OsInput {
     /// Where the pointer is (screen point and its window), and the button `down` or `drag` holds.
     pointer: Cell<Option<(f64, f64, Target)>>,
     pressed: Cell<Option<Button>>,
-    /// Key downs, button presses and wheel steps posted since the last check that they arrived, and
-    /// the document they went to (`performance.timeOrigin`).
-    posted: Cell<[u64; 3]>,
+    /// What strobe posted since the last check that it arrived (`COUNTED`), and the document it went to
+    /// (`performance.timeOrigin`). A move counts only onto another point than the last one posted: a
+    /// browser fires no `pointermove` for a pointer that stayed where it was.
+    posted: Cell<[u64; 6]>,
+    moved_to: Cell<Option<(i64, i64)>>,
+    /// Keys `down` holds, whose `up` posts a key up.
+    held: RefCell<Vec<Key>>,
     document: Cell<f64>,
     parked: Cell<Option<bool>>,
     pacer: super::Pacer,
@@ -76,8 +102,55 @@ pub struct OsInput {
 
 fn refused(summary: String) -> Error {
     Refusal::new(ValidatorId::InputMismatch, summary)
-        .fix("strobe gives a page measured against a native app the OS's input, as the native side gets; where the OS's posted input cannot reach the page, compare two pages or two native apps")
+        .fix("strobe gives a page measured from outside (against a native app, or a page in another engine) the OS's input, as the other side gets; where the OS's posted input cannot reach the page, compare pages in one engine or two native apps")
         .into()
+}
+
+/// Why no OS input reaches a page of `engine` here, if none does: a headless browser has no window,
+/// and Safari keeps a WebDriver session's window from every input but its driver's (pointer moves
+/// strobe posted through the OS reached no page on air, Safari 27; a click there asks whether to stop
+/// the session). Such a page takes its driver's input outside its runs, and none in them.
+pub fn unreachable(engine: WebEngine, headless: bool) -> Option<Refusal> {
+    if headless {
+        return Some(
+            Refusal::new(ValidatorId::Headless, "a headless browser has no window, so the OS has nowhere to send input")
+                .fix("run the pages headed (drop --headless and the target's headless), or keep input out of runs (setup and reset may use it)"),
+        );
+    }
+    (engine == WebEngine::Webkit && cfg!(target_os = "macos")).then(|| {
+        Refusal::new(ValidatorId::InputMismatch, "Safari keeps the window of a WebDriver session from every input but its driver's, so the OS's input never reaches the page")
+            .fix("compare the Safari page with Safari pages only (input through its driver on every side), or keep input out of its runs (setup and reset may use it)")
+    })
+}
+
+/// The page's `VIEWPORT` now.
+fn viewport(page: &Page) -> Result<Vec<f64>> {
+    let v = page.eval(VIEWPORT)?;
+    Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default())
+}
+
+/// The browser shows no window strobe's OS input can reach. On Linux with a Wayland session that is
+/// most likely a Wayland window: XTest (strobe's OS input there) reaches X11 windows only.
+fn no_window(pids: &[u32]) -> Error {
+    if cfg!(target_os = "linux") && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        return Refusal::new(
+            ValidatorId::InputMismatch,
+            format!("OS input to the page: the browser (pids {pids:?}) shows no X11 window, and this session runs Wayland (WAYLAND_DISPLAY is set): it opened a Wayland window, which XTest, strobe's OS input on Linux, cannot reach"),
+        )
+        .fix("measure pages from outside in an X11 session (or with WAYLAND_DISPLAY unset, so the browser opens an X11 window)")
+        .into();
+    }
+    Error::msg("OS input to the page: the browser shows no window")
+}
+
+/// Another window of the browser itself (a dialog, a popup, its developer tools) is where strobe would
+/// send input, not the page's window.
+fn covered_by_own(x: f64, y: f64) -> Error {
+    Error::refused(
+        "WindowHidden",
+        format!("another window of the browser (a dialog, a popup, its developer tools) is at ({x:.0}, {y:.0}), where strobe would send the page's input"),
+        "close it, or keep it off the page while strobe drives it",
+    )
 }
 
 fn locked() -> Error {
@@ -94,6 +167,7 @@ impl OsInput {
             pids: RefCell::new(pids),
             top: Cell::new(0),
             geometry: Cell::new(((0, 0, 0, 0), (0, 0))),
+            viewport: RefCell::new(Vec::new()),
             origin: Cell::new((0.0, 0.0)),
             scale: Cell::new((1.0, 1.0)),
             frame_ms: Cell::new(1000.0 / 60.0),
@@ -102,7 +176,9 @@ impl OsInput {
             last_input: Cell::new(0),
             pointer: Cell::new(None),
             pressed: Cell::new(None),
-            posted: Cell::new([0; 3]),
+            posted: Cell::new([0; 6]),
+            moved_to: Cell::new(None),
+            held: RefCell::new(Vec::new()),
             document: Cell::new(0.0),
             parked: Cell::new(None),
             pacer: super::Pacer::default(),
@@ -112,30 +188,82 @@ impl OsInput {
         Ok(os)
     }
 
-    /// Maps the page onto the screen again when its window moved, resized or was replaced since the
-    /// last map (setup may do any of those): after setup, before the runs.
+    /// Maps the page onto the screen again when its window or viewport moved, resized, zoomed or was
+    /// replaced since the last map (setup may do any of those): after setup, before the runs.
     pub fn recheck(&self, page: &Page) -> Result<()> {
-        let w = host::main_window(&self.pids.borrow()).ok_or_else(|| Error::msg("OS input to the page: the browser shows no window"))?;
-        if w.hwnd != self.top.get() || (w.rect, w.client) != self.geometry.get() { self.map(page) } else { Ok(()) }
+        match self.moved(page)? {
+            Some(_) => self.map(page),
+            None => Ok(()),
+        }
     }
 
-    /// Two points in the page's lower part, as screen points through the input thread's own
-    /// (DPI-aware) coordinates, each posted as a move from just beside it; where the trusted
-    /// `pointermove`s landed in the page gives the origin and scale, and proves posted input reaches it.
+    /// Refuses `InputMismatch` when the window or the page's viewport moved, resized, zoomed or was
+    /// replaced since strobe mapped the page onto the screen: input after that went to points mapped
+    /// for where it was. After each run and reset (`what`), outside its span.
+    /// The page's own word counts too: a `resize`, `fullscreenchange` or visual viewport `resize` since
+    /// `begin` refuses even when the viewport came back (resized and restored within the run).
+    pub fn placed(&self, page: &Page, what: &str) -> Result<()> {
+        let why = match self.moved(page)? {
+            Some(why) => Some(why.to_string()),
+            None => match page.eval("window.__strobeOs?.viewport ?? 0")?.as_f64().unwrap_or(0.0) {
+                0.0 => None,
+                n => Some(format!("the page's viewport resized {n} time(s) (resize, fullscreenchange or a visual viewport resize)")),
+            },
+        };
+        match why {
+            Some(why) => Err(Refusal::new(ValidatorId::InputMismatch, format!("{why} during the {what}: strobe's OS input after that went to screen points mapped for where the page was"))
+                .fix("keep the browser's window, its size and the page's zoom as they are while the runs go (setup may change them: strobe maps the page again after it)")
+                .into()),
+            None => Ok(()),
+        }
+    }
+
+    /// What changed since the last map, if anything: the window (replaced, moved or resized, from the
+    /// OS) or the viewport (moved, resized or zoomed, as the page sees it).
+    fn moved(&self, page: &Page) -> Result<Option<&'static str>> {
+        let w = host::main_window(&self.pids.borrow()).ok_or_else(|| no_window(&self.pids.borrow()))?;
+        Ok(if w.hwnd != self.top.get() {
+            Some("the browser's window was replaced")
+        } else if (w.rect, w.client) != self.geometry.get() {
+            Some("the browser's window moved or resized")
+        } else if viewport(page)? != *self.viewport.borrow() {
+            Some("the page's viewport moved, resized or zoomed")
+        } else {
+            None
+        })
+    }
+
+    /// Three points in the page, in the input thread's own (DPI-aware) screen units, each posted as a
+    /// move from just beside it; where the trusted `pointermove`s landed in the page gives the origin
+    /// and scale from two, and proves posted input reaches it. The points are fractions of the window's
+    /// frame as the input thread reads it, below the share of the window's height the browser draws
+    /// above the page (its outer height less the viewport's, over its outer height, as the page sees
+    /// them: a ratio of one unit, so a device scale, a page zoom or a Retina display changes nothing),
+    /// and whole screen units, as the posters send them. The map must hold: the third point lands
+    /// where it says, and the viewport it puts on the screen lies in the window's frame; else the
+    /// block is refused `InputMismatch`.
     fn map(&self, page: &Page) -> Result<()> {
         if host::session_locked() {
             return Err(locked());
         }
         let pids = self.pids.borrow().clone();
-        let w = host::main_window(&pids).ok_or_else(|| Error::msg("OS input to the page: the browser shows no window"))?;
-        let size = page.eval("[innerWidth, innerHeight]")?;
-        let (iw, ih) = (size[0].as_f64().unwrap_or(0.0), size[1].as_f64().unwrap_or(0.0));
-        let dip = [(0.3 * iw, 0.55 * ih), (0.7 * iw, 0.85 * ih)];
+        let w = host::main_window(&pids).ok_or_else(|| no_window(&pids))?;
+        let view = viewport(page)?;
+        let at = |i: usize| view.get(i).copied().unwrap_or(0.0);
+        let (iw, ih, oh) = (at(2), at(3), at(6));
+        let r = self.poster.frame(w.hwnd)?;
+        // An estimate (borders, and a title bar the page does not count, move it a little): the points
+        // are 0.3 of the content's height from its edges either way.
+        let chrome = if oh > 0.0 { ((oh - ih) / oh).clamp(0.0, 0.5) } else { 0.0 };
+        let (top, height) = (r.1 + chrome * r.3, r.3 * (1.0 - chrome));
+        let points = [(0.3, 0.4), (0.7, 0.7), (0.7, 0.4)].map(|(fx, fy): (f64, f64)| ((r.0 + fx * r.2).round(), (top + fy * height).round()));
         let mut probes = Vec::new();
         let mut landed = Vec::new();
-        for (dx, dy) in dip {
-            let (px, py) = self.poster.client_point(w.hwnd, dx, dy)?;
+        for (px, py) in points {
             let t = self.poster.target(&pids, px, py)?;
+            if t.top() != w.hwnd {
+                return Err(covered_by_own(px, py));
+            }
             self.poster.park(px, py)?;
             // A move onto the point the pointer already sits on sends nothing on X11: come from beside
             // it, let that move arrive, and only then look for the one onto the point.
@@ -163,10 +291,33 @@ impl OsInput {
                 probes[1].1 - probes[0].1
             )));
         }
-        self.origin.set((probes[0].0 - landed[0][0] * scale.0, probes[0].1 - landed[0][1] * scale.1));
+        let origin = (probes[0].0 - landed[0][0] * scale.0, probes[0].1 - landed[0][1] * scale.1);
+        // The third move, which the map did not use, lands where the map puts it (within 2 page pixels).
+        let at = ((probes[2].0 - origin.0) / scale.0, (probes[2].1 - origin.1) / scale.1);
+        if (at.0 - landed[2][0]).abs() > 2.0 || (at.1 - landed[2][1]).abs() > 2.0 {
+            return Err(refused(format!(
+                "the page's points do not map to the screen by one origin and scale: a third move posted at ({:.0}, {:.0}) landed at ({:.1}, {:.1}) in the page, where the map put ({:.1}, {:.1})",
+                probes[2].0, probes[2].1, landed[2][0], landed[2][1], at.0, at.1
+            )));
+        }
+        // The viewport the map puts on the screen lies in the window's frame (within 3 screen units).
+        let slack = 3.0;
+        let (x0, y0, x1, y1) = (origin.0, origin.1, origin.0 + iw * scale.0, origin.1 + ih * scale.1);
+        if x0 < r.0 - slack || y0 < r.1 - slack || x1 > r.0 + r.2 + slack || y1 > r.1 + r.3 + slack {
+            return Err(refused(format!(
+                "the page's viewport, mapped onto the screen from where strobe's moves landed, is ({x0:.0}, {y0:.0})-({x1:.0}, {y1:.0}), outside the browser's window ({:.0}, {:.0})-({:.0}, {:.0}) as the OS reports it",
+                r.0,
+                r.1,
+                r.0 + r.2,
+                r.1 + r.3
+            )));
+        }
+        self.origin.set(origin);
         self.scale.set(scale);
         self.top.set(w.hwnd);
         self.geometry.set((w.rect, w.client));
+        *self.viewport.borrow_mut() = view;
+        self.moved_to.set(probes.last().map(|p| (p.0 as i64, p.1 as i64)));
         self.frame_ms.set(host::display_of(w.hwnd).filter(|d| d.hz > 1.0).map_or(1000.0 / 60.0, |d| 1000.0 / d.hz));
         self.document.set(page.eval("performance.timeOrigin")?.as_f64().unwrap_or(0.0));
         Ok(())
@@ -228,18 +379,34 @@ impl OsInput {
         Ok(())
     }
 
-    /// The window the OS hit-tests at a screen point, which must be the browser's.
+    /// The window the OS hit-tests at a screen point, which must be the page's window itself: not
+    /// another app's (`WindowHidden` from the poster), nor another of the browser's (a dialog, a popup,
+    /// its developer tools).
     fn target(&self, x: f64, y: f64) -> Result<Target> {
         if host::session_locked() {
             return Err(locked());
         }
-        self.poster.target(&self.pids.borrow(), x, y)
+        let t = self.poster.target(&self.pids.borrow(), x, y)?;
+        if t.top() != self.top.get() {
+            return Err(covered_by_own(x, y));
+        }
+        Ok(t)
+    }
+
+    /// A pointer move posted to `t`, counted for `delivered` when it goes to another point.
+    fn move_to(&self, t: Target, buttons: usize) -> Result<u64> {
+        let at = self.poster.move_to(t, buttons)?;
+        let p = t.point();
+        if self.moved_to.replace(Some(p)) != Some(p) {
+            self.count(MOVE);
+        }
+        Ok(at)
     }
 
     /// A pointer move to a screen point; while a button is held a drag's move, kept for `input.rate`.
     fn pointer_to(&self, x: f64, y: f64, t: Target) -> Result<u64> {
         self.park(x, y)?;
-        let at = self.poster.move_to(t, self.pressed.get().map_or(0, input::held_flag))?;
+        let at = self.move_to(t, self.pressed.get().map_or(0, input::held_flag))?;
         self.pointer.set(Some((x, y, t)));
         if self.pressed.get().is_some()
             && let Some(d) = self.log.borrow_mut().drags.last_mut()
@@ -254,8 +421,8 @@ impl OsInput {
         let (_, _, t) = self.pointer.get().ok_or_else(|| Error::usage("page.down(\"Mouse\") presses where the pointer is: move it first (hover, move, or down's at option)"))?;
         let at = self.poster.button(t, b, down, false, Mods::default(), self.top.get())?;
         self.pressed.set(down.then_some(b));
+        self.count(if down { PRESS } else { RELEASE });
         if down {
-            self.count(1);
             self.log.borrow_mut().drags.push(vec![at]);
         }
         self.input(at, if !down && sample { "discrete" } else { "pointer" }, false);
@@ -278,43 +445,46 @@ impl OsInput {
         if let Some(b) = self.pressed.get() {
             let _ = self.button(b, false, false);
         }
+        self.held.borrow_mut().clear();
         self.poster.release_all(self.top.get());
     }
 
     /// Starts a count of what arrives (before each run, and its reset): strobe's posted input and the
     /// page's trusted events from zero, so one stretch's input never covers for another's.
     pub fn begin(&self, page: &Page) -> Result<()> {
-        self.posted.set([0; 3]);
-        let v = page.eval("window.__strobeOs && (__strobeOs.keys = __strobeOs.presses = __strobeOs.wheels = 0), performance.timeOrigin")?;
+        self.posted.set([0; 6]);
+        let v = page.eval("window.__strobeOs && (__strobeOs.n.fill(0), __strobeOs.viewport = 0), performance.timeOrigin")?;
         self.document.set(v.as_f64().unwrap_or(0.0));
         Ok(())
     }
 
     /// Refuses `InputMismatch` unless what strobe posted since `begin` reached the page as trusted
-    /// events: keys and button presses at least 95% of those posted, wheel turns some (a page
-    /// coalesces them), within a second of looking (posted input reaches the page on its own time). A
-    /// document that changed meanwhile (a navigation) took its counts with it: nothing to check.
+    /// events (`COUNTED`): every key down and up and every button press and release (a page may get
+    /// more, such as the Shift a capital letter needs, never fewer), and at least one wheel turn and one
+    /// pointer move where strobe posted any (browsers and the OS coalesce those), within a second of
+    /// looking (posted input reaches the page on its own time). A document that changed meanwhile (a
+    /// navigation) took its counts with it: nothing to check.
     pub fn delivered(&self, page: &Page) -> Result<()> {
         let posted = self.posted.get();
-        if posted == [0; 3] {
+        if posted == [0; 6] {
             return Ok(());
         }
-        let enough = |i: usize, got: f64| if i == 2 { posted[i] == 0 || got > 0.0 } else { got >= 0.95 * posted[i] as f64 };
+        let enough = |i: usize, got: f64| if COUNTED[i].1 { got >= posted[i] as f64 } else { posted[i] == 0 || got > 0.0 };
         let until = Instant::now() + Duration::from_secs(1);
         let r = loop {
-            let v = page.eval("JSON.stringify([performance.timeOrigin, window.__strobeOs?.keys ?? 0, window.__strobeOs?.presses ?? 0, window.__strobeOs?.wheels ?? 0])")?;
+            let v = page.eval("JSON.stringify([performance.timeOrigin, ...(window.__strobeOs?.n ?? [0, 0, 0, 0, 0, 0])])")?;
             let r: Vec<f64> = v.as_str().and_then(|s| serde_json::from_str::<Vec<f64>>(s).ok()).unwrap_or_default();
-            if r.len() < 4 || r[0] != self.document.get() {
-                self.posted.set([0; 3]);
+            if r.len() < 7 || r[0] != self.document.get() {
+                self.posted.set([0; 6]);
                 self.document.set(r.first().copied().unwrap_or(0.0));
                 return Ok(());
             }
-            if (0..3).all(|i| enough(i, r[i + 1])) || Instant::now() >= until {
+            if (0..6).all(|i| enough(i, r[i + 1])) || Instant::now() >= until {
                 break r;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        for (i, what) in ["keys", "mouse button presses", "wheel turns"].iter().enumerate() {
+        for (i, (what, _)) in COUNTED.iter().enumerate() {
             if !enough(i, r[i + 1]) {
                 return Err(refused(format!("OS input did not reach the page: strobe posted {} {what} through the OS and the page received {} in a second", posted[i], r[i + 1])));
             }
@@ -389,7 +559,8 @@ impl Driver {
                         c => Key::Char(c),
                     };
                     last = os.poster.press(os.top.get(), None, Mods::default(), key)?;
-                    os.count(0);
+                    os.count(KEY_DOWN);
+                    os.count(KEY_UP);
                     os.input(last, "discrete", false);
                 }
                 (o, last)
@@ -402,7 +573,11 @@ impl Driver {
                 // After the click into the field, if there was one: its frames settle first.
                 os.rest(Duration::ZERO, os.frame())?;
                 let at = os.poster.press(os.top.get(), None, mods, key)?;
-                os.count(0);
+                os.count(KEY_DOWN);
+                // macOS sends no key up while Command is down: the page never sees one.
+                if !(cfg!(target_os = "macos") && mods.meta) {
+                    os.count(KEY_UP);
+                }
                 os.input(at, "discrete", false);
                 (o, at)
             }
@@ -436,9 +611,18 @@ impl Driver {
                     os.rest(Duration::ZERO, os.frame())?;
                 }
                 let at = if call == "down" { os.poster.hold(os.top.get(), key)? } else { os.poster.release(os.top.get(), key)? };
-                if call == "down" {
-                    os.count(0);
+                // An `up` posts a key up only for a key strobe holds.
+                let mut held = os.held.borrow_mut();
+                if call == "down" && !held.contains(&key) {
+                    held.push(key);
+                    os.count(KEY_DOWN);
+                } else if call == "up"
+                    && let Some(i) = held.iter().position(|k| *k == key)
+                {
+                    held.remove(i);
+                    os.count(KEY_UP);
                 }
+                drop(held);
                 os.input(at, if call == "down" { "discrete" } else { "pointer" }, false);
                 (opts(1), at)
             }
@@ -447,7 +631,7 @@ impl Driver {
                 let (d, o) = (opts(1), opts(2));
                 let (x, y, t) = self.os_aim(os, &sel(0), &o)?;
                 os.park(x, y)?;
-                os.input(os.poster.move_to(t, 0)?, "pointer", false);
+                os.input(os.move_to(t, 0)?, "pointer", false);
                 let frame = os.frame();
                 os.rest(Duration::ZERO, frame)?;
                 let (by_y, by_x) = (d["by"].as_f64().unwrap_or(0.0), d["byX"].as_f64().unwrap_or(0.0));
@@ -462,7 +646,7 @@ impl Driver {
                     }
                     let at = os.poster.wheel(t, by_x / steps as f64, by_y / steps as f64)?;
                     if at != 0 {
-                        os.count(2);
+                        os.count(WHEEL);
                         os.input(at, "scroll", last == 0);
                         last = at;
                     }
@@ -485,7 +669,7 @@ impl Driver {
                     self.os_aim(os, &sel(0), &o)?
                 };
                 os.park(x, y)?;
-                os.input(os.poster.move_to(t, 0)?, "pointer", false);
+                os.input(os.move_to(t, 0)?, "pointer", false);
                 os.rest(Duration::ZERO, os.frame())?;
                 let (dx, dy) = (d["dx"].as_f64().unwrap_or(0.0), d["dy"].as_f64().unwrap_or(0.0));
                 let at = os.poster.wheel(t, dx, dy)?;
@@ -495,7 +679,7 @@ impl Driver {
                         dx.abs().max(dy.abs())
                     )));
                 }
-                os.count(2);
+                os.count(WHEEL);
                 os.input(at, "scroll", true);
                 (o, at)
             }
@@ -533,7 +717,7 @@ impl Driver {
         let mods = Mods::parse_list(&o["modifiers"])?;
         let count = o["count"].as_u64().unwrap_or(1).clamp(1, 3);
         os.park(x, y)?;
-        os.input(os.poster.move_to(t, 0)?, "pointer", false);
+        os.input(os.move_to(t, 0)?, "pointer", false);
         os.pointer.set(Some((x, y, t)));
         let gap = os.frame();
         // A frame of what came before (a hover, an earlier step) settles before the press.
@@ -548,13 +732,14 @@ impl Driver {
             // single click is.
             let pressed = os.poster.button(t, b, true, k > 0, mods, os.top.get())?;
             os.input(pressed, "pointer", false);
-            os.count(1);
+            os.count(PRESS);
             if count == 1 && quiet {
                 os.rest(Duration::from_millis(60), gap)?;
             } else {
                 std::thread::sleep(if count == 1 { Duration::from_millis(60) } else { gap });
             }
             last = os.poster.button(t, b, false, false, mods, os.top.get())?;
+            os.count(RELEASE);
             os.input(last, if count == 1 { kind } else { "pointer" }, false);
             if count == 1
                 && kind == "discrete"
@@ -567,7 +752,9 @@ impl Driver {
     }
 
     /// Clicks into the element unless focus is already in it, as a person clicks into a field (that
-    /// click is no keystroke).
+    /// click is no keystroke). After the click focus must be in it, in a document that has focus (one
+    /// read): keys the OS sends go to what has focus, which may be elsewhere (the address bar, another
+    /// field), and `InputMismatch` refuses rather than time keys the element never got.
     fn os_focus(&self, os: &OsInput, sel: &Value, o: &Value) -> Result<()> {
         if no_selector(sel) {
             return Ok(());
@@ -578,6 +765,10 @@ impl Driver {
             // Its frames (a focus ring, a caret) settle before the first key, which is measured: at least
             // 2 refreshes, since the click's first frame may not have begun yet.
             os.rest(os.frame() * 2, os.frame())?;
+            let s = Self::sel(sel)?;
+            if self.read(&format!("document.hasFocus() && __strobe.focused({})", s.page_spec()), self.timeout(o))? != Value::Bool(true) {
+                return Err(refused(format!("the click into {} put no focus in it, so the keys strobe would send through the OS would go elsewhere", s.source)));
+            }
         }
         Ok(())
     }

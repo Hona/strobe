@@ -1240,7 +1240,10 @@ pub fn run(args: &Args) -> Result<Output> {
     let check = args.has("check");
     let blocks = args.num("blocks")?.map(|b| b as usize);
     let base_spec = match (args.get("base"), aa) {
-        _ if check && (aa || args.get("base").is_some()) => return Err(Error::usage("--check runs each case once on --head, with nothing to compare; drop --base and --aa")),
+        _ if check && aa => return Err(Error::usage("--check runs each case once on --head, with nothing to compare; drop --aa")),
+        // `--base <target> --head <target> --check`: each case once on each of two targets, checked as
+        // their implementation comparison measures them (`expand`).
+        _ if check && blocks.is_none() && args.get("base").is_some() => None,
         _ if check && blocks.is_some() => return Err(Error::usage("--check runs one untimed block per case; --blocks N runs N timed ones: pick one")),
         _ if check => None,
         _ if blocks.is_some() && (aa || args.get("base").is_some() || leak_run) => {
@@ -1379,6 +1382,11 @@ pub fn run(args: &Args) -> Result<Output> {
     ctx.projects = target_projects(&ctx.describe)?;
     ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
     check_engines(&mut series, &ctx.describe, args)?;
+    // A check of two targets refuses what their comparison would before anything builds.
+    if let Some((a, b)) = check_pair(&ctx.describe, args, &project)? {
+        let sides = [resolve_side("base", a, None, &ctx.describe, &project, &config)?, resolve_side("head", b, None, &ctx.describe, &project, &config)?];
+        implementation_preflight(&ctx.describe, &series, &sides, &config, &ctx.projects)?;
+    }
     ctx.journeys = series.iter().filter(|s| s.gap.is_none() && s.refused.is_none()).count();
     if ctx.implementations {
         for v in &variants {
@@ -4040,10 +4048,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let traceless = outside || page.cdp().is_none();
         // Frames from the OS's presents: from outside, or headed in such an engine. Then `interaction.*`
         // too (a default secondary), from the page's own changes (`CHANGES_SCRIPT`, in every document
-        // from its start). From outside the input is the OS's (`os::OsInput`), in Chromium; another
-        // engine's page takes none in its runs there yet.
-        let os_frames_on = outside || (traceless && !headless && !x.counters && set != Set::Memory);
-        let os_input = outside && page.cdp().is_some();
+        // from its start). From outside the input is the OS's (`os::OsInput`), in every engine; a page
+        // the OS's input cannot reach (`os::unreachable`) takes none in its runs there.
+        let os_frames_on = !headless && (outside || (traceless && !x.counters && set != Set::Memory));
+        let no_os_input = if outside { crate::driver::os::unreachable(engine, headless) } else { None };
+        let os_input = outside && no_os_input.is_none();
         let changes = os_frames_on;
         if changes {
             page.add_init_script(CHANGES_SCRIPT)?;
@@ -4150,13 +4159,38 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let edges: RefCell<Vec<WebEdge>> = RefCell::new(Vec::new());
         let reads_before = Cell::new((0u64, 0.0f64));
         let counted_before: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
+        // strobe's own calls into the page at an edge (its reads, marks, counts and the OS input's
+        // checks) stay inside the stretch: after the processes' readings at its start, before them at
+        // its end, so none of their round trips is the run's CPU.
+        let reading = || {
+            let procs = browser.processes();
+            let tsc = host::tsc();
+            let (c, carry) = (counters(), *carried.borrow());
+            edges.borrow_mut().push((super::record::per_process(&procs), tsc, std::array::from_fn(|i| c[i] + carry[i])));
+        };
+        // The OS input posted on each side of an edge reached the page, counted on its own: input in a
+        // stretch never covers for a timed one lost (or the other way round).
+        let os_edge = || -> Result<()> {
+            if let Some(os) = driver.os.get() {
+                os.delivered(&page)?;
+                os.placed(&page, "run")?;
+                os.begin(&page)?;
+            }
+            Ok(())
+        };
+        // A trace's mark goes nearest the stretch's start: the trace's readers cut the run there.
         let edge = |start: bool, n: usize| -> Result<()> {
             if start {
                 cost.pause();
-                if !traceless {
-                    driver.mark(&hooks.untimed_mark(n, true))?;
-                }
-                let (k, ms) = driver.take_reads();
+            }
+            if !traceless {
+                driver.mark(&hooks.untimed_mark(n, start))?;
+            }
+            if start {
+                reading();
+            }
+            let (k, ms) = driver.take_reads();
+            if start {
                 reads_before.set((reads_before.get().0 + k, reads_before.get().1 + ms));
             }
             if !counted.is_empty() {
@@ -4168,14 +4202,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     hooks.add(&now.iter().map(|(k, v)| (k.clone(), before.get(k).copied().unwrap_or(0.0) - v)).collect());
                 }
             }
-            let (c, carry) = (counters(), *carried.borrow());
-            let procs = browser.processes();
-            edges.borrow_mut().push((super::record::per_process(&procs), host::tsc(), std::array::from_fn(|i| c[i] + carry[i])));
+            os_edge()?;
             if !start {
-                driver.take_reads();
-                if !traceless {
-                    driver.mark(&hooks.untimed_mark(n, false))?;
-                }
+                reading();
                 cost.resume();
             }
             Ok(())
@@ -4186,15 +4215,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     let call = a["call"].as_str().unwrap_or("");
                     let args = a["args"].as_array().cloned().unwrap_or_default();
                     hooks.op(call, &args);
-                    // From outside a Chromium page gets the OS's input (`os::OsInput`); another engine's
-                    // would get its driver's, where the other side gets the OS's (SPEC §9.10).
-                    if outside && !os_input && hooks.in_run() && crate::driver::os::INPUT.contains(&call) {
-                        return Err(Refusal::new(
-                            ValidatorId::InputMismatch,
-                            format!("page.{call}() in a run of a {engine} page measured against a native implementation: strobe gives that engine no OS input yet, and the other side gets the OS's"),
-                        )
-                        .fix("keep input out of runs (setup and reset may use it), or measure the page in Chromium")
-                        .into());
+                    // From outside a page gets the OS's input (`os::OsInput`); one it cannot reach would get
+                    // its driver's, where the other side gets the OS's (SPEC §9.10).
+                    if let Some(r) = no_os_input.as_ref().filter(|_| hooks.in_run() && crate::driver::os::INPUT.contains(&call)) {
+                        return Err(
+                            Refusal { summary: format!("page.{call}() in a run of a {engine} page measured from outside: {}, and the other side gets the OS's", r.summary), ..r.clone() }.into()
+                        );
                     }
                     if call == "goto" && hooks.in_run() {
                         let before = counters();
@@ -4591,9 +4617,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
-            // Whether the OS input reached the page, read after the run.
+            // Whether the OS input reached the page, and where strobe mapped it, read after the run.
             if let Some(os) = driver.os.get() {
                 os.delivered(&page)?;
+                os.placed(&page, "run")?;
             }
             // A key or button the run left held would be down in the next one: let go, outside its span.
             driver.release_all()?;
@@ -4611,6 +4638,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // A reset's OS input is checked on its own: a click there must not cover a run's lost one.
                 if let Some(os) = driver.os.get() {
                     os.delivered(&page)?;
+                    os.placed(&page, "reset")?;
                 }
                 if same.on() {
                     read_same(journey::When::Reset)?;
@@ -5436,6 +5464,10 @@ fn join_url(base: &str, path: &str) -> String {
 /// as sides that name targets (SPEC §9.10). Both sides naming different targets make an implementation
 /// comparison; one target named (by both sides, or by `--head` alone) narrows the series to it.
 fn series_and_sides(describe: &Value, args: &Args, base: Option<&str>, head: &str, project: &Path, config: &Value) -> Result<(Vec<Series>, Vec<Variant>)> {
+    if let Some(pair) = check_pair(describe, args, project)? {
+        let series = expand(describe, args, None, None, Some(pair))?;
+        return Ok((series, vec![resolve_variant("head", ".", project, config)?]));
+    }
     let base_side = base.map(|b| side_spec(b, describe, project)).transpose()?.flatten();
     let head_side = side_spec(head, describe, project)?;
     if base.is_some() && base_side.is_some() != head_side.is_some() {
@@ -5452,7 +5484,7 @@ fn series_and_sides(describe: &Value, args: &Args, base: Option<&str>, head: &st
         return Err(Error::usage("--target picks targets of builds; an implementation comparison's sides name its two targets already: drop --target"));
     }
     let only = if sides.is_none() { head_side.map(|(t, _)| t) } else { None };
-    let series = expand(describe, args, sides, only)?;
+    let series = expand(describe, args, sides, only, None)?;
     let resolve = |role: &'static str, spec: &str, side: Option<(&str, Option<&str>)>| match side {
         Some((t, v)) => resolve_side(role, t, v, describe, project, config),
         None => resolve_variant(role, spec, project, config),
@@ -5463,6 +5495,22 @@ fn series_and_sides(describe: &Value, args: &Args, base: Option<&str>, head: &st
     }
     variants.push(resolve("head", head, head_side)?);
     Ok((series, variants))
+}
+
+/// `--base <target> --head <target> --check`: the two targets of the bench file it names, each run at
+/// the bench file's own folder (a check builds no variant), or None without `--base`.
+fn check_pair<'a>(describe: &Value, args: &'a Args, project: &Path) -> Result<Option<(&'a str, &'a str)>> {
+    let Some(b) = args.get("base").filter(|_| args.has("check")) else { return Ok(None) };
+    let h = args.get("head").unwrap_or(".");
+    if args.get("target").is_some() {
+        return Err(Error::usage("--check --base <target> --head <target> runs those two targets: drop --target"));
+    }
+    match (side_spec(b, describe, project)?, side_spec(h, describe, project)?) {
+        (Some((b, None)), Some((h, None))) if b != h => Ok(Some((b, h))),
+        _ => Err(Error::usage(format!(
+            "--check --base {b} --head {h}: name two different targets of the bench file, with no =<variant> (a check runs the bench file's own folder), to check them as their comparison measures them; or drop --base"
+        ))),
+    }
 }
 
 /// What an implementation comparison refuses before anything builds (SPEC §9.10): a primary that is
@@ -5560,7 +5608,8 @@ fn side_gap(c: &Value, target: &str) -> Option<(String, Option<String>)> {
 
 /// The series: case × target × params, or in an implementation comparison (`sides`: the base's and the
 /// head's targets) case × params, each block on its side's target. `only`: the one target a side names.
-fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Option<&str>) -> Result<Vec<Series>> {
+/// `pair`: the two targets `--base`/`--head` name in a `--check` (`check_pair`), each case on each.
+fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Option<&str>, pair: Option<(&str, &str)>) -> Result<Vec<Series>> {
     let filter = args.get("filter");
     let only_target = only.or(args.get("target"));
     let fixed: BTreeMap<String, String> =
@@ -5601,11 +5650,17 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
     }
     let mut out = Vec::new();
     let targets = describe["targets"].as_object().cloned().unwrap_or_default();
-    // `--check` of every target of a file whose targets run on different engines checks each page the
-    // way an implementation comparison measures it: from outside, with OS input (SPEC §9.10).
-    // Pages in several browsers and nothing else are no such file: each checks in its own engine.
-    let check = args.has("check") && sides.is_none() && only_target.is_none();
-    let engines: std::collections::BTreeSet<&str> = targets.values().map(|t| if WebEngine::ALL.iter().any(|e| e.name() == engine(t)) { "page" } else { engine(t) }).collect();
+    // `--check` of every target of a file checks each page of a case that runs on different engines the
+    // way an implementation comparison measures it: from outside, with OS input (SPEC §9.10). Pages in
+    // several browsers and nothing else are no such case: each checks in its own engine. `--base
+    // <target> --head <target> --check` (`pair`) checks the two the way their comparison measures
+    // them: from outside when their engines differ, two browsers' pages too.
+    let check = args.has("check") && sides.is_none() && (only_target.is_none() || pair.is_some());
+    let kind = |t: &Value| match pair {
+        Some(_) => engine(t),
+        None if WebEngine::ALL.iter().any(|e| e.name() == engine(t)) => "page",
+        None => engine(t),
+    };
     for (case, c) in describe["cases"].as_object().cloned().unwrap_or_default() {
         if filter.is_some_and(|f| !case_matches(f, &case)) {
             continue;
@@ -5624,10 +5679,17 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
         // A case may name the targets it runs on; by default it runs on every target.
         let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
         // An implementation comparison runs each journey once, on both sides' targets.
-        let names: Vec<String> = match sides {
-            Some((_, head)) => vec![head.to_string()],
-            None => targets.keys().cloned().collect(),
+        let names: Vec<String> = match (sides, pair) {
+            (Some((_, head)), _) => vec![head.to_string()],
+            (None, Some((a, b))) => vec![a.to_string(), b.to_string()],
+            (None, None) => targets.keys().cloned().collect(),
         };
+        // The engines of the targets this case runs on.
+        let engines: std::collections::BTreeSet<&str> = names
+            .iter()
+            .filter(|t| on.as_ref().is_none_or(|on| on.contains(&t.as_str())) && !c["unsupported"][t.as_str()].is_string() && !c["gaps"][t.as_str()].is_object())
+            .map(|t| kind(&targets[t.as_str()]))
+            .collect();
         for target in &names {
             // `--target`: target names as `--filter` takes cases (comma-separated, globs with *).
             let excluded = on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) || c["unsupported"][target].is_string() || c["gaps"][target].is_object();

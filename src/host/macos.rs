@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::ffi::{CString, c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 pub type CFTypeRef = *const c_void;
 type CFIndex = isize;
@@ -440,7 +441,6 @@ fn responsible_for() -> Option<unsafe extern "C" fn(libc::pid_t) -> libc::pid_t>
 /// macOS answers a process's own pid once its responsible process has exited, reaped or not, so
 /// `remembered` (for `kill_set`) gives a process's last other answer: what an exited app left.
 fn responsible_pids(all: &[Bsd], remembered: bool) -> Vec<Option<u32>> {
-    use std::time::{Duration, Instant};
     /// (answer, first seen, last answer naming another process).
     type Seen = HashMap<(u32, u64), (Option<u32>, Instant, Option<u32>)>;
     static SEEN: Mutex<Option<Seen>> = Mutex::new(None);
@@ -1148,10 +1148,34 @@ fn main_win(pids: &[u32]) -> Option<Win> {
         .max_by(|a, b| (a.onscreen, a.bounds.size.width * a.bounds.size.height).partial_cmp(&(b.onscreen, b.bounds.size.width * b.bounds.size.height)).unwrap_or(std::cmp::Ordering::Equal))
 }
 
-/// Seconds since the last keyboard, mouse or trackpad input from the hardware. The HID system's state, not
-/// the session's: the clicks strobe posts to the session count there, and must not read as a person.
+/// When strobe last posted input (`note_posted`), and when the person's last input was as of then.
+static POSTED: Mutex<Option<(Instant, Instant)>> = Mutex::new(None);
+
+/// When the last input of a person was: the HID system's last event, unless that was strobe's own last
+/// post (within 250 ms of it), whose input resets the HID idle clock as a person's does (a move posted
+/// at the session tap from a private event source, and a cursor warp, each did on air, macOS 27): then
+/// the person's last input as of that post.
+fn person_last(now: Instant) -> Instant {
+    let idle = unsafe { CGEventSourceSecondsSinceLastEventType(1, u32::MAX) };
+    let last = now.checked_sub(Duration::from_secs_f64(idle.clamp(0.0, 1e7))).unwrap_or(now);
+    match *POSTED.lock().unwrap_or_else(|e| e.into_inner()) {
+        Some((post, person)) if last.max(post) - last.min(post) < Duration::from_millis(250) => person,
+        _ => last,
+    }
+}
+
+/// Strobe posted input now (a key, a pointer event, a cursor warp): it is no person's.
+pub fn note_posted() {
+    let now = Instant::now();
+    let person = person_last(now);
+    *POSTED.lock().unwrap_or_else(|e| e.into_inner()) = Some((now, person));
+}
+
+/// Seconds since the last keyboard, mouse or trackpad input of a person: the HID system's idle clock,
+/// with strobe's own posted input (`note_posted`) not counted.
 pub fn user_idle_s() -> f64 {
-    unsafe { CGEventSourceSecondsSinceLastEventType(1, u32::MAX) }
+    let now = Instant::now();
+    now.duration_since(person_last(now)).as_secs_f64()
 }
 
 /// How long nobody may have touched this Mac before strobe brings a covered app to the front.
@@ -1374,6 +1398,16 @@ pub fn normal_windows(pids: &[u32]) -> Vec<isize> {
 /// nothing it draws can be seen.
 pub fn unshared_windows(pids: &[u32]) -> Vec<(u32, u32)> {
     windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0).into_iter().filter(|w| pids.contains(&w.pid) && (0..1000).contains(&w.layer) && w.alpha > 0.0 && w.sharing == 0).map(|w| (w.id, w.pid)).collect()
+}
+
+/// The frontmost on-screen window of any app holding a point (points, global display space), at any
+/// level (a screen saver or a system alert over it covers it): its owner's pid, its id and the owner's
+/// name. The window server's own order, which counts a window that lets clicks through as covering.
+pub fn front_window_at(x: f64, y: f64) -> Option<(u32, u32, String)> {
+    windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0)
+        .into_iter()
+        .find(|w| w.alpha > 0.0 && x >= w.bounds.origin.x && y >= w.bounds.origin.y && x < w.bounds.origin.x + w.bounds.size.width && y < w.bounds.origin.y + w.bounds.size.height)
+        .map(|w| (w.pid, w.id, if w.owner.is_empty() { format!("process {}", w.pid) } else { w.owner }))
 }
 
 /// The frontmost on-screen window of `pids` holding a point (points, global display space).

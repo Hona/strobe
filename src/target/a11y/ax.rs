@@ -72,6 +72,8 @@ const AX_VALUE_SIZE: u32 = 2;
 const AX_VALUE_ERROR: u32 = 5;
 /// kAXErrorAPIDisabled: the process is not trusted for accessibility.
 const AX_API_DISABLED: AXError = -25211;
+/// kAXErrorNotImplemented: the app implements no answer to the call (Safari's web content to a hit test).
+const AX_NOT_IMPLEMENTED: AXError = -25208;
 
 /// What a snapshot reads of every element, in this order.
 const ATTRS: &[&str] = &["AXRole", "AXSubrole", "AXTitle", "AXDescription", "AXValue", "AXIdentifier", "AXPosition", "AXSize", "AXFocused", "AXEnabled", "AXChildren", "AXMinimized"];
@@ -277,15 +279,20 @@ pub fn activate(pid: u32) -> Result<()> {
 }
 
 /// The process whose element the window server hit-tests at a point, and that element (`describe`
-/// says what it is: two more reads of its app, made only for an error).
-pub fn app_at(x: f64, y: f64) -> Result<(u32, Cf)> {
+/// says what it is: two more reads of its app, made only for an error). None when the app there
+/// implements no hit test (`kAXErrorNotImplemented`); every other failure is an error.
+pub fn app_at(x: f64, y: f64) -> Result<Option<(u32, Cf)>> {
     let wide = Cf(unsafe { AXUIElementCreateSystemWide() });
     let mut at: CFTypeRef = std::ptr::null();
-    check(unsafe { AXUIElementCopyElementAtPosition(wide.0, x as f32, y as f32, &mut at) }, "hit test")?;
+    let e = unsafe { AXUIElementCopyElementAtPosition(wide.0, x as f32, y as f32, &mut at) };
+    if e == AX_NOT_IMPLEMENTED {
+        return Ok(None);
+    }
+    check(e, "hit test")?;
     let at = Cf::new(at).ok_or_else(|| Error::msg("hit test: nothing at that point"))?;
     let mut pid = 0;
     unsafe { AXUIElementGetPid(at.0, &mut pid) };
-    Ok((pid as u32, at))
+    Ok(Some((pid as u32, at)))
 }
 
 /// An element as a person reads it: its role and title.

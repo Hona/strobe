@@ -188,6 +188,14 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     if headless {
         args.push("-headless".into());
     }
+    // macOS: Firefox opens behind the active app, where Chromium makes itself the active one. Measured
+    // in front (a block from outside needs it there), it comes to the front as it opens once nobody has
+    // used the Mac for the time strobe waits before bringing an app forward, never under a person's
+    // hands.
+    #[cfg(target_os = "macos")]
+    if !headless && host::macos::user_idle_s() >= host::macos::IDLE_BEFORE_ACTIVATE_S {
+        args.push("-foreground".into());
+    }
     args.push("about:blank".into());
     let mut cmd = Command::new(&exe);
     cmd.args(&args)

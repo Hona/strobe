@@ -577,7 +577,8 @@ pub struct Driver {
     live: std::cell::OnceCell<os::Presents>,
     live_pids: RefCell<Vec<u32>>,
     refresh: Cell<Duration>,
-    /// A page measured from outside against a native implementation: its input goes through the OS.
+    /// A page measured from outside (against a native implementation or a page in another engine):
+    /// its input goes through the OS.
     pub os: std::cell::OnceCell<os::OsInput>,
     /// strobe's looks at the page through the probe since the last `take_reads` (an input's aim, an
     /// `until` or `waitFor` selector; never `idle` or `frame`): `driver.reads`.

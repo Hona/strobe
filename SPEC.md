@@ -486,7 +486,8 @@ that would take them too; a filter that matches nothing is a usage error that li
 With `--base`: the A/B pipeline in §9. Without it: `--aa`
 runs `--head` against itself (§10.4), `--probes memory --repeat <n>` is a leak run (§8.6), and
 `--check` validates the file: one block per series on `--head`, one run per case, no warmup and
-no statistics. Each case passes, with its declared metrics' values from that run, or fails with
+no statistics (`--check --base <target> --head <target>`: each case on those two targets, checked as
+their implementation comparison measures them, 9.10). Each case passes, with its declared metrics' values from that run, or fails with
 the refusal, the page's URL and its screenshot; the next case still runs, and any failure exits 1.
 A failure keeps the fix strobe's driver gave (a missing permission and where to grant it) and
 names the hook once (`setup: …`, not `setup: setup: …`). Under each case, `--check` prints the
@@ -2039,10 +2040,13 @@ as letting the app go idle between two clicks (`await ctx.untimed(() => page.idl
 run's timed totals. It is for waits: work started in a stretch (a heavy setup step, a page load)
 can leave a cost the run pays after it (a garbage collection, a cache filling), which stays timed;
 put setup in `setup` or `reset`. Each edge is a runner request: strobe stamps a stretch's start, then
-pauses its own cost meter, marks the trace and reads the target; at its end it reads the target,
-marks the trace and resumes its meter, then stamps the end. So the readings (a system snapshot is
-15–20 ms on Windows) are inside the stretch: in neither the run's time nor its phases, nor
-strobe's measured cost.
+pauses its own cost meter, marks the trace and reads the target; at its end it marks the trace,
+reads the target and resumes its meter, then stamps the end. So the readings (a system snapshot is
+15-20 ms on Windows) are inside the stretch: in neither the run's time nor its phases, nor
+strobe's measured cost. strobe's other calls into a page at an edge (its reads count, the page's
+`count.<name>` global, the OS input's delivery and placement checks) come after the target's
+readings at a stretch's start and before them at its end: their round trips are none of the run's
+CPU.
 - **Time:** `run.duration` is the run's span less its stretches; `phase.<name>` less those inside the
   phase. A phase inside a stretch is a usage error, as is a stretch inside a stretch.
 - **CPU:** per edge, each process's cycles by pid and start time and the cycle clock (native: the
@@ -2586,8 +2590,10 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   call differs by over 5% of the side that gave more of it (not for `adapted: "steps"`, whose steps
   differ by design), or
   when the drags' `input.rate` differs by over 5% (a driver that starved on one side looks like a slow
-  app). A page against a native side gets OS input (below); another engine's page there takes no
-  input in its runs yet (`InputMismatch`).
+  app). A page against a native side or a page in another engine gets OS input (below), in every
+  engine; a page the OS's input cannot reach takes none in its runs: a headless one (`Headless`) and
+  Safari's (`InputMismatch`: Safari keeps a WebDriver session's window from every input but its
+  driver's).
 - **The same latency samples** (`NotEquivalent` for `interaction.*`, `scroll.latency.*`): both sides
   take samples by one rule (§7.4: an input at rest, the app's model changing within a second, a
   present within a second); a side whose blocks gave under 0.8 or over 1.25 times the other's samples
@@ -2616,9 +2622,13 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   journeys differ (`NotEquivalent`, `InputMismatch`, compared with the first target that ran it). A
   differing journey fails the check (exit 1); a gap, found before the run or met in it, is listed
   (exit 0), and exits 4 with `--require-parity`.
-  A file whose targets run on different engines checks its pages from outside with OS input, as a
-  timed block does; pages in several browsers and no other target are no such file, and each checks
-  in its own engine.
+  A case whose targets (those it runs on) run on different engines checks its pages from outside
+  with OS input, as a timed block does; pages in several browsers and no other target are no such
+  case, and each checks in its own engine. `--check --base <target> --head <target>` checks two
+  targets of the file as their implementation comparison measures them: each case once on each (one
+  cold block per side, at the bench file's own folder: no `=<variant>`, no `--target`), what the
+  comparison refuses before anything builds refused the same way (`NotComparable`,
+  `VariantMismatch`), and both from outside when their engines differ, two browsers' pages too.
 - **Launches** across kinds: a launch case whose sides are a page (`web`, `url`) and a spawned app
   (`app`, `exe`, `webview`, `command`, `native`) is a usage error before anything builds (exit 2,
   `NotComparable`): the page's launch is a navigation in a browser already running, timed in the
@@ -2716,30 +2726,59 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   macOS and Linux as for native apps), and `cpu.work` over the browser's process set (now on every
   page block: CPU time per run). `Performance.getMetrics` and the JS heap are still read at run
   boundaries (per side), outside the CPU window, which brackets the run alone (in every page block),
-  and warmup waits for the processes' CPU to hold steady. Every input of such a block (setup's and
-  reset's too) is the OS's, as the native side's is (`driver::os`, Chromium pages): posted window
-  messages on Windows, Quartz events on macOS, XTest on X11, through the native driver's posters, never
-  DevTools. Elements are found through the page probe, and a page point goes to the screen by a map
-  strobe measures before setup: two points in the page's client area, made screen points by the input
-  thread's own (per-monitor DPI-aware on Windows) coordinates, each posted as a move from 3 px beside
+  and warmup waits for the processes' CPU to hold steady. The same holds for a page against a page in
+  another engine (Chromium against Firefox: OS presents on both sides). Every input of such a block
+  (setup's and reset's too) is the OS's, as the native side's is (`driver::os`, every engine): posted
+  window messages on Windows, Quartz events on macOS, XTest on X11, through the native driver's
+  posters, never DevTools or WebDriver. Elements are found through the page probe, and a page point
+  goes to the screen by a map strobe measures before setup, the same way in every engine (never from
+  an engine's own idea of where its viewport is, such as Firefox's `mozInnerScreenX`): three points
+  placed in the window's frame as the input thread reads it (per-monitor DPI-aware on Windows,
+  points on macOS), at fixed fractions of its width and of the part below the share of the window
+  the browser draws above the page (`(outerHeight - innerHeight) / outerHeight`, as the page sees
+  them: a ratio of one unit, so a device scale, a page zoom or a Retina display changes nothing),
+  rounded to whole screen units as the posters send them, each posted as a move from 3 units beside
   it and then onto it; where the trusted `pointermove`s landed in the page gives the origin and scale
-  and proves posted input reaches it. None within a second, or points that do not map by one scale,
-  refuse the block `InputMismatch`. After setup strobe maps again when the browser's window moved,
-  resized or was replaced. The refresh period that paces scrolls and drags is the display's under the
-  window (`display_of`). The calls behave as the
+  from two and proves posted input reaches it. None within a second, points that do not map by one
+  scale, a third point that lands over 2 page pixels from where the map puts it, or a viewport the
+  map puts outside the window's frame (within 3 units), refuse the block `InputMismatch`. The map
+  holds while the window (its frame and client size, from the OS) and the page's viewport
+  (`screenX`, `screenY`, `innerWidth`, `innerHeight`, `devicePixelRatio`, `outerWidth`,
+  `outerHeight`, and the visual viewport's `scale`, `offsetLeft` and `offsetTop`, as the page sees
+  them: a page or pinch zoom changes them) stay as they were: after setup strobe maps again when
+  either changed or the window was replaced; after each run, each reset and each `ctx.untimed` edge
+  a change, or any `resize`, `fullscreenchange` or visual viewport `resize` the page saw since
+  (a viewport that changed and came back), refuses the block `InputMismatch` (input after it went to
+  points mapped for where the page was). A page the OS's input cannot reach gets none: a headless one
+  (no window), and Safari's (a WebDriver session's window takes no input but its driver's: pointer
+  moves strobe posted through the OS reached no page on air, and a click there asks whether to stop
+  the session); its setup and reset take its driver's input, and an input call in its runs refuses
+  the block (`Headless`, `InputMismatch`). Linux: a browser that shows no X11 window in a Wayland
+  session (`WAYLAND_DISPLAY` set) opened a Wayland window, which XTest cannot reach: `InputMismatch`.
+  macOS: where an app's accessibility implements no hit test at a point (`kAXErrorNotImplemented`:
+  Safari's web content), the window list's frontmost window there, at any level, must be the
+  browser's; every other accessibility error stays one. The refresh period that paces scrolls and
+  drags is the display's under the window (`display_of`). The calls behave as the
   native driver's: a click parks the cursor, presses, waits for the page to rest and releases; `type`
   clicks into a field without focus, then presses a key per character; `scroll` sends one wheel step
   per refresh at `speed` (default 3000 px/s, the native default); `drag` moves once per refresh; the
-  window the OS hit-tests must be the browser's (`WindowHidden` otherwise), and a locked session refuses
-  `SessionLocked`. strobe checks that what it posted arrived after setup, after each run and after
-  each reset, each counted from zero (strobe's posts and the page's trusted events) before it: keys
-  and button presses under 95% of those posted, or wheel turns posted and none received (a page
-  coalesces them), within a second refuse the block `InputMismatch`. A navigation in between took the
-  page's counts with it: nothing to check there. Input latency then follows
+  window the OS hit-tests must be the page's window itself (another app's or another of the browser's
+  own, such as a dialog, a popup or its developer tools, refuses `WindowHidden`), and a locked session
+  refuses `SessionLocked`. A `type` or `press` that clicks into a field checks after the click that
+  focus is in it, in a document that has focus (one read), and refuses `InputMismatch` otherwise: the
+  keys would go elsewhere (the address bar). strobe checks that what it posted arrived after setup,
+  after each run, each reset and each `ctx.untimed` edge (so input in a stretch never covers for a
+  timed one lost), each counted from zero (strobe's posts and the page's trusted events) before it:
+  fewer key downs, key ups, button presses or button releases than strobe posted (a page may get
+  more, such as the Shift a capital letter needs; macOS sends no key up while Command is down, so
+  none is expected), or wheel turns or pointer moves posted and none received (browsers and the OS
+  coalesce those; a move onto the point the pointer is on counts as none, since no browser fires
+  one), within a second refuse the block `InputMismatch`. A navigation in between took the page's
+  counts with it: nothing to check there. Input latency then follows
   the native rule (§7.4) with the page's own changes (`CHANGES_SCRIPT`: DOM mutations, input and
   scroll events) in place of an accessibility tree's, and `until: "frame"` waits for the browser's next
-  frame on the screen from the OS's presents. Windows: whether posted messages reach a Chromium window
-  is checked by that probe on each block (not yet on a real unlocked desktop). macOS: keys posted to
+  frame on the screen from the OS's presents. Windows: whether posted messages reach a Chromium or
+  Firefox window is checked by that probe on each block (not yet on a real unlocked desktop). macOS: keys posted to
   the browser's process reach the page with their modifiers (a page's own `Meta+2` handler runs), but
   a chord the browser handles as a menu key equivalent (Cmd+A's select all, Cmd+C) does nothing,
   whether posted to the process, into the session's event stream or at the HID tap (checked on air:
@@ -2749,7 +2788,11 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   side.
 - **macOS.** A page or Electron side's window is brought to the front (as a native block's, after a
   minute without input) and must be the active app and uncovered at the start and end of the runs
-  (`WindowHidden`, which a bench waits out), so both sides run as the key window.
+  (`WindowHidden`, which a bench waits out), so both sides run as the key window. Whether a person
+  used the Mac reads the HID system's idle clock less strobe's own posted input: a move posted at the
+  session tap from a private event source, and a cursor warp, reset that clock as a person's input
+  does (air, macOS 27), so strobe notes when it posts and a last event within 250 ms of its own post
+  is none of a person's. Another process's posted input (another bench's) still counts as a person.
 - **Where each spends its time** (`--why`, rule 3): each side gets its own attribution block,
   profiled with its own engine's tools: a page or Electron side with Chromium's (CPU and allocation
   profiles, forced layouts, GC, a heap snapshot, the memory census), a native side with native stacks,
@@ -2795,7 +2838,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs, or another window over the point strobe would click (the OS hit-tests elsewhere). On macOS the app must also be the active app (strobe makes it so in every block); while someone uses the Mac the block does not refuse but waits, holding nothing, until a minute passes without input, then activates the app and runs it again; a block whose app lost the front while nobody used the Mac (another app opened a window or took focus by itself) is discarded and runs again, up to 5 times |
 | `WrongScreen` | a block's window or page is not on the screen its case's (or target's) `expect` names (§9.6): a title, a dialog or heading, an address, or selectors that must be visible, read before the runs and after them (never inside one). A first-run dialog over the pane the case meant fails the block instead of timing it. Before a native app's runs, only titles are checked unless setup already drove the app: reading its tree there would connect strobe to it for the runs |
 | `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
-| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric) |
+| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric); every frame and latency metric of a block when the OS's present events lost the way to the screen of any present of the target's processes in its measured runs (Windows: a DirectComposition surface's, as Firefox's WebRender presents; counted with none, its frames would read short or 0) |
 | `AmbiguousInteraction` | over half of a block's inputs were sent while the target was drawing (a present begun before the input began or reached the screen in the 2 refreshes before it: an animation, a caret, a press's look still settling after 300 ms), so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
@@ -2803,14 +2846,14 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block); any run case's block (a `--check`, one target's) whose window is off its target's declared viewport by over 2 DIP (a macOS native window by its frame), or that the app or the screen clamps (named) |
 | `FixtureMismatch` | a block's target held no TCP connection the bench file's fixture answered at any run's start or end, or one of its processes served the fixture's port itself or runs the fixture's executable or a copy of it (it started its own server), §9.10 |
 | `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10). Also a question with no answer between two implementations: `query a..b` of their recordings, or a base..head view of `query <exp>` (exit 2, §11.1). At exit 2 it stays typed: the error carries the validator (`--json` and MCP give `validator: "NotComparable"`), so nothing reads its message |
-| `InputMismatch` | the sides of an implementation comparison got other input (§9.10): one acted through accessibility actions where the other got pointer or key input, a kind of input call in their runs differs by over 5% (not with steps per target), or their drags' `input.rate` does (the series, from that pair); OS input posted to a page measured from outside did not reach it (the block); a run of a page from outside in an engine strobe gives no OS input sends input |
+| `InputMismatch` | the sides of an implementation comparison got other input (§9.10): one acted through accessibility actions where the other got pointer or key input, a kind of input call in their runs differs by over 5% (not with steps per target), or their drags' `input.rate` does (the series, from that pair); OS input posted to a page measured from outside did not reach it, its map onto the screen did not hold (a third move off it, a viewport outside the window's frame), or the window or viewport moved, resized or zoomed during a run or reset (the block); a run of a Safari page from outside sends input (Safari keeps a WebDriver session's window from the OS's input) |
 | `NotEquivalent` | the sides of an implementation comparison did not do the same journey (§9.10): an `expect.same` element read differently after setup, a run or a reset, or showed on neither side at any point (the series, from that pair); or their latency samples (`interaction.n`, `scroll.n`) are under 0.8 or over 1.25 times each other (refuses `interaction.*` or `scroll.latency.*`) |
 | `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`, a `run` per target without its own, an `@name` its `ui` lacks; or one met at run time, at any pair, which discards the series' blocks): the series' primary, nothing run; the bench and `--check` still exit 0 |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
 | `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes and a launch's attribution block, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also launch cases (no preload script), `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
-| `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block |
+| `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block; a run of a headless page measured from outside that sends input (no window for the OS's input) |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
@@ -3566,7 +3609,9 @@ profilers, heap snapshots, the census, Playwright) asks for the Chromium side an
 
 - Its own remote agent, no geckodriver: `firefox -no-remote -profile <dir> --remote-debugging-port 0
   --new-instance [-headless] about:blank` (`-wait-for-browser` on Windows, so the launcher process strobe
-  holds lives as long as the browser). Firefox writes `WebDriverBiDiServer.json` (`ws_port`) into the
+  holds lives as long as the browser; `-foreground` on macOS when headed and nobody has used the Mac
+  for the minute strobe waits before bringing an app forward: Firefox opens behind the active app,
+  where Chromium makes itself the active one). Firefox writes `WebDriverBiDiServer.json` (`ws_port`) into the
   profile, not a `DevToolsActivePort` file; strobe opens `ws://127.0.0.1:<port>/session` and one
   session (`session.new`). Firefox takes one BiDi connection: a second to `/session/<id>` is refused.
 - Stock builds only, found in the standard locations (`%ProgramFiles%` and `%LOCALAPPDATA%\Mozilla
@@ -5438,6 +5483,58 @@ dropped (now only `files` keep numbers). A launch series records `until` (checke
 compact name, where they said `before:` and `this PR:`; new notes name implementations at the source.
 Not run: a timed implementation comparison (the cross-side window check with a macOS frame against a
 page, the `UserFolders` caution of later launches, the plan line of a windowless series).
+
+OS input to pages in every engine (2026-11-06, ff-os: 5.6, 9.6 "Untimed stretches", 9.10 "Pages from
+outside" and "--check parity matrix", 10.1 `InputMismatch`, `Headless`, `NoPresentSource`). A page
+measured from outside gets the OS's input in Firefox and WebKit too, through the same `driver::os` as
+Chromium's: the rest rule, press and release samples, `Covered` and `OutOfView` before sending, and the
+browser's process set (Safari's XPC services included) for presents and hit tests. The map onto the
+screen is still measured from where posted moves land, never from an engine's own idea of its
+viewport, and is now placed in the window's frame from the input thread at fractions of it below the
+browser's own share of the window (`(outerHeight - innerHeight) / outerHeight`, a ratio: it had mixed
+the page's CSS pixels with the OS's device-independent ones, wrong under a device scale or zoom),
+rounded to whole screen units as posted, with a third point checked against the map and the viewport
+checked inside the frame. The map is checked after every run, reset and `ctx.untimed` edge (the
+window from the OS; `screenX`, `screenY`, inner and outer sizes, `devicePixelRatio` and the visual
+viewport's scale and offsets from the page; any `resize`, `fullscreenchange` or visual viewport
+`resize` since), and input must hit the page's window itself, not another of the browser's. Delivery is
+exact for every key down and up and button press and release (it allowed 5% short), at least one for
+wheel turns and pointer moves, also checked at `ctx.untimed` edges, and a click into a field must put
+focus in it before keys go. A page the OS's input cannot reach takes none in its runs: headless
+(`Headless`; no present capture or page-change script either) and Safari (`InputMismatch`: its
+WebDriver session window took no pointer move strobe posted); a Linux browser with a Wayland window
+refuses typed (`InputMismatch`), not "no window". macOS: a point whose accessibility hit test is not
+implemented (Safari's web content, `kAXErrorNotImplemented`) is hit-tested by the window list at any
+level; other accessibility errors stay errors. Windows: a present the OS's events lost (Firefox's
+WebRender presents through DirectComposition surfaces, which `present_history` marked lost and the
+frame counts dropped, so `frames.presented.count` could read 0) now refuses the block's frame and
+latency metrics `NoPresentSource`. `ctx.untimed` edges keep strobe's page calls inside the stretch.
+`--check --base <target> --head <target>` checks two targets as their comparison measures them, and a
+plain `--check` decides "from outside" per case over the targets it runs on. macOS: Firefox launches
+with `-foreground` once nobody has used the Mac for a minute, and that idle clock no longer counts
+strobe's own posted input (a posted move and a cursor warp each reset the HID idle clock on air; the
+SPEC's earlier "the HID system's idle time, so strobe's own clicks do not count" was wrong).
+
+Checked on air (macOS 27, AC, shared with other agents' benches, `--check`, one cold run each, no
+verdicts): `os-input.bench.ts --base chromium --head firefox --check`: all 16 blocks passed from outside
+(type, press, held button, hover, scroll, wheel, drag at `input.rate` 60.0/s on both, held key);
+`--base chromium --head webkit --check --filter type`: Chromium passed, Safari refused `InputMismatch`.
+`press.bench.ts --check` (Cocoa, Chromium, Firefox, Safari): every Chromium, Cocoa and Firefox case
+passed (Firefox `interaction.p50` 25.7-61.3 ms, the press cases timed from their presses), Safari
+refused its five input cases and passed the three without input, which now check in their own
+engines (pages only). The `ctx.untimed` CPU residue: `untimed-cpu` (a 500 ms spin inside a stretch)
+in Firefox from outside read 153 ms of `cpu.work` before the edge change and 1.2-1.4 ms after (a
+100 ms control 7.0 ms); warm `--blocks 2` in Firefox's own engine 0.2-0.5 ms against a 4.1-5.0 ms
+control (Chromium 15-20 ms against 4-6 ms: Chromium's own work after its main thread was blocked, not
+taken out). A cold single run can still hold a browser's work after its launch (Firefox's `untimed`
+case read 155 ms once, 19.5 ms in the next check; Chromium 232-504 ms in a 1.2 s idle run), which
+`--check` does not warm away. Not run: Windows (adais locked: posted messages to Firefox, the frame check
+against `GetWindowRect`, the lost-present refusal on Firefox's DirectComposition presents) and Linux
+headed (vps has no display: XTest to Firefox, WebKitGTK's automation window, the Wayland refusal);
+a window moved or zoomed mid-run (the refusal path). Firefox launched with `-foreground` once the
+idle clock passed a minute (seen in its arguments), but its blocks still waited for it: another
+agent's bench posted input on air throughout, which counts as a person, so the exclusion of
+strobe's own posts is not shown end to end.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

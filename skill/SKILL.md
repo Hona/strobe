@@ -581,7 +581,7 @@ Fewer than 6 pairs never gets a verdict.
   - Each target has a `name` (what every report calls it); `cwd: "../other-repo"` takes that repo's strobe.json for its builds and app profiles.
   - Both talk to one `fixture("<server> --port {port}", { seed })`: strobe starts it per block outside both apps; pass `{fixture.url}` in the targets' `args`, `env` or `files`.
     - `FixtureMismatch`: no connection the fixture answered, a side served its port itself, or ran its executable (or a copy).
-  - A declared `viewport` holds on both sides (app windows sized through the OS); a side that shows another size, or that strobe cannot measure (a native app on macOS, a native launch), refuses `VariantMismatch` naming it: drop `viewport` from both.
+  - A declared `viewport` holds on both sides of a run case (app windows sized through the OS); a side that shows another size, or that strobe cannot measure (a native app on macOS), refuses `VariantMismatch` naming it: drop `viewport` from both. Launches keep the window each app opens; their sides must match each other.
   - Pick a primary both sides measure the same way: `cpu.work`, `run.duration`, `launch.ready`, `memory.app.private`; `main.work` or `ui.cpu` against another engine exits 2 (`NotComparable`).
   - Give each target a `ui` adapter for what differs: `ui: { timeline: ".scroll-view", openSession: ({ page }) => page.click("@row") }`; journeys say `page.scroll("@timeline", …)`, `await ctx.ui.openSession()`, `until: "@timeline"`, `"@row index=-1"` (the last).
   - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case, or just an `@name` its `ui` lacks (a parity gap: listed with the missing name, never run).

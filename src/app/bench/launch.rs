@@ -314,6 +314,10 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         // The page's own size in the window the app opened (a launch is never resized), which
         // `admit_window` holds to the other side's and to a viewport the targets ask for.
         let client = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
+        // What the result says the launch drew in: the page's own size, not the window asked for.
+        if let Some(c) = client.filter(|_| !browser.embedded) {
+            ctx.used = Some(Window { width: c[0].round() as u32, height: c[1].round() as u32, scale: Some(c[2]), ..window.clone() });
+        }
         // The launch's processes once it was ready (what its numbers summed), and whether they talk to
         // the block's fixture by then.
         let procs = browser.processes();

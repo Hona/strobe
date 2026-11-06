@@ -2504,14 +2504,17 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   builds against its own project's strobe.json, as a single target's are. After each block: what the app drew in (more than 2 DIP
   apart) or its scale against the other side's first block of the series: a native app's client
   area from the OS, a page's viewport (`innerWidth` × `innerHeight`, `devicePixelRatio`; a launch
-  case's once it is ready). With a declared viewport each side must also show it (within 2 DIP), or
-  the block refuses naming the side: a page's browser window and an app's window (a webview's, an
-  Electron app's, through the OS as a native app's: DevTools resizes no app window) are sized to it
-  before the runs, a web launch's before its navigation; an app's launch is timed in the window
-  the app opens, unresized. A side strobe cannot measure (a native side on macOS, whose window list
-  gives a window's frame with its title bar, not its content: checked on air, a 640×480 page read
-  648×611 as a window, a Cocoa app 640×512; a native launch) cannot be held to a declared viewport
-  and refuses too; without one it is not compared. result.json's `fairness.window.client_dip` is
+  case's once it is ready, which is also the window its result reports). With a declared viewport
+  each side of a run case must also show it (within 2 DIP), or the block refuses naming the side: a
+  page's browser window and an app's window (a webview's, an Electron app's, through the OS as a
+  native app's: DevTools resizes no app window; checked on air with an Electron app) are sized to it
+  before the runs, from the window's size less the page's (what the app draws around it, the title
+  bar on macOS), read again before each of up to three passes. A side strobe cannot measure (a
+  native side on macOS, whose window list gives a window's frame with its title bar, not its
+  content: checked on air, a 640×480 page read 648×611 as a window, a Cocoa app 640×512) cannot be
+  held to a declared viewport and refuses too; without one it is not compared. A launch case is
+  timed in the window the app opens (a web launch's browser window takes the viewport before its
+  navigation): its sides are held to each other only. result.json's `fairness.window.client_dip` is
   set only when both sides were measured. Native sides also their GPU adapter and scale (`admit_setup`, across
   the sides). One case means one launch `profile`, priority and CPU pinning for both. Not built yet: a
   page side's `ctx.mock` (a mock one side has and the other cannot) and the GPU adapter of a page side.
@@ -2606,7 +2609,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
-| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block); a side whose content area is off its declared viewport by over 2 DIP, or that strobe cannot measure while a viewport is declared (named) |
+| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block); in a run case, a side whose content area is off its declared viewport by over 2 DIP, or that strobe cannot measure while a viewport is declared (named) |
 | `FixtureMismatch` | a block's target held no TCP connection the bench file's fixture answered at any run's start or end, or one of its processes served the fixture's port itself or runs the fixture's executable or a copy of it (it started its own server), §9.10 |
 | `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10). Also a question with no answer between two implementations: `query a..b` of their recordings, or a base..head view of `query <exp>` (exit 2, §11.1). At exit 2 it stays typed: the error carries the validator (`--json` and MCP give `validator: "NotComparable"`), so nothing reads its message |
 | `InputMismatch` | the sides of an implementation comparison got other input (§9.10): one acted through accessibility actions where the other got pointer or key input, a kind of input call in their runs differs by over 5% (not with steps per target), or their drags' `input.rate` does (the series, from that pair); OS input posted to a page measured from outside did not reach it (the block); a run of a page from outside in an engine strobe gives no OS input sends input |
@@ -5142,6 +5145,26 @@ and markers read back by trace_processor with no import errors) work on Firefox 
 Not built: Firefox launch cases (and so launch attribution through `MOZ_PROFILER_STARTUP`), sampled
 allocations (the profiler's `jsallocations`), Linux WebKit attribution through the Web Inspector
 (waits for the WebKit drivers to land). Not checked: headed Firefox attribution on Windows (locked).
+
+Isolation, viewports, fixtures and launch ends (2026-11-06, issues-1: 9.10, 13.2). An isolated launch on
+macOS sets `CFFIXED_USER_HOME` (Cocoa's home and `NSSearchPath…` folders in the home) and an Electron
+launch adds `--use-mock-keychain` (macOS) or `--password-store=basic` (Linux). Checked on air (macOS
+27.0.1, AC) with a stock Electron 45 app given its own bundle id: without the variable `app.getPath`
+gave the user's `~/Documents` and `~/Library/Application Support/<name>`; with it every path was in
+the home, `safeStorage` encrypted without a keychain prompt (the prompt had hung an unmocked run), and
+nothing appeared in the user's Library; `cfprefsd` still wrote the user's own Preferences (so the
+Library rule stays). The known-folder guard stopped a `--check` on air and on adais (Windows) when a
+file was added to and removed from the real Downloads while the copy ran. An Electron app's window
+took a 1000×700 viewport on air (`webview::fit`, which had never moved a macOS window: it took the
+app's 1470×33 menu bar strip, before its window showed, for the main window). The fixture's socket
+ownership and copy checks were run with `scripts/dev/fixture.bench.ts` on adais and vps: `use` passes,
+`own`, `port` and a copied runtime each refuse `FixtureMismatch`; `{fixture.port}` in a target's `args`
+or `env` had become a JSON number that native targets dropped (now only `files` keep numbers). A
+launch series records `until` (checked in a headless `--check` on adais); the PR notes of an old
+implementation result on air name each side by its compact name (`<name>:`, `<name>'s attribution block
+failed`), where they said `before:` and `this PR:`.
+Not run: a timed implementation comparison (the per-side viewport check after a block runs only
+there), the fixture checks on macOS.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

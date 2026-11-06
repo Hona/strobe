@@ -545,21 +545,17 @@ fn admit_window(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()>
     let target = &ctx.describe["targets"][v.target_of(s)];
     let windowed = !matches!(target["kind"].as_str(), Some("script" | "cli")) && target["window"] != false;
     let asked = target["viewport"].as_object().map(|vp| (vp.get("width").and_then(Value::as_f64).unwrap_or(0.0), vp.get("height").and_then(Value::as_f64).unwrap_or(0.0)));
-    let launch = if s.launch.is_object() { " (a launch case times the window the app opens: strobe does not resize it)" } else { "" };
-    match (asked.filter(|_| windowed), b.client) {
+    // A launch is timed in the window the app opens (never resized): its sides are held to each other.
+    match (asked.filter(|_| windowed && !s.launch.is_object()), b.client) {
         (Some((w, h)), Some(c)) if (c[0] - w).abs() > 2.0 || (c[1] - h).abs() > 2.0 => {
             return Err(Error::refused(
                 "VariantMismatch",
-                format!("{}'s window showed {}×{}, not the viewport {w}×{h} its target asks for{launch}", v.name, c[0], c[1]),
+                format!("{}'s window showed {}×{}, not the viewport {w}×{h} its target asks for", v.name, c[0], c[1]),
                 "drop viewport from both targets (each app's own size is compared then), or let the app take the size",
             ));
         }
         (Some((w, h)), None) => {
-            let why = if cfg!(target_os = "macos") && !s.launch.is_object() {
-                "macOS reports a native window's whole frame, title bar included".to_string()
-            } else {
-                format!("its blocks measure no content area{launch}")
-            };
+            let why = if cfg!(target_os = "macos") { "macOS reports a native window's whole frame, title bar included" } else { "its blocks measure none" };
             return Err(Error::refused(
                 "VariantMismatch",
                 format!("strobe cannot read the content area of {}'s window ({why}), so it cannot hold it to the viewport {w}×{h} both targets ask for", v.name),

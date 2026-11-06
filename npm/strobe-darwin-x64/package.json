@@ -1,6 +1,6 @@
 {
   "name": "@hona/strobe-darwin-x64",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "The strobe binary for macOS x64 (Intel); installed by @hona/strobe",
   "files": ["strobe"],
   "os": ["darwin"],

@@ -965,7 +965,7 @@ impl<'a> Doc<'a> {
         t += &format!("- **Machine:** {}\n", cell(&self.machine()));
         // What each build showed on screen (`bench::shown_line`), so a reader sees what was measured.
         for s in &self.series {
-            if let Some(l) = crate::app::bench::shown_line(s) {
+            if let Some(l) = crate::app::bench::shown_line(s, ("base", "head")) {
                 t += &format!("- **On screen{}:** {}\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() }, cell(&l));
             }
         }

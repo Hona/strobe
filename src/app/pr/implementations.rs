@@ -506,8 +506,7 @@ impl<'a> Doc<'a> {
             };
             let ms = |x: &Value, k: &str| x[k].as_f64().map(|v| nb(&disp(v, "ms")));
             row("CPU per run, timed pairs", ms(b, "cpu_ms_per_run"), ms(h, "cpu_ms_per_run"));
-            row("CPU per run, profiled launch", ms(b, "profiled_cpu_ms_per_run"), ms(h, "profiled_cpu_ms_per_run"));
-            let from = |x: &Value| if x["processes_from"] == "timed" { " <sub>timed</sub>" } else { "" };
+            let from = |x: &Value| if x["processes_from"] == "timed" { " <sub>timed</sub>" } else { " <sub>profiled</sub>" };
             row("By process", shares(&b["processes"], 4, None, false).map(|t| t + from(b)), shares(&h["processes"], 4, None, false).map(|t| t + from(h)));
             row("By whose threads", shares(&b["origins"], 4, None, false), shares(&h["origins"], 4, None, false));
             row("Busiest threads", threads(s, "base"), threads(s, "head"));

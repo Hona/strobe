@@ -3,9 +3,9 @@
 use serde::Serialize;
 use std::fmt;
 
-/// An error with the exit code it maps to (SPEC §5.2) and an optional fix. A refusal (exit 4) also
-/// carries what refused it, typed: `refusal` is set exactly when `code` is 4 and it came from
-/// `Error::refused` or a `Refusal`.
+/// An error with the exit code it maps to (SPEC §5.2) and an optional fix. A refusal carries what
+/// refused it, typed: `refusal` is set when it came from `Error::refused` or a `Refusal` (exit 4), or
+/// from `Error::usage_refused`, a question that cannot be asked at all (exit 2: `NotComparable`).
 #[derive(Clone, Debug)]
 pub struct Error {
     pub code: i32,
@@ -38,6 +38,12 @@ impl Error {
             None => Error::msg(format!("internal: {validator} is not a validator: {}", message.into())),
         }
     }
+    /// A usage error a validator names (exit 2, SPEC §10.1): what was asked cannot be answered at all,
+    /// such as a diff of two implementations (`NotComparable`). Typed like a refusal, so callers read
+    /// `validator()` and never the message.
+    pub fn usage_refused(r: Refusal) -> Self {
+        Error { code: 2, message: r.message(), hint: r.fix.clone(), refusal: Some(Box::new(r)) }
+    }
     pub fn unreachable(message: impl Into<String>) -> Self {
         Error::new(255, message)
     }
@@ -45,7 +51,7 @@ impl Error {
         self.hint = Some(hint.into());
         self
     }
-    /// The validator that refused, for an exit-4 error.
+    /// The validator that refused (an exit-4 error, or a usage error a validator names).
     pub fn validator(&self) -> Option<ValidatorId> {
         self.refusal.as_ref().map(|r| r.validator)
     }

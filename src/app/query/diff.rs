@@ -7,7 +7,7 @@
 
 use super::{NativeStacks, Output, Part, Rec, Stacks, fmt};
 use crate::cli::Args;
-use crate::model::{Error, Result};
+use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::symbols::Frame;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
@@ -42,8 +42,9 @@ fn implementation(rec: &Rec) -> Option<(String, String)> {
 /// `NotComparable`: two implementations share no code, so no view of one is a diff of the other's.
 /// The hint names each recording's own view.
 fn not_comparable(what: &str, view: &str, recs: &[&str]) -> Error {
-    Error::usage(format!("NotComparable: {what}, two implementations that share no code: a..b {view} would match functions, threads or heaps that are not the same thing"))
-        .hint(recs.iter().map(|r| format!("strobe query {r} {view}")).collect::<Vec<_>>().join(" · "))
+    let r = Refusal::new(ValidatorId::NotComparable, format!("{what}, two implementations that share no code: a..b {view} would match functions, threads or heaps that are not the same thing"))
+        .fix(recs.iter().map(|r| format!("strobe query {r} {view}")).collect::<Vec<_>>().join(" · "));
+    Error::usage_refused(r)
 }
 
 fn run_with(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize, plan_runs: Option<u64>) -> Result<Output> {

@@ -1599,7 +1599,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
                 text += &format!("      self  {o}\n");
             }
             let missing: Vec<&str> = s["shown"]["head"]["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|m| !m.contains("before the runs")).collect();
-            match shown_line(s) {
+            match shown_line(s, ("base", "head")) {
                 Some(line) => text += &format!("      shown  {line}{}\n", if missing.is_empty() { String::new() } else { format!(" (not read: {})", missing.join("; ")) }),
                 None if !missing.is_empty() => text += &format!("      shown  nothing read: {}\n", missing.join("; ")),
                 None => {}
@@ -4849,8 +4849,8 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
     let cross = engine(&kind(tb)) != engine(&kind(th));
     for s in series.iter().filter(|s| s.gap.is_none() && cross) {
         if let Some(d) = model::metric(&s.primary).filter(|d| d.across == model::Across::PerSide) {
-            return Err(Error::usage(format!(
-                "NotComparable: {}'s primary {} is one engine's own measure ({}), and {} runs on {} while {} runs on {}: pick a primary both sides measure the same way, such as cpu.work, run.duration or launch.ready",
+            let why = format!(
+                "{}'s primary {} is one engine's own measure ({}), and {} runs on {} while {} runs on {}",
                 s.case,
                 d.name,
                 d.about,
@@ -4858,7 +4858,8 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
                 engine(&kind(tb)),
                 variants[1].name,
                 engine(&kind(th)),
-            )));
+            );
+            return Err(Error::usage_refused(Refusal::new(ValidatorId::NotComparable, why).fix("pick a primary both sides measure the same way, such as cpu.work, run.duration or launch.ready")));
         }
     }
     let size = |t: &Value| t["viewport"].is_object().then(|| (t["viewport"]["width"].as_f64().unwrap_or(0.0), t["viewport"]["height"].as_f64().unwrap_or(0.0)));
@@ -6176,7 +6177,7 @@ fn render(r: &Value) -> String {
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
         out += &self_line(&s);
-        if let Some(line) = shown_line(&s) {
+        if let Some(line) = shown_line(&s, (bn, hn)) {
             out += &format!("shown  {line}{}\n", if s["shown"]["changed"] == true { "  ! different screens (ScreenChanged)" } else { "" });
         }
         let f = &r["fixture"];

@@ -120,7 +120,7 @@ pub fn dispatch(args: &Args) -> Result<Output> {
 
 fn fail(e: &Error, json: bool) -> i32 {
     if json {
-        println!("{}", json!({ "error": e.message, "hint": e.hint, "code": e.code }));
+        println!("{}", json!({ "error": e.message, "hint": e.hint, "code": e.code, "validator": e.validator() }));
     } else {
         eprintln!("strobe: {}", e.message);
         if let Some(h) = &e.hint {

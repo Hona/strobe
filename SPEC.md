@@ -2251,8 +2251,11 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
   another engine, a command) gets none and says why (`Attribution`, info), and the other side keeps
   its own. `Unresolved` warns per side, by name, below 95% of script samples source-mapped or of
   native samples symbolized. The sides are never diffed: `query a..b` of two implementations'
-  recordings and `query <exp> <view>` of an implementation comparison are refused `NotComparable`
-  (exit 2) with each recording's own view, and the report reads each side on its own (§11.2).
+  recordings and the base..head views of `query <exp> <view>` (`hotspots`, `alloc`, `layout`,
+  `style`, `threads`, `frames`, `heap`, `memory`) are refused `NotComparable`
+  (exit 2) with each recording's own view; `query <exp> summary` and `progress` answer as for any
+  experiment, and `query <exp> insights` gives each side's own insights under its name, no movers
+  between them. The report reads each side on its own (§11.2).
 - **Screens.** Base and head show two apps, so `ScreenChanged` compares only blocks of one side;
   `expect.same` compares the sides. Each side keeps its first block's start and end thumbnails
   (`shown.<side>.thumb_start`, `thumb_end`).
@@ -2289,7 +2292,7 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block) |
 | `FixtureMismatch` | a block's target held no TCP connection to the bench file's fixture at any run's start or end, or one of its processes runs the fixture's executable (it started its own server), §9.10 |
-| `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10) |
+| `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10). Also a question with no answer between two implementations: `query a..b` of their recordings, or a base..head view of `query <exp>` (exit 2, §11.1). At exit 2 it stays typed: the error carries the validator (`--json` and MCP give `validator: "NotComparable"`), so nothing reads its message |
 | `InputMismatch` | a run of a page measured from outside against a native implementation sends input through DevTools, where the other side would get OS input or none (§9.10) |
 | `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`): the series' primary, nothing run; the bench still exits 0 |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
@@ -2515,8 +2518,9 @@ session.
 `a..b` works with `hotspots`, `alloc`, `layout`, `style`, `threads`, `frames`, `summary`, `memory`
 and `heap`; `query exp_… <view>` runs the same views on each series' base and head attribution
 recordings. Never across implementations (§9.10): two recordings of an implementation
-comparison's two sides (each recording names its experiment and side), or `query exp_… <view>` of
-such an experiment, are refused `NotComparable` (exit 2), naming each recording's own view. Every row is per measured run on each side (each side's own run count) when both sides
+comparison's two sides (each recording names its experiment and side), or a base..head view of
+`query exp_… <view>` of such an experiment, are refused `NotComparable` (exit 2, typed: §10.1),
+naming each recording's own view; its `insights` are each side's own. Every row is per measured run on each side (each side's own run count) when both sides
 know their runs; otherwise neither side is divided and the header says per recording. Native samples
 without times (macOS `sample`) cover the whole capture, launch, warmups and resets included: never
 divided by runs, and they name no insight movers. Two recordings are two launches, often two builds
@@ -2796,11 +2800,11 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   their own, Details (Metrics with side-name columns and a footnote whose confidence comes from the
   comparisons and the plan's looks; Pairs; Per implementation, not compared, from
   `series[].per_side`; Equivalence checked; Where each spends its time, from each side's profiled
-  launch, never a diff: CPU per run in the timed pairs and in the profiled launch (a profiled browser
-  spends many times its timed CPU on its own sampler and trace, a native sampler little, so totals
-  that share a scale come from the timed pairs), its share by process (a browser's renderer, GPU
-  process, browser and the rest from its timed blocks' per-side numbers; a native app's programs from
-  its profiled launch), by whose threads (app, driver, os: native sides), the
+  launch, never a diff: CPU per run in the timed pairs (a profiled launch's own total is its
+  profiler's too, and a browser's profiler costs far more than a native sampler, so it is not in the
+  table), its share by process (a browser's renderer, GPU process, browser and the rest from its
+  timed blocks' per-side numbers, marked timed; a native app's programs from its profiled launch,
+  marked profiled), by whose threads (app, driver, os: native sides), the
   busiest threads, the top packages or crates by their share of the side's sampled time, and how much
   of its samples were named; How it was measured: both identities, machine, window, input, observer and frame
   source, fixture, what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original
@@ -2833,10 +2837,12 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   run (timed, and in the profiled launch) by process (as the PR block takes them) and by whose
   threads (none on macOS, which keeps no thread's start), the busiest threads, its call tree as an icicle (CPU time,
   or allocations; click to zoom), its top functions and packages by self time, and its memory by
-  part, every list on one scale for both columns (ms per run, bytes), so a bar's length compares
-  across them; an icicle is as wide as its side's sampled time against the larger side's. Untimed
-  native samples (macOS `sample`) cover the whole capture: that side's sampled lists and icicle
-  keep a scale of their own, marked. Each column gives `strobe open <exp>/<side>` and its
+  part. Both columns share a list's scale (ms per run, bytes) only where both sides' numbers come
+  from one source: the timed blocks, or one profiler (two native apps, two pages); an icicle is then
+  as wide as its side's sampled time against the larger side's. A browser's profiler and a native
+  sampler slow their apps unlike each other, so across them each column keeps its own scale and the
+  section says so; every list from a profiled launch is marked perturbed. Untimed native samples
+  (macOS `sample`) cover the whole capture and are marked too. Each column gives `strobe open <exp>/<side>` and its
   recording's own view. The verdict panel names the sides (`Rewrite uses 62% less CPU time than
   Original`, `Better than Original`, or `Better on its own · not after Holm`). No function, flame or
   heap diffs: two implementations share no code. `report` adds `scoreboard`, `p_repeated`,
@@ -4724,13 +4730,21 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   The bench writes `scoreboard`, `p_repeated` and `holm_decided` (`family::Board::write`, also the
   text output's `family` line) and runs a primary decided better or worse on to
   `family_min_pairs(journeys)`; reports read a result without them by computing the family from its
-  blocks. Per-side attribution (phase 4) is built: checked on air with OpenCode Electron (a perf
-  build) against OpenCode (Rune) on one fixture, idle journey, `--why always`, 3 pairs (a smoke
-  run): each side got its own block, 100% of the Electron side's script samples source-mapped and
-  100% of the Rune side's native samples symbolized; `query` of the two recordings and of the
-  experiment refused `NotComparable` (exit 2); the report drew both columns. The profiled Electron
-  launch spent 548 ms of CPU per 5 s run against 5.80 ms in its timed blocks (Rune: 3.80 against
-  3.34 ms), which is why totals and a browser's processes come from the timed pairs. Every
+  blocks. Per-side attribution (phase 4) is built: checked on air with an Electron app (a perf
+  build with its own bundle id) against its native rewrite on one fixture, idle journey, `--why
+  always`, 3 pairs (a smoke run): each side got its own block, 100% of the Electron side's script
+  samples source-mapped and 100% of the native side's samples symbolized; `query` of the two
+  recordings and of the experiment refused `NotComparable` (exit 2); the report drew both columns.
+  The profiled Electron launch spent 548 ms of CPU per 5 s run against 5.80 ms in its timed blocks
+  (the native side 3.80 against 3.34 ms). That is strobe's own cost, almost all of it V8's CPU
+  sampler in the renderer: the renderer went from 0.015–0.028% of a core in the timed blocks to
+  10.3% (+514 ms per run), the browser process from 0.08% to 0.32% and the GPU process from 0.01%
+  to 0.11%, while the renderer's main thread did 4.4 ms of work per run (0.36 ms timed) and the
+  trace's own threads (`PerfettoTrace`, the tracing service) about 0.3% of a core: about 30 µs of
+  renderer CPU per sample at the ~3,200 samples a second the idle profile took (macOS suspends the
+  thread to read its stack). A lighter trace would save little; the sampling interval is §8.3's. So
+  totals and a browser's processes come from the timed pairs, profiled lists are marked perturbed,
+  and the two columns share no scale across profilers. Every
   card's pair strip is now on a log-ratio scale (it was `(head − base) / base`, which drew −80% four
   times closer to no change than +400%); builds-mode PR blocks are unchanged (55 stored experiments
   matched byte for byte, the version line aside); 2 of their 55 cards moved their dots. A note's

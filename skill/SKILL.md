@@ -569,7 +569,8 @@ Fewer than 6 pairs never gets a verdict.
   - `--noworse 5%` asks "no worse anywhere"; `--check --head <target>` runs one side's cases once.
   - Where each spends its time: `--why always` profiles each side once with its own engine's tools.
   - Read each side alone (`query <rec> threads`, `hotspots --by package`); `query a..b` across implementations is refused (`NotComparable`).
-  - `report experiment <exp> --open`: both sides in two columns on one ms-per-run scale.
+  - `report experiment <exp> --open`: both sides in two columns; a shared scale only where both come from one source.
+  - Profiled launches are perturbed (a browser's profiler far more than a native sampler): compare totals from the timed pairs.
 
 ## Every performance claim in a PR comes from strobe
 

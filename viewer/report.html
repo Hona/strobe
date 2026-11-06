@@ -2005,8 +2005,8 @@ function renderExperiment(r) {
           ? h("span", {
               class: "ref-pill",
               title: [
-                `Base: ${baseVar?.spec || baseTag}${baseVar?.subject ? " — " + baseVar.subject : ""}`,
-                `Head: ${headVar?.spec || headTag}${headVar?.subject ? " — " + headVar.subject : ""}`,
+                `${impl ? baseTag : "Base"}: ${baseVar?.spec || baseTag}${baseVar?.subject ? " — " + baseVar.subject : ""}`,
+                `${impl ? headTag : "Head"}: ${headVar?.spec || headTag}${headVar?.subject ? " — " + headVar.subject : ""}`,
               ].join("\n"),
             }, impl ? `${headTag} vs ${baseTag}` : `${baseTag} → ${headTag}`)
           : headVar
@@ -2065,6 +2065,7 @@ function renderExperiment(r) {
       ...renderImplSeries(r, s, baseVar, headVar),
       gap ? null : renderNextStepsSection(r, s, aa),
       gap || !impactI.hasStream ? null : renderFramePacingSection(r, s, impactI),
+      gap || !impactI.hasStream || !state.distOpen ? null : renderDistExplorer(r, s, impactI),
       gap ? null : renderAllMetricsDisclosure(s, aa),
       gap ? null : renderPlanVsActual(r, s),
       gap ? null : renderRigFooter(r, s, impactI),
@@ -2301,7 +2302,7 @@ function buildHeroProse(r, s, c, cl, aa) {
 function renderShown(s) {
   const sh = s?.shown;
   if (!sh) return null;
-  const roles = ["base", "head"].filter((r) => sh[r] && (sh[r].end || sh[r].thumb_end));
+  const roles = ["base", "head"].filter((r) => sh[r] && (sh[r].end || sh[r].thumb_end || sh[r].thumb));
   if (!roles.length) return null;
   const text = (v) => !v.end ? "nothing read" : v.start && v.start !== v.end ? `'${v.start}' → '${v.end}'` : `'${v.end}'`;
   return h("div", { class: `shown-row${sh.changed ? " warn" : ""}`, title: sh.changed ? "Base and head showed different screens (ScreenChanged)" : "What each build showed on screen" },
@@ -2309,7 +2310,7 @@ function renderShown(s) {
       const v = sh[role];
       const others = (v.others || []).map((o) => `${o.blocks} on '${o.label}'`).join(", ");
       return h("div", { class: "shown-side" },
-        v.thumb_end ? h("img", { class: "shown-thumb", src: v.thumb_end, alt: `${sideWord(role)} screen` }) : null,
+        (v.thumb_end || v.thumb) ? h("img", { class: "shown-thumb", src: v.thumb_end || v.thumb, alt: `${sideWord(role)} screen` }) : null,
         h("span", { class: "shown-label", title: others ? `other blocks: ${others}` : text(v) }, `On screen · ${sideWord(role, true)}: ${text(v)}${others ? ` (+${others})` : ""}`)
       );
     })
@@ -2367,7 +2368,7 @@ function renderImplPanel(r, baseVar, headVar) {
   const fx = r.fixture;
   const kv = (rows) => h("div", { class: "impl-kv" }, rows.filter((x) => x[1] != null && x[1] !== "").flatMap(([k, v]) => [h("span", {}, k), h("span", {}, String(v))]));
   const side = (v, role) => h("div", {},
-    h("div", { class: "impl-side-name" }, `${sideName(v, role)} · ${role}`),
+    h("div", { class: "impl-side-name", title: `--${role}` }, sideName(v, role)),
     kv([
       ["Build", v?.label || v?.spec || ""],
       ["Commit", v?.commit ? `${v.commit}${v.dirty ? " (dirty)" : ""}${v.subject ? " · " + v.subject : ""}` : ""],
@@ -2509,11 +2510,22 @@ function renderImplAttribution(r, s, nameOf) {
     packages: (role) => (sd(role)?.packages || []).filter(pos).slice(0, 8),
     memory: (role) => (sd(role)?.memory?.parts || []).map((p) => ({ name: p.name, ms: p.bytes })).filter(pos),
   };
-  const sampled = (key) => key === "functions" || key === "packages";
   const timed = (role) => sd(role)?.per_run !== false;
-  // One maximum for both columns; an untimed side's sampled list keeps its own.
+  const profiler = (role) => sd(role)?.profiler || "none";
+  // Where a list's numbers come from on a side: the timed blocks (no profiler), or its profiled
+  // launch under its profiler, per run or over the whole capture (untimed samples).
+  const sourceOf = (key, role) => {
+    if (key === "memory") return "memory";
+    if (key === "processes" && sd(role)?.processes_from === "timed") return "timed";
+    const sampled = key === "functions" || key === "packages";
+    return `profiled:${profiler(role)}${sampled && !timed(role) ? ":capture" : ""}`;
+  };
+  const perturbed = (key, role) => sourceOf(key, role).startsWith("profiled");
+  // Both columns share a list's scale only when both sides' numbers come from one source (the timed
+  // blocks, or one profiler): a profiler slows its own engine its own way.
+  const shared = (key) => roles.every((x) => att(x) && lists[key](x).length) && sourceOf(key, "base") === sourceOf(key, "head");
   const maxOf = (key, role) => {
-    const over = sampled(key) && !timed(role) ? [role] : roles.filter((x) => !sampled(key) || timed(x));
+    const over = shared(key) ? roles : [role];
     return Math.max(1e-9, ...over.flatMap((x) => lists[key](x).map((t) => t.ms)));
   };
   const bars = (key, role, fmt) => {
@@ -2526,21 +2538,22 @@ function renderImplAttribution(r, s, nameOf) {
       h("span", { class: "mono", style: "text-align:right" }, fmt(t.ms, role))
     ));
   };
-  const ms = (x, role) => `${fmtVal(x, "ms")}${timed(role) ? "" : " *"}`;
-  const ms1 = (x) => fmtVal(x, "ms");
+  const ms = (x) => fmtVal(x, "ms");
+  const msSampled = (x, role) => `${fmtVal(x, "ms")}${timed(role) ? "" : " *"}`;
   const bytes = (x) => fmtBytes(x);
   const pair = (title, note, key, fmt, foot) => {
     if (!roles.some((role) => lists[key](role).length)) return null;
+    const scale = roles.every((x) => lists[key](x).length) ? (shared(key) ? "one scale for both columns" : "each column on its own scale (different sources)") : "";
+    // A profiled launch's numbers are its profiler's too: every such column says so.
+    const footOf = (role) => [foot?.(role), lists[key](role).length && perturbed(key, role) ? `perturbed: from the profiled launch (${profiler(role)})` : null].filter(Boolean).join(" · ");
     return [
-      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, title), note ? h("span", { class: "sec-sub" }, note) : null),
+      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, title), h("span", { class: "sec-sub" }, [note, scale].filter(Boolean).join(" · "))),
       h("div", { class: "impl-grid" }, roles.map((role) => h("div", {},
         att(role) ? bars(key, role, fmt) : h("div", { class: "sec-sub" }, "not profiled"),
-        foot && foot(role) ? h("div", { class: "sec-sub", style: "margin-top:4px" }, foot(role)) : null))),
+        footOf(role) ? h("div", { class: "sec-sub", style: "margin-top:4px" }, footOf(role)) : null))),
     ];
   };
-  const processesFrom = (role) => !lists.processes(role).length ? null
-    : sd(role)?.processes_from === "timed" ? "From the timed blocks (each role's share of a core × the run), no profiler running"
-      : "From its profiled launch: its threads' CPU from the OS";
+  const processesFrom = (role) => lists.processes(role).length && sd(role)?.processes_from === "timed" ? "from the timed blocks (each role's share of a core × the run), no profiler running" : null;
   const head = (role) => {
     const a = att(role), x = sd(role);
     if (!a) {
@@ -2553,10 +2566,10 @@ function renderImplAttribution(r, s, nameOf) {
     return h("div", {},
       h("div", { class: "impl-side-name" }, nameOf(role)),
       h("div", { class: "impl-kv" },
-        h("span", {}, "Profiled with"), h("span", {}, x?.profiler ? `${x.profiler}${x.engine === "native" ? "; threads and memory from the OS" : "; heap snapshot, forced layouts, GC"}` : "no stacks (threads and memory from the OS)"),
+        h("span", {}, "Profiled with"), h("span", {}, x?.profiler ? `${x.profiler}${x.engine === "native" ? "; threads and memory from the OS" : x.engine === "chromium" ? "; heap snapshot, forced layouts, GC" : ""}` : x?.engine === "native" ? "no stacks (threads and memory from the OS)" : "no stacks"),
         h("span", {}, "Samples named"), h("span", { style: low ? "color:var(--warn-ink)" : "" }, named ? `${(100 * named.share).toFixed(1)}% ${named.what}${low ? " (under 95%: Unresolved)" : ""}` : "—"),
         h("span", {}, "CPU per run"), h("span", {}, finite(x?.cpu_ms_per_run) ? `${fmtVal(x.cpu_ms_per_run, "ms")} in the timed pairs` : "—"),
-        h("span", {}, "Profiled launch"), h("span", {}, finite(x?.profiled_cpu_ms_per_run) ? `${fmtVal(x.profiled_cpu_ms_per_run, "ms")} per run, its profiler's work included` : "—"),
+        h("span", {}, "Profiled launch"), h("span", {}, finite(x?.profiled_cpu_ms_per_run) ? `${fmtVal(x.profiled_cpu_ms_per_run, "ms")} per run (perturbed, with profiler)` : "—"),
         h("span", {}, "Measured runs"), h("span", {}, x?.per_run ? String(x.runs) : x?.untimed ? "whole capture (samples carry no times)" : "unknown"),
       ),
       h("div", { style: "margin-top:6px" },
@@ -2572,12 +2585,9 @@ function renderImplAttribution(r, s, nameOf) {
   const kind = state.flameKind;
   const treeOf = (role) => att(role)?.tree?.[kind] || null;
   const rootOf = (role) => treeOf(role)?.nodes?.[0]?.[2] || 0;
-  const icicleMax = (role) => {
-    const t = treeOf(role);
-    if (!t) return 1e-9;
-    const over = t.per_run ? roles.filter((x) => treeOf(x)?.per_run && treeOf(x).unit === t.unit) : [role];
-    return Math.max(1e-9, ...over.map(rootOf));
-  };
+  // Two call trees share a width scale only from one profiler, both per run, in one unit.
+  const treesShared = roles.every((x) => treeOf(x)?.per_run) && profiler("base") === profiler("head") && treeOf("base").unit === treeOf("head").unit;
+  const icicleMax = (role) => Math.max(1e-9, ...(treesShared ? roles : [role]).map(rootOf));
   const icicle = (role) => {
     const t = treeOf(role);
     if (!t || (t.nodes?.length || 0) < 2) return h("div", { class: "sec-sub" }, "—");
@@ -2603,11 +2613,11 @@ function renderImplAttribution(r, s, nameOf) {
         x += w;
       }
     };
-    // Unzoomed, the root's width is its time against the larger side's; zoomed, a frame fills its
-    // column, and so does a side too small to draw at the shared scale (the caption says so).
+    // Unzoomed on a shared scale, the root's width is its time against the larger side's; zoomed, a
+    // frame fills its column, and so does a side too small to draw at that scale (the caption says so).
     const scaled = (100 * nodes[0].v) / icicleMax(role);
-    const shared = zoom === nodes[0] && scaled >= 2;
-    place(zoom, 0, shared ? scaled : 100, 0);
+    const narrow = zoom === nodes[0] && scaled >= 2;
+    place(zoom, 0, narrow ? scaled : 100, 0);
     const all = nodes[0].v || 1e-12;
     return h("div", {},
       h("div", { class: "flame", style: `height:${(depth + 1) * rowH}px;margin:8px 0 4px` },
@@ -2627,32 +2637,32 @@ function renderImplAttribution(r, s, nameOf) {
           return el;
         })
       ),
-      h("div", { class: "sec-sub" }, `${t.what} · ${fmtV(nodes[0].v)}${t.per_run ? " per run" : " over the whole capture (no times: its own scale)"}${zoom === nodes[0] && !shared && t.per_run ? ` · ${scaled.toFixed(1)}% of the larger side's, drawn across the column` : ""} · ${t.nodes.length} of ${t.nodes_total} frames${zoom !== nodes[0] ? " · zoomed: click the top frame to go up" : " · click to zoom"}`)
+      h("div", { class: "sec-sub" }, `${t.what} · ${fmtV(nodes[0].v)}${t.per_run ? " per run" : " over the whole capture (no times)"} · perturbed: from the profiled launch (${profiler(role)})${treesShared && zoom === nodes[0] && !narrow ? ` · ${scaled.toFixed(1)}% of the larger side's, drawn across the column` : ""} · ${t.nodes.length} of ${t.nodes_total} frames${zoom !== nodes[0] ? " · zoomed: click the top frame to go up" : " · click to zoom"}`)
     );
   };
   const toggle = kinds.length > 1
     ? h("div", { class: "seg", role: "group", "aria-label": "Call trees of" },
         kinds.map(([k, lbl]) => h("button", { type: "button", "aria-pressed": String(kind === k), onclick: () => { state.flameKind = k; state.implZoom = {}; render(); } }, lbl)))
     : null;
-  const untimedNote = roles.some((role) => att(role) && !timed(role)) ? " · * whole capture, not per run (these samples carry no times), on its own scale" : "";
+  const untimedNote = roles.some((role) => att(role) && sd(role)?.untimed) ? " · * whole capture, not per run (these samples carry no times)" : "";
   return h("section", { class: "card-surface", id: "impl-attribution" },
     h("div", { class: "card-hd" },
       h("div", { class: "card-hd-left" },
         h("h2", { class: "sec-title" }, "Where each spends its time"),
-        h("span", { class: "sec-sub" }, "One profiled launch per implementation, apart from the timed pairs and slowed by its profiler · each read with its own engine's tools · bars share one scale across both columns · never a diff")
+        h("span", { class: "sec-sub" }, "One profiled launch per implementation, apart from the timed pairs and slowed by its profiler · each read with its own engine's tools · both columns share a scale only where their numbers come from one source · never a diff")
       ),
       h("div", { class: "card-hd-right" }, toggle)
     ),
     h("div", { class: "impl-grid" }, roles.map(head)),
-    pair("By process", "CPU per run of each process, from the OS (a browser's by role)", "processes", ms1, processesFrom),
-    pair("By whose threads", "in the profiled launch · app: started in the app's code · driver: a device driver's user-mode part · os: the OS's pools and services", "origins", ms1),
-    pair("Busiest threads", "CPU per run in the profiled launch, from the OS", "threads", ms1),
+    pair("By process", "CPU per run of each process, from the OS (a browser's by role)", "processes", ms, processesFrom),
+    pair("By whose threads", "app: started in the app's code · driver: a device driver's user-mode part · os: the OS's pools and services", "origins", ms),
+    pair("Busiest threads", "CPU per run, from the OS", "threads", ms),
     kinds.length ? [
-      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, "Call trees"), h("span", { class: "sec-sub" }, "A browser's profile covers its JavaScript; native stacks cover every thread · width: time against the larger side")),
+      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, "Call trees"), h("span", { class: "sec-sub" }, `A browser's profile covers its JavaScript; native stacks cover every thread · ${treesShared ? "width: time against the larger side" : "each column on its own scale (different profilers)"}`)),
       h("div", { class: "impl-grid" }, roles.map((role) => h("div", {}, icicle(role)))),
     ] : null,
-    pair("Top functions", `self time per run, sampled${untimedNote}`, "functions", ms),
-    pair("Top packages", `self time per run, sampled${untimedNote}`, "packages", ms),
+    pair("Top functions", `self time per run, sampled${untimedNote}`, "functions", msSampled),
+    pair("Top packages", `self time per run, sampled${untimedNote}`, "packages", msSampled),
     pair("Memory by part", "after the runs: a native app's by what holds it, a browser's by allocator across its processes", "memory", bytes),
   );
 }
@@ -2663,8 +2673,8 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
   const u = unitOf(m);
   const cl = classify(c, m, aa);
   let { pill, headline } = humanHeadline(c, m, u, cl, s, aa);
-  // Two implementations, in the PR block's words: "OpenCode (Rune) uses 62% less CPU time than
-  // Electron", counted as decided only once it held across the journeys (Holm).
+  // Two implementations, in the PR block's words: "Rewrite uses 62% less CPU time than Original",
+  // counted as decided only once it held across the journeys (Holm).
   if (SIDES && (cl.tone === "win" || cl.tone === "loss")) {
     const better = cl.tone === "win";
     if (s.claim) headline = `${SIDES.head} ${s.claim} than ${SIDES.base}`;
@@ -2857,10 +2867,11 @@ function renderImpactStrip(s, imp, aa) {
     const subs = [];
     for (const x of cands) if (x !== lead) subs.push(metricSubRow(x, aa));
     if (finite(maxGapBase) && finite(maxGapHead)) {
-      const vsStr = finite(vs) ? ` (${Math.round(maxGapBase / vs)}→${Math.round(maxGapHead / vs)}×)` : "";
+      const to = SIDES ? " vs " : "→";
+      const vsStr = finite(vs) ? ` (${Math.round(maxGapBase / vs)}${to}${Math.round(maxGapHead / vs)}×)` : "";
       subs.push(h("div", { class: "pil-subrow" },
         h("span", { class: "k" }, "Max gap"),
-        h("span", { class: "v" }, `${fmtBare(maxGapBase, "ms")} → ${fmtVal(maxGapHead, "ms")}${vsStr}`)
+        h("span", { class: "v" }, `${fmtBare(maxGapBase, "ms")} ${SIDES ? "vs" : "→"} ${fmtVal(maxGapHead, "ms")}${vsStr}`)
       ));
     }
     smoothCol = lead ? pillarEl("Smoothness", lead, subs, aa) : inactivePillar("Smoothness", "—", "No frame pacing metrics.");
@@ -2922,7 +2933,7 @@ function pillarEl(title, item, subs, aa, customCap) {
       h("span", { class: "pil-val" }, fmtVal(c.head, u)),
       h("span", { class: `pil-delta ${toneCls}` }, coherentDeltaStr(c, u))
     ),
-    h("div", { class: "pil-caption" }, customCap || `${labelOf(c.metric)} · was ${fmtVal(c.base, u)}`),
+    h("div", { class: "pil-caption" }, customCap || (SIDES ? `${labelOf(c.metric)} · ${SIDES.head}; ${SIDES.base} ${fmtVal(c.base, u)}` : `${labelOf(c.metric)} · was ${fmtVal(c.base, u)}`)),
     subs.length ? h("div", { class: "pil-subs" }, subs) : null
   );
 }
@@ -2962,7 +2973,7 @@ function metricSubRow(item, aa) {
 
   return h("div", { class: "pil-subrow" },
     h("span", { class: "k" }, shortLbl),
-    h("span", { class: `v ${toneCls}` }, `${fmtBare(c.base, u)} → ${fmtVal(c.head, u)} (${coherentDeltaStr(c, u)})`)
+    h("span", { class: `v ${toneCls}` }, `${fmtBare(c.base, u)} ${SIDES ? "vs" : "→"} ${fmtVal(c.head, u)} (${coherentDeltaStr(c, u)})`)
   );
 }
 
@@ -4333,9 +4344,11 @@ function renderFramePacingSection(r, s, imp) {
         h("div", {},
           h("div", { class: "plot-caption" },
             h("span", {}, "Skipped display refreshes (≥2× vsync)"),
-            h("span", { class: "dim" }, `${((1 - bB.missed) * 100).toFixed(2)}% → ${((1 - bH.missed) * 100).toFixed(2)}% on time`)
+            h("span", { class: "dim" }, SIDES
+              ? `on time: ${SIDES.base} ${((1 - bB.missed) * 100).toFixed(2)}%, ${SIDES.head} ${((1 - bH.missed) * 100).toFixed(2)}%`
+              : `${((1 - bB.missed) * 100).toFixed(2)}% → ${((1 - bH.missed) * 100).toFixed(2)}% on time`)
           ),
-          h("div", { class: "missed-rows" }, missedRowEl("Base", "base", bB), missedRowEl("Head", "head", bH)),
+          h("div", { class: "missed-rows" }, missedRowEl(sideWord("base", true), "base", bB), missedRowEl(sideWord("head", true), "head", bH)),
           h("div", { class: "legend-inline" },
             h("span", {}, h("i", { class: "lg-box missed-seg-2" }), "2× vsync"),
             h("span", {}, h("i", { class: "lg-box missed-seg-3" }), "3× vsync"),
@@ -4343,7 +4356,7 @@ function renderFramePacingSection(r, s, imp) {
           )
         ),
         h("div", { class: "plot-col" },
-          h("div", { class: "plot-caption" }, h("span", {}, "Tail frame gaps in vsync multiples"), h("span", { class: "dim" }, "○ Base  ·  ● Head")),
+          h("div", { class: "plot-caption" }, h("span", {}, "Tail frame gaps in vsync multiples"), h("span", { class: "dim" }, `○ ${sideWord("base", true)}  ·  ● ${sideWord("head", true)}`)),
           chartBox(106, (w) => drawTailDumbbells(w, gaps, vs))
         )
       )
@@ -4416,7 +4429,7 @@ function renderDistExplorer(r, s, imp) {
         : h("div", { class: "dist-layout" },
             chartBox(220, (w) => drawDistCurve(w, arrs, vs, state.distMode === "cdf")),
             h("table", { class: "qtable" },
-              h("thead", {}, h("tr", {}, h("th", {}, "Quantile"), h("th", {}, "Base"), h("th", {}, "Head"))),
+              h("thead", {}, h("tr", {}, h("th", {}, "Quantile"), h("th", {}, sideWord("base", true)), h("th", {}, sideWord("head", true)))),
               h("tbody", {}, rows.map(([lbl, fn]) => h("tr", {}, h("td", {}, lbl), h("td", {}, fn(arrs.base)), h("td", { style: "font-weight:600" }, fn(arrs.head)))))
             )
           )
@@ -4491,8 +4504,8 @@ function renderAllMetricsDisclosure(s, aa) {
     h("div", { class: "forest-wrap" },
       h("div", { class: "forest-row hd" },
         h("span", {}, "Metric"),
-        h("span", { style: "text-align:right" }, "Base"),
-        h("span", { style: "text-align:right" }, "Head"),
+        h("span", { style: "text-align:right" }, sideWord("base", true)),
+        h("span", { style: "text-align:right" }, sideWord("head", true)),
         h("span", { style: "text-align:right" }, "Paired Δ"),
         h("span", { style: "text-align:center" }, `Interval (±${parseFloat((bnd * 500).toPrecision(3))}% scale)`),
         h("span", {}, "Range"),
@@ -4649,8 +4662,8 @@ function renderRigFooter(r, s, imp) {
           : h("div", {}, `${s.pairs || "?"} AB/BA fresh-launch pairs · ${plan.runs_per_block || 5} measured runs/launch`)
         : null,
       s && finite(s.elapsed_ms) ? h("div", {}, `Series runtime: ${fmtDuration(s.elapsed_ms)} · Strobe ${env.strobe || ""}`) : null,
-      baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `Base: ${baseVar.subject}`) : null,
-      headVar?.subject && headVar.subject !== baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `Head: ${headVar.subject}`) : null,
+      baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `${sideWord("base", true)}: ${baseVar.subject}`) : null,
+      headVar?.subject && headVar.subject !== baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `${sideWord("head", true)}: ${headVar.subject}`) : null,
       !s && finite(r.duration_ms) ? h("div", {}, `Duration: ${fmtDuration(r.duration_ms)}${r.probes ? ` · Probes: ${r.probes}` : ""}`) : null,
       !s && env.strobe ? h("div", {}, `Strobe ${env.strobe}`) : null,
       infoNotes.map((n) => h("div", { style: "color:var(--ink-4)" }, `Note: ${n.text}`))

@@ -363,11 +363,11 @@ fn call_tool(name: &str, input: &Value) -> Value {
         Ok(Ok(out)) => result(out),
         Ok(Err(e)) if e.code == 4 => {
             let text = format!("refused: {}\nfix: {}", e.message, e.hint.clone().unwrap_or_default());
-            json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "refused": true, "error": e.message, "hint": e.hint, "code": 4 }, "isError": false })
+            json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "refused": true, "error": e.message, "hint": e.hint, "code": 4, "validator": e.validator() }, "isError": false })
         }
         Ok(Err(e)) => {
-            let text = format!("{}{}", e.message, e.hint.map(|h| format!("\nfix: {h}")).unwrap_or_default());
-            json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "error": e.message, "code": e.code }, "isError": true })
+            let text = format!("{}{}", e.message, e.hint.as_ref().map(|h| format!("\nfix: {h}")).unwrap_or_default());
+            json!({ "content": [{ "type": "text", "text": text }], "structuredContent": { "error": e.message, "code": e.code, "validator": e.validator() }, "isError": true })
         }
         Err(_) => {
             let id = pending.unwrap_or_default();

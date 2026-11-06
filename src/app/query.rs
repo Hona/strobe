@@ -378,6 +378,24 @@ pub fn insights(rec: &Rec) -> Result<Output> {
 pub fn experiment_insights(result: &Value) -> Result<Output> {
     let mut text = format!("insights · {}\n", result["id"].as_str().unwrap_or(""));
     let mut series_out = Vec::new();
+    // Two implementations share no code (SPEC §9.10): each side's profiled launch gets its own
+    // insights, under its name, and no movers between them.
+    if result["comparison"] == "implementations" {
+        for s in result["series"].as_array().into_iter().flatten() {
+            let mut sides = json!({});
+            for (i, role) in ["base", "head"].into_iter().enumerate() {
+                let Some(id) = s["attribution"][role].as_str() else { continue };
+                let name = result["variants"][i]["name"].as_str().unwrap_or(role);
+                let o = insights(&Rec::resolve(id)?)?;
+                text += &format!("\n{} · {name}\n{}", s["label"].as_str().unwrap_or(""), o.text);
+                sides[role] = json!({ "name": name, "recording": id, "insights": o.json["insights"] });
+            }
+            if sides.as_object().is_some_and(|o| !o.is_empty()) {
+                series_out.push(json!({ "series": s["label"], "sides": sides }));
+            }
+        }
+        return Ok(Output::new(text, json!({ "experiment": result["id"], "comparison": "implementations", "series": series_out })));
+    }
     for s in result["series"].as_array().into_iter().flatten() {
         let (Some(b), Some(h)) = (s["attribution"]["base"].as_str(), s["attribution"]["head"].as_str()) else { continue };
         let (base, head) = (Rec::resolve(b)?, Rec::resolve(h)?);

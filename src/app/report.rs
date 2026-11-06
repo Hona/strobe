@@ -151,13 +151,21 @@ fn attach_series(data: &mut Value) -> Option<Value> {
     let id = data["id"].clone();
     // Two implementations share no code: each side is read on its own, never diffed (SPEC §11.2).
     let implementations = super::family::implementations(data);
+    // Each side's engine (`chromium`, `native`, `script`, …), as the bench named it.
+    let engine = |i: usize| data["variants"][i]["engine"].as_str().unwrap_or("chromium").to_string();
+    let engines = [engine(0), engine(1)];
     let series = data["series"].as_array_mut()?;
     let mut insights = Vec::new();
     for s in series {
         let recs: Vec<(&str, Rec)> = ["base", "head"].into_iter().filter_map(|role| Some((role, Rec::resolve(s["attribution"][role].as_str()?).ok()?))).collect();
         let sides: Vec<(&str, Option<Value>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> =
-                recs.iter().map(|(role, rec)| (*role, scope.spawn(move || if implementations { side_attribution(rec, plan_runs) } else { attribution(rec, plan_runs) }))).collect();
+            let handles: Vec<_> = recs
+                .iter()
+                .map(|(role, rec)| {
+                    let engine = engines[usize::from(*role == "head")].as_str();
+                    (*role, scope.spawn(move || if implementations { side_attribution(rec, plan_runs, engine) } else { attribution(rec, plan_runs) }))
+                })
+                .collect();
             handles.into_iter().map(|(role, h)| (role, h.join().ok().flatten())).collect()
         });
         let mut out = json!({});
@@ -289,21 +297,25 @@ fn timed_side(s: &Value, role: &str, side: &mut Value) {
     side["cpu_ms_per_run"] = json!(median("cpu.work"));
     let ps = &s["per_side"][role];
     let (Some(dur), Some(total)) = (median("run.duration"), median("cpu.work")) else { return };
-    let mut rows: Vec<Value> = Vec::new();
-    for (metric, name) in [("cpu.renderer", "renderer"), ("cpu.gpu", "GPU process"), ("cpu.browser", "browser")] {
-        if let Some(pct) = ps[metric]["median"].as_f64() {
-            rows.push(json!({ "name": name, "ms": pct / 100.0 * dur }));
-        }
+    let rows = role_rows(|m| ps[m]["median"].as_f64(), dur, total);
+    if !rows.is_empty() {
+        side["processes"] = json!(rows);
+        side["processes_from"] = json!("timed");
     }
-    if rows.is_empty() {
-        return;
-    }
+}
+
+/// A browser's processes by role as CPU ms per run: each role's share of a core (`pct(metric)`) over
+/// a run of `dur` ms, and what the roles leave of `total` as the rest. Empty when no role was read.
+fn role_rows(pct: impl Fn(&str) -> Option<f64>, dur: f64, total: f64) -> Vec<Value> {
+    let mut rows: Vec<Value> = [("cpu.renderer", "renderer"), ("cpu.gpu", "GPU process"), ("cpu.browser", "browser")]
+        .into_iter()
+        .filter_map(|(metric, name)| Some(json!({ "name": name, "ms": pct(metric).filter(|x| x.is_finite())? / 100.0 * dur })))
+        .collect();
     let named: f64 = rows.iter().filter_map(|r| r["ms"].as_f64()).sum();
-    if total - named > 0.005 * total {
+    if !rows.is_empty() && total - named > 0.005 * total {
         rows.push(json!({ "name": "other (utility, network, …)", "ms": total - named }));
     }
-    side["processes"] = json!(rows);
-    side["processes_from"] = json!("timed");
+    rows
 }
 
 /// One side of an implementation comparison on its own (SPEC §11.2), profiled with its own engine's
@@ -312,7 +324,7 @@ fn timed_side(s: &Value, role: &str, side: &mut Value) {
 /// thread origin (native), self time by function and package, memory by part, and how much of its
 /// samples were named. Per run where its samples carry times; untimed native samples (macOS
 /// `sample`) cover the whole capture, so they are per recording and say so.
-fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
+fn side_attribution(rec: &Rec, plan_runs: Option<u64>, engine: &str) -> Option<Value> {
     let mut h = attribution(rec, plan_runs)?;
     let tree = query::side_tree(rec, plan_runs);
     if tree.as_object().is_some_and(|o| !o.is_empty()) {
@@ -325,7 +337,7 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
     let values = &rec.meta["values"];
     let v = |k: &str| values[k].as_f64().filter(|x| x.is_finite());
     let mut side = json!({
-        "engine": if native || rec.dir.join("threads.json").exists() { "native" } else { "chromium" },
+        "engine": engine,
         "per_run": runs.is_some(), "runs": runs, "untimed": untimed,
         "cpu_ms_per_run": v("cpu.work"),
     });
@@ -334,9 +346,10 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
         side["resolved_share"] = h["resolved_share"].clone();
         side["samples"] = h["samples"].clone();
     } else if h["samples"].as_u64().unwrap_or(0) > 0 {
-        side["profiler"] = json!("V8 CPU profile");
+        side["profiler"] = json!(if engine == "script" { "script CPU profile" } else { "V8 CPU profile" });
+        // A script's profile names its own source files: nothing is mapped, and nothing is missing.
         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
-        side["mapped_share"] = if scripts > 0.0 { json!(mapped / scripts) } else { Value::Null };
+        side["mapped_share"] = if scripts > 0.0 && engine != "script" { json!(mapped / scripts) } else { Value::Null };
         side["samples"] = h["samples"].clone();
     }
     // Self time by function, leaving out a profile's idle time and root.
@@ -360,20 +373,13 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
     }
     let threads: Vec<Value> = store::read_json(&rec.dir.join("threads.json")).ok().and_then(|t| t.as_array().cloned()).unwrap_or_default();
     if threads.is_empty() {
-        // A browser's processes by role: each role's share of a core over the runs, as ms per run.
-        if let Some(dur) = v("run.duration") {
-            let mut rows: Vec<Value> = Vec::new();
-            for (metric, name) in [("cpu.renderer", "renderer"), ("cpu.gpu", "GPU process"), ("cpu.browser", "browser")] {
-                if let Some(pct) = v(metric) {
-                    rows.push(json!({ "name": name, "ms": pct / 100.0 * dur }));
-                }
+        // A browser's processes by role in its profiled launch (the timed blocks' replace them).
+        if let (Some(dur), Some(total)) = (v("run.duration"), v("cpu.app.total")) {
+            let rows = role_rows(v, dur, total / 100.0 * dur);
+            if !rows.is_empty() {
+                side["processes"] = json!(rows);
+                side["processes_from"] = json!("profiled");
             }
-            let named: f64 = rows.iter().filter_map(|r| r["ms"].as_f64()).sum();
-            if let Some(total) = v("cpu.app.total").map(|p| p / 100.0 * dur).filter(|t| !rows.is_empty() && t - named > 0.005 * t) {
-                rows.push(json!({ "name": "other (utility, network, …)", "ms": total - named }));
-            }
-            side["processes"] = json!(rows);
-            side["processes_from"] = json!("profiled");
         }
     } else {
         // A native app's processes by program, and its threads by whose code they started in.

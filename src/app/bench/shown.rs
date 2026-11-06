@@ -627,12 +627,13 @@ fn side_text(v: &Value) -> Option<String> {
 }
 
 /// What a series measured on screen, for the text output, the PR block and the viewer: `'Hex ·
-/// General'`, or `base '…' · head '…'` when they differed. None when strobe read nothing.
-pub fn shown_line(series: &Value) -> Option<String> {
+/// General'`, or `base '…' · head '…'` when they differed, each side by `names` (an implementation
+/// comparison's side names). None when strobe read nothing.
+pub fn shown_line(series: &Value, names: (&str, &str)) -> Option<String> {
     let sh = &series["shown"];
     let (b, h) = (side_text(&sh["base"]), side_text(&sh["head"]));
     match (b, h) {
-        (Some(b), Some(h)) if b != h => Some(format!("base {b} · head {h}")),
+        (Some(b), Some(h)) if b != h => Some(format!("{} {b} · {} {h}", names.0, names.1)),
         (Some(x), _) | (None, Some(x)) => Some(x),
         _ => None,
     }

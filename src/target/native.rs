@@ -137,7 +137,8 @@ impl Native {
         let client = size.then_some((at.width, at.height));
         host::place_window(&w, at.x, at.y, client);
         let want = client.map(|(cw, ch)| ((cw as f64 * w.scale()).round() as i32, (ch as f64 * w.scale()).round() as i32));
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut asked = Instant::now();
         let mut now = w;
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(50));
@@ -145,6 +146,12 @@ impl Native {
             now = s;
             if now.rect.0 == at.x && now.rect.1 == at.y && want.is_none_or(|c| c == now.client) {
                 break;
+            }
+            // A window that has just shown may not take it yet (macOS answers a new window's
+            // accessibility calls a moment later): asked again, from where it is now.
+            if asked.elapsed() >= Duration::from_millis(300) {
+                host::place_window(&now, at.x, at.y, client);
+                asked = Instant::now();
             }
         }
         self.window = Some(now.clone());

@@ -283,7 +283,7 @@ adais: a successful `record --bench` exits 0 (`$LASTEXITCODE`), and its shell re
 
 | Syntax | Meaning |
 |---|---|
-| `https://…`, `http://…` | a page in a strobe-launched Chromium (or `--engine firefox`: Firefox): isolated profile, real GPU, fixed window (§13.1) |
+| `https://…`, `http://…` | a page in a strobe-launched Chromium (or `--engine firefox`: Firefox; `--engine webkit`: Safari, WebKitGTK or WPE): isolated profile, real GPU, fixed window (§13.1) |
 | `cdp:<port>`, `cdp:ws://…` | a running CDP endpoint (Playwright's, a dev Electron's) |
 | `app:<id>` | an app by its profile in strobe.json `apps`: an Electron app (§13.2) launched in an isolated home, or attached through its bridge (§13.3); a profile with `kind: "native"` is a native app (§13.7), one with `kind: "webview"` an app on the OS's webview (§13.8) |
 | `exe:<path>` | launch a packaged Electron app in an isolated home; `--app <id>` borrows a profile for another build of that app; `--native` launches any executable as a native app (§13.7) |
@@ -382,7 +382,8 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   flag once only skipped the lock check on it.
   `--engine` passes on as in a bench; a Firefox case gets no attribution block (no profilers yet), only
   its check run.
-- `--engine firefox [--headless]` records a page in Firefox (§13.1) from outside: its processes' CPU
+- `--engine firefox [--headless]` (or `webkit`: Safari headed only, WPE headless on Linux) records a
+  page in that engine (§13.1) from outside: its processes' CPU
   in cycles (`cpu.app.total`, `cpu.work`), GPU use and VRAM from the OS sampler, private memory, DOM
   nodes, and headed the OS's presents of its processes (`frames.*`, §7.2), kept as `presents.json.gz`
   and `frames.json` so `query <rec> frames` reads them as a native recording's. Where cycles are not
@@ -1080,7 +1081,9 @@ A counter is an exact metric per run, `count.<name>`. Two sources add to it:
   first, as for `main.work`. In Firefox (§13.1) the global comes from a BiDi preload script and the
   marks are strobe's own on the host clock, with no trace; the totals are read the same way, but a
   document the page replaces by itself (a link, `location.assign`) rather than through `page.goto`
-  takes its uncounted totals with it.
+  takes its uncounted totals with it. In WebKit (WebDriver Classic: no preload) the global arrives only
+  once strobe first touches a document, after the page's own scripts, so `count.*` (and `canvas.*`) of a
+  run that loaded a page are refused `EngineUnsupported`; keep such runs on one page.
 
 A counter the page never touched reads 0. Compare builds that both count: a base without the
 counter reads 0, not "unknown".
@@ -1112,7 +1115,8 @@ and still count for it. `data:` and `blob:` requests are not network requests. A
 `://` matches the URL's path; `*` stays within a path segment, `**` crosses them, and the query
 string never takes part: `net.requests{/api/session/*/message}`. Firefox: WebDriver BiDi's
 `network.beforeRequestSent` and `network.responseCompleted` (`bytesReceived`) of the page's browsing
-context, the same rules; never Resource Timing's `transferSize` (zero across origins).
+context, the same rules; never Resource Timing's `transferSize` (zero across origins). WebKit: WebDriver
+Classic reports no requests, so `net.*` is refused `EngineUnsupported`.
 
 **Garbage collection** (`main.gc`): the summed duration of V8's top-level `V8.GC_*` slices on the
 renderer main thread in the run's span (a GC slice inside another counts once), the pauses a frame
@@ -1802,7 +1806,8 @@ handlers over a loopback socket of their own (a random token, one line each way)
 `network.provideResponse` or letting it go (`continueRequest`); the HTTP cache stays on. BiDi's URL
 patterns have no wildcards, so the intercept is the glob's literal URL, else its literal origin, else
 every request of the page, and a paused request no glob matches goes on at once (one round trip in
-strobe). The handler's request has no `body` there (BiDi does not carry it).
+strobe). The handler's request has no `body` there (BiDi does not carry it). On a WebKit page (WebDriver
+Classic: no interception) `mock` refuses `EngineUnsupported`; serve such responses from a local server.
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
 checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
@@ -2278,7 +2283,7 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
-| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`): a primary refuses before anything builds, with the closest metric the engine has; a secondary is refused per block |
+| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses before anything builds, with the closest metric the engine has; a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
 | `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses before anything builds; a secondary is refused per block |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -3052,18 +3057,28 @@ is the stable path: Safari's BiDi is not usable yet.
   the Technology Preview's bundle). Headed only: `--headless` refuses up front (`EngineUnsupported`), and
   a block always waits for an unlocked session (Safari's input actions do nothing on a locked screen).
   - `LiveChannel` when that Safari already runs: a session would run in the same app, beside the
-    person's tabs and their web content processes. The fix names Safari Technology Preview.
+    person's tabs and their web content processes. The fix names Safari Technology Preview. Checked at
+    the launch's start and again right before the session request (LaunchServices would hand the session
+    to a Safari a person opened while the driver started).
   - Remote automation off (one-time `safaridriver --enable`, an administrator's password; or Settings ›
     Developer › Allow remote automation): `session not created` "You must enable 'Allow remote
     automation'…" exits 3 (needs a human) with that command. Even that failed request starts Safari
     (checked on macOS 27, Safari 27.0.1): strobe ends the Safari processes its request started.
-  - safaridriver starts Safari through LaunchServices, outside the driver's tree: strobe takes the
-    Safari process that was not running before its session request, with its start time. Its process
-    set is that process's tree and every XPC service responsible to it (web content, GPU, networking:
-    the XPC accounting of §13.2). The driver is strobe's tool and is never in the set.
-  - Closing deletes the session, ends the driver, sends Safari SIGTERM (5 s to go), then ends its tree
-    and every XPC service still responsible to it (`kill_launch`), and any process of the last set that
-    still runs.
+  - safaridriver starts Safari through LaunchServices, outside the driver's tree, with `--automation`
+    (and `-ApplePersistenceIgnoreStateQuietly YES`); it stays running after the session ends and after
+    the driver quits (checked on Safari 27.0.1). strobe's Safari is the process of that executable that
+    was not running before its request and carries `--automation`, with its start time: a Safari a
+    person opened is never taken for it, so never ended. Its process set is that process's tree and
+    every XPC service responsible to it (web content, GPU, networking: the XPC accounting of §13.2). The
+    driver is strobe's tool and is never in the set.
+  - A window that is not the session's in strobe's Safari (a link a person opened from another app
+    lands in the running Safari) refuses the block `LiveChannel`, and that Safari is left running for
+    them: strobe reads the session's windows once its checks have run, and again after the runs.
+  - Closing reads the process set (with start times) while Safari still runs, deletes the session, ends
+    the driver, sends Safari SIGTERM (5 s to go), then ends its tree and every process of that set still
+    running with its start time (XPC services of a Safari that already quit too). A Safari that still
+    shows a window once the session's closed, or one not the session's, is a person's now: it and its
+    services are left running.
   - `SoftwareGpu`: the Mac's GPU from IOKit (WebKit composites through Core Animation on Metal; a
     software or paravirtual adapter only in a virtual machine).
   - No audio switch: Safari has none, so a page's sound plays (Chromium and Firefox are muted).
@@ -3078,16 +3093,21 @@ is the stable path: Safari's BiDi is not usable yet.
   `webkitgtk:browserOptions` / `wpe:browserOptions` `binary` (Debian: `webkit2gtk-driver`,
   `wpewebkit-webdriver`). A private home per launch (`HOME`, `XDG_{CONFIG,DATA,CACHE,STATE}_HOME`),
   stamped as every launch; audio goes to GStreamer's fake sink (`GST_PLUGIN_FEATURE_RANK=
-  fakeaudiosink:MAX`: media and Web Audio keep their clock, nothing plays). Headless, the browser also
-  gets a private `XDG_RUNTIME_DIR` and no session bus: a headless page talks to no desktop, and a
-  server's session bus with desktop portals that never start held WPE's first load for 75 s (three
-  activation timeouts; 0.1 s without the bus, checked on Debian 13). The process set is the
-  MiniBrowser's tree (its web, network and GPU processes) and what carries the home's stamp, without the
-  driver; WebKitGTK names the browser's pid (`webkit:processID`), else it is the driver's child running
+  fakeaudiosink:MAX`: media and Web Audio keep their clock, nothing plays) and GSettings to memory
+  (`GSETTINGS_BACKEND=memory`: nothing reaches the user's dconf). Headless, the browser also gets a
+  private `XDG_RUNTIME_DIR`, a session bus address that leads nowhere, no `DISPLAY` or `WAYLAND_DISPLAY`
+  and `NO_AT_BRIDGE=1`, so GDBus never autolaunches a bus through X11 onto the user's session: a
+  headless page talks to no desktop, and a server's session bus with desktop portals that never start
+  held WPE's first load for 75 s (three activation timeouts; 0.1 s without the bus, checked on
+  Debian 13). The process set (and the OS sampler's) is the MiniBrowser's tree (its web, network and GPU
+  processes), without the driver; WebKitGTK names the browser's pid (`webkit:processID`), else it is the driver's child running
   the MiniBrowser. `SoftwareGpu` reads WebKit's own `webkit://gpu` page before the target loads
   (`GL_RENDERER`; llvmpipe under Xvfb refuses).
-- Process roles by executable: `WebContent` / `WebProcess` processes are the renderer, `GPU` /
-  `GPUProcess` the GPU, the browser process the browser; networking has none.
+- Process roles by executable: `WebContent` (`.Development`, `.CaptivePortal` too) / `WebProcess`
+  processes are the renderer, `WebKit.GPU` (`.Development` too) / `GPUProcess` the GPU, the browser
+  process the browser; networking has none. What the browser draws with is read once at launch.
+  `status`, `up`, the ledger and fingerprints name Safari's version from its bundle (`plutil` for a
+  binary `Info.plist`).
 - No preload in Classic WebDriver: strobe's page scripts (its `navigator.webdriver` override, the rAF
   it keeps, counters, canvas and change hooks) run in a document the first time strobe touches it
   (navigate runs them right after the load event, any later call first runs them in a document it has

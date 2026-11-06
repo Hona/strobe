@@ -132,7 +132,8 @@ impl ValidatorId {
 }
 
 /// The browser engine a page target runs in (SPEC §13.1): Chromium over CDP (the default), Firefox
-/// over WebDriver BiDi, WebKit (not built yet: a typed refusal).
+/// over WebDriver BiDi, WebKit over WebDriver Classic (Safari on macOS, WebKitGTK or WPE on Linux; refused
+/// on Windows).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum WebEngine {

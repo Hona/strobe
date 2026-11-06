@@ -432,6 +432,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         None => json!({ "refused": "Headless: the page ran headless, so nothing it drew reached a display" }),
     };
     let version = browser.version().to_string();
+    browser.own()?;
     browser.close();
     let mut meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": "", "duration_ms": for_ms, "engine": engine, "headless": headless,

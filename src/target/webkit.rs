@@ -104,11 +104,14 @@ fn bundle_version(i: &Install) -> Option<String> {
     Some(format!("{} {}", i.flavor.name(), plist_string(&app.join("Contents/Info.plist"), "CFBundleShortVersionString")?))
 }
 
-/// A string value of an XML property list (`<key>k</key><string>v</string>`); None for a binary one.
+/// A string value of a property list: read as XML (`<key>k</key><string>v</string>`), else through
+/// macOS's `plutil` (a binary one).
 fn plist_string(path: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let after = text.split(&format!("<key>{key}</key>")).nth(1)?;
-    Some(after.split("<string>").nth(1)?.split("</string>").next()?.trim().to_string())
+    let xml = std::fs::read_to_string(path).ok().and_then(|text| {
+        let after = text.split(&format!("<key>{key}</key>")).nth(1)?.to_string();
+        Some(after.split("<string>").nth(1)?.split("</string>").next()?.trim().to_string())
+    });
+    xml.or_else(|| host::output(Command::new("/usr/bin/plutil").args(["-extract", key, "raw", "-o", "-"]).arg(path)).filter(|v| !v.is_empty()))
 }
 
 /// What `status` and `up` say about WebKit pages here.
@@ -146,6 +149,11 @@ pub struct Browser {
     documents: Arc<AtomicU64>,
     pointer: bool,
     shift_base: bool,
+    /// macOS: the windows of strobe's Safari once its session opened (the session's own). Any other is a
+    /// person's (a link opened into it from another app): that Safari is theirs from then on.
+    own_windows: Vec<isize>,
+    /// What the browser draws with, read once at launch.
+    gpu: Gpu,
 }
 
 /// The page strobe drives: the session's one window.
@@ -176,8 +184,24 @@ impl Started {
         Started { exe: exe.to_path_buf(), before: host::running(exe), armed: cfg!(target_os = "macos") }
     }
 
+    /// Only a Safari in automation mode (`--automation`, as safaridriver starts it) is strobe's: one a
+    /// person opened meanwhile never is.
     fn pids(&self) -> Vec<u32> {
-        host::running(&self.exe).into_iter().filter(|p| !self.before.contains(p)).collect()
+        host::running(&self.exe).into_iter().filter(|p| !self.before.contains(p) && automation(*p)).collect()
+    }
+}
+
+/// Whether a browser process runs in automation mode, as its WebDriver server starts it (macOS: Safari's
+/// `--automation` argument). Elsewhere the browser is always the driver's own child.
+fn automation(pid: u32) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        host::macos::args_of(pid).is_some_and(|a| a.iter().any(|x| x == "--automation"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        true
     }
 }
 
@@ -242,21 +266,24 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
             .fix("run --headless (WPE WebKit) or on a desktop session")
             .into());
     }
-    let started = Started::new(&install.browser);
+    let mut started = Started::new(&install.browser);
     // Safari's web content processes are shared by its windows: a session in a Safari a person runs
     // would run beside their tabs, in their Safari.
-    if cfg!(target_os = "macos") && !started.before.is_empty() {
-        let pids: Vec<String> = started.before.iter().map(u32::to_string).collect();
+    let live = |running: &[u32]| -> Error {
+        let pids: Vec<String> = running.iter().map(u32::to_string).collect();
         let fix = if install.flavor == Flavor::Safari {
             "quit Safari while strobe measures, or install Safari Technology Preview (brew install --cask safari-technology-preview), which strobe uses instead"
         } else {
             "quit Safari Technology Preview while strobe measures"
         };
-        return Err(Error::refused(
+        Error::refused(
             "LiveChannel",
             format!("{} is running (pid {}): a WebDriver session would run in that same app, beside your tabs and their web content processes", install.flavor.name(), pids.join(", ")),
             fix,
-        ));
+        )
+    };
+    if cfg!(target_os = "macos") && !started.before.is_empty() {
+        return Err(live(&started.before));
     }
     let port = free_port()?;
     let mut cmd = Command::new(&install.driver);
@@ -279,16 +306,24 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
             // A measurement never plays sound on the user's speakers: GStreamer's automatic audio sink picks
             // its fake sink, which keeps the clock, so media and Web Audio still run.
             .env("GST_PLUGIN_FEATURE_RANK", "fakeaudiosink:MAX")
+            // GSettings in memory: nothing the browser sets reaches the user's dconf database.
+            .env("GSETTINGS_BACKEND", "memory")
             .envs(super::isolate::launch_env(h));
         if headless {
             // A headless page talks to no desktop: none of the session's services (portals, the
-            // accessibility bus), which a server's session may answer only after a long timeout.
+            // accessibility bus), which a server's session may answer only after a long timeout. No
+            // display either, and a bus address that leads nowhere, so GDBus never autolaunches a bus
+            // through X11 onto the user's session.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(h.join("run"), std::fs::Permissions::from_mode(0o700));
             }
-            cmd.env("XDG_RUNTIME_DIR", text(h.join("run"))).env_remove("DBUS_SESSION_BUS_ADDRESS");
+            cmd.env("XDG_RUNTIME_DIR", text(h.join("run")))
+                .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}", h.join("run").join("no-bus").display()))
+                .env("NO_AT_BRIDGE", "1")
+                .env_remove("DISPLAY")
+                .env_remove("WAYLAND_DISPLAY");
         }
     }
     let child = match host::spawn_owned(&mut cmd, cpus, 0, home.as_deref()) {
@@ -312,6 +347,15 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         Flavor::Gtk => json!({ "browserName": "MiniBrowser", "webkitgtk:browserOptions": { "binary": install.browser, "args": ["--automation"] } }),
         Flavor::Wpe => json!({ "browserName": "MiniBrowser", "wpe:browserOptions": { "binary": install.browser, "args": ["--automation", "--headless", format!("--size={}x{}", w.width, w.height)] } }),
     };
+    // Again right before the session: LaunchServices would hand it to a Safari a person opened while the
+    // driver started.
+    if cfg!(target_os = "macos") {
+        let running = host::running(&install.browser);
+        if !running.is_empty() {
+            started.before = running.clone();
+            return Err(live(&running));
+        }
+    }
     let session = match server.new_session(caps, Duration::from_secs(60))? {
         Ok(s) => s,
         Err(f) if f.message.to_lowercase().contains("remote automation") => {
@@ -348,6 +392,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     if !headless {
         session.set_window_rect(w.x, w.y, w.width, w.height)?;
     }
+    let gpu = read_gpu(&session)?;
     // The input checks run on a blank page strobe loaded itself, with the window brought forward where
     // macOS lets strobe (nobody used the Mac for a minute). A Safari window behind other apps may not
     // answer them: the block waits, as for any window that is not the active one.
@@ -366,8 +411,9 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         .into(),
         _ => Error { message: format!("{}'s input check on a blank page: {}", install.flavor.name(), e.message), ..e },
     })?;
+    // macOS: the session's own windows, so a window a person opens in this Safari later shows (`own`).
+    let own_windows: Vec<isize> = if cfg!(target_os = "macos") { host::top_windows(&[pid]).into_iter().map(|w| w.0).collect() } else { Vec::new() };
     let (driver, home) = launching.done();
-    let mut started = started;
     started.armed = false;
     Ok(Browser {
         flavor: install.flavor,
@@ -385,7 +431,28 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         documents: Arc::new(AtomicU64::new(0)),
         pointer,
         shift_base,
+        own_windows,
+        gpu,
     })
+}
+
+/// What the browser draws with, read once at launch. macOS: the Mac's GPU (WebKit composites through Core
+/// Animation on Metal; a software renderer only in a virtual machine). Linux: WebKit's own `webkit://gpu`
+/// page (its GL renderer and how it composites), before the target loads.
+fn read_gpu(session: &Session) -> Result<Gpu> {
+    if cfg!(target_os = "macos") {
+        let devices: Vec<String> = crate::probe::gpu::adapters().into_iter().map(|a| a.name).collect();
+        let software = devices.is_empty() || devices.iter().any(|d| crate::validity::is_software_gpu(d) || d.to_lowercase().contains("paravirtual"));
+        return Ok(Gpu { devices, compositing: "Core Animation".into(), software });
+    }
+    session.send("POST", "/url", Some(&json!({ "url": "webkit://gpu" })), Duration::from_secs(30))?;
+    let text = session.send("POST", "/execute/sync", Some(&json!({ "script": "return document.body.innerText", "args": [] })), Duration::from_secs(10))?;
+    let lines: Vec<&str> = text.as_str().unwrap_or("").lines().map(str::trim).collect();
+    let after = |key: &str| lines.iter().position(|l| *l == key).and_then(|i| lines.get(i + 1)).map(|s| s.to_string()).filter(|s| !s.is_empty());
+    let devices: Vec<String> = after("GL_RENDERER").into_iter().collect();
+    let compositing = [after("Renderer"), after("API"), after("Platform")].into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    let software = devices.first().is_none_or(|d| crate::validity::is_software_gpu(d));
+    Ok(Gpu { devices, compositing, software })
 }
 
 /// Whether the browser delivers WebDriver pointer input to the page, checked on the blank page the
@@ -486,13 +553,9 @@ impl Browser {
         self.processes().iter().map(|p| p.pid).collect()
     }
 
-    /// Linux: the private home the browser runs in (its stamp); none on macOS.
-    pub fn home(&self) -> Option<PathBuf> {
-        self.home.clone()
-    }
-
-    /// Each process's role by its executable: web content processes are the renderer, the GPU process
-    /// the GPU, the browser itself the browser (networking has none).
+    /// Each process's role by its executable: web content processes are the renderer (Safari's
+    /// `WebContent`, `WebContent.Development`, `WebContent.CaptivePortal`; WebKitGTK's and WPE's
+    /// `WebProcess`), the GPU process the GPU, the browser itself the browser (networking has none).
     pub fn process_roles(&self) -> Vec<(u32, &'static str)> {
         self.processes()
             .into_iter()
@@ -500,8 +563,8 @@ impl Browser {
                 let name = host::exe_of(p.pid).and_then(|e| e.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or(p.name);
                 let role = match name.as_str() {
                     _ if p.pid == self.pid => "browser",
-                    n if n.ends_with("WebContent") || n.ends_with("WebProcess") => "renderer",
-                    n if n.ends_with(".GPU") || n.ends_with("GPUProcess") => "gpu",
+                    n if n.contains("WebContent") || n.contains("WebProcess") => "renderer",
+                    n if n.contains("WebKit.GPU") || n.contains("GPUProcess") => "gpu",
                     _ => return None,
                 };
                 Some((p.pid, role))
@@ -509,42 +572,77 @@ impl Browser {
             .collect()
     }
 
-    /// What the browser draws with. macOS: the Mac's GPU (WebKit composites through Core Animation on
-    /// Metal; a software renderer only in a virtual machine). Linux: WebKit's own `webkit://gpu` page
-    /// (its GL renderer and how it composites), read before the page loads.
+    /// What the browser draws with, as read at launch (`read_gpu`).
     pub fn gpu(&self) -> Result<Gpu> {
-        if cfg!(target_os = "macos") {
-            let devices: Vec<String> = crate::probe::gpu::adapters().into_iter().map(|a| a.name).collect();
-            let software = devices.is_empty() || devices.iter().any(|d| crate::validity::is_software_gpu(d) || d.to_lowercase().contains("paravirtual"));
-            return Ok(Gpu { devices, compositing: "Core Animation".into(), software });
+        Ok(self.gpu.clone())
+    }
+
+    /// macOS: the windows of strobe's Safari that are not its session's: a person opened them (a link from
+    /// another app lands in the running Safari), so that Safari holds their tabs now.
+    fn foreign_windows(&self) -> usize {
+        if !cfg!(target_os = "macos") || self.pid == 0 {
+            return 0;
         }
-        self.session.send("POST", "/url", Some(&json!({ "url": "webkit://gpu" })), Duration::from_secs(30))?;
-        let text = self.session.send("POST", "/execute/sync", Some(&json!({ "script": "return document.body.innerText", "args": [] })), Duration::from_secs(10))?;
-        let lines: Vec<&str> = text.as_str().unwrap_or("").lines().map(str::trim).collect();
-        let after = |key: &str| lines.iter().position(|l| *l == key).and_then(|i| lines.get(i + 1)).map(|s| s.to_string()).filter(|s| !s.is_empty());
-        let devices: Vec<String> = after("GL_RENDERER").into_iter().collect();
-        let compositing = [after("Renderer"), after("API"), after("Platform")].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-        let software = devices.first().is_none_or(|d| crate::validity::is_software_gpu(d));
-        self.session.send("POST", "/url", Some(&json!({ "url": "about:blank" })), Duration::from_secs(30))?;
-        Ok(Gpu { devices, compositing, software })
+        host::top_windows(&[self.pid]).into_iter().filter(|w| !self.own_windows.contains(&w.0)).count()
+    }
+
+    /// `LiveChannel` once a person has opened a window in strobe's Safari: what the block measured ran
+    /// beside their tabs, and strobe leaves that Safari to them when it closes.
+    pub fn own(&self) -> Result<()> {
+        match self.foreign_windows() {
+            0 => Ok(()),
+            n => Err(Error::refused(
+                "LiveChannel",
+                format!("{n} window(s) not strobe's opened in the {} strobe launched (a link opened from another app lands there): the block ran beside them", self.flavor.name()),
+                "leave the Mac alone while strobe measures in Safari, or install Safari Technology Preview; strobe leaves that Safari running for whoever opened them",
+            )),
+        }
+    }
+
+    /// The processes now with their start times, read while the browser still runs: macOS answers which
+    /// app an XPC service is responsible to only while that app runs.
+    fn snapshot(&self) -> Vec<(u32, Option<u64>)> {
+        self.processes().iter().map(|p| (p.pid, host::start_time(p.pid))).collect()
     }
 
     /// Ends the session (the driver closes its window), stops the driver, ends the browser strobe started
-    /// and every process it left, and removes the private home.
+    /// and every process it left, and removes the private home. A Safari a person opened a window in by
+    /// then is left running, with its services.
     pub fn close(mut self) {
-        let _ = self.session.delete(Duration::from_secs(10));
-        self.end();
+        let set = self.snapshot();
+        let deleted = self.session.delete(Duration::from_secs(10)).is_ok();
+        // The session's windows close with it: one still there is a person's.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut theirs = deleted && cfg!(target_os = "macos") && !host::top_windows(&[self.pid]).is_empty();
+        while theirs && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+            theirs = !host::top_windows(&[self.pid]).is_empty();
+        }
+        if theirs || self.foreign_windows() > 0 {
+            self.pid = 0;
+        }
+        self.end_with(set);
     }
 
     fn end(&mut self) {
-        // The set while the browser runs, so its XPC services' responsible process is read and kept.
-        let set: Vec<(u32, Option<u64>)> = self.processes().iter().map(|p| (p.pid, host::start_time(p.pid))).collect();
+        if self.foreign_windows() > 0 {
+            self.pid = 0;
+        }
+        let set = self.snapshot();
+        self.end_with(set);
+    }
+
+    /// Stops the driver and ends the browser (`pid`, none when it is a person's now) and every process of
+    /// `set` still running, by start time: an XPC service of a Safari that already quit too.
+    fn end_with(&mut self, set: Vec<(u32, Option<u64>)>) {
         drop(self.driver.take());
-        end_browser(std::mem::take(&mut self.pid), self.start);
-        // Anything of the set still running is the browser's: ended.
-        for (pid, start) in set.into_iter().filter(|(_, s)| s.is_some()) {
-            if host::start_time(pid) == start {
-                host::kill_launch(pid, start);
+        let pid = std::mem::take(&mut self.pid);
+        if pid != 0 {
+            end_browser(pid, self.start);
+            for (p, start) in set.into_iter().filter(|(_, s)| s.is_some()) {
+                if host::start_time(p) == start {
+                    host::kill_launch(p, start);
+                }
             }
         }
         if let Some(h) = self.home.take() {

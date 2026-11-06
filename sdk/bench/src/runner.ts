@@ -128,7 +128,10 @@ const prepareContext = () => ({
   get playwright() {
     if (state.engine === "chromium") return state.playwright
     const summary = `ctx.playwright connects over Chromium's DevTools protocol; this target runs in ${state.engine}`
-    const fix = "use ctx.mock for network mocks and the page driver for the rest, or run the target in Chromium"
+    const fix =
+      state.engine === "webkit"
+        ? "use the page driver, serve mocked responses from a local server (WebKit has no ctx.mock), or run the target in Chromium"
+        : "use ctx.mock for network mocks and the page driver for the rest, or run the target in Chromium"
     throw Object.assign(new Error(`EngineUnsupported: ${summary}`), { hint: fix, refusal: { validator: "EngineUnsupported", summary, fix } })
   },
   mock,

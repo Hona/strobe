@@ -3602,8 +3602,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             page.add_init_script(CHANGES_SCRIPT)?;
             page.eval(CHANGES_SCRIPT)?;
         }
-        // The page's changes and input events in the run so far, harvested before a `goto` takes the document with them.
-        let harvested: RefCell<(Vec<u64>, Vec<InputEvent>)> = RefCell::new((Vec::new(), Vec::new()));
+        // The page's changes in the run so far, harvested before a `goto` takes the document with them.
+        let harvested: RefCell<Vec<u64>> = RefCell::new(Vec::new());
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
@@ -3697,9 +3697,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                         }
                         take_canvas();
                         if changes {
-                            let mut h = harvested.borrow_mut();
-                            h.0.extend(page_changes(&page));
-                            h.1.extend(page_input_events(&page));
+                            harvested.borrow_mut().extend(page_changes(&page));
                         }
                     }
                     let segment = call == "goto" && profiling.get();
@@ -3939,8 +3937,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             driver.inputs.borrow_mut().clear();
             if changes {
                 page_changes(&page);
-                page_input_events(&page);
-                *harvested.borrow_mut() = (Vec::new(), Vec::new());
+                harvested.borrow_mut().clear();
             }
             let docs = page.documents();
             // From outside the run is strobe's own span on the host clock, as a native app's: no page
@@ -3982,11 +3979,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let index = run_counts.borrow().len();
             run_counts.borrow_mut().push(hooks.counts());
             if changes {
-                let (mut seen, mut events) = harvested.take();
+                let mut seen = harvested.take();
                 seen.extend(page_changes(&page));
-                events.extend(page_input_events(&page));
-                let (received, unseen) = page_inputs(driver.inputs.take(), &events);
-                run_inputs.borrow_mut().push((received, seen, unseen));
+                run_inputs.borrow_mut().push((driver.inputs.take(), seen));
             }
             if page.documents() != docs {
                 loaded_document.set(true);
@@ -4119,11 +4114,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let screen = screen_state(&procs0, &procs1);
         let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
         let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
-        // The window must have stayed visible for the whole block.
+        // The window must have stayed visible for the whole block, and the browser strobe's alone.
         if !hidden_ok {
             validity::window_visible(&page)?;
             front_page(s, &browser)?;
         }
+        browser.own()?;
         let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         let pss = host::pss_bytes(&browser.processes().iter().map(|p| p.pid).collect::<Vec<_>>());
         // What the page had to draw in: its viewport in CSS pixels (device-independent at zoom 1) and
@@ -4357,12 +4353,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
             refused.insert(m.clone(), metrics::split_refusal(m, &values));
         }
+        // What strobe's page scripts see from a document's start: WebDriver Classic runs them only after the
+        // document's own, so a run that loaded one missed its counter calls, canvas frames and changes.
+        let unseen_start = |m: &str| loaded_document.get() && ["count.", "canvas.", "interaction.", "scroll.latency."].iter().any(|p| m.starts_with(p));
         for m in declared_metrics(s) {
             let webgpu = (no_webgpu && m.starts_with("canvas."))
                 .then(|| Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: the page has no WebGPU here (no GPUCanvasContext: {engine} on this OS does not ship it, or the origin is not a secure context)")));
-            // What strobe's page scripts see from a document's start: WebDriver Classic runs them only after
-            // the document's own, so a run that loaded one missed its counter calls, canvas frames and changes.
-            let preload = (loaded_document.get() && ["count.", "canvas.", "interaction.", "scroll.latency."].iter().any(|p| m.starts_with(p))).then(|| {
+            let preload = unseen_start(m).then(|| {
                 Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: a run loaded a page, and WebDriver Classic ({engine}) runs strobe's page scripts only after the page's own, so what the new page did first went unseen"))
                     .fix("keep the run on one page (load it in prepare or reset), or measure it in Chromium or Firefox")
             });
@@ -4371,9 +4368,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 refused.insert(m.clone(), r);
             }
         }
-        if no_webgpu {
-            values.retain(|k, _| !k.starts_with("canvas."));
-        }
+        // Undeclared ones go too (default secondaries, descriptive rows): no value the engine cannot give.
+        values.retain(|k, _| !(no_webgpu && k.starts_with("canvas.")) && !unseen_start(k) && validity::engine_refusal(engine, k).is_none());
         let phases = metrics::phase_frames(&data);
         let frames = metrics::run_frames(&data);
         // Traceless, the frame pacing per run (`intervals`) comes from the OS's presents where this OS
@@ -4408,7 +4404,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .iter()
                     .enumerate()
                     .map(|(j, r)| {
-                        let (sent, changes, _) = inputs.get(first + j).cloned().unwrap_or_default();
+                        let (sent, changes) = inputs.get(first + j).cloned().unwrap_or_default();
                         let sent: Vec<Value> = sent.iter().map(|&(t, scroll)| json!({ "t_ns": t, "kind": if scroll { "scroll" } else { "discrete" }, "first": true })).collect();
                         (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
                     })
@@ -5010,14 +5006,9 @@ fn margins(v: &Value, primary: &str) -> std::result::Result<BTreeMap<String, f64
     Ok(out)
 }
 
-/// One run's inputs as the page received them (host clock, and whether each was a scroll), the page's own
-/// changes (host clock), and how many inputs the page got no event for (`page_inputs`), for input latency
-/// from the OS's presents.
-type RunInputs = (Vec<(u64, bool)>, Vec<u64>, usize);
-
-/// An input event the page got (page_input_events): whether it was a wheel step, its own timestamp and
-/// when the page's listener ran (host clock).
-type InputEvent = (bool, u64, u64);
+/// One run's inputs strobe sent (host clock, and whether each was a scroll) and the page's own changes
+/// (host clock), for input latency from the OS's presents.
+type RunInputs = (Vec<(u64, bool)>, Vec<u64>);
 
 /// The page engine a target runs in (`web`, `url`; `apply_engines` set it): Chromium unless it says.
 fn engine_of(target: &Value) -> WebEngine {
@@ -5090,6 +5081,13 @@ fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()>
         if let Some(e) = web::refusal(engine, t["headless"] == true || args.has("headless")) {
             return Err(e);
         }
+        if engine == WebEngine::Webkit && t["scale"].is_number() {
+            return Err(Error::refused(
+                "EngineUnsupported",
+                format!("{}: the target asks for scale {}, and a WebKit page draws at the display's own: WebDriver has no device scale override", s.label(), t["scale"]),
+                "drop the target's scale for --engine webkit, or measure the scaled page in Chromium or Firefox",
+            ));
+        }
         if engine != WebEngine::Chromium && s.launch.is_object() {
             return Err(Error::refused("EngineUnsupported", format!("{}: launch cases time a launch through Chromium's DevTools; {engine} launch cases are not built yet", s.label()), "measure the launch in Chromium, or time the load in a run case (phase around page.goto)"));
         }
@@ -5124,66 +5122,14 @@ fn page_changes(page: &Page) -> Vec<u64> {
     times.iter().map(|t| (h1 - ((now - t - 1.0).max(0.0)) * 1e6).max(0.0) as u64).collect()
 }
 
-/// The input events the page got since the last read (`CHANGES_SCRIPT`: `pointerup` and `keydown`, or
-/// `wheel`), on the host clock as `page_changes` maps them: whether each was a wheel step, its own
-/// `timeStamp` (when the browser created it) and when the page's listener ran. Each time is taken as read
-/// (the start of a coarsened millisecond), so an input is never placed after it happened.
-fn page_input_events(page: &Page) -> Vec<InputEvent> {
-    let h0 = host::now_ns();
-    let read: Vec<Value> = page
-        .eval("JSON.stringify([performance.now(), ...(globalThis.__strobeInputs?.splice(0) ?? [])])")
-        .ok()
-        .and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok()))
-        .unwrap_or_default();
-    let h1 = host::now_ns().max(h0) as f64;
-    let Some((now, events)) = read.split_first() else { return Vec::new() };
-    let now = now.as_f64().unwrap_or(0.0);
-    let host = |t: f64| (h1 - (now - t).max(0.0) * 1e6).max(0.0) as u64;
-    events.iter().filter_map(|e| Some((e[0].as_u64()? == 1, host(e[1].as_f64()?), host(e[2].as_f64()?)))).collect()
-}
-
-/// The run's inputs as the page received them: each input strobe sent (host clock, in order) takes the
-/// time of the first event of its kind the page then got, so a latency starts in the browser, not when
-/// strobe's WebDriver command left (that would add the driver's round trip and relay). That time is the
-/// event's own `timeStamp` where it lies between strobe's send and the page's listener, else the
-/// listener's time: Safari (27) stamps WebDriver's events on another clock. Returns the inputs and how
-/// many the page got no event for within a second.
-fn page_inputs(sent: Vec<(u64, bool)>, events: &[InputEvent]) -> (Vec<(u64, bool)>, usize) {
-    let events: Vec<(bool, u64)> = events
-        .iter()
-        .map(|&(k, stamp, seen)| {
-            // The last send before the listener ran: the event cannot be older than it.
-            let after = sent.iter().map(|s| s.0).filter(|&t| t <= seen + 1_000_000).max().unwrap_or(0);
-            (k, if stamp + 1_000_000 >= after && stamp <= seen + 1_000_000 { stamp } else { seen })
-        })
-        .collect();
-    let mut used = vec![false; events.len()];
-    let (mut out, mut unseen) = (Vec::new(), 0);
-    for (t, scroll) in sent {
-        // The page's millisecond clock may put the event up to 1 ms before strobe's send time.
-        let found = (0..events.len()).find(|&i| !used[i] && events[i].0 == scroll && events[i].1 + 1_000_000 >= t && events[i].1 <= t + 1_000_000_000);
-        match found {
-            Some(i) => {
-                used[i] = true;
-                out.push((events[i].1.max(t), scroll));
-            }
-            None => unseen += 1,
-        }
-    }
-    (out, unseen)
-}
-
-/// The page's own changes, for input latency where the browser reports none (Firefox, WebKit): when the
-/// DOM changed (in open and closed shadow roots too), an input or change event fired, or the page
-/// scrolled, at most one entry per millisecond (a page that mutates in a tight loop fills nothing); and
-/// when the input events strobe's inputs became reached the page (`pointerup`, `keydown`, `wheel`: their
-/// own `timeStamp` and the listener's time). Installed in every document of a headed series in such an
-/// engine.
+/// The page's own changes, for input latency where the browser reports none (Firefox): when the DOM
+/// changed (in open and closed shadow roots too), an input or change event fired, or the page scrolled.
+/// At most one entry per millisecond: a page that mutates in a tight loop fills nothing. Installed in
+/// every document of a headed series in such an engine.
 const CHANGES_SCRIPT: &str = r#"(() => {
   if (globalThis.__strobeChangesOn) return
   globalThis.__strobeChangesOn = true
   globalThis.__strobeChanges ??= []
-  globalThis.__strobeInputs ??= []
   let last = -1
   const at = () => {
     const c = globalThis.__strobeChanges, t = performance.now()
@@ -5199,8 +5145,6 @@ const CHANGES_SCRIPT: &str = r#"(() => {
     return root
   }
   for (const e of ["input", "change", "scroll"]) addEventListener(e, at, true)
-  const input = (e) => { const c = globalThis.__strobeInputs; if (c.length < 10000) c.push([e.type === "wheel" ? 1 : 0, e.timeStamp, performance.now()]) }
-  for (const e of ["pointerup", "keydown", "wheel"]) addEventListener(e, input, { capture: true, passive: true })
 })()"#;
 
 /// A page's frames where the engine reports none of its own (Firefox, headed): the OS's presents of its
@@ -5256,9 +5200,7 @@ fn os_frames(
     if !inputs.is_empty() {
         let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
         let mut reactions = frames::Reactions::default();
-        for (sent, changes, unseen) in inputs {
-            // An input the page got no event for changed nothing a frame could show.
-            reactions.unchanged += *unseen;
+        for (sent, changes) in inputs {
             let sent: Vec<frames::Sent> = sent.iter().map(|&(t_ns, scroll)| frames::Sent { t_ns, scroll }).collect();
             let got = frames::reactions(&sent, changes, &p.presents, pids, quiet);
             reactions.interaction.extend(got.interaction);

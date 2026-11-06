@@ -871,6 +871,32 @@ pub fn exe_of(pid: u32) -> Option<PathBuf> {
 /// strings (applev), which are left out. Arguments are never read as environment. None for a
 /// process of another user. One buffer of `KERN_ARGMAX` bytes per thread, reused.
 pub fn env_of(pid: u32) -> Option<Vec<String>> {
+    procargs(pid, procargs_env)
+}
+
+/// A process's arguments (after its executable path), from `KERN_PROCARGS2` as `env_of` reads it.
+pub fn args_of(pid: u32) -> Option<Vec<String>> {
+    procargs(pid, |b| {
+        let argc = i32::from_ne_bytes([b[0], b[1], b[2], b[3]]).max(0) as usize;
+        let mut at = 4;
+        at += b[at..].iter().position(|c| *c == 0).unwrap_or(b.len() - at);
+        at += b[at..].iter().position(|c| *c != 0).unwrap_or(b.len() - at);
+        let mut out = Vec::new();
+        for _ in 0..argc {
+            if at >= b.len() {
+                break;
+            }
+            let end = at + b[at..].iter().position(|c| *c == 0).unwrap_or(b.len() - at);
+            out.push(String::from_utf8_lossy(&b[at..end]).to_string());
+            at = end + 1;
+        }
+        // The first is the program as it was started.
+        out.into_iter().skip(1).collect()
+    })
+}
+
+/// `f` over a process's `KERN_PROCARGS2` buffer; None for a process of another user.
+fn procargs<T>(pid: u32, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
     thread_local! {
         static BUF: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
     }
@@ -890,7 +916,7 @@ pub fn env_of(pid: u32) -> Option<Vec<String>> {
         if unsafe { libc::sysctl(mib.as_mut_ptr(), 3, buf.as_mut_ptr() as *mut c_void, &mut len, std::ptr::null_mut(), 0) } != 0 || len < 4 {
             return None;
         }
-        Some(procargs_env(&buf[..len]))
+        Some(f(&buf[..len]))
     })
 }
 

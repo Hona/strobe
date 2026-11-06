@@ -361,6 +361,8 @@ pub fn engine_refusal(engine: WebEngine, metric: &str) -> Option<Refusal> {
         "frames.partial" => "frames.dropped (headed)",
         m if crate::metrics::split_metric(m) => "frames.interval.p95 (headed) or cpu.gpu",
         m if m.starts_with("js.heap.") => "memory.app.private",
+        // A leak run's heap snapshots and census.
+        "leak.suspects.retained" | "dom.nodes.growth" => "memory.app.private over runs",
         "gpu.compile" => "gpu.process.3d",
         "layout.shift" => "a count.<name> the page keeps",
         m if m.starts_with("span.") => "phase.<name> around the same work in the case",

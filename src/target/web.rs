@@ -68,7 +68,9 @@ pub fn find(engine: WebEngine, headless: bool) -> Option<PathBuf> {
 /// the system's Safari and the distribution's MiniBrowser).
 pub fn patched(engine: WebEngine) -> Option<String> {
     match engine {
-        WebEngine::Firefox => find(engine, false).filter(|p| firefox::patched(p)).map(|p| format!("{} is Playwright's patched Firefox (from STROBE_FIREFOX): its process model and preferences are not the Firefox people run", p.display())),
+        WebEngine::Firefox => find(engine, false)
+            .filter(|p| firefox::patched(p))
+            .map(|p| format!("{} is Playwright's patched Firefox (from STROBE_FIREFOX): its process model and preferences are not the Firefox people run", p.display())),
         WebEngine::Chromium | WebEngine::Webkit => None,
     }
 }
@@ -127,7 +129,17 @@ impl WebBrowser {
         match self {
             WebBrowser::Chromium(b) => b.profile.clone(),
             WebBrowser::Firefox(b) => b.profile.clone(),
-            WebBrowser::Webkit(b) => b.home(),
+            // The browser's tree holds all its processes; the home's stamp would add the WebDriver server.
+            WebBrowser::Webkit(_) => None,
+        }
+    }
+
+    /// Whether the browser is still only strobe's (`LiveChannel` once a person opened a window in a
+    /// Safari strobe launched).
+    pub fn own(&self) -> Result<()> {
+        match self {
+            WebBrowser::Chromium(_) | WebBrowser::Firefox(_) => Ok(()),
+            WebBrowser::Webkit(b) => b.own(),
         }
     }
 

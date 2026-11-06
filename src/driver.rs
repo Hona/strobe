@@ -926,7 +926,14 @@ impl Driver {
         match &self.page {
             Page::Chromium(p) => p.send("Input.dispatchKeyEvent", e).map(|_| ()),
             // The session's input state holds the modifiers already down.
-            Page::Firefox(_) | Page::Webkit(_) => self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }])),
+            Page::Firefox(_) | Page::Webkit(_) => {
+                // Safari types a symbol with Shift held only from its key's own character (`stroke`).
+                let key = match key {
+                    Key::Char(c) if self.mods.get() & 8 != 0 && !c.is_ascii_alphabetic() && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
+                    k => k,
+                };
+                self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }]))
+            }
         }
     }
 

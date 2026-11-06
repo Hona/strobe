@@ -359,7 +359,9 @@ export interface AppOptions {
 /**
  * The browser a page runs in: `"chromium"` (default; over CDP, with its trace, profilers and heap snapshots),
  * `"firefox"` (over WebDriver BiDi: CPU, GPU, memory, counters, phases, network, and headed the OS's frames and
- * input latency; Chromium-only metrics are refused EngineUnsupported) or `"webkit"` (refused: not built yet).
+ * input latency; Chromium-only metrics are refused EngineUnsupported) or `"webkit"` (over WebDriver Classic:
+ * Safari on macOS, headed; WebKitGTK headed or WPE headless on Linux; refused on Windows; no network events,
+ * mocks or preload, so `net.*`, `ctx.mock` and the counters of a run that loads a page are refused).
  */
 export type Engine = "chromium" | "firefox" | "webkit"
 

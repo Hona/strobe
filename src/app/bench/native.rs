@@ -899,8 +899,8 @@ pub(super) fn line(why: &str) -> Refusal {
     Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why))
 }
 
-/// How a native launch ends.
-enum Until {
+/// How a native launch ends (an app launch ends on the window conditions too).
+pub(super) enum Until {
     /// The main window is visible.
     Visible,
     /// The window's pixels first changed from its first frame.
@@ -915,11 +915,59 @@ enum Until {
 
 /// One look at the launching app: when (epoch ms), whether its window shows, its pixels, and the tree's
 /// CPU cycles.
-struct Sample {
-    at: f64,
+pub(super) struct Sample {
+    pub(super) at: f64,
     shown: bool,
     px: Option<Vec<u8>>,
-    cycles: u64,
+    pub(super) cycles: u64,
+}
+
+/// `until: { window }` of a launch case: visible, painted or settled (None when it names no window).
+pub(super) fn window_until(s: &Series, until: &Value) -> Result<Option<Until>> {
+    Ok(match until.get("window").and_then(Value::as_str) {
+        Some("visible") => Some(Until::Visible),
+        Some("painted") => Some(Until::Painted),
+        Some("settled") => Some(Until::Settled),
+        Some(other) => return Err(Error::usage(format!("{}: launch.until.window is visible, painted or settled, not {other}", s.case))),
+        None => None,
+    })
+}
+
+/// Follows a launching window's samples to a window condition.
+#[derive(Default)]
+pub(super) struct WindowWait {
+    first: Option<Vec<u8>>,
+    prev: Option<Vec<u8>>,
+    change: Option<Sample>,
+}
+
+impl WindowWait {
+    /// The sample the launch is ready at, once `sample` completes `until`: the first with the window
+    /// shown, the first whose pixels differ from the first's, or the last change once the pixels held
+    /// for a second.
+    pub(super) fn step(&mut self, until: &Until, sample: Sample) -> Option<Sample> {
+        match until {
+            Until::Visible if sample.shown => Some(sample),
+            Until::Painted | Until::Settled => {
+                let px = sample.px.clone()?;
+                let first = self.first.get_or_insert_with(|| px.clone()).clone();
+                let moved = self.prev.as_ref().is_some_and(|p| differs(p, &px));
+                self.prev = Some(px.clone());
+                if matches!(until, Until::Painted) && differs(&first, &px) {
+                    return Some(sample);
+                }
+                if self.change.is_none() || moved {
+                    self.change = Some(sample);
+                    None
+                } else if self.change.as_ref().is_some_and(|c| sample.at - c.at >= 1000.0) {
+                    self.change.take()
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
 }
 
 /// A cell (a 16th of the window each way) moving by more than 8 levels in a colour channel; see
@@ -930,7 +978,7 @@ fn differs(a: &[u8], b: &[u8]) -> bool {
 
 /// Every 30 ms until `stop`: keeps the app's windows on top without focus, and sends a sample (with
 /// pixels when `capture`). Returns the pixel samples.
-fn watch(pid: u32, home: &Path, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender<Sample>) -> Vec<(f64, Vec<u8>)> {
+pub(super) fn watch(pid: u32, home: &Path, capture: bool, stop: &AtomicBool, tx: std::sync::mpsc::Sender<Sample>) -> Vec<(f64, Vec<u8>)> {
     let mut out = Vec::new();
     let mut raised = Instant::now() - Duration::from_secs(1);
     while !stop.load(Ordering::Relaxed) {
@@ -977,7 +1025,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     }
     let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
     let windowless = target["window"] == false || app.windowless;
-    let until = match spec["until"].get("window").and_then(Value::as_str) {
+    let until = match window_until(s, &spec["until"])? {
         // A milestone of the app's own (an output or log line): the launch needs no window at all.
         _ if spec["until"]["milestone"].is_string() => {
             let name = spec["until"]["milestone"].as_str().unwrap_or("").to_string();
@@ -987,10 +1035,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             Until::Milestone(name)
         }
         _ if windowless => return Err(Error::usage(format!("{}: a target with window: false times its launch to a milestone: until: {{ milestone: \"<name>\" }}", s.case))),
-        Some("visible") => Until::Visible,
-        Some("painted") => Until::Painted,
-        Some("settled") => Until::Settled,
-        Some(other) => return Err(Error::usage(format!("{}: launch.until.window is visible, painted or settled, not {other}", s.case))),
+        Some(w) => w,
         None => Until::Selector(spec["until"].clone()),
     };
     let capture = spec["screen"] != false && !windowless;
@@ -1170,30 +1215,12 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                 (n.epoch_ms + (late.next_screen_ns as f64 - n.at_ns as f64) / 1e6, cycles)
             }
         } else {
-            let mut first_px: Option<Vec<u8>> = None;
-            let mut prev_px: Option<Vec<u8>> = None;
-            let mut change: Option<Sample> = None;
+            let mut wait = WindowWait::default();
             let sample = loop {
-                if let Ok(sample) = rx.recv_timeout(Duration::from_millis(100)) {
-                    match until {
-                        Until::Visible if sample.shown => break sample,
-                        Until::Painted | Until::Settled => {
-                            if let Some(px) = sample.px.clone() {
-                                let first = first_px.get_or_insert_with(|| px.clone()).clone();
-                                let moved = prev_px.as_ref().is_some_and(|p| differs(p, &px));
-                                prev_px = Some(px.clone());
-                                if matches!(until, Until::Painted) && differs(&first, &px) {
-                                    break sample;
-                                }
-                                if change.is_none() || moved {
-                                    change = Some(sample);
-                                } else if change.as_ref().is_some_and(|c| sample.at - c.at >= 1000.0) {
-                                    break change.take().unwrap_or(sample);
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
+                if let Ok(sample) = rx.recv_timeout(Duration::from_millis(100))
+                    && let Some(ready) = wait.step(&until, sample)
+                {
+                    break ready;
                 }
                 if n.exited().is_some() && n.processes().is_empty() {
                     return Err(Error::refused(

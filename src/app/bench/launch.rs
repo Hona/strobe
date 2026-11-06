@@ -58,6 +58,25 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         steps.push((name.to_string(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
     };
+    // `until: { window }`: the launch ends on its window's pixels, as a native app's can (the same
+    // samples on both sides of an implementation comparison), not on an element in the page.
+    let window_until = super::native::window_until(s, &spec["until"])?;
+    if web && window_until.is_some() {
+        return Err(Error::usage(format!("{}: a web target's launch is timed in the page, which has no window of its own: time it to a selector", s.case)));
+    }
+    if matches!(window_until, Some(super::native::Until::Painted | super::native::Until::Settled)) {
+        if spec["screen"] == false {
+            return Err(Error::usage(format!("{}: launch.until.window painted or settled reads the window's pixels; drop screen: false", s.case)));
+        }
+        #[cfg(target_os = "macos")]
+        if !host::macos::screen_capture_allowed() {
+            return Err(Error::refused(
+                "NoPresentSource",
+                format!("{}: launch.until.window reads the window's pixels: {}", s.case, no_pixels(true)),
+                "grant Screen Recording, or time the launch to a selector",
+            ));
+        }
+    }
     // An app's home is ready before the hook (folders, seed, profile files, a `{port}` a warm home
     // keeps), and the hook gets the environment and executable the app launches with, so it can start
     // what the app expects to find (a background service) the way the app would.
@@ -132,14 +151,23 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
     let result = (|| -> Result<Block> {
-        let watch = Watch::start(&browser.cdp, observer(&spec["until"])?, profile)?;
+        // Timed to the window, the pages still start paused for their profilers, with an observer that
+        // never resolves.
+        let watch = Watch::start(&browser.cdp, if window_until.is_some() { NO_OBSERVER.to_string() } else { observer(&spec["until"])? }, profile)?;
         let stop = Arc::new(AtomicBool::new(false));
         let (pid, profile_dir) = (browser.pid, browser.profile.clone());
+        let (tx, samples) = channel();
         // An app's windows stay on top without focus (an occluded window never paints); `screen` also
-        // captures their pixels.
+        // captures their pixels. Timed to the window, each look goes to the wait below too, with the
+        // process set's cycles, as a native launch's does.
         let sampler = (!web).then(|| {
             let stop = stop.clone();
-            std::thread::spawn(move || sample_screen(pid, profile_dir.as_deref(), screen, &stop))
+            let timed = window_until.is_some();
+            std::thread::spawn(
+                move || {
+                    if timed && let Some(home) = &profile_dir { super::native::watch(pid, home, screen, &stop, tx) } else { sample_screen(pid, profile_dir.as_deref(), screen, &stop) }
+                },
+            )
         });
         let tails = {
             let globs: Vec<String> = milestones.iter().filter(|m| m.source != "output" && m.source != "page").map(|m| m.source.clone()).collect();
@@ -169,14 +197,37 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             started.epoch_ms
         };
         let timeout = Duration::from_millis(spec["timeout"].as_u64().unwrap_or(120_000));
-        let (ready_at, page) = match watch.ready(timeout) {
-            Ok(found) => found,
-            Err(e) => {
-                let shot = watch.any_page().map(|p| snapshot(&p.into(), &ctx.exp, "launch")).unwrap_or_default();
-                return Err(Error::refused("RunIncomplete", format!("{} launch: {}{shot}", s.case, e.message), "the until selector never showed"));
+        let (ready_at, page, cpu1) = match &window_until {
+            Some(until) => {
+                let deadline = Instant::now() + timeout;
+                let mut wait = super::native::WindowWait::default();
+                let ready = loop {
+                    if let Ok(sample) = samples.recv_timeout(Duration::from_millis(100))
+                        && let Some(ready) = wait.step(until, sample)
+                    {
+                        break ready;
+                    }
+                    if let Some(g) = &guard {
+                        g.check("while the app started")?;
+                    }
+                    if Instant::now() > deadline {
+                        return Err(Error::refused(
+                            "RunIncomplete",
+                            format!("{} launch: its window never got to {} in {} s", s.case, spec["until"]["window"].as_str().unwrap_or(""), timeout.as_secs()),
+                            "check that the app opens a window",
+                        ));
+                    }
+                };
+                (ready.at, electron::main_page(&browser)?, ready.cycles)
             }
+            None => match watch.ready(timeout) {
+                Ok((at, page)) => (at, page, cpu_now()),
+                Err(e) => {
+                    let shot = watch.any_page().map(|p| snapshot(&p.into(), &ctx.exp, "launch")).unwrap_or_default();
+                    return Err(Error::refused("RunIncomplete", format!("{} launch: {}{shot}", s.case, e.message), "the until selector never showed"));
+                }
+            },
         };
-        let cpu1 = cpu_now();
         // Never from process times (15.6 ms ticks): without cycles over the cycle clock, unknown, and
         // `refusals` says why.
         let cpu_ms = match (clock.0, host::tsc()) {
@@ -563,6 +614,9 @@ fn tail_from(home: &Path, glob: &str, mut offsets: BTreeMap<PathBuf, u64>, stop:
 pub(super) fn found_all(milestones: &[Milestone], lines: &[Line], which: impl Fn(&Milestone) -> bool) -> bool {
     milestones.iter().filter(|m| which(m)).all(|m| lines.iter().any(|(_, l, src)| *src == m.source && m.pattern.is_match(l)))
 }
+
+/// The init script of a launch timed to its window: nothing in the page ends it.
+const NO_OBSERVER: &str = "window.__strobeLaunch = window.__strobeLaunch || new Promise(() => {}); false";
 
 /// The init script that resolves `window.__strobeLaunch` with the epoch time `until` first showed, and
 /// returns whether it already shows (a late install). `until` is a selector in the one grammar pages

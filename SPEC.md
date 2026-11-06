@@ -1905,6 +1905,15 @@ discarded first, so the OS has read the build from disk before any timed launch.
   `waitForDebuggerOnStart`, so each page pauses until strobe's observer is in it, then runs. A page
   that loaded before strobe could attach (a browser opens its first page at startup) gets the
   observer late; that is still valid unless `until` already shows, which refuses the launch.
+- **Window conditions** (`until: { window: "visible" | "painted" | "settled" }`): an app, exe or
+  command target's launch may end on its window, as a native app's does: the window's 16x16
+  pixels and its process set's CPU cycles every 30 ms (`native::watch`, the same reads for both
+  kinds), ready at the first look with the window shown, the first whose pixels differ from the
+  first look's, or their last change once they held for a second. Two implementations (an Electron
+  side and a native side, 9.10) then end their launches alike, with no selector either has to
+  share. The pages still start paused for their profilers; nothing in them ends the launch. Not for
+  `web` and `url` targets (a page has no window of its own); painted and settled need the screen
+  read (`screen: false` is a usage error; macOS needs Screen Recording, `NoPresentSource`).
 - **Milestones** (`{ name: { match, in? } }`): the first line matching `match` (text, or a RegExp)
   in `in`: `"output"` (stdout and stderr, colour codes removed; the default), `"page"` (the main
   page's `performance.mark` names) or a glob of files under the launch's home (an app's log).

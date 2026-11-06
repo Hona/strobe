@@ -217,7 +217,7 @@ export interface Milestone {
   in?: "output" | "page" | (string & {})
 }
 
-/** A native app's launch ends on its main window: `visible`, its pixels first `painted` (changed from its first frame), or `settled` (their last change, once they hold for a second). */
+/** A native, app, exe or command launch ends on its main window: `visible`, its pixels first `painted` (changed from its first frame), or `settled` (their last change, once they hold for a second). Not a web target's (a page has no window of its own). */
 export interface WindowUntil {
   window: "visible" | "painted" | "settled"
 }
@@ -228,7 +228,7 @@ export interface MilestoneUntil {
 }
 
 export interface Launch<P> {
-  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target: the screen time of the frame that first showed the element in its accessibility tree (OS present events), or a window condition. */
+  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target: the screen time of the frame that first showed the element in its accessibility tree (OS present events). Any target with a window of its own may end on a window condition instead, read from its pixels the same way on every kind (two implementations timed alike). */
   until: Selector | WindowUntil | MilestoneUntil
   /** Named points on the way, each a metric `launch.<name>`. One a case declares must appear in every launch. */
   milestones?: Record<string, Milestone>

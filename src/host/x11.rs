@@ -143,7 +143,11 @@ fn top(x: &X, w: &Info, stack: &[Window]) -> TopWindow {
 pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     with(|x| {
         let stack = clients(x);
-        let best = stack.iter().filter_map(|&w| info(x, w)).filter(|i| pids.contains(&i.pid) && i.viewable && !i.hidden && i.rect.2 >= 100 && i.rect.3 >= 100).max_by_key(|i| i.rect.2 as i64 * i.rect.3 as i64)?;
+        let best = stack
+            .iter()
+            .filter_map(|&w| info(x, w))
+            .filter(|i| pids.contains(&i.pid) && i.viewable && !i.hidden && i.rect.2 >= 100 && i.rect.3 >= 100)
+            .max_by_key(|i| i.rect.2 as i64 * i.rect.3 as i64)?;
         Some(top(x, &best, &stack))
     })
 }

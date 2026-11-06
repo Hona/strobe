@@ -243,8 +243,11 @@ fn runs(
         #[cfg(target_os = "macos")]
         if viewport.is_some() && !host::macos::accessibility_trusted() {
             let (who, pane) = (host::macos::responsible_app(), host::macos::accessibility_pane());
-            return Err(Error::usage(format!("sizing {}'s window to the target's viewport needs the accessibility permission, which {who} (the app strobe runs under) does not have", app.exe.display()))
-                .hint(format!("{pane}: turn on {who}, or drop viewport from the target")));
+            return Err(Error::usage(format!(
+                "sizing {}'s window to the target's viewport needs the accessibility permission, which {who} (the app strobe runs under) does not have",
+                app.exe.display()
+            ))
+            .hint(format!("{pane}: turn on {who}, or drop viewport from the target")));
         }
         if let Some(w) = n.place(&at, viewport.is_some()) {
             let scale = w.scale();

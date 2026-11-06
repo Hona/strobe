@@ -1963,7 +1963,12 @@ fn warm_gpu(ctx: &mut Ctx, s: &Series, variants: &[Variant], halted: &mut Option
             if round == 3 {
                 ctx.warnings.push(validity::warn(
                     "GpuCacheGrowing",
-                    format!("{}: {}'s GPU shader caches still grew by {} in its third warm-up block: its measured blocks may still compile shaders", s.label(), side_of(ctx, v), fmt::bytes(grew as f64)),
+                    format!(
+                        "{}: {}'s GPU shader caches still grew by {} in its third warm-up block: its measured blocks may still compile shaders",
+                        s.label(),
+                        side_of(ctx, v),
+                        fmt::bytes(grew as f64)
+                    ),
                 ));
             }
         }
@@ -3564,7 +3569,8 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
         let over = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).filter(|_| x.measures_time()).map(Overhead::over).unwrap_or_default();
         for (part, pct, budget) in over {
             if ctx.overhead_warned.insert(format!("{}\n{part}", s.label())) {
-                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), side_of(ctx, v), pct_of_core(pct))));
+                ctx.warnings
+                    .push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), side_of(ctx, v), pct_of_core(pct))));
             }
         }
         r

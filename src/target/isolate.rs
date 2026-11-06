@@ -376,12 +376,7 @@ impl Guard {
     /// when a folder's time did not move or only what the OS writes by itself appeared.
     fn folder_changes(&self) -> Vec<(PathBuf, Option<Vec<String>>)> {
         let since = self.taken.unwrap_or(SystemTime::UNIX_EPOCH);
-        self.folders
-            .iter()
-            .filter(|(p, before)| modified(p) != *before)
-            .map(|(p, _)| (p.clone(), appeared(p, since)))
-            .filter(|(_, new)| new.as_ref().is_none_or(|n| !n.is_empty()))
-            .collect()
+        self.folders.iter().filter(|(p, before)| modified(p) != *before).map(|(p, _)| (p.clone(), appeared(p, since))).filter(|(_, new)| new.as_ref().is_none_or(|n| !n.is_empty())).collect()
     }
 
     /// Fails when a guarded file changed, or its process stopped running or answering, or the app

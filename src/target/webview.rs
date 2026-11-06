@@ -140,7 +140,14 @@ pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Windo
     if size && ((got.0 - want.0).abs() > 2.0 || (got.1 - want.1).abs() > 2.0) {
         return Err(Error::refused(
             "VariantMismatch",
-            format!("{} keeps its page at {}×{} CSS pixels, not the target's viewport {}×{}: the app fixes its window's size, or the screen clamps it", browser.exe.display(), got.0, got.1, at.width, at.height),
+            format!(
+                "{} keeps its page at {}×{} CSS pixels, not the target's viewport {}×{}: the app fixes its window's size, or the screen clamps it",
+                browser.exe.display(),
+                got.0,
+                got.1,
+                at.width,
+                at.height
+            ),
             "drop viewport from the target (the app's own size is measured then), or ask for one that fits the screen",
         ));
     }

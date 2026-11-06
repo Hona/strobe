@@ -175,7 +175,68 @@ const state: {
   engine: string
   relay: any
   devtools: { endpoint: string; target: string } | null
-} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null, devtools: null }
+  /** The experiment's seed (`--seed`, or drawn by strobe), the block's case seed, and the hook's stream. */
+  seed: number
+  caseSeed: number
+  stream: () => number
+  /** A hook read `ctx.seed` or called `ctx.random()`: the workload depends on the seed (the ledger's rule). */
+  usedRandom: boolean
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null, devtools: null, seed: 0, caseSeed: 0, stream: () => 0, usedRandom: false }
+
+// Seeds (SPEC §9.6): a case's seed is mix(experiment seed, case + "\n" + its params as canonical JSON), so
+// base and head, and every target of a journey, get the same one. Each hook call starts its own stream
+// from mix(case seed, hook): every run starts from the same point, so warmup converges and the runs repeat.
+// mix: FNV-1a over the text's UTF-8 bytes from `seed`, then murmur3's finalizer; the stream is mulberry32.
+function mix(seed: number, text: string): number {
+  let h = (0x811c9dc5 ^ seed) >>> 0
+  for (const b of new TextEncoder().encode(text)) h = Math.imul(h ^ b, 0x01000193)
+  h ^= h >>> 16
+  h = Math.imul(h, 0x85ebca6b)
+  h ^= h >>> 13
+  h = Math.imul(h, 0xc2b2ae35)
+  h ^= h >>> 16
+  return h >>> 0
+}
+
+function mulberry32(a: number): () => number {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0
+    let t = Math.imul(a ^ (a >>> 15), 1 | a)
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+// JSON with object keys sorted at every level: the same params give the same text in any order.
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`
+  if (value && typeof value === "object")
+    return `{${Object.keys(value).sort().map((k) => `${JSON.stringify(k)}:${canonical((value as any)[k])}`).join(",")}}`
+  return JSON.stringify(value) ?? "null"
+}
+
+// The hook about to run starts its stream (`ctx.random()`) over.
+const stream = (hook: string) => void (state.stream = mulberry32(mix(state.caseSeed, hook)))
+
+// `ctx.seed` and `ctx.random()` on a hook's context. A getter, so only reading it counts as using it
+// (never copy a context with spread syntax: that reads every getter).
+const seeded = <T extends object>(ctx: T): T =>
+  Object.defineProperties(ctx, {
+    seed: {
+      enumerable: true,
+      get() {
+        state.usedRandom = true
+        return state.caseSeed
+      },
+    },
+    random: {
+      enumerable: true,
+      value() {
+        state.usedRandom = true
+        return state.stream()
+      },
+    },
+  })
 
 // `ctx.ui.<name>`: the side's selector, or its step called with this context; a name it lacks is a parity gap.
 const uiOf = (ctx: () => object) =>
@@ -189,7 +250,7 @@ const uiOf = (ctx: () => object) =>
     has: (_, name) => typeof name === "string" && name in ui(state.target),
   })
 
-const context = (): any => ({
+const context = (): any => seeded({
   page,
   ui: uiOf(context),
   case: state.case,
@@ -236,7 +297,7 @@ const context = (): any => ({
       await Bun.sleep(10)
     }
   },
-})
+}) as any
 
 // A script every new document of the block's page runs before its own, in any engine: strobe adds it
 // through its own connection (CDP's Page.addScriptToEvaluateOnNewDocument, BiDi's script.addPreloadScript).
@@ -251,7 +312,7 @@ function addInitScript(script: string | Function, arg?: unknown) {
 
 // Playwright connects over CDP, which only Chromium speaks: on another engine reading it throws, typed
 // as strobe's EngineUnsupported refusal, so the bench names the cause instead of a null page failing later.
-const prepareContext = () => ({
+const prepareContext = () => seeded({
   case: state.case,
   params: state.params,
   target: state.target,
@@ -492,8 +553,13 @@ async function handle(op: string, args: any) {
     case "fixture":
       state.fixture = { url: args.url, port: args.port, pid: args.pid, home: args.home }
       return true
+    // The experiment's seed, once, before the first block.
+    case "seed":
+      state.seed = args.seed >>> 0
+      return true
     case "block":
       Object.assign(state, {
+        caseSeed: mix(state.seed, `${args.case ?? ""}\n${canonical(args.params ?? {})}`),
         case: args.case ?? "",
         params: args.params ?? {},
         target: args.target,
@@ -512,23 +578,27 @@ async function handle(op: string, args: any) {
       })
       return true
     case "before":
-      await spec.cases[args.case].launch.before?.({
-        case: state.case,
-        params: state.params,
-        target: state.target,
-        variant: state.variant,
-        root: state.root,
-        home: state.home,
-        env: state.env,
-        exe: state.exe,
-        fixture: state.fixture,
-      })
+      stream("before")
+      await spec.cases[args.case].launch.before?.(
+        seeded({
+          case: state.case,
+          params: state.params,
+          target: state.target,
+          variant: state.variant,
+          root: state.root,
+          home: state.home,
+          env: state.env,
+          exe: state.exe,
+          fixture: state.fixture,
+        }),
+      )
       return true
     case "prepare": {
       const target = spec.targets[state.target]
       if (target?.prepare) {
         state.devtools = args.endpoint ? { endpoint: args.endpoint, target: args.target } : null
         if (args.endpoint) state.playwright = await playwright(args.endpoint, args.target)
+        stream("prepare")
         state.prepared = await target.prepare(prepareContext())
       }
       // A `url` function names the first page from what `prepare` returned, so the block loads one page.
@@ -536,23 +606,28 @@ async function handle(op: string, args: any) {
       return { url }
     }
     case "setup":
-      await spec.setup?.({ ...context(), addInitScript })
+      stream("setup")
+      // Not spread: that would read `ctx.seed`.
+      await spec.setup?.(Object.assign(context(), { addInitScript }))
       return true
     case "run": {
       const run = hookFor(spec.cases[args.case].run, state.target)
       if (!run) throw new ParityGap(state.target, `run for ${args.case}`)
+      stream("run")
       await run(context())
       return true
     }
     case "reset": {
       const reset = hookFor(spec.cases[args.case].reset, state.target)
       if (!reset) return false
+      stream("reset")
       await reset(context())
       return true
     }
     case "close": {
       // Teardown hooks run while the browser is still open; one that throws does not keep the rest.
       const errors: unknown[] = []
+      stream("teardown")
       await Promise.resolve(spec.teardown?.(context())).catch((e) => errors.push(e))
       await Promise.resolve(spec.targets[state.target]?.teardown?.(prepareContext())).catch((e) => errors.push(e))
       if (state.session) await state.session.detach().catch(() => {})
@@ -585,11 +660,14 @@ createInterface({ input: socket }).on("line", (line) => {
     else waiting.resolve(message.ok)
     return
   }
+  // `used_random`: some hook so far read `ctx.seed` or called `ctx.random()` (the ledger's rule, SPEC §14.2).
+  const used = () => (state.usedRandom ? { used_random: true } : {})
   handle(message.op, message.args ?? {}).then(
-    (ok) => write({ id: message.id, ok: ok ?? null }),
+    (ok) => write({ id: message.id, ok: ok ?? null, ...used() }),
     (error) =>
       write({
         id: message.id,
+        ...used(),
         error: String(error?.message ?? error),
         stack: String(error?.stack ?? ""),
         ...(typeof error?.hint === "string" ? { hint: error.hint } : {}),

@@ -1,5 +1,6 @@
 //! `strobe query`: views over recordings and experiments (SPEC §11.1).
 
+mod actions;
 mod diff;
 mod rec;
 mod waits;
@@ -47,6 +48,7 @@ pub fn run(args: &Args) -> Result<Output> {
         return match view {
             "summary" | "progress" => Ok(Output::new(result["text"].as_str().unwrap_or("").to_string(), result)),
             "insights" => experiment_insights(&result),
+            "actions" => actions::experiment(&result, args, top),
             other => {
                 // A check of one case has one recording: its views answer for the experiment.
                 let mut recs: Vec<String> = result["series"].as_array().into_iter().flatten().filter_map(|s| s["recording"].as_str().map(str::to_string)).collect();
@@ -64,7 +66,7 @@ pub fn run(args: &Args) -> Result<Output> {
                     recs.extend(s["attribution"].as_str().map(str::to_string));
                 }
                 Err(Error::usage(format!(
-                    "experiments support summary, progress, insights and the base..head views ({}); {other} reads a recording{}",
+                    "experiments support summary, progress, insights, actions and the base..head views ({}); {other} reads a recording{}",
                     diff::VIEWS.join(" "),
                     if recs.is_empty() { " (this experiment kept none)".to_string() } else { format!(": strobe query <rec> {other} with one of {}", recs.join(", ")) }
                 )))
@@ -141,6 +143,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "heap" => heap(&rec, top, args.has("reveal")),
         "leaks" => leaks(&rec, top, args.has("reveal")),
         "insights" => insights(&rec),
+        "actions" => actions::recording(&dir, args, top),
         "memory" => {
             let by = args.get("by").unwrap_or("process");
             if !matches!(by, "process" | "layer" | "allocator") {
@@ -154,7 +157,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             memory(&dir, by, top, args.get("at"))
         }
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights sql"))),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights actions sql"))),
     }
 }
 

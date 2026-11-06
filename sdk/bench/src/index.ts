@@ -104,7 +104,7 @@ export interface Page {
   eval<A extends unknown[], T>(fn: (...args: A) => T, ...args: A): Promise<Awaited<T>>
 }
 
-export interface Context<P> {
+export interface Context<P> extends Seeded {
   page: Page
   /**
    * The running target's adapter ({@link Side.ui}): a selector string, or a step called with this context
@@ -164,6 +164,25 @@ export interface Context<P> {
   fixture: FixtureInfo | null
 }
 
+/**
+ * Seeded workloads (a fuzzer, a random walk through an app). `strobe bench --seed <n>` replays one; without
+ * it strobe draws a seed and prints it. strobe seeds only what the bench file asks for: never the app's own
+ * `Math.random`, `crypto` or clock (pass `ctx.seed` in with `ctx.addInitScript` to seed the app's).
+ */
+export interface Seeded {
+  /**
+   * This case's seed (a 32-bit unsigned integer): from the experiment's seed, the case and its params, so base
+   * and head (and both targets of a journey) get the same one. Reading it marks the workload as seeded.
+   */
+  seed: number
+  /**
+   * A number in [0, 1) from this hook's stream. Each hook call starts its stream over: every `run` from the same
+   * point (so warmup converges and base and head run the same inputs), every `reset`, `setup`, `prepare` and
+   * `before` from its own. Within one call each draw is the next.
+   */
+  random(): number
+}
+
 /** A block's running fixture. */
 export interface FixtureInfo {
   /** `http://127.0.0.1:<port>`. */
@@ -194,7 +213,7 @@ export interface MockResponse {
 /** Answers a request, or returns `undefined` to let it through to the network. */
 export type MockHandler = (request: MockRequest) => MockResponse | undefined | Promise<MockResponse | undefined>
 
-export interface PrepareContext<P> {
+export interface PrepareContext<P> extends Seeded {
   /** The case this block runs, so one file can give each case its own fixture. */
   case: string
   params: P
@@ -234,7 +253,7 @@ export interface SetupContext<P> extends Context<P> {
 }
 
 /** What a launch's `before` hook gets: the launch has not started yet. */
-export interface LaunchContext<P> {
+export interface LaunchContext<P> extends Seeded {
   case: string
   params: P
   target: string

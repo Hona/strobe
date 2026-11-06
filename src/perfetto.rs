@@ -7,7 +7,7 @@
 use crate::model::Result;
 use crate::probe::symbols::{Frame, Symbolizer};
 use crate::store;
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
 use std::path::Path;
@@ -115,6 +115,7 @@ pub fn build(dir: &Path, out: &Path) -> Result<Built> {
     }
     b.web_runs(&page);
     b.native_runs(dir);
+    b.actions(dir);
     b.timeline(dir, &threads);
     b.presents(dir, &meta);
     b.memory(dir);
@@ -566,6 +567,8 @@ impl Builder {
                 self.count("marks");
             }
         }
+        // Each measured input's edge (what its latency is timed from), as an instant on the track where
+        // the block's action log draws each call as a slice (`actions`).
         if !inputs.is_empty() {
             let track = self.track("inputs strobe sent", 2, None);
             for (n, t, args) in inputs {
@@ -579,6 +582,49 @@ impl Builder {
                 self.instant(track, MONOTONIC, t, "changed", &[]);
                 self.count("accessibility changes");
             }
+        }
+    }
+
+    /// What a bench block's hooks sent the target (`actions.json.gz`): each call a slice from when strobe
+    /// got it to its answer, on the host clock, warmup runs, setup and resets included. Typed text and
+    /// arguments stay out of the trace (`query <rec> actions --reveal` shows them).
+    fn actions(&mut self, dir: &Path) {
+        let Ok(Some(log)) = store::actions::ActionLog::read(&dir.join(store::actions::FILE)) else { return };
+        if log.actions.is_empty() {
+            return;
+        }
+        let track = self.track("inputs strobe sent", 2, None);
+        for a in &log.actions {
+            let name = match &a.selector {
+                Some(s) => format!("{} {s}", a.call),
+                None => a.call.clone(),
+            };
+            let mut args: Vec<(String, Value)> = vec![("seq".into(), json!(a.seq)), ("hook".into(), json!(a.hook.name()))];
+            if let Some(r) = a.run {
+                args.push(("run".into(), json!(r)));
+            }
+            if let Some(p) = &a.phase {
+                args.push(("phase".into(), json!(p)));
+            }
+            if a.untimed {
+                args.push(("untimed".into(), json!(true)));
+            }
+            if let Some(p) = a.press_ns {
+                args.push(("press_ms_before".into(), json!(a.t_ns.saturating_sub(p) as f64 / 1e6)));
+            }
+            if let Some(h) = &a.hit {
+                args.push(("hit".into(), json!(format!("{} {:?}", h.role, h.name))));
+            }
+            args.push((
+                "outcome".into(),
+                json!(match &a.outcome {
+                    store::actions::Outcome::Ok => "ok".to_string(),
+                    store::actions::Outcome::Refusal { validator, summary } => format!("refused {validator}: {summary}"),
+                    store::actions::Outcome::Error { message } => format!("error: {message}"),
+                }),
+            ));
+            self.slice(track, MONOTONIC, a.t_ns, a.end_ns, &name, &args);
+            self.count("inputs");
         }
     }
 

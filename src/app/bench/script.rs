@@ -353,10 +353,11 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             store::write_atomic(&rec.join("alloc-0.heapprofile"), &std::fs::read(&p)?)?;
         }
         let _ = std::fs::remove_dir_all(&dir);
+        super::keep_actions(ctx, &rec)?;
         store::write_json(
             &rec.join("meta.json"),
             &json!({
-                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": target["entry"], "probes": set, "runs": block.run_ms.len(), "values": block.values,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "script": true,
                 "note": "script profiles cover the whole host process: its start, setup, warmup and measured runs",

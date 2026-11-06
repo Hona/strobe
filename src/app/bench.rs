@@ -325,7 +325,9 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
             h.update(format!("{}-{:?}", m.len(), m.modified().ok()).as_bytes());
         }
     }
-    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan"];
+    // `--seed` is the workload only where a hook used it (`used_random`, set after the runs): the ledger
+    // compares `seed` on its own.
+    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan", "seed"];
     let flags: serde_json::Map<String, Value> = args.to_json()["flags"].as_object().into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
     // An implementation comparison's side is its target at a build: both are its identity, the build
     // resolved in that target's own project (its `cwd`'s repository and app profiles).
@@ -353,6 +355,23 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
 thread_local! {
     /// The saved state `--resume` hands to the bench it starts.
     static RESUMED: RefCell<Option<Value>> = const { RefCell::new(None) };
+}
+
+/// The `Rerun` warning: the ledger found earlier attempts on these variants with another setup.
+const RERUN: &str = "earlier experiments on these same variants ran another bench file, harness, case, primary, margin, seed or flags (the ledger names them): a verdict reached by changing the setup until one says what you hoped is not a verdict";
+
+/// The experiment's seed: `--seed <n>`, else one drawn from the OS's random source.
+fn seed_of(args: &Args) -> Result<u32> {
+    match args.get("seed") {
+        Some(s) => s.trim().parse::<u32>().map_err(|_| Error::usage(format!("--seed: a whole number from 0 to 4294967295, not {s}"))),
+        None => Ok(u32::from_str_radix(&host::paths::csprng_hex(4)?, 16).unwrap_or(0)),
+    }
+}
+
+/// A block's recording keeps what its hooks did to the target (`actions.json.gz`, SPEC §14.1).
+fn keep_actions(ctx: &Ctx, dir: &Path) -> Result<()> {
+    let log = ctx.runner.actions();
+    if log.is_empty() { Ok(()) } else { log.write(dir) }
 }
 
 /// Sleeps for `d`, or until a stop is asked for.
@@ -848,6 +867,8 @@ fn counted_apart(m: &str) -> bool {
 struct Ctx<'a> {
     args: &'a Args,
     exp: String,
+    /// The experiment's seed (`--seed`, or drawn): every case's `ctx.seed` comes from it.
+    seed: u32,
     describe: Value,
     runner: Runner,
     window: Window,
@@ -1266,6 +1287,7 @@ pub fn run(args: &Args) -> Result<Output> {
         None if leak_run => Mode::Leak,
         None => Mode::Compare,
     };
+    let seed = seed_of(args)?;
     let exp = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&exp)?;
     // Before it registers: a `--stop` that sees the registration must find its stop file kept.
@@ -1292,7 +1314,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let topo = host::topology();
     let (pin, runner_pin, pin_label) = pinning(args.get("pin").unwrap_or("auto"), &topo)?;
     let _own = OwnAffinity::start(runner_pin);
-    progress(format!("strobe bench {} · {exp} · {}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(), super::pr::version()));
+    progress(format!("strobe bench {} · {exp} · {} · seed {seed}", file.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default(), super::pr::version()));
     // The display state comes from a callback that first reports a moment after it is registered:
     // read now, the first block reads a state rather than none (a pair whose base saw none ran again).
     let _ = host::display_state();
@@ -1302,6 +1324,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut ctx = Ctx {
         args,
         exp: exp.clone(),
+        seed,
         describe: Value::Null,
         runner,
         window: Window::default(),
@@ -1364,9 +1387,12 @@ pub fn run(args: &Args) -> Result<Output> {
             ctx.saved["args"]["flags"][k] = json!(p.display().to_string().trim_start_matches(r"\\?\"));
         }
     }
+    // A drawn seed too: `--resume` and the rerun line replay the same workload.
+    ctx.saved["args"]["flags"]["seed"] = json!(seed.to_string());
     let _ = store::write_json(&dir.join("state.json"), &ctx.saved);
     ctx.awake.hold(false);
     ctx.describe = ctx.runner.describe()?;
+    ctx.runner.seed(seed)?;
     apply_engines(&mut ctx.describe, args)?;
     if let Some(f) = args.get("filter") {
         let (text, err) = filter_report(&ctx.describe, f);
@@ -1466,16 +1492,15 @@ pub fn run(args: &Args) -> Result<Output> {
         if !pages.is_empty() {
             ident["engines"] = json!(pages);
         }
+        ident["seed"] = json!(seed);
     }
-    let ledger = store::ledger::for_experiment(&exp, &super::record::now_iso(), &ident);
+    let ledger_at = super::record::now_iso();
+    let mut ledger = store::ledger::for_experiment(&exp, &ledger_at, &ident);
     if let Some(t) = ledger["text"].as_str() {
         progress(format!("ledger  {t}"));
     }
     if ledger["changed"] == true {
-        ctx.warnings.push(validity::warn(
-            "Rerun",
-            "earlier experiments on these same variants ran another bench file, harness, case, primary, margin or flags (the ledger names them): a verdict reached by changing the setup until one says what you hoped is not a verdict",
-        ));
+        ctx.warnings.push(validity::warn("Rerun", RERUN));
     }
     // The plan (SPEC §9.1): pairs and minutes per series from earlier runs here, and the ETA it keeps.
     let estimate = if compares && !args.has("pixels-only") { plan::estimate(&series, &ctx.describe, &file, args, &config, &project, &variants, Some(&exp)) } else { Value::Null };
@@ -1591,13 +1616,22 @@ pub fn run(args: &Args) -> Result<Output> {
     for text in variants.iter().flat_map(|v| v.changed.iter()) {
         ctx.warnings.push(validity::warn("VariantChanged", text.clone()));
     }
+    // Now it is known whether a hook used the seed: only then is another `--seed` another workload.
+    let used_random = ctx.runner.used_random();
+    if ident.is_object() {
+        ident["used_random"] = json!(used_random);
+        ledger = store::ledger::for_experiment(&exp, &ledger_at, &ident);
+        if ledger["changed"] == true && !ctx.warnings.iter().any(|w| w.id == "Rerun") {
+            ctx.warnings.push(validity::warn("Rerun", RERUN));
+        }
+    }
     if let Some(h) = halted.as_ref().filter(|_| check || pixels_only) {
         ctx.warnings.push(validity::warn("Stopped", format!("{}; not run: {}", h.message, not_run.join(", "))));
     }
     if check {
         let mut series_out = series_out;
         let matrix = journey::matrix(&mut series_out);
-        return check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"));
+        return check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"), (seed, used_random));
     }
     if pixels_only {
         let mut text = String::new();
@@ -1608,7 +1642,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
         }
         text += &format!("\n{exp}\n");
-        let result = json!({ "id": exp, "kind": "pixels", "file": file, "created": super::record::now_iso(), "series": series_out, "warnings": ctx.warnings, "text": text });
+        let result = json!({ "id": exp, "kind": "pixels", "file": file, "created": super::record::now_iso(), "plan": { "seed": seed, "used_random": used_random }, "series": series_out, "warnings": ctx.warnings, "text": text });
         store::write_json(&dir.join("result.json"), &result)?;
         let mut out = Output::new(text, result);
         if !all_decided {
@@ -1629,6 +1663,7 @@ pub fn run(args: &Args) -> Result<Output> {
             "looks": if args.get("pairs").is_none_or(|p| p == "auto") { LOOKS.to_vec() } else { vec![args.num("pairs")?.unwrap_or(0.0) as usize] },
             "alpha": if args.get("pairs").is_none_or(|p| p == "auto") { POCOCK_ALPHA } else { 0.05 },
             "estimate": estimate,
+            "seed": seed, "used_random": used_random,
         },
         "file_repo": super::pr::repo_relative(&file.display().to_string()), "identity": ident, "ledger": ledger,
         "comparison": if ctx.implementations { "implementations" } else { "builds" },
@@ -1738,6 +1773,18 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
+    // A failed case has no recording: what its hooks sent before it failed is kept beside the result.
+    let mut actions = Value::Null;
+    if !passed && !ctx.runner.actions().is_empty() {
+        // A journey's label names no target: each side's file is its own.
+        let name = if s.sides.is_some() { format!("{} {}", s.label(), s.target) } else { s.label() };
+        let slug: String = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_ascii_lowercase).collect::<Vec<_>>().join("-");
+        let path = store::experiment_dir(&ctx.exp)?.join(format!("failed-{slug}.actions.json"));
+        match ctx.runner.actions().write_json(&path) {
+            Ok(()) => actions = json!({ "path": path, "count": ctx.runner.actions().actions.len() }),
+            Err(e) => ctx.warnings.push(validity::warn("Actions", format!("{}: {}", s.label(), e.message))),
+        }
+    }
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
     let (mut attribution, mut sampling) = (Value::Null, Value::Null);
@@ -1771,13 +1818,15 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
-        "log": log, "log_path": ctx.runner.log,
+        "log": log, "log_path": ctx.runner.log, "actions": actions,
         // For the parity matrix (`journey::matrix`).
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target), "same": same, "ops": ops, "adapted": s.adapted,
     }))
 }
 
-fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool) -> Result<Output> {
+/// `seeded`: the experiment's seed, and whether a hook used it.
+#[allow(clippy::too_many_arguments)]
+fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool, seeded: (u32, bool)) -> Result<Output> {
     // A gap is listed, not failed; journeys whose sides differ (`journey_refusal`) fail.
     let gaps = series.iter().filter(|s| s["kind"] == "gap").count();
     // Refused before it ran (`check_engines`): listed, not failed, as a gap is; the rest of the file ran.
@@ -1883,6 +1932,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             if let Some(h) = s["hint"].as_str() {
                 text += &format!("      fix: {h}\n");
             }
+            if let Some(n) = s["actions"]["count"].as_u64() {
+                text += &format!("      actions  {n} sent before it failed · strobe query {exp} actions\n");
+            }
         }
         for (why, names) in &reasons {
             text += &format!("      refused  {}: {why}\n", names.join(", "));
@@ -1913,12 +1965,18 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() },
         if before > 0 { format!(", {before} refused before running") } else { String::new() }
     );
+    // A failure of a seeded workload is replayed by its seed.
+    if failed > 0 && seeded.1 {
+        text += &format!("seed  {0} (the hooks used ctx.random() or ctx.seed): add --seed {0} to replay the same workload\n", seeded.0);
+    }
     for w in &warnings {
         text += &format!("{} {:<24}{}\n", if w.level == "warn" { "!" } else { "i" }, w.id, w.text);
     }
     text += &format!("\n{exp}\n");
-    let result =
-        json!({ "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "text": text });
+    let result = json!({
+        "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "plan": { "seed": seeded.0, "used_random": seeded.1 },
+        "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "text": text,
+    });
     store::write_json(&dir.join("result.json"), &result)?;
     let mut out = Output::new(text, result);
     if failed > 0 {
@@ -5087,7 +5145,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // keeps its OS presents for `query <rec> frames`.
         let recording = if (keep && !outside) || set == Set::Memory {
             let mut meta = json!({
-                "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
                 // Rule 3: a block with profilers or a census describes the profiled page.
@@ -5121,6 +5179,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .collect();
                 store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": values.get("display.hz"), "runs": per }))?;
             }
+            keep_actions(ctx, &dir)?;
             store::write_json(&dir.join("meta.json"), &meta)?;
             if let Some(d) = draft.take() {
                 d.keep();
@@ -7072,7 +7131,9 @@ fn render(r: &Value) -> String {
         } else {
             format!("warmup until steady · {} runs per block", r["plan"]["runs_per_block"])
         };
-        out += &format!("blocks {} pairs ({} fresh launches) · {per_block} · stopped: {}\n", s["pairs"], s["launches"], s["stopped"].as_str().unwrap_or(""));
+        // A seeded workload: both sides ran the same inputs, and `--seed` replays them.
+        let seeded = if r["plan"]["used_random"] == true { format!(" · seed {}", r["plan"]["seed"]) } else { String::new() };
+        out += &format!("blocks {} pairs ({} fresh launches) · {per_block}{seeded} · stopped: {}\n", s["pairs"], s["launches"], s["stopped"].as_str().unwrap_or(""));
         let steps: Vec<(String, f64)> = serde_json::from_value(s["steps"].clone()).unwrap_or_default();
         out += &format!("time   {} · per block {}\n", fmt::ms_duration(s["elapsed_ms"].as_f64().unwrap_or(0.0) as u64), steps_text(&steps));
         out += &self_line(&s);

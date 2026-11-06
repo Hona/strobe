@@ -1189,7 +1189,8 @@ impl<'a> Doc<'a> {
             line += &format!(" --base {} --head {}", quote(&spec(&base, "<base>")), quote(&spec(&head, ".")));
         }
         const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "update-pr", "repo", "force", "format", "out"];
-        let mut rest: Vec<(&String, &Value)> = flags.into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).collect();
+        // The seed only when a hook used it: then it is the workload (`plan.used_random`).
+        let mut rest: Vec<(&String, &Value)> = flags.into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str()) && (*k != "seed" || r["plan"]["used_random"] == true)).collect();
         rest.sort_by(|a, b| a.0.cmp(b.0));
         for (k, v) in rest {
             match v.as_str() {

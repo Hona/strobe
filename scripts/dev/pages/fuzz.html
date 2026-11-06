@@ -1,0 +1,30 @@
+<!doctype html>
+<!-- A grid of twelve buttons and a text field for seeded random walks (seed.bench.ts). A button is marked
+data-clicked with how many clicks landed on it. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>fuzz</title>
+    <style>
+      body { margin: 16px; font: 13px/18px system-ui, sans-serif; }
+      #grid { display: grid; grid-template-columns: repeat(4, 120px); gap: 8px; margin-bottom: 16px; }
+      button { height: 40px; }
+      button[data-clicked] { background: #cde; }
+      #text { width: 400px; }
+    </style>
+  </head>
+  <body>
+    <div id="grid"></div>
+    <input id="text" />
+    <script>
+      const grid = document.getElementById("grid")
+      for (let i = 0; i < 12; i++) {
+        const b = document.createElement("button")
+        b.id = `b${i}`
+        b.textContent = `button ${i}`
+        b.onclick = () => (b.dataset.clicked = String(Number(b.dataset.clicked ?? 0) + 1))
+        grid.append(b)
+      }
+    </script>
+  </body>
+</html>

@@ -2,6 +2,7 @@
 
 use crate::host::{self, paths};
 use crate::model::{Error, Refusal, Result};
+use crate::store::actions::{ActionLog, Hook, Outcome};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -79,6 +80,16 @@ pub struct Runner {
     lines: Receiver<String>,
     next: u64,
     pub log: PathBuf,
+    /// The experiment's seed, once given (`seed`).
+    seed: Option<u32>,
+    /// Some hook read `ctx.seed` or called `ctx.random()` (SPEC §14.2: only then is `--seed` the workload).
+    used_random: bool,
+    /// What the current block's hooks did to the target (`store::actions`), since its `block` call.
+    actions: ActionLog,
+    /// The block's `run` calls so far, its open `ctx.untimed` stretch and `ctx.phase`s.
+    runs: u32,
+    untimed: bool,
+    phases: Vec<String>,
 }
 
 /// What the runner reports about a bench file.
@@ -136,7 +147,7 @@ impl Runner {
             }
         });
         let pid = child.pid();
-        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log };
+        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log, seed: None, used_random: false, actions: ActionLog::default(), runs: 0, untimed: false, phases: Vec::new() };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -162,10 +173,23 @@ impl Runner {
         Ok(())
     }
 
-    /// Calls `op` and serves the runner's requests (driver calls, phases) until it answers.
+    /// Calls `op` and serves the runner's requests (driver calls, phases) until it answers. The hooks'
+    /// actions on the target go into the block's log (`actions`) as they are served: a host clock read
+    /// at each end, no call to the target.
     pub fn call(&mut self, op: &str, args: Value, timeout: Duration, mut serve: impl FnMut(&str, &Value) -> Result<Value>) -> Result<Value> {
         let id = self.next;
         self.next += 1;
+        if op == "block" {
+            self.actions.clear(self.seed);
+            (self.runs, self.untimed) = (0, false);
+            self.phases.clear();
+        }
+        let hook = Hook::of_op(op);
+        if hook == Some(Hook::Run) {
+            self.runs += 1;
+        }
+        // A reset belongs to the run before it.
+        let run = matches!(hook, Some(Hook::Run | Hook::Reset)).then(|| self.runs.checked_sub(1)).flatten();
         self.write(&json!({ "id": id, "op": op, "args": args }))?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -180,6 +204,7 @@ impl Runner {
             };
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("id").and_then(Value::as_u64) == Some(id) {
+                self.used_random |= msg["used_random"] == true;
                 if let Some(err) = msg.get("error").and_then(Value::as_str) {
                     let stack = msg.get("stack").and_then(Value::as_str).unwrap_or("");
                     let first = stack.lines().find(|l| l.contains(".bench.")).unwrap_or("").trim();
@@ -198,7 +223,25 @@ impl Runner {
             if let Some(rid) = msg.get("id").and_then(Value::as_str) {
                 let req_op = msg.get("op").and_then(Value::as_str).unwrap_or("").to_string();
                 let args = msg.get("args").cloned().unwrap_or(Value::Null);
-                let reply = match serve(&req_op, &args) {
+                let action = hook.and_then(|h| ActionLog::of_request(h, run, self.untimed, self.phases.last().cloned(), &req_op, &args, host::now_ns()));
+                let served = serve(&req_op, &args);
+                if let Some(mut a) = action {
+                    a.end_ns = host::now_ns();
+                    a.outcome = Outcome::of(&served);
+                    self.actions.push(a);
+                }
+                if served.is_ok() {
+                    let start = args["edge"] == "start";
+                    match req_op.as_str() {
+                        "untimed" => self.untimed = start,
+                        "phase" if start => self.phases.push(args["name"].as_str().unwrap_or("").to_string()),
+                        "phase" => {
+                            self.phases.pop();
+                        }
+                        _ => {}
+                    }
+                }
+                let reply = match served {
                     Ok(v) => json!({ "id": rid, "ok": v }),
                     Err(e) => {
                         let mut reply = json!({ "id": rid, "error": e.message });
@@ -219,6 +262,24 @@ impl Runner {
     /// The runner's process, for its CPU in a block's overhead.
     pub fn pid(&self) -> u32 {
         self.pid
+    }
+
+    /// Gives the runner the experiment's seed (`--seed`, or drawn), before any block: hooks get each
+    /// case's seed from it (`ctx.seed`, `ctx.random()`).
+    pub fn seed(&mut self, seed: u32) -> Result<()> {
+        self.seed = Some(seed);
+        self.call("seed", json!({ "seed": seed }), Duration::from_secs(60), |_, _| Err(Error::msg("no driver while seeding")))?;
+        Ok(())
+    }
+
+    /// Whether some hook so far read `ctx.seed` or called `ctx.random()`.
+    pub fn used_random(&self) -> bool {
+        self.used_random
+    }
+
+    /// What the current (or last) block's hooks did to the target, since its `block` call.
+    pub fn actions(&self) -> &ActionLog {
+        &self.actions
     }
 
     pub fn describe(&mut self) -> Result<Describe> {

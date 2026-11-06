@@ -74,6 +74,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("resume", Value, "bench"),
     ("gpu-store", Value, ""),
     ("metrics", Value, "run"),
+    ("seed", Number, "record bench plan run"),
     // query, report, open, history.
     ("by", Value, "query"),
     ("top", Number, "query history"),
@@ -340,6 +341,8 @@ Use
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
         [--unlock-wait 2h]             (a series that needs a presenting window waits at most that long for an unlock)
+        [--seed <n>]                   (ctx.seed and ctx.random(): replay a seeded workload; without it strobe draws one
+                                        and prints it)
         --filter: case names, comma-separated; exact unless a name holds * (a glob)
         --base <target>[=<variant>] --head <target>[=<variant>]: two targets of the file compared (two
                                   implementations of one app); target:<name> when a folder or ref has that name
@@ -353,7 +356,9 @@ Use
   config [<dir>]                  check the project's strobe.json (and your own) without a bench: where it is, each
                                   app profile resolved for this OS (its executable, guards, window), build and serve
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
-                                  views: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights sql
+                                  views: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights
+                                  actions sql
+                                  (actions: what a bench block's hooks sent the target, in order; --phase, typed text with --reveal)
                                   (waits: where threads were off their CPUs and who woke them, from a native capture;
                                   --thread <name> --phase <name> --by function|file|package)
                                   (a..b: hotspots alloc layout style threads frames summary heap memory, per-run deltas;

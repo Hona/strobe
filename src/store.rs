@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+pub mod actions;
 pub mod ledger;
 
 /// A short random id, `<prefix>_` + 6 hex from the OS's random source, that names no recording or

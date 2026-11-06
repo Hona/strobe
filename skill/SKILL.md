@@ -101,15 +101,17 @@ strobe run --base "<command>" --head "<command>" [--aa | --check] [--primary cpu
 strobe query <rec_… | a..b | exp_…> <view> [args]
 ```
 
-- Views: `summary` `frames` `threads` `gpu` `hotspots` `waits` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `sql`.
+- Views: `summary` `frames` `threads` `gpu` `hotspots` `waits` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `actions` `sql`.
+- `actions [--phase <name>] [--top N] [--reveal]`: what a bench block's hooks sent the target, in order (hook, run, phase, call, selector, outcome).
+  - On a kept bench recording, or `exp_…` for a check (a failed case's too); typed text shows as its length unless `--reveal`.
 - `hotspots` and `alloc` take `--by function|file|package` (`hotspots`: `--native`, `--thread <name>` for native samples).
 - `waits --thread <name> --phase <name> --by function|package`: where threads were off their CPUs and who woke them.
   - From a capture with `--probes waits` (Linux needs CAP_PERFMON; Windows the deep helper; macOS refuses `NoWaits` when it records).
 - `frames` (pages): the renderer vs GPU process stage split and each worst frame's pipeline stages.
 - `memory` takes `--by process|layer|allocator` and `--at <i>`.
 - `a..b` (two recordings, per run each) works with `hotspots` `alloc` `layout` `style` `threads` `frames` `summary` `heap` `memory`.
-- `exp_…` takes `summary`, `progress`, `insights`, and those views for each series' base..head.
-- `--reveal` shows heap strings.
+- `exp_…` takes `summary`, `progress`, `insights`, `actions`, and those views for each series' base..head.
+- `--reveal` shows heap strings and typed text.
 - `threads --timeline`: each thread's CPU per second from the launch with the runs marked, exited threads too.
   - A driver thread that starts 25 s in and runs 30 s shows as such.
 
@@ -328,6 +330,11 @@ export default bench({
 - Scripts before the page's own (a frame counter, seeded `localStorage`): `ctx.addInitScript(fn, arg?)` in `prepare` or `setup`, Playwright's `page.addInitScript` in any engine; new documents only.
 - Mock APIs with `ctx.mock(pattern, handler)` in `prepare`: Playwright's `page.route` turns the HTTP cache off, so reloads refetch every script.
 - `teardown` (target or file) stops what `prepare` started.
+- Random workloads (a fuzzer, a random walk): draw from `ctx.random()`, never `Math.random()`.
+  - Every hook call starts its stream over: each run sends the same inputs, so warmup converges and base and head run the same workload.
+  - `ctx.seed` is the case's seed; to seed the app too, pass it in yourself: `ctx.addInitScript((s) => …, ctx.seed)`. strobe never patches the app's `Math.random`.
+  - strobe draws the experiment's seed and prints it (`seed 42`); `bench … --seed 42` replays it, and `query <rec> actions` shows what was sent.
+  - A failed `--check` prints the seed and keeps the case's actions (`query <exp> actions`).
 - Never call `page.eval` in `run`.
 
 ### More in a bench file
@@ -541,6 +548,7 @@ Fewer than 6 pairs never gets a verdict.
 - **Rerunning?** Every experiment counts the others on the same two variants.
   - The text, the result's `ledger` and the PR table say "3rd experiment on these variants; earlier: …" with what changed.
   - Rerunning until one says "faster" shows; paste the ledger line as it is.
+  - Another `--seed` counts as a change only when the hooks used `ctx.random()` or `ctx.seed`.
 - **Why is it slow?** `bench … --why always` (or `record --probes attribution`), then on the attribution recording:
   - `query hotspots` (CPU by function, full stacks, original file:line:column through source maps)
     - Its header (and each attribution block's line, `query <rec> summary`, result `attribution_sampling`) gives the interval the sampler kept, not the one asked: `sampled every 2.0 ms (asked 1 ms: 2.0× coarser)`.

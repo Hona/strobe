@@ -1195,10 +1195,11 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
     let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
     let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
     probe::symbols::store_maps(&page.clone().into(), &scripts, &dir, served.as_deref())?;
+    super::keep_actions(ctx, &dir)?;
     store::write_json(
         &dir.join("meta.json"),
         &json!({
-            "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+            "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
             "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
             "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
             // The page's sampler (SPEC §8.3), not the main process's.

@@ -28,7 +28,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.
     b.set("gpu-store", "exe");
-    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless", "engine"] {
+    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless", "engine", "seed"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }
@@ -96,6 +96,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(spec) = args.get("bench") {
         let (file, case) = spec.rsplit_once('#').ok_or_else(|| Error::usage("--bench <file.bench.ts>#<case> (a case glob such as show* works)"))?;
         return bench_case(args, file, case);
+    }
+    if args.has("seed") {
+        return Err(Error::usage("--seed seeds a bench file's ctx.random(): record --bench <file>#<case> --seed <n>"));
     }
     let target = args.pos.first().ok_or_else(|| Error::usage("record needs a target: strobe record https://… [--for 10s], or --bench <file>#<case>"))?.clone();
     if let Some(id) = args.get("id") {

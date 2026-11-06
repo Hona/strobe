@@ -440,11 +440,22 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--bisect <good>..<bad>] [--on <devices>] [--max-time <duration>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
-             [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--engine chromium|firefox|webkit] [--headless] [--json]
+             [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--engine chromium|firefox|webkit] [--headless]
+             [--seed <n>] [--json]
 strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
 ```
+
+**Seed.** `--seed <n>` (a 32-bit unsigned integer) is the experiment's seed, from which every
+case's `ctx.seed` and `ctx.random()` come (§9.6); without it strobe draws one from the OS's random
+source. Either way it is printed on the first line (`strobe bench x.bench.ts · exp_… · seed 42`),
+kept in `result.json` `plan.seed` (with `plan.used_random`: whether a hook read `ctx.seed` or called
+`ctx.random()`), in each block recording's `meta.json` (`seed`) and `actions.json.gz` (§14.1), and in
+the saved command line, so `--resume` replays the same workload. The PR block's Rerun drawer and a
+failed `--check`'s footer (`seed  42 …: add --seed 42 to replay the same workload`) print it only
+when a hook used it. `record --bench … --seed <n>` and `strobe run --base … --head …` pass it on;
+`record` of a target and `strobe run -- <command>` refuse it (usage error): nothing seeds them.
 
 **Stopping and resuming.** Ctrl-C (SIGINT), SIGTERM or `strobe bench --stop <exp>` (from any shell,
 or for a bench the daemon runs) stops a bench once its current block ends; waits (a locked session,
@@ -2073,8 +2084,42 @@ answered at once, so strobe serves the hook's other calls meanwhile and `const s
 ctx.waitForLine(/saved/); await page.click(…); await saved` misses nothing and never deadlocks;
 output lines no watch waits for are dropped), `fixture` (the block's fixture: `{ url, port, pid }`, or null, §9.10), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
-`head`, for logging only), `url`, `root` (the variant's folder), `prepared`, in `prepare` and `setup`
+`head`, for logging only), `url`, `root` (the variant's folder), `prepared`, `seed` and `random()`
+(below; also in `prepare` and a launch's `before`), in `prepare` and `setup`
 `addInitScript(script, arg?)`, and in `prepare` only `playwright` and `mock(pattern, handler)`.
+
+**Seeded workloads** (`ctx.seed`, `ctx.random()`): a fuzzer or a random walk through an app replays
+exactly from the experiment's seed (`--seed`, §5.6). A case's seed (`ctx.seed`, a 32-bit unsigned
+integer) is `mix(experiment seed, case + "\n" + params)`, the params as JSON with keys sorted at
+every level: base and head, and both targets of a journey (§9.10), get the same one, and another
+case or param another. `ctx.random()` gives numbers in [0, 1) from a stream that each hook call
+starts over at `mix(case seed, hook)` (`prepare`, `before`, `setup`, `run`, `reset`, `teardown`;
+a `ctx.ui` step draws from its hook's): every run, warmup included, draws the same numbers, so
+warmup converges and both sides run the same inputs; within one call each draw is the next. `mix`
+is FNV-1a over the text's UTF-8 bytes started from the seed, then murmur3's 32-bit finalizer; the
+stream is mulberry32 (`sdk/bench/src/runner.ts`). strobe seeds only what the bench file asks for:
+never the target's own `Math.random`, `crypto` or clock (rule 2: that would change what is
+measured); a bench that wants the app seeded passes `ctx.seed` in itself (`ctx.addInitScript((s) =>
+…, ctx.seed)`). Not seeded either: the app's own nondeterminism, scheduling, IPC order, GC and
+timers. Reading `ctx.seed` or calling `ctx.random()` marks the experiment `used_random` (the runner
+says so on its replies); only then is `--seed` part of the workload (the rerun ledger, §14.2), so a
+context is never copied with spread syntax inside the runner (that would read the getter).
+
+**Actions.** Every input, page load, window or accessibility action (`page.goto`, `click`, `hover`,
+`move`, `type`, `press`, `down`, `up`, `drag`, `scroll`, `wheel`, `window`, `act`), `ctx.call` and
+`ctx.exec` a hook makes is logged by strobe as it serves it (`runner::Runner::call`): no round trip
+to the target, two host-clock reads per call (inside a run they count as strobe's own cost, §8.2).
+Each record (`store::actions::ActionRecord`) has `seq`, `hook`, `run` (the block's run from 0,
+warmup included; a reset has its run's), `untimed`, `phase` (the innermost), `t_ns` and `end_ns`
+(when strobe got the call and answered it, host clock), `call`, `selector` (what it aimed at, `@name`
+resolved), `args` (the rest, typed text included), `outcome` (`ok`, `refusal` with its validator and
+summary, or `error`), and where the driver reports them `press_ns`, `hit` (`role`, `key`, `name`,
+`point`, `rect` in the window's client area, `scrolled`) and `sample` (the input's latency sample:
+`edge` `press`, `sent`, `scroll`, `unchanged`, `busy` or `unmatched`, and `latency_ms`). A block's
+log starts at its `block` call and holds at most 100,000 actions (`truncated` past that). It goes
+into the block's recording as `actions.json.gz` (§14.1); a failed `--check` case, which has no
+recording, keeps it as `failed-<case>.actions.json` beside its `result.json` (the case's
+`actions: { path, count }`, and a line under its failure). `query <rec> actions` shows them (§11.1).
 
 **Untimed stretches** (`await ctx.untimed(fn)`): a wait inside a run that is not the journey, such
 as letting the app go idle between two clicks (`await ctx.untimed(() => page.idle())`), leaves the
@@ -3113,6 +3158,7 @@ session.
 | `gpu` | | a trace: the browser GPU process's tasks by name. Without one (a native app, a process from outside): per adapter the tree's engine use and GPU memory (dedicated, shared) from the OS's per-process statistics, the device's counters, what reached the screen or why not, and the lock state |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
 | `insights` | (`exp_…` too) | rule hits with their numbers and the commands that show the evidence; for an experiment, the largest base/head movers per series first |
+| `actions` | `--phase` `--top` `--reveal` (`exp_…` too) | a bench block's actions in order (§9.6, `actions.json.gz`): seq, hook, run, ms from the first, how long strobe took to serve it, call, selector (and the element it hit, where known), arguments, outcome, untimed and phase; the seed in the header. `--phase` keeps one phase's, `--top` bounds the rows (default 15), `--json` gives every record. Typed text, `act` values and `ctx.call` arguments show as their length (`«18 chars»`) unless `--reveal` (rule 9). `exp_…`: each series' kept recording's and each failed check case's (`failed-<case>.actions.json`) |
 | `timeline` | `--from --to --thread` | bounded event list for a range |
 | `progress` | (`exp_…` only) | a running experiment's state and estimate |
 | `sql` | `"<query>"` | rows from trace_processor, row-limited |
@@ -3533,7 +3579,11 @@ protobuf written by hand (no generated code, no C):
 - strobe's own data as tracks under one `strobe <rec>` root: `recording` (one slice over the
   recording whose arguments are its meta: validity, timing, probes, note, warnings, environment,
   values, OS averages), `runs and phases` (from strobe's marks in the Chrome trace, or a native
-  block's `frames.json`, with `runs.json` per run), `marks`, `inputs strobe sent`, `accessibility tree
+  block's `frames.json`, with `runs.json` per run), `marks`, `inputs strobe sent` (a bench block's
+  actions from `actions.json.gz` as slices from when strobe got each call to its answer, named by call
+  and selector, with seq, hook, run, phase, untimed and outcome as arguments, never the typed text,
+  in every recording that kept them, Chromium trace recordings too; and a native or traceless block's
+  measured input edges from `frames.json` as instants), `accessibility tree
   changes`, `OS presents` (every present by process as a slice named by its fate, the app's frames on
   screen, their interval in ms, vertical blanks per display path), `memory · <process>` (the readings
   in MB), per thread its CPU (% of a core) and wakes per second from the thread timeline (§7.4),
@@ -4638,7 +4688,11 @@ recordings/rec_3f9a1c/
                         the sampling interval asked and kept
   cpu-g<t>-r<n>.cpuprofile  Firefox: one V8-format profile per page thread and measured run
   memory-<n>.json.gz    Firefox: an about:memory report (`memory-0`, `memory-s0`, `memory-<run>`), owner-only (§8.6)
+  actions.json.gz       bench blocks: the experiment's `seed`, `truncated`, and each action the hooks made, in
+                        order (§9.6 Actions; `store::actions`), owner-only: it holds typed text
 ```
+
+A bench block's `meta.json` names the experiment's `seed` beside `experiment`.
 
 A native recording's stacks go to `deep.json.gz` beside these, symbolized against the variant's
 executable and `.pdb` that §9.5 copies (the module's own CodeView path finds it).
@@ -4659,6 +4713,7 @@ experiments/
     result.json         the --json result: series, blocks (variant, values per metric, runs),
                         pairs, intervals, verdicts, warnings, environment, recordings
     blocks/<n>.log      the runner's stderr per block
+    failed-<case>.actions.json  a failed --check case's actions (it has no recording), owner-only
 ```
 
 - Experiment ids: `exp_` + 6 hex; any unique prefix works.
@@ -4671,9 +4726,13 @@ experiments/
   size and time; a URL), the bench file's name and content hash, the harness's content hash (files
   over 1 MB by size and time), each series' label, case, primary and margins, and the flags that
   chose what ran and how it was judged (all but `--base`, `--head`, `--id`, output and resume
-  flags). The ledger of an experiment is every other experiment with the same two variants in the
-  same roles: how many came before and after it, each one's verdicts, and what differed (bench
-  file, harness, cases, a series' primary or margin, flags). `bench` prints it before anything
+  flags), and its `seed` with `used_random`. The ledger of an experiment is every other experiment
+  with the same two variants in the same roles: how many came before and after it, each one's
+  verdicts, and what differed (bench file, harness, cases, a series' primary or margin, flags, and
+  the seed, but only when either experiment's hooks used it: `--seed 7 → 42` is a change of
+  workload where a hook read `ctx.seed` or called `ctx.random()`, and nothing otherwise; while a
+  bench runs its own `used_random` is not known yet, so the other's decides, and the ledger is
+  computed again with it before `result.json` is written). `bench` prints it before anything
   builds (`ledger  3rd experiment on these variants; earlier: exp_x unclear, exp_y unclear (primary
   main.busy → main.work)`), keeps it in `result.json` (`ledger`: `attempt`, `total`, `earlier`,
   `later`, per-series verdicts, `changed`, `text`) and the text output, and warns `Rerun` when the
@@ -4931,13 +4990,26 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 Query views built: `summary` (with per-run style, layout and paint), `frames`, `threads` (a native recording's: its threads' wakes and CPU;
 its `frames`: submissions per run, work per frame, gaps), `hotspots`, `alloc`, `layout`, `style`, `shifts`, `gc`, `heap` (and
 `a..b heap`), `leaks`, `memory` (and `a..b memory`; native recordings by what holds the memory), `gpu`
-(a trace's GPU process; without a trace the OS's per-process GPU statistics), `insights`, `sql`,
-`progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`, `a..b gpu` (§11.1 listed it; no
+(a trace's GPU process; without a trace the OS's per-process GPU statistics), `insights`, `actions`,
+`sql`, `progress`. Not yet: `stack`, `cpu`, `timeline`, `--max-bytes`, `a..b gpu` (§11.1 listed it; no
 code). `a..b` (and `query exp_… <view>` for each series' base and head) answers `hotspots`, `alloc`,
 `layout`, `style`, `threads`, `frames`, `summary`, `heap` and `memory` (§11.1); before 2026-11-05
 only `heap` and `memory`. The insights rule `long-tasks` never fired before 2026-11-05: its query's
 third column was named after a multi-line subquery, so the CSV header spanned lines and the count
 read as zero (rec_b6be22: 4 tasks over 50 ms, the longest 55.4 ms, now reported).
+
+Seeds and actions (2026-11-07, §5.6, §9.6, §11.1, §14; `scripts/dev/seed.bench.ts` on adais, locked,
+headless Chromium, `--check` and `record --bench`, single noisy smoke runs): `--seed 42` twice gave
+the same six clicks and typed words in `query <exp> actions` (`#b2 #b6 #b5 #b3 #b0 #b4`, "charlie
+hotel golf"), `--seed 7` others (`#b5 #b11 #b4 #b5 #b8 #b11`, "delta golf delta"), and `--filter`
+changed none of them (a case's seed comes from the case and its params alone).
+`record --bench seed.bench.ts#walk --seed 42` warmed up in 3 runs and kept 5, and all 8 runs in its
+`actions.json.gz` hold the same 7 actions; `strobe open` drew them as 56 slices on `inputs strobe
+sent` in its Chromium trace recording. A case without `ctx.random()` alone left `plan.used_random`
+false. The failing case kept `failed-broken-fuzz.actions.json` (4 actions, the last its error), and
+the check's footer printed the seed. Not yet: `hit`, `press_ns` and `sample` are never filled (the
+driver reports no aim to the runner yet), and a comparison's ledger line `--seed a → b` has not
+been seen in a timed experiment.
 
 Press edge and untimed stretches (2026-11-06, §7.4, §9.6; `scripts/dev/press.bench.ts` with
 `scripts/dev/press-app.swift`, `--check`). On air, unlocked, two clicks a run, each followed by an

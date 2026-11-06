@@ -104,6 +104,11 @@ fn attempt(line: &Value, current: &Value, later: bool) -> Value {
             changed.push(format!("{t}: {} → {}", show(ea.get(t)), show(eb.get(t))));
         }
     }
+    // Another seed is another workload only where a hook used it (`ctx.random()`, `ctx.seed`): either
+    // attempt's `used_random`, and while this one runs (not known yet) the other's.
+    if then.get("seed").is_some() && now.get("seed").is_some() && then["seed"] != now["seed"] && (then["used_random"] == true || now["used_random"] == true) {
+        changed.push(format!("--seed {} → {}", then["seed"], now["seed"]));
+    }
     let flags = |id: &Value| id["flags"].as_object().cloned().unwrap_or_default();
     let (fa, fb) = (flags(then), flags(now));
     let mut keys: Vec<&String> = fa.keys().chain(fb.keys()).collect();

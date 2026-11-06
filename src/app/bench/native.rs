@@ -887,10 +887,11 @@ fn runs(
             None if set == Set::Attribution => crate::probe::stacks::no_stacks().into(),
             None => String::new(),
         };
+        super::keep_actions(ctx, &dir)?;
         store::write_json(
             &dir.join("meta.json"),
             &json!({
-                "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+                "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": super::refusal_map(&refused), "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
                 "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
                 "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
@@ -1470,10 +1471,11 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                     meta_values["io.write"] = json!(span.io_write);
                 }
             }
+            super::keep_actions(ctx, &dir)?;
             store::write_json(
                 &dir.join("meta.json"),
                 &json!({
-                    "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+                    "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                     "target": app.exe, "probes": "attribution", "runs": 1, "values": meta_values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "launch": true,
                     "gpu_cache": prepared.gpu_warm.map(|w| if w { "warm" } else { "cold" }),
                     "timing": "perturbed",

@@ -22,7 +22,7 @@
     "window": { "type": ["object", "null"], "description": "The window's place and size: x, y, width, height." },
     "refresh_hz": { "type": ["number", "null"], "description": "The display's refresh; null when every series ran headless (no display)." },
     "args": { "type": ["object", "null"], "description": "The command line: command, flags, pos." },
-    "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache." },
+    "plan": { "type": "object", "description": "pin, runs_per_block, aa, looks, alpha, estimate, reserve, gpu_cache; seed (the experiment's, --seed or drawn) and used_random (a hook read ctx.seed or called ctx.random(): only then is the seed the workload). A check's plan holds only seed and used_random." },
     "identity": { "type": ["object", "null"], "description": "What makes two experiments the same comparison (SPEC 14.2)." },
     "ledger": { "type": ["object", "null"], "description": "The other experiments on the same variants (SPEC 14.2)." },
     "comparison": {
@@ -380,6 +380,11 @@
         "hint": { "type": ["string", "null"] },
         "log": { "type": "array", "items": { "type": "string" } },
         "log_path": { "type": "string" },
+        "actions": {
+          "type": ["object", "null"],
+          "description": "check: a failed case's actions (it has no recording): path (failed-<case>.actions.json beside result.json, owner-only) and count. strobe query <exp> actions reads them.",
+          "properties": { "path": { "type": "string" }, "count": { "type": "integer" } }
+        },
         "session_locked": { "type": "boolean" },
         "screen": { "type": ["object", "null"] },
         "hero": { "type": "boolean", "description": "implementations: the case says hero: true." },

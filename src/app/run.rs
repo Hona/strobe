@@ -18,6 +18,9 @@ pub fn run(args: &Args) -> Result<Output> {
     if args.get("base").is_some() || args.get("head").is_some() || args.has("aa") {
         return paired(args);
     }
+    if args.has("seed") {
+        return Err(Error::usage("--seed seeds a bench's ctx.random(); strobe run -- <command> runs your own harness: give it its own seed"));
+    }
     let at = args.pos.iter().position(|a| a == "--").ok_or_else(|| {
         Error::usage("run needs a command after --: strobe run [--pin auto] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…], or two to compare: strobe run --base \"<command>\" --head \"<command>\"")
     })?;

@@ -219,7 +219,10 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                         ));
                     }
                 };
-                (ready.at, electron::main_page(&browser)?, ready.cycles)
+                // The app's main page through the session strobe attached at its start (where an
+                // attribution launch's profiler runs).
+                let main = electron::main_page(&browser)?;
+                (ready.at, watch.page(&main.target).unwrap_or(main), ready.cycles)
             }
             None => match watch.ready(timeout) {
                 Ok((at, page)) => (at, page, cpu_now()),
@@ -735,6 +738,11 @@ impl Watch {
     fn ready(&self, timeout: Duration) -> Result<(f64, chromium::Page)> {
         let (at, session, target) = self.found.recv_timeout(timeout).map_err(|_| Error::timeout(format!("not visible in {} s", timeout.as_secs())))?;
         Ok((at, chromium::Page { cdp: self.cdp.clone(), session, target }))
+    }
+
+    /// A page by its target, through the session the watch attached.
+    fn page(&self, target: &str) -> Option<chromium::Page> {
+        self.pages.lock().unwrap().iter().find(|(_, t)| t == target).map(|(session, target)| chromium::Page { cdp: self.cdp.clone(), session: session.clone(), target: target.clone() })
     }
 
     fn any_page(&self) -> Option<chromium::Page> {

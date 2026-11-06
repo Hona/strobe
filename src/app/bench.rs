@@ -1508,7 +1508,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let overhead = r.as_ref().ok().and_then(|b| b.overhead.clone());
     let (passed, error, hint, values, refused, locked, recording, screen, shown) = match r {
         Ok(b) => {
-            let shown = shown::summarize(std::slice::from_ref(&b)).0;
+            let shown = shown::summarize(std::slice::from_ref(&b), false).0;
             (true, Value::Null, Value::Null, json!(b.values), refusal_map(&b.refused), b.locked, json!(b.recording), b.screen.unwrap_or(Value::Null), shown)
         }
         Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null, Value::Null),
@@ -1894,7 +1894,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     if blocks.iter().any(|b| b.display == Some(0)) {
         warnings.push(validity::info("DisplayOff", "the blocks ran with the display off (a locked session's display sleeps): compare them only with runs whose display was off too"));
     }
-    let (shown, screen_warnings) = shown::summarize(&blocks);
+    let (shown, screen_warnings) = shown::summarize(&blocks, false);
     warnings.extend(screen_warnings);
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
@@ -2269,7 +2269,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         warnings.push(validity::info("Counters", note));
     }
     analyse(s, def, &blocks, &pairs, primary.relative, &mut warnings);
-    let (shown, screen_warnings) = shown::summarize(&blocks);
+    let (shown, screen_warnings) = shown::summarize(&blocks, ctx.implementations);
     warnings.extend(screen_warnings);
     // A number from a locked screen is not comparable with one from an unlocked screen: pairs that
     // ran in both states decide nothing.

@@ -124,7 +124,8 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
     ctx.used = Some(window.clone());
-    let screen = !web && spec["screen"] != false && !profile;
+    // An attribution launch reads no pixels, unless they are what ends it.
+    let screen = !web && spec["screen"] != false && (!profile || window_until.is_some());
     let inspect_port = if spec["inspect"] == true && !profile { Some(free_port()?) } else { None };
     let mut guard = None;
     // The time stamp counter's rate, from two readings around the launch: cycles to ms.

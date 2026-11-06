@@ -2366,7 +2366,9 @@ it: sending all of it with each call made the page parse it on its main thread e
 `find` stops at the match it needs, and its work inside a run, a wait's checks, is named in profiles by
 its source URL, `strobe-driver.js` (30 clicks each waiting on a selector: 5 ms of the page's main
 thread over five runs, 0.2% of its samples, on an M4). Base and head on different labels (or, with no text read,
-hashes 20 bits apart), or blocks of one variant on several, warn `ScreenChanged`. Text output prints
+hashes 20 bits apart), or blocks of one variant on several, warn `ScreenChanged`; two implementations
+(9.10) draw their own titles and screens, so there only each side's blocks are compared (each target's
+`expect` says what both must show). Text output prints
 `shown  'X'` per series (`--check`: per case, with what could not be read and the thumbnail's path),
 the PR block an `On screen:` line under each series' caption (`bench::shown_line`) and an alert, and
 the viewer the label with the thumbnail per variant.

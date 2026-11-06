@@ -543,8 +543,9 @@ fn side(blocks: &[&Shown]) -> Value {
 }
 
 /// A series' screens per variant, and `ScreenChanged` when base and head (or blocks of one variant)
-/// ended their runs on different screens.
-pub(super) fn summarize(blocks: &[Block]) -> (Value, Vec<Warning>) {
+/// ended their runs on different screens. Two implementations (`across`, SPEC 9.10) draw their own
+/// titles and screens by design: only each side's blocks are compared with each other.
+pub(super) fn summarize(blocks: &[Block], across: bool) -> (Value, Vec<Warning>) {
     let mut out = serde_json::Map::new();
     let mut warnings = Vec::new();
     let mut roles: Vec<&str> = Vec::new();
@@ -584,7 +585,7 @@ pub(super) fn summarize(blocks: &[Block]) -> (Value, Vec<Warning>) {
         }
         out.insert(role.to_string(), v);
     }
-    if let (Some(b), Some(h)) = (out.get("base"), out.get("head")) {
+    if let (false, Some(b), Some(h)) = (across, out.get("base"), out.get("head")) {
         let (bl, hl) = (b["end"].as_str(), h["end"].as_str());
         let changed = match (bl, hl) {
             (Some(x), Some(y)) => x != y,

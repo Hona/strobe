@@ -5881,21 +5881,29 @@ agent's bench posted input on air throughout, which counts as a person, so the e
 strobe's own posts is not shown end to end.
 
 Display fit and typing at rest (2026-11-07, 7.4, 9.10 "Declared viewport", 10.1 `DisplayTooSmall`,
-13.1). On air (MacBook Air, 1470×956 points, Dock hidden, AC) a page target with a 1440×900 viewport
-refused `DisplayTooSmall` before its first block in `--check`, in one fitting window per engine:
-at most 1462×839 in Edge and 1470×838 in Firefox (0.14.0 had run the block and refused
-`VariantMismatch` with the page at 1440×792 and 1440×838; 0.13 measured the smaller page). A
-1440×830 viewport passed in both, Edge's from what strobe kept (no window opened); `strobe plan`
-refused both from `windows.json` after the first fit and said nothing before it. Edge's window part
-went from 8×131 to 8×84 when `--disable-blink-features=AutomationControlled` gave way to the preload:
-the flag's bar was 47 points; `navigator.webdriver` still reads false. The typing dev bench
-(`scripts/dev/type.bench.ts`, `scripts/dev/type-app.swift`): the 0.14.0 driver's 9 keys counted 7 at
-a p50 of 9.7 ms, which the new rule reads as 0 at rest; settled before each key, 9 of 9 at 36.9 ms
-(run 0.45 s → 2.2 s), and a Firefox page field 8 of 9 at 35.2 ms (0.14.0: 8 at 25.8 ms, 1 at rest
-under the new rule). Headless on adais and vps: the fit is skipped (no window) and typing is
-unchanged. Not run: a headed Windows or Linux page against its work area (adais is locked; vps has
-no display), WebKit (Safari on air belongs to the user), the macOS x86-64 `NSScreen` path (built for
-arm64 only).
+`AmbiguousInteraction`, 13.1). On air (MacBook Air, 1470×956 points, Dock hidden, AC) a page target
+with a 1440×900 viewport refused `DisplayTooSmall` right after the engine checks in `--check`, in one
+fitting window per engine opened in the slot: at most 1462×839 in Edge and 1470×838 in Firefox (0.14.0
+had run the block and refused `VariantMismatch` with the page at 1440×792 and 1440×838; 0.13 measured
+the smaller page). The work area from the window list (1470×923: the 33-point menu bar, no Dock window
+while it hides) matched `NSScreen`'s visible frame; a visible Dock (bottom, left or right) was not
+tried, since that would change the user's settings. With the Mac in use (input in the last minute) no
+window opened and each series' first block refused the same `DisplayTooSmall`. A 1440×830 viewport
+passed in both, Edge's from `windows.json` (no window opened); `strobe plan` refused both from the file
+after the first fit and said nothing before it. Edge's window part went from 8×131 to 8×84 when
+`--disable-blink-features=AutomationControlled` gave way to the preload: the flag's bar was 47 points;
+`navigator.webdriver` still reads false (headed and headless). The typing dev bench
+(`scripts/dev/type.bench.ts`, `scripts/dev/type-app.swift`, one cold `--check` run): the 0.14.0
+driver's 9 keys into the Cocoa field counted 7 at a p50 of 9.7 ms, which the new rule reads as 0 at
+rest; paced, 9 of 9 at 36.0 ms (run 0.45 s → 2.2 s); a Firefox page field 9 of 9 at 36.2 ms (0.14.0:
+8 at 25.8 ms, 1 at rest under the new rule); headed Chromium, paced from the page's frames, 10 frames
+for 9 keys and `interaction.p50` 35.7 ms from its trace (0.14.0: 4 frames, 24.9 ms, the keys sharing
+frames), run 95 ms → 358 ms. `burst: true` refused `interaction.*` `AmbiguousInteraction` in Cocoa,
+Firefox and Chromium (Chromium 86.5 ms a run). Headless on vps: paced 333-350 ms a run against burst
+94-101 ms (Chromium, Firefox), the page 1440×900; on adais (locked) Chromium headless paced 1.8 s a run
+(its animation frames ran about every 100 ms there; Firefox 309 ms). Not run: a headed Windows or Linux
+page against its work area (adais is locked; vps has no display, so RandR is built, not run), a
+visible Dock, WebKit (Safari on air belongs to the user).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

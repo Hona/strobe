@@ -24,6 +24,11 @@ pub struct Frame {
     pub seq: String,
     /// A FORKED report: the compositor's part of a frame whose main-thread part is pending.
     pub forked: bool,
+    /// The renderer's and the raster/GPU side's stages of the report (ns, `STAGES_CPU`, `STAGES_GPU`),
+    /// when the report carries them.
+    pub split: Option<(i64, i64)>,
+    /// The report's slice id in the trace.
+    pub id: i64,
 }
 
 /// One vsync's outcome after merging every report for its sequence.
@@ -32,6 +37,28 @@ pub struct Vsync {
     pub ts: i64,
     pub cost: i64,
     pub outcome: Outcome,
+    /// The presented report's stage split (renderer, GPU process), ns.
+    pub split: Option<(i64, i64)>,
+    /// The presented report's slice id (-1 for none), to find its stages again.
+    pub report: i64,
+}
+
+/// The stages of a frame report (Chromium's `PipelineReporter` children) on the renderer's side: its
+/// compositor thread begins the frame, the main thread runs and commits, the compositor activates the
+/// tree and submits the frame (or, with the display tree in the GPU process, its update).
+pub const STAGES_RENDERER: [&str; 6] = ["BeginImplFrameToSendBeginMainFrame", "SendBeginMainFrameToCommit", "Commit", "Activation", "EndActivateToSubmitCompositorFrame", "EndActivateToSubmitUpdateDisplayTree"];
+/// The GPU process's side: tiles raster between commit and activation, and the display compositor
+/// draws to its swap (the children of the submit-to-presentation stage, by name on each platform).
+/// Its waits (the frame in flight to the display compositor, its deadline, the buffer's latch and the
+/// display's refresh after the swap) are in neither side.
+pub const STAGES_RASTER: &str = "EndCommitToActivation";
+pub const STAGES_VIZ_PARENT: [&str; 2] = ["SubmitCompositorFrameToPresentationCompositorFrame", "SubmitUpdateDisplayTreeToPresentationCompositorFrame"];
+pub const STAGES_VIZ: [&str; 5] = ["StartDrawToSwapStart", "Swap", "SwapStartToSwapEnd", "SwapStartToBufferAvailable", "BufferAvailableToBufferReady"];
+/// The share of presented frames whose reports must carry both sides for a block to split them.
+pub const SPLIT_SHARE: f64 = 0.95;
+
+fn sql_list(names: &[&str]) -> String {
+    names.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(",")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -54,13 +81,13 @@ pub fn vsyncs(frames: &[Frame]) -> Vec<Vsync> {
             let pick = |state: &str| group.iter().filter(|f| f.state == state).min_by_key(|f| f.forked);
             let ts = group.iter().map(|f| f.ts).min().unwrap_or(0);
             if let Some(f) = pick("STATE_PRESENTED_ALL") {
-                Vsync { ts, cost: f.dur, outcome: Outcome::Presented }
+                Vsync { ts, cost: f.dur, outcome: Outcome::Presented, split: f.split, report: f.id }
             } else if let Some(f) = pick("STATE_PRESENTED_PARTIAL") {
-                Vsync { ts, cost: f.dur, outcome: Outcome::Partial }
+                Vsync { ts, cost: f.dur, outcome: Outcome::Partial, split: f.split, report: f.id }
             } else if group.iter().any(|f| f.state == "STATE_DROPPED") {
-                Vsync { ts, cost: 0, outcome: Outcome::Dropped }
+                Vsync { ts, cost: 0, outcome: Outcome::Dropped, split: None, report: -1 }
             } else {
-                Vsync { ts, cost: 0, outcome: Outcome::NoUpdate }
+                Vsync { ts, cost: 0, outcome: Outcome::NoUpdate, split: None, report: -1 }
             }
         })
         .collect();
@@ -211,13 +238,27 @@ create perfetto table _w as
   select substr(a.name, 1, length(a.name) - 6) as k, a.ts as t0, b.ts as t1, a.upid as upid
   from _m a join _m b on b.name = substr(a.name, 1, length(a.name) - 6) || ':end'
   where a.name glob '*:start';
+create perfetto table _st as
+  select c.parent_id as id,
+    sum(case when c.name in ({cpu}) then c.dur else 0 end) as cpu,
+    sum(case when c.name in ({cpu}) then 1 else 0 end) as ncpu,
+    sum(case when c.name = '{raster}' then c.dur else 0 end) as raster
+  from slice c join slice p on p.id = c.parent_id
+  where p.name = 'PipelineReporter' group by c.parent_id;
+create perfetto table _sv as
+  select v.parent_id as id, sum(g.dur) as gpu, count(*) as n
+  from slice g join slice v on v.id = g.parent_id
+  where v.name in ({viz_parent}) and g.name in ({gpu})
+  group by v.parent_id;
 select 'win' as kind, k, t0 as a, t1 as b, upid as c, null as d from _w
 union all
 select 'frame', w.k, s.ts, s.dur,
   extract_arg(s.arg_set_id, 'frame_reporter.frame_source') || ':' || extract_arg(s.arg_set_id, 'frame_reporter.frame_sequence'),
   extract_arg(s.arg_set_id, 'frame_reporter.state') || '|' || coalesce(extract_arg(s.arg_set_id, 'frame_reporter.frame_type'), '')
+    || '|' || coalesce(case when st.ncpu > 0 and sv.n > 0 then st.cpu || ':' || (st.raster + sv.gpu) end, '') || '|' || s.id
   from slice s join track tr on s.track_id = tr.id
   join _w w on extract_arg(tr.dimension_arg_set_id, 'upid') = w.upid and s.ts >= w.t0 and s.ts < w.t1
+  left join _st st on st.id = s.id left join _sv sv on sv.id = s.id
   where s.name = 'PipelineReporter'
 union all
 select 'task', w.k, s.ts, s.dur, null, null
@@ -254,7 +295,11 @@ select 'span', w.k, s.ts, s.dur, null, s.name
   join _w w on coalesce(t.upid, extract_arg(tr.dimension_arg_set_id, 'upid')) = w.upid and s.ts >= w.t0 and s.ts + s.dur <= w.t1
   where s.category glob '*blink.user_timing*' and s.dur >= 0 and s.name not glob 'strobe:*'
     and not (s.dur = 0 and tr.type = 'thread_track_event');
-"#
+"#,
+        cpu = sql_list(&STAGES_RENDERER),
+        raster = STAGES_RASTER,
+        viz_parent = sql_list(&STAGES_VIZ_PARENT),
+        gpu = sql_list(&STAGES_VIZ),
     );
     let table = engine::query(trace, &sql)?;
     let mut data = BlockData::default();
@@ -265,8 +310,11 @@ select 'span', w.k, s.ts, s.dur, null, s.name
             "win" => data.windows.push(Window { key, t0: num(&row[2]), t1: num(&row[3]), upid: num(&row[4]) }),
             "frame" => {
                 let raw = row[5].clone().unwrap_or_default();
-                let (state, kind) = raw.split_once('|').unwrap_or((raw.as_str(), ""));
-                data.frames.entry(key).or_default().push(Frame { ts: num(&row[2]), dur: num(&row[3]), state: state.to_string(), seq: row[4].clone().unwrap_or_default(), forked: kind == "FORKED" });
+                let mut parts = raw.splitn(4, '|');
+                let (state, kind, split, id) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+                let split = split.split_once(':').and_then(|(c, g)| Some((c.parse::<f64>().ok()? as i64, g.parse::<f64>().ok()? as i64)));
+                let id = id.parse::<i64>().unwrap_or(-1);
+                data.frames.entry(key).or_default().push(Frame { ts: num(&row[2]), dur: num(&row[3]), state: state.to_string(), seq: row[4].clone().unwrap_or_default(), forked: kind == "FORKED", split, id });
             }
             "task" => data.tasks.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),
@@ -311,11 +359,21 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
     let mut per_run: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     let mut discrete: Vec<f64> = Vec::new();
     let mut scroll: Vec<f64> = Vec::new();
+    let (mut split_cpu, mut split_gpu, mut split_bad) = (Vec::new(), Vec::new(), 0usize);
     for w in &runs {
         let v = vsyncs(data.frames.get(&w.key).map(Vec::as_slice).unwrap_or(&[]));
         let presented: Vec<&Vsync> = v.iter().filter(|s| matches!(s.outcome, Outcome::Presented | Outcome::Partial)).collect();
         let dropped = v.iter().filter(|s| s.outcome == Outcome::Dropped).count();
         frame_ms.extend(presented.iter().map(|s| s.cost as f64 / 1e6));
+        for (s, (c, g)) in presented.iter().filter_map(|s| Some((s, s.split?))) {
+            // The stages are children of the report: together they never outlast it.
+            if c < 0 || g < 0 || c + g > s.cost {
+                split_bad += 1;
+                continue;
+            }
+            split_cpu.push(c as f64 / 1e6);
+            split_gpu.push(g as f64 / 1e6);
+        }
         interval_ms.extend(intervals(&v));
         vsync.extend(vsync_ms(&v));
         presented_all += presented.len();
@@ -361,6 +419,18 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
         out.insert("display.hz".into(), 1000.0 / median(&vsync));
     }
     out.insert("frames.n".into(), frame_ms.len() as f64);
+    // Where presented frames' time went (SPEC §7.2): the renderer's stages and the GPU process's, from
+    // frames whose reports carry both and keep the stages inside the frame; only when nearly all
+    // presented frames do (a split of the few that carry stages would describe those few).
+    out.insert("frames.split.n".into(), split_cpu.len() as f64);
+    if split_bad > 0 {
+        out.insert("frames.split.bad".into(), split_bad as f64);
+    } else if !split_cpu.is_empty() && split_cpu.len() as f64 >= SPLIT_SHARE * frame_ms.len() as f64 {
+        split_cpu.sort_by(|a, b| a.total_cmp(b));
+        split_gpu.sort_by(|a, b| a.total_cmp(b));
+        out.insert("frames.renderer.p95".into(), percentile(&split_cpu, 0.95));
+        out.insert("frames.viz.p95".into(), percentile(&split_gpu, 0.95));
+    }
     for (name, values) in per_run {
         out.insert(name.to_string(), median(&values));
     }
@@ -386,6 +456,26 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
         out.insert("cpu.process.total".into(), v);
     }
     out
+}
+
+/// A frame-split metric (`frames.renderer.*`, `frames.viz.*`).
+pub fn split_metric(m: &str) -> bool {
+    m.starts_with("frames.renderer.") || m.starts_with("frames.viz.")
+}
+
+/// Why a page block has no value for a declared frame-split metric: its stages broke the frame's own
+/// bounds (never split then), or too few presented frames' reports carried both sides.
+pub fn split_refusal(metric: &str, values: &BTreeMap<String, f64>) -> crate::model::Refusal {
+    use crate::model::{Refusal, ValidatorId};
+    let (split, all) = (values.get("frames.split.n").copied().unwrap_or(0.0), values.get("frames.n").copied().unwrap_or(0.0));
+    match values.get("frames.split.bad") {
+        Some(bad) => Refusal::new(ValidatorId::NoPresentSource, format!("{metric}: {bad:.0} presented frames had stages that add up to more than the frame, so no frame is split")),
+        None if all == 0.0 => Refusal::new(ValidatorId::NoPresentSource, format!("{metric}: no presented frame")),
+        None => Refusal::new(
+            ValidatorId::NoPresentSource,
+            format!("{metric}: {split:.0} of {all:.0} presented frames carried both sides' pipeline stages (renderer and GPU process), under the {:.0}% a split needs", SPLIT_SHARE * 100.0),
+        ),
+    }
 }
 
 /// Frame costs per phase name, pooled over measured runs (for reports).

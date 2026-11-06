@@ -107,6 +107,13 @@ export interface Context<P> {
   /** Calls an export of a `script()` target's module in its process and returns what it returned (JSON). */
   call<T = unknown>(name: string, ...args: unknown[]): Promise<T>
   /**
+   * `cli()` targets: runs a command to its exit in the variant's folder, timed and counted from outside (its CPU,
+   * context switches, peak memory and IO, with everything it starts), and resolves with its exit code and output.
+   * Default: the target's command (with a `cmd:` variant, the variant's). A nonzero exit fails the run. Lines it
+   * prints as `strobe:metric <name>=<value>` add to `metric.<name>` for the run.
+   */
+  exec(line?: string): Promise<{ code: number; output: string }>
+  /**
    * Native targets: resolves with the first line matching `match` that the app writes after the call, from its
    * output (`in: "output"`, the default; needs the target's `output: true`) or from files under its home matching a glob (`in: "logs/*.log"`), and
    * when strobe read it on its host clock (`at`, ns: the clock of phase marks and presented frames). Start the wait
@@ -318,6 +325,7 @@ export type Target<P> = Side &
     | ({ kind: "exe"; path: string; app?: string } & AppOptions)
     | ({ kind: "command" } & CommandOptions)
     | ({ kind: "script" } & ScriptOptions)
+    | ({ kind: "cli" } & CliOptions)
     | ({ kind: "native"; app?: string; path?: string } & NativeOptions)
     | ({ kind: "webview"; app?: string; path?: string } & WebviewOptions)
   )
@@ -399,6 +407,21 @@ export interface ScriptOptions {
   entry: string
   /** Default `"bun"`. */
   runtime?: "bun" | "node"
+  env?: Record<string, string>
+  /** Run once per variant before its first block, in its folder. */
+  build?: string
+}
+
+export interface CliOptions {
+  /**
+   * The command line each `ctx.exec()` runs in the variant's folder, to its exit, at most the case's `timeout`.
+   * Unix: `sh -c "exec <run>"` for one simple command, else `sh -c "<run>"` (assignments, pipes, `;`, `&&`,
+   * redirects, builtins); Windows: the first word is the program (a `.cmd` or `.bat`, or a word that is no
+   * executable, runs under cmd). Omit it when the variants are commands (`--base "cmd:<line>"`, what
+   * `strobe run --base … --head …` does). `{fixture.url}` and the like are filled in.
+   */
+  run?: string
+  /** Extra environment for the command (`{fixture.*}` filled in). */
   env?: Record<string, string>
   /** Run once per variant before its first block, in its folder. */
   build?: string
@@ -509,6 +532,16 @@ export function command<P = any>(run: string, opts: Omit<CommandOptions, "run"> 
 /** A Bun or Node module of the variant, loaded in a fresh process per block; cases call its exports with `ctx.call`. */
 export function script<P = any>(entry: string, opts: Omit<ScriptOptions, "entry"> & Side = {}): Target<P> {
   return { kind: "script", entry, ...opts }
+}
+
+/**
+ * A command run to its exit per `ctx.exec()` (a CLI, a compiler, a test binary), measured from outside: `cpu.work`
+ * (its CPU with everything it starts), `run.duration` (spawn to exit), `cpu.wakes`, `memory.peak`, `io.read`,
+ * `io.write`, and `metric.<name>` from its `strobe:metric <name>=<value> [lower|higher]` lines (default lower is
+ * better; every command of a run must print each name it prints, in one direction). Cases: `run: (ctx) => ctx.exec()`.
+ */
+export function cli<P = any>(run?: string, opts: Omit<CliOptions, "run"> & Side = {}): Target<P> {
+  return { kind: "cli", run, ...opts }
 }
 
 /**

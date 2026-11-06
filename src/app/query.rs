@@ -2,6 +2,7 @@
 
 mod diff;
 mod rec;
+mod waits;
 
 use super::{Output, fmt};
 use crate::cli::Args;
@@ -102,6 +103,7 @@ pub fn run(args: &Args) -> Result<Output> {
                 hotspots_of(&rec, by, top)
             }
         }
+        "waits" => waits::waits(&dir, by_arg(args)?, top, args.get("thread"), args.get("phase")),
         "layout" => layout(&rec, top),
         "shifts" => {
             let v =
@@ -125,7 +127,7 @@ pub fn run(args: &Args) -> Result<Output> {
             }
             memory(&dir, by, top, args.get("at"))
         }
-        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots alloc layout style shifts gc heap leaks memory insights sql"))),
+        other => Err(Error::usage(format!("unknown view {other}: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights sql"))),
     }
 }
 
@@ -671,18 +673,84 @@ fn frames(trace: &Path, meta: &Value, top: usize) -> Result<Output> {
             text += &format!("  {:<14} {:>5} frames · p50 {} · p95 {}\n", name, v.len(), fmt::value(metrics::percentile(&v, 0.5), "ms"), fmt::value(metrics::percentile(&v, 0.95), "ms"));
         }
     }
+    if g("frames.renderer.p95").is_finite() {
+        text += &format!(
+            "stages    renderer p95 {} · GPU process (raster, draw to swap) p95 {} · {:.0} of {} frames carry both (stage spans, not busy time)\n",
+            fmt::value(g("frames.renderer.p95"), "ms"),
+            fmt::value(g("frames.viz.p95"), "ms"),
+            g("frames.split.n"),
+            ms.len()
+        );
+    } else if !ms.is_empty() {
+        text += &format!("stages    refused: {}\n", metrics::split_refusal("frames.renderer.p95", &values).summary);
+    }
     all.sort_by_key(|f| std::cmp::Reverse(f.cost));
     let t0 = data.windows.first().map(|w| w.t0).unwrap_or(0);
+    let worst_frames: Vec<&metrics::Vsync> = all.iter().take(top.min(10)).collect();
+    let stages = frame_stages(trace, &worst_frames).unwrap_or_default();
     text += "worst\n";
-    let worst: Vec<Value> = all.iter().take(top.min(10)).map(|f| json!({ "at_ms": (f.ts - t0) as f64 / 1e6, "ms": f.cost as f64 / 1e6 })).collect();
-    for w in &worst {
-        text += &format!("  {:>9} at {:>8.1} ms\n", fmt::value(w["ms"].as_f64().unwrap_or(0.0), "ms"), w["at_ms"].as_f64().unwrap_or(0.0));
+    let mut worst: Vec<Value> = Vec::new();
+    for f in &worst_frames {
+        let ms = |ns: i64| ns as f64 / 1e6;
+        let at_ms = ms(f.ts - t0);
+        text += &format!("  {:>9} at {:>8.1} ms", fmt::value(ms(f.cost), "ms"), at_ms);
+        if let Some((c, gp)) = f.split {
+            text += &format!("  renderer {} · GPU process {}", fmt::value(ms(c), "ms"), fmt::value(ms(gp), "ms"));
+        }
+        text.push('\n');
+        let mine = stages.get(&f.report).cloned().unwrap_or_default();
+        if !mine.is_empty() {
+            let parts: Vec<String> = mine
+                .iter()
+                .map(|(name, dur, kids)| {
+                    let inner = if kids.is_empty() { String::new() } else { format!(" ({})", kids.iter().map(|(n, d)| format!("{n} {:.1}", ms(*d))).collect::<Vec<_>>().join(", ")) };
+                    format!("{name} {:.1}{inner}", ms(*dur))
+                })
+                .collect();
+            text += &format!("             {}\n", parts.join(" · "));
+        }
+        worst.push(json!({
+            "at_ms": at_ms, "ms": ms(f.cost),
+            "renderer_ms": f.split.map(|s| ms(s.0)), "viz_ms": f.split.map(|s| ms(s.1)),
+            "stages": mine.iter().map(|(n, d, kids)| json!({ "name": n, "ms": ms(*d), "stages": kids.iter().map(|(k, kd)| json!({ "name": k, "ms": ms(*kd) })).collect::<Vec<_>>() })).collect::<Vec<_>>(),
+        }));
     }
     let phase_json: BTreeMap<&String, usize> = phases.iter().map(|(k, v)| (k, v.len())).collect();
     Ok(Output::new(
         text,
         json!({ "presented": ms.len(), "dropped_pct": dropped, "latency": { "p50": q(0.5), "p95": q(0.95), "p99": q(0.99) }, "values": values, "worst": worst, "phases": phase_json }),
     ))
+}
+
+/// A frame's report stage by stage (Chromium's `PipelineReporter` children, each with its own children).
+type Stages = Vec<(String, i64, Vec<(String, i64)>)>;
+
+/// The stages of these frames' presented reports, by the report's slice id.
+fn frame_stages(trace: &Path, frames: &[&metrics::Vsync]) -> Result<BTreeMap<i64, Stages>> {
+    let ids: Vec<String> = frames.iter().filter(|f| f.report >= 0).map(|f| f.report.to_string()).collect();
+    if ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let sql = format!(
+        "select p.id, c.id, c.name, c.dur, g.name, g.dur from slice p join slice c on c.parent_id = p.id left join slice g on g.parent_id = c.id
+         where p.id in ({}) order by p.id, c.ts, c.id, g.ts",
+        ids.join(",")
+    );
+    let t = engine::query(trace, &sql)?;
+    let num = |c: &Option<String>| c.as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) as i64;
+    let mut out: BTreeMap<i64, Stages> = BTreeMap::new();
+    let mut last_stage: Option<i64> = None;
+    for r in &t.rows {
+        let stages = out.entry(num(&r[0])).or_default();
+        if last_stage != Some(num(&r[1])) {
+            stages.push((r[2].clone().unwrap_or_default(), num(&r[3]), Vec::new()));
+            last_stage = Some(num(&r[1]));
+        }
+        if let (Some(kid), Some(last)) = (r[4].clone(), stages.last_mut()) {
+            last.2.push((kid, num(&r[5])));
+        }
+    }
+    Ok(out)
 }
 
 /// The GPU process's work by name: its named tasks below the task loop on every thread (WebGPU command

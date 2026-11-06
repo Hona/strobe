@@ -33,6 +33,13 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
             b.set(k, v);
         }
     }
+    // The recording is the case's attribution block: only `waits` adds to it (`timing` or `memory`
+    // would skip it or make a leak run).
+    match args.get("probes") {
+        None | Some("attribution" | "deep") => {}
+        Some("waits") => b.set("probes", "waits"),
+        Some(p) => return Err(Error::usage(format!("record --bench records the case's attribution block; --probes {p} does not apply (waits adds off-CPU waits to a native case)"))),
+    }
     let out = super::bench::run(&b)?;
     let recordings: Vec<Value> = out.json["series"]
         .as_array()
@@ -109,7 +116,11 @@ pub fn run(args: &Args) -> Result<Output> {
         return super::outside::record(args, &target);
     }
 
-    let set = Set::parse(args.get("probes").unwrap_or("timing")).ok_or_else(|| Error::usage("--probes: timing, attribution or memory"))?;
+    // `waits`: a native app's attribution recording with its off-CPU waits.
+    let set = match args.get("probes").unwrap_or("timing") {
+        "waits" => Set::Attribution,
+        p => Set::parse(p).ok_or_else(|| Error::usage("--probes: timing, attribution, memory or waits (a native app's attribution with off-CPU waits)"))?,
+    };
     let for_ms = match args.get("for") {
         Some(d) => duration_ms(d)?,
         None => 10_000,
@@ -129,6 +140,9 @@ pub fn run(args: &Args) -> Result<Output> {
     // A native app (a profile of kind native, or `exe:<path> --native`): measured from outside.
     if let Some(a) = app.clone().filter(|a| a.kind == isolate::AppKind::Native || args.has("native")) {
         return native(args, &a.as_kind(isolate::AppKind::Native), &target, set, for_ms);
+    }
+    if args.get("probes") == Some("waits") {
+        return Err(Error::usage(format!("--probes waits takes a native capture's off-CPU waits: a native app (app:<id> of kind native, exe:<path> --native) or pid:<n>, not {target}")));
     }
     // An app opens its own window: `--headless` would only skip the lock check on a headed app.
     if args.has("headless") && app.is_some() {
@@ -492,7 +506,8 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
                 c
             })
         });
-        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home))));
+        let waits = args.get("probes") == Some("waits");
+        let stacks = (set == Set::Attribution && crate::probe::stacks::stacks_available()).then(|| crate::probe::stacks::StackCapture::start(crate::probe::stacks::Targets::new(n.pid, Some(&n.home)), waits));
         let cycles = || -> (Cycles, Option<u64>) { (per_process(&n.processes()), host::tsc()) };
         progress(match &stop {
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
@@ -559,10 +574,19 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             Some(Err(e)) => json!({ "refused": e.message }),
             None => Value::Null,
         };
+        // Waits asked for and not taken refuse the recording, saying why (SPEC §11.1).
+        if waits {
+            match &stacks {
+                Some(Ok(d)) if d.waits.is_none() => return Err(d.waits_refused.clone().unwrap_or_else(|| crate::probe::stacks::no_waits("no waits were taken", "try again")).into()),
+                Some(Err(e)) => return Err(crate::probe::stacks::no_waits(format!("the native capture failed: {}", e.message), "fix what it names").into()),
+                None => return Err(crate::probe::stacks::no_waits(crate::probe::stacks::no_stacks(), "see strobe status").into()),
+                _ => {}
+            }
+        }
         let stacks_note = match stacks {
             Some(Ok(d)) => {
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
-                format!("native stacks: {} samples (query hotspots){}", d.samples.len(), crate::probe::stacks::stacks_how(&d))
+                format!("native stacks: {} samples (query hotspots){}{}", d.samples.len(), crate::probe::stacks::stacks_how(&d), d.waits.as_ref().map(|w| format!("; {} off-CPU waits (query waits)", w.waits.len())).unwrap_or_default())
             }
             Some(Err(e)) => format!("native stacks failed: {}", e.message),
             None => crate::probe::stacks::no_stacks().into(),

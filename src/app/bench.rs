@@ -25,6 +25,7 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 mod block;
+mod cli;
 mod fixture;
 mod launch;
 mod mocks;
@@ -179,6 +180,22 @@ enum Kind {
     Url(String),
     App(String),
     Exe(PathBuf),
+    /// `cmd:<line>`: a command line, for a `cli()` target (`strobe run --base … --head …`); it runs in
+    /// the folder strobe was started in.
+    Cmd(String),
+}
+
+impl Kind {
+    fn name(&self) -> &'static str {
+        match self {
+            Kind::Dir => "dir",
+            Kind::Git(_) => "git",
+            Kind::Url(_) => "url",
+            Kind::App(_) => "app",
+            Kind::Exe(_) => "exe",
+            Kind::Cmd(_) => "cmd",
+        }
+    }
 }
 
 struct Variant {
@@ -218,6 +235,7 @@ fn engine(kind: &str) -> &'static str {
     match kind {
         "native" => "native",
         "script" => "script",
+        "cli" => "cli",
         _ => "chromium",
     }
 }
@@ -254,6 +272,7 @@ fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
         Kind::App(id) => format!("app:{id}{}", isolate::app(id, config).map(|a| stamp(&a.exe)).unwrap_or_default()),
         Kind::Exe(p) => format!("exe:{}{}", p.display(), stamp(p)),
         Kind::Url(h) => format!("url:{h}"),
+        Kind::Cmd(l) => format!("cmd:{l}"),
     }
 }
 
@@ -433,6 +452,10 @@ struct Block {
     /// A page's browser as this block launched it: its version, and whether it drew in software.
     #[serde(skip_serializing_if = "Option::is_none")]
     browser: Option<BrowserSeen>,
+    /// The direction (`lower`, `higher`) each `metric.<name>` the block measured is better in, as the
+    /// command's lines said it (`cli()` targets).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    directions: BTreeMap<String, String>,
 }
 
 /// What a page block's browser was (`Block::browser`): read once per target and headless mode, since
@@ -453,6 +476,20 @@ fn series_browser(blocks: &[Block]) -> Value {
         }
     }
     if seen.is_empty() { Value::Null } else { json!(seen.join(" / ")) }
+}
+
+/// The definition `name` compares under in these blocks: a `metric.<name>` is better in the direction
+/// its lines gave, and blocks (a variant's lines, or a run's) that disagree refuse it (`NoMetric`).
+fn def_in(name: &str, blocks: &[Block]) -> std::result::Result<Option<&'static MetricDef>, Refusal> {
+    if !name.starts_with("metric.") {
+        return Ok(model::metric(name));
+    }
+    let dirs: std::collections::BTreeSet<&str> = blocks.iter().filter_map(|b| b.directions.get(name).map(String::as_str)).collect();
+    match dirs.into_iter().collect::<Vec<_>>().as_slice() {
+        [] | ["lower"] => Ok(model::metric(name)),
+        ["higher"] => Ok(Some(&model::METRIC_HIGHER)),
+        _ => Err(Refusal::new(ValidatorId::NoMetric, format!("{name}: base's and head's lines disagree on its direction (lower and higher)")).fix("print one direction for a name on both sides")),
+    }
 }
 
 /// A window's client area in device-independent pixels, and its scale.
@@ -1386,7 +1423,7 @@ pub fn run(args: &Args) -> Result<Output> {
             let kind = v.target.as_deref().map(|t| ctx.describe["targets"][t]["kind"].clone()).unwrap_or(Value::Null);
             json!({
                 "role": v.role, "name": v.name, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
-                "kind": match v.kind { Kind::Dir => "dir", Kind::Git(_) => "git", Kind::Url(_) => "url", Kind::App(_) => "app", Kind::Exe(_) => "exe" },
+                "kind": v.kind.name(),
                 "target": v.target, "engine": kind.as_str().map(engine), "target_kind": kind,
                 "repo": v.target.as_deref().and_then(|t| ctx.projects.get(t)).map(|(p, _)| p.display().to_string()),
                 "process_set": process_set_of(&series_out, v.role),
@@ -1441,6 +1478,11 @@ pub fn run(args: &Args) -> Result<Output> {
 /// with what timed out and its screenshot, and the next case runs.
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     let target = ctx.describe["targets"][&s.target].clone();
+    // `record --bench` (`--check --why always`) of a command: nothing profiles a process that ends
+    // inside each run (SPEC §9.6).
+    if target["kind"] == "cli" && ctx.args.get("why") == Some("always") {
+        return Err(Error::usage(format!("{}: a cli() case has no attribution recording: its commands end inside each run (profile a long-running command with strobe record pid:<n> --probes deep)", s.case)));
+    }
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     prepare_all(ctx, s, variants, config)?;
@@ -1901,7 +1943,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     };
     // Non-inferiority (SPEC §9.3): the same interval at the same looks, judged against the margin.
     let margin = s.noworse.get(&s.primary).copied();
-    let compare_primary = |pp: &[(f64, f64)]| match margin {
+    let compare_primary = |pp: &[(f64, f64)], def: &MetricDef| match margin {
         Some(m) => stats::compare_noworse(&s.primary, def, pp, m, confidence),
         None => stats::compare(&s.primary, def, pp, bound, confidence),
     };
@@ -1917,9 +1959,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress(format!("  resumed with the {} pairs it had finished", pairs.len()));
     }
     // Outside-in CPU (`cpu.work`) is a tested secondary where the target is measured from outside: a
-    // script, a native app, both sides of an implementation comparison, and a page in an engine without
-    // the renderer's task time.
-    let script = target["kind"] == "script" || is_native(&target) || s.sides.is_some() || engine_of(&target) != WebEngine::Chromium;
+    // script, a command, a native app, both sides of an implementation comparison, and a page in an
+    // engine without the renderer's task time.
+    let script = target["kind"] == "script" || target["kind"] == "cli" || is_native(&target) || s.sides.is_some() || engine_of(&target) != WebEngine::Chromium;
     let mut stopped = String::from("max pairs");
     let mut last: Option<Comparison> = None;
     // Why the series ended early (a stop, or an error after some pairs), as the error to report.
@@ -1997,7 +2039,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             continue;
         }
         let look = looks.contains(&n);
-        let cmp = compare_primary(&primary_pairs);
+        // A `metric.<name>` primary is better in the direction its lines gave (known from the blocks).
+        let def = def_in(&s.primary, &blocks)?.unwrap_or(def);
+        let cmp = compare_primary(&primary_pairs, def);
         let next = looks.iter().find(|&&l| l > n).copied();
         let decided = look && cmp.decided;
         // Give up only at a look from 12 pairs, on a robust projection: early intervals are [min, max]
@@ -2080,10 +2124,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             stopped = if h.code == 130 { "stopped".into() } else { format!("failed: {}", h.message.lines().next().unwrap_or("")) };
         }
     }
+    let def = def_in(&s.primary, &blocks)?.unwrap_or(def);
     // Pairs a resumed series had finished: the comparison at the last of them.
     if last.is_none() && !pairs.is_empty() {
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
-        last = Some(compare_primary(&pp));
+        last = Some(compare_primary(&pp, def));
     }
     let primary = last.ok_or_else(|| Error::msg("no pairs completed"))?;
     let primary_decided = stopped == "primary decided" && pairs.len() >= min_pairs;
@@ -2158,6 +2203,13 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             }
             continue;
         }
+        let d = match def_in(name, blocks) {
+            Ok(dd) => dd.unwrap_or(d),
+            Err(why) => {
+                secondaries.push(refused(name, d, &why));
+                continue;
+            }
+        };
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
         let c = match s.noworse.get(name) {
             Some(&m) => stats::compare_noworse(name, d, &pp, m, 0.95),
@@ -2187,7 +2239,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut descriptive: Vec<Comparison> = Vec::new();
     // A launch's milestones and CPU, and a process's CPU, are context like the fixed list.
     let found: Vec<String> =
-        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
+        blocks.first().map(|b| b.values.keys().filter(|k| k.starts_with("launch.") || k.starts_with("metric.") || *k == "memory.peak" || *k == "cpu.work" || (*k == "cpu.app.total" && rate_context)).cloned().collect()).unwrap_or_default();
     for name in DESCRIPTIVE.iter().map(|n| n.to_string()).chain(found) {
         let name = name.as_str();
         if name == s.primary || names.iter().any(|n| n == name) || s.per_side(name) {
@@ -2197,6 +2249,13 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         if !blocks.iter().all(|b| b.values.get(name).is_some_and(|v| v.is_finite())) {
             continue;
         }
+        let d = match def_in(name, &blocks) {
+            Ok(dd) => dd.unwrap_or(d),
+            Err(why) => {
+                descriptive.push(refused(name, d, &why));
+                continue;
+            }
+        };
         let pp: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], name), val(&blocks[b], name))).collect();
         let mut c = tail_check(d, &blocks, stats::compare(name, d, &pp, bound, 0.95));
         if c.kind != VerdictKind::Refused {
@@ -2251,6 +2310,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let profiled = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) == WebEngine::Chromium;
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
+        // A command ends inside each run: there is nothing to profile it with.
+        _ if target["kind"] == "cli" => false,
         // Profilers are Chromium's DevTools: another engine's page gets none yet.
         "always" | "auto" if !profiled => {
             progress(format!("  no attribution blocks: {} pages have no profilers in strobe yet", engine_of(&target)));
@@ -2470,6 +2531,7 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
+        _ if metrics::split_metric(def.name) => ("frames.split.n", "frames with their stages"),
         _ => ("frames.n", "frames"),
     };
     let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
@@ -2840,7 +2902,7 @@ pub(crate) fn screen_line(s: &Value) -> Option<String> {
 
 /// The commit subject of a git variant, so a report still says what was compared days later.
 fn subject(v: &Variant) -> Option<String> {
-    let root = v.root.as_ref()?;
+    let root = v.root.as_ref().filter(|_| !matches!(v.kind, Kind::Cmd(_)))?;
     Some(git::subject(root, "HEAD")).filter(|s| !s.is_empty())
 }
 
@@ -3170,12 +3232,14 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let Some(spec) = &ctx.fixture else { return kind_block(ctx, s, v, pair, x) };
     let running = spec.start(&s.params, &store::experiment_dir(&ctx.exp)?.join("fixture.log"), ctx.runner_pin)?;
-    let unfilled = ctx.describe["targets"][&s.target].clone();
-    ctx.describe["targets"][&s.target] = running.fill(&unfilled);
+    // The target this variant runs (its side's, in an implementation comparison).
+    let name = v.target_of(s).to_string();
+    let unfilled = ctx.describe["targets"][&name].clone();
+    ctx.describe["targets"][&name] = running.fill(&unfilled);
     ctx.fixture_running = Some(running.clone());
     let info = json!({ "url": running.url(), "port": running.port, "pid": running.pid, "home": running.home() });
     let r = ctx.runner.call("fixture", info, Duration::from_secs(10), launch::no_page).and_then(|_| kind_block(ctx, s, v, pair, x));
-    ctx.describe["targets"][&s.target] = unfilled;
+    ctx.describe["targets"][&name] = unfilled;
     ctx.fixture_running = None;
     let r = r.and_then(|mut b| {
         b.fixture_connected = running.verdict(&v.name)?;
@@ -3188,7 +3252,9 @@ fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
 /// One block of whatever kind the target and case are.
 fn kind_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let native = is_native(&ctx.describe["targets"][&s.target]);
-    if s.launch.is_object() && native {
+    if ctx.describe["targets"][&s.target]["kind"] == "cli" {
+        cli::block(ctx, s, v, pair, x)
+    } else if s.launch.is_object() && native {
         native::launch(ctx, s, v, pair, x)
     } else if s.launch.is_object() {
         launch::block(ctx, s, v, pair, x)
@@ -3232,7 +3298,7 @@ fn runs_locked(ctx: &Ctx, s: &Series, x: &Exec) -> bool {
             || (m.starts_with("launch.") && m != "launch.painted" && m != "launch.settled")
     };
     match t["kind"].as_str().unwrap_or("") {
-        "script" => true,
+        "script" | "cli" => true,
         // A headless page draws to no display: the lock screen covers nothing of it.
         "web" | "url" if headless_of(ctx, s) => true,
         _ if x.set == Set::Memory => true,
@@ -3318,7 +3384,7 @@ fn phase_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     if b.values.is_empty() {
         return b;
     }
-    let page = !is_native(&ctx.describe["targets"][&s.target]) && ctx.describe["targets"][&s.target]["kind"] != "script";
+    let page = !is_native(&ctx.describe["targets"][&s.target]) && !matches!(ctx.describe["targets"][&s.target]["kind"].as_str(), Some("script" | "cli"));
     for m in declared_metrics(s) {
         if b.values.get(m).is_some_and(|v| v.is_finite()) || b.refused.contains_key(m) {
             continue;
@@ -4209,6 +4275,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             values.remove(&m);
             refused.insert(m, r);
         }
+        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
+            refused.insert(m.clone(), metrics::split_refusal(m, &values));
+        }
         for m in declared_metrics(s) {
             let webgpu = (no_webgpu && m.starts_with("canvas."))
                 .then(|| Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: the page has no WebGPU here (no GPUCanvasContext: {engine} on this OS does not ship it, or the origin is not a secure context)")));
@@ -4295,6 +4364,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             fixture_connected: None,
             client: content,
             browser: Some(seen),
+            directions: BTreeMap::new(),
         })
     })();
     lapped.set(Instant::now());
@@ -5222,7 +5292,12 @@ fn glob(pattern: &str, text: &str) -> bool {
 }
 
 fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Value) -> Result<Variant> {
-    let (kind, label, root) = if let Some(href) = spec.strip_prefix("url:") {
+    let (kind, label, root) = if let Some(line) = spec.strip_prefix("cmd:") {
+        if line.trim().is_empty() {
+            return Err(Error::usage("cmd:<line> needs a command line"));
+        }
+        (Kind::Cmd(line.to_string()), line.to_string(), Some(std::env::current_dir()?))
+    } else if let Some(href) = spec.strip_prefix("url:") {
         (Kind::Url(href.to_string()), href.to_string(), None)
     } else if let Some(id) = spec.strip_prefix("app:") {
         // Fails early when the profile is missing or the app is not installed.
@@ -5490,7 +5565,14 @@ fn prepare_variant(v: &mut Variant, target: &Value, config: &Value, h: &Harness,
     }
     // Command and script targets run in the variant's folder: a git ref gets its worktree, and the
     // target's own `build`, if any, runs there. strobe.json's web build and server are not theirs.
-    if matches!(target["kind"].as_str(), Some("command") | Some("script")) {
+    if matches!(v.kind, Kind::Cmd(_)) && target["kind"] != "cli" {
+        return Err(Error::usage(format!("{}: a cmd:<line> variant is a command line, for a cli() target; this target is a {}", v.role, target["kind"].as_str().unwrap_or("?"))));
+    }
+    if matches!(target["kind"].as_str(), Some("command") | Some("script") | Some("cli")) {
+        // A command line runs as given, in the folder strobe started in: nothing to place or build.
+        if let Kind::Cmd(_) = &v.kind {
+            return Ok(());
+        }
         if let Kind::Git(r) = &v.kind
             && v.root.is_none()
         {

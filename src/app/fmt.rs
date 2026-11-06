@@ -27,6 +27,8 @@ pub fn value(v: f64, unit: &str) -> String {
         "pp" => format!("{v:.digits$} pp"),
         "MB" => format!("{v:.0} MB"),
         "/s" => format!("{v:.digits$}/s"),
+        // A number the target reported in a unit of its own (`metric.<name>`).
+        "value" => format!("{v:.digits$}"),
         // Counts in the billions: 4.12 G instr.
         "instructions" => match v.abs() {
             a if a >= 1e9 => format!("{:.2} G instr", v / 1e9),

@@ -347,6 +347,7 @@ pub fn engine_refusal(engine: WebEngine, metric: &str) -> Option<Refusal> {
         m if m.starts_with("main.") || matches!(m, "layout.count" | "style.count") => "cpu.work (the browser's processes' CPU per run) or cpu.renderer",
         m if m.starts_with("frames.presented.") && m != "frames.presented.count" => "frames.interval.p95 (headed) or cpu.work",
         "frames.partial" => "frames.dropped (headed)",
+        m if crate::metrics::split_metric(m) => "frames.interval.p95 (headed) or cpu.gpu",
         m if m.starts_with("js.heap.") => "memory.app.private",
         "gpu.compile" => "gpu.process.3d",
         "layout.shift" => "a count.<name> the page keeps",

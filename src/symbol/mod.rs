@@ -119,7 +119,12 @@ pub fn addr_key(pid: u32, addr: u64, leaf: bool) -> String {
 
 /// Every sampled address's frames, keyed by `addr_key` (cached in `deep-symbols.json.gz`).
 pub fn resolve_all(dir: &Path, deep: &Deep) -> Result<HashMap<String, Resolved>> {
-    let cache = dir.join("deep-symbols.json.gz");
+    resolve_cached(dir, deep, "deep-symbols.json.gz")
+}
+
+/// `resolve_all` with its cache in `cache` (beside the recording's other files).
+pub fn resolve_cached(dir: &Path, deep: &Deep, cache: &str) -> Result<HashMap<String, Resolved>> {
+    let cache = dir.join(cache);
     if let Ok(f) = std::fs::File::open(&cache) {
         let mut text = String::new();
         if flate2::read::GzDecoder::new(f).read_to_string(&mut text).is_ok()

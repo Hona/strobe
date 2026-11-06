@@ -108,6 +108,8 @@ validators!(
     ParityGap,
     InputMismatch,
     Headless,
+    NoMetric,
+    NoWaits,
 );
 
 impl ValidatorId {
@@ -124,7 +126,7 @@ impl ValidatorId {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
-            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless => false,
+            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless | NoMetric | NoWaits => false,
         }
     }
 }
@@ -383,6 +385,7 @@ const CARE_PRIVATE: &str = "the OS's private memory of every process of each app
 const CARE_HOST: &str = "what every process of each app allocated in its own address space, without GPU memory";
 const CARE_GPU_MEMORY: &str = "GPU memory of every process of each app";
 const CARE_FRAMES: &str = "descriptive: more frames can mean smoother or wasteful";
+const CARE_PEAK: &str = "the largest of each command's processes at its peak (a resident set on Linux and macOS, a commit on Windows), not their sum";
 
 const TIME: (&str, &str) = ("faster", "slower");
 const COUNT: (&str, &str) = ("fewer", "more");
@@ -536,6 +539,26 @@ pub const METRICS: &[MetricDef] = &[
         about: "frames presented without all updates, per run",
     },
     MetricDef { name: "main.busy", unit: "%", better: Better::Lower, kind: Kind::Timed, words: AMOUNT, min_n: 0, across: Across::PerSide, about: "renderer main thread busy share during runs" },
+    MetricDef {
+        name: "frames.renderer.p95",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 200,
+        across: Across::PerSide,
+        about: "95th percentile of a presented frame's renderer stages (pages): the compositor thread begins the frame, the main thread runs and commits, the compositor activates and submits; stage spans, queueing included, not busy time",
+    },
+    MetricDef {
+        name: "frames.viz.p95",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 200,
+        across: Across::PerSide,
+        about: "95th percentile of a presented frame's GPU-process stages (pages): commit to activation (tiles raster) and the display compositor's draw to its swap; stage spans, not GPU busy time, and the waits for the display are in neither side",
+    },
     MetricDef {
         name: "main.work",
         unit: "ms",
@@ -884,6 +907,26 @@ pub const METRICS: &[MetricDef] = &[
         about: "times per second the target's processes woke the CPU package from idle during runs (macOS: what Activity Monitor's Energy Impact weighs); refused where the OS does not count them per process",
     },
     MetricDef {
+        name: "memory.peak",
+        unit: "MB",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Care(CARE_PEAK),
+        about: "cli targets: the most memory one of the command's processes held at once over a run (Linux and macOS its peak resident set, `ru_maxrss`; Windows its peak commit, the job's `PeakProcessMemoryUsed`)",
+    },
+    MetricDef {
+        name: "metric",
+        unit: "value",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: AMOUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "`metric.<name>`: what a cli target's command printed as `strobe:metric <name>=<value> [lower|higher]` lines, summed per run; the command's own number, not strobe's measurement, its direction the one the lines give (lower by default)",
+    },
+    MetricDef {
         name: "io.read",
         unit: "bytes",
         better: Better::Lower,
@@ -1015,9 +1058,22 @@ pub const METRICS: &[MetricDef] = &[
     },
 ];
 
+/// `metric.<name>` whose command's lines say `higher` (a rate, a score): the family's definition with
+/// the other direction (SPEC §9.6).
+pub const METRIC_HIGHER: MetricDef = MetricDef {
+    name: "metric",
+    unit: "value",
+    better: Better::Higher,
+    kind: Kind::Timed,
+    words: ("more", "less"),
+    min_n: 0,
+    across: Across::Compared,
+    about: "`metric.<name>`: what a cli target's command printed, summed per run, higher is better (its lines say `higher`)",
+};
+
 /// A metric's definition. Families resolve by their base: `net.requests{<glob>}` → `net.requests`,
-/// `count.<name>` → `count`, `phase.<name>` → `phase`, `span.<name>` → `span`, `launch.<milestone>`
-/// → `launch.milestone`.
+/// `count.<name>` → `count`, `phase.<name>` → `phase`, `span.<name>` → `span`, `metric.<name>` →
+/// `metric`, `launch.<milestone>` → `launch.milestone`.
 pub fn metric(name: &str) -> Option<&'static MetricDef> {
     let base = name.split_once('{').map_or(name, |(b, _)| b);
     let find = |n: &str| METRICS.iter().find(|m| m.name == n);
@@ -1025,6 +1081,7 @@ pub fn metric(name: &str) -> Option<&'static MetricDef> {
         Some(("count", rest)) if !rest.is_empty() => find("count"),
         Some(("phase", rest)) if !rest.is_empty() => find("phase"),
         Some(("span", rest)) if !rest.is_empty() => find("span"),
+        Some(("metric", rest)) if !rest.is_empty() => find("metric"),
         Some(("launch", rest)) if !rest.is_empty() => find("launch.milestone"),
         _ => None,
     })

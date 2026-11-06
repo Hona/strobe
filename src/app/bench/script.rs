@@ -301,6 +301,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             fixture_connected: None,
             client: None,
             browser: None,
+            directions: BTreeMap::new(),
         })
     })();
     host.into_inner().exit();

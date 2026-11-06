@@ -313,6 +313,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             fixture_connected: None,
             client: None,
             browser: None,
+            directions: BTreeMap::new(),
         })
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may

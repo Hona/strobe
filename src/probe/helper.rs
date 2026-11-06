@@ -425,7 +425,7 @@ impl Conn {
                     return Err(Error::msg(format!("no process of the target (root {root}) runs as this user")));
                 }
                 if self.stacks.is_none() {
-                    self.stacks = Some(super::kernel_profile::Capture::start(&roots)?);
+                    self.stacks = Some(super::kernel_profile::Capture::start(&roots, req["waits"] == true)?);
                 }
                 Ok(json!({ "ok": {} }))
             }

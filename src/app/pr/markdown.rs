@@ -1121,8 +1121,18 @@ impl<'a> Doc<'a> {
             if local_path(s) { label_commit(v).unwrap_or_else(|| fallback.to_string()) } else { s.to_string() }
         };
         let flags = r["args"]["flags"].as_object();
-        let mut line = format!("strobe bench {}", quote(&self.file()));
-        if flags.is_some_and(|f| f.contains_key("aa")) || base.is_null() {
+        // A command A/B (`cmd:` variants) reruns as `strobe run`, which writes its own bench file.
+        let cmd = |v: &Value| v["kind"].as_str() == Some("cmd");
+        let commands = cmd(&head) && (base.is_null() || cmd(&base));
+        let line_of = |v: &Value| v["spec"].as_str().unwrap_or("").strip_prefix("cmd:").unwrap_or("").to_string();
+        let mut line = if commands { "strobe run".to_string() } else { format!("strobe bench {}", quote(&self.file())) };
+        if commands {
+            if flags.is_some_and(|f| f.contains_key("aa")) || base.is_null() {
+                line += &format!("{} --head {}", if base.is_null() { " --check" } else { " --aa" }, quote(&line_of(&head)));
+            } else {
+                line += &format!(" --base {} --head {}", quote(&line_of(&base)), quote(&line_of(&head)));
+            }
+        } else if flags.is_some_and(|f| f.contains_key("aa")) || base.is_null() {
             line += &format!("{} --head {}", if base.is_null() { "" } else { " --aa" }, quote(&spec(&head, ".")));
         } else {
             line += &format!(" --base {} --head {}", quote(&spec(&base, "<base>")), quote(&spec(&head, ".")));

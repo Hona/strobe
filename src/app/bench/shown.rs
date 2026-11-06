@@ -59,7 +59,7 @@ fn path_of(url: &str) -> String {
 }
 
 impl Screen {
-    /// `Hex Settings · General`: the first title (a page without one: its path), then up to two
+    /// `App Settings · General`: the first title (a page without one: its path), then up to two
     /// headings that differ from it.
     pub fn label(&self) -> String {
         let mut parts: Vec<String> = Vec::new();
@@ -616,7 +616,7 @@ pub(super) fn summarize(blocks: &[Block], across: bool) -> (Value, Vec<Warning>)
     (Value::Object(out), warnings)
 }
 
-/// One variant's screen in a line: `'Hex · General'`, or `'Welcome' → 'Hex · General'` when the runs
+/// One variant's screen in a line: `'App · General'`, or `'Welcome' → 'App · General'` when the runs
 /// moved it.
 fn side_text(v: &Value) -> Option<String> {
     let end = v["end"].as_str()?;
@@ -626,7 +626,7 @@ fn side_text(v: &Value) -> Option<String> {
     })
 }
 
-/// What a series measured on screen, for the text output, the PR block and the viewer: `'Hex ·
+/// What a series measured on screen, for the text output, the PR block and the viewer: `'App ·
 /// General'`, or `base '…' · head '…'` when they differed, each side by `names` (an implementation
 /// comparison's side names). None when strobe read nothing.
 pub fn shown_line(series: &Value, names: (&str, &str)) -> Option<String> {

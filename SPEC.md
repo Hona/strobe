@@ -58,7 +58,8 @@ When a design change is agreed, update this file in the same change.
     registers, how to build and serve it, its mocks and benches) lives in that app's own repo:
     `strobe.json` (`apps`, `build`, `serve`) and its bench files. Strobe has mechanisms, never a
     product's names. The only product-specific code is on the using side: registering strobe's
-    MCP and skill with the agent harness that drives it (§5.3), as mesh does.
+    MCP and skill with the agent harness that drives it (§5.3), as mesh does. `scripts/generic.ts`
+    (the Check workflow) fails on a product's name in any file outside its explicit allowlist.
 
 ## 2. Invariants
 
@@ -126,6 +127,7 @@ schema/         strobe.v1.json (project config), result.v1.json (experiment resu
                 in @hona/strobe (`schema/`). bridge.v1.json comes with the bridge (§24.1, 0b)
 install.sh  install.ps1
 .github/workflows/release.yml   build + release only, no tests
+.github/workflows/check.yml     clippy and build on every OS, and scripts/generic.ts (rule 15)
 SPEC.md  AGENTS.md  README.md
 ```
 
@@ -1072,7 +1074,7 @@ function it is in, so it is named after that function's start. A build without m
 names. Checked against 0.11.0's names on eight recordings: Bun bundles without `names` now read
 `plantedHotFunction`, `spin`, `spinMultiline` (were `c`, `o`, `U`); esbuild's maps that named
 functions by a parameter (`ms`, `dt`, `ctx`, `scene`) now read `spin`, `spinStatic`, `frame`, `draw`;
-two opencode recordings whose sources are on disk read the same names as before, row for row.
+two recordings of a web app whose sources are on disk read the same names as before, row for row.
 
 **Allocations** (`alloc`): `HeapProfiler.startSampling` every 32 KB on average, objects already
 collected by minor or major GC included, so short-lived garbage counts; `query alloc` ranks bytes by
@@ -2539,14 +2541,14 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `NotEquivalent` | the sides of an implementation comparison did not do the same journey (§9.10): an `expect.same` element read differently after setup, a run or a reset, or showed on neither side at any point (the series, from that pair); or their latency samples (`interaction.n`, `scroll.n`) are under 0.8 or over 1.25 times each other (refuses `interaction.*` or `scroll.latency.*`) |
 | `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`, a `run` per target without its own, an `@name` its `ui` lacks; or one met at run time, at any pair, which discards the series' blocks): the series' primary, nothing run; the bench and `--check` still exit 0 |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
-| `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore history-search "cache key" (was "")` |
+| `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
 | `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
 | `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
-| `BackgroundPriority` | the target runs at background priority, inherited from strobe or its own: macOS `taskpolicy -b` (`PRIO_DARWIN_PROCESS`), Windows' idle priority class, efficiency mode (EcoQoS) or background mode (very low memory priority), Linux `SCHED_IDLE` or nice 19. The OS keeps it on efficiency cores, at low clocks or behind other work: an opencode drag read 83–91% dropped frames under `taskpolicy -b` against 0.4% at normal priority. Refuses frame and input-latency metrics (`frames.*`, `interaction.*`, `scroll.*`, `canvas.*`, `input.*`, `launch.painted`, `launch.settled`): a primary among them refuses the bench before anything builds (strobe's own priority) or at the block (the target's), a secondary shows refused, and `record` prints `frames refused`. CPU, memory and counters stay, with a warning to compare them only with runs at the same priority. Attribution and memory blocks are untimed and keep running. `record pid:` measures a process as its user runs it and is not checked |
+| `BackgroundPriority` | the target runs at background priority, inherited from strobe or its own: macOS `taskpolicy -b` (`PRIO_DARWIN_PROCESS`), Windows' idle priority class, efficiency mode (EcoQoS) or background mode (very low memory priority), Linux `SCHED_IDLE` or nice 19. The OS keeps it on efficiency cores, at low clocks or behind other work: a drag in an Electron app read 83–91% dropped frames under `taskpolicy -b` against 0.4% at normal priority. Refuses frame and input-latency metrics (`frames.*`, `interaction.*`, `scroll.*`, `canvas.*`, `input.*`, `launch.painted`, `launch.settled`): a primary among them refuses the bench before anything builds (strobe's own priority) or at the block (the target's), a secondary shows refused, and `record` prints `frames refused`. CPU, memory and counters stay, with a warning to compare them only with runs at the same priority. Attribution and memory blocks are untimed and keep running. `record pid:` measures a process as its user runs it and is not checked |
 | `PresentsUnmatched` | over 5% of the inputs strobe sent a native app (those after which its accessibility tree changed) showed no frame within a second while the present session lost no events (refuses `interaction.*`, §7.4) |
 | `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
@@ -2617,7 +2619,7 @@ provider build and keep its tree; after the runs it is always read. What cannot 
 (`missing`: no Screen Recording, no Accessibility). A 320-pixel thumbnail is kept in the experiment's
 `shown/` folder for the first block of each series and variant, and for any block whose label or
 hash (20 of 64 bits or more) differs from it. Blocks keep `shown { start, end }`; a series keeps
-`shown { base, head, changed }` with the screen most blocks ended on (`'Hex Settings · General'`:
+`shown { base, head, changed }` with the screen most blocks ended on (`'App Settings · General'`:
 the first title, then up to two headings), the other screens and how many blocks showed each, and
 the first block's start and end thumbnails inline (`thumb_start`, `thumb_end`). A page's screen, `expect.visible`, `look` and the driver's
 selectors and waits read the page through one in-page probe (`driver::HELPER`: `screen`, `find`,
@@ -2945,7 +2947,7 @@ percentiles use one definition everywhere, each launch's percentile and the medi
 across launches (`frames.interval.*`); shares of late frames count every gap. Commit subjects lose
 `(#123)` references, which would link to the PR's repository. Variants are named by commit
 (`1982f5313f`, `origin/x@7bf4e2d566`, `(dirty)`), a prebuilt executable by the last two parts of
-its path (`exe:…/base/hex`), the bench file by its path in its repository, never a local folder;
+its path (`exe:…/base/app`), the bench file by its path in its repository, never a local folder;
 whatever a note quotes, a home folder reads `~` and another absolute path its last part. The
 block's first line names the bench file (`strobe · exp_c3c66b · perf/launch.bench.ts ·
 generated`), so a body with several blocks says which file each covers. Metric names drop the
@@ -3557,7 +3559,7 @@ Strobe launches any Electron app the same way, with no change to the app:
   `$XDG_CACHE_HOME/mesa_shader_cache`, NVIDIA's Linux `$XDG_CACHE_HOME/nvidia` and `~/.nv`), and
   Chromium keeps its own in the profile (`GPUCache`, `GrShaderCache`, `GraphiteDawnCache`,
   `DawnGraphiteCache`, `DawnWebGPUCache`, `ShaderCache`). A person's are warm; a fresh home's are
-  empty, so every block compiled again: Hex's dictation spent 4.6 to 5.3 s of each 6 s run in
+  empty, so every block compiled again: a native app's GPU-heavy case spent 4.6 to 5.3 s of each 6 s run in
   NVIDIA's compiler on a driver thread, from about 25 s after the launch, which drowned the app's
   own CPU. With `warm`, each variant has its own store (`<state>/gpu-cache/<exp>-<role>`): before a
   launch its folders are moved into the home (a rename, no copy; what a seed put there wins), and
@@ -3803,7 +3805,7 @@ As built (Windows):
   sampler thread runs at highest priority so it is not preempted between a suspend and its resume.
   The recording keeps what it cost (`suspend`: samples, threads, each sample's suspend-to-resume time
   as mean, p99 and max, samples the cap left out, threads it could not open), and the block note and
-  `query hotspots` print it. Measured on adais (Hex's dictation case, cold GPU caches, 13 threads):
+  `query hotspots` print it. Measured on adais (that native app's GPU-heavy case, cold GPU caches, 13 threads):
   46 µs mean, 90 µs p99 per sample, so a thread busy all the time is stopped about 2.3% of its time
   (4.5% at p99). The maximum, 80 ms, is a thread inside a driver's system call: a suspend lands only
   when the thread returns to user mode, so it ran in the kernel meanwhile and the time is an upper
@@ -3855,7 +3857,7 @@ means the metric is not printed and the refusal says why (rule 1), never 0.
 | thread origin (`app`, `driver`, `os`; 7.4) | the Win32 start address's module | the first module down from the top of the thread's stack (`process_vm_readv`) | per process only: its executable; an XPC service in the target's set (`.xpc` bundle) is `app` wherever macOS keeps it (a web view's web content process does the app's work), the Metal shader compiler service `driver` |
 | accessibility tree (§13.7) | UI Automation (COM) | AT-SPI over strobe's own D-Bus client: the registry's app roots by connection pid, a level per round trip | the AX API (`AXUIElementCopyMultipleAttributeValues`, one call per element; `AXObserver`), Accessibility permission |
 | input to a native app (§13.7) | window messages posted to its message loop | XTest (the X server's own device events) | Quartz events: keys posted to its process (`CGEventPostToPid`), pointer events to the session at the point (AppKit drops mouse events posted to a process), Accessibility permission |
-| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So every block of a window case makes the app the active one (`AXFrontmost`), and only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block waits for them). It activates every block, not only a covered one, because the active app's key window is another state: a Rune window at rest cost 3× the CPU as the key window (920 vs 2780 ms per 10 s on an M4), and a series whose blocks were activated only when covered mixed the two (ui.cpu 206 ms in some blocks, 1250 ms in others) |
+| top-level windows | `EnumWindows`, `IsIconic`, `DWMWA_CLOAKED`, `GetDpiForWindow`; placed by `SetWindowPos` (topmost, never activated, posted) | X11 (`x11rb`'s pure-Rust connection): `_NET_CLIENT_LIST_STACKING` (else the root's children, each frame stood for by its `WM_STATE` client: XWayland's manager under weston keeps no list), `_NET_WM_PID`, `_NET_WM_STATE_HIDDEN`, `_NET_FRAME_EXTENTS`, `Xft.dpi`; occlusion from the stacking order; placed by `_NET_MOVERESIZE_WINDOW` and kept above by `_NET_WM_STATE_ABOVE` (no focus). Native Wayland windows are invisible to any other client: such an app has no main window for strobe (XWayland apps work) | `CGWindowListCopyWindowInfo` (no permission): bounds in points, on-screen state, occlusion by other apps' windows in front (≥ 99% covered is hidden); moving needs the Accessibility permission (`AXUIElement`), and no API keeps another app's window on top without activating it. So every block of a window case makes the app the active one (`AXFrontmost`), and only after a minute with no keyboard or mouse input in the session (`CGEventSourceSecondsSinceLastEventType`): an idle Mac whose apps are maximized can run a window bench, and a person at the keyboard keeps their focus (the block waits for them). It activates every block, not only a covered one, because the active app's key window is another state: a GPU-drawn toolkit's window at rest cost 3× the CPU as the key window (920 vs 2780 ms per 10 s on an M4), and a series whose blocks were activated only when covered mixed the two (ui.cpu 206 ms in some blocks, 1250 ms in others) |
 | window pixels (`launch.painted`, `settled`) | `StretchBlt` from the screen, halftone | `GetImage` of one row through each cell row of the window | `CGWindowListCreateImage` with the Screen Recording permission; refused without it (macOS returns the desktop instead) |
 
 **Windows cycle clock** (`host::tsc`, `host::cycle_clock`). Thread, process and idle cycle times are
@@ -4442,7 +4444,7 @@ yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless
 runner and the script's host inside the run. Counted over the whole run loop instead, the same block
 read 40–80% (script) and 7% (native): strobe's own between-run reads, never inside a run. On air
 (M4) the OS sampler's thread read 0.85–1.2% of a core in `--check` blocks, over its 0.5% budget,
-mostly IOKit reads of every GPU client each tick (§8.5); the present consumer read 0.6–1.6% on Hex,
+mostly IOKit reads of every GPU client each tick (§8.5); the present consumer read 0.6–1.6% on a native app,
 its time mostly in the IOSurface lock of each changed frame. Every recording also keeps strobe's own
 CPU, GPU and memory per tick (§8.5, `os.strobe`), the rule 2 track.
 
@@ -4593,7 +4595,7 @@ under `--check`, values noisy and not compared):
   virtual output). logind listed strobe's `idle` inhibitor during the blocks and none after. One first
   block of a fresh session found no tree (the app started before the accessibility bus strobe's own
   call started); strobe now starts the bus before each launch.
-- Same VM, AccessKit apps (Rune `dev` `c35fe19`, `examples/hello` and `examples/settings`, debug
+- Same VM, AccessKit apps (a GPU-drawn UI toolkit's `hello` and `settings` examples, debug
   builds on lavapipe), read through `query`'s `checked`: `hello`'s switch toggles by `act`, by click and
   by Tab then Space, and `act(focus)` then `switch:focus` matches (unlike Windows, X11 gives the window
   focus, so `:focus` works); `settings`' switch rows toggle by `act` and by click, a swatch radio and a
@@ -4608,7 +4610,7 @@ under `--check`, values noisy and not compared):
   (GTK 4): a click lands in its entry (GTK 4 hit-tests to a text element no child list names; strobe
   takes its ancestor) and keys reach it (Enter closes the dialog), but GTK 4's entry reports no text
   through AT-SPI (pyatspi reads "" after typing too), so a wait on typed text cannot pass.
-- Same VM, headless weston 14 with XWayland: Rune `hello` with `WAYLAND_DISPLAY` opens a native
+- Same VM, headless weston 14 with XWayland: that toolkit's `hello` with `WAYLAND_DISPLAY` opens a native
   Wayland window, and its launch fails naming that and the fix; with the profile's `unset`, it opens
   on XWayland, strobe finds the window (weston's manager keeps no `_NET_CLIENT_LIST_STACKING`; found
   through `WM_STATE`), `act` and click toggle the switch, and keys are refused with the XWayland
@@ -4620,7 +4622,7 @@ under `--check`, values noisy and not compared):
   where to turn Accessibility on. Posting events without the permission: macOS drops them
   (`CGPreflightPostEventAccess` false), so strobe refuses before posting. Not run: everything behind
   the two permissions (AX snapshots, observers, clicks, keys, wheel, window actions, ScreenCaptureKit
-  frames and their join with inputs), and a Rune app (its AccessKit tree has not landed on Rune's dev).
+  frames and their join with inputs), and a native app on an AccessKit toolkit (that toolkit's AccessKit tree had not landed yet).
 - Not checked on hardware: X Present on an X server with a real display (no such Linux machine), and
   on XWayland.
 
@@ -4650,7 +4652,7 @@ no Screen Recording, `--check` smoke runs, values noisy and not compared):
   AppKit handled none of the mouse events posted to the app's process, from any event source, with or
   without the window fields, active or not, so pointer input now goes through the session (§13.7);
   whether a person is at the Mac reads the HID system's idle time, so strobe's own clicks do not count.
-- A Rune app (`examples/settings`, AccessKit): switches by click, `act(toggle)`, `act(invoke)` and
+- A GPU-drawn UI toolkit's `settings` example (AccessKit): switches by click, `act(toggle)`, `act(invoke)` and
   focus then Space; radios and segments by click and `act(select)`; the slider by
   `act(setValue)`. Found and fixed: a radio is pressed for `select` (the adapter takes an AXSelected
   write and does nothing); a range control gets a number even when its AXValue reads as text
@@ -4664,12 +4666,12 @@ no Screen Recording, `--check` smoke runs, values noisy and not compared):
 Live on macOS with Screen Recording (2026-11-05, air, macOS 27, through a remote shell's daemon;
 `--check` smoke runs, values noisy and not compared):
 
-- ScreenCaptureKit frames: an idle window read 60 frames a second (Cocoa, Rune's settings, Hex),
+- ScreenCaptureKit frames: an idle window read 60 frames a second (Cocoa, that toolkit's `settings` example, a native app built on it),
   so `idle` never came and interactions read `AmbiguousInteraction` and `UnpacedSpin`. Streams are
   now display regions counted by changed pixels outside the window server's own redraws (§13.6).
   Then `ax.bench.ts` passed all 8 cases (`frames`: 1 frame after a click; `click`
-  `interaction.p95` about 40 ms), Rune's settings at rest showed 5 frames in 2 s and a switch's
-  toggle about 70 frames over 1.2 s, and Hex's Settings went idle at rest. A native block's
+  `interaction.p95` about 40 ms), the toolkit's `settings` example at rest showed 5 frames in 2 s and a switch's
+  toggle about 70 frames over 1.2 s, and the native app's Settings went idle at rest. A native block's
   `frames.n` came from the empty Chrome data (summary `0 on screen`); a `record pid:` of a process
   showing only an overlay found no display. Both fixed.
 - The page drag: moves came in bursts because strobe's sleeps woke 20 to 60 ms late
@@ -4677,11 +4679,11 @@ Live on macOS with Screen Recording (2026-11-05, air, macOS 27, through a remote
   The "2 frames over the drag" was the keyframe path pressing 300 px off the element, not an
   occluded window: with the path starting at `[0, 0]` the box moved (`main.work` 198 ms) and the
   page presented every frame (`frames.interval.p95` 16.7 ms).
-- `look app:hex` said `headings none` while Hex's pane title is a heading (bench `expect: {
+- `look app:<name>` of that native app said `headings none` while its pane title is a heading (bench `expect: {
   heading }` passed): AccessKit's first answer held 6 nodes and the rest came a moment later
   without a notification. The screen read now waits until two reads 250 ms apart agree on the
   node count (`headings General · Permissions needed`).
-- On Windows (2026-11-05, adais, session locked), `look exe:` of Hex said `headings none` while macOS
+- On Windows (2026-11-05, adais, session locked), `look exe:` of that app said `headings none` while macOS
   read `General`: AccessKit's Windows adapter gives a heading the ARIA role "heading" and no
   HeadingLevel, and the reader counted only HeadingLevel. It now reads the ARIA role too (`headings
   General · Status`), for `look`, `expect.heading`, `role=heading` and the screen read alike.
@@ -4720,23 +4722,23 @@ second update left the body alone, a hand edit inside the block was refused, and
 host; `<picture>` sources and `#gh-dark-mode-only` addresses keep the bare one (not checked for a
 private repository's readers), so the block uses plain `![alt](…)` and the SVG's own stylesheet.
 
-Batch 5 (2026-11-05, from the first pull request made with `--format pr`, hex#1347; adais locked,
+Batch 5 (2026-11-05, from the first pull request made with `--format pr`, in a consumer's repository; adais locked,
 air unlocked; `--check` smoke runs, values noisy and not compared): the PR block's Pairs table past
 20 pairs, profiled-launch rows only beside a decided change, uneven pairs, short metric names, one
 refusal reason, `not pinned`, no machine paths, the hero's heading level under the author's
 sections and across blocks, the bench file in the first line (§11.2); `sample` bounded and stopped
 with its block (§13.4); `--check` groups refusals by reason; `look app:|exe:` (§5.12). Checked:
-19 reports (12 real, 7 synthetic, hex#1347's two experiments among them) render the same twice, fit,
-and carry no local path; `--update-pr` against hex#1347's real body through a stand-in `gh` put both
+19 reports (12 real, 7 synthetic, that pull request's two experiments among them) render the same twice, fit,
+and carry no local path; `--update-pr` against that pull request's real body through a stand-in `gh` put both
 blocks at `###` under its `##` sections, kept the author's text, changed nothing on a second run,
 and in a body without headings gave one block `#` and two blocks `##` with valid hashes; GitHub's
-Markdown API and CSS drew it light and dark at 900 and 400 px. On air (Hex, Rune's AccessKit
-adapter): `look exe:` listed the window, titles and 60 keyed elements; `page.click`, hover then
+Markdown API and CSS drew it light and dark at 900 and 400 px. On air (a native app on an AccessKit
+toolkit): `look exe:` listed the window, titles and 60 keyed elements; `page.click`, hover then
 click, and `down`/`up` on sidebar items each switched the pane, and `page.scroll` moved History by
-about 29 rows per 1,500 px (as `wheel` did), so the failures hex#1347 reported did not reproduce
+about 29 rows per 1,500 px (as `wheel` did), so the failures that pull request reported did not reproduce
 with this build (its bench still invokes and wheels on macOS); `console.error` from `run()` showed
 under the case in `--check`. An attribution `record --bench` of a 0.8 s case had waited the full
-60 s report wait: `sample` was still reading Hex's 84 MB of symbols at the stop and dropped the
+60 s report wait: `sample` was still reading the app's 84 MB of symbols at the stop and dropped the
 SIGINT (an hour before the bound); with the start wait it analysed in 0.4 s with 32 samples.
 
 Leftovers and capture cost (13.2, 13.7; 2026-11-05): everything strobe launches carries
@@ -4946,7 +4948,7 @@ quiet for 10 s lost its connection; and a web launch case's observer went into t
 from about:blank late (its session had the Page domain off), so an `until` already in the HTML was refused
 `RunIncomplete` (0.11.0 too). Checked with short `--check` runs (not timed) of a page served by `ctx.mock`
 (an init script that marks each document and counts WebGPU frames, a JSON echo of a POST body, a
-`main.work`, a `cpu.work`, a reload and a launch case) and of the Hex-site-shaped bench:
+`main.work`, a `cpu.work`, a reload and a launch case) and of a bench shaped like a product's website:
 
 - adais (Windows 11, locked, headless): Chromium 4 of 4 (`count.frame` 12 in 1 s through the init
   script, the echoed body, the launch case on an `until` set by the page's first script); Firefox 159 2 of
@@ -4976,24 +4978,24 @@ the set's clients open; the macOS present session reads the window list once per
 (macOS), macOS snapshots keep each window's owner and CoreGraphics id, the hit test and the pointer
 target make fewer reads of the app, and a key reads one window's entry for its owner; a click whose
 `until` selector never shows says when its element moved. Profiled first with `sample` on strobe's
-own process inside the measured runs of a Hex `history-search` block on air (15 runs): the present
+own process inside the measured runs of a native app's search-typing block on air (15 runs): the present
 consumer's queue was in the IOSurface lock trap a fifth of the wall time, the main thread on CPU
 2.3% (process scans between runs, the shown screens, a key's `window_state`, snapshots), the sampler
 0.6% (the process tree scan and IOKit). Single reads on air: the whole on-screen window list 215 µs
 of CPU with 15 windows (one window's entry 42 µs); matching the accelerators 20 µs; walking 71 GPU
 clients 149 µs; every client's owner 296 µs; one client's `AppUsage` 4 µs; `PerformanceStatistics`
 13 µs; Linux's `smaps_rollup` for strobe 94 µs on vps against `statm` 17 µs. The head's profile of
-a `switch-panes` block then showed `rest` reading the whole live-present queue between sleeps (now
+a pane-switching block then showed `rest` reading the whole live-present queue between sleeps (now
 each process's latest start is kept). On air (macOS 27, AC, `--check`, one cold run per case, so
 noisy; base 0.9.0, head this change, three head runs): strobe's process in the cocoa app's cases
 read chord 8.6% → 2.7–7.3%, click 5.2% → 2.6–2.9%, frames 2.3% → 1.3–1.5%, query (7 ms runs, a
 whole snapshot each) 21.9% → 11.2–17.7%, scroll 4.2% → 0.81–2.8%, toggle 4.4% → 0.79–3.2%, type
 4.9% → 1.4–4.6%, wheel 4.0% → 0.86–3.3%; the sampler 0.28–1.1% → 0.10–0.39%, the present consumer
-0.04–0.64% → 0.04–0.30%. Hex `switch-panes` 7.0% → 1.3% (twice), `history-scroll` 5.9% → 1.8–4.7%,
-its sampler 0.40–1.0% → 0.13–0.52%; the present consumer stayed 0.15–1.1% on Hex's redraws (it is
+0.04–0.64% → 0.04–0.30%. The native app's pane switching 7.0% → 1.3% (twice), list scrolling 5.9% → 1.8–4.7%,
+its sampler 0.40–1.0% → 0.13–0.52%; the present consumer stayed 0.15–1.1% on that app's redraws (it is
 the lock of each changed frame, which this change leaves alone). In 15-run blocks profiled with
-`sample` attached: `switch-panes` 4.8% → 4.0% with the app's own `ui.cpu` 157 → 130 ms a run (fewer
-reads of its tree), `history-scroll` 4.3% → 3.1%, query 16.2% → 14.1%. A Hex `model-picker` check
+`sample` attached: pane switching 4.8% → 4.0% with the app's own `ui.cpu` 157 → 130 ms a run (fewer
+reads of its tree), list scrolling 4.3% → 3.1%, query 16.2% → 14.1%. A picker case's check
 failed with "The element clicked ("picker-back") moved: strobe aimed at it at (348, 215, 24 × 24) and
 it is now at (348, 130, 24 × 24)". Tried and dropped: locking frames with `kIOSurfaceLockAvoidSync`
 first (the lock trap kept its time, and whether such a lock sees a frame the GPU still writes was not
@@ -5006,13 +5008,13 @@ strobe's process 1.0–1.1% before, 1.0–1.2% after. Linux (vps, Xvfb, `atspi.b
 after; single noisy runs on 2 cores). `record pid:` on adais and vps wrote `os.strobe` (31 ticks
 over 3 s) and `strobe open --no-browser` drew three "strobe itself" tracks, which trace_processor read
 back with no import errors.
-After review: a Hex `switch-panes` check had read `interaction.p50` 15.8 ms on the base and 43.6 and
+After review: the native app's pane-switching check had read `interaction.p50` 15.8 ms on the base and 43.6 and
 77.2 ms on the head; `query <rec> frames` showed a cold-run artifact over which of its three clicks
 counted (base: one counted at 15.8 ms, the slow History click dropped as mid-drawing; head: 31.5 and
 55.8 ms counted, or one at 77.2 ms). It also showed what a read that stops at its match changes: an
 `until` selector could return before the app's frame and post the next input while that frame was on
 its way, so `until: <selector>` now also waits for the app's next frame after the input and the last
-accessibility change (above). Warmed blocks of `switch-panes` (10 runs, the 0.10.0 base and this head
+accessibility change (above). Warmed pane-switching blocks (10 runs, the 0.10.0 base and this head
 in turn, base–head–head–base–base–head, with someone using the Mac between blocks, so noisy):
 `interaction.p50` base 64.8, 64.3 ms and once refused, head 16.4 ms and twice refused
 (AmbiguousInteraction); `ui.cpu` base 254, 120, 222 ms, head 47, 186, 190 ms; strobe's process base
@@ -5228,18 +5230,18 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `refused (<validator>): …` in the series, as `TailTooShort` does. `native(path)` is a fixed
   executable: a build never replaces it. `{cache}` keeps the platform's separators (cmd's own
   commands read `/` as a switch).
-- GPU shader caches (§13.2), checked on adais (RTX 5070 Ti, Hex's dictation `recording` case, a
+- GPU shader caches (§13.2), checked on adais (RTX 5070 Ti, a native app's recording case that runs a
   Vulkan model): NVIDIA's driver-thread CPU over a `record --bench` (a check launch, then an
   attribution launch) went 5.2 s (cold, 23 s launch) then 26.5 s, 13.5 s and 0.55 s (80 to 115 s
   launches) as the executable's store filled over three recordings; a warm check launch's driver
-  threads used 26 ms. By hand, a 40 s dictation in one home: 41.3 s of the process's CPU cold, 20.7 s
+  threads used 26 ms. By hand, a 40 s recording in one home: 41.3 s of the process's CPU cold, 20.7 s
   after one killed launch, 2.8 s after a second. The cache files grow when the process ends, killed
   or not. Each variant's store is lent by renaming folders into the home and back.
 - macOS native stacks in a bench's attribution block came back empty ("0 samples"): `sample`'s
   untimed samples all carry the capture's start, before the warmup runs, and the block kept only
   samples inside its measured runs. Untimed samples are kept whole now, as §13.4 says, and `--phase`
   refuses them. `sample` itself works on air (macOS 27.0.1: 1,549 samples of a 2 s capture of a
-  same-user process, through `strobe run` in the bench slot), and a `record --bench` of Hex's dictation case on air now keeps 8,888 samples, 100% resolved.
+  same-user process, through `strobe run` in the bench slot), and a `record --bench` of that native app's recording case on air now keeps 8,888 samples, 100% resolved.
 - Flags beyond §5: `bench --id --keep`, `record --headless --home --served --id --native --os-frames`, `query --native --thread --phase`, `status --fast`,
   `top --target --once --interval --limit --sort`. `record` without `--for` records 10 s.
 - `up` installs the binary into the per-user programs folder and adds it to the user PATH; `leave`
@@ -5345,7 +5347,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   its own process in the isolated home (it hands off), so it cannot be a target. Not yet run on an
   unlocked session: clicks, hover and wheel on a real window, `until: "frame"` and idle against live
   presents, `interaction.*` and `scroll.latency.*`, a launch timed to a selector, `snapshot`, window
-  actions, and a winit app (Rune with AccessKit): its lazy tree, key paths, chords and clicks.
+  actions, and a winit app (a GPU-drawn UI toolkit with AccessKit): its lazy tree, key paths, chords and clicks.
   Driving costs the app: each tree read through classic controls' proxies sends messages to its UI
   thread (`ui.wakes` read 6,000 to 7,500 per second in a typing case that waits on its text).
   A winit app with an AccessKit tree (locked session, release build): its lazy provider's first

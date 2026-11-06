@@ -433,14 +433,14 @@ export default bench({
 ### What was on screen
 
 - Every windowed block records its window titles, dialogs and headings (a page: title, address, headings) and a perceptual hash with a thumbnail, before and after its runs.
-- Output says `shown  'Hex Settings · General'` per series, the PR block an `On screen:` line, and `ScreenChanged` warns when base and head (or some blocks) showed different screens.
+- Output says `shown  'App Settings · General'` per series, the PR block an `On screen:` line, and `ScreenChanged` warns when base and head (or some blocks) showed different screens.
 - Read it before trusting a number: a first-run dialog over the pane once turned a whole A/B into a measurement of the dialog.
 - Pin it with `expect: { title: /Settings/, heading: "General", visible: "nav-general" }` on the case or target: a block on another screen is refused `WrongScreen` instead of timed.
 
 ### Every run starts from the same state
 
 - Before each run and after the last reset, strobe compares the values of editable controls and the states of check boxes, radio buttons and switches with run 1's start (not labels, clocks, headings or focus).
-- A reset that takes back nothing, or a typing run with no reset, is refused `ResetIncomplete`, naming the control: `the reset did not restore history-search "cache keycache key" (was "")`.
+- A reset that takes back nothing, or a typing run with no reset, is refused `ResetIncomplete`, naming the control: `the reset did not restore search "cache keycache key" (was "")`.
   - Controls "not there at run 1" mean the screen was still loading then (wait in setup) or the run left something open.
   - strobe waits for the first start to settle; a control that changes by itself (a clock, a meter) is not compared.
   - Select-all is `ControlOrMeta+a`: Control+a moves to the line start on macOS.

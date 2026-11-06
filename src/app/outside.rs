@@ -232,7 +232,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
     }
     // Presents far faster than the display refreshes, locked or not (`UnpacedSpin`).
     // The display the process shows on: its main window's, else any window's (an app that shows only
-    // an overlay, such as a dictation HUD, has no main window).
+    // an overlay, such as a HUD, has no main window).
     let display_of = |pids: &[u32]| host::main_window(pids).map(|w| w.hwnd).or_else(|| host::top_windows(pids).first().map(|w| w.0)).and_then(host::display_of);
     let unpaced = presents.as_ref().ok().and_then(|p| {
         let pids = pids_now();

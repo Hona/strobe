@@ -1426,7 +1426,7 @@ pub fn window_image(id: isize) -> Option<crate::png::Image> {
 /// only once nobody has used this Mac for a minute: a person at the keyboard keeps their focus, and
 /// the block waits for them. Activating every time, not only when other windows cover the app's,
 /// keeps every block in one state: an app's key window can cost several times an inactive one's
-/// (a Rune window at rest: 3× its CPU). Returns 1 when the app is active.
+/// (a GPU-drawn toolkit's window at rest: 3× its CPU). Returns 1 when the app is active.
 pub fn raise_windows(pids: &[u32]) -> usize {
     let Some(w) = main_win(pids) else { return 0 };
     if !w.onscreen {

@@ -591,7 +591,7 @@ pub(super) fn scrub_paths(s: &str) -> String {
     drive.replace_all(&s, "…/").to_string()
 }
 
-/// A prebuilt executable as a report names it in public: `exe:…/base/hex`, the last two parts of
+/// A prebuilt executable as a report names it in public: `exe:…/base/app`, the last two parts of
 /// its path (the folder tells the builds apart), never the machine's path.
 pub(super) fn symbolic(spec: &str) -> String {
     let Some(path) = spec.strip_prefix("exe:") else { return spec.to_string() };

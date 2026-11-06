@@ -6,8 +6,8 @@
 - NEVER write automated tests: no unit, integration, e2e, or any other tests, no test files, no test dependencies, no CI test steps. Verify with the calibration page and A/A runs on real devices (SPEC §10.3, §10.4).
 - Iteration speed first. Smallest change that works.
 - Never experiment on the user's real app data or config. Attach to a running app only to read.
-- Strobe is generic (SPEC rule 15). Never put a product's names, paths, env vars or quirks in strobe's code or docs: they belong in that product's own `strobe.json` (`apps`, `build`, `serve`) and bench files. The only product-specific code is registering strobe with the agent harness that uses it (`up`/`leave`).
-- NEVER launch a desktop app the user also runs (for example their OpenCode channels) by hand, or through strobe without an app profile whose `guard` covers the user's own state (SPEC §13.2). An app-specific test-root variable alone once replaced the user's live opencode service. Check the guarded state before and after.
+- Strobe is generic (SPEC rule 15). Never put a product's names, paths, env vars or quirks in strobe's code or docs: they belong in that product's own `strobe.json` (`apps`, `build`, `serve`) and bench files. The only product-specific code is registering strobe with the agent harness that uses it (`up`/`leave`). `bun scripts/generic.ts` checks it (the Check workflow runs it).
+- NEVER launch a desktop app the user also runs (for example their own installs of the app under test) by hand, or through strobe without an app profile whose `guard` covers the user's own state (SPEC §13.2). An app-specific test-root variable alone once replaced the user's live background service of that app. Check the guarded state before and after.
 - Never run two benches on one device, and never bench while something heavy (a build, a test suite) runs on it.
 - Rust stable. Well-known crates are fine; give each one a one-line reason in `Cargo.toml` and keep the budgets in SPEC §19.
 

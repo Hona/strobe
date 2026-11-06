@@ -3494,6 +3494,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let quiet_ms = settled.elapsed().as_secs_f64() * 1e3;
     let launched = Instant::now();
     let mut guard = None;
+    // An app's hooks get its home, environment and executable (SPEC §9.6), as a launch case's do.
+    let mut hook_app = json!({});
     let browser: WebBrowser = if kind == "command" {
         let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
         crate::target::command::launch(&crate::target::command::Spec::from_target(&target, &root), &isolate::new_home(), true, &window, ctx.pin)?.0.into()
@@ -3503,7 +3505,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             dev_build(&launch.exe)?;
         }
         let seed = seed_dir(ctx, s, &target);
-        let (b, g) = electron::launch(&launch, seed.as_deref(), &window, ctx.pin)?;
+        let home = isolate::prepare_home(&launch, seed.as_deref(), None)?;
+        hook_app = json!({ "home": home.dir, "env": home.environment(&launch), "exe": launch.exe });
+        let (b, g, _) = electron::launch_with(&launch, seed.as_deref(), &window, ctx.pin, &electron::Extra { prepared: Some(home), ..Default::default() })?;
         guard = Some(g);
         b.into()
     } else {
@@ -3681,7 +3685,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
         };
         let t = s.hook_timeout();
-        ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root, "engine": engine }), t, &serve)?;
+        let mut block = json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root, "engine": engine });
+        if let (Some(b), Some(a)) = (block.as_object_mut(), hook_app.as_object()) {
+            b.extend(a.clone());
+        }
+        ctx.runner.call("block", block, t, &serve)?;
         // `prepare` (and a target `url` function) may name the first page, so a block loads one page, not two.
         let mut first = url.clone();
         if target["prepare"].as_bool() == Some(true) {

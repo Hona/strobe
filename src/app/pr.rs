@@ -15,7 +15,7 @@ mod markdown;
 use extract::*;
 use github::*;
 pub use github::{Updated, hero_level, relevel, splice, update_pr};
-pub use implementations::{claim, factor_or_pct, fairness, range_x};
+pub use implementations::{claim, cpu_scope, factor_or_pct, fairness, range_x, ready_noun};
 use markdown::*;
 use crate::model::{self, Better, Error, Result, VerdictKind};
 use crate::stats;
@@ -28,6 +28,24 @@ use std::collections::BTreeMap;
 pub(crate) fn side_names(r: &Value) -> (String, String) {
     let name = |i: usize, other: &str| r["variants"][i]["name"].as_str().filter(|_| r["comparison"] == "implementations").unwrap_or(other).to_string();
     (name(0, "Before"), name(1, "This PR"))
+}
+
+/// Side names for a label with little room: without the words both start with, and a rest that is
+/// one parenthesis unwrapped (`Studio classic`, `Studio (native)` → `classic`, `native`). The full
+/// names when they share no first word or that would leave either empty or both the same.
+pub(crate) fn compact_names(base: &str, head: &str) -> (String, String) {
+    let (b, h): (Vec<&str>, Vec<&str>) = (base.split_whitespace().collect(), head.split_whitespace().collect());
+    let common = b.iter().zip(&h).take_while(|(x, y)| x == y).count();
+    let rest = |w: &[&str]| {
+        let s = w.join(" ");
+        s.strip_prefix('(').and_then(|x| x.strip_suffix(')')).filter(|x| !x.contains(['(', ')'])).map(str::to_string).unwrap_or(s)
+    };
+    let full = (base.to_string(), head.to_string());
+    if common == 0 || common >= b.len() || common >= h.len() {
+        return full;
+    }
+    let (x, y) = (rest(&b[common..]), rest(&h[common..]));
+    if x.is_empty() || y.is_empty() || x == y { full } else { (x, y) }
 }
 
 /// GitHub refuses a body over 65,536 characters (UTF-16 units); the block leaves most of it to the author.

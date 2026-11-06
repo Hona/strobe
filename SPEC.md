@@ -3027,17 +3027,32 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   the Pairs and equivalence tables; never a journey's line, the caution or the scoreboard.
 - **Card** (1200×630, the same visual system): header `Rewrite vs Original · <file>` and the
   id; left, the headline journey (title, its change very large in its tone, the words with the
-  comparator, the Care note of its metric, both medians named, the pairs' log-ratio strip, the tally
+  comparator, what its metric counts, both medians named, the pairs' log-ratio strip, the tally
   and interval, the equivalence checks), or a calm heading with the first undecided journey's pairs
   in grey; a 1px rule; right, a forest plot of every journey on one log-ratio axis oriented
   better-left (a higher-is-better metric plotted negated; tick labels only when no row is), wide
   enough for every interval, the bound shaded, each row's interval and estimate in green or red only
   when confirmed across the family, else grey, its change at the right, a gap row's `not comparable:
   no @find`; every journey while 24 px rows fit (14), else every journey decided worse and the
-  headline stay and `and K more in the report`; the scoreboard (every count, so they add up to the
-  compared journeys) and its Holm line under it. Footer: two lines, machine · OS · window @scale, Hz
-  · same server and data · OS input to both, and what CPU summed on each side · pairs. One journey:
-  the headline across the card.
+  headline stay and `and K more in the report`; rows share the pane up to 112 px each, their type,
+  dots and whiskers growing past 42 px, so a few journeys fill it; the scoreboard (every count, so
+  they add up to the compared journeys) and its Holm line under it. Footer: two lines, machine · OS ·
+  window @scale, Hz · same server and data · OS input to both, and what CPU summed on each side ·
+  pairs. One journey: the headline across the card.
+  - The header names both sides in full; the body (comparator, medians, calm heading, footer) drops
+    the words both names start with and unwraps a rest in one parenthesis (`Studio classic`,
+    `Studio (native)` → `classic`, `native`; `pr::compact_names`), keeping full names when that
+    leaves either empty or both the same.
+  - What CPU summed is said once, in the footer: a CPU time headline says only `CPU time per run`
+    (`per launch` for a launch); another Care metric keeps its note under the headline.
+  - A journey row's metric names a launch by what it waited for: `time until the window settles`
+    (or `first paints`, or `time until <milestone>`) when `launch.ready` equals that value in every
+    launch of both sides (`pr::ready_noun`; the PR block's journey line says the same), else
+    `time until ready`.
+  - No number is cut: a line too wide shrinks first (the medians break after `→` onto two lines
+    below 85%), a journey title keeps its parameters and cuts the words before them, and an ellipsis
+    comes only past the smallest size. A gap row's words sit on the background, clear of no
+    change's line.
 - **Badges:** per journey as for builds; `--format badge --scoreboard` draws `vs Original | better in
   4/5 · worse in 1 · 1 gap` (red with a confirmed regression, green with none and nothing unclear,
   else grey: an unconfirmed regression is unclear); `--scoreboard` on anything else is a usage error.
@@ -5008,6 +5023,14 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `C:/Users/<name>/…` path now reads `~/…` (it read `C:~/…`). The Pairs
   table and its summary row now show a pair's change in the main comparison's own scale (`relative`):
   deciding it per pair once showed a zero head as −100% beside a comparison by differences.
+  The implementation card was polished on the first real result (an Electron app against its native
+  rewrite, 2 journeys, macOS): its medians line had cut the head's number (`… → <head name>
+  6.…`), the CPU scope was said twice, the right pane was mostly empty and a launch timed to its
+  window settling read `time until ready`. Checked by rendering that result, the hand-written ones
+  of 1, 3, 6, 10 (and its mirror) and 20 journeys, and copies of the real one with long side names,
+  a shared prefix, a parameterized journey and no decision, light and dark: no number is cut or
+  overlapped. Builds-mode cards and badges are unchanged (25 stored experiments, 200 images, matched
+  byte for byte).
 
 - Daemon and CLI safety: each invocation has its own scope (`app::RunScope`, thread-local and
   nested): its progress log and its stop files, so two benches the daemon runs at once never write

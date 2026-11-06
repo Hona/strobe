@@ -39,7 +39,8 @@ struct Lead {
     /// `less CPU time than Original`.
     words: String,
     scope: String,
-    medians: String,
+    /// `Original 12.8 ms`, `Rewrite 6.99 ms`.
+    medians: (String, String),
     tally: String,
     same: String,
 }
@@ -72,15 +73,27 @@ fn log_of(c: &Value, x: f64) -> f64 {
     }
 }
 
-fn lead_of(r: &Value, s: &Value, multi: bool) -> Lead {
+/// The card's side names: the full ones in the header, these in the body.
+fn names(r: &Value) -> (String, String) {
     let (bn, hn) = pr::side_names(r);
+    pr::compact_names(&bn, &hn)
+}
+
+fn lead_of(r: &Value, s: &Value, multi: bool) -> Lead {
+    let (bn, hn) = names(r);
     let c = &s["primary"];
     let mut tile = tile(s, c, String::new());
     let cl = pr::claim(c);
     tile.amount = cl.amount.clone();
     let m = metric(c);
     let unit = unit_of(m);
-    let scope = c["care_note"].as_str().map(|n| format!("{}: {n}", capitalize(&short(m).0))).unwrap_or_default();
+    let noun = capitalize(&short(m).0);
+    // The footer says what CPU summed: a CPU time says only what it is per.
+    let scope = match c["care_note"].as_str() {
+        Some(_) if m.starts_with("cpu.") && unit == "ms" && !pr::cpu_scope(r, (&bn, &hn)).is_empty() => format!("{noun} per {}", if s["kind"] == "launch" { "launch" } else { "run" }),
+        Some(n) => format!("{noun}: {n}"),
+        None => String::new(),
+    };
     let range = if c["relative"] == true { pr::range_x(c).replace('\u{a0}', " ") } else { String::new() };
     let tally = fmt_join([tile.tally.clone(), range]);
     let checks: Vec<String> = s["equivalence"].as_array().into_iter().flatten().filter(|e| e["ok"] == true).filter_map(|e| e["selector"].as_str().map(str::to_string)).collect();
@@ -89,7 +102,7 @@ fn lead_of(r: &Value, s: &Value, multi: bool) -> Lead {
         journey: if multi { title(s, &[]) } else { String::new() },
         words: format!("{} than {bn}", cl.card()),
         scope,
-        medians: format!("{bn} {} → {hn} {}", disp(f(&c["base"]), unit), disp(f(&c["head"]), unit)),
+        medians: (format!("{bn} {}", disp(f(&c["base"]), unit)), format!("{hn} {}", disp(f(&c["head"]), unit))),
         tally,
         same,
         tile,
@@ -102,6 +115,7 @@ fn fmt_join<const N: usize>(parts: [String; N]) -> String {
 
 pub(super) fn build(r: &Value) -> Forest {
     let (bn, hn) = pr::side_names(r);
+    let (cb, ch) = names(r);
     let series: Vec<&Value> = r["series"].as_array().map(|a| a.iter().collect()).unwrap_or_default();
     let board = family::Board::of(r);
     let fam = &board.family;
@@ -155,7 +169,7 @@ pub(super) fn build(r: &Value) -> Forest {
         };
         rows.push(Row {
             name,
-            metric: if mixed && !gap { short(metric(c)).0 } else { String::new() },
+            metric: if mixed && !gap { pr::ready_noun(s).unwrap_or_else(|| short(metric(c)).0) } else { String::new() },
             ci,
             note,
             value,
@@ -195,7 +209,7 @@ pub(super) fn build(r: &Value) -> Forest {
     } else if series.iter().all(|s| family::gap(s)) {
         ("Not comparable".into(), series.first().map(|s| format!("{}: {}", title(s, &[]), family::gap_reason(r, s))).unwrap_or_default())
     } else if series.iter().filter(|s| !family::gap(s)).all(|s| primary_out(s, false) == Out::Same) {
-        (format!("No measurable difference from {bn}"), format!("every compared journey within its bound in {}", pr_pairs(&series)))
+        (format!("No measurable difference from {cb}"), format!("every compared journey within its bound in {}", pr_pairs(&series)))
     } else {
         // Only a count past the pairs already run: "~6 pairs" after 8 reads as a contradiction.
         let need = series.iter().filter_map(|s| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000 && *n > s["pairs"].as_u64().unwrap_or(0))).max();
@@ -215,7 +229,7 @@ pub(super) fn build(r: &Value) -> Forest {
         score_parts.push(format!("{} gap{}", fam.gaps, if fam.gaps == 1 { "" } else { "s" }));
     }
     let score2 = capitalize(&board.correction());
-    let (f1, f2) = pr::fairness(r, &series);
+    let (f1, f2) = pr::fairness(r, &series, (&cb, &ch));
     let foot = (super::super::fmt::fields(f1), super::super::fmt::fields(f2));
     let file = r["file_repo"].as_str().or(r["file"].as_str()).unwrap_or("").replace('\\', "/");
     let subject = super::super::fmt::fields([format!("{hn} vs {bn}"), file]);
@@ -301,10 +315,49 @@ fn chrome_i(svg: &mut Svg, card: &Forest) {
     svg.text(W - LEFT, HEAD_I / 2.0 + 6.0, (18.0, false), Ink::Muted, "end", &card.id);
     let left = LEFT + 24.0 + measure("strobe", 20.0, true) + 24.0;
     let room = W - LEFT - id_w - 28.0 - left;
-    svg.text(left, HEAD_I / 2.0 + 7.0, (20.0, false), Ink::Fg, "start", &clip(&card.subject, room, 20.0, false));
+    squeezed(svg, (left, HEAD_I / 2.0 + 7.0), (20.0, false), Ink::Fg, &card.subject, room, 0.8);
     let fw = W - 2.0 * LEFT;
-    svg.text(LEFT, H - FOOT_I + 32.0, (17.0, false), Ink::Muted, "start", &clip(&card.foot.0, fw, 17.0, false));
-    svg.text(LEFT, H - FOOT_I + 58.0, (17.0, false), Ink::Muted, "start", &clip(&card.foot.1, fw, 17.0, false));
+    squeezed(svg, (LEFT, H - FOOT_I + 32.0), (17.0, false), Ink::Muted, &card.foot.0, fw, 0.75);
+    squeezed(svg, (LEFT, H - FOOT_I + 58.0), (17.0, false), Ink::Muted, &card.foot.1, fw, 0.75);
+}
+
+/// `text` from `x` at `size`, or smaller down to `least` of it to fit `width`; cut with an ellipsis
+/// only past that (`cut`), so a number stays whole wherever there is any room for it.
+fn squeezed(svg: &mut Svg, (x, y): (f32, f32), (size, bold): (f32, bool), ink: Ink, text: &str, width: f32, least: f32) {
+    let s = fit(text, width, size, bold).max((size * least).floor());
+    svg.text(x, y, (s, bold), ink, "start", &cut(text, width, s, bold));
+}
+
+/// `text` cut to `width` with an ellipsis; a title's parameters at its end (`(rows 10000)`) stay
+/// whole and the words before them are cut, while there is room for a few of them.
+fn cut(text: &str, width: f32, size: f32, bold: bool) -> String {
+    if measure(text, size, bold) <= width {
+        return text.to_string();
+    }
+    if let Some((head, tail)) = text.strip_suffix(')').and_then(|t| t.rsplit_once(" (")) {
+        let tail = format!("({tail})");
+        let room = width - measure(&tail, size, bold) - size * 0.3;
+        if room >= measure("Abc…", size, bold) {
+            return format!("{} {tail}", clip(head, room, size, bold));
+        }
+    }
+    clip(text, width, size, bold)
+}
+
+/// `Original 12.8 ms → Rewrite 6.99 ms` from `y`, a little smaller to fit, else on two lines (the
+/// arrow ending the first); never cut. The last line's baseline.
+fn medians_svg(svg: &mut Svg, (before, after): &(String, String), x: f32, y: f32, w: f32) -> f32 {
+    let one = format!("{before} → {after}");
+    let s = fit(&one, w, 20.0, false);
+    if s >= 17.0 {
+        svg.text(x, y, (s, false), Ink::Fg, "start", &one);
+        return y;
+    }
+    let first = format!("{before} →");
+    let s = fit(&first, w, 20.0, false).min(fit(after, w, 20.0, false));
+    svg.text(x, y, (s, false), Ink::Fg, "start", &first);
+    svg.text(x, y + s * 1.3, (s, false), Ink::Fg, "start", after);
+    y + s * 1.3
 }
 
 /// The headline in a column `x`..`x + w`, from `top`; `wide` for a one-journey card.
@@ -312,7 +365,7 @@ fn lead_svg(svg: &mut Svg, l: &Lead, x: f32, top: f32, w: f32, wide: bool) {
     let mut y = top;
     if !l.journey.is_empty() {
         y += 34.0;
-        svg.text(x, y, (20.0, false), Ink::Muted, "start", &clip(&l.journey, w, 20.0, false));
+        squeezed(svg, (x, y), (20.0, false), Ink::Muted, &l.journey, w, 0.8);
     }
     let size = if wide { 168.0 } else { 120.0 };
     y += size * 0.86 + if l.journey.is_empty() { 16.0 } else { 6.0 };
@@ -332,8 +385,7 @@ fn lead_svg(svg: &mut Svg, l: &Lead, x: f32, top: f32, w: f32, wide: bool) {
             svg.text(x, y, (ss, false), Ink::Muted, "start", &clip(line, w, ss, false));
         }
     }
-    y += 36.0;
-    svg.text(x, y, (20.0, false), Ink::Fg, "start", &clip(&l.medians, w, 20.0, false));
+    y = medians_svg(svg, &l.medians, x, y + 36.0, w);
     y += 14.0;
     let sw = if wide { w * 0.62 } else { w };
     strip(svg, x, y, sw, &l.tile, 6.0, l.tile.tone != Tone::Plain);
@@ -366,11 +418,10 @@ fn calm_svg(svg: &mut Svg, card: &Forest, x: f32, top: f32, w: f32) {
     if let Some(l) = &card.calm_pairs {
         y += 30.0;
         if !l.journey.is_empty() {
-            svg.text(x, y, (17.0, false), Ink::Muted, "start", &clip(&l.journey, w, 17.0, false));
+            squeezed(svg, (x, y), (17.0, false), Ink::Muted, &l.journey, w, 0.8);
             y += 28.0;
         }
-        svg.text(x, y, (20.0, false), Ink::Fg, "start", &clip(&l.medians, w, 20.0, false));
-        y += 14.0;
+        y = medians_svg(svg, &l.medians, x, y, w) + 14.0;
         let sw = if card.journeys <= 1 { w * 0.62 } else { w };
         strip(svg, x, y, sw, &l.tile, 6.0, false);
         y += 36.0 + 40.0;
@@ -387,12 +438,21 @@ fn arrow(svg: &mut Svg, x: f32, y: f32, left: bool, ink: Ink) {
 /// The forest plot: every kept journey on one log-ratio axis, the bound shaded, the scoreboard under it.
 fn forest_svg(svg: &mut Svg, card: &Forest, top: f32, bottom: f32) {
     let (x0, x1) = (RIGHT, RIGHT_END);
-    let name_w = 196.0;
-    let value_w = 76.0;
-    let (ax0, ax1) = (x0 + name_w + 12.0, x1 - value_w);
     let head_y = top + 34.0;
     svg.text(x0, head_y, (20.0, true), Ink::Fg, "start", &format!("{} journey{}", card.journeys, if card.journeys == 1 { "" } else { "s" }));
     let rows = &card.rows;
+    let score_h = if card.score.1.is_empty() { 34.0 } else { 58.0 };
+    let more_h = if card.hidden > 0 { 26.0 } else { 0.0 };
+    let tick_h = 26.0;
+    let rows_top = head_y + 16.0;
+    let avail = bottom - 14.0 - score_h - more_h - tick_h - rows_top;
+    // Rows share the pane's height up to 112 px each; past 42 px everything in them grows with it
+    // (`g`, 0 to 1), so a few journeys fill the pane rather than sit at its top.
+    let rh = (avail / rows.len().max(1) as f32).clamp(24.0, 112.0);
+    let g = ((rh - 42.0) / 70.0).clamp(0.0, 1.0);
+    let name_w = 196.0 + 40.0 * g;
+    let value_w = 76.0 + 24.0 * g;
+    let (ax0, ax1) = (x0 + name_w + 12.0, x1 - value_w);
     // One axis for every row, wide enough for every interval (a regression is never cut off), with
     // room on both sides of no change.
     // `--equivalence 0` draws no band; 100% or more one that stops short of minus infinity.
@@ -414,40 +474,42 @@ fn forest_svg(svg: &mut Svg, card: &Forest, top: f32, bottom: f32) {
     arrow(svg, mid - 12.0 - wb - 12.0, head_y - 5.5, true, Ink::Muted);
     svg.text(mid + 12.0, head_y - 1.0, (15.0, false), Ink::Muted, "start", "worse");
     arrow(svg, mid + 12.0 + ww + 12.0, head_y - 5.5, false, Ink::Muted);
-    let score_h = if card.score.1.is_empty() { 34.0 } else { 58.0 };
-    let more_h = if card.hidden > 0 { 26.0 } else { 0.0 };
-    let tick_h = 26.0;
-    let rows_top = head_y + 16.0;
-    let avail = bottom - 14.0 - score_h - more_h - tick_h - rows_top;
-    let rh = (avail / rows.len().max(1) as f32).clamp(24.0, 42.0);
     let rows_bottom = rows_top + rh * rows.len() as f32;
     // The bound, shaded across the rows.
     let (b0, b1) = (px(band.0), px(band.1));
     svg.rect(b0, rows_top, (b1 - b0).max(1.0), rows_bottom - rows_top, Ink::Band);
     svg.line(zero, rows_top, zero, rows_bottom, Ink::Muted);
-    let name_size = if rh >= 34.0 { 17.0 } else { 15.0 };
+    let name_size = if rh >= 34.0 { 17.0 + 7.0 * g } else { 15.0 };
+    let (sub_size, note_size, tick_size) = (12.0 + 4.0 * g, 14.0 + 3.0 * g, 13.0 + 2.0 * g);
+    let (dot, whisker, bar) = (5.5 + 2.5 * g, 6.0 + 3.0 * g, 2.0 + g);
     for (i, row) in rows.iter().enumerate() {
         let cy = rows_top + rh * (i as f32 + 0.5);
         if i > 0 {
             svg.line(x0, (rows_top + rh * i as f32).round() + 0.5, x1, (rows_top + rh * i as f32).round() + 0.5, Ink::Line);
         }
         let two = !row.metric.is_empty() && rh >= 36.0;
-        let ny = if two { cy - 2.0 } else { cy + name_size * 0.35 };
-        svg.text(x0, ny, (name_size, row.hero), Ink::Fg, "start", &clip(&row.name, name_w, name_size, row.hero));
+        let k = name_size / 17.0;
+        let ny = if two { cy - 2.0 * k } else { cy + name_size * 0.35 };
+        squeezed(svg, (x0, ny), (name_size, row.hero), Ink::Fg, &row.name, name_w, 0.8);
         if two {
-            svg.text(x0, cy + 14.0, (12.0, false), Ink::Muted, "start", &clip(&row.metric, name_w, 12.0, false));
+            squeezed(svg, (x0, cy + 14.0 * k), (sub_size, false), Ink::Muted, &row.metric, name_w, 0.8);
         }
         let ink = tone_ink(row.tone);
         let ink = if ink == Ink::Fg { Ink::Plain } else { ink };
         match row.ci {
             Some((lo, est, hi)) => {
                 let (a, b) = (px(lo), px(hi));
-                svg.rect(a, cy - 1.0, (b - a).max(1.0), 2.0, ink);
-                svg.rect(a - 0.5, cy - 6.0, 1.5, 12.0, ink);
-                svg.rect(b - 1.0, cy - 6.0, 1.5, 12.0, ink);
-                svg.dot(px(est), cy, 5.5, ink);
+                svg.rect(a, cy - bar / 2.0, (b - a).max(1.0), bar, ink);
+                svg.rect(a - 0.5, cy - whisker, 1.5, 2.0 * whisker, ink);
+                svg.rect(b - 1.0, cy - whisker, 1.5, 2.0 * whisker, ink);
+                svg.dot(px(est), cy, dot, ink);
             }
-            None => svg.text(ax0, cy + 5.0, (14.0, false), Ink::Muted, "start", &clip(&row.note, ax1 - ax0, 14.0, false)),
+            None => {
+                // On the background, so no change's line does not run through the words.
+                let nw = measure(&row.note, note_size, false).min(ax1 - ax0) + 12.0;
+                svg.rect(ax0 - 6.0, cy - note_size * 0.7, nw, note_size * 1.4, Ink::Bg);
+                squeezed(svg, (ax0, cy + 5.0 * note_size / 14.0), (note_size, false), Ink::Muted, &row.note, ax1 - ax0, 0.8);
+            }
         }
         let vink = match row.tone {
             Tone::Plain => Ink::Muted,
@@ -456,8 +518,8 @@ fn forest_svg(svg: &mut Svg, card: &Forest, top: f32, bottom: f32) {
         svg.text(x1, cy + name_size * 0.35, (name_size, true), vink, "end", &row.value);
     }
     // Ticks: no change, and up to two round changes either side that the axis reaches.
-    let mut y = rows_bottom + 18.0;
-    svg.text(zero, y, (13.0, false), Ink::Muted, "middle", "0");
+    let mut y = rows_bottom + 18.0 + 2.0 * g;
+    svg.text(zero, y, (tick_size, false), Ink::Muted, "middle", "0");
     // Changes in the metric's own direction label the axis only when every row reads it that way
     // (lower is better); a row plotted negated would read them backwards.
     let marks: [(f64, &str); 12] =
@@ -475,16 +537,16 @@ fn forest_svg(svg: &mut Svg, card: &Forest, top: f32, bottom: f32) {
         }
         last_x.push(tx);
         svg.line(tx.round() + 0.5, rows_bottom, tx.round() + 0.5, rows_bottom + 5.0, Ink::Muted);
-        svg.text(tx, y, (13.0, false), Ink::Muted, "middle", &label);
+        svg.text(tx, y, (tick_size, false), Ink::Muted, "middle", &label);
     }
     if card.hidden > 0 {
         y += 24.0;
         svg.text(x0, y, (15.0, false), Ink::Muted, "start", &format!("and {} more in the report", card.hidden));
     }
     let sy = bottom - 14.0 - if card.score.1.is_empty() { 0.0 } else { 24.0 };
-    svg.text(x0, sy, (18.0, true), Ink::Fg, "start", &clip(&card.score.0, x1 - x0, 18.0, true));
+    squeezed(svg, (x0, sy), (18.0, true), Ink::Fg, &card.score.0, x1 - x0, 0.7);
     if !card.score.1.is_empty() {
-        svg.text(x0, sy + 24.0, (15.0, false), Ink::Muted, "start", &clip(&card.score.1, x1 - x0, 15.0, false));
+        squeezed(svg, (x0, sy + 24.0), (15.0, false), Ink::Muted, &card.score.1, x1 - x0, 0.75);
     }
 }
 

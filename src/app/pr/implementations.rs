@@ -138,10 +138,29 @@ fn pairs_span(series: &[&Value]) -> String {
     }
 }
 
+/// What a launch journey's `launch.ready` waited for, read from its launches: `time until the window
+/// settles` (or first paints, or reaches a milestone) when ready fell on that moment in every launch
+/// of both sides; None for a selector, a window that showed, or a series that is not a launch.
+pub fn ready_noun(s: &Value) -> Option<String> {
+    if s["kind"] != "launch" || s["primary"]["metric"] != "launch.ready" {
+        return None;
+    }
+    let blocks: Vec<&Value> = s["blocks"].as_array()?.iter().filter(|b| b["values"]["launch.ready"].is_number()).collect();
+    let mut ends: Vec<String> = vec!["launch.settled".into(), "launch.painted".into()];
+    let milestones =
+        blocks.first()?["values"].as_object()?.keys().filter(|k| k.starts_with("launch.") && !k.starts_with("launch.node.") && *k != "launch.ready" && !ends.contains(k)).cloned().collect::<Vec<_>>();
+    ends.extend(milestones);
+    let end = ends.into_iter().find(|m| blocks.iter().all(|b| (f(&b["values"][m.as_str()]) - f(&b["values"]["launch.ready"])).abs() < 1e-6))?;
+    Some(match end.as_str() {
+        "launch.settled" => "time until the window settles".into(),
+        "launch.painted" => "time until the window first paints".into(),
+        m => format!("time until {}", m.trim_start_matches("launch.")),
+    })
+}
+
 /// What the CPU of each side summed: `CPU sums every app process (Original 5, Rewrite 1;
-/// server excluded)`.
-pub fn cpu_scope(r: &Value) -> String {
-    let (bn, hn) = side_names(r);
+/// server excluded)`, with the side names given.
+pub fn cpu_scope(r: &Value, (bn, hn): (&str, &str)) -> String {
     let (b, h) = variants(r);
     let count = |v: &Value| v["process_set"]["median_count"].as_f64();
     let server = if r["fixture"].is_object() { "; server excluded" } else { "" };
@@ -151,8 +170,9 @@ pub fn cpu_scope(r: &Value) -> String {
     }
 }
 
-/// The fairness line's parts: machine, window, data, input, what CPU summed, pairs.
-pub fn fairness(r: &Value, series: &[&Value]) -> (Vec<String>, Vec<String>) {
+/// The fairness line's parts: machine, window, data, input, what CPU summed (with these side
+/// names), pairs.
+pub fn fairness(r: &Value, series: &[&Value], names: (&str, &str)) -> (Vec<String>, Vec<String>) {
     let w = &r["fairness"]["window"];
     let window = match (w["client_dip"][0].as_f64(), w["client_dip"][1].as_f64()) {
         (Some(x), Some(y)) => {
@@ -170,7 +190,7 @@ pub fn fairness(r: &Value, series: &[&Value]) -> (Vec<String>, Vec<String>) {
         if r["fixture"].is_object() { "same server and data".into() } else { String::new() },
         if r["fairness"]["input"] == "os" { "OS input to both".into() } else { String::new() },
     ];
-    (first, vec![cpu_scope(r), pairs_span(series)])
+    (first, vec![cpu_scope(r, names), pairs_span(series)])
 }
 
 impl<'a> Doc<'a> {
@@ -218,7 +238,7 @@ impl<'a> Doc<'a> {
             out += &format!("- **{}:** {}\n", cell(&self.title(s)), self.journey_line(s, board.alone(i), fam.compared));
         }
         out += "\n";
-        let (a, b) = fairness(r, &self.series);
+        let (a, b) = fairness(r, &self.series, (&bn, &hn));
         out += &format!("{}.\n\n", cell(&fmt::fields(a.into_iter().chain(b))));
         // What a Care metric other than CPU sums on each side, where every reader sees it (the fairness
         // line says it for CPU).
@@ -341,7 +361,7 @@ impl<'a> Doc<'a> {
         let o = self.primary_out(s);
         let (w, n) = wins(&pairs(s), m);
         let medians = format!("medians {}", before_after(c));
-        let thing = self.noun_in(s, m);
+        let thing = ready_noun(s).map(|n| capitalize(&n)).unwrap_or_else(|| self.noun_in(s, m));
         let same = same_line(s);
         let line = match o {
             Out::Better | Out::Worse if !beyond_margin(c) => {
@@ -588,7 +608,7 @@ impl<'a> Doc<'a> {
             };
             t += &format!("- **Fixture:** {} started per block outside both apps{seed}{connected}{cpu}\n", code(&scrub_paths(fx["command"].as_str().unwrap_or(""))));
         }
-        let scope = cpu_scope(r);
+        let scope = cpu_scope(r, (&bn, &hn));
         if !scope.is_empty() {
             t += &format!("- **What CPU counts:** {}\n", cell(&scope));
         }

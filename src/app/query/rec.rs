@@ -561,7 +561,7 @@ fn batch_sql(token: &str, parts: &[Part]) -> String {
     let width = parts.iter().map(|p| p.width()).max().unwrap_or(0);
     let selects: Vec<String> = parts
         .iter()
-        .map(|p| format!("select {} as part, *{} from (\n{}\n)", PARTS.iter().position(|x| x == p).unwrap_or(0), ", null".repeat(width - p.width()), p.sql()))
+        .map(|p| format!("select {} as part, *{} from (\n{}\n)", PARTS.iter().position(|x| x == p).unwrap_or(0), ", null".repeat(width - p.width()), p.sql().replace(IN_WINDOW, IN_RUN)))
         .collect();
     format!("{}\n{};", windows_sql(token), selects.join("\nunion all\n"))
 }
@@ -575,7 +575,12 @@ fn cell_cmp(x: &[Option<String>], y: &[Option<String>], i: usize) -> std::cmp::O
     }
 }
 
-/// `_w`: the trace's run and phase windows between `strobe:<token>:…:start|end` marks.
+/// A slice in a run window, as each part joins it; and in a run window outside its untimed stretches.
+const IN_WINDOW: &str = "s.ts >= w.t0 and s.ts < w.t1";
+const IN_RUN: &str = "s.ts >= w.t0 and s.ts < w.t1 and not exists (select 1 from _u u where s.ts >= u.t0 and s.ts < u.t1)";
+
+/// `_w`: the trace's run windows between `strobe:<token>:…:start|end` marks; `_u`: the runs' untimed
+/// stretches (`ctx.untimed`), whose slices no part counts (`IN_RUN`).
 fn windows_sql(token: &str) -> String {
     format!(
         "create perfetto table _m as
@@ -584,7 +589,10 @@ fn windows_sql(token: &str) -> String {
 create perfetto table _w as
   select substr(a.name, 1, length(a.name) - 6) as k, a.ts as t0, b.ts as t1, a.upid as upid
   from _m a join _m b on b.name = substr(a.name, 1, length(a.name) - 6) || ':end'
-  where a.name glob '*:start' and a.name not glob '*:phase:*';"
+  where a.name glob '*:start' and a.name not glob '*:phase:*' and a.name not glob '*:untimed:*';
+create perfetto table _u as
+  select a.ts as t0, b.ts as t1 from _m a join _m b on b.name = substr(a.name, 1, length(a.name) - 6) || ':end'
+  where a.name glob '*:untimed:*:start';"
     )
 }
 

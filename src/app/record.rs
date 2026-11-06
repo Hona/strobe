@@ -428,7 +428,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     let profile = profiler.map(probe::gecko::Profiler::stop).transpose()?;
     if let Some(raw) = profile {
         progress("reading Firefox's profile");
-        let got = probe::gecko::convert(&raw, &token, &[("run:0".to_string(), t0, t1)], &dir)?;
+        let got = probe::gecko::convert(&raw, &token, &[("run:0".to_string(), t0, t1)], &[], &dir)?;
         probe::symbols::store_maps(&page, &got.scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
@@ -461,7 +461,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     let os_frames = match presents {
         Some(Ok(p)) => {
             let display = host::main_window(&tree).and_then(|w| host::display_of(w.hwnd));
-            let f = crate::probe::present::frames::native_values(&p, &tree, &[(t0, t1)], display.as_ref());
+            let f = crate::probe::present::frames::native_values(&p, &tree, &[crate::metrics::Timed::whole(t0, t1)], display.as_ref());
             // What `query <rec> frames` reads for a recording without a trace, as a native one's.
             crate::symbol::write_gz(&dir.join("presents.json.gz"), &p)?;
             store::write_json(&dir.join("frames.json"), &json!({ "pids": tree, "runs": { "run:0": { "t0_ns": t0, "t1_ns": t1, "inputs": [], "marks": [], "changes": [] } } }))?;
@@ -634,7 +634,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let os_frames = match &presents {
             Some(Ok(p)) => {
                 let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
-                let f = crate::probe::present::frames::native_values(p, &n.pids(), &[(t0, t1)], display.as_ref());
+                let f = crate::probe::present::frames::native_values(p, &n.pids(), &[crate::metrics::Timed::whole(t0, t1)], display.as_ref());
                 frame_values = f.values;
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
                 json!({ "events": p.events, "events_lost": p.events_lost, "consumer_cpu_ms": p.consumer_cpu_ms, "refused": f.refused, "refused_metrics": f.partial, "display": display })
@@ -744,7 +744,16 @@ pub fn per_process(procs: &[host::ProcTimes]) -> Cycles {
 /// between counts from zero, and one that exited takes its CPU with it instead of lowering the others'
 /// sum (a launcher that handed over, a utility process that ended).
 pub fn cycles_used(a: &Cycles, b: &Cycles) -> u64 {
-    b.iter().map(|(k, c)| c.saturating_sub(a.get(k).copied().unwrap_or(0))).sum()
+    cycles_timed(&[a, b], |_| true)
+}
+
+/// Cycles used over a run's timed parts, of the processes `keep` takes (by pid): `edges` are the
+/// readings at the run's start, at each untimed stretch's start and end (`ctx.untimed`), and at the
+/// run's end, so each pair is a timed part. Each part is `cycles_used` of its own readings: a process
+/// born in a stretch counts from the stretch's end, and one that exits in a stretch keeps what it used
+/// before it.
+pub fn cycles_timed(edges: &[&Cycles], keep: impl Fn(u32) -> bool) -> u64 {
+    edges.as_chunks::<2>().0.iter().map(|[a, b]| b.iter().filter(|(k, _)| keep(k.0)).map(|(k, c)| c.saturating_sub(a.get(k).copied().unwrap_or(0))).sum::<u64>()).sum()
 }
 
 /// A new recording's id and folder, held as a draft until its meta.json is written: `--id` (a handle

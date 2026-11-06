@@ -1139,18 +1139,24 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
     let mut runs_json = Vec::new();
     let mut slow: Vec<(f64, String, &'static str)> = Vec::new();
     for (run, r) in f["runs"].as_object().into_iter().flatten() {
-        let (t0, t1) = (r["t0_ns"].as_u64().unwrap_or(0), r["t1_ns"].as_u64().unwrap_or(0));
-        let shown = crate::probe::present::frames::from_presents(&presents.presents, &pids, t0, t1);
-        let mut screens: Vec<u64> = shown.shown.iter().map(|s| s.screen_ns).collect();
+        // The run's span without its untimed stretches (none in a recording from before them).
+        let timed = crate::metrics::Timed {
+            t0: r["t0_ns"].as_u64().unwrap_or(0),
+            t1: r["t1_ns"].as_u64().unwrap_or(0),
+            untimed: r["untimed"].as_array().into_iter().flatten().filter_map(|g| Some((g[0].as_u64()?, g[1].as_u64()?))).collect(),
+        };
+        let shown = crate::probe::present::frames::from_timed(&presents.presents, &pids, &timed);
+        let mut screens: Vec<(usize, u64)> = shown.shown.iter().map(|s| (s.seg, s.screen_ns)).collect();
         screens.sort_unstable();
-        let mut gaps: Vec<f64> = screens.windows(2).map(|w| (w[1] - w[0]) as f64 / 1e6).collect();
+        let mut gaps: Vec<f64> = screens.windows(2).filter(|w| w[0].0 == w[1].0).map(|w| (w[1].1 - w[0].1) as f64 / 1e6).collect();
         gaps.sort_by(f64::total_cmp);
         let inputs = r["inputs"].as_array().cloned().unwrap_or_default();
         let kind = |k: &str| inputs.iter().filter(|i| i["kind"] == k).count();
         let sent: Vec<crate::probe::present::frames::Sent> = inputs
             .iter()
             .filter(|i| i["kind"] == "discrete" || (i["kind"] == "scroll" && i["first"] == true))
-            .map(|i| crate::probe::present::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll" })
+            .map(|i| crate::probe::present::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll", press: i["press_ns"].as_u64(), acted: i["acted"].as_bool() })
+            .filter(|s| !timed.untimed_at(s.t_ns) && !s.press.is_some_and(|p| timed.untimed_at(p)))
             .collect();
         // Each change as its earliest and latest time; a recording from before kept one time, the latest.
         let changes: Vec<crate::probe::present::frames::Change> = r["changes"]
@@ -1158,16 +1164,18 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
             .into_iter()
             .flatten()
             .filter_map(|c| match (c.as_u64(), c[0].as_u64(), c[1].as_u64()) {
-                (Some(t), _, _) => Some(crate::probe::present::frames::notified(t)),
-                (None, Some(lo), Some(hi)) => Some((lo, hi)),
+                (Some(t), _, _) => Some(crate::probe::present::frames::notified(t, false)),
+                (None, Some(lo), Some(hi)) => Some(crate::probe::present::frames::Change(lo, hi, c[2].as_bool().unwrap_or(false))),
                 _ => None,
             })
             .collect();
         let got = crate::probe::present::frames::reactions(&sent, &changes, &presents.presents, &pids, quiet);
-        slow.extend(got.interaction.iter().map(|ms| (*ms, run.clone(), "input")));
+        let pressed = |e: crate::probe::present::frames::Edge| if e == crate::probe::present::frames::Edge::Press { "press" } else { "input" };
+        slow.extend(got.interaction.iter().map(|(ms, e)| (*ms, run.clone(), pressed(*e))));
         slow.extend(got.scroll.iter().map(|ms| (*ms, run.clone(), "scroll")));
+        let untimed_ms = timed.untimed_in(timed.t0, timed.t1) as f64 / 1e6;
         text += &format!(
-            "{run:<8} {:>5} frames on screen · {} discarded · interval p50 {} · p95 {} · inputs {} ({} pointer, {} action) · latency p50 {}{}\n",
+            "{run:<8} {:>5} frames on screen · {} discarded · interval p50 {} · p95 {} · inputs {} ({} pointer, {} action) · latency p50 {} ({} at a press){}{}\n",
             shown.shown.len(),
             shown.discarded,
             fmt::value(metrics::percentile(&gaps, 0.5), "ms"),
@@ -1177,22 +1185,28 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
             kind("pattern"),
             fmt::value(
                 {
-                    let mut v = got.interaction.clone();
+                    let mut v: Vec<f64> = got.interaction.iter().map(|x| x.0).collect();
                     v.sort_by(f64::total_cmp);
                     metrics::percentile(&v, 0.5)
                 },
                 "ms"
             ),
+            got.presses(),
             if got.unchanged + got.busy.0 + got.unshown.0 > 0 {
                 format!(" · not counted: {} changed no tree, {} came mid-drawing, {} showed no frame", got.unchanged, got.busy.0, got.unshown.0)
             } else {
                 String::new()
             },
+            if timed.untimed.is_empty() { String::new() } else { format!(" · {} untimed left out ({} stretches)", fmt::value(untimed_ms, "ms"), timed.untimed.len()) },
         );
-        runs_json.push(json!({ "run": run, "frames": shown.shown.len(), "discarded": shown.discarded, "interval_p95": metrics::percentile(&gaps, 0.95), "latencies_ms": got.interaction, "scroll_latencies_ms": got.scroll, "unchanged": got.unchanged, "busy": got.busy, "unshown": got.unshown }));
+        runs_json.push(json!({
+            "run": run, "frames": shown.shown.len(), "discarded": shown.discarded, "interval_p95": metrics::percentile(&gaps, 0.95),
+            "latencies_ms": got.interaction.iter().map(|x| x.0).collect::<Vec<_>>(), "edges": got.interaction.iter().map(|x| x.1).collect::<Vec<_>>(),
+            "scroll_latencies_ms": got.scroll, "unchanged": got.unchanged, "busy": got.busy, "unshown": got.unshown, "untimed_ms": untimed_ms,
+        }));
     }
     slow.sort_by(|a, b| b.0.total_cmp(&a.0));
-    text += "slowest inputs (posted to the screen time of the frame that showed them)\n";
+    text += "slowest inputs (posted to the screen time of the frame that showed them; press: a click the app acted on at its press, timed from it)\n";
     for (ms, run, k) in slow.iter().take(top.min(10)) {
         text += &format!("  {:>9}  {run} {k}\n", fmt::value(*ms, "ms"));
     }

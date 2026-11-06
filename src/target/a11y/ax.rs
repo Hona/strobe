@@ -105,17 +105,18 @@ const MAX_NODES: usize = 50_000;
 
 #[derive(Default)]
 struct Signal {
-    changes: Mutex<(Changes, std::collections::VecDeque<u64>)>,
+    changes: Mutex<(Changes, std::collections::VecDeque<(u64, bool)>)>,
     cv: Condvar,
 }
 
 impl Signal {
-    fn bump(&self) {
+    /// A change heard now; `feedback`: focus moving only (`Accessibility::change_times`).
+    fn bump(&self, feedback: bool) {
         let now = crate::host::now_ns();
         let mut c = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         c.0.count += 1;
         c.0.last_ns = now;
-        c.1.push_back(now);
+        c.1.push_back((now, feedback));
         if c.1.len() > 65_536 {
             c.1.pop_front();
         }
@@ -123,10 +124,11 @@ impl Signal {
     }
 }
 
-extern "C" fn on_notification(_obs: CFTypeRef, _el: CFTypeRef, _name: CFTypeRef, refcon: *mut c_void) {
+extern "C" fn on_notification(_obs: CFTypeRef, _el: CFTypeRef, name: CFTypeRef, refcon: *mut c_void) {
     if !refcon.is_null() {
+        let focus = cf_string(name).is_some_and(|n| matches!(n.as_str(), "AXFocusedUIElementChanged" | "AXFocusedWindowChanged"));
         // The observer thread holds the Arc for as long as the observer exists.
-        unsafe { (*(refcon as *const Signal)).bump() };
+        unsafe { (*(refcon as *const Signal)).bump(focus) };
     }
 }
 
@@ -673,7 +675,7 @@ impl Accessibility for Ax {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
-    fn change_times(&self) -> Vec<u64> {
+    fn change_times(&self) -> Vec<(u64, bool)> {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect()
     }
 

@@ -39,18 +39,19 @@ pub struct Uia {
 /// Change events, counted; waiters sleep on the condvar.
 #[derive(Default)]
 struct Signal {
-    changes: Mutex<(Changes, std::collections::VecDeque<u64>)>,
+    changes: Mutex<(Changes, std::collections::VecDeque<(u64, bool)>)>,
     cv: Condvar,
     pids: Mutex<Vec<u32>>,
 }
 
 impl Signal {
-    fn bump(&self) {
+    /// A change heard now; `feedback`: focus moving only (`Accessibility::change_times`).
+    fn bump(&self, feedback: bool) {
         let now = crate::host::now_ns();
         let mut c = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         c.0.count += 1;
         c.0.last_ns = now;
-        c.1.push_back(now);
+        c.1.push_back((now, feedback));
         if c.1.len() > 65_536 {
             c.1.pop_front();
         }
@@ -64,14 +65,15 @@ struct Events(Arc<Signal>);
 
 impl IUIAutomationStructureChangedEventHandler_Impl for Events_Impl {
     fn HandleStructureChangedEvent(&self, _: Option<&IUIAutomationElement>, _: StructureChangeType, _: *const SAFEARRAY) -> windows::core::Result<()> {
-        self.0.bump();
+        self.0.bump(false);
         Ok(())
     }
 }
 
 impl IUIAutomationPropertyChangedEventHandler_Impl for Events_Impl {
-    fn HandlePropertyChangedEvent(&self, _: Option<&IUIAutomationElement>, _: UIA_PROPERTY_ID, _: &VARIANT) -> windows::core::Result<()> {
-        self.0.bump();
+    fn HandlePropertyChangedEvent(&self, _: Option<&IUIAutomationElement>, property: UIA_PROPERTY_ID, _: &VARIANT) -> windows::core::Result<()> {
+        // A push button takes keyboard focus on the mouse press, before its release acts.
+        self.0.bump(property == UIA_HasKeyboardFocusPropertyId);
         Ok(())
     }
 }
@@ -81,7 +83,7 @@ impl IUIAutomationFocusChangedEventHandler_Impl for Events_Impl {
         // Focus events come from the whole desktop: only the app's count.
         let pid = sender.and_then(|s| unsafe { s.CachedProcessId() }.ok()).unwrap_or(0) as u32;
         if self.0.pids.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
-            self.0.bump();
+            self.0.bump(true);
         }
         Ok(())
     }
@@ -440,7 +442,7 @@ impl Accessibility for Uia {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
-    fn change_times(&self) -> Vec<u64> {
+    fn change_times(&self) -> Vec<(u64, bool)> {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect()
     }
 

@@ -22,7 +22,7 @@ create perfetto table _m as
 create perfetto table _w as
   select substr(a.name, 1, length(a.name) - 6) as k, a.ts as t0, b.ts as t1, a.upid as upid
   from _m a join _m b on b.name = substr(a.name, 1, length(a.name) - 6) || ':end'
-  where a.name glob '*:start' and a.name not glob '*:phase:*';
+  where a.name glob '*:start' and a.name not glob '*:phase:*' and a.name not glob '*:untimed:*';
 select s.id, w.k, (s.ts - w.t0) / 1e6, extract_arg(s.arg_set_id, 'debug.data.score'), a.key, a.display_value
   from slice s join thread_track tt on s.track_id = tt.id join thread t using(utid)
   join _w w on t.upid = w.upid and s.ts >= w.t0 and s.ts < w.t1

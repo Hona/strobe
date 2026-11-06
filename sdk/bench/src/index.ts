@@ -44,6 +44,12 @@ export interface Options {
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
   goto(url: string, opts?: Options): Promise<void>
+  /**
+   * A single click is one `interaction.*` sample: from its press when the target changed between the press and the
+   * release (it acts on the press: tabs, menus, many native controls; `interaction.n.press` counts them), else from
+   * its release. Double and triple clicks are none. Chromium times its press and release events each from its own
+   * trace, two samples.
+   */
   click(selector: Element, opts?: ClickOptions): Promise<void>
   /** Moves the pointer onto `selector` without a click: reveals hover-only controls, or parks the pointer. */
   hover(selector: Element, opts?: Options): Promise<void>
@@ -109,6 +115,17 @@ export interface Context<P> {
   case: string
   /** Marks a named span inside a run; every metric can be sliced by it, and `phase.<name>` is its wall time. */
   phase<T>(name: string, fn: () => T | Promise<T>): Promise<T>
+  /**
+   * Leaves `fn`'s time out of the run: a wait between steps that is not the journey (`await ctx.untimed(() =>
+   * page.idle())` between two clicks). Its wall time and the target's CPU in it (`cpu.*`, `ui.*`, `io.*`, `main.*`)
+   * leave the run's totals, frames begun in it leave `frames.*`, `ctx.count` in it counts nothing, and inputs sent in
+   * it are no `interaction.*` samples (an input just before it still is: its frame may come during it). For waits:
+   * work started in it can leave a cost the run pays after it. A run total strobe cannot take a stretch out of
+   * (`gpu.process.3d`, `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.*`, `canvas.*`, `js.heap.retained`)
+   * is refused `Untimed` in a block whose runs used it. Outside a run (setup, reset) nothing is timed and it just
+   * calls `fn`; one inside another, and `ctx.phase` inside one, are errors.
+   */
+  untimed<T>(fn: () => T | Promise<T>): Promise<T>
   /** Adds `n` (default 1) to the `count.<name>` metric of the current run. Outside a run it counts nothing. */
   count(name: string, n?: number): void
   /** Calls an export of a `script()` target's module in its process and returns what it returned (JSON). */

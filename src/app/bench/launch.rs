@@ -493,8 +493,12 @@ pub(super) fn memory(procs: &[host::ProcTimes], values: &mut BTreeMap<String, f6
     values.extend(probe::memory::Reading::take(procs, "when the launch was ready").values().into_iter().map(|(k, v)| (k.to_string(), v)));
 }
 
-pub(super) fn no_page(_: &str, _: &Value) -> Result<Value> {
-    Err(Error::msg("a launch case's hooks have no page driver: a launch is timed from outside the app"))
+pub(super) fn no_page(op: &str, _: &Value) -> Result<Value> {
+    match op {
+        // A launch case's hooks are never timed: nothing to leave out.
+        "untimed" => Ok(Value::Bool(false)),
+        _ => Err(Error::msg("a launch case's hooks have no page driver: a launch is timed from outside the app")),
+    }
 }
 
 pub(super) fn milestones(spec: &Value) -> Result<Vec<Milestone>> {

@@ -564,16 +564,18 @@ impl Driver {
             // A frame of what came before (the move's hover, an earlier step) settles before the press.
             let quiet = self.settle(Duration::ZERO)?;
             for _ in 1..=count {
+                let pressed = crate::host::now_ns();
                 p.actions(json!([pointer(vec![json!({ "type": "pointerDown", "button": n })])]))?;
                 if count == 1 {
-                    // Held until the pressed look is on the screen and settled (SPEC 7.4); a target that
-                    // was still drawing before the press is held the minimum only.
+                    // Held until what the press drew is on the screen and settled (SPEC 7.4); a target
+                    // that was still drawing before the press is held the minimum only. A page that
+                    // acts on the press (`mousedown`) is timed from it.
                     if quiet {
                         self.settle(gap)?;
                     } else {
                         std::thread::sleep(gap);
                     }
-                    self.input_at(false);
+                    self.input_at(false, Some(pressed));
                 } else {
                     // A double or triple click's presses follow at once: no settling inside the gesture,
                     // and no sample (SPEC 7.4).
@@ -593,10 +595,10 @@ impl Driver {
         result
     }
 
-    /// An input time for `interaction.*` (a single click's release, a key press, a button's `up`) or
-    /// `scroll.latency.*` (a scroll's first step).
-    fn input_at(&self, scroll: bool) {
-        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll });
+    /// An input time for `interaction.*` (a single click's release with its press, a key press, a
+    /// button's `up`) or `scroll.latency.*` (a scroll's first step).
+    fn input_at(&self, scroll: bool, press: Option<u64>) {
+        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll, press, acted: None });
     }
 
     /// Follows the page's OS presents (a headed page whose engine reports no frames of its own): a
@@ -659,7 +661,7 @@ impl Driver {
             self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
         } else if sample {
             // A release is a sample, as a native app's is (SPEC 7.4).
-            self.input_at(false);
+            self.input_at(false, None);
         }
         self.mouse(if down { "mousePressed" } else { "mouseReleased" }, (x, y), Some(b), mask, 1, 0)
     }
@@ -887,7 +889,7 @@ impl Driver {
                 let delta = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
                 let (mask, last) = self.buttons.get();
                 self.settle(Duration::ZERO)?;
-                self.input_at(true);
+                self.input_at(true, None);
                 match &self.page {
                     Page::Chromium(p) => {
                         p.send(
@@ -999,7 +1001,7 @@ impl Driver {
     /// with it) go down as keys around it, in one action list.
     fn stroke(&self, key: Key, extra: i64) -> Result<()> {
         let m = self.mods.get() | extra;
-        self.input_at(false);
+        self.input_at(false, None);
         match &self.page {
             Page::Chromium(_) => {
                 self.key_event(key, true, m)?;
@@ -1042,7 +1044,7 @@ impl Driver {
             if k > 1 {
                 self.pacer.wait(start + Duration::from_secs_f64(frame * (k - 1) as f64 / 1e3), Duration::from_secs_f64(frame / 1e3));
             } else {
-                self.input_at(true);
+                self.input_at(true, None);
             }
             let f = k as f64 / steps as f64;
             let to = ((dx * f).round(), (dy * f).round());
@@ -1116,7 +1118,7 @@ impl Driver {
         }
         self.mods.set(if down { self.mods.get() | bit } else { self.mods.get() & !bit });
         if down && bit == 0 {
-            self.input_at(false);
+            self.input_at(false, None);
         }
         self.key_event(key, down, self.mods.get())
     }

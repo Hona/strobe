@@ -508,8 +508,9 @@ fn sample_node(t: &Thread, stack: Option<usize>, idle: Option<u64>, p: &mut CpuP
 /// Turns the profile Firefox wrote (`raw`) into the recording's sources in `dir`: `cpu-g<thread>-<run>.cpuprofile`
 /// per page thread and measured run (`runs`: run key and host-clock span), `gecko.json` with the
 /// views' rows, and the profile itself, gzipped. The page's processes are those holding strobe's run
-/// marks (`token`). Refuses a profile that lost a run's samples.
-pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], dir: &Path) -> Result<Converted> {
+/// marks (`token`). Samples in the runs' untimed stretches (`untimed`, host clock) are none of them.
+/// Refuses a profile that lost a run's samples.
+pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], untimed: &[(u64, u64)], dir: &Path) -> Result<Converted> {
     let bytes = std::fs::read(raw).map_err(|e| Error::msg(format!("Firefox's profile {}: {e}", raw.display())))?;
     let profile = read_profile(&bytes)?;
     let all = threads(&profile)?;
@@ -549,7 +550,7 @@ pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], dir: &Path)
             return Err(Refusal::new(ValidatorId::ClockUnsynced, summary).into());
         }
     }
-    let window_of = |ts: i64| windows.iter().position(|w| ts >= w.1 && ts < w.2);
+    let window_of = |ts: i64| windows.iter().position(|w| ts >= w.1 && ts < w.2).filter(|_| !untimed.iter().any(|&(a, b)| ts >= a as i64 && ts < b as i64));
     // Each process's name, from its threads.
     let mut process_names: HashMap<u64, String> = HashMap::new();
     let mut todo = vec![&profile];

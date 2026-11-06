@@ -20,6 +20,9 @@ pub struct Input {
     pub kind: &'static str,
     /// A scroll step that starts a gesture (the first of a `scroll` or a lone `wheel`).
     pub first: bool,
+    /// A single click's release: when its press was posted (`frames::Sent::press`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub press_ns: Option<u64>,
 }
 
 /// What a run's page calls did: inputs and phase marks, both on the host clock.
@@ -29,6 +32,23 @@ pub struct Log {
     pub marks: Vec<(String, u64)>,
     /// Each drag's move times (a button held by `down` or `drag`), for `input.rate`.
     pub drags: Vec<Vec<u64>>,
+}
+
+impl Log {
+    /// The inputs a latency is measured from (a click's release with its press, a key press, a
+    /// scroll's first wheel step), those `ctx.untimed` left out of the run excepted.
+    pub fn sent(&self, run: &crate::metrics::Timed) -> Vec<crate::probe::present::frames::Sent> {
+        self.inputs
+            .iter()
+            .filter(|i| (i.kind == "discrete" || (i.kind == "scroll" && i.first)) && !run.untimed_at(i.t_ns) && !i.press_ns.is_some_and(|p| run.untimed_at(p)))
+            .map(|i| crate::probe::present::frames::Sent { t_ns: i.t_ns, scroll: i.kind == "scroll", press: i.press_ns, acted: None })
+            .collect()
+    }
+
+    /// Drags begun in the run's timed stretches.
+    pub fn timed_drags(&self, run: &crate::metrics::Timed) -> Vec<Vec<u64>> {
+        self.drags.iter().filter(|d| d.first().is_none_or(|t| !run.untimed_at(*t))).cloned().collect()
+    }
 }
 
 pub use imp::Session;
@@ -183,8 +203,9 @@ mod imp {
             self.poster.release_all(self.main.get());
         }
 
-        /// Times of the accessibility changes heard so far (the newest 65,536).
-        pub fn changes(&self) -> Vec<u64> {
+        /// Times of the accessibility changes heard so far (the newest 65,536), each with whether it was
+        /// press feedback only.
+        pub fn changes(&self) -> Vec<(u64, bool)> {
             self.a11y.change_times()
         }
 
@@ -195,7 +216,7 @@ mod imp {
 
         fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
             self.last_input.set(t_ns);
-            self.log.borrow_mut().inputs.push(Input { t_ns, kind, first });
+            self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None });
         }
 
         /// The app's windows to search, main first: `window` (a title, or part of one) picks one.
@@ -413,7 +434,7 @@ mod imp {
         fn busy(&self, t: Duration, changes: u64, presents: &RefCell<Option<PresentCapture>>) -> Error {
             let now = host::now_ns();
             let since = now.saturating_sub(1_000_000_000);
-            let recent = self.a11y.change_times().iter().filter(|&&c| c > since).count();
+            let recent = self.a11y.change_times().iter().filter(|c| c.0 > since).count();
             // Each step finds the next present after the last one found; a second of frames is at most a few hundred.
             let frames = presents.borrow_mut().as_mut().map(|p| {
                 let (mut n, mut after) = (0usize, since);
@@ -703,12 +724,15 @@ mod imp {
             let quiet = self.rest(Duration::ZERO, gap, presents)?;
             let mut last = 0;
             for k in 0..count {
-                // The press shows a pressed look at most; the release is the click's action, held
-                // as a person holds a click, until the pressed look is on the screen (the minimum
-                // only when the app was still drawing before the press). A double click's presses
-                // follow at once, with no settling inside the gesture, and its releases are no
-                // samples: only a single click's release is (SPEC 7.4).
-                self.input(self.poster.button(t, b, true, k > 0, mods, top)?, "pointer", false);
+                // The press shows a pressed look, or does the click (many native controls act on the
+                // press); the release does it otherwise. It is held as a person holds a click, until
+                // what the press drew is on the screen (the minimum only when the app was still
+                // drawing before the press): its time starts at the press, so a reaction to the
+                // press is measured from there (SPEC 7.4). A double click's presses follow at once,
+                // with no settling inside the gesture, and its releases are no samples: only a single
+                // click is.
+                let pressed = self.poster.button(t, b, true, k > 0, mods, top)?;
+                self.input(pressed, "pointer", false);
                 if count == 1 && quiet {
                     self.rest(Duration::from_millis(60), gap, presents)?;
                 } else {
@@ -716,6 +740,12 @@ mod imp {
                 }
                 last = self.poster.button(t, b, false, false, mods, top)?;
                 self.input(last, if count == 1 { kind } else { "pointer" }, false);
+                if count == 1
+                    && kind == "discrete"
+                    && let Some(i) = self.log.borrow_mut().inputs.last_mut()
+                {
+                    i.press_ns = Some(pressed);
+                }
             }
             self.until(opts, last, presents).map_err(|e| self.moved(e, &selector, opts, aimed))
         }

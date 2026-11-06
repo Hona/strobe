@@ -211,6 +211,15 @@ const context = (): any => ({
       await request("phase", { name, edge: "end" })
     }
   },
+  // Each edge waits for strobe's readings of the target, so the stretch starts after them and ends before them.
+  async untimed<T>(fn: () => T | Promise<T>) {
+    await request("untimed", { edge: "start" })
+    try {
+      return await fn()
+    } finally {
+      await request("untimed", { edge: "end" })
+    }
+  },
   count(name: string, n = 1) {
     void request("count", { name, n })
   },

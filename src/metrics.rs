@@ -6,6 +6,53 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// A run's span with the stretches the bench file left out of it (`ctx.untimed`, SPEC §9.6), on
+/// one clock (the host's, or a trace's): its timed totals, frames and inputs cover the rest.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Timed {
+    pub t0: u64,
+    pub t1: u64,
+    /// Inside `[t0, t1]`, in order, not overlapping.
+    pub untimed: Vec<(u64, u64)>,
+}
+
+impl Timed {
+    pub fn whole(t0: u64, t1: u64) -> Timed {
+        Timed { t0, t1, untimed: Vec::new() }
+    }
+
+    /// The stretches between the untimed ones, in order.
+    pub fn segments(&self) -> Vec<(u64, u64)> {
+        let mut out = Vec::new();
+        let mut at = self.t0;
+        for &(a, b) in &self.untimed {
+            if a > at {
+                out.push((at, a));
+            }
+            at = at.max(b);
+        }
+        if self.t1 > at {
+            out.push((at, self.t1));
+        }
+        out
+    }
+
+    /// Whether `t` is in an untimed stretch.
+    pub fn untimed_at(&self, t: u64) -> bool {
+        self.untimed.iter().any(|&(a, b)| t >= a && t < b)
+    }
+
+    /// The untimed time inside `[a, b)`.
+    pub fn untimed_in(&self, a: u64, b: u64) -> u64 {
+        self.untimed.iter().map(|&(x, y)| y.min(b).saturating_sub(x.max(a))).sum()
+    }
+
+    /// The run's timed length (ns).
+    pub fn ns(&self) -> u64 {
+        self.t1.saturating_sub(self.t0).saturating_sub(self.untimed_in(self.t0, self.t1))
+    }
+}
+
 /// A run or phase window between two `strobe:<token>:…:start|end` marks.
 #[derive(Clone, Debug, Serialize)]
 pub struct Window {
@@ -67,7 +114,13 @@ pub enum Outcome {
     Partial,
     Dropped,
     NoUpdate,
+    /// Where an untimed stretch's frames were (`BlockData::leave_out_untimed`): no interval spans it,
+    /// and it is no vsync.
+    Untimed,
 }
+
+/// The state of the frame `leave_out_untimed` puts where an untimed stretch's frames were.
+const UNTIMED_STATE: &str = "STROBE_UNTIMED";
 
 /// Merges a window's frame reports into one outcome per vsync, in time order.
 pub fn vsyncs(frames: &[Frame]) -> Vec<Vsync> {
@@ -84,6 +137,8 @@ pub fn vsyncs(frames: &[Frame]) -> Vec<Vsync> {
                 Vsync { ts, cost: f.dur, outcome: Outcome::Presented, split: f.split, report: f.id }
             } else if let Some(f) = pick("STATE_PRESENTED_PARTIAL") {
                 Vsync { ts, cost: f.dur, outcome: Outcome::Partial, split: f.split, report: f.id }
+            } else if group.iter().any(|f| f.state == UNTIMED_STATE) {
+                Vsync { ts, cost: 0, outcome: Outcome::Untimed, split: None, report: -1 }
             } else if group.iter().any(|f| f.state == "STATE_DROPPED") {
                 Vsync { ts, cost: 0, outcome: Outcome::Dropped, split: None, report: -1 }
             } else {
@@ -119,7 +174,7 @@ pub fn intervals(v: &[Vsync]) -> Vec<f64> {
                 }
                 last = Some(at);
             }
-            Outcome::NoUpdate => last = None,
+            Outcome::NoUpdate | Outcome::Untimed => last = None,
             Outcome::Dropped => {}
         }
     }
@@ -128,7 +183,7 @@ pub fn intervals(v: &[Vsync]) -> Vec<f64> {
 
 /// The vsync interval (ms): the median gap between consecutive sequence starts.
 pub fn vsync_ms(v: &[Vsync]) -> Option<f64> {
-    let gaps: Vec<f64> = v.windows(2).map(|w| (w[1].ts - w[0].ts) as f64 / 1e6).filter(|g| *g > 0.5 && *g < 50.0).collect();
+    let gaps: Vec<f64> = v.windows(2).filter(|w| w.iter().all(|s| s.outcome != Outcome::Untimed)).map(|w| (w[1].ts - w[0].ts) as f64 / 1e6).filter(|g| *g > 0.5 && *g < 50.0).collect();
     (gaps.len() >= 10).then(|| median(&gaps))
 }
 
@@ -139,20 +194,102 @@ pub struct BlockData {
     /// Per window key.
     pub frames: BTreeMap<String, Vec<Frame>>,
     pub tasks: BTreeMap<String, Vec<(i64, i64)>>,
-    pub latencies: BTreeMap<String, Vec<(i64, String)>>,
+    /// Input events' latencies: (event time, ns, event type).
+    pub latencies: BTreeMap<String, Vec<(i64, i64, String)>>,
     /// Layout shifts per window key: (ts, score). Only in traces with the `loading` category.
     pub shifts: BTreeMap<String, Vec<(i64, f64)>>,
-    /// Main-thread GC slice durations per window key (ns). Only in traces with `disabled-by-default-v8.gc`.
-    pub gc: BTreeMap<String, Vec<i64>>,
-    /// The GPU process's outermost shader and pipeline compile slices per window key (ns), on any of its
-    /// threads. Only in traces with the Dawn categories.
-    pub gpu_compile: BTreeMap<String, Vec<i64>>,
+    /// Main-thread GC slices per window key (ts, ns). Only in traces with `disabled-by-default-v8.gc`.
+    pub gc: BTreeMap<String, Vec<(i64, i64)>>,
+    /// The GPU process's outermost shader and pipeline compile slices per window key (ts, ns), on any
+    /// of its threads. Only in traces with the Dawn categories.
+    pub gpu_compile: BTreeMap<String, Vec<(i64, i64)>>,
     /// The page's own `performance.measure()` spans inside each window: (name, start, ns). Marks are
     /// instants on the thread's own track; a measure is an async slice, of any length (0 too).
     pub spans: BTreeMap<String, Vec<(String, i64, i64)>>,
+    /// Each run window's `ctx.untimed` stretches (trace clock), by the run's key: what `leave_out_untimed`
+    /// took out of it and its phases.
+    pub untimed: BTreeMap<String, Vec<(i64, i64)>>,
+}
+
+/// `[a, a + d)` without the stretches `gaps` (sorted), as (start, ns) pieces.
+fn outside(a: i64, d: i64, gaps: &[(i64, i64)]) -> Vec<(i64, i64)> {
+    let (mut out, mut at, end) = (Vec::new(), a, a + d);
+    for &(x, y) in gaps {
+        if y <= at || x >= end {
+            continue;
+        }
+        if x > at {
+            out.push((at, x - at));
+        }
+        at = at.max(y);
+    }
+    if end > at || (d == 0 && !gaps.iter().any(|&(x, y)| a >= x && a < y)) {
+        out.push((at, (end - at).max(0)));
+    }
+    out
 }
 
 impl BlockData {
+    /// Takes the `ctx.untimed` stretches (SPEC §9.6) out of the runs they were in, and out of those
+    /// runs' phases: their windows are `…:untimed:<run>.<n>`. Frames begun in one leave, with a frame
+    /// that wanted no update in their place (so no interval spans the stretch), as do input latencies
+    /// of events sent in one and layout shifts there; tasks, GC, compiles and the page's spans keep
+    /// only their parts outside them.
+    fn leave_out_untimed(&mut self) {
+        for w in self.windows.iter().filter(|w| w.key.contains(":untimed:")) {
+            let Some((head, rest)) = w.key.split_once(":untimed:") else { continue };
+            let run = rest.split('.').next().unwrap_or("");
+            self.untimed.entry(format!("{head}:run:{run}")).or_default().push((w.t0, w.t1));
+        }
+        self.windows.retain(|w| !w.key.contains(":untimed:"));
+        let run_or_phase = |k: &String| !k.contains(":untimed:");
+        self.frames.retain(|k, _| run_or_phase(k));
+        self.tasks.retain(|k, _| run_or_phase(k));
+        self.latencies.retain(|k, _| run_or_phase(k));
+        self.shifts.retain(|k, _| run_or_phase(k));
+        self.gc.retain(|k, _| run_or_phase(k));
+        self.gpu_compile.retain(|k, _| run_or_phase(k));
+        self.spans.retain(|k, _| run_or_phase(k));
+        for gaps in self.untimed.values_mut() {
+            gaps.sort_unstable();
+        }
+        let gaps_of = |untimed: &BTreeMap<String, Vec<(i64, i64)>>, key: &str| -> Option<Vec<(i64, i64)>> { untimed.get(key.split(":phase:").next().unwrap_or(key)).cloned() };
+        let inside = |gaps: &[(i64, i64)], t: i64| gaps.iter().any(|&(a, b)| t >= a && t < b);
+        for (k, frames) in self.frames.iter_mut() {
+            let Some(gaps) = gaps_of(&self.untimed, k) else { continue };
+            frames.retain(|f| !inside(&gaps, f.ts));
+            frames.extend(gaps.iter().map(|&(a, _)| Frame { ts: a, state: UNTIMED_STATE.into(), seq: format!("untimed:{a}"), id: -1, ..Frame::default() }));
+        }
+        for (k, v) in self.latencies.iter_mut() {
+            if let Some(gaps) = gaps_of(&self.untimed, k) {
+                v.retain(|l| !inside(&gaps, l.0));
+            }
+        }
+        for (k, v) in self.shifts.iter_mut() {
+            if let Some(gaps) = gaps_of(&self.untimed, k) {
+                v.retain(|s| !inside(&gaps, s.0));
+            }
+        }
+        for map in [&mut self.tasks, &mut self.gc, &mut self.gpu_compile] {
+            for (k, v) in map.iter_mut() {
+                if let Some(gaps) = gaps_of(&self.untimed, k) {
+                    *v = v.iter().flat_map(|&(a, d)| outside(a, d, &gaps)).collect();
+                }
+            }
+        }
+        for (k, v) in self.spans.iter_mut() {
+            if let Some(gaps) = gaps_of(&self.untimed, k) {
+                *v = v.iter().flat_map(|(n, a, d)| outside(*a, *d, &gaps).into_iter().map(move |(a, d)| (n.clone(), a, d))).collect();
+            }
+        }
+    }
+
+    /// The untimed time inside a run or phase window (ns).
+    pub fn untimed_in(&self, w: &Window) -> i64 {
+        let run = w.key.split(":phase:").next().unwrap_or(&w.key);
+        self.untimed.get(run).map_or(0, |gaps| gaps.iter().map(|&(a, b)| (b.min(w.t1) - a.max(w.t0)).max(0)).sum())
+    }
+
     /// Relabels runs before `first` as warmup (`…:run:<i>` → `…:warm:<i>`, phases included): a block
     /// decides where warmup ended only after the runs, from the work they did.
     pub fn warm_below(&mut self, first: usize) {
@@ -171,6 +308,7 @@ impl BlockData {
         self.gc = std::mem::take(&mut self.gc).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.gpu_compile = std::mem::take(&mut self.gpu_compile).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.spans = std::mem::take(&mut self.spans).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.untimed = std::mem::take(&mut self.untimed).into_iter().map(|(k, v)| (demote(&k), v)).collect();
     }
 
     /// `span.<name>` of each run window (ms): the time its spans covered, overlapping ones merged (two
@@ -203,7 +341,10 @@ impl BlockData {
             .iter()
             .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
             .map(|w| {
-                (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gpu_compile.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6))
+                (
+                    w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")),
+                    self.gpu_compile.get(&w.key).map_or(0.0, |s| s.iter().map(|x| x.1).sum::<i64>() as f64 / 1e6),
+                )
             })
             .collect()
     }
@@ -213,7 +354,12 @@ impl BlockData {
         self.windows
             .iter()
             .filter(|w| w.key.contains(&format!(":{prefix}:")) && !w.key.contains(":phase:"))
-            .map(|w| (w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")), self.gc.get(&w.key).map_or(0.0, |s| s.iter().sum::<i64>() as f64 / 1e6)))
+            .map(|w| {
+                (
+                    w.key.rsplit_once(&format!(":{prefix}:")).map_or(w.key.clone(), |(_, i)| format!("{prefix}:{i}")),
+                    self.gc.get(&w.key).map_or(0.0, |s| s.iter().map(|x| x.1).sum::<i64>() as f64 / 1e6),
+                )
+            })
             .collect()
     }
 
@@ -317,19 +463,23 @@ select 'span', w.k, s.ts, s.dur, null, s.name
                 data.frames.entry(key).or_default().push(Frame { ts: num(&row[2]), dur: num(&row[3]), state: state.to_string(), seq: row[4].clone().unwrap_or_default(), forked: kind == "FORKED", split, id });
             }
             "task" => data.tasks.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
-            "lat" => data.latencies.entry(key).or_default().push((num(&row[3]), row[5].clone().unwrap_or_default())),
+            "lat" => data.latencies.entry(key).or_default().push((num(&row[2]), num(&row[3]), row[5].clone().unwrap_or_default())),
             "shift" => data.shifts.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0))),
-            "gc" => data.gc.entry(key).or_default().push(num(&row[3])),
-            "gpuc" => data.gpu_compile.entry(key).or_default().push(num(&row[3])),
+            "gc" => data.gc.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
+            "gpuc" => data.gpu_compile.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "span" => data.spans.entry(key).or_default().push((row[5].clone().unwrap_or_default(), num(&row[2]), num(&row[3]))),
             _ => {}
         }
     }
     data.windows.sort_by_key(|w| w.t0);
+    data.leave_out_untimed();
     Ok(data)
 }
 
 const DISCRETE: [&str; 8] = ["MOUSE_PRESSED", "MOUSE_RELEASED", "KEY_PRESSED", "KEY_RELEASED", "TOUCH_PRESSED", "TOUCH_RELEASED", "GESTURE_TAP", "GESTURE_TAP_DOWN"];
+/// The pointer presses among them (`interaction.n.press`): Chromium times each event to the frame that
+/// showed it, so a click is a press and a release there, each its own sample (SPEC §7.4).
+const PRESSES: [&str; 3] = ["MOUSE_PRESSED", "TOUCH_PRESSED", "GESTURE_TAP_DOWN"];
 
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
@@ -358,6 +508,7 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
     let (mut presented_all, mut dropped_all) = (0usize, 0usize);
     let mut per_run: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     let mut discrete: Vec<f64> = Vec::new();
+    let mut presses = 0usize;
     let mut scroll: Vec<f64> = Vec::new();
     let (mut split_cpu, mut split_gpu, mut split_bad) = (Vec::new(), Vec::new(), 0usize);
     for w in &runs {
@@ -384,15 +535,16 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
         // A lean trace has no RunTask slices: main.busy then comes from the Performance domain.
         if !data.tasks.is_empty() {
             let tasks = data.tasks.get(&w.key).map(Vec::as_slice).unwrap_or(&[]);
-            let span = (w.t1 - w.t0).max(1) as f64;
+            let span = (w.t1 - w.t0 - data.untimed_in(w)).max(1) as f64;
             let busy: f64 = tasks.iter().map(|(ts, dur)| ((*ts + *dur).min(w.t1) - ts).max(0) as f64).sum();
             per_run.entry("main.busy").or_default().push(100.0 * busy / span);
             per_run.entry("main.tasks.long").or_default().push(tasks.iter().filter(|t| t.1 > 50_000_000).count() as f64);
         }
-        for (dur, ty) in data.latencies.get(&w.key).map(Vec::as_slice).unwrap_or(&[]) {
+        for (_, dur, ty) in data.latencies.get(&w.key).map(Vec::as_slice).unwrap_or(&[]) {
             let ms = *dur as f64 / 1e6;
             if DISCRETE.contains(&ty.as_str()) {
                 discrete.push(ms);
+                presses += usize::from(PRESSES.contains(&ty.as_str()));
             } else if ty.contains("SCROLL_UPDATE") || ty == "MOUSE_WHEEL" {
                 scroll.push(ms);
             }
@@ -437,6 +589,7 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
     discrete.sort_by(|a, b| a.total_cmp(b));
     if !discrete.is_empty() {
         out.insert("interaction.n".into(), discrete.len() as f64);
+        out.insert("interaction.n.press".into(), presses as f64);
         out.insert("interaction.p50".into(), percentile(&discrete, 0.5));
         out.insert("interaction.p95".into(), percentile(&discrete, 0.95));
     }

@@ -164,7 +164,8 @@
         "Headless",
         "NoMetric",
         "NoWaits",
-        "NotEquivalent"
+        "NotEquivalent",
+        "Untimed"
       ]
     },
     "verdictKind": {
@@ -302,6 +303,11 @@
         "engine": { "enum": ["chromium", "firefox", "webkit", null], "description": "A page target's browser engine (--engine, or the target's engine)." },
         "browser": { "type": ["string", "null"], "description": "The browser versions this series' blocks ran (`a / b` when the sides of an implementation comparison ran two); part of a tracked series' fingerprint." },
         "overhead": { "$ref": "#/definitions/overhead" },
+        "untimed": {
+          "type": ["object", "null"],
+          "description": "What ctx.untimed left out of the series' runs (SPEC 9.6): stretches a run and ms of each run, each the median over its blocks of the blocks' median per run (`untimed.n`, `untimed.ms` in a block's values); null when no run left one out.",
+          "properties": { "stretches": { "type": "number" }, "ms": { "type": "number" } }
+        },
         "secondaries": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "descriptive": { "type": "array", "items": { "$ref": "#/definitions/comparison" } },
         "decided": { "type": "boolean" },

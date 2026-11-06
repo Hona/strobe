@@ -912,8 +912,8 @@ What strobe reads from a native app (§13.7), per run:
   refreshed, plus ten, refuses the frame metrics (`UnpacedSpin`).
 - **Interaction latency** (`interaction.p50|p95`, `interaction.n`; `scroll.latency.p50|p95`,
   `scroll.n`), from strobe's own inputs (§13.7) to the presents that showed them:
-  - Inputs: a single click's release (its press shows a pressed look at most; the release does the
-    click), a mouse button's release by `up`, each key going down in `type`, `press` and `down`, and
+  - Inputs: a single click (below: its release, or its press when the app acted on the press), a
+    mouse button's release by `up`, each key going down in `type`, `press` and `down`, and
     for `scroll.latency.*` the first wheel step of each `scroll` or `wheel`. Moves, hovers, mouse
     button presses, key releases, a drag's end, the releases `release_all` sends between runs, and a
     double or triple click's releases are never samples: a multi-click's presses follow a frame apart,
@@ -966,6 +966,55 @@ What strobe reads from a native app (§13.7), per run:
     reset or without, and nothing is waited when the change already came. Each input is resolved on
     its own after the run: nothing pending carries over between inputs, runs or a reset, and a present
     after several inputs is the reaction of each (latency from each).
+  - Changes are claimed in order: each input takes the first change (by when it is known to have
+    happened) that no earlier input took, so a change announced late for one input is never another's
+    too.
+  - The press edge: many controls act on the mouse press, not the release (tabs, menus, sidebars,
+    games, most native list and segment controls). The reaction then comes during the press hold,
+    before the release, and a sample at the release has nothing left to show (one consumer's sidebar
+    gave one sample a run, whatever the bench did). So a single click that acted on its press is one
+    sample from its press: its latency is from the press to the first present that began after the
+    press and no earlier than its change's earliest, and the at-rest check applies at the press (the
+    settle before the press already waits for it). Otherwise it is the release's sample, as above;
+    never both (`interaction.n.press` says how many of a block's samples were presses, `--check`
+    prints it beside `interaction.p50` and `p95`, and `query <rec> frames` labels them `press`). A
+    click acted on its press when, from what is provable:
+    - its model changed between the press and the release, by a change that is no press feedback
+      (focus moving: UI Automation's focus event and `HasKeyboardFocus`, AX's focused-element and
+      focused-window notifications, AT-SPI's `Focus` events and `focused` state; and AT-SPI's
+      `pressed` state, while `armed` is no change at all): a push button takes focus on the press
+      and acts on the release;
+    - and its model did not change again between the release and the next input (within a second):
+      a release-acting control that shows press feedback in its model (a ripple element,
+      `data-pressed`) is the release's sample, never its highlight's;
+    - and a frame that shows the change began before the release: a reaction drawn only after it is
+      timed from the release, not charged the hold;
+    - and (an accessibility tree) every earlier input within a second already had its change before
+      this press: a change in the hold may otherwise be one of theirs announced late (the toolkit
+      above: 350–440 ms), so the click is no sample, counted as drawing (`AmbiguousInteraction` when
+      over half are).
+    A page says the first two in its own order of events (`CHANGES_SCRIPT`): a capture listener on its
+    trusted `pointerdown` opens a press, one on `pointerup` or `pointercancel` closes it and opens the
+    time after the release until the next trusted press, key or wheel turn, and each change the
+    page's observers report marks whichever is open, so a mutation the press's own handlers made, or
+    one queued after it, marks the press, and one from before it (the move's hover) cannot. strobe
+    matches each click to the first of the page's presses not yet matched that can have followed its
+    press and come before its next input, so a page whose main thread was busy past the release still
+    has its press (seen late, in order). Clock bounds alone could not tell: Firefox's mousedown
+    handler changed the page 1 to 3 ms after strobe sent the press, inside the 3.4 ms width of a
+    change's bounds, so neither click of a check run counted as a press (air). Without the page's word
+    (an accessibility tree, or a page that saw no trusted press), a change follows the press when it
+    is known to (a page's earliest after it; an accessibility event heard after it, as for any input)
+    and happened before the release when its latest is before it. A provider that announces late can
+    announce a press's change after the release (the hold lasts 60–300 ms): that click stays a release
+    sample, which has nothing new to show and is then usually no sample at all; a case lets the app
+    go idle between its clicks (`ctx.untimed(() => page.idle())`, §9.6). The hold's timer starts at
+    the press, and its settle never refuses: a press reaction still drawing at the release lengthens
+    the hold at most to 300 ms and changes no press sample. Chromium times every event to the frame
+    that showed it from its own trace (`EventLatency`), so there a click is two samples, its press and
+    its release, each when it showed a frame; `interaction.n.press` counts the press events among
+    them. Two pages on different engines are different instruments (Chromium's trace against OS
+    presents): an implementation comparison of them measures both from outside (§9.10).
   - Refused when ambiguous: an input sent while the app was drawing is not a sample, since the next
     frame may be that drawing's: a present that began before the input and began or reached the
     screen within the 2 refreshes before it (one begun before and shown after the input is on its way
@@ -1969,7 +2018,7 @@ export default bench({
   same) and `run`/`reset` per target (`{ <target>: fn }`), §9.10. Targets take `ui` there (their
   adapter: `@name` → a selector or a step).
 
-**`ctx`:** `page`, `ui` (the running target's adapter, §9.10), `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
+**`ctx`:** `page`, `ui` (the running target's adapter, §9.10), `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `untimed(fn)` (below), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `waitForLine(match, { in, timeout })` (native targets: the first line matching a string or
 RegExp that the app writes after the call, from its output, which strobe pipes only for a target
 with `output: true` (a pipe makes a C runtime buffer stdout: the app must flush each line; without
@@ -1983,6 +2032,63 @@ output lines no watch waits for are dropped), `fixture` (the block's fixture: `{
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, in `prepare` and `setup`
 `addInitScript(script, arg?)`, and in `prepare` only `playwright` and `mock(pattern, handler)`.
+
+**Untimed stretches** (`await ctx.untimed(fn)`): a wait inside a run that is not the journey, such
+as letting the app go idle between two clicks (`await ctx.untimed(() => page.idle())`), leaves the
+run's timed totals. It is for waits: work started in a stretch (a heavy setup step, a page load)
+can leave a cost the run pays after it (a garbage collection, a cache filling), which stays timed;
+put setup in `setup` or `reset`. Each edge is a runner request: strobe stamps a stretch's start, then
+pauses its own cost meter, marks the trace and reads the target; at its end it reads the target,
+marks the trace and resumes its meter, then stamps the end. So the readings (a system snapshot is
+15–20 ms on Windows) are inside the stretch: in neither the run's time nor its phases, nor
+strobe's measured cost.
+- **Time:** `run.duration` is the run's span less its stretches; `phase.<name>` less those inside the
+  phase. A phase inside a stretch is a usage error, as is a stretch inside a stretch.
+- **CPU:** per edge, each process's cycles by pid and start time and the cycle clock (native: the
+  app's process set, and per thread the system snapshot of `cpu.wakes`; pages: the browser's
+  processes and Chromium's Performance counters, with what a departed document carried; script: the
+  host's tree), and the fixture's. The run's readings at its start and end and the stretches' edges
+  make its timed parts `[t0, a0), [b0, a1), …, [bk, t1)`, and `cpu.work`, `cpu.app.total`, the
+  browser's `cpu.<role>`, `ui.cpu`, `ui.wakes`, `cpu.wakes`, `io.*`, `main.work` and its parts are
+  sums over the parts, each process and thread against its own readings in that part: one born in a
+  stretch counts from its end, one that exits in a stretch keeps what it did before it, and a thread
+  id reused by another thread counts from zero. Pages' `cpu.*` read each process this way with or
+  without stretches (they used to sum the processes, so an exiting renderer lowered the sum).
+  `cpu.fixture` is the run's less each stretch's.
+- **Counts:** `ctx.count` in a stretch counts nothing, and what the page's counter global counted
+  in one (its reading at each edge) leaves the run's `count.<name>`. An input call in a stretch is no
+  call of the journey (`InputMismatch` counts, §9.10).
+- **Frames:** a frame begun in a stretch is none of the run's, and gaps are taken within the timed
+  parts only (OS presents: per part; Chromium's trace: each stretch is a window
+  `untimed:<run>.<n>` from marks at its edges, which `metrics::read` takes out of its run and its
+  phases, leaving a marker vsync of its own in their place, so no interval spans the stretch and no
+  dropped vsync before it reads as one the page wanted no update for; tasks, GC, compiles and the
+  page's spans keep their parts outside it, and `main.busy` is over the timed time). A run whose last
+  step was a stretch ends without waiting for the page's next frame, which would be the stretch's.
+- **Inputs:** one sent in a stretch (a click's release or its press) is no `interaction.*` or
+  `scroll.latency.*` sample, and a drag begun there is no `input.*`. An input just before a stretch
+  still is: its frame may come during the stretch (a click, then the wait for it to settle).
+- **Attribution:** native stacks and off-CPU waits, Firefox's profile and the trace views of `query`
+  (style, layout, threads) leave the stretches out. A Chromium attribution block's V8 CPU profile
+  is one per document and holds them.
+- **Refused** (`Untimed`): run totals strobe has no reading of at each edge, in a block whose
+  measured runs used a stretch: `gpu.process.3d` (sampled over a window), `energy.cpu`,
+  `cpu.instructions`, `cpu.idle_wakes` (the OS's counters), `net.*` and `canvas.*` (kept by the page
+  per run) and `js.heap.retained` (read after the run). A declared one is listed refused, an
+  undeclared one leaves the block's values.
+- A `cli()` run's totals are its commands': a command run in a stretch is not the run's.
+- Outside a run (setup, reset, a launch case's hooks) nothing is timed and `fn` just runs.
+- **Shown:** a block's `untimed.n` and `untimed.ms` (its runs' stretches and the time they left out,
+  each the median per run), a series' `untimed: { stretches, ms }` in result.json (the median over
+  its blocks), an `untimed` line under the series in the bench text and `--check`, a note in the PR
+  block, the report's protocol column, and per run in `query <rec> frames` (each run's stretches
+  are in its recording's `frames.json`).
+
+Checked headless on adais (`scripts/dev/press.bench.ts`): a page busy 500 ms untimed read `cpu.work`
+4.2 ms and `main.work` 1.0 ms in Chromium (509 ms and 501 ms timed), 5.4 ms in Firefox (509 ms timed);
+`run.duration` of 0.2 s around a 1 s untimed wait read 221 ms (Firefox) and 321 ms (Chromium: its
+frame after the run, two animation frames of a headless page with the display off, about 100 ms;
+12 ms on vps), `phase.all` 219 ms.
 
 **Mocks** (`ctx.mock(pattern, handler)` in `prepare`): answers requests whose URL matches
 `pattern` (`*` any run of characters, `?` one) through the Fetch domain with only those patterns
@@ -2448,10 +2554,14 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   differing journey fails the check (exit 1); a gap, found before the run or met in it, is listed
   (exit 0), and exits 4 with `--require-parity`.
   A file whose targets run on different engines checks its pages from outside with OS input, as a
-  timed block does.
-- **Comparability** (`MetricDef.across`, §7.1). Between sides of one engine (two pages, two native
-  apps) every metric compares. Between engines (Chromium, native, script: `web`, `url`, `app`, `exe`
-  and `command` are Chromium), a `per_side` metric is one engine's own (`main.*`, `layout.*`, `js.*`,
+  timed block does; pages in several browsers and no other target are no such file, and each checks
+  in its own engine.
+- **Comparability** (`MetricDef.across`, §7.1). Between sides of one engine (two pages in one
+  browser, two native apps) every metric compares. Between engines (Chromium, Firefox, WebKit,
+  native, script: a page's own `engine`, and `app`, `exe` and `command` are Chromium), the sides are
+  measured from outside: a Chromium page against a
+  Firefox page compares OS presents with OS presents, never Chromium's trace (`EventLatency`) with
+  another engine's presents. A `per_side` metric there is one engine's own (`main.*`, `layout.*`, `js.*`,
   `dom.*`, `net.*`, `canvas.*`, `cpu.renderer|gpu|browser`, `ui.*`, `span.*`, `launch.<milestone>`,
   `frames.presented.p*`): as a primary it is a usage error before anything builds (exit 2,
   `NotComparable: …`), as a declared secondary a row refused `NotComparable`; never tested, never a
@@ -2648,6 +2758,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `NoSpan` | a declared `span.<name>` no measured run's page measured, or a target with no page (§7.3) |
 | `NoMetric` | a declared `metric.<name>` that a measured run of a `cli()` target's command did not print (`strobe:metric <name>=<value>`): a run that printed none is not 0 (9.6) |
 | `NoWaits` | `query <rec> waits` on a capture without off-CPU waits: not asked for (`--probes waits`), macOS, Linux without CAP_PERFMON or tracefs, Windows without this build's deep helper (11.1) |
+| `Untimed` | a run total strobe cannot take a `ctx.untimed` stretch out of, in a block whose measured runs used one: `gpu.process.3d`, `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.*`, `canvas.*`, `js.heap.retained` (refuses that metric; §9.6) |
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
@@ -4667,6 +4778,27 @@ code). `a..b` (and `query exp_… <view>` for each series' base and head) answer
 only `heap` and `memory`. The insights rule `long-tasks` never fired before 2026-11-05: its query's
 third column was named after a multi-line subquery, so the CSV header spanned lines and the count
 read as zero (rec_b6be22: 4 tasks over 50 ms, the longest 55.4 ms, now reported).
+
+Press edge and untimed stretches (2026-11-06, §7.4, §9.6; `scripts/dev/press.bench.ts` with
+`scripts/dev/press-app.swift`, `--check`). On air, unlocked, two clicks a run, each followed by an
+untimed `page.idle()`: an item that acts on the press gave press samples, 2 of 2 (Cocoa app,
+Firefox, Safari); one that acts on the release release samples, 0 of 2 at a press; one that acts on
+the release with press feedback in its model (Cocoa: keyboard focus on the press, heard as two
+focus notifications 5 ms after it; pages: `data-pressed` set on pointerdown and removed on
+pointerup) release samples, 0 of 2. Chromium gives 4 samples either way (its own press and release
+events), 2 of them presses. strobe 0.13.0 gave the Cocoa press case one sample a run. Twelve clicks a
+run, six of them untimed, against twelve timed (an untimed idle after each): Cocoa `cpu.work` 68.2
+against 162 ms, `ui.cpu` 59.6 against 141 ms, `interaction.n` 6 against 12, `frames.presented.count`
+6 against 12, `run.duration` 876 against 1739 ms; Firefox `cpu.work` 266 against 428 ms, 6 against
+12 samples; Safari 188 against 901 ms; Chromium (from its trace) 12 against 24 samples, 54 against
+110 ms. Headless on adais and vps: a page busy 0.5 s untimed read `cpu.work` 2.4 to 3.5 ms
+(Chromium, Firefox) against 489 to 505 ms timed, Chromium's `main.work` 0.9 to 2.9 ms against 501
+to 503 ms; `phase.all` of 0.2 s around a 1 s stretch 203 to 209 ms with the edges' readings inside
+the stretch (219 ms before); a run ending in a stretch 101–103 ms for 100 ms timed (Chromium skips
+its frame after the run: 302 ms for a 200 ms run that ends timed on adais, display off);
+`net.requests` refused `Untimed`. Not yet run: native press clicks on Windows (UI Automation, a push
+button's focus on the press) and Linux (AT-SPI), which need an unlocked session and a display;
+WebKitGTK; a process born or exiting inside a stretch.
 
 Native recordings and launches (2026-11-04, adais, session locked): `record pid:|proc:` writes the
 views `record exe:` writes (`threads.json`, `runs.json`, `memory.json`, the OS samples for `query gpu`);

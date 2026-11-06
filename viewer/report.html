@@ -4688,6 +4688,7 @@ function renderRigFooter(r, s, imp) {
           : h("div", {}, `${s.pairs || "?"} AB/BA fresh-launch pairs · ${plan.runs_per_block || 5} measured runs/launch`)
         : null,
       s && finite(s.elapsed_ms) ? h("div", {}, `Series runtime: ${fmtDuration(s.elapsed_ms)} · Strobe ${env.strobe || ""}`) : null,
+      s && finite(s.untimed?.stretches) ? h("div", {}, `Untimed (ctx.untimed): ${s.untimed.stretches} stretch${s.untimed.stretches === 1 ? "" : "es"} a run, ${fmtVal(s.untimed.ms, "ms")} of each run left out`) : null,
       baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `${sideWord("base", true)}: ${baseVar.subject}`) : null,
       headVar?.subject && headVar.subject !== baseVar?.subject ? h("div", { style: "color:var(--ink-3)" }, `${sideWord("head", true)}: ${headVar.subject}`) : null,
       !s && finite(r.duration_ms) ? h("div", {}, `Duration: ${fmtDuration(r.duration_ms)}${r.probes ? ` · Probes: ${r.probes}` : ""}`) : null,
@@ -5693,7 +5694,7 @@ function renderRecording(m) {
       ? ["Total app CPU", fmtVal(g("cpu.app.total"), "%"), `${(g("cpu.app.total") / 100).toFixed(2)} cores`, true]
       : null,
     finite(g("interaction.p95"))
-      ? ["Input → screen p95", fmtVal(g("interaction.p95"), "ms"), "discrete input", true]
+      ? ["Input → screen p95", fmtVal(g("interaction.p95"), "ms"), finite(g("interaction.n.press")) ? `${g("interaction.n")} inputs, ${g("interaction.n.press")} timed from a press` : "discrete input", true]
       : null,
   ].filter(Boolean);
 

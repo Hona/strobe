@@ -310,6 +310,12 @@ export default bench({
 ### Case lifecycle
 
 - `reset` puts state back between runs and is never measured.
+- Waits inside a run that are not the journey: `await ctx.untimed(() => page.idle())` between two clicks.
+  - Its time, the target's CPU in it (`cpu.*`, `ui.*`, `io.*`, `main.*`), its frames, counts and inputs sent in it leave the run's numbers.
+  - An input just before it still counts: its frame may come during the wait.
+  - For waits only: work started in it (a page load, a big setup) can leave a cost the run pays after it.
+  - `gpu.process.3d`, `energy.*`, `cpu.instructions`, `cpu.idle_wakes`, `net.*`, `canvas.*`, `js.heap.retained` are refused (`Untimed`) in a block that used it.
+  - `--check` and the bench text print an `untimed` line with what it left out.
 - Playwright only in `prepare` on `web` targets, and Chromium only: prefer `ctx.addInitScript` and `ctx.mock`, which work in every engine.
 - What `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working for the whole block.
 - Scripts before the page's own (a frame counter, seeded `localStorage`): `ctx.addInitScript(fn, arg?)` in `prepare` or `setup`, Playwright's `page.addInitScript` in any engine; new documents only.
@@ -343,6 +349,9 @@ export default bench({
   - `io.read`, `gpu.process.3d`, `gpu.vram`
   - `memory.app.private` and `memory.app.host` (what the app itself allocated: Windows charges the VRAM a GPU driver maps into the process as private commit)
   - and from OS present events `frames.interval.p95`, `frames.dropped`, `interaction.p95` (input to the frame that showed it; counts inputs after which the app's accessibility tree changed)
+  - A click whose control acts on the press (tabs, menus, sidebars) is timed from its press, one sample either way; `interaction.n.press` says how many, and `query <rec> frames` labels them `press`.
+  - Focus moving or a pressed look on the press never makes it a press sample, nor does a control that changes again after the release.
+  - A click that gives no sample in `query <rec> frames` ("changed no tree") on an app that announces late: let it go idle between clicks with `ctx.untimed(() => page.idle())`.
 - `page` drives any app with an accessibility tree: `page.click("nav-history", { until: "history-pane" })`.
   - Windows: UI Automation, posted window messages, never takes focus.
   - macOS: AX, Quartz events (keys to the app, which they bring to the front; clicks and wheel at the point, as a person's).

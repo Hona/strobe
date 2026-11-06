@@ -79,6 +79,34 @@ impl Span {
     pub fn wakes_per_s(&self) -> f64 {
         if self.ms > 0.0 { self.switches as f64 / (self.ms / 1e3) } else { f64::NAN }
     }
+
+    /// A run's timed parts (`ctx.untimed` left out between them) as one span: each part is `span` of
+    /// its own snapshots, so a thread born in a stretch counts from the stretch's end and one that
+    /// exits in a stretch keeps what it did before it. A thread's CPU is unknown when any part's is.
+    /// The OS's counters are the first part's (a run with stretches refuses them).
+    pub fn joined(parts: Vec<Span>) -> Span {
+        let mut by: BTreeMap<(u32, u32), ThreadSpan> = BTreeMap::new();
+        let mut out = Span { counted: parts.first().map(|p| p.counted.clone()).unwrap_or_default(), ..Span::default() };
+        for p in parts {
+            out.ms += p.ms;
+            out.switches += p.switches;
+            out.io_read += p.io_read;
+            out.io_write += p.io_write;
+            for t in p.threads {
+                match by.get_mut(&(t.pid, t.tid)) {
+                    Some(s) => {
+                        s.switches += t.switches;
+                        s.cpu_ms = s.cpu_ms.zip(t.cpu_ms).map(|(a, b)| a + b);
+                    }
+                    None => {
+                        by.insert((t.pid, t.tid), t);
+                    }
+                }
+            }
+        }
+        out.threads = by.into_values().collect();
+        out
+    }
 }
 
 /// From `a` to `b`. A thread or process that started in between counts from zero; one that exited in
@@ -92,8 +120,9 @@ pub fn span(a: &Snapshot, b: &Snapshot) -> Span {
     };
     let mut out = Span { ms, counted: counted(&a.counters, &b.counters), ..Span::default() };
     for (&(pid, tid), &(switches, cycles)) in &b.threads {
-        let (s0, c0) = a.threads.get(&(pid, tid)).copied().unwrap_or((0, Some(0)));
-        let n = switches.wrapping_sub(s0) as u64;
+        // A count below the earlier one is another thread under a reused id, born in between: from zero.
+        let (s0, c0) = a.threads.get(&(pid, tid)).copied().filter(|&(s0, c0)| s0 <= switches && c0.zip(cycles).is_none_or(|(c0, c)| c0 <= c)).unwrap_or((0, Some(0)));
+        let n = (switches - s0) as u64;
         out.switches += n;
         let cpu_ms = match (cycles, c0, per_ms) {
             (Some(c), Some(c0), Some(r)) => Some(c.saturating_sub(c0) as f64 / r),

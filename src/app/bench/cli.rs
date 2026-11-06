@@ -219,6 +219,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let mut steps: Vec<(String, f64)> = Vec::new();
     let hooks = super::block::Hooks::default();
     let ran: RefCell<Vec<Ran>> = RefCell::new(Vec::new());
+    let cost = SelfCost::new(ctx.runner.pid());
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "exec" => {
@@ -228,8 +229,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 let line = fixture.as_ref().and_then(|f| f.fill(&json!(line)).as_str().map(str::to_string)).unwrap_or(line);
                 let (r, output) = exec(&line, &at)?;
                 let code = r.usage.code;
-                // Only a run's commands count; setup's and reset's prepare.
-                if hooks.in_run() {
+                // Only a run's commands count; setup's and reset's prepare, as do a run's untimed ones.
+                if hooks.in_run() && !hooks.untimed_now() {
                     ran.borrow_mut().push(r);
                 }
                 Ok(json!({ "code": code, "output": output }))
@@ -238,10 +239,16 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 hooks.count(a);
                 Ok(Value::Bool(true))
             }
-            "phase" => {
-                hooks.phase(a);
-                Ok(Value::Bool(true))
-            }
+            "phase" => hooks.phase(a),
+            // Commands in an untimed stretch are not the run's (above): a cli run's totals are its commands'.
+            "untimed" => hooks.untimed(a, |start, _| {
+                if start {
+                    cost.pause()
+                } else {
+                    cost.resume()
+                }
+                Ok(())
+            }),
             "call" => Err(Error::usage("ctx.call is a script() target's; a cli target runs commands with ctx.exec()")),
             "driver" => Err(Error::msg("a cli target has no page: run its commands with ctx.exec()")),
             "line" => Err(Error::usage("waitForLine reads a native app's output; ctx.exec() resolves with the command's output")),
@@ -256,25 +263,26 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     ctx.runner.call("setup", json!({}), s.hook_timeout(), &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
     lapped = Instant::now();
-    /// One run: its commands, its counts and its phase marks.
-    type CliRun = (Vec<Ran>, BTreeMap<String, f64>, Vec<(String, u64)>);
+    /// One run: its commands, its counts, its phase marks and its span.
+    type CliRun = (Vec<Ran>, BTreeMap<String, f64>, Vec<(String, u64)>, metrics::Timed);
     let mut runs: Vec<CliRun> = Vec::new();
-    let mut cost = SelfCost::new(ctx.runner.pid());
     let mut warmup = super::block::Warmup::new(x);
     let wall = |r: &[Ran]| -> f64 { r.iter().map(|x| x.wall).sum() };
     let cpu = |r: &[Ran]| sum_of(r, |x| x.usage.cpu_ns.map(|c| c as f64 / 1e6));
     while warmup.more(runs.len()) {
         hooks.begin(&format!("run:{}", runs.len()));
         cost.start();
+        let t0 = host::now_ns();
         let r = ctx.runner.call("run", json!({ "case": s.case }), t, &serve);
+        let t1 = host::now_ns();
         cost.end();
         hooks.end();
         r.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw, timed out, or a command failed"))?;
         let done = std::mem::take(&mut *ran.borrow_mut());
         if done.is_empty() {
-            return Err(Error::refused("RunIncomplete", format!("{} run: it ran no command", s.case), "call ctx.exec() in the case's run"));
+            return Err(Error::refused("RunIncomplete", format!("{} run: it ran no command outside ctx.untimed", s.case), "call ctx.exec() in the case's run"));
         }
-        runs.push((done, hooks.counts(), hooks.take_marks()));
+        runs.push((done, hooks.counts(), hooks.take_marks(), metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() }));
         if s.reset {
             ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
         }
@@ -337,7 +345,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             Refusal::new(ValidatorId::NotOnThisOs, format!("{m}: {}", first_why(&|u| u.io_refused.clone()).unwrap_or_else(|| "this OS gave no IO bytes for the command's processes".into())))
         });
     }
-    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.1, r.2.as_slice())).collect();
+    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.1, r.2.as_slice(), &r.3)).collect();
     extra.extend(super::block::per_run_hooks(s, &key, &hooked));
     // `metric.<name>`: every command of every measured run must print it (a run with a command that
     // printed none is not 0), and every line of a name says the same direction.
@@ -362,6 +370,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         }
     }
     let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
+    super::untimed_values(&measured.iter().map(|r| &r.3).collect::<Vec<_>>(), &mut values);
     if warmup.unsteady() {
         values.insert("warmup.unsteady".into(), 1.0);
     }

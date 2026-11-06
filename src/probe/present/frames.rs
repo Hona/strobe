@@ -9,6 +9,7 @@
 //! neither an interval nor a drop, as Chromium's `STATE_NO_UPDATE_DESIRED` resets intervals.
 
 use super::{Present, Presents};
+pub use crate::metrics::Timed;
 use std::collections::BTreeMap;
 
 /// A frame that reached the screen.
@@ -18,6 +19,9 @@ pub struct Shown {
     pub stream: u64,
     pub pending_ns: u64,
     pub screen_ns: u64,
+    /// The stretch of its run it began in (`Timed::segments`): gaps are taken within one, never across a
+    /// stretch `ctx.untimed` left out.
+    pub seg: usize,
 }
 
 /// Inputs that showed no frame beyond this share, with no events lost, refuse their latency: the
@@ -76,12 +80,20 @@ pub struct RunFrames {
 
 /// The displayed and discarded presents of `pids` started in `[t0, t1)`.
 pub fn from_presents(presents: &[Present], pids: &[u32], t0: u64, t1: u64) -> RunFrames {
+    from_timed(presents, pids, &Timed::whole(t0, t1))
+}
+
+/// The displayed and discarded presents of `pids` started in a run's timed stretches: a frame begun
+/// inside a `ctx.untimed` stretch is none of the run's.
+pub fn from_timed(presents: &[Present], pids: &[u32], run: &Timed) -> RunFrames {
     let mut out = RunFrames::default();
-    for p in presents.iter().filter(|p| pids.contains(&p.pid) && p.start_ns >= t0 && p.start_ns < t1) {
-        match p.state.as_str() {
-            "displayed" => out.shown.push(Shown { stream: stream(p), pending_ns: p.start_ns, screen_ns: p.screen_ns }),
-            "discarded" => out.discarded += 1,
-            _ => {}
+    for (seg, (t0, t1)) in run.segments().into_iter().enumerate() {
+        for p in presents.iter().filter(|p| pids.contains(&p.pid) && p.start_ns >= t0 && p.start_ns < t1) {
+            match p.state.as_str() {
+                "displayed" => out.shown.push(Shown { stream: stream(p), pending_ns: p.start_ns, screen_ns: p.screen_ns, seg }),
+                "discarded" => out.discarded += 1,
+                _ => {}
+            }
         }
     }
     out
@@ -99,12 +111,13 @@ pub struct NativeFrames {
 /// Metrics that need when a frame was handed over, not only when it was shown.
 const NEED_BEGIN: &[&str] = &["frames.interval.p50", "frames.interval.p95", "frames.interval.p99", "frames.interval.max", "frames.dropped", "frames.dropped.pct"];
 
-/// Frame metrics of a native app's measured runs (their spans on the host clock) from its
+/// Frame metrics of a native app's measured runs (their timed stretches on the host clock) from its
 /// processes' presents. `display` is the target window's display path, for the refresh period.
-pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: Option<&crate::host::DisplayPath>) -> NativeFrames {
+pub fn native_values(p: &Presents, pids: &[u32], timed: &[Timed], display: Option<&crate::host::DisplayPath>) -> NativeFrames {
+    let runs: Vec<(u64, u64)> = timed.iter().map(|r| (r.t0, r.t1)).collect();
     let (t0, t1) = (runs.first().map_or(0, |r| r.0), runs.last().map_or(0, |r| r.1));
     let refresh = refresh_ms(&p.vsyncs, t0.saturating_sub(1_000_000_000), t1 + 1_000_000_000, display);
-    let frames: Vec<RunFrames> = runs.iter().map(|r| from_presents(&p.presents, pids, r.0, r.1)).collect();
+    let frames: Vec<RunFrames> = timed.iter().map(|r| from_timed(&p.presents, pids, r)).collect();
     let mut out = NativeFrames { values: values(&frames, refresh), ..NativeFrames::default() };
     if refresh.is_none() && !p.vsyncs.is_empty() && display.is_none() {
         out.refused = Some("NoPresentSource: several displays run at different refresh rates and the target's window is unknown, so its refresh period is too".into());
@@ -116,7 +129,7 @@ pub fn native_values(p: &Presents, pids: &[u32], runs: &[(u64, u64)], display: O
         out.refused = Some(format!("NoPresentSource: the app showed no frame through {only} in the runs: it may draw another way, which strobe does not see"));
         out.values.clear();
     }
-    if let Some(why) = unshared(p, pids, runs) {
+    if let Some(why) = unshared(p, pids, &runs) {
         out.refused = Some(why);
         out.values.clear();
     }
@@ -149,9 +162,9 @@ pub fn unshared(p: &Presents, pids: &[u32], runs: &[(u64, u64)]) -> Option<Strin
 
 /// Missed refreshes and the intervals between frames shown while the target kept drawing.
 fn gaps(shown: &[Shown], refresh_ns: f64) -> (usize, Vec<f64>) {
-    let mut by: BTreeMap<u64, Vec<&Shown>> = BTreeMap::new();
+    let mut by: BTreeMap<(u64, usize), Vec<&Shown>> = BTreeMap::new();
     for s in shown {
-        by.entry(s.stream).or_default().push(s);
+        by.entry((s.stream, s.seg)).or_default().push(s);
     }
     let (mut missed, mut intervals) = (0usize, Vec::new());
     for list in by.values_mut() {
@@ -211,23 +224,54 @@ pub fn values(runs: &[RunFrames], refresh_ms: Option<f64>) -> BTreeMap<String, f
 }
 
 /// An input strobe gave a target: when it was sent (host clock), and whether it is a discrete one (a
-/// single click's release, a key press, a button's `up`) or the first wheel step of a scroll.
+/// single click's release, a key press, a button's `up`) or the first wheel step of a scroll. A single
+/// click's release carries when its press went out: a target that acted on the press is timed from it.
 #[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct Sent {
     pub t_ns: u64,
     pub scroll: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub press: Option<u64>,
+    /// The target's own word on whether it acted on the press: it changed between the press and the
+    /// release, and not again after the release within a second. A page tells from its events' order
+    /// (`CHANGES_SCRIPT`), exactly. None where it says nothing (an accessibility tree): then the
+    /// changes' times decide (`reactions`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub acted: Option<bool>,
 }
 
-/// A change of the target's model (its accessibility tree, a page's DOM) on the host clock, as the
-/// earliest and the latest it can have happened.
-pub type Change = (u64, u64);
+/// The edge of an input its latency is timed from (`interaction.n.press` counts the presses).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Edge {
+    /// The input as sent: a click's release, a key going down, a button's `up`, a scroll's first step.
+    Sent,
+    /// A single click's press: the target changed its model between the press and the release, so it
+    /// acted on the press (tabs, menus and many native controls do), and the release has nothing left
+    /// to show.
+    Press,
+}
+
+/// A change of the target's model (its accessibility tree, a page's DOM) on the host clock: the
+/// earliest and the latest it can have happened, and whether it is press feedback only (focus moving,
+/// a control armed or pressed: what a release-acting button shows on the mouse press), which never
+/// says a click acted on its press.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Change(pub u64, pub u64, #[serde(default)] pub bool);
 
 /// A change strobe heard of at `at` (an accessibility event): it happened by then, and how long before
 /// is not known (events carry no source time). A provider may announce a change long after drawing it
 /// (one toolkit's tree on macOS: 350–440 ms after its pane switch began to draw), so the event's time is
 /// no bound on the reaction's frame.
-pub fn notified(at: u64) -> Change {
-    (0, at)
+pub fn notified(at: u64, feedback: bool) -> Change {
+    Change(0, at, feedback)
+}
+
+/// Whether a change can have followed `t`: one with an earliest (a page's) when that is after `t` (a
+/// change read a millisecond either side of a press may be the move's hover); an accessibility event
+/// (`notified`, no earliest) when it was heard after `t`, as for any input.
+fn after(c: &Change, t: u64) -> bool {
+    if c.0 == 0 { c.1 > t } else { c.0 > t }
 }
 
 /// Input latencies from outside the target (SPEC §7.4), in ms: discrete inputs for `interaction.*`,
@@ -237,17 +281,22 @@ pub fn notified(at: u64) -> Change {
 /// present of `pids` begun before it reached the screen (or began, when it never did) in the `quiet`
 /// before it, so a frame on its way at the send (a press's look, an animation's) is never taken for its
 /// reaction. Its latency is then to the screen time of the first present that began after it and after
-/// the earliest its first change can have happened (a frame begun before the model changed cannot show
-/// the change: a page's `:active` undone at the release is not an asynchronous reaction's frame; an
-/// accessibility event bounds nothing, `notified`), and reached the screen, within a second. Nothing
-/// carries over between inputs.
+/// the earliest its change can have happened (a frame begun before the model changed cannot show the
+/// change: a page's `:active` undone at the release is not an asynchronous reaction's frame; an
+/// accessibility event bounds nothing, `notified`), and reached the screen, within a second. Inputs
+/// claim changes in order, each the first one no earlier input claimed, so a change announced late
+/// for one input is never another's too.
+///
+/// A single click is one sample from its press instead when it acted on its press (`pressed`): never
+/// one from each edge.
 #[derive(Clone, Debug, Default)]
 pub struct Reactions {
-    pub interaction: Vec<f64>,
+    pub interaction: Vec<(f64, Edge)>,
     pub scroll: Vec<f64>,
     /// Inputs that changed the model, per kind: (discrete, scroll).
     pub tried: (usize, usize),
-    /// Of those, the target was still drawing when they were sent.
+    /// Of those, the target was still drawing when they were sent, or (a press) an earlier input's
+    /// change was still to come.
     pub busy: (usize, usize),
     /// Of those, no present reached the screen within a second.
     pub unshown: (usize, usize),
@@ -256,32 +305,105 @@ pub struct Reactions {
 }
 
 /// The longest an input waits for its frame: past this its present is something else's.
-const HORIZON_NS: u64 = 1_000_000_000;
+pub const HORIZON_NS: u64 = 1_000_000_000;
+
+/// What decides one input's sample.
+enum Pick {
+    /// From this edge, bounded by this change (its index), or by the edge alone.
+    At(u64, Option<usize>, Edge),
+    /// A press whose change (its index) may be an earlier input's announced late: no sample.
+    Ambiguous(usize),
+    Unchanged,
+}
 
 pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: &[u32], quiet_ns: u64) -> Reactions {
     let mut mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid) && p.state != "lost" && p.state != "failed").collect();
     // Sources deliver presents as they complete, not as they began: the searches below need start order.
     mine.sort_by_key(|p| p.start_ns);
+    let mut sent = sent.to_vec();
+    sent.sort_by_key(|s| s.t_ns);
+    // Changes in the order they are known to have happened by, each claimed by one input at most.
+    let mut order: Vec<usize> = (0..changes.len()).collect();
+    order.sort_by_key(|&i| changes[i].1);
+    let mut claimed = vec![false; changes.len()];
+    // Each earlier input: when it was sent, and the latest its claimed change happened by.
+    let mut seen: Vec<(u64, Option<u64>)> = Vec::new();
     let mut out = Reactions::default();
-    for s in sent {
-        // The earliest the first change after the input can have happened.
-        let Some(changed) = changes.iter().filter(|c| c.1 > s.t_ns && c.1 <= s.t_ns + HORIZON_NS).map(|c| c.0).min() else {
-            out.unchanged += 1;
-            continue;
+    // The first change yet unclaimed that passes `ok`.
+    let first = |claimed: &[bool], ok: &dyn Fn(&Change) -> bool| order.iter().copied().find(|&i| !claimed[i] && ok(&changes[i]));
+    // The first frame of the target that began after `t` and no earlier than `bound`, and reached the screen.
+    let frame = |t: u64, bound: u64| {
+        let at = mine.partition_point(|p| p.start_ns <= t);
+        mine[at..].iter().take_while(|p| p.start_ns <= t + HORIZON_NS).find(|p| p.state == "displayed" && p.screen_ns > t && p.start_ns >= bound).copied()
+    };
+    let drawing = |t: u64| {
+        let at = mine.partition_point(|p| p.start_ns <= t);
+        mine[..at].iter().rev().take_while(|p| p.start_ns + HORIZON_NS > t).any(|p| p.start_ns.max(p.screen_ns) + quiet_ns > t)
+    };
+    for (k, s) in sent.iter().enumerate() {
+        let next = sent.get(k + 1).map_or(u64::MAX, |n| n.press.unwrap_or(n.t_ns));
+        // A click that acted on its press: the page says so (`acted`), else its first change after the
+        // press that is no press feedback came before the release, and nothing changed again between
+        // the release and the next input (a release-acting control with press feedback in its model is
+        // the release's), and every earlier input's change came before this press (else the change may
+        // be one of theirs, announced late: ambiguous). Its press is the sample only when a frame
+        // showing the change began before the release: a reaction drawn after it is not charged the hold.
+        let pressed = s.press.and_then(|p| {
+            let i = match s.acted {
+                Some(true) => first(&claimed, &|c| c.1 > p),
+                Some(false) => return None,
+                None => {
+                    let i = first(&claimed, &|c| !c.2 && after(c, p)).filter(|&i| changes[i].1 < s.t_ns)?;
+                    let again = order.iter().any(|&j| j != i && !claimed[j] && !changes[j].2 && changes[j].1 > s.t_ns && changes[j].1 < next.min(s.t_ns + HORIZON_NS));
+                    if again {
+                        return None;
+                    }
+                    if seen.iter().any(|&(at, by)| at + HORIZON_NS > p && by.is_none_or(|by| by >= p)) {
+                        return Some(Pick::Ambiguous(i));
+                    }
+                    Some(i)
+                }
+            };
+            let bound = i.map_or(p, |i| changes[i].0);
+            if !drawing(p) && frame(p, bound).is_none_or(|f| f.start_ns >= s.t_ns) {
+                return None;
+            }
+            Some(Pick::At(p, i, Edge::Press))
+        });
+        let pick = pressed.unwrap_or_else(|| match first(&claimed, &|c| c.1 > s.t_ns && c.1 <= s.t_ns + HORIZON_NS) {
+            Some(i) => Pick::At(s.t_ns, Some(i), Edge::Sent),
+            None => Pick::Unchanged,
+        });
+        let kind = usize::from(s.scroll);
+        let bump = |x: &mut (usize, usize)| if kind == 1 { x.1 += 1 } else { x.0 += 1 };
+        let (t, i, edge) = match pick {
+            Pick::At(t, i, edge) => (t, i, edge),
+            Pick::Ambiguous(i) => {
+                claimed[i] = true;
+                bump(&mut out.tried);
+                bump(&mut out.busy);
+                seen.push((s.t_ns, Some(changes[i].1)));
+                continue;
+            }
+            Pick::Unchanged => {
+                out.unchanged += 1;
+                seen.push((s.t_ns, None));
+                continue;
+            }
         };
-        let k = usize::from(s.scroll);
-        let bump = |t: &mut (usize, usize)| if k == 1 { t.1 += 1 } else { t.0 += 1 };
+        if let Some(i) = i {
+            claimed[i] = true;
+        }
+        seen.push((s.t_ns, i.map(|i| changes[i].1)));
         bump(&mut out.tried);
-        let at = mine.partition_point(|p| p.start_ns <= s.t_ns);
-        let drawing = mine[..at].iter().rev().take_while(|p| p.start_ns + HORIZON_NS > s.t_ns).any(|p| p.start_ns.max(p.screen_ns) + quiet_ns > s.t_ns);
-        if drawing {
+        if drawing(t) {
             bump(&mut out.busy);
             continue;
         }
-        match mine[at..].iter().take_while(|p| p.start_ns <= s.t_ns + HORIZON_NS).find(|p| p.state == "displayed" && p.screen_ns > s.t_ns && p.start_ns >= changed) {
+        match frame(t, i.map_or(t, |i| changes[i].0)) {
             Some(p) => {
-                let ms = (p.screen_ns - s.t_ns) as f64 / 1e6;
-                if s.scroll { out.scroll.push(ms) } else { out.interaction.push(ms) }
+                let ms = (p.screen_ns - t) as f64 / 1e6;
+                if s.scroll { out.scroll.push(ms) } else { out.interaction.push((ms, edge)) }
             }
             None => bump(&mut out.unshown),
         }
@@ -290,12 +412,29 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
 }
 
 impl Reactions {
+    /// Another run's, added.
+    pub fn add(&mut self, o: Reactions) {
+        self.interaction.extend(o.interaction);
+        self.scroll.extend(o.scroll);
+        self.tried = (self.tried.0 + o.tried.0, self.tried.1 + o.tried.1);
+        self.busy = (self.busy.0 + o.busy.0, self.busy.1 + o.busy.1);
+        self.unshown = (self.unshown.0 + o.unshown.0, self.unshown.1 + o.unshown.1);
+        self.unchanged += o.unchanged;
+    }
+
+    /// The interaction samples timed from a click's press.
+    pub fn presses(&self) -> usize {
+        self.interaction.iter().filter(|x| x.1 == Edge::Press).count()
+    }
+
     /// Values pooled over a block's runs, and why a kind is refused when it is: more than half of
     /// its inputs came while the app was drawing (`AmbiguousInteraction`), over 5% showed no frame
-    /// while the session lost no events (`PresentsUnmatched`), or none reached a frame.
+    /// while the session lost no events (`PresentsUnmatched`), or none reached a frame. Beside
+    /// `interaction.n`, `interaction.n.press`: how many of its samples are a click's press.
     pub fn values(&self, events_lost: u64, out: &mut BTreeMap<String, f64>, refused: &mut BTreeMap<String, String>) {
+        let interaction: Vec<f64> = self.interaction.iter().map(|x| x.0).collect();
         for (prefix, count, v, tried, busy, unshown) in
-            [("interaction", "interaction.n", &self.interaction, self.tried.0, self.busy.0, self.unshown.0), ("scroll.latency", "scroll.n", &self.scroll, self.tried.1, self.busy.1, self.unshown.1)]
+            [("interaction", "interaction.n", &interaction, self.tried.0, self.busy.0, self.unshown.0), ("scroll.latency", "scroll.n", &self.scroll, self.tried.1, self.busy.1, self.unshown.1)]
         {
             let why = if tried == 0 {
                 Some(if self.unchanged > 0 {
@@ -327,6 +466,9 @@ impl Reactions {
                     out.insert(count.to_string(), v.len() as f64);
                     out.insert(format!("{prefix}.p50"), pct(&v, 0.5));
                     out.insert(format!("{prefix}.p95"), pct(&v, 0.95));
+                    if prefix == "interaction" {
+                        out.insert("interaction.n.press".into(), self.presses() as f64);
+                    }
                 }
             }
         }

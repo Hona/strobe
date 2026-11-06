@@ -14,7 +14,6 @@ use crate::driver::native::{Input, Log};
 use crate::host;
 use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::present::PresentCapture;
-use crate::probe::present::frames::Sent;
 use crate::target::a11y::input::{self, Button, Key, Mods, Named, Poster, Target};
 use crate::target::a11y::keys;
 use crate::target::web::WebPage as Page;
@@ -210,7 +209,7 @@ impl OsInput {
 
     fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
         self.last_input.set(t_ns);
-        self.log.borrow_mut().inputs.push(Input { t_ns, kind, first });
+        self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None });
     }
 
     fn count(&self, i: usize) {
@@ -275,12 +274,6 @@ impl OsInput {
             let _ = self.button(b, false, false);
         }
         self.poster.release_all(self.top.get());
-    }
-
-    /// The run's inputs a latency is measured from (a click's release, a key press, a scroll's first
-    /// wheel step), with whether each was a scroll: what `run_inputs` keeps.
-    pub fn sent(log: &Log) -> Vec<Sent> {
-        log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| Sent { t_ns: i.t_ns, scroll: i.kind == "scroll" }).collect()
     }
 
     /// Starts a count of what arrives (before each run, and its reset): strobe's posted input and the
@@ -542,12 +535,14 @@ impl Driver {
         let quiet = os.rest(Duration::ZERO, gap)?;
         let mut last = 0;
         for k in 0..count {
-            // The press shows a pressed look at most; the release is the click's action, held as a
-            // person holds a click, until the pressed look is on the screen (the minimum only when the
-            // page was still drawing before the press). A double click's presses follow at once, with
-            // no settling inside the gesture, and its releases are no samples: only a single click's
-            // release is (SPEC 7.4).
-            os.input(os.poster.button(t, b, true, k > 0, mods, os.top.get())?, "pointer", false);
+            // The press shows a pressed look, or does the click (a `mousedown` handler); the release
+            // does it otherwise. It is held as a person holds a click, until what the press drew is on
+            // the screen (the minimum only when the page was still drawing before the press): a
+            // reaction to the press is timed from it (SPEC 7.4). A double click's presses follow at
+            // once, with no settling inside the gesture, and its releases are no samples: only a
+            // single click is.
+            let pressed = os.poster.button(t, b, true, k > 0, mods, os.top.get())?;
+            os.input(pressed, "pointer", false);
             os.count(1);
             if count == 1 && quiet {
                 os.rest(Duration::from_millis(60), gap)?;
@@ -556,6 +551,12 @@ impl Driver {
             }
             last = os.poster.button(t, b, false, false, mods, os.top.get())?;
             os.input(last, if count == 1 { kind } else { "pointer" }, false);
+            if count == 1
+                && kind == "discrete"
+                && let Some(i) = os.log.borrow_mut().inputs.last_mut()
+            {
+                i.press_ns = Some(pressed);
+            }
         }
         Ok(last)
     }

@@ -1070,6 +1070,17 @@ impl<'a> Doc<'a> {
             let whose = if every || !self.multi() { String::new() } else { format!(" ({})", cell(&series.join(", "))) };
             t += &format!("- **{}{whose}:** {}\n", warning_name(&id), cell(text.trim_end_matches('.')));
         }
+        // Waits the bench file left out of its runs (`ctx.untimed`): the numbers time the rest.
+        for s in self.series.iter().filter(|s| s["untimed"]["stretches"].is_number()) {
+            let u = &s["untimed"];
+            let whose = if self.multi() { format!(" ({})", cell(&self.title(s))) } else { String::new() };
+            t += &format!(
+                "- **Untimed{whose}:** {:.0} stretch{} a run, {} of each run left out of its time, CPU, frames and inputs (`ctx.untimed`)\n",
+                u["stretches"].as_f64().unwrap_or(0.0),
+                if u["stretches"].as_f64() == Some(1.0) { "" } else { "es" },
+                crate::app::fmt::value(u["ms"].as_f64().unwrap_or(f64::NAN), "ms")
+            );
+        }
         if let Some(l) = store::ledger::line(r) {
             t += &format!("- **Other experiments on these builds:** {}\n", cell(&l));
         }

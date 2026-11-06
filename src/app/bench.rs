@@ -248,14 +248,16 @@ impl Variant {
     }
 }
 
-/// What a target runs on. Metrics that are a browser engine's own (`Across::PerSide`) compare only
-/// between sides of one engine.
-fn engine(kind: &str) -> &'static str {
-    match kind {
+/// What a target runs on: a page's browser engine, Chromium for apps on it, or the kind. Metrics that
+/// are a browser engine's own (`Across::PerSide`) compare only between sides of one engine, and two
+/// pages on different engines are measured from outside as a page against a native app is: Chromium's
+/// trace and another engine's OS presents are not one instrument.
+fn engine(target: &Value) -> &'static str {
+    match target["kind"].as_str().unwrap_or("") {
         "native" => "native",
         "script" => "script",
         "cli" => "cli",
-        _ => "chromium",
+        _ => engine_of(target).name(),
     }
 }
 
@@ -392,11 +394,14 @@ const LOOKS: [usize; 5] = [8, 12, 18, 26, 40];
 const POCOCK_ALPHA: f64 = 0.0158;
 
 /// One run as the block saw it: wall time, the target's CPU (% of a core), renderer main-thread
-/// task time (ms), and its span on the host clock.
+/// task time (ms), all without its untimed stretches, and its span on the host clock.
 #[derive(Clone, Debug)]
 struct Run {
     ms: f64,
     cpu: f64,
+    /// The target's CPU (% of a core) over the whole span, untimed stretches too: what other work on
+    /// its CPUs is told apart from.
+    cpu_whole: f64,
     task: f64,
     /// The target's processes' CPU in the run (ms, every thread): what warms up on an engine with no
     /// main-thread task counter (Firefox), as for native targets.
@@ -407,6 +412,8 @@ struct Run {
     roles: [f64; 3],
     t0: u64,
     t1: u64,
+    /// Its span with the stretches `ctx.untimed` left out (host clock).
+    timed: metrics::Timed,
     /// The run with its reset (ms): what it cost the block.
     total: f64,
     /// Drags in the run: moves strobe sent per second and the 95th percentile gap (ms).
@@ -649,8 +656,8 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
     } else {
         "X11 Present"
     };
-    let observer = |v: Option<&Variant>| match v.and_then(|v| v.target.as_deref()).map(|t| engine(ctx.describe["targets"][t]["kind"].as_str().unwrap_or(""))) {
-        Some("chromium") => "devtools",
+    let observer = |v: Option<&Variant>| match v.and_then(|v| v.target.as_deref()).map(|t| engine(&ctx.describe["targets"][t])) {
+        Some("chromium" | "firefox" | "webkit") => "devtools",
         Some("native") => "accessibility",
         _ => "none",
     };
@@ -1023,6 +1030,34 @@ impl Overhead {
     }
 }
 
+/// A series' untimed stretches (SPEC §9.6), from its blocks' `untimed.n` and `untimed.ms` (each the
+/// median per measured run): `{ stretches, ms }` per run, the median over the blocks; null when no
+/// run left one out.
+fn untimed_of(blocks: &[(Option<f64>, Option<f64>)]) -> Value {
+    let n: Vec<f64> = blocks.iter().filter_map(|b| b.0).collect();
+    let ms: Vec<f64> = blocks.iter().filter_map(|b| b.1).collect();
+    if n.is_empty() {
+        return Value::Null;
+    }
+    json!({ "stretches": metrics::median(&n), "ms": metrics::median(&ms) })
+}
+
+/// `2 stretches a run, 603 ms of each run left out`: a series' `untimed`.
+fn untimed_line(u: &Value) -> Option<String> {
+    let (n, ms) = (u["stretches"].as_f64()?, u["ms"].as_f64().unwrap_or(f64::NAN));
+    Some(format!("{n:.0} stretch{} a run, {} of each run left out (ctx.untimed)", if n == 1.0 { "" } else { "es" }, fmt::value(ms, "ms")))
+}
+
+/// `untimed.n` and `untimed.ms` of a block (SPEC §9.6): its measured runs' untimed stretches and the
+/// time they left out, each the median per run; none when no run left one out.
+fn untimed_values(runs: &[&metrics::Timed], values: &mut BTreeMap<String, f64>) {
+    if runs.iter().all(|r| r.untimed.is_empty()) {
+        return;
+    }
+    values.insert("untimed.n".into(), metrics::median(&runs.iter().map(|r| r.untimed.len() as f64).collect::<Vec<_>>()));
+    values.insert("untimed.ms".into(), metrics::median(&runs.iter().map(|r| r.untimed_in(r.t0, r.t1) as f64 / 1e6).collect::<Vec<_>>()));
+}
+
 /// The blocks' overhead, each part's mean over the blocks that measured it.
 fn mean_overhead(blocks: &[Block]) -> Option<Overhead> {
     let all: Vec<&Overhead> = blocks.iter().filter_map(|b| b.overhead.as_ref()).collect();
@@ -1048,17 +1083,22 @@ type RunCost = (u64, Option<u64>, Option<u64>);
 
 /// strobe's own process and the runner's CPU inside the runs only (rule 2): read just before each
 /// run begins and just after it ends, so the work strobe does between runs (reading the target's
-/// processes, snapshots, resets) is never counted, and the share is over the measured runs' time.
-/// Each read is of the one process (`host::process_cycles`), not a list of the system's.
+/// processes, snapshots, resets) is never counted, and the share is over the measured runs' time;
+/// a run's `ctx.untimed` stretches pause it (`pause`, `resume`). Each read is of the one process
+/// (`host::process_cycles`), not a list of the system's.
 struct SelfCost {
     runner: u32,
-    open: Option<(u64, Option<u64>, Option<u64>)>,
-    runs: Vec<RunCost>,
+    /// The readings when the run (or its stretch after a pause) began: the cycle clock, strobe's and
+    /// the runner's cycles.
+    open: Cell<Option<RunCost>>,
+    /// The run so far, over its stretches before a pause.
+    sum: Cell<Option<RunCost>>,
+    runs: RefCell<Vec<RunCost>>,
 }
 
 impl SelfCost {
     fn new(runner: u32) -> SelfCost {
-        SelfCost { runner, open: None, runs: Vec::new() }
+        SelfCost { runner, open: Cell::new(None), sum: Cell::new(None), runs: RefCell::new(Vec::new()) }
     }
 
     fn read(&self) -> (Option<u64>, Option<u64>, Option<u64>) {
@@ -1066,26 +1106,41 @@ impl SelfCost {
     }
 
     /// A run begins now.
-    fn start(&mut self) {
-        let (strobe, runner, tsc) = self.read();
-        self.open = tsc.map(|t| (t, strobe, runner));
+    fn start(&self) {
+        self.sum.set(Some((0, Some(0), Some(0))));
+        self.resume();
     }
 
-    /// The run that began ended now.
-    fn end(&mut self) {
+    /// A run's untimed stretch ends now: the run counts again.
+    fn resume(&self) {
         let (strobe, runner, tsc) = self.read();
+        self.open.set(tsc.map(|t| (t, strobe, runner)));
+    }
+
+    /// A run's untimed stretch begins now: what the run used so far is kept, and nothing until `resume`.
+    fn pause(&self) {
+        let (strobe, runner, tsc) = self.read();
+        let Some(sum) = self.sum.get() else { return };
         let Some((t0, s0, r0)) = self.open.take() else {
-            self.runs.push((0, None, None));
+            self.sum.set(Some((sum.0, None, None)));
             return;
         };
         let span = tsc.map_or(0, |t| t.saturating_sub(t0));
-        let delta = |a: Option<u64>, b: Option<u64>| a.zip(b).filter(|(a, b)| b >= a).map(|(a, b)| b - a);
-        self.runs.push((span, delta(s0, strobe), delta(r0, runner)));
+        let delta = |a: Option<u64>, b: Option<u64>, so_far: Option<u64>| a.zip(b).filter(|(a, b)| b >= a).and_then(|(a, b)| Some(so_far? + b - a));
+        self.sum.set(Some((sum.0 + span, delta(s0, strobe, sum.1), delta(r0, runner, sum.2))));
+    }
+
+    /// The run that began ended now.
+    fn end(&self) {
+        self.pause();
+        let run = self.sum.take().map_or((0, None, None), |s| if s.0 == 0 { (0, None, None) } else { s });
+        self.runs.borrow_mut().push(run);
     }
 
     /// strobe's and the runner's share of one core over the runs from `first` on.
     fn share(&self, first: usize) -> (Option<f64>, Option<f64>) {
-        let runs = &self.runs[first.min(self.runs.len())..];
+        let runs = self.runs.borrow();
+        let runs = &runs[first.min(runs.len())..];
         let span: u64 = runs.iter().map(|r| r.0).sum();
         let part = |f: fn(&RunCost) -> Option<u64>| {
             let used: Option<u64> = runs.iter().map(f).sum();
@@ -1311,7 +1366,7 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         implementation_preflight(&ctx.describe, &series, &variants, &config, &ctx.projects)?;
         ctx.cross_engine = {
-            let kinds: Vec<&str> = variants.iter().filter_map(|v| v.target.as_deref()).map(|t| engine(ctx.describe["targets"][t]["kind"].as_str().unwrap_or(""))).collect();
+            let kinds: Vec<&str> = variants.iter().filter_map(|v| v.target.as_deref()).map(|t| engine(&ctx.describe["targets"][t])).collect();
             kinds[0] != kinds[1]
         };
     }
@@ -1553,7 +1608,7 @@ pub fn run(args: &Args) -> Result<Output> {
             json!({
                 "role": v.role, "name": v.name, "spec": v.spec, "label": v.label, "subject": subject(v), "commit": v.commit, "dirty": v.dirty,
                 "kind": v.kind.name(),
-                "target": v.target, "engine": kind.as_str().map(engine), "target_kind": kind,
+                "target": v.target, "engine": v.target.as_deref().map(|t| engine(&ctx.describe["targets"][t])), "target_kind": kind,
                 "repo": v.target.as_deref().and_then(|t| ctx.projects.get(t)).map(|(p, _)| p.display().to_string()),
                 "process_set": process_set_of(&series_out, v.role),
             })
@@ -1684,7 +1739,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"], "engine": target["engine"],
-        "recording": recording, "screen": screen, "shown": shown, "overhead": overhead,
+        "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
         "log": log, "log_path": ctx.runner.log,
         // For the parity matrix (`journey::matrix`).
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target), "same": same, "ops": ops, "adapted": s.adapted,
@@ -1737,6 +1792,12 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
                         _ => format!("{name} {}", fmt::value(v, def.map_or("", |m| m.unit))),
                     }
                 })
+                // Which edge the input samples were timed from (SPEC §7.4).
+                .map(|t| match (name, s["values"]["interaction.n"].as_f64(), s["values"]["interaction.n.press"].as_f64()) {
+                    ("interaction.p50" | "interaction.p95", Some(n), Some(p)) if !t.contains('—') => format!("{t} ({n:.0} inputs, {p:.0} at a press)"),
+                    ("interaction.p95", _, Some(p)) => format!("{t} ({p:.0} at a press)"),
+                    _ => t,
+                })
                 .or_else(|| s["refused"][name].is_string().then(|| format!("{name} refused")))
         };
         // A launch's milestones too, declared or not: when each line or pixel change came.
@@ -1767,6 +1828,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
             if let Some(o) = serde_json::from_value::<Overhead>(s["overhead"].clone()).ok().map(|o| o.text()).filter(|t| !t.is_empty()) {
                 text += &format!("      self  {o}\n");
+            }
+            if let Some(u) = untimed_line(&s["untimed"]) {
+                text += &format!("      untimed  {u}\n");
             }
             let missing: Vec<&str> = s["shown"]["head"]["missing"].as_array().into_iter().flatten().filter_map(Value::as_str).filter(|m| !m.contains("before the runs")).collect();
             match shown_line(s, ("base", "head")) {
@@ -2096,7 +2160,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
-        "overhead": mean_overhead(&blocks),
+        "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
         "blocks": blocks, "warnings": warnings, "attribution": {}, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     }))
@@ -2637,7 +2701,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
-        "overhead": mean_overhead(&blocks),
+        "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
         "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
         "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
@@ -3665,8 +3729,9 @@ fn kind_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> 
 }
 
 /// `phase.<name>` for one run (ms): the summed spans between its `…:phase:<name>:start` and `:end`
-/// marks on one clock; NaN when the run never entered the phase.
-fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
+/// marks on one clock, without the run's untimed stretches inside them; NaN when the run never
+/// entered the phase.
+fn phase_ms(marks: &[(String, u64)], name: &str, run: &metrics::Timed) -> f64 {
     let (start, end) = (format!(":phase:{name}:start"), format!(":phase:{name}:end"));
     let mut open: Option<u64> = None;
     let mut total: Option<u64> = None;
@@ -3676,7 +3741,7 @@ fn phase_ms(marks: &[(String, u64)], name: &str) -> f64 {
         } else if key.ends_with(&end)
             && let Some(from) = open.take()
         {
-            *total.get_or_insert(0) += at.saturating_sub(from);
+            *total.get_or_insert(0) += at.saturating_sub(from).saturating_sub(run.untimed_in(from, *at));
         }
     }
     total.map_or(f64::NAN, |ns| ns as f64 / 1e6)
@@ -3978,7 +4043,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             page.eval(CHANGES_SCRIPT)?;
         }
         // The page's changes in the run so far, harvested before a `goto` takes the document with them.
-        let harvested: RefCell<Vec<probe::present::frames::Change>> = RefCell::new(Vec::new());
+        let harvested: RefCell<PageChanges> = RefCell::new(PageChanges::default());
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
@@ -4069,6 +4134,45 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 _ => Ok(()),
             }
         };
+        let cost = SelfCost::new(ctx.runner.pid());
+        // The run's untimed stretches, read inside each (`Hooks::untimed`): the browser's processes and
+        // the page's counters (with what a departed document carried) at each edge, the page's counter
+        // global (what it counted in a stretch leaves the run's counts), and strobe's reads of the page
+        // before the first. A trace marks each stretch, which its readers take out of its run
+        // (`metrics::read`).
+        let edges: RefCell<Vec<WebEdge>> = RefCell::new(Vec::new());
+        let reads_before = Cell::new((0u64, 0.0f64));
+        let counted_before: RefCell<BTreeMap<String, f64>> = RefCell::new(BTreeMap::new());
+        let edge = |start: bool, n: usize| -> Result<()> {
+            if start {
+                cost.pause();
+                if !traceless {
+                    driver.mark(&hooks.untimed_mark(n, true))?;
+                }
+                let (k, ms) = driver.take_reads();
+                reads_before.set((reads_before.get().0 + k, reads_before.get().1 + ms));
+            }
+            if !counted.is_empty() {
+                let now = page_counts();
+                if start {
+                    *counted_before.borrow_mut() = now;
+                } else {
+                    let before = counted_before.take();
+                    hooks.add(&now.iter().map(|(k, v)| (k.clone(), before.get(k).copied().unwrap_or(0.0) - v)).collect());
+                }
+            }
+            let (c, carry) = (counters(), *carried.borrow());
+            let procs = browser.processes();
+            edges.borrow_mut().push((super::record::per_process(&procs), host::tsc(), std::array::from_fn(|i| c[i] + carry[i])));
+            if !start {
+                driver.take_reads();
+                if !traceless {
+                    driver.mark(&hooks.untimed_mark(n, false))?;
+                }
+                cost.resume();
+            }
+            Ok(())
+        };
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -4141,12 +4245,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // outside, or in an engine without that trace, strobe's own marks on the host clock.
                 "phase" => {
                     if traceless {
-                        hooks.phase(a);
-                    } else if let Some(key) = hooks.phase_key(a) {
+                        hooks.phase(a)?;
+                    } else if let Some(key) = hooks.phase_key(a)? {
                         driver.mark(&key)?;
                     }
                     Ok(Value::Bool(true))
                 }
+                "untimed" => hooks.untimed(a, edge),
                 "line" => Err(Error::usage("waitForLine reads a native app's output or the log files under its home; a page has neither (wait for the page instead: page.waitFor)")),
                 other => Err(Error::msg(format!("unknown runner request {other}"))),
             }
@@ -4300,7 +4405,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut census: Vec<Value> = Vec::new();
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
         let sampler = probe::os::Sampler::start(browser.pid(), browser.profile());
-        let (sampled, runner_pid) = (Instant::now(), ctx.runner.pid());
+        let sampled = Instant::now();
         // Renderer main-thread task time, a cumulative counter: the live work signal for warmup, and
         // main.busy when the trace carries no RunTask slices.
         if let Some(p) = page.cdp() {
@@ -4344,7 +4449,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 
         let run_timeout = s.run_timeout();
         let perf = x.counters.then(probe::wakes::Perf::new);
-        let mut cost = SelfCost::new(runner_pid);
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
             // As a native app is before each run (`front_page`).
@@ -4355,20 +4459,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // The target's CPU in TSC cycles over TSC time: process times move in 15.6 ms ticks, which
             // made an idle 5 s run read 0, 0.31% or 0.62% and nothing between. One read of the
             // target's processes at each end of the run gives its cycles, times and roles.
+            // Each process's cycles by pid and start time (`record::per_process`), read at once.
             let read = || {
                 let procs = browser.processes();
                 let tsc = host::tsc();
                 let (cycles, cpu) = procs.iter().fold((0u64, 0u64), |(c, t), p| (c + p.cycles, t + p.cpu_ns));
-                (procs, cycles, tsc, cpu)
-            };
-            let by_role = |procs: &[host::ProcTimes], roles: &BTreeMap<u32, usize>| -> [u64; 3] {
-                let mut out = [0u64; 3];
-                for p in procs {
-                    if let Some(i) = roles.get(&p.pid) {
-                        out[*i] += p.cycles;
-                    }
-                }
-                out
+                (super::record::per_process(&procs), cycles, tsc, cpu)
             };
             let mut roles = process_roles(&browser);
             // Strobe's own calls into the page (resetting its counters, its marks, the Performance
@@ -4395,10 +4491,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             if changes {
                 page_changes(&page);
-                harvested.borrow_mut().clear();
+                harvested.take();
             }
             let docs = page.documents();
             driver.take_reads();
+            edges.borrow_mut().clear();
+            reads_before.set((0, 0.0));
             if let Some(os) = driver.os.get() {
                 os.set_pids(browser.pids());
                 os.take_log();
@@ -4410,32 +4508,57 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 driver.mark(&format!("{key}:start"))?;
             }
             let listed = probe::wakes::wall_us();
-            let (procs_start, cyc0, tsc0, _) = read();
-            let k0 = probe::wakes::Counters::take(listed, &procs_start.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+            let (at0, cyc0, tsc0, _) = read();
+            let k0 = probe::wakes::Counters::take(listed, &at0.keys().map(|k| k.0).collect::<Vec<_>>(), perf.as_ref());
             // strobe's own cost over the run.
             cost.start();
             let t0 = host::now_ns();
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
-            if !outside {
+            // The page's next frame ends the run (what its last step drew), except after an untimed
+            // stretch, whose own frames are none of the run's.
+            if !outside && !hooks.ended_untimed() {
                 driver.dispatch("frame", &[])?;
             }
             let t1 = host::now_ns();
             cost.end();
-            let (procs_end, cyc1, tsc1, cpu1) = read();
-            let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
-            // OS input's log: its inputs for latency, its drags for `input.rate`.
+            let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
+            let (at1, cyc1, tsc1, cpu1) = read();
+            let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &at1.keys().map(|k| k.0).collect::<Vec<_>>(), perf.as_ref());
+            // OS input's log: its inputs for latency, its drags for `input.rate` (those begun untimed left out).
             let sent = driver.os.get().map(|os| os.take_log());
-            let input = crate::driver::input_pacing(&sent.as_ref().map_or_else(|| driver.drags.take(), |l| l.drags.clone()));
+            let mut drags = sent.as_ref().map_or_else(|| driver.drags.take(), |l| l.drags.clone());
+            drags.retain(|d| d.first().is_none_or(|t| !timed.untimed_at(*t)));
+            let input = crate::driver::input_pacing(&drags);
             let c1 = counters();
             if !traceless || gecko_on {
                 driver.mark(&format!("{key}:end"))?;
             }
             // Read once the run's span and CPU window closed: the page's own count of its time.
             let reads = driver.take_reads();
+            let reads = (reads.0 + reads_before.get().0, reads.1 + reads_before.get().1);
             roles.extend(process_roles(&browser));
-            let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
+            // The readings at the run's start, each untimed stretch's edges and the run's end: each pair
+            // a timed part (a stretch the run never ended ends with it). The cycle clock's and the page
+            // counters' untimed time is the sum over the stretches (`gap`).
+            let carry_end = *carried.borrow();
+            let mut e = edges.take();
+            let end: WebEdge = (at1.clone(), tsc1, std::array::from_fn(|i| c1[i] + carry_end[i]));
+            if e.len() % 2 == 1 {
+                e.push(end.clone());
+            }
+            let mut gap = (0u64, [0.0f64; 6]);
+            for [a, b] in e.as_chunks::<2>().0 {
+                gap.0 += b.1.zip(a.1).map_or(0, |(y, x)| y.saturating_sub(x));
+                for i in 0..6 {
+                    gap.1[i] += b.2[i] - a.2[i];
+                }
+            }
+            let mut cycles_at: Vec<&super::record::Cycles> = vec![&at0];
+            cycles_at.extend(e.iter().map(|x| &x.0));
+            cycles_at.push(&at1);
+            let timed_cycles = |keep: &dyn Fn(u32) -> bool| super::record::cycles_timed(&cycles_at, keep);
             if !counted.is_empty() {
                 hooks.add(&page_counts());
             }
@@ -4449,8 +4572,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if changes {
                 let mut seen = harvested.take();
                 seen.extend(page_changes(&page));
-                let inputs = sent.as_ref().map_or_else(|| driver.inputs.take(), crate::driver::os::OsInput::sent);
-                run_inputs.borrow_mut().push((inputs, seen));
+                let timed_input = |s: &probe::present::frames::Sent| !timed.untimed_at(s.t_ns) && !s.press.is_some_and(|p| timed.untimed_at(p));
+                let mut inputs: Vec<probe::present::frames::Sent> = sent.as_ref().map_or_else(|| driver.inputs.take().into_iter().filter(timed_input).collect(), |l| l.sent(&timed));
+                seen.acted(&mut inputs);
+                run_inputs.borrow_mut().push((inputs, seen.changes, timed.clone()));
             }
             if page.documents() != docs {
                 loaded_document.set(true);
@@ -4484,27 +4609,35 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     read_same(journey::When::Reset)?;
                 }
             }
-            let wall = (t1 - t0) as f64;
-            let cpu = match (tsc0, tsc1) {
+            // The run's timed time, and its cycles over the cycle clock's timed time: the untimed
+            // stretches leave both (`gap`).
+            let wall = timed.ns() as f64;
+            let share = |cycles: u64, untimed_tsc: u64| match (tsc0, tsc1) {
+                (Some(a), Some(b)) if b > a + untimed_tsc => Some(100.0 * cycles as f64 / (b - a - untimed_tsc) as f64),
+                _ => None,
+            };
+            let cpu = match share(super::record::cycles_used(&at0, &at1), 0) {
                 // No process readings (an OS without a process sampler yet): unknown, never 0%.
-                _ if cyc1 == 0 && cpu1 == 0 => f64::NAN,
-                (Some(a), Some(b)) if b > a && cyc0 > 0 => 100.0 * cyc1.saturating_sub(cyc0) as f64 / (b - a) as f64,
+                _ if cyc1 == 0 && cpu1 == 0 => (f64::NAN, f64::NAN),
+                Some(whole) if cyc0 > 0 => (share(timed_cycles(&|_| true), gap.0).unwrap_or(f64::NAN), whole),
                 // Never from process times, which move in 15.6 ms ticks on Windows (where cycles are not
                 // time, as on Windows on Arm before 11 24H2, the metric is refused instead).
-                _ => f64::NAN,
+                _ => (f64::NAN, f64::NAN),
             };
+            let (cpu, cpu_whole) = cpu;
             let carry = *carried.borrow();
-            let parts = std::array::from_fn(|i| c1[i + 1] + carry[i + 1] - c0[i + 1]);
+            let parts = std::array::from_fn(|i| c1[i + 1] + carry[i + 1] - c0[i + 1] - gap.1[i + 1]);
             // Cycles only: a process's share needs the exact counter, and a process born during the run
             // (a renderer after a cross-site navigation) counts from zero. A role no process has (a browser
             // that composites in its own process: no GPU process) is absent, never 0.
-            let roles = std::array::from_fn(|i| match (tsc0, tsc1) {
-                (Some(a), Some(b)) if b > a && roles.values().any(|&r| r == i) => 100.0 * role1[i].saturating_sub(role0[i]) as f64 / (b - a) as f64,
+            let roles = std::array::from_fn(|i| match share(timed_cycles(&|pid| roles.get(&pid) == Some(&i)), gap.0) {
+                Some(pct) if roles.values().any(|&r| r == i) => pct,
                 _ => f64::NAN,
             });
             let counted = probe::wakes::counted(&k0, &k1);
             let work = cpu * wall / 1e6 / 100.0;
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], work, parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted, reads })
+            let task = c1[0] + carry[0] - c0[0] - gap.1[0];
+            Ok(Run { ms: wall / 1e6, cpu, cpu_whole, task, work, parts, roles, t0, t1, timed, total: began.elapsed().as_secs_f64() * 1e3, input, counted, reads })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -4608,7 +4741,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             .filter(|_| !pinned.is_empty())
             .filter_map(|((_, w), r)| {
                 let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
-                r.cpu.is_finite().then(|| (busy - r.cpu).max(0.0))
+                r.cpu_whole.is_finite().then(|| (busy - r.cpu_whole).max(0.0))
             })
             .collect();
         let background = busiest_others(&procs0, &procs1);
@@ -4641,7 +4774,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // measured run's own span) and its style, layout and GC rows, then the page's source maps.
         if let Some(g) = gecko.take() {
             let raw = g.stop()?;
-            let got = probe::gecko::convert(&raw, &token, &spans, &dir)?;
+            let untimed: Vec<(u64, u64)> = measured.iter().flat_map(|r| r.timed.untimed.iter().copied()).collect();
+            let got = probe::gecko::convert(&raw, &token, &spans, &untimed, &dir)?;
             let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
             probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
@@ -4718,10 +4852,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let per: BTreeMap<String, f64> = (0..measured.len())
                 .filter_map(|j| {
                     if traceless {
-                        return Some((key(j), phase_ms(run_marks.get(first + j)?, name))).filter(|(_, ms)| ms.is_finite());
+                        return Some((key(j), phase_ms(run_marks.get(first + j)?, name, &measured.get(j)?.timed))).filter(|(_, ms)| ms.is_finite());
                     }
                     let suffix = format!(":run:{}:phase:{name}", first + j);
-                    let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0) as f64 / 1e6).collect();
+                    let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0 - data.untimed_in(w)) as f64 / 1e6).collect();
                     (!spans.is_empty()).then(|| (key(j), spans.iter().sum()))
                 })
                 .collect();
@@ -4810,8 +4944,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if traceless {
             values.remove("frames.n");
             if let Some(p) = presents {
-                let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
-                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &spans, run_inputs_kept.get(first..).unwrap_or_default(), &mut values, &mut os_refused);
+                let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
+                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(first..).unwrap_or_default(), &mut values, &mut os_refused);
             }
         }
         if canvas {
@@ -4851,6 +4985,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         let mut refused = uncounted;
         refuse_not_on_this_os(s, &mut values, &mut refused);
+        block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
         for (m, r) in os_refused {
             values.remove(&m);
             refused.insert(m, r);
@@ -4880,7 +5015,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // Traceless, the frame pacing per run (`intervals`) comes from the OS's presents where this OS
         // tells when a frame was handed over (Windows).
         let intervals = match (&os_presents, values.get("display.hz")) {
-            (Some(p), Some(hz)) if !p.no_begin => present_intervals(p, &browser.pids(), &measured.iter().map(|r| (r.t0, r.t1)).collect::<Vec<_>>(), 1000.0 / hz),
+            (Some(p), Some(hz)) if !p.no_begin => present_intervals(p, &browser.pids(), &measured.iter().map(|r| r.timed.clone()).collect::<Vec<_>>(), 1000.0 / hz),
             _ => metrics::run_intervals(&data),
         };
         // From outside there is no trace to keep: the block's numbers are in result.json. A Firefox block
@@ -4911,9 +5046,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .iter()
                     .enumerate()
                     .map(|(j, r)| {
-                        let (sent, changes) = inputs.get(first + j).cloned().unwrap_or_default();
-                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true })).collect();
-                        (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
+                        let (sent, changes, _) = inputs.get(first + j).cloned().unwrap_or_default();
+                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true, "press_ns": s.press, "acted": s.acted })).collect();
+                        (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
                     })
                     .collect();
                 store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": values.get("display.hz"), "runs": per }))?;
@@ -5329,8 +5464,7 @@ fn series_and_sides(describe: &Value, args: &Args, base: Option<&str>, head: &st
 fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Variant], config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> Result<()> {
     let (Some(b), Some(h)) = (variants[0].target.as_deref(), variants.get(1).and_then(|v| v.target.as_deref())) else { return Ok(()) };
     let (tb, th) = (&describe["targets"][b], &describe["targets"][h]);
-    let kind = |t: &Value| t["kind"].as_str().unwrap_or("").to_string();
-    let cross = engine(&kind(tb)) != engine(&kind(th));
+    let cross = engine(tb) != engine(th);
     for s in series.iter().filter(|s| s.gap.is_none() && s.refused.is_none() && cross) {
         if let Some(d) = model::metric(&s.primary).filter(|d| d.across == model::Across::PerSide) {
             let why = format!(
@@ -5339,9 +5473,9 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
                 d.name,
                 d.about,
                 variants[0].name,
-                engine(&kind(tb)),
+                engine(tb),
                 variants[1].name,
-                engine(&kind(th)),
+                engine(th),
             );
             return Err(Error::usage_refused(Refusal::new(ValidatorId::NotComparable, why).fix("pick a primary both sides measure the same way, such as cpu.work, run.duration or launch.ready")));
         }
@@ -5444,8 +5578,9 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
     let targets = describe["targets"].as_object().cloned().unwrap_or_default();
     // `--check` of every target of a file whose targets run on different engines checks each page the
     // way an implementation comparison measures it: from outside, with OS input (SPEC §9.10).
+    // Pages in several browsers and nothing else are no such file: each checks in its own engine.
     let check = args.has("check") && sides.is_none() && only_target.is_none();
-    let engines: std::collections::BTreeSet<&str> = targets.values().map(|t| engine(t["kind"].as_str().unwrap_or(""))).collect();
+    let engines: std::collections::BTreeSet<&str> = targets.values().map(|t| if WebEngine::ALL.iter().any(|e| e.name() == engine(t)) { "page" } else { engine(t) }).collect();
     for (case, c) in describe["cases"].as_object().cloned().unwrap_or_default() {
         if filter.is_some_and(|f| !case_matches(f, &case)) {
             continue;
@@ -5502,7 +5637,7 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
                     adapted: c["adapted"].as_str().map(str::to_string),
                     refused: None,
                     hero: c["hero"] == true,
-                    cross_engine: sides.is_some_and(|(b, h)| engine(targets[b]["kind"].as_str().unwrap_or("")) != engine(targets[h]["kind"].as_str().unwrap_or(""))) || (check && engines.len() > 1),
+                    cross_engine: sides.is_some_and(|(b, h)| engine(&targets[b]) != engine(&targets[h])) || (check && engines.len() > 1),
                     case: case.clone(),
                     target: target.clone(),
                     params: p.clone(),
@@ -5561,7 +5696,11 @@ fn margins(v: &Value, primary: &str) -> std::result::Result<BTreeMap<String, f64
 
 /// One run's inputs strobe sent (host clock, and whether each was a scroll) and the page's own changes
 /// (host clock), for input latency from the OS's presents.
-type RunInputs = (Vec<probe::present::frames::Sent>, Vec<probe::present::frames::Change>);
+type RunInputs = (Vec<probe::present::frames::Sent>, Vec<probe::present::frames::Change>, metrics::Timed);
+
+/// The browser's processes, the cycle clock and the page's counters (with what departed documents
+/// carried) at one edge of a run's untimed stretch.
+type WebEdge = (super::record::Cycles, Option<u64>, [f64; 6]);
 
 /// The page engine a target runs in (`web`, `url`; `apply_engines` set it): Chromium unless it says.
 fn engine_of(target: &Value) -> WebEngine {
@@ -5697,33 +5836,85 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
 /// latest each can have happened. The read returns the page's monotonic clock with them, between two
 /// host-clock reads; each change goes back from those by its distance from that clock, give or take the
 /// 1 ms the page's clock may be coarsened to. The latest says whether it can have followed an input; the
-/// earliest is the soonest a frame showing it can have begun.
-fn page_changes(page: &Page) -> Vec<probe::present::frames::Change> {
+/// earliest is the soonest a frame showing it can have begun. With them, the page's trusted pointer
+/// presses on the same terms (`CHANGES_SCRIPT`).
+fn page_changes(page: &Page) -> PageChanges {
     let h0 = host::now_ns();
-    let read: Vec<f64> = page
-        .eval("JSON.stringify([performance.now(), ...(globalThis.__strobeChanges?.splice(0) ?? [])])")
+    let read: (f64, Vec<f64>, Vec<(f64, u8, f64)>) = page
+        .eval("JSON.stringify([performance.now(), globalThis.__strobeChanges?.splice(0) ?? [], globalThis.__strobePresses?.splice(0) ?? []])")
         .ok()
         .and_then(|v| v.as_str().and_then(|s| serde_json::from_str(s).ok()))
         .unwrap_or_default();
     let h1 = host::now_ns().max(h0) as f64;
-    let Some((&now, times)) = read.split_first() else { return Vec::new() };
+    let (now, times, presses) = read;
     let back = |h: f64, ms: f64| (h - ms.max(0.0) * 1e6).max(0.0) as u64;
-    times.iter().map(|t| (back(h0 as f64, now - t + 1.0), back(h1, now - t - 1.0))).collect()
+    let at = |t: f64| probe::present::frames::Change(back(h0 as f64, now - t + 1.0), back(h1, now - t - 1.0), false);
+    PageChanges { changes: times.iter().map(|&t| at(t)).collect(), presses: presses.iter().map(|&(t, acted, again)| (at(t), acted == 1, (again >= 0.0).then(|| at(again)))).collect() }
+}
+
+/// What `page_changes` read: the page's changes, and its trusted presses, each with whether the page
+/// changed between it and its release and when it first changed after the release, before the next
+/// press, key or wheel turn.
+#[derive(Default)]
+struct PageChanges {
+    changes: Vec<probe::present::frames::Change>,
+    presses: Vec<(probe::present::frames::Change, bool, Option<probe::present::frames::Change>)>,
+}
+
+impl PageChanges {
+    fn extend(&mut self, o: PageChanges) {
+        self.changes.extend(o.changes);
+        self.presses.extend(o.presses);
+    }
+
+    /// Each single click's say on whether the page acted on its press (`Sent::acted`): it changed
+    /// between the press and the release, and not again after the release within a second. The
+    /// page's press for a click is the first one not yet matched that can have followed strobe's
+    /// press and can have come before strobe's next input: a page whose main thread was busy past the
+    /// release sees the press late, still in order.
+    fn acted(&self, sent: &mut [probe::present::frames::Sent]) {
+        let mut from = 0;
+        for k in 0..sent.len() {
+            let Some(p) = sent[k].press else { continue };
+            let next = sent.get(k + 1).map_or(u64::MAX, |n| n.press.unwrap_or(n.t_ns));
+            let release = sent[k].t_ns;
+            let found = self.presses.iter().enumerate().skip(from).find(|(_, (d, _, _))| d.1 > p && d.0 < next);
+            sent[k].acted = found.map(|(i, (_, acted, again))| {
+                from = i + 1;
+                *acted && !again.is_some_and(|a| a.0 < release + probe::present::frames::HORIZON_NS)
+            });
+        }
+    }
 }
 
 /// The page's own changes, for input latency where the browser reports none (Firefox): when the DOM
 /// changed (in open and closed shadow roots too), an input or change event fired, or the page scrolled.
-/// At most one entry per millisecond: a page that mutates in a tight loop fills nothing. Installed in
-/// every document of a headed series in such an engine.
+/// At most one entry per millisecond: a page that mutates in a tight loop fills nothing. Beside them,
+/// each trusted pointer press with whether the page changed between it and its release, and when it
+/// first changed after the release before the next press, key or wheel turn, in the page's own order
+/// of events (a mutation the press's handlers made, or one queued after the press: never one from
+/// before it, such as a hover's), which no clock can tell within a millisecond. Installed in every
+/// document of a headed series in such an engine.
 const CHANGES_SCRIPT: &str = r#"(() => {
   if (globalThis.__strobeChangesOn) return
   globalThis.__strobeChangesOn = true
   globalThis.__strobeChanges ??= []
-  let last = -1
+  globalThis.__strobePresses ??= []
+  let last = -1, pressed = null, released = null
   const at = () => {
     const c = globalThis.__strobeChanges, t = performance.now()
+    if (pressed) pressed[1] = 1
+    else if (released && released[2] < 0) released[2] = t
     if (c.length < 10000 && Math.floor(t) !== last) { last = Math.floor(t); c.push(t) }
   }
+  const press = { capture: true, passive: true }
+  addEventListener("pointerdown", (e) => {
+    const p = globalThis.__strobePresses
+    released = null
+    if (e.isTrusted && p.length < 10000) { pressed = [performance.now(), 0, -1]; p.push(pressed) }
+  }, press)
+  for (const e of ["pointerup", "pointercancel"]) addEventListener(e, (ev) => { if (ev.isTrusted) { released = pressed; pressed = null } }, press)
+  for (const e of ["keydown", "wheel"]) addEventListener(e, (ev) => { if (ev.isTrusted) released = null }, press)
   const opts = { subtree: true, childList: true, attributes: true, characterData: true }
   const observer = new MutationObserver(at)
   observer.observe(document, opts)
@@ -5747,12 +5938,13 @@ fn os_frames(
     v: &Variant,
     presents: Result<probe::present::Presents>,
     pids: &[u32],
-    spans: &[(u64, u64)],
+    timed: &[metrics::Timed],
     inputs: &[RunInputs],
     values: &mut BTreeMap<String, f64>,
     refused: &mut BTreeMap<String, Refusal>,
 ) -> Option<probe::present::Presents> {
     use probe::present::frames;
+    let spans: &[(u64, u64)] = &timed.iter().map(|r| (r.t0, r.t1)).collect::<Vec<_>>();
     let declared: Vec<String> = declared_metrics(s).into_iter().cloned().collect();
     let frame_metric = |m: &str| ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| m.starts_with(p));
     let line = |why: &str| Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why));
@@ -5766,7 +5958,7 @@ fn os_frames(
         }
     };
     let display = host::main_window(pids).and_then(|w| host::display_of(w.hwnd));
-    let f = frames::native_values(&p, pids, spans, display.as_ref());
+    let f = frames::native_values(&p, pids, timed, display.as_ref());
     let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
     let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
     let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
@@ -5789,14 +5981,8 @@ fn os_frames(
     if !inputs.is_empty() {
         let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
         let mut reactions = frames::Reactions::default();
-        for (sent, changes) in inputs {
-            let got = frames::reactions(sent, changes, &p.presents, pids, quiet);
-            reactions.interaction.extend(got.interaction);
-            reactions.scroll.extend(got.scroll);
-            reactions.tried = (reactions.tried.0 + got.tried.0, reactions.tried.1 + got.tried.1);
-            reactions.busy = (reactions.busy.0 + got.busy.0, reactions.busy.1 + got.busy.1);
-            reactions.unshown = (reactions.unshown.0 + got.unshown.0, reactions.unshown.1 + got.unshown.1);
-            reactions.unchanged += got.unchanged;
+        for (sent, changes, _) in inputs {
+            reactions.add(frames::reactions(sent, changes, &p.presents, pids, quiet));
         }
         let mut why = BTreeMap::new();
         reactions.values(p.events_lost, values, &mut why);
@@ -5815,12 +6001,12 @@ fn os_frames(
 /// The gaps (ms, sorted) between the frames of `pids` shown in the runs while each next frame was handed
 /// over before the last one showed plus half a refresh (the app kept drawing, §7.2): a traceless block's
 /// frame pacing for reports, where the OS tells when a frame was handed over (Windows).
-fn present_intervals(p: &probe::present::Presents, pids: &[u32], runs: &[(u64, u64)], refresh_ms: f64) -> Vec<f64> {
+fn present_intervals(p: &probe::present::Presents, pids: &[u32], runs: &[metrics::Timed], refresh_ms: f64) -> Vec<f64> {
     let mut out = Vec::new();
-    for &(t0, t1) in runs {
-        let mut shown = probe::present::frames::from_presents(&p.presents, pids, t0, t1).shown;
-        shown.sort_by_key(|s| (s.stream, s.screen_ns));
-        for w in shown.windows(2).filter(|w| w[0].stream == w[1].stream) {
+    for run in runs {
+        let mut shown = probe::present::frames::from_timed(&p.presents, pids, run).shown;
+        shown.sort_by_key(|s| (s.stream, s.seg, s.screen_ns));
+        for w in shown.windows(2).filter(|w| (w[0].stream, w[0].seg) == (w[1].stream, w[1].seg)) {
             if w[1].screen_ns > w[0].screen_ns && (w[1].pending_ns as f64) <= w[0].screen_ns as f64 + refresh_ms * 1e6 / 2.0 {
                 out.push((w[1].screen_ns - w[0].screen_ns) as f64 / 1e6);
             }
@@ -6615,12 +6801,17 @@ fn leak_text(r: &Value, s: &Value, file: &str) -> String {
     out
 }
 
-/// `self   strobe 1.2% · runner 0.3% … of a core (mean over the blocks' runs)`, when the series measured it.
+/// `self   strobe 1.2% · runner 0.3% … of a core (mean over the blocks' runs)`, when the series measured it,
+/// and what `ctx.untimed` left out of its runs.
 fn self_line(s: &Value) -> String {
-    match serde_json::from_value::<Overhead>(s["overhead"].clone()).ok().map(|o| o.text()).filter(|t| !t.is_empty()) {
+    let mut out = match serde_json::from_value::<Overhead>(s["overhead"].clone()).ok().map(|o| o.text()).filter(|t| !t.is_empty()) {
         Some(t) => format!("self   {t} (mean over the blocks' runs)\n"),
         None => String::new(),
+    };
+    if let Some(u) = untimed_line(&s["untimed"]) {
+        out += &format!("untimed  {u}\n");
     }
+    out
 }
 
 /// A `--blocks` series' text: the primary in each block, and the blocks' median with a 95% interval

@@ -246,7 +246,7 @@ pub fn record(args: &Args, target: &str) -> Result<Output> {
         Ok(p) => {
             let pids = pids_now();
             let display = display_of(&pids);
-            let f = frames::native_values(p, &pids, &[(t0, t1)], display.as_ref());
+            let f = frames::native_values(p, &pids, &[frames::Timed::whole(t0, t1)], display.as_ref());
             match f.refused {
                 Some(why) if display.is_none() && why.contains("several displays") => {
                     Some("NoPresentSource: several displays run at different refresh rates and the process has no window to say which it is on".to_string())

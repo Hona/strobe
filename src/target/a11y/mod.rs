@@ -515,8 +515,10 @@ pub trait Accessibility {
     }
     /// Changes announced so far.
     fn changes(&self) -> Changes;
-    /// When each change arrived (host clock), the newest 65,536.
-    fn change_times(&self) -> Vec<u64>;
+    /// When each change arrived (host clock), the newest 65,536, and whether it was press feedback
+    /// only: focus moving, or (AT-SPI) a control pressed. A release-acting button shows them on the
+    /// mouse press, so they never say a click acted on its press (`frames::Change`).
+    fn change_times(&self) -> Vec<(u64, bool)>;
     /// Waits until more than `seen` changes were announced or `deadline` passes.
     fn wait_change(&self, seen: u64, deadline: Instant) -> Changes;
     /// Whether the element the OS hit-tests at a screen point is node `i` of the last snapshot or

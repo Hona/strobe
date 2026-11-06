@@ -83,20 +83,29 @@ fn cycles(n: &Native) -> (Cycles, Option<u64>) {
     (per_process(&n.processes()), host::tsc())
 }
 
-/// CPU ms between two `cycles` readings over `wall_ms` (`record::cycles_used`); unknown (NaN) without
-/// cycles.
-fn cpu_ms(a: (Cycles, Option<u64>), b: (Cycles, Option<u64>), wall_ms: f64) -> f64 {
+/// CPU ms over a run's timed parts (`edges`: its readings at its start, each untimed stretch's start
+/// and end, and its end; `record::cycles_timed`), from the cycle clock's rate between `a` and `b`, the
+/// first and last readings, `wall_ms` apart; unknown (NaN) without cycles.
+fn cpu_ms(edges: &[&Cycles], a: &(Cycles, Option<u64>), b: &(Cycles, Option<u64>), wall_ms: f64) -> f64 {
     match (a.1, b.1) {
-        (Some(t0), Some(t1)) if t1 > t0 && b.0.values().any(|c| *c > 0) => super::super::record::cycles_used(&a.0, &b.0) as f64 / (t1 - t0) as f64 * wall_ms,
+        (Some(t0), Some(t1)) if t1 > t0 && b.0.values().any(|c| *c > 0) => super::super::record::cycles_timed(edges, |_| true) as f64 / (t1 - t0) as f64 * wall_ms,
         _ => f64::NAN,
     }
 }
 
+/// The app's processes' cycles and threads at one edge of an untimed stretch.
+type Edge = (Cycles, Snapshot);
+
 /// One measured run.
 struct Run {
+    /// Its timed time and CPU (ms), without its untimed stretches.
     ms: f64,
     cpu: f64,
+    /// Its whole span's CPU (ms), untimed stretches too: what other work on its CPUs is told apart from.
+    cpu_whole: f64,
     span: Span,
+    /// Its span on the host clock, with the stretches `ctx.untimed` left out.
+    timed: metrics::Timed,
     counts: BTreeMap<String, f64>,
     /// What the page calls did in the run: inputs and phase marks (host clock).
     log: Log,
@@ -287,6 +296,30 @@ fn runs(
     let pixels = x.pixels.clone();
     let lines = RefCell::new(super::launch::Lines::default());
     let output = n.output.take();
+    let cost = SelfCost::new(ctx.runner.pid());
+    // The run's untimed stretches: the app's cycles and threads at each edge, read inside the stretch
+    // (`Hooks::untimed`), and strobe's reads of its tree before the first (those inside one are not the run's).
+    let edges: RefCell<Vec<Edge>> = RefCell::new(Vec::new());
+    let reads_before = Cell::new((0u64, 0.0f64));
+    let edge = |start: bool| {
+        if start {
+            cost.pause();
+            if let Some(se) = drive.session.get() {
+                let (n, ms) = se.take_reads();
+                reads_before.set((reads_before.get().0 + n, reads_before.get().1 + ms));
+            }
+        }
+        let listed = wakes::wall_us();
+        let procs = host::process_set(root, Some(&home.dir));
+        let snap = Snapshot::take_since(listed, &procs.iter().map(|p| p.pid).collect::<Vec<_>>(), None);
+        edges.borrow_mut().push((per_process(&procs), snap));
+        if !start {
+            if let Some(se) = drive.session.get() {
+                se.take_reads();
+            }
+            cost.resume();
+        }
+    };
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "line" => lines.borrow_mut().serve(output.as_ref(), &home.dir, a),
@@ -307,10 +340,11 @@ fn runs(
                 hooks.count(a);
                 Ok(Value::Bool(true))
             }
-            "phase" => {
-                hooks.phase(a);
-                Ok(Value::Bool(true))
-            }
+            "phase" => hooks.phase(a),
+            "untimed" => hooks.untimed(a, |start, _| {
+                edge(start);
+                Ok(())
+            }),
             other => Err(Error::msg(format!("unknown runner request {other}"))),
         }
     };
@@ -358,7 +392,6 @@ fn runs(
     let procs0 = (host::now_ns(), host::all_processes());
     let sampler = probe::os::Sampler::start(n.pid, Some(n.home.clone()));
     let sampled = Instant::now();
-    let mut cost = SelfCost::new(ctx.runner.pid());
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
     let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
     let run_timeout = s.run_timeout();
@@ -418,6 +451,8 @@ fn runs(
             se.take_log();
             se.take_reads();
         }
+        edges.borrow_mut().clear();
+        reads_before.set((0, 0.0));
         hooks.begin(&format!("run:{i}"));
         // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
         let running = n.exited().is_none();
@@ -439,16 +474,46 @@ fn runs(
         }
         ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
         hooks.end();
+        let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
+        log.drags = log.timed_drags(&timed);
         let reads = drive.session.get().map(Session::take_reads).unwrap_or_default();
+        let reads = (reads.0 + reads_before.get().0, reads.1 + reads_before.get().1);
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
-        let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), window_end: t1, elements, reads, t0, t1, total: 0.0 });
+        // The readings at the run's start, each untimed stretch's edges and the run's end: each pair a
+        // timed part. A stretch the run never ended (it threw) ends with the run.
+        let mut e = edges.take();
+        let end: Edge = (c1.0.clone(), snap1.clone());
+        if e.len() % 2 == 1 {
+            e.push(end.clone());
+        }
+        let mut edge_list: Vec<&Edge> = e.iter().collect();
+        let start: Edge = (c0.0.clone(), snap0.clone());
+        edge_list.insert(0, &start);
+        edge_list.push(&end);
+        let cycles_at: Vec<&Cycles> = edge_list.iter().map(|x| &x.0).collect();
+        let parts: Vec<Span> = edge_list.as_chunks::<2>().0.iter().map(|[a, b]| wakes::span(&a.1, &b.1)).collect();
+        let whole_ms = (t1 - t0) as f64 / 1e6;
+        runs.push(Run {
+            ms: timed.ns() as f64 / 1e6,
+            cpu: cpu_ms(&cycles_at, &c0, &c1, whole_ms),
+            cpu_whole: cpu_ms(&[&c0.0, &c1.0], &c0, &c1, whole_ms),
+            span: Span::joined(parts),
+            timed,
+            counts: hooks.counts(),
+            log,
+            changes: Vec::new(),
+            window_end: t1,
+            elements,
+            reads,
+            t0,
+            t1,
+            total: 0.0,
+        });
         // The last measured input's change: an app may announce it after the run's `until` (a read).
         if let Some(se) = drive.session.get() {
-            let sample = |i: &&crate::driver::native::Input| i.kind == "discrete" || (i.kind == "scroll" && i.first);
-            if let Some(last) = runs[i].log.inputs.iter().filter(sample).map(|i| i.t_ns).max() {
+            if let Some(last) = runs[i].log.sent(&runs[i].timed).iter().map(|s| s.t_ns).max() {
                 let left = (last + 1_000_000_000).saturating_sub(host::now_ns());
                 se.wait_change_after(last, Instant::now() + Duration::from_nanos(left));
             }
@@ -491,7 +556,7 @@ fn runs(
     // Each run's changes, to the end of its window.
     let changes = drive.session.get().map(Session::changes).unwrap_or_default();
     for r in &mut runs {
-        r.changes = changes.iter().copied().filter(|&c| c >= r.t0 && c <= r.window_end).map(frames::notified).collect();
+        r.changes = changes.iter().filter(|c| c.0 >= r.t0 && c.0 <= r.window_end).map(|&(at, feedback)| frames::notified(at, feedback)).collect();
     }
     let (strobe_pct, runner_pct) = cost.share(first);
     let samples = sampler.stop();
@@ -589,7 +654,7 @@ fn runs(
         extra.insert("gpu.process.3d".into(), gpu_3d);
     }
     // The bench file's `ctx.count`, and `phase.<name>` from strobe's own marks.
-    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice())).collect();
+    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice(), &r.timed)).collect();
     extra.extend(super::block::per_run_hooks(s, &key, &hooked));
     // strobe's own reads of the app's tree inside the runs (`ObserverCost`).
     extra.insert("driver.reads".into(), per_run(&|r| r.reads.0 as f64));
@@ -610,7 +675,8 @@ fn runs(
         .filter(|_| !pinned.is_empty())
         .filter_map(|(w, r)| {
             let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
-            let cpu = if r.ms > 0.0 { 100.0 * r.cpu / r.ms } else { f64::NAN };
+            let whole = r.t1.saturating_sub(r.t0) as f64 / 1e6;
+            let cpu = if whole > 0.0 { 100.0 * r.cpu_whole / whole } else { f64::NAN };
             cpu.is_finite().then(|| (busy - cpu).max(0.0))
         })
         .collect();
@@ -621,20 +687,14 @@ fn runs(
     let mut present_pct = None;
     match &presents {
         Some(Ok(p)) => {
+            // Spin and windows nobody may capture are the app's whole runs; frames and inputs their timed stretches.
             let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
-            let f = frames::native_values(p, &pids, &spans, display.as_ref());
+            let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
+            let f = frames::native_values(p, &pids, &timed, display.as_ref());
             let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
             let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
             for r in measured {
-                let sent: Vec<frames::Sent> =
-                    r.log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| frames::Sent { t_ns: i.t_ns, scroll: i.kind == "scroll" }).collect();
-                let got = frames::reactions(&sent, &r.changes, &p.presents, &pids, quiet);
-                reactions.interaction.extend(got.interaction);
-                reactions.scroll.extend(got.scroll);
-                reactions.tried = (reactions.tried.0 + got.tried.0, reactions.tried.1 + got.tried.1);
-                reactions.busy = (reactions.busy.0 + got.busy.0, reactions.busy.1 + got.busy.1);
-                reactions.unshown = (reactions.unshown.0 + got.unshown.0, reactions.unshown.1 + got.unshown.1);
-                reactions.unchanged += got.unchanged;
+                reactions.add(frames::reactions(&r.log.sent(&r.timed), &r.changes, &p.presents, &pids, quiet));
             }
             // SPEC §19: the present session's consumer may use 0.5% of a core (`Overhead`, warned for
             // timed blocks); past 2% it competes with the app it measures, and its frames describe a
@@ -762,6 +822,7 @@ fn runs(
         }
         refused.insert(m.clone(), missing(m, &have));
     }
+    super::block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
     for m in refused.keys() {
         values.remove(m);
     }
@@ -794,7 +855,7 @@ fn runs(
             .collect();
         store::write_json(&dir.join("runs.json"), &json!(run_rows))?;
         let per: serde_json::Map<String, Value> =
-            measured.iter().enumerate().map(|(j, r)| (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
+            measured.iter().enumerate().map(|(j, r)| (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
         store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "display_hz": values.get("display.hz"), "runs": per }))?;
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
@@ -807,11 +868,12 @@ fn runs(
                 let mut d = d.clone();
                 // Untimed samples (macOS `sample`) all carry the capture's start, before the warmup
                 // runs: keeping only the measured runs' span dropped every one of them.
+                // The runs' timed parts: `ctx.untimed` stretches are none of the case's.
                 if !d.untimed {
-                    d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1));
+                    d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1 && !r.timed.untimed_at(x.0)));
                 }
                 if let Some(w) = d.waits.as_mut() {
-                    w.clip(&measured.iter().map(|r| (r.t0, r.t1)).collect::<Vec<_>>());
+                    w.clip(&measured.iter().flat_map(|r| r.timed.segments()).collect::<Vec<_>>());
                 }
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
                 format!(

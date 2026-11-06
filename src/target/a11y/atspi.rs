@@ -47,18 +47,19 @@ const CHECKABLE: u32 = 41;
 
 #[derive(Default)]
 struct Signal {
-    changes: Mutex<(Changes, std::collections::VecDeque<u64>)>,
+    changes: Mutex<(Changes, std::collections::VecDeque<(u64, bool)>)>,
     cv: Condvar,
     pids: Mutex<Vec<u32>>,
 }
 
 impl Signal {
-    fn bump(&self) {
+    /// A change heard now; `feedback`: focus moving or a control pressed only (`Accessibility::change_times`).
+    fn bump(&self, feedback: bool) {
         let now = crate::host::now_ns();
         let mut c = self.changes.lock().unwrap_or_else(|e| e.into_inner());
         c.0.count += 1;
         c.0.last_ns = now;
-        c.1.push_back(now);
+        c.1.push_back((now, feedback));
         if c.1.len() > 65_536 {
             c.1.pop_front();
         }
@@ -177,7 +178,9 @@ impl Drop for Atspi {
 }
 
 /// The event thread: each signal from one of the app's connections is a change. Caret moves and
-/// text selections are not (a person's caret blinking or moving changes nothing the app shows).
+/// text selections are not (a person's caret blinking or moving changes nothing the app shows), nor
+/// is a control armed (its look between the press and the release). Focus moving and a control
+/// pressed are press feedback (`Accessibility::change_times`).
 fn listen(mut ev: Conn, signal: &Signal, stop: &AtomicBool) {
     let mut owners: HashMap<String, u32> = HashMap::new();
     while !stop.load(Ordering::Relaxed) {
@@ -189,9 +192,12 @@ fn listen(mut ev: Conn, signal: &Signal, stop: &AtomicBool) {
                 continue;
             }
         };
-        if matches!(s.member.as_str(), "TextCaretMoved" | "TextSelectionChanged") {
+        // `StateChanged`'s first argument names the state.
+        let state = (s.member == "StateChanged").then(|| s.body.first().and_then(Value::as_str).unwrap_or("").to_string());
+        if matches!(s.member.as_str(), "TextCaretMoved" | "TextSelectionChanged") || state.as_deref() == Some("armed") {
             continue;
         }
+        let feedback = s.iface.ends_with(".Focus") || matches!(state.as_deref(), Some("focused" | "pressed"));
         let pid = match owners.get(&s.sender) {
             Some(p) => *p,
             None => {
@@ -201,7 +207,7 @@ fn listen(mut ev: Conn, signal: &Signal, stop: &AtomicBool) {
             }
         };
         if signal.pids.lock().unwrap_or_else(|e| e.into_inner()).contains(&pid) {
-            signal.bump();
+            signal.bump(feedback);
         }
     }
 }
@@ -655,7 +661,7 @@ impl Accessibility for Atspi {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).0
     }
 
-    fn change_times(&self) -> Vec<u64> {
+    fn change_times(&self) -> Vec<(u64, bool)> {
         self.signal.changes.lock().unwrap_or_else(|e| e.into_inner()).1.iter().copied().collect()
     }
 

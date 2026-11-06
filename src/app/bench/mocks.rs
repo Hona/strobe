@@ -35,6 +35,13 @@ impl Mocks {
     pub(super) fn add(&self, page: &Page, a: &Value) -> Result<Value> {
         let p = match page {
             Page::Firefox(p) => p,
+            Page::Webkit(_) => {
+                return Err(Error::refused(
+                    "EngineUnsupported",
+                    "ctx.mock: WebDriver Classic (a WebKit page) cannot intercept requests",
+                    "serve the responses from a local server (strobe.json serve), or mock in Chromium or Firefox",
+                ));
+            }
             Page::Chromium(_) => return Err(Error::msg("internal: a Chromium page's mocks go through the runner's own CDP session")),
         };
         let pattern = a["pattern"].as_str().filter(|s| !s.is_empty()).ok_or_else(|| Error::usage("mock(pattern, handler): pattern is a URL glob"))?.to_string();

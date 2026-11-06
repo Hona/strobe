@@ -43,9 +43,9 @@ pub fn is_software_gpu(name: &str) -> bool {
 pub fn window_visible(page: &Page) -> Result<()> {
     let state = page.eval("document.visibilityState")?;
     if state.as_str() != Some("visible") {
-        // macOS: Firefox's window counts as hidden behind other apps' (occlusion tracking), and strobe makes
-        // it the active app only once nobody has used the Mac for a minute: a bench waits for that.
-        let hidden = if cfg!(target_os = "macos") && page.firefox().is_some() { Hidden::NotActive } else { Hidden::Other };
+        // macOS: a Firefox or Safari window counts as hidden behind other apps' (occlusion tracking), and
+        // strobe makes it the active app only once nobody has used the Mac for a minute: a bench waits for that.
+        let hidden = if cfg!(target_os = "macos") && page.cdp().is_none() { Hidden::NotActive } else { Hidden::Other };
         return Err(Refusal::window_hidden(hidden, format!("the page reports visibilityState={state}"))
             .fix("keep the window visible and unminimized while strobe measures; browsers throttle hidden windows")
             .into());
@@ -336,12 +336,24 @@ pub fn engine_throttled(engine: WebEngine, cpus: Option<u64>, ms: f64, keep: boo
 /// Firefox: the renderer main thread's task time and its parts, layouts and style counts, long tasks,
 /// layout shifts, GC and GPU compiles (Chromium's Performance domain and trace), the JS heap, the page's
 /// spans, and a frame's begin-to-screen cost (only a toolkit knows when it began a frame: Firefox's
-/// frames come from the OS's presents, §7.2).
+/// frames come from the OS's presents, §7.2). WebKit (WebDriver Classic) also has no network events
+/// (`net.*`) and runs an input action list as one batch in its UI process (`input.rate`, `input.gap.p95`
+/// would time strobe's requests, not the page's input).
 pub fn engine_refusal(engine: WebEngine, metric: &str) -> Option<Refusal> {
     match engine {
         WebEngine::Chromium => return None,
         // Neither has Chromium's Performance domain or trace.
         WebEngine::Firefox | WebEngine::Webkit => {}
+    }
+    if engine == WebEngine::Webkit {
+        let classic = match metric {
+            m if m.starts_with("net.") => Some(("WebDriver Classic reports no network requests", "measure it in Chromium or Firefox")),
+            "input.rate" | "input.gap.p95" => Some(("WebDriver Classic delivers input actions in batches inside the browser, so strobe's send times are not the page's input times", "measure it in Chromium or Firefox")),
+            _ => None,
+        };
+        if let Some((why, fix)) = classic {
+            return Some(Refusal::new(ValidatorId::EngineUnsupported, format!("{metric}: {why}")).fix(fix));
+        }
     }
     let instead = match metric {
         m if m.starts_with("main.") || matches!(m, "layout.count" | "style.count") => "cpu.work (the browser's processes' CPU per run) or cpu.renderer",

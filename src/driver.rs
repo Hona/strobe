@@ -267,7 +267,8 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
 /// each one made the page parse it on its main thread every call.
 fn helped(page: &Page, expr: &str, timeout: Duration) -> Result<Value> {
     match page.eval_timeout(expr, timeout) {
-        Err(e) if e.message.contains("__strobe is not defined") => {
+        // V8 and SpiderMonkey say "is not defined", JavaScriptCore "Can't find variable".
+        Err(e) if e.message.contains("__strobe is not defined") || e.message.contains("Can't find variable: __strobe") => {
             page.eval_timeout(HELPER, timeout)?;
             page.eval_timeout(expr, timeout)
         }
@@ -440,7 +441,7 @@ impl Driver {
                 let name = button.map_or("none", |b| cdp_button(b).0);
                 p.send("Input.dispatchMouseEvent", json!({ "type": kind, "x": x, "y": y, "button": name, "buttons": mask, "clickCount": count, "modifiers": self.mods.get() | extra })).map(|_| ())
             }
-            Page::Firefox(p) => {
+            Page::Firefox(_) | Page::Webkit(_) => {
                 let at = json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" });
                 let b = button.map_or(0, bidi_button);
                 let pointer = match kind {
@@ -448,16 +449,17 @@ impl Driver {
                     "mousePressed" => vec![at, json!({ "type": "pointerDown", "button": b })],
                     _ => vec![json!({ "type": "pointerUp", "button": b })],
                 };
-                p.actions(with_mods(pointer, extra & !self.mods.get())?)
+                self.page.actions(with_mods(pointer, extra & !self.mods.get())?)
             }
         }
     }
 
-    /// A click over BiDi as a person clicks, as native targets are clicked: `mods` go down once and
+    /// A click over WebDriver (BiDi or Classic) as a person clicks, as native targets are clicked: `mods` go down once and
     /// stay down over the move, every press and release; each press is held (60 ms for one click, a
     /// frame between a double click's presses), and the input time is taken just before the last
     /// release goes out. The session's input state keeps keys and buttons between the action lists.
-    fn bidi_click(&self, p: &crate::target::firefox::Page, (x, y): (f64, f64), b: Button, mods: i64, count: u64) -> Result<()> {
+    fn webdriver_click(&self, (x, y): (f64, f64), b: Button, mods: i64, count: u64) -> Result<()> {
+        let p = &self.page;
         let keys = mod_keys(mods);
         let pointer = |actions: Vec<Value>| json!({ "type": "pointer", "id": "mouse", "parameters": { "pointerType": "mouse" }, "actions": actions });
         let key_list = |down: bool| -> Result<Value> { Ok(json!({ "type": "key", "id": "keyboard", "actions": keys.iter().map(|k| key_action(*k, down)).collect::<Result<Vec<_>>>()? })) };
@@ -515,7 +517,7 @@ impl Driver {
                 let e = json!({ "type": "mouseMoved", "x": x, "y": y, "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() });
                 p.post("Input.dispatchMouseEvent", e)
             }
-            Page::Firefox(p) => p.post_actions(with_mods(vec![json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" })], 0)?),
+            Page::Firefox(_) | Page::Webkit(_) => self.page.post_actions(with_mods(vec![json!({ "type": "pointerMove", "x": x.round() as i64, "y": y.round() as i64, "origin": "viewport" })], 0)?),
         }
     }
 
@@ -669,8 +671,8 @@ impl Driver {
                 let (held, bit) = (self.buttons.get().0, cdp_button(b).1);
                 self.pointer.set((x, y));
                 match &self.page {
-                    Page::Firefox(p) => {
-                        self.bidi_click(p, (x, y), b, mods & !self.mods.get(), count)?;
+                    Page::Firefox(_) | Page::Webkit(_) => {
+                        self.webdriver_click((x, y), b, mods & !self.mods.get(), count)?;
                         return self.until(&o);
                     }
                     Page::Chromium(_) => {}
@@ -733,7 +735,7 @@ impl Driver {
                     Page::Chromium(p) => {
                         p.send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
                     }
-                    Page::Firefox(p) => self.paced_wheel(p, (x, y), (by_x, by), speed)?,
+                    Page::Firefox(_) | Page::Webkit(_) => self.paced_wheel((x, y), (by_x, by), speed)?,
                 }
                 self.until(&opts(2))
             }
@@ -757,7 +759,7 @@ impl Driver {
                             json!({ "type": "mouseWheel", "x": x, "y": y, "deltaX": delta("dx"), "deltaY": delta("dy"), "button": last.filter(|_| mask != 0).map_or("none", |b| cdp_button(b).0), "buttons": mask, "modifiers": self.mods.get() }),
                         )?;
                     }
-                    Page::Firefox(p) => p.actions(json!([{ "type": "wheel", "id": "wheel", "actions": [wheel_step((x, y), (delta("dx"), delta("dy")))] }]))?,
+                    Page::Firefox(_) | Page::Webkit(_) => self.page.actions(json!([{ "type": "wheel", "id": "wheel", "actions": [wheel_step((x, y), (delta("dx"), delta("dy")))] }]))?,
                 }
                 self.until(&opts(2))
             }
@@ -844,21 +846,23 @@ impl Driver {
 
     /// A key pressed and released with `extra` modifiers on top of the held ones. Modifiers mark the
     /// events, as CDP takes them; they are not keys of their own.
-    /// Over BiDi a chord's modifiers (and Shift for a character a US keyboard types with it) go down as
-    /// keys around it, in one action list.
+    /// Over WebDriver (BiDi or Classic) a chord's modifiers (and Shift for a character a US keyboard types
+    /// with it) go down as keys around it, in one action list.
     fn stroke(&self, key: Key, extra: i64) -> Result<()> {
         let m = self.mods.get() | extra;
         self.input_at(false);
-        let p = match &self.page {
+        match &self.page {
             Page::Chromium(_) => {
                 self.key_event(key, true, m)?;
                 return self.key_event(key, false, m);
             }
-            Page::Firefox(p) => p,
-        };
+            Page::Firefox(_) | Page::Webkit(_) => {}
+        }
         let shift = if matches!(key, Key::Char(c) if keys::us_key(c).is_some_and(|k| k.1)) { 8 } else { 0 };
         let press = (extra | shift) & !self.mods.get();
         let key = match key {
+            // Safari types a symbol with Shift only from its key's own character.
+            Key::Char(c) if (m | shift) & 8 != 0 && !c.is_ascii_alphabetic() && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
             Key::Char(c) if (m | shift) & 8 != 0 && c.is_ascii_graphic() => Key::Char(keys::us_shifted(c)),
             k => k,
         };
@@ -866,13 +870,15 @@ impl Driver {
         actions.push(key_action(key, true)?);
         actions.push(key_action(key, false)?);
         actions.extend(mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<Vec<_>>>()?);
-        p.actions(json!([{ "type": "key", "id": "keyboard", "actions": actions }]))
+        self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": actions }]))
     }
 
-    /// `scroll` over BiDi, which has no scroll gesture: wheel steps of the distance at `speed` (CSS px a
-    /// second), one per display frame on strobe's clock, sent without waiting for each to be handled,
-    /// then one empty action list that returns once the page has handled them all.
-    fn paced_wheel(&self, p: &crate::target::firefox::Page, at: (f64, f64), (dx, dy): (f64, f64), speed: f64) -> Result<()> {
+    /// `scroll` over WebDriver, which has no scroll gesture: wheel steps of the distance at `speed` (CSS
+    /// px a second), one per display frame on strobe's clock, sent without waiting for each to be handled
+    /// (WebDriver Classic: each waited for), then one empty action list that returns once the page has
+    /// handled them all.
+    fn paced_wheel(&self, at: (f64, f64), (dx, dy): (f64, f64), speed: f64) -> Result<()> {
+        let p = &self.page;
         let frame = self.frame_period()?;
         let dist = dx.hypot(dy);
         let steps = ((dist / speed.max(1.0)) * 1e3 / frame).ceil().max(1.0) as u32;
@@ -920,7 +926,7 @@ impl Driver {
         match &self.page {
             Page::Chromium(p) => p.send("Input.dispatchKeyEvent", e).map(|_| ()),
             // The session's input state holds the modifiers already down.
-            Page::Firefox(p) => p.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }])),
+            Page::Firefox(_) | Page::Webkit(_) => self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }])),
         }
     }
 

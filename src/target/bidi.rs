@@ -172,8 +172,8 @@ pub fn value(v: &Value) -> Value {
     }
 }
 
-/// A key as WebDriver input names it: a character, or a named key's private-use code point
-/// (W3C WebDriver's key table). F13 to F24, CapsLock and ContextMenu have none: a usage error.
+/// A key as WebDriver input names it, BiDi and Classic alike: a character, or a named key's private-use
+/// code point (W3C WebDriver's key table). F13 to F24, CapsLock and ContextMenu have none: a usage error.
 pub fn key_value(key: Key) -> Result<String> {
     let code = match key {
         Key::Char(c) => return Ok(c.to_string()),
@@ -199,7 +199,7 @@ pub fn key_value(key: Key) -> Result<String> {
             Named::Meta => '\u{E03D}',
             Named::F(k @ 1..=12) => char::from_u32(0xE031 + k as u32 - 1).unwrap_or('\u{E031}'),
             Named::Letter(c) | Named::Digit(c) => (c as char).to_ascii_lowercase(),
-            Named::F(_) | Named::CapsLock | Named::ContextMenu => return Err(Error::usage(format!("{n:?}: WebDriver input has no such key, so a Firefox page cannot be sent it"))),
+            Named::F(_) | Named::CapsLock | Named::ContextMenu => return Err(Error::usage(format!("{n:?}: WebDriver input has no such key, so a page in Firefox or WebKit cannot be sent it"))),
         },
     };
     Ok(code.to_string())

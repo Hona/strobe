@@ -76,6 +76,8 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(p) => s.line("✓", "firefox", format!("{} · {}", crate::target::firefox::version_of(&p).unwrap_or_else(|| "Firefox".into()), p.display())),
         None => s.line("i", "firefox", "none (only --engine firefox needs it: install Firefox from mozilla.org)"),
     }
+    let webkit = [false, true].into_iter().any(|h| crate::target::webkit::find(h).is_some());
+    s.line(if webkit { "✓" } else { "i" }, "webkit", crate::target::webkit::describe());
     match runner::find_bun() {
         Some(p) => s.line("✓", "bun", p.display().to_string()),
         None => s.line("!", "bun", "missing: bench files need Bun (https://bun.sh)"),

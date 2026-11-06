@@ -479,6 +479,10 @@ Fewer than 6 pairs never gets a verdict.
 - Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 - No display (locked, a server)? `--headless` runs page cases (check or timed) with frame and latency metrics refused.
 - Comparing engines? `cpu.work` is the one primary both have; a Firefox page's main-thread split does not exist.
+- WebKit pages: `--engine webkit` (macOS: Safari Technology Preview, else Safari, headed only; Linux: WebKitGTK headed, WPE with `--headless`; never on Windows).
+  - Exit 3 "remote automation is off": a person runs `safaridriver --enable` once (admin password).
+  - `LiveChannel`: that Safari is running; quit it or install Safari Technology Preview.
+  - Refused there (`EngineUnsupported`): `main.*`, `net.*`, `input.rate`, `ctx.mock`, clicks in WPE headless (it drops pointer input; keys and scrolling work), and `count.*`, `canvas.*`, `interaction.*` of a run that loads a page (no preload in WebDriver Classic: keep runs on one page).
 - `--blocks N` times one build alone (what `track` records).
 
 ### `strobe.json`

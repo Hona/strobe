@@ -10,4 +10,6 @@ pub mod firefox;
 pub mod isolate;
 pub mod native;
 pub mod web;
+pub mod webdriver;
+pub mod webkit;
 pub mod webview;

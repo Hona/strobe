@@ -113,24 +113,30 @@ pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Windo
         .hint(format!("{pane}: turn on {app}, or drop viewport from the target")));
     }
     let want = (at.width as f64, at.height as f64);
-    let settled = |client: Option<(u32, u32)>| -> crate::model::Result<(f64, f64, f64)> {
-        // As it is now: the first pass moved it.
-        crate::host::place_window(&crate::host::window_state(main.hwnd).unwrap_or_else(|| main.clone()), at.x, at.y, client);
+    let fits = |p: (f64, f64, f64)| (p.0 - want.0).abs() < 1.0 && (p.1 - want.1).abs() < 1.0;
+    // Each pass asks the OS for the window's size as it is now plus what the page lacks: the window's
+    // size (in device-independent pixels) less the page's is what the app draws around it (macOS: the
+    // whole frame, title bar included). A pass the window has not taken yet (an app still showing it)
+    // leaves the next to ask again from what it reads then.
+    let mut got = inner()?;
+    for _ in 0..3 {
+        let w = crate::host::window_state(main.hwnd).unwrap_or_else(|| main.clone());
+        let around = (w.client.0 as f64 / w.scale() - got.0, w.client.1 as f64 / w.scale() - got.1);
+        let client = size.then(|| ((want.0 + around.0).max(1.0).round() as u32, (want.1 + around.1).max(1.0).round() as u32));
+        crate::host::place_window(&w, at.x, at.y, client);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let now = inner()?;
-            if !size || ((now.0 - want.0).abs() < 1.0 && (now.1 - want.1).abs() < 1.0) || Instant::now() > deadline {
-                return Ok(now);
+            got = inner()?;
+            if !size || fits(got) || Instant::now() > deadline {
+                break;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-    };
-    let mut got = settled(size.then_some((at.width, at.height)))?;
-    if size && ((got.0 - want.0).abs() >= 1.0 || (got.1 - want.1).abs() >= 1.0) && got.0 > 0.0 {
-        let client = ((2.0 * want.0 - got.0).max(1.0).round() as u32, (2.0 * want.1 - got.1).max(1.0).round() as u32);
-        got = settled(Some(client))?;
+        if !size || fits(got) {
+            break;
+        }
     }
-    if size && ((got.0 - want.0).abs() >= 1.0 || (got.1 - want.1).abs() >= 1.0) {
+    if size && !fits(got) {
         return Err(Error::usage(format!(
             "{} keeps its page at {}×{} CSS pixels, not the target's viewport {}×{}: the app fixes its window's size",
             browser.exe.display(),

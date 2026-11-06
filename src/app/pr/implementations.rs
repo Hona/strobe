@@ -243,6 +243,7 @@ impl<'a> Doc<'a> {
             out += &lines.join("\n");
             out += "\n\n";
         }
+        out += &self.folder_caution();
         out += &format!("{}\n\n", self.scoreboard_line(&board, &bn));
         for (i, s) in self.series.iter().enumerate() {
             out += &format!("- **{}:** {}\n", cell(&self.title(s)), self.journey_line(s, board.alone(i), fam.compared));
@@ -576,7 +577,14 @@ impl<'a> Doc<'a> {
                 fair["priority"].as_str().map(|p| format!("{p} priority")).unwrap_or_default(),
             ])
             .replace(" · ", ", ");
-            t += &format!("- **Window, the same on both:** client area {x:.0}×{y:.0} device-independent pixels, {}\n", cell(&extra));
+            // A macOS native side is measured by its window's frame (title bar included).
+            let framed: Vec<String> = w["frame"].as_array().into_iter().flatten().filter_map(Value::as_str).map(|role| cell(if role == "base" { &bn } else { &hn })).collect();
+            let frame = match framed.len() {
+                0 => String::new(),
+                2 => "; both measured by their window's frame, title bar included".to_string(),
+                _ => format!("; {} measured by its window's frame, title bar included (up to 32 points taller)", framed[0]),
+            };
+            t += &format!("- **Window, the same on both:** client area {x:.0}×{y:.0} device-independent pixels{frame}, {}\n", cell(&extra));
         }
         if fair["input"].is_string() {
             let obs = |k: &str| match fair["observer"][k].as_str() {

@@ -859,7 +859,28 @@ pub fn debug_runtime(exe: &std::path::Path) -> Option<String> {
     None
 }
 
-/// The largest visible top-level window of these processes that is not minimized (over 100×100).
+/// The user's Documents and Desktop as the shell resolves them for strobe (`SHGetKnownFolderPath`):
+/// OneDrive's folder backup moves them outside the profile.
+pub fn user_folders() -> Vec<std::path::PathBuf> {
+    use windows_sys::Win32::UI::Shell::{FOLDERID_Desktop, FOLDERID_Documents, SHGetKnownFolderPath};
+    [FOLDERID_Documents, FOLDERID_Desktop]
+        .iter()
+        .filter_map(|id| {
+            let mut p: windows_sys::core::PWSTR = std::ptr::null_mut();
+            let ok = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut p) } == 0;
+            let path = (ok && !p.is_null()).then(|| {
+                let len = (0..).take_while(|&i| unsafe { *p.add(i) } != 0).count();
+                std::path::PathBuf::from(String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, len) }))
+            });
+            if !p.is_null() {
+                unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(p as *const std::ffi::c_void)) };
+            }
+            path
+        })
+        .collect()
+}
+
+/// The largest visible top-level window of these processes that is not minimized (at least 100×100).
 pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
     use windows_sys::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{EnumWindows, GetWindowRect, GetWindowThreadProcessId, IsIconic, IsWindowVisible};
@@ -875,7 +896,7 @@ pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
             let mut r: RECT = unsafe { zeroed() };
             if unsafe { GetWindowRect(hwnd, &mut r) } != 0 {
                 let area = (r.right - r.left) as i64 * (r.bottom - r.top) as i64;
-                if area > 10_000 && state.best.is_none_or(|(a, _, _)| area > a) {
+                if r.right - r.left >= 100 && r.bottom - r.top >= 100 && state.best.is_none_or(|(a, _, _)| area > a) {
                     state.best = Some((area, hwnd, pid));
                 }
             }

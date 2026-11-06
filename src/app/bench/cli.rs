@@ -403,6 +403,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         process_set: None,
         fixture_connected: None,
         client: None,
+        frame: false,
         browser: None,
         directions,
         ..Block::default()

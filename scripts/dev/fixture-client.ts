@@ -1,9 +1,12 @@
 // The app of scripts/dev/fixture.bench.ts. `use` holds a connection to the fixture; `own` starts a
 // server of its own and talks only to that; `port` serves the fixture's port itself (on ::1) and talks
-// to that.
+// to that; `both` talks to the fixture and also serves a port of its own.
 const [arg, mode = "use"] = process.argv.slice(2)
 let [host, port] = ["127.0.0.1", Number(arg)]
-if (mode === "own") port = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("mine") }).port
+if (mode === "own" || mode === "both") {
+  const own = Bun.serve({ hostname: "127.0.0.1", port: 0, fetch: () => new Response("mine") }).port
+  if (mode === "own") port = own
+}
 if (mode === "port") {
   Bun.serve({ hostname: "::1", port, fetch: () => new Response("mine") })
   host = "::1"

@@ -909,6 +909,20 @@ pub fn home() -> PathBuf {
     std::env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// The user's own Documents and Desktop folders, where an app saves without being asked to (an
+/// onboarding project): Windows' known folders where the shell keeps them (OneDrive's folder backup
+/// moves them out of the profile), elsewhere in the home.
+pub fn user_folders() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        win::user_folders()
+    }
+    #[cfg(not(windows))]
+    {
+        vec![home().join("Documents"), home().join("Desktop")]
+    }
+}
+
 pub fn exists(path: &Path) -> bool {
     path.exists()
 }

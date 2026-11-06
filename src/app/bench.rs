@@ -479,6 +479,10 @@ struct Block {
     /// The main window's client area after the runs, in device-independent pixels, and its scale.
     #[serde(skip_serializing_if = "Option::is_none")]
     client: Option<[f64; 3]>,
+    /// `client` is the window's whole frame, title bar included: a native window on macOS, whose
+    /// window list does not separate the title bar.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    frame: bool,
     /// A page's browser as this block launched it: its version, and whether it drew in software.
     #[serde(skip_serializing_if = "Option::is_none")]
     browser: Option<BrowserSeen>,
@@ -534,48 +538,80 @@ fn client_of(w: &host::TopWindow) -> [f64; 3] {
     [(w.client.0 as f64 / sc).round(), (w.client.1 as f64 / sc).round(), sc]
 }
 
-/// `VariantMismatch` when the two sides of an implementation comparison showed different windows: a
-/// client area more than 2 device-independent pixels apart, or another scale (SPEC §9.10). A
-/// difference there is not the implementation. A side whose target asks for a viewport must show it,
-/// and a side strobe cannot measure cannot be held to one: both refuse, naming the side.
+/// Every target the series runs (both sides') opens no window: a script, a command line, or an app
+/// with `window: false` (on the target or its profile).
+fn series_windowless(ctx: &Ctx, s: &Series) -> bool {
+    let names: Vec<&str> = match &s.sides {
+        Some((b, h)) => vec![b.as_str(), h.as_str()],
+        None => vec![s.target.as_str()],
+    };
+    names.iter().all(|n| {
+        let t = &ctx.describe["targets"][*n];
+        matches!(t["kind"].as_str(), Some("script" | "cli")) || t["window"] == false || profile_of(t).and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless)
+    })
+}
+
+/// How a note names a side: an implementation's own name in an implementation comparison, else its
+/// role (`base`, `head`), which reports word as `before` and `this PR`.
+fn side_of<'a>(ctx: &Ctx, v: &'a Variant) -> &'a str {
+    if ctx.implementations { &v.name } else { v.role }
+}
+
+/// The tallest title bar a macOS window's frame may add to its content (a unified toolbar's is taller
+/// and counts as content): what a native frame on macOS may exceed a page's height by.
+const TITLE_BAR_PT: f64 = 32.0;
+
+/// Every block of a run case (a `--check`, one target's, either side's): a target's declared viewport
+/// must be what the block drew in, within 2 device-independent pixels (a native window's frame on
+/// macOS, which strobe sizes to it). In an implementation comparison also `VariantMismatch` when the
+/// sides showed different windows (SPEC §9.10): widths over 2 DIP apart, heights too (or, a macOS
+/// native frame against a page, outside the title bar's 0 to 32 points), or another scale. A
+/// difference there is not the implementation. Each refusal names the side.
 fn admit_window(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()> {
-    if !ctx.implementations {
-        return Ok(());
-    }
     let target = &ctx.describe["targets"][v.target_of(s)];
     let windowed = !matches!(target["kind"].as_str(), Some("script" | "cli")) && target["window"] != false;
     let asked = target["viewport"].as_object().map(|vp| (vp.get("width").and_then(Value::as_f64).unwrap_or(0.0), vp.get("height").and_then(Value::as_f64).unwrap_or(0.0)));
     // A launch is timed in the window the app opens (never resized): its sides are held to each other.
     match (asked.filter(|_| windowed && !s.launch.is_object()), b.client) {
         (Some((w, h)), Some(c)) if (c[0] - w).abs() > 2.0 || (c[1] - h).abs() > 2.0 => {
+            let what = if b.frame { "window (its frame, title bar included)" } else { "page" };
             return Err(Error::refused(
                 "VariantMismatch",
-                format!("{}'s window showed {}×{}, not the viewport {w}×{h} its target asks for", v.name, c[0], c[1]),
-                "drop viewport from both targets (each app's own size is compared then), or let the app take the size",
+                format!("{}'s {what} was {}×{}, not the viewport {w}×{h} its target asks for", v.name, c[0], c[1]),
+                "drop viewport from the targets (each app's own size is used then), or let the app take the size",
             ));
         }
         (Some((w, h)), None) => {
-            let why = if cfg!(target_os = "macos") { "macOS reports a native window's whole frame, title bar included" } else { "its blocks measure none" };
             return Err(Error::refused(
                 "VariantMismatch",
-                format!("strobe cannot read the content area of {}'s window ({why}), so it cannot hold it to the viewport {w}×{h} both targets ask for", v.name),
-                "drop viewport from both targets: each app opens at its own size",
+                format!("strobe measured no window for {}, so it cannot hold it to the viewport {w}×{h} its target asks for", v.name),
+                "drop viewport from the targets: each app opens at its own size",
             ));
         }
         _ => {}
     }
+    if !ctx.implementations {
+        return Ok(());
+    }
     let Some(mine) = b.client else { return Ok(()) };
     let other = if v.role == "base" { "head" } else { "base" };
-    if let Some(theirs) = ctx.windows.get(&format!("{}\n{other}", s.label())).copied()
-        && ((mine[0] - theirs[0]).abs() > 2.0 || (mine[1] - theirs[1]).abs() > 2.0 || (mine[2] - theirs[2]).abs() > 0.01)
-    {
-        return Err(Error::refused(
-            "VariantMismatch",
-            format!("{}'s window showed {}×{} at scale {}, the other side's {}×{} at scale {}", v.name, mine[0], mine[1], mine[2], theirs[0], theirs[1], theirs[2]),
-            "give both targets the same viewport (and let both apps take it): an implementation comparison varies the app, not its window",
-        ));
+    if let Some((theirs, their_frame)) = ctx.windows.get(&format!("{}\n{other}", s.label())).copied() {
+        let tall = match (b.frame, their_frame) {
+            (true, false) => mine[1] - theirs[1],
+            (false, true) => theirs[1] - mine[1],
+            _ => 0.0,
+        };
+        let height_ok = if b.frame != their_frame { (-2.0..=TITLE_BAR_PT + 2.0).contains(&tall) } else { (mine[1] - theirs[1]).abs() <= 2.0 };
+        if (mine[0] - theirs[0]).abs() > 2.0 || !height_ok || (mine[2] - theirs[2]).abs() > 0.01 {
+            let shown = |c: [f64; 3], frame: bool| format!("{}×{}{} at scale {}", c[0], c[1], if frame { " (its frame, title bar included)" } else { "" }, c[2]);
+            return Err(Error::refused(
+                "VariantMismatch",
+                format!("{}'s window showed {}, the other side's {}", v.name, shown(mine, b.frame), shown(theirs, their_frame)),
+                "give both targets the same viewport (and let both apps take it): an implementation comparison varies the app, not its window",
+            ));
+        }
     }
-    ctx.windows.insert(format!("{}\n{}", s.label(), v.role), mine);
+    ctx.windows.insert(format!("{}\n{}", s.label(), v.role), (mine, b.frame));
     Ok(())
 }
 
@@ -620,18 +656,28 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
     };
     // What the sides drew in, as measured (`Block.client`, which `admit_window` held equal on both),
     // only when both sides were measured: a side strobe could not measure leaves it unknown.
+    // A macOS native side's size is its window's frame (title bar included): the content side's is
+    // given when there is one, and `frame` names the sides measured by their frame.
     let measured = |role: &str| {
-        series.iter().flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default()).filter(|b| b["variant"] == role).find_map(|b| serde_json::from_value::<[f64; 3]>(b["client"].clone()).ok())
+        series
+            .iter()
+            .flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default())
+            .filter(|b| b["variant"] == role)
+            .find_map(|b| serde_json::from_value::<[f64; 3]>(b["client"].clone()).ok().map(|c| (c, b["frame"] == true)))
     };
-    let (client, scale) = match (measured("base"), measured("head")) {
-        (Some(c), Some(_)) => (json!([c[0], c[1]]), json!(c[2])),
-        _ => (Value::Null, Value::Null),
+    let (client, scale, frame) = match (measured("base"), measured("head")) {
+        (Some(b), Some(h)) => {
+            let (c, _) = if b.1 && !h.1 { h } else { b };
+            let framed: Vec<&str> = [("base", b.1), ("head", h.1)].into_iter().filter(|x| x.1).map(|x| x.0).collect();
+            (json!([c[0], c[1]]), json!(c[2]), json!(framed))
+        }
+        _ => (Value::Null, Value::Null, json!([])),
     };
     let gpu_cache = ctx.gpu_cache.values().next().map(|n| n.split(':').next().unwrap_or("").to_string());
     let some = |v: &Value| v["ops"].as_object().is_some_and(|o| !o.is_empty());
     let gave_input = series.iter().any(|s| some(s) || s["blocks"].as_array().into_iter().flatten().any(some));
     json!({
-        "window": { "client_dip": client, "scale": scale, "display": Value::Null, "hz": host::refresh_at(w.x + 20, w.y + 20) },
+        "window": { "client_dip": client, "scale": scale, "frame": frame, "display": Value::Null, "hz": host::refresh_at(w.x + 20, w.y + 20) },
         "adapter": ctx.gpu["devices"].as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
         // Pages against a native implementation get OS input, as native apps always do; two pages DevTools
         // input; runs that gave no input (scripts, commands, journeys without steps) none.
@@ -851,7 +897,11 @@ struct Ctx<'a> {
     /// The fixture of the block that runs now (`any_block`), for its hooks.
     fixture_running: Option<std::rc::Rc<fixture::Running>>,
     /// Per series and side, the window its first block showed (`admit_window`).
-    windows: BTreeMap<String, [f64; 3]>,
+    windows: BTreeMap<String, ([f64; 3], bool)>,
+    /// The sides whose first launch has run: a later launch notes what appears in the user's
+    /// Documents or Desktop (`folder_notes`) instead of stopping (SPEC §13.2).
+    folders_first: std::collections::BTreeSet<String>,
+    folder_notes: isolate::Notes,
     /// The CPUs the target is not pinned to (the runner's): a fixture runs there.
     runner_pin: Option<u64>,
 }
@@ -1224,6 +1274,8 @@ pub fn run(args: &Args) -> Result<Output> {
         projects: BTreeMap::new(),
         fixture_running: None,
         windows: BTreeMap::new(),
+        folders_first: Default::default(),
+        folder_notes: Default::default(),
         runner_pin,
     };
     // What `--resume` needs from another folder: the bench file and directory variants as full paths.
@@ -1625,7 +1677,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
                 progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
                 attribution = json!(b.recording);
             }
-            Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", v.role, e.message))),
+            Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
         }
     }
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
@@ -1911,7 +1963,7 @@ fn warm_gpu(ctx: &mut Ctx, s: &Series, variants: &[Variant], halted: &mut Option
             if round == 3 {
                 ctx.warnings.push(validity::warn(
                     "GpuCacheGrowing",
-                    format!("{}: {}'s GPU shader caches still grew by {} in its third warm-up block: its measured blocks may still compile shaders", s.label(), v.role, fmt::bytes(grew as f64)),
+                    format!("{}: {}'s GPU shader caches still grew by {} in its third warm-up block: its measured blocks may still compile shaders", s.label(), side_of(ctx, v), fmt::bytes(grew as f64)),
                 ));
             }
         }
@@ -2020,7 +2072,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let mut warnings: Vec<Warning> = Vec::new();
     // The analysers of one build's blocks: HighVariance, MultimodalDistribution, NotSteady,
     // Background, StateDrift (Drift is a trend of pair differences: none here).
-    analyse(s, def, &blocks, &[], false, &mut warnings);
+    analyse(s, def, &blocks, &[], false, ["base", "head"], &mut warnings);
     let (session, locked, _) = session_of(blocks.iter());
     if session == "mixed" {
         warnings.push(validity::warn("SessionLocked", format!("{locked} of {} blocks ran on a locked screen and the rest unlocked: their values do not compare", blocks.len())));
@@ -2033,7 +2085,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
-        "until": launch::until_of(&s.launch),
+        "until": launch::until_of(&s.launch), "windowless": series_windowless(ctx, s),
         "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
@@ -2420,7 +2472,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if let Some(note) = counters_note {
         warnings.push(validity::info("Counters", note));
     }
-    analyse(s, def, &blocks, &pairs, primary.relative, &mut warnings);
+    let names = match &*variants {
+        [b, h] if ctx.implementations => [b.name.as_str(), h.name.as_str()],
+        _ => ["base", "head"],
+    };
+    analyse(s, def, &blocks, &pairs, primary.relative, names, &mut warnings);
     let (shown, screen_warnings) = shown::summarize(&blocks, ctx.implementations);
     warnings.extend(screen_warnings);
     // A number from a locked screen is not comparable with one from an unlocked screen: pairs that
@@ -2558,7 +2614,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     }
                     recordings[v.role] = json!(b.recording);
                 }
-                Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", if ctx.implementations { v.name.as_str() } else { v.role }, e.message))),
+                Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
             }
         }
     }
@@ -2570,7 +2626,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut out = json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
-        "until": launch::until_of(&s.launch),
+        "until": launch::until_of(&s.launch), "windowless": series_windowless(ctx, s),
         "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
@@ -2964,8 +3020,9 @@ fn bound_text(x: f64, c: &Comparison, def: &MetricDef) -> String {
     if c.relative { fmt::pct(x) } else { fmt::signed(x, def.unit) }
 }
 
-fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize)], relative: bool, w: &mut Vec<Warning>) {
-    for role in ["base", "head"] {
+/// The analysers of a series' blocks; `names` are how its notes name base and head (`side_of`).
+fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize)], relative: bool, names: [&str; 2], w: &mut Vec<Warning>) {
+    for (role, name) in ["base", "head"].into_iter().zip(names) {
         let v: Vec<f64> = blocks.iter().filter(|b| b.variant == role).map(|b| val(b, &s.primary)).filter(|x| x.is_finite()).collect();
         if v.len() >= 3 {
             let mean = v.iter().sum::<f64>() / v.len() as f64;
@@ -2973,13 +3030,13 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             // A CV means nothing near zero: 0.1% vs 0% dropped frames is not variance worth a warning.
             let tiny = matches!(def.unit, "%" | "count") && mean < 1.0;
             if mean > 0.0 && !tiny && sd / mean > 0.10 {
-                w.push(validity::warn("HighVariance", format!("{role}: {} varies {:.0}% between launches (CV)", def.name, 100.0 * sd / mean)));
+                w.push(validity::warn("HighVariance", format!("{name}: {} varies {:.0}% between launches (CV)", def.name, 100.0 * sd / mean)));
             }
         }
         if let Some(m) = stats::mvalue(&v)
             && m >= 3.2
         {
-            w.push(validity::warn("MultimodalDistribution", format!("{role}: {} looks multimodal (mValue {m:.1}); check pinning and background load", def.name)));
+            w.push(validity::warn("MultimodalDistribution", format!("{name}: {} looks multimodal (mValue {m:.1}); check pinning and background load", def.name)));
         }
     }
     let unsteady = blocks.iter().filter(|b| b.values.contains_key("warmup.unsteady")).count();
@@ -3507,7 +3564,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
         let over = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).filter(|_| x.measures_time()).map(Overhead::over).unwrap_or_default();
         for (part, pct, budget) in over {
             if ctx.overhead_warned.insert(format!("{}\n{part}", s.label())) {
-                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), v.role, pct_of_core(pct))));
+                ctx.warnings.push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), side_of(ctx, v), pct_of_core(pct))));
             }
         }
         r
@@ -3549,7 +3606,16 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
 /// `ctx.fixture`, and ended with the block. The block is refused `FixtureMismatch` when the target
 /// never held a connection to it or ran its executable.
 fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
-    let b = fixture_block(ctx, s, v, pair, x)?;
+    let b = fixture_block(ctx, s, v, pair, x);
+    // What appeared in the user's Documents or Desktop during a later launch: a caution, once each.
+    let noted: Vec<String> = std::mem::take(&mut *ctx.folder_notes.lock().unwrap_or_else(|e| e.into_inner()));
+    for n in noted {
+        let text = format!("{n} while {}'s copy ran ({}): yours, or an isolation gap", v.name, s.label());
+        if !ctx.warnings.iter().any(|w| w.id == "UserFolders" && w.text == text) {
+            ctx.warnings.push(validity::warn("UserFolders", text));
+        }
+    }
+    let b = b?;
     admit_window(ctx, s, v, &b)?;
     Ok(b)
 }
@@ -3822,6 +3888,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let outside = s.cross_engine && !x.counters && matches!(set, Set::Lean | Set::Timing) && x.pixels.is_none();
     // The block's OS present capture, which the OS input's waits read live.
     let presents_rc: crate::driver::os::Presents = Default::default();
+    // How the block's notes name its side (`side_of`), read before the runs' closures borrow ctx.
+    let side = side_of(ctx, v).to_string();
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -3912,11 +3980,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if !app && viewport {
             browser.fit_viewport(&page, window.width, window.height)?;
         }
-        // A webview app's window is placed like a native app's, and sized to the viewport; so is an
-        // Electron app's given a viewport (DevTools resizes no app window: the OS does). The block
-        // records the page's own size, not the one asked for.
+        // An app's window (a webview's, an Electron app's) is placed like a native app's and sized to
+        // a viewport (DevTools resizes no app window: the OS does). The block records the page's own
+        // size, not the one asked for.
         if let (WebBrowser::Chromium(b), Page::Chromium(p)) = (&browser, &page)
-            && (b.embedded || (app && viewport))
+            && (b.embedded || app)
         {
             ctx.used = Some(crate::target::webview::fit(b, p, Some(&window), viewport)?);
         }
@@ -4483,7 +4551,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 if let (Some(dir), Some(b)) = (&gecko_dir, firefox) {
                     match probe::gecko::census(b, &page, &dir.join("memory-0.json.gz"), "after warmup, before the profiler started and the measured runs") {
                         Ok(c) => census.push(c),
-                        Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", v.role, e.message))),
+                        Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", side, e.message))),
                     }
                     gecko = Some(probe::gecko::start(b)?);
                 } else if set == Set::Attribution {
@@ -4602,7 +4670,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if set == Set::Attribution && shift && page.cdp().is_some() {
             match probe::shifts::largest(&trace, &token, cp()?, first, 5) {
                 Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
-                Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", v.role, e.message))),
+                Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", side, e.message))),
             }
         }
         // A Firefox block's census came before its profiler; Firefox gives strobe no heap snapshot.
@@ -4614,7 +4682,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // The live objects after the runs (post-GC), once no trace subscription copies every
             // snapshot chunk (SPEC §8.6).
             if let Err(e) = probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz")) {
-                ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", v.role, e.message)));
+                ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", side, e.message)));
             }
             lap("heap");
         }
@@ -4624,7 +4692,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
             && !ctx.warnings.iter().any(|w| w.id == "Teardown")
         {
-            ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
+            ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side, e.message)));
         }
         let mut data = if set == Set::Memory || x.counters || traceless { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
         data.warm_below(first);
@@ -4878,6 +4946,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             process_set: Some(programs(&browser.processes())),
             fixture_connected: None,
             client: content,
+            frame: false,
             browser: Some(seen),
             directions: BTreeMap::new(),
             same: same.take(first),
@@ -5074,6 +5143,14 @@ fn with_gpu_cache(ctx: &mut Ctx, s: &Series, v: &Variant, target: &Value, mut ap
     };
     let key = if s.gpu_cache.is_some() { s.label() } else { s.target.clone() };
     ctx.gpu_cache.entry(key).or_insert_with(|| note.to_string());
+    // The user's Documents and Desktop: checked strictly around each side's first launch and in a
+    // `--check` (a change stops it); past those a change is noted (`any_block`), since a person's
+    // own save over a long bench is likelier than a copy's.
+    if ctx.folders_first.insert(v.role.to_string()) || ctx.mode == Mode::Check {
+        app.folder_notes = None;
+    } else {
+        app.folder_notes = Some(ctx.folder_notes.clone());
+    }
     Ok(app)
 }
 
@@ -5724,7 +5801,7 @@ fn os_frames(
         }
     }
     if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
-        ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", v.role, p.events_lost)));
+        ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", side_of(ctx, v), p.events_lost)));
     }
     Some(p)
 }
@@ -6625,10 +6702,21 @@ fn render(r: &Value) -> String {
         let cpus = env["logical_cpus"].as_u64().map(|n| format!("{n} logical CPUs")).unwrap_or_default();
         out += &format!("env    {}\n", fmt::fields([env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), &cpus]));
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
-        // A script or command line (every side's) has no window and draws to no display.
+        // A script, a command line or a `window: false` app (every side's) has no window and draws to no
+        // display (`windowless` in the series; older results by the target kinds).
         let kinds = if sides { vec![&s["target_kinds"]["base"], &s["target_kinds"]["head"]] } else { vec![&s["target_kind"]] };
-        let windowless = kinds.iter().all(|k| matches!(k.as_str(), Some("script" | "cli")));
-        let window = Some(fmt::size(&r["window"])).filter(|s| !s.is_empty() && !windowless).map(|s| format!("window {s}")).unwrap_or_default();
+        let windowless = s["windowless"].as_bool().unwrap_or_else(|| kinds.iter().all(|k| matches!(k.as_str(), Some("script" | "cli"))));
+        // Two implementations: the window both were measured in, or none (one side's alone says nothing).
+        let size = if sides {
+            let c = &r["fairness"]["window"]["client_dip"];
+            match (c[0].as_f64(), c[1].as_f64()) {
+                (Some(x), Some(y)) => format!("{x:.0}×{y:.0}"),
+                _ => String::new(),
+            }
+        } else {
+            fmt::size(&r["window"])
+        };
+        let window = Some(size).filter(|s| !s.is_empty() && !windowless).map(|s| format!("window {s}")).unwrap_or_default();
         // A headless page drew to no display: no refresh, no visibility to claim.
         let headless = s["headless"] == true;
         let refresh = if headless {
@@ -6645,6 +6733,7 @@ fn render(r: &Value) -> String {
         }
         let screen = match s["session"].as_str() {
             _ if headless => "headless (no display)",
+            _ if windowless => "no window",
             Some("locked") => "session locked (nothing measured needs a presenting window)",
             Some("mixed") => "session locked in some pairs only: nothing decided",
             _ => "visible",

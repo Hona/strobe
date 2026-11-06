@@ -1135,7 +1135,8 @@ fn top_window(w: &Win) -> super::TopWindow {
     }
 }
 
-/// The largest normal window of `pids` (over 100×100 points), on screen first.
+/// The largest normal window of `pids` (at least 100×100 points: an app's 1470×33 menu bar strip is
+/// no main window, whatever its area), on screen first.
 pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
     main_win(pids).as_ref().map(top_window)
 }
@@ -1143,7 +1144,7 @@ pub fn main_window(pids: &[u32]) -> Option<super::TopWindow> {
 fn main_win(pids: &[u32]) -> Option<Win> {
     windows(LIST_ALL | EXCLUDE_DESKTOP, 0)
         .into_iter()
-        .filter(|w| pids.contains(&w.pid) && w.layer == 0 && w.bounds.size.width * w.bounds.size.height > 10_000.0)
+        .filter(|w| pids.contains(&w.pid) && w.layer == 0 && w.bounds.size.width >= 100.0 && w.bounds.size.height >= 100.0)
         .max_by(|a, b| (a.onscreen, a.bounds.size.width * a.bounds.size.height).partial_cmp(&(b.onscreen, b.bounds.size.width * b.bounds.size.height)).unwrap_or(std::cmp::Ordering::Equal))
 }
 
@@ -1292,7 +1293,9 @@ pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u
             let v = Cf(v);
             unsafe { AXValueGetValue(v.0, 2, &mut size as *mut _ as *mut c_void) };
         }
-        if (pos.x as i32, pos.y as i32, size.width as i32, size.height as i32) != w.rect {
+        // Within a point each way, as `a11y::ax` matches frames: AX and CoreGraphics may round apart.
+        let near = |a: f64, b: i32| (a as i32 - b).abs() <= 1;
+        if !(near(pos.x, w.rect.0) && near(pos.y, w.rect.1) && near(size.width, w.rect.2) && near(size.height, w.rect.3)) {
             continue;
         }
         let p = CGPoint { x: x as f64, y: y as f64 };

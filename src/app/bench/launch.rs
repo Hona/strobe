@@ -361,7 +361,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                         values.insert(format!("launch.node.{name}"), at - started_ms);
                     }
                 }
-                Err(e) if !ctx.warnings.iter().any(|w| w.id == "Inspect") => ctx.warnings.push(validity::warn("Inspect", format!("{}: {}", v.role, e.message))),
+                Err(e) if !ctx.warnings.iter().any(|w| w.id == "Inspect") => ctx.warnings.push(validity::warn("Inspect", format!("{}: {}", side_of(ctx, v), e.message))),
                 Err(_) => {}
             }
             lap("node", &mut steps);
@@ -430,7 +430,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     if let Err(e) = closed
         && !ctx.warnings.iter().any(|w| w.id == "Teardown")
     {
-        ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", v.role, e.message)));
+        ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", side_of(ctx, v), e.message)));
     }
     result
 }

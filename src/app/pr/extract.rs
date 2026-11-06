@@ -606,12 +606,21 @@ pub(super) fn symbolic(spec: &str) -> String {
 /// implementation's compact name) where the note names base or head (`head: …`, `base attribution
 /// block failed`), and metric ids by their names.
 pub(super) fn plain_note(text: &str, (base, head): (&str, &str)) -> String {
-    let roles = regex_lite::Regex::new(r"\b(base|head)(: | attribution block\b)").expect("pattern");
+    use std::sync::OnceLock;
+    // Every form a note names a side in (results from before notes named implementations themselves):
+    // `head: …`, `base block: …`, `head launch: …`, `base's GPU shader caches …`, `base attribution
+    // block failed`, `base heap snapshot failed`, `head about:memory`, `base layout shifts`.
+    static ROLES: OnceLock<regex_lite::Regex> = OnceLock::new();
+    static IDS: OnceLock<regex_lite::Regex> = OnceLock::new();
+    let roles = ROLES.get_or_init(|| regex_lite::Regex::new(r"\b(base|head)(: |'s | (?:block|launch|attribution block|heap snapshot|about:memory|layout shifts)\b)").expect("pattern"));
     let t = roles.replace_all(text, |c: &regex_lite::Captures| {
         let side = if &c[1] == "base" { base } else { head };
-        if &c[2] == ": " { format!("{side}: ") } else { format!("{side}'s attribution block") }
+        match &c[2] {
+            " attribution block" => format!("{side}'s attribution block"),
+            rest => format!("{side}{rest}"),
+        }
     });
-    let ids = regex_lite::Regex::new(r"\b[a-z]+(\.[a-z0-9]+)+\b").expect("pattern");
+    let ids = IDS.get_or_init(|| regex_lite::Regex::new(r"\b[a-z]+(\.[a-z0-9]+)+\b").expect("pattern"));
     ids.replace_all(&t, |c: &regex_lite::Captures| if model::metric(&c[0]).is_some() { lc(&noun(&c[0])) } else { c[0].to_string() }).to_string()
 }
 

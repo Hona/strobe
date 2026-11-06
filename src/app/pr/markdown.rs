@@ -57,6 +57,7 @@ impl<'a> Doc<'a> {
             out += &regs.iter().map(|r| format!("> **Regression:** {}", r.1)).collect::<Vec<_>>().join("\n");
             out += "\n\n";
         }
+        out += &self.folder_caution();
         // The proof: every series once, by name.
         for s in &self.series {
             let mut line = self.sentence(s);
@@ -1046,7 +1047,8 @@ impl<'a> Doc<'a> {
             .chain(self.series.iter().flat_map(|s| s["warnings"].as_array().into_iter().flatten().map(move |w| (self.title(s), w))))
         {
             let id = w["id"].as_str().unwrap_or("");
-            if id == "ReservedCpus" || id == "SessionLocked" && w["level"] != "warn" || id == "DisplayOff" {
+            // `UserFolders` leads the block as a caution (`folder_caution`).
+            if id == "ReservedCpus" || id == "SessionLocked" && w["level"] != "warn" || id == "DisplayOff" || id == "UserFolders" {
                 continue;
             }
             let raw = w["text"].as_str().unwrap_or("");
@@ -1072,6 +1074,20 @@ impl<'a> Doc<'a> {
             t += &format!("- **Other experiments on these builds:** {}\n", cell(&l));
         }
         t
+    }
+
+    /// What appeared in the user's own Documents or Desktop while a copy ran (`UserFolders`): a person
+    /// reads it before the numbers, since it may be an isolation gap.
+    pub(super) fn folder_caution(&self) -> String {
+        let lines: Vec<String> = self.r["warnings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|w| w["id"] == "UserFolders")
+            .filter_map(|w| w["text"].as_str())
+            .map(|t| format!("> **Your folders changed:** {}", cell(&scrub_paths(t))))
+            .collect();
+        if lines.is_empty() { String::new() } else { format!("> [!CAUTION]\n{}\n\n", lines.join("\n")) }
     }
 
     /// The strobe that recorded the result and the one that formatted it.

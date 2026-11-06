@@ -138,11 +138,12 @@ fn top(x: &X, w: &Info, stack: &[Window]) -> TopWindow {
     }
 }
 
-/// The largest viewable window of `pids` (over 100×100 pixels).
+/// The largest viewable window of `pids` (at least 100×100 pixels: a strip such as a menu bar is no
+/// main window, whatever its area).
 pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     with(|x| {
         let stack = clients(x);
-        let best = stack.iter().filter_map(|&w| info(x, w)).filter(|i| pids.contains(&i.pid) && i.viewable && !i.hidden && i.rect.2 as i64 * i.rect.3 as i64 > 10_000).max_by_key(|i| i.rect.2 as i64 * i.rect.3 as i64)?;
+        let best = stack.iter().filter_map(|&w| info(x, w)).filter(|i| pids.contains(&i.pid) && i.viewable && !i.hidden && i.rect.2 >= 100 && i.rect.3 >= 100).max_by_key(|i| i.rect.2 as i64 * i.rect.3 as i64)?;
         Some(top(x, &best, &stack))
     })
 }

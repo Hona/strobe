@@ -75,6 +75,9 @@ pub struct App {
     /// Where the GPU shader caches of this app's launches persist between them (`gpuCache: "warm"`):
     /// lent into each home before the launch and taken back when the home goes (`lend_gpu_caches`).
     pub gpu_cache: Option<PathBuf>,
+    /// Set: something appearing in the user's Documents or Desktop while this launch runs is noted
+    /// here for the experiment (a bench's later launches of a side); unset, it stops the launch.
+    pub folder_notes: Option<Notes>,
 }
 
 #[derive(Clone, Debug)]
@@ -228,6 +231,7 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         windowless: p["window"] == false,
         gpu_cache_mode: p["gpuCache"].as_str().map(str::to_string),
         gpu_cache: None,
+        folder_notes: None,
     })
 }
 
@@ -295,18 +299,41 @@ pub struct Guard {
     checks: Vec<Check>,
     /// Seed files the home shares with other launches: none may change.
     pub shared: Vec<Shared>,
-    /// The user's own known folders (`KNOWN_FOLDERS` in the real home) and when each last changed:
-    /// a file the copy added or removed there changes its folder's time.
-    folders: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+    /// The user's own Documents and Desktop (`host::user_folders`) and when each last changed, read
+    /// when the launch began.
+    folders: Vec<(PathBuf, Option<SystemTime>)>,
+    taken: Option<SystemTime>,
+    /// Where a change there is noted instead of stopping the experiment (`App::folder_notes`).
+    notes: Option<Notes>,
 }
 
-/// The user's folders an app writes into without being asked to (an onboarding project, a saved or
-/// downloaded file), watched in the real home while a copy runs. Only each folder's own time is read
-/// (a `stat`), never its contents: macOS asks a person before an app lists them.
-const KNOWN_FOLDERS: &[&str] = &["Documents", "Desktop", "Downloads"];
+/// Notes a guard leaves for its experiment (`App::folder_notes`).
+pub type Notes = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-fn modified(p: &Path) -> Option<std::time::SystemTime> {
+use std::time::SystemTime;
+
+fn modified(p: &Path) -> Option<SystemTime> {
     std::fs::metadata(p).ok()?.modified().ok()
+}
+
+/// What the OS or a sync client writes into a folder by itself: never the copy's doing.
+fn incidental(name: &str) -> bool {
+    matches!(name, ".DS_Store" | ".localized" | "desktop.ini" | "Icon\r") || (name.starts_with('.') && name.ends_with(".icloud"))
+}
+
+/// What appeared in `dir` since `since` (by each entry's own time), but what the OS writes by itself.
+/// None when strobe may not list it (macOS asks a person first), so it is listed only once its time
+/// moved.
+fn appeared(dir: &Path, since: SystemTime) -> Option<Vec<String>> {
+    let mut out: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|e| !incidental(&e.file_name().to_string_lossy()))
+        .filter(|e| e.metadata().ok().and_then(|m| m.created().ok().max(m.modified().ok())).is_some_and(|t| t >= since))
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    out.sort();
+    Some(out)
 }
 
 #[derive(Clone, Debug)]
@@ -335,27 +362,50 @@ impl Guard {
                 Check { file: g.file.clone(), before, pid, addr }
             })
             .collect();
-        let folders = KNOWN_FOLDERS
-            .iter()
-            .map(|d| {
-                let p = host::home().join(d);
+        let folders = host::user_folders()
+            .into_iter()
+            .map(|p| {
                 let when = modified(&p);
                 (p, when)
             })
             .collect();
-        Guard { checks, shared: Vec::new(), folders }
+        Guard { checks, shared: Vec::new(), folders, taken: Some(SystemTime::now()), notes: app.folder_notes.clone() }
+    }
+
+    /// What appeared in the user's own Documents or Desktop since the launch began, by folder: none
+    /// when a folder's time did not move or only what the OS writes by itself appeared.
+    fn folder_changes(&self) -> Vec<(PathBuf, Option<Vec<String>>)> {
+        let since = self.taken.unwrap_or(SystemTime::UNIX_EPOCH);
+        self.folders
+            .iter()
+            .filter(|(p, before)| modified(p) != *before)
+            .map(|(p, _)| (p.clone(), appeared(p, since)))
+            .filter(|(_, new)| new.as_ref().is_none_or(|n| !n.is_empty()))
+            .collect()
     }
 
     /// Fails when a guarded file changed, or its process stopped running or answering, or the app
-    /// wrote to a seed file its home shares with other launches, or something was added to or
-    /// removed from one of the user's own known folders.
+    /// wrote to a seed file its home shares with other launches, or something appeared in the user's
+    /// own Documents or Desktop (noted instead, for the experiment, past each side's first launch).
     pub fn check(&self, when: &str) -> Result<()> {
-        if let Some((p, _)) = self.folders.iter().find(|(p, before)| modified(p) != *before) {
-            return Err(Error::msg(format!(
-                "stopped {when}: something added or removed a file in your {} while the copy ran; strobe never measures past disturbed user state",
-                p.display()
-            ))
-            .hint("an isolation gap when the copy wrote it: add the env var, switch or file that keeps that folder in its home to its profile in strobe.json apps; if it was you or another program, run again"));
+        for (p, new) in self.folder_changes() {
+            let what = match &new {
+                Some(n) => format!("{} appeared in your {}", n.join(", "), p.display()),
+                None => format!("your {} changed (strobe may not list it)", p.display()),
+            };
+            match &self.notes {
+                Some(notes) => {
+                    let mut n = notes.lock().unwrap_or_else(|e| e.into_inner());
+                    if !n.contains(&what) {
+                        n.push(what);
+                    }
+                }
+                None => {
+                    return Err(Error::msg(format!("stopped {when}: {what} while the copy ran; strobe never measures past disturbed user state")).hint(
+                        "an isolation gap when the copy wrote it: add the env var, switch or file that keeps that folder in its home to its profile in strobe.json apps; if it was you or another program, run again",
+                    ));
+                }
+            }
         }
         if let Some(s) = self.shared.iter().find(|s| stamp(&s.cache) != Some((s.len, s.modified))) {
             return Err(Error::msg(format!(
@@ -930,6 +980,13 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     // throws when the folder is missing (an isolated desktop app failed to start on exactly that).
     for d in ["Documents", "Desktop", "Downloads", "Pictures", "Music", "Videos"] {
         std::fs::create_dir_all(home.join(d))?;
+    }
+    // macOS: what Cocoa resolves into the home (`CFFIXED_USER_HOME`, below) exists there as in a
+    // person's home, so an app that only looks a folder up (never creates it) finds one.
+    if cfg!(target_os = "macos") {
+        for d in ["Movies", "Library/Application Support", "Library/Caches", "Library/Preferences", "Library/Logs", "Library/Saved Application State"] {
+            std::fs::create_dir_all(home.join(d))?;
+        }
     }
     for d in &app.dirs {
         std::fs::create_dir_all(home.join(d))?;

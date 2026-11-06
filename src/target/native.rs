@@ -109,7 +109,8 @@ impl Native {
     pub fn wait_window(&mut self, timeout: Duration, guard: &Guard) -> Result<TopWindow> {
         let deadline = Instant::now() + timeout;
         loop {
-            if let Some(w) = host::main_window(&self.pids()) {
+            // A window still being shown (off screen, minimized while it opens) is not the one to place.
+            if let Some(w) = host::main_window(&self.pids()).filter(|w| w.visible && !w.iconic) {
                 self.window = Some(w.clone());
                 return Ok(w);
             }

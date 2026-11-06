@@ -136,19 +136,16 @@ pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Windo
             break;
         }
     }
-    if size && !fits(got) {
-        return Err(Error::usage(format!(
-            "{} keeps its page at {}×{} CSS pixels, not the target's viewport {}×{}: the app fixes its window's size",
-            browser.exe.display(),
-            got.0,
-            got.1,
-            at.width,
-            at.height
-        ))
-        .hint("drop viewport from the target: the app's own size is measured then"));
+    // Aimed to the pixel, held to 2 DIP as every window is (a fractional scale rounds a page's size).
+    if size && ((got.0 - want.0).abs() > 2.0 || (got.1 - want.1).abs() > 2.0) {
+        return Err(Error::refused(
+            "VariantMismatch",
+            format!("{} keeps its page at {}×{} CSS pixels, not the target's viewport {}×{}: the app fixes its window's size, or the screen clamps it", browser.exe.display(), got.0, got.1, at.width, at.height),
+            "drop viewport from the target (the app's own size is measured then), or ask for one that fits the screen",
+        ));
     }
     let placed = crate::host::window_state(main.hwnd).unwrap_or(main);
-    Ok(Window { x: placed.rect.0, y: placed.rect.1, width: got.0 as u32, height: got.1 as u32, scale: Some(got.2) })
+    Ok(Window { x: placed.rect.0, y: placed.rect.1, width: got.0.round() as u32, height: got.1.round() as u32, scale: Some(got.2) })
 }
 
 /// `path` with `\` as separators, lowercase and without a trailing separator: how Windows compares

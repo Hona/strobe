@@ -1,12 +1,14 @@
 {
   "build": {
     "command": "bun -e \"require('fs').copyFileSync(process.execPath, process.argv.at(-1))\" \"{cache}\\fake-app.exe\"",
-    "output": "{cache}/fake-app.exe"
+    "output": "{cache}/fake-app.exe",
+    "macos": { "command": "bun -e \"require('fs').copyFileSync(process.execPath, process.argv.at(-1))\" \"{cache}/fake-app\"", "output": "{cache}/fake-app" },
+    "linux": { "command": "bun -e \"require('fs').copyFileSync(process.execPath, process.argv.at(-1))\" \"{cache}/fake-app\"", "output": "{cache}/fake-app" }
   },
   "apps": {
     "fake": {
       "kind": "native",
-      "exe": "fake-app.exe"
+      "exe": { "windows": "fake-app.exe", "macos": "fake-app", "linux": "fake-app" }
     }
   }
 }

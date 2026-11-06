@@ -120,7 +120,7 @@ struct Run {
 /// variant and reason.
 fn unattributed(ctx: &mut Ctx, v: &Variant, n: &Native) {
     if let Some(why) = n.unattributed() {
-        let w = validity::warn("Unattributed", format!("{}: {why}; cpu, memory, wakes and GPU cover the app's own processes only", v.role));
+        let w = validity::warn("Unattributed", format!("{}: {why}; cpu, memory, wakes and GPU cover the app's own processes only", side_of(ctx, v)));
         if !ctx.warnings.iter().any(|x| x.text == w.text) {
             ctx.warnings.push(w);
         }
@@ -238,9 +238,27 @@ fn runs(
             at.width = vp["width"].as_u64().unwrap_or(at.width as u64) as u32;
             at.height = vp["height"].as_u64().unwrap_or(at.height as u64) as u32;
         }
+        // macOS sizes another app's window only through the accessibility API: without it nothing
+        // would move, and the block would run in the app's own size.
+        #[cfg(target_os = "macos")]
+        if viewport.is_some() && !host::macos::accessibility_trusted() {
+            let (who, pane) = (host::macos::responsible_app(), host::macos::accessibility_pane());
+            return Err(Error::usage(format!("sizing {}'s window to the target's viewport needs the accessibility permission, which {who} (the app strobe runs under) does not have", app.exe.display()))
+                .hint(format!("{pane}: turn on {who}, or drop viewport from the target")));
+        }
         if let Some(w) = n.place(&at, viewport.is_some()) {
             let scale = w.scale();
-            ctx.used = Some(Window { x: w.rect.0, y: w.rect.1, width: (w.client.0 as f64 / scale).round() as u32, height: (w.client.1 as f64 / scale).round() as u32, scale: Some(scale) });
+            let got = (w.client.0 as f64 / scale, w.client.1 as f64 / scale);
+            // A window that keeps its own size (fixed, or clamped to the screen) never had the viewport.
+            if viewport.is_some() && ((got.0 - at.width as f64).abs() > 2.0 || (got.1 - at.height as f64).abs() > 2.0) {
+                let what = if cfg!(target_os = "macos") { "window (its frame, title bar included)" } else { "window's client area" };
+                return Err(Error::refused(
+                    "VariantMismatch",
+                    format!("{}'s {what} stayed {:.0}×{:.0}, not the viewport {}×{} its target asks for: the app keeps its size, or the screen clamps it", v.name, got.0, got.1, at.width, at.height),
+                    "drop viewport from the target (the app's own size is measured then), or ask for one that fits the screen",
+                ));
+            }
+            ctx.used = Some(Window { x: w.rect.0, y: w.rect.1, width: got.0.round() as u32, height: got.1.round() as u32, scale: Some(scale) });
         }
     }
     drive.follow(n);
@@ -672,7 +690,7 @@ fn runs(
                 }
             }
             if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
-                ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", v.role, p.events_lost)));
+                ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", side_of(ctx, v), p.events_lost)));
             }
         }
         Some(Err(e)) => presents_err = Some(e.message.clone()),
@@ -825,7 +843,7 @@ fn runs(
     if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
         && !ctx.warnings.iter().any(|w| w.id == "Teardown")
     {
-        ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", v.role, e.message)));
+        ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side_of(ctx, v), e.message)));
     }
     lap("analyse", steps);
     Ok(Block {
@@ -845,9 +863,10 @@ fn runs(
         shown,
         overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
         process_set: Some(programs(&n.processes())),
-        // macOS's window list gives a window's frame, title bar included, not its content area: no
-        // content size to compare there.
-        client: n.window.as_ref().filter(|_| !cfg!(target_os = "macos")).map(client_of),
+        // macOS's window list gives a window's frame, title bar included, not its content area: kept
+        // as the frame (`admit_window` allows a page's side the title bar).
+        client: n.window.as_ref().map(client_of),
+        frame: cfg!(target_os = "macos"),
         directions: BTreeMap::new(),
         same: same.take(first),
         ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
@@ -1401,7 +1420,28 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         } else {
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, process_set: Some(programs(&procs)), same: same.take(0), ..Block::default() })
+        // The window the app opened, once ready (a launch is never resized): its sides are held to
+        // each other (`admit_window`), and the result reports it.
+        let opened = (!windowless).then(|| host::main_window(&n.pids())).flatten();
+        if let Some(w) = &opened {
+            let c = client_of(w);
+            ctx.used = Some(Window { x: w.rect.0, y: w.rect.1, width: c[0] as u32, height: c[1] as u32, scale: Some(c[2]) });
+        }
+        Ok(Block {
+            variant: v.role.to_string(),
+            pair,
+            values,
+            run_ms: vec![ready_ms],
+            recording,
+            steps: steps.clone(),
+            shown,
+            refused,
+            process_set: Some(programs(&procs)),
+            same: same.take(0),
+            client: opened.as_ref().map(client_of),
+            frame: opened.is_some() && cfg!(target_os = "macos"),
+            ..Block::default()
+        })
     })();
     // A launch that failed before its recording still ends the helper's session.
     if let Some(Ok(c)) = stacks.take() {
@@ -1416,7 +1456,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
     if let Err(e) = closed
         && !ctx.warnings.iter().any(|w| w.id == "Teardown")
     {
-        ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", v.role, e.message)));
+        ctx.warnings.push(validity::warn("Teardown", format!("{} launch: {}", side_of(ctx, v), e.message)));
     }
     result
 }

@@ -390,6 +390,7 @@ impl Guard {
     pub fn check(&self, when: &str) -> Result<()> {
         for (p, new) in self.folder_changes() {
             let what = match &new {
+                Some(n) if n.len() > 5 => format!("{} and {} more appeared in your {}", n[..5].join(", "), n.len() - 5, p.display()),
                 Some(n) => format!("{} appeared in your {}", n.join(", "), p.display()),
                 None => format!("your {} changed (strobe may not list it)", p.display()),
             };

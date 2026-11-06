@@ -15,6 +15,8 @@ export default bench({
   fixture: fixture(process.env.STROBE_DEV_FIXTURE === "copy" ? "bun fixture-server.ts {port} copy {home}" : "bun fixture-server.ts {port}"),
   targets: { use: client("use"), both: client("both"), own: client("own"), port: client("port") },
   cases: {
-    idle: { primary: "cpu.work", setup: ({ page }) => page.wait(1000), run: ({ page }) => page.wait(500) },
+    // Setup gives the client time to start and connect: a first launch of a fresh copy of its runtime
+    // can take a few seconds (macOS checks a new binary).
+    idle: { primary: "cpu.work", setup: ({ page }) => page.wait(3000), run: ({ page }) => page.wait(500) },
   },
 })

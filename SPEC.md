@@ -4891,7 +4891,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | counters (§7.5) | macOS: one `proc_pid_rusage` per process at each end of a run, nothing in the target; Linux perf events: per context switch in the target (4.4 µs in a VM), so they open only in counter blocks, never in a timing block |
 | off-CPU waits (`--probes waits`, attribution only, §11.1) | none in timing blocks: per context switch in the target (Linux about 7 µs on top of `deep` in a VM), so only a capture that asks takes them |
 | Firefox's profiler (attribution only, §8.3) | the browser's own samplers, in the target's processes: on Windows 1 ms through Firefox 160, where any shorter interval makes every process's sampler busy-wait a core (bug 1349801; 10.2 cores for a page's Firefox 159 on adais at 200 µs or 500 µs, 0.3-0.4 cores at 1 ms, 0.25 with no profiler), and 500 µs from Firefox 161, whose sampler waits on a high-resolution timer (bug 2082760; Nightly 162: 0.65 cores at 500 µs, 0.3 with no profiler); 200 µs on macOS and Linux (air 0.3-0.6 cores and vps 0.1-0.5 at any interval, no profiler alike) |
-| `cli()` targets (§9.6) | nothing in the command; per command run strobe spawns it, reads its output on two threads and, after its exit, the OS's accounting (Linux also scans `/proc` for its process group), on strobe's CPUs |
+| `cli()` targets (§9.6) | nothing in the command; per command run strobe spawns it, reads its output on two threads (started before it) and, after its exit, the OS's accounting and one list of the system's processes for what it left (Linux also scans `/proc` for its process group), on strobe's CPUs; while the command runs, strobe only waits and reads its output (adais: 0.16% of a core beside a 300 ms command, 3–6% beside a 6 ms one) |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
@@ -4900,7 +4900,13 @@ Every page, native and script block records what strobe cost inside its measured
 from that one process just before a run begins and just after it ends (a page's: around its start
 and end marks), so strobe's work between runs (reading the target's processes, snapshots, resets,
 warmup runs) is not in it; and the parts that measure themselves over the block (`sampler_pct`,
-`present_pct`, `reserve_pct`). `--check` prints it per case (`self  strobe 0.81% · runner 0.40% ·
+`present_pct`, `reserve_pct`). A `cli()` block counts only while its commands run, from each
+launch's return to the command's exit, since its values are the commands' (`run.duration` sums
+their spawn-to-exit times): the launch itself and the accounting after each exit sit outside. The
+launch is the OS creating the process, which Windows charges to the launcher (5–7 ms of CPU per
+launch on adais, for strobe and for Bun's `spawnSync` alike); it stays in `run.duration` as the
+command's start. Each edge reads strobe's own cycles right beside the clock and the runner's beyond
+them, so reading the runner is not in strobe's count. `--check` prints it per case (`self  strobe 0.81% · runner 0.40% ·
 sampler 0.16% of a core`), a bench per series (the blocks' mean); in a timed block a part over its
 budget above warns `OverheadBudget`, once per series and part. strobe's own process has no budget
 yet. Measured on adais: a windowless native app's 5 s idle run 0.81%, a headless page's click run
@@ -5028,6 +5034,20 @@ recording) passed and kept `exec-shell.actions.json.gz`: `--seed 42` ran `bun --
 them by construction (`Runner::collect_actions`), not by a measurement; and a comparison's ledger
 line `--seed a → b`, a bisect's one seed and a track's derived seed have not been seen in timed
 runs.
+
+strobe's own CPU in `cli()` runs (2026-11-07, §19; `--check`, single noisy smoke runs, adais locked
+and vps). A run of three `bun --version` read strobe at 65–93% of a core on adais and 43–52% on vps,
+a 300 ms command 6–26% and 2%. Counted over the whole run, the share held strobe's own work around
+each command: on adais 7.5 ms launching it (`CreateProcess`, which Windows charges to the launcher:
+5.5–7.4 ms per launch for Bun's `spawnSync` too) and 11 ms after its exit (6 ms listing the system's
+processes for what it left, then 5 ms listing them again to end the tree of a process that had
+exited, which no list holds), beside commands that ran 0.03–6 ms. Now the share counts while a
+command runs, its reader threads start before it, and the second list is gone (a Unix launch also
+leaves the stop list before its reap, whose pid may be reused): three `bun --version` read 3–6%
+(adais) and 4–8% (vps), a 300 ms command 0.16% and 0.06–0.11%. Unchanged, on adais and vps: a
+script target's 3 ms calls 7% (the relay of each `ctx.call`), a headless page's click 0.5% and 2–3%,
+a windowless native app's idle run 0.3%. A command that ends within microseconds of its launch
+reads a share of a span that short.
 
 Press edge and untimed stretches (2026-11-06, §7.4, §9.6; `scripts/dev/press.bench.ts` with
 `scripts/dev/press-app.swift`, `--check`). On air, unlocked, two clicks a run, each followed by an

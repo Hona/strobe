@@ -168,7 +168,7 @@ strobe history [<ser_…|file>]
 
 - Tracked series: points, sparkline, changes, culprits (`query history|changes`; `report history <ser_…>`).
 - A port's file shows journeys × commits (`less -50%`, `same`, `gap`, `unclear -3%`), the latest scoreboard, changes and marks.
-- `report history <file> --format card` draws the port's progress; `--format badge --scoreboard` draws `vs <base> (tracked, 3 pairs) | better in 4/5 · 1 gap` from the newest commit's points (grey unless a change was confirmed).
+- `report history <file> --format card` draws the port's progress; `--format badge --scoreboard` draws `vs <base> (tracked, 3 pairs) | better in 4/5 · 1 gap` from the newest commit's points: grey, red only with `· 1 open regression` (a confirmed regression no confirmed improvement followed).
 
 ### `strobe look`
 

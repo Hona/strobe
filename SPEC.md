@@ -5592,8 +5592,10 @@ strobe track <file.bench.ts> --base … --head <target>=git:<branch> --schedule 
   went from a gap to compared, or back, between two tracked commits; the comparator's identity
   changing between two points (`Comparator updated (<base name> <old> → <new>)`).
 - **Points are evidence, not verdicts.** Everything that shows one says what it is: its pairs and
-  confidence (`3 pairs, 75%`), and the scoreboard says `tracked`. Green and red are only for changes a
-  paired A/B confirmed.
+  confidence (`3 pairs, 75%`), and the scoreboard says `tracked` and stays grey. Green and red are
+  only for changes a paired A/B confirmed. A scoreboard turns red only when it says so in words: an
+  **open regression** is a journey whose latest confirmed change (in commit order) is a regression,
+  with no confirmed improvement after it.
 - **Views.** `strobe history <file>` draws each port as journeys × commits: a row per commit (date,
   commit, subject), a column per journey, the comparator's updates between rows, a cell in words only
   when its whole interval lies past the bound (`less −50%`, `more +18%` in the metric's words, `same`,
@@ -5606,7 +5608,8 @@ strobe track <file.bench.ts> --base … --head <target>=git:<branch> --schedule 
 - **Card** (`report history <file|ser_…> --format card`, 1200×630, §11.2's visual system): header
   `<head> vs <base> · <file>` and the device; left, `tracked, 3 pairs, 75% · at <commit>`, the
   scoreboard at the newest commit very large and neutral (`4 of 5`), `journeys better than <base>`,
-  the other counts, then where the port started, the commits tracked, the confirmed changes (relative,
+  the other counts, the open regressions in red (`1 open regression: idle +20%`), then where the port
+  started, the commits tracked, the confirmed changes (relative,
   or in the metric's unit) and the journeys compared since a commit while they still are; right, a row
   per journey (every one worse at the newest commit kept first when they do not all fit): its points
   in grey over the commits, on the row's own scale from its lowest point to its highest with no change
@@ -5615,9 +5618,8 @@ strobe track <file.bench.ts> --base … --head <target>=git:<branch> --schedule 
   the right; the scoreboard under the rows. Footer: device, OS, CPU, pairs per commit and their
   confidence, and the latest comparator update (or that the comparator stayed the same).
 - **Badge** (`--format badge [--scoreboard]`): `vs <base> (tracked, 3 pairs) | better in 4/5 · worse
-  in 1 · 1 gap` from the newest commit's points, grey unless a confirmed change gives it a tone: red
-  when some journey's latest confirmed change is a regression, green when none is and one is an
-  improvement; `--badge-url` prints the shields.io URL. `report history` takes `--format html`
+  in 1 · 1 gap` from the newest commit's points, grey; with open regressions it says so and only then
+  is red (`better in 2/2 · 1 open regression`); `--badge-url` prints the shields.io URL. `report history` takes `--format html`
   (default), `card` or `badge`, and `--scoreboard` only with a badge; MCP's `report` takes a
   `.bench.ts` handle as tracked history.
 - **Schedules** keep the head target and its repository: the daemon follows the ref there and starts

@@ -14,18 +14,17 @@ const SPLIT: f32 = 580.0;
 const RIGHT: f32 = 608.0;
 const RIGHT_END: f32 = 1160.0;
 
-/// Tracked points are evidence, not verdicts: green and red are only for changes a paired A/B
-/// confirmed. The tone of a port: red when some journey's latest confirmed change is a regression,
-/// green when none is and some journey's is an improvement, else grey.
-fn confirmed_tone(p: &Port) -> Tone {
-    let latest: Vec<&Value> = p.journeys.iter().filter_map(|j| j.changes.iter().rfind(|c| c["state"] == "confirmed")).collect();
-    if latest.iter().any(|c| c["direction"] == "regression") {
-        Tone::Err
-    } else if latest.iter().any(|c| c["direction"] == "improvement") {
-        Tone::Ok
-    } else {
-        Tone::Plain
-    }
+/// Tracked points are evidence, not verdicts: the scoreboard stays grey. Red only says, in words, that
+/// a confirmed regression is still open: a journey whose latest confirmed change (in commit order) is
+/// a regression, with no confirmed improvement after it. Each one: (journey, change).
+fn open_regressions(p: &Port) -> Vec<(&str, &Value)> {
+    let at = |c: &Value| p.commits.iter().position(|k| k["commit"] == c["bad"]);
+    p.journeys.iter().filter_map(|j| j.changes.iter().filter(|c| c["state"] == "confirmed").max_by_key(|c| at(c)).filter(|c| c["direction"] == "regression").map(|c| (j.label.as_str(), c))).collect()
+}
+
+/// `1 open regression`.
+fn open_text(n: usize) -> String {
+    format!("{n} open regression{}", if n == 1 { "" } else { "s" })
 }
 
 /// A confirmed change as the paired A/B measured it: `+20%`, or `+4.1 ms` for one compared by differences.
@@ -130,6 +129,14 @@ fn left_pane(svg: &mut Svg, p: &Port, b: &Board, x: f32, top: f32, w: f32) {
     if !rest.is_empty() {
         y += 34.0;
         svg.text(x, y, (20.0, false), Ink::Fg, "start", &clip(&rest.join(" · "), w, 20.0, false));
+    }
+    // A confirmed regression still open, said in words and only then in red.
+    let open = open_regressions(p);
+    if !open.is_empty() {
+        let which: Vec<String> =
+            open.iter().map(|(label, c)| format!("{} {}", lower(label), confirmed_change(c, &p.journeys.iter().find(|j| j.label == *label).map(|j| j.unit.clone()).unwrap_or_default()))).collect();
+        y += 30.0;
+        svg.text(x, y, (20.0, false), Ink::Err, "start", &clip(&format!("{}: {}", open_text(open.len()), which.join(", ")), w, 20.0, false));
     }
     y += 40.0;
     let mut notes: Vec<String> = Vec::new();
@@ -287,18 +294,11 @@ fn rows(svg: &mut Svg, p: &Port, b: &Board, top: f32, bottom: f32) {
     let score = format!("{}{}", capitalize(&b.words()), if hidden > 0 { format!(" · {hidden} more in strobe history") } else { String::new() });
     let sy = bottom - 38.0;
     svg.text(x0, sy, (18.0, true), Ink::Fg, "start", &clip(&score, x1 - x0, 18.0, true));
-    svg.text(
-        x0,
-        sy + 24.0,
-        (15.0, false),
-        Ink::Muted,
-        "start",
-        &clip(&format!("tracked points at the newest commit, not a verdict · bound ±{:.0}%", p.bound * 100.0), x1 - x0, 15.0, false),
-    );
+    svg.text(x0, sy + 24.0, (15.0, false), Ink::Muted, "start", &clip(&format!("tracked points at the newest commit, not a verdict · bound ±{:.0}%", p.bound * 100.0), x1 - x0, 15.0, false));
 }
 
 /// The badge: `vs <base> (tracked, 3 pairs) | better in 4/5 · worse in 1 · 1 gap`, from the points at
-/// the newest commit; grey unless a confirmed change gives it a tone (`confirmed_tone`).
+/// the newest commit; grey, and red only with `· 1 open regression` in its words (`open_regressions`).
 fn badge(p: &Port) -> (String, String, Tone) {
     let b = Board::latest(p);
     let mut v = format!("better in {}/{}", b.better, b.compared);
@@ -311,7 +311,11 @@ fn badge(p: &Port) -> (String, String, Tone) {
     if b.missing > 0 {
         v += &format!(" · {} without a value", b.missing);
     }
-    (format!("vs {} (tracked, {} pairs)", p.base, p.pairs), v, confirmed_tone(p))
+    let open = open_regressions(p).len();
+    if open > 0 {
+        v += &format!(" · {}", open_text(open));
+    }
+    (format!("vs {} (tracked, {} pairs)", p.base, p.pairs), v, if open > 0 { Tone::Err } else { Tone::Plain })
 }
 
 /// `report history <file|ser_…> --format card|badge [--out <file.png|.svg>] [--theme …] [--badge-url] [--scoreboard]`.
@@ -331,7 +335,9 @@ pub(crate) fn report(args: &Args, p: &Port, default: &Path, format: &str) -> Res
         let path = out.display().to_string();
         return Ok(Output::new(format!("{path} · {noun} {value}\n"), json!({ "path": path, "bytes": bytes.len(), "label": noun, "value": value, "url": url, "scoreboard": board.json() })));
     }
-    let alt = format!("{} vs {}: {} at the latest tracked commit, over {} commits.", p.head, p.base, board.words(), p.commits.len());
+    let open = open_regressions(p).len();
+    let open = if open > 0 { format!("; {}", open_text(open)) } else { String::new() };
+    let alt = format!("{} vs {}: {} at the latest tracked commit, over {} commits{open}.", p.head, p.base, board.words(), p.commits.len());
     let bytes = image(|t| svg(p, t), &out, theme, &alt, 1.0)?;
     crate::app::report::write_whole(&out, &bytes)?;
     let path = out.display().to_string();

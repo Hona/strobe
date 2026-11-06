@@ -29,6 +29,7 @@ pub mod stacks;
 pub mod suspend;
 pub mod symbols;
 pub mod trace;
+pub mod video;
 pub mod wakes;
 
 /// Joins a capture's thread once it has been told to stop, waiting at most `wait`: a stop or a drop

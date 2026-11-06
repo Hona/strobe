@@ -30,40 +30,40 @@ use std::ffi::{CString, c_char, c_void};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-type Id = *mut c_void;
-type Sel = *mut c_void;
+pub(crate) type Id = *mut c_void;
+pub(crate) type Sel = *mut c_void;
 
 #[link(name = "objc")]
 unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> Id;
     fn sel_registerName(name: *const c_char) -> Sel;
-    fn objc_msgSend();
-    fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
-    fn objc_registerClassPair(cls: Id);
-    fn class_addMethod(cls: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> u8;
-    fn class_addIvar(cls: Id, name: *const c_char, size: usize, align: u8, types: *const c_char) -> u8;
-    fn class_addProtocol(cls: Id, proto: Id) -> u8;
-    fn class_getInstanceVariable(cls: Id, name: *const c_char) -> Id;
-    fn objc_getProtocol(name: *const c_char) -> Id;
-    fn object_getIvar(obj: Id, ivar: Id) -> Id;
-    fn object_setIvar(obj: Id, ivar: Id, value: Id);
-    fn objc_retain(obj: Id) -> Id;
-    fn objc_release(obj: Id);
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
+    pub(crate) fn objc_msgSend();
+    pub(crate) fn objc_allocateClassPair(superclass: Id, name: *const c_char, extra: usize) -> Id;
+    pub(crate) fn objc_registerClassPair(cls: Id);
+    pub(crate) fn class_addMethod(cls: Id, sel: Sel, imp: *const c_void, types: *const c_char) -> u8;
+    pub(crate) fn class_addIvar(cls: Id, name: *const c_char, size: usize, align: u8, types: *const c_char) -> u8;
+    pub(crate) fn class_addProtocol(cls: Id, proto: Id) -> u8;
+    pub(crate) fn class_getInstanceVariable(cls: Id, name: *const c_char) -> Id;
+    pub(crate) fn objc_getProtocol(name: *const c_char) -> Id;
+    pub(crate) fn object_getIvar(obj: Id, ivar: Id) -> Id;
+    pub(crate) fn object_setIvar(obj: Id, ivar: Id, value: Id);
+    pub(crate) fn objc_retain(obj: Id) -> Id;
+    pub(crate) fn objc_release(obj: Id);
+    pub(crate) fn objc_autoreleasePoolPush() -> *mut c_void;
+    pub(crate) fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 unsafe extern "C" {
     static _NSConcreteStackBlock: c_void;
-    fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
-    fn dispatch_sync_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
-    fn dispatch_release(object: *mut c_void);
+    pub(crate) fn dispatch_queue_create(label: *const c_char, attr: *const c_void) -> *mut c_void;
+    pub(crate) fn dispatch_sync_f(queue: *mut c_void, ctx: *mut c_void, work: extern "C" fn(*mut c_void));
+    pub(crate) fn dispatch_release(object: *mut c_void);
 }
 
 #[link(name = "ScreenCaptureKit", kind = "framework")]
 unsafe extern "C" {
-    static SCStreamFrameInfoStatus: CFTypeRef;
-    static SCStreamFrameInfoDisplayTime: CFTypeRef;
+    pub(crate) static SCStreamFrameInfoStatus: CFTypeRef;
+    pub(crate) static SCStreamFrameInfoDisplayTime: CFTypeRef;
     static SCStreamFrameInfoDirtyRects: CFTypeRef;
 }
 
@@ -98,8 +98,8 @@ fn app_rects(rects: &[CGRect], w: f64, h: f64, scale: f64) -> Vec<CGRect> {
 
 #[link(name = "CoreMedia", kind = "framework")]
 unsafe extern "C" {
-    fn CMSampleBufferGetSampleAttachmentsArray(sbuf: *mut c_void, create: u8) -> CFTypeRef;
-    fn CMSampleBufferGetImageBuffer(sbuf: *mut c_void) -> *mut c_void;
+    pub(crate) fn CMSampleBufferGetSampleAttachmentsArray(sbuf: *mut c_void, create: u8) -> CFTypeRef;
+    pub(crate) fn CMSampleBufferGetImageBuffer(sbuf: *mut c_void) -> *mut c_void;
 }
 
 #[link(name = "CoreVideo", kind = "framework")]
@@ -232,24 +232,24 @@ fn pixels_changed(image: *mut c_void, rects: &[CGRect], prev: &mut Prev) -> Opti
 
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
-    fn CGPreflightScreenCaptureAccess() -> u8;
+    pub(crate) fn CGPreflightScreenCaptureAccess() -> u8;
 }
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct CMTime {
-    value: i64,
-    timescale: i32,
-    flags: u32,
-    epoch: i64,
+pub(crate) struct CMTime {
+    pub(crate) value: i64,
+    pub(crate) timescale: i32,
+    pub(crate) flags: u32,
+    pub(crate) epoch: i64,
 }
 
-fn sel(name: &str) -> Sel {
+pub(crate) fn sel(name: &str) -> Sel {
     let c = CString::new(name).unwrap_or_default();
     unsafe { sel_registerName(c.as_ptr()) }
 }
 
-fn class(name: &str) -> Id {
+pub(crate) fn class(name: &str) -> Id {
     let c = CString::new(name).unwrap_or_default();
     unsafe { objc_getClass(c.as_ptr()) }
 }
@@ -257,13 +257,15 @@ fn class(name: &str) -> Id {
 /// `objc_msgSend` with a given signature.
 macro_rules! send {
     ($ret:ty; $obj:expr, $sel:expr $(, $t:ty = $a:expr)*) => {{
-        let f: unsafe extern "C" fn(Id, Sel $(, $t)*) -> $ret = unsafe { std::mem::transmute(objc_msgSend as *const ()) };
-        unsafe { f($obj, sel($sel) $(, $a)*) }
+        let f: unsafe extern "C" fn($crate::probe::present::sck::Id, $crate::probe::present::sck::Sel $(, $t)*) -> $ret =
+            unsafe { std::mem::transmute($crate::probe::present::sck::objc_msgSend as *const ()) };
+        unsafe { f($obj, $crate::probe::present::sck::sel($sel) $(, $a)*) }
     }};
 }
+pub(crate) use send;
 
 /// A method that returns a `CGRect` (`frame`): in registers on arm64, through memory on x86_64.
-fn rect_of(obj: Id, name: &str) -> CGRect {
+pub(crate) fn rect_of(obj: Id, name: &str) -> CGRect {
     #[cfg(target_arch = "x86_64")]
     {
         let f: unsafe extern "C" fn(*mut CGRect, Id, Sel) = unsafe { std::mem::transmute(objc_msgSend_stret as *const ()) };
@@ -291,6 +293,7 @@ unsafe impl Sync for Descriptor {}
 
 static DESCRIPTOR: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64, copy: copy_ctx, dispose: dispose_ctx, signature: c"v24@?0@8@16".as_ptr() };
 static DESCRIPTOR_ERROR: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64, copy: copy_ctx, dispose: dispose_ctx, signature: c"v16@?0@8".as_ptr() };
+static DESCRIPTOR_NONE: Descriptor = Descriptor { reserved: 0, size: std::mem::size_of::<Block>() as u64, copy: copy_ctx, dispose: dispose_ctx, signature: c"v8@?0".as_ptr() };
 
 /// A completion block as the compiler makes one: it starts on the "stack" (strobe's own allocation),
 /// and a framework that keeps it `Block_copy`s it to the heap, where the blocks runtime counts its
@@ -298,7 +301,7 @@ static DESCRIPTOR_ERROR: Descriptor = Descriptor { reserved: 0, size: std::mem::
 /// reply that carried it is freed later, on another queue). Its context, an `Arc`, is shared by every
 /// copy, so it lives until the framework's copy is gone.
 #[repr(C)]
-struct Block {
+pub(crate) struct Block {
     isa: *const c_void,
     flags: i32,
     reserved: i32,
@@ -342,13 +345,35 @@ extern "C" fn completed_error(b: *mut Block, e: Id) {
     completed(b, std::ptr::null_mut(), e)
 }
 
+/// A completion handler without arguments.
+extern "C" fn completed_none(b: *mut Block) {
+    completed(b, std::ptr::null_mut(), std::ptr::null_mut())
+}
+
+/// What a completion handler takes: (object, error), an error, or nothing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Handler {
+    ObjectError,
+    Error,
+    Nothing,
+}
+
 /// Calls `f` with a completion block and waits up to `wait` for it: the handler's (object, error),
 /// both retained (the caller releases them); `error_only` for a handler of just an error. The
 /// framework keeps its own copy of the block for as long as it wants (`Block`), so neither a late
 /// call after a timeout nor the framework releasing its copy after this returns touches freed memory.
-fn with_completion(wait: Duration, error_only: bool, f: impl FnOnce(*mut Block)) -> Option<(Id, Id)> {
+pub(crate) fn with_completion(wait: Duration, error_only: bool, f: impl FnOnce(*mut Block)) -> Option<(Id, Id)> {
+    with_handler(wait, if error_only { Handler::Error } else { Handler::ObjectError }, f)
+}
+
+/// `with_completion` for a handler of any of the shapes `Handler` names.
+pub(crate) fn with_handler(wait: Duration, handler: Handler, f: impl FnOnce(*mut Block)) -> Option<(Id, Id)> {
     let done: Arc<Done> = Arc::new((Mutex::new(None), Condvar::new()));
-    let (invoke, descriptor) = if error_only { (completed_error as *const c_void, &DESCRIPTOR_ERROR) } else { (completed as *const c_void, &DESCRIPTOR) };
+    let (invoke, descriptor) = match handler {
+        Handler::Error => (completed_error as *const c_void, &DESCRIPTOR_ERROR),
+        Handler::ObjectError => (completed as *const c_void, &DESCRIPTOR),
+        Handler::Nothing => (completed_none as *const c_void, &DESCRIPTOR_NONE),
+    };
     let mut block = Block { isa: unsafe { &_NSConcreteStackBlock }, flags: BLOCK_HAS_COPY_DISPOSE | BLOCK_HAS_SIGNATURE, reserved: 0, invoke, descriptor, ctx: Arc::as_ptr(&done) as *const c_void };
     // The method returns before the handler runs; a framework that calls it later copied the block.
     f(&raw mut block);
@@ -364,7 +389,7 @@ fn with_completion(wait: Duration, error_only: bool, f: impl FnOnce(*mut Block))
     got.take().map(|(a, e)| (a as Id, e as Id))
 }
 
-fn description(e: Id) -> String {
+pub(crate) fn description(e: Id) -> String {
     if e.is_null() {
         return String::new();
     }
@@ -559,7 +584,7 @@ extern "C" fn on_frame(this: Id, _cmd: Sel, _stream: Id, sbuf: *mut c_void, kind
     sh.consumer_ns += crate::host::thread_cycles().saturating_sub(cpu0);
 }
 
-unsafe fn cf_dict_value(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef {
+pub(crate) unsafe fn cf_dict_value(dict: CFTypeRef, key: CFTypeRef) -> CFTypeRef {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFDictionaryGetValue(d: CFTypeRef, key: CFTypeRef) -> CFTypeRef;

@@ -25,6 +25,7 @@ strobe record https://… --engine firefox [--probes timing|attribution] [--head
 strobe record --bench <file.bench.ts>#<case> [--head <variant>]
 strobe record pid:<n>|proc:<name> [--probes timing|deep|waits] [--for 10s]
 strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
+strobe record <target> --video     (or record --bench … --video: a video of the check run; timing perturbed)
 ```
 
 - `--for` (and every duration) needs its unit: `500ms`, `10s`, `2m`; a bare number exits 2.
@@ -45,7 +46,7 @@ strobe bench <file.bench.ts> --head <variant>
     [--params k=v|all] [--primary <metric>] [--pairs auto|N] [--runs 5] [--power high|keep]
     [--why auto|always|never] [--trace lean|full] [--probes memory --repeat 10] [--bisect good..bad]
     [--pixels | --pixels-only] [--reserve-cpus auto|on|off] [--noworse 2% | metric=2%,…]
-    [--engine chromium|firefox] [--headless]
+    [--engine chromium|firefox] [--headless] [--video]
 ```
 
 - variant: a directory, a git ref, `app:<id>`, `exe:<path>`; or a target of the file, `<target>[=<variant>]`, on both sides: an implementation comparison.
@@ -460,6 +461,10 @@ export default bench({
 - Output says `shown  'App Settings · General'` per series, the PR block an `On screen:` line, and `ScreenChanged` warns when base and head (or some blocks) showed different screens.
 - Read it before trusting a number: a first-run dialog over the pane once turned a whole A/B into a measurement of the dialog.
 - Pin it with `expect: { title: /Settings/, heading: "General", visible: "nav-general" }` on the case or target: a block on another screen is refused `WrongScreen` instead of timed.
+- To watch it: `--video` on `record`, `bench --check` or a comparison (one untimed filmed run per side after the timed pairs; never in them).
+  - `strobe report experiment <exp> --open`: both sides' players on one clock, a strip of the runs and each input strobe sent; click one to seek there.
+  - `screen` (the OS's copy of the window: headed apps and pages) or `renderer` (a Chromium page's own frames: headless, locked sessions). Two kinds never compare side by side.
+  - Needs ffmpeg for `renderer` and Linux X11 (strobe says how to install it); headless Firefox/WebKit, `window: false`, scripts and cli targets get none.
 
 ### Every run starts from the same state
 

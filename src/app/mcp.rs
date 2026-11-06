@@ -70,6 +70,7 @@ const TOOLS: &[Tool] = &[
             ("seed", "with bench: the seed of ctx.seed and ctx.random() (a 32-bit unsigned integer; default: drawn, and printed)"),
             ("pin", "with bench: auto, none, ccdN or a CPU list"),
             ("power", "high (default for timed recordings) or keep"),
+            ("video", "also film the recording (timing perturbed): the window's screen (headed) or a Chromium page's renderer (headless); report recording <rec> plays it with its input markers"),
         ],
         required: &[],
         long: true,
@@ -109,6 +110,7 @@ const TOOLS: &[Tool] = &[
             ("keep", "keep every block's recording"),
             ("pixels", "also compare base and head at the case's page.snapshot()s"),
             ("pixels-only", "only compare snapshots, no timing"),
+            ("video", "film untimed: with check the check run; on a comparison one warmed run per side after every timed pair (never in them); report experiment <exp> plays both side by side"),
             ("style", "attribution blocks also trace what invalidated style"),
             ("max-time", "stop starting pairs after this long, e.g. 30m"),
             ("unlock-wait", "a series that needs a presenting window waits at most this long for an unlock (default: until unlocked), e.g. 2h"),
@@ -532,12 +534,22 @@ fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
     {
         return r;
     }
+    // A report or a video holds the target's own pixels and data (rule 9): only the daemon's own pages
+    // or a person typing the address may fetch them, never another site's page in the browser.
+    if (path.starts_with("/report/") || path.starts_with("/video/")) && req.headers.get("sec-fetch-site").is_some_and(|s| s != "same-origin" && s != "none") {
+        return http::Response::text(403, "cross-site requests are not allowed");
+    }
     if req.method == "GET" && path.starts_with("/report/") {
         let handle = path.trim_start_matches("/report/");
         return match report_html(handle) {
             Ok(html) => http::Response::new(200, "text/html; charset=utf-8", html.into_bytes()),
             Err(e) => http::Response::text(404, &e.message),
         };
+    }
+    if req.method == "GET"
+        && let Some(rec) = path.strip_prefix("/video/")
+    {
+        return video(&req, rec);
     }
     if path == "/health" {
         return http::Response::new(200, "application/json", json!({ "strobe": env!("CARGO_PKG_VERSION"), "build": build_id() }).to_string().into_bytes());
@@ -564,8 +576,48 @@ fn serve(req: http::Request, port: u16, token: &str) -> http::Response {
 
 fn report_html(handle: &str) -> Result<String> {
     let dir = store::resolve(handle)?;
-    let (view, data) = if store::is_experiment(&dir) { ("experiment", store::read_json(&dir.join("result.json"))?) } else { ("recording", store::read_json(&dir.join("meta.json"))?) };
+    let experiment = store::is_experiment(&dir);
+    let (view, mut data) = if experiment { ("experiment", store::read_json(&dir.join("result.json"))?) } else { ("recording", store::read_json(&dir.join("meta.json"))?) };
+    super::report::attach_videos(&mut data, (!experiment).then_some(dir.as_path()), &super::report::Videos::Daemon)?;
     Ok(super::report::html(view, &data))
+}
+
+/// `GET /video/<rec>`: a recording's video, with byte ranges (a player seeks through them).
+fn video(req: &http::Request, rec: &str) -> http::Response {
+    let file = store::resolve(rec).ok().filter(|d| !store::is_experiment(d)).and_then(|d| {
+        let j = store::read_json(&d.join("video.json")).ok()?;
+        let name = j["file"].as_str().filter(|n| matches!(*n, "video.mp4" | "video.webm"))?.to_string();
+        Some(d.join(name))
+    });
+    let Some((file, len)) = file.and_then(|f| Some((f.clone(), std::fs::metadata(&f).ok().filter(|m| m.is_file())?.len()))) else { return http::Response::text(404, "no video") };
+    let kind = if file.extension().is_some_and(|e| e == "webm") { "video/webm" } else { "video/mp4" };
+    // The bytes are read from the file as they are sent (`Response::file`), never held whole.
+    let body = |status: u16, a: u64, n: u64| http::Response { file: Some((file.clone(), a, n)), ..http::Response::new(status, kind, Vec::new()) };
+    // `bytes=a-b`, `bytes=a-`, `bytes=-n`: one range.
+    let range = req.headers.get("range").and_then(|r| r.strip_prefix("bytes=")).and_then(|r| r.split_once('-')).and_then(|(a, b)| match (a.trim().parse::<u64>().ok(), b.trim().parse::<u64>().ok()) {
+        (Some(a), Some(b)) => Some((a, b.min(len.saturating_sub(1)))),
+        (Some(a), None) => Some((a, len.saturating_sub(1))),
+        (None, Some(n)) => Some((len.saturating_sub(n), len.saturating_sub(1))),
+        (None, None) => None,
+    });
+    match range {
+        Some((a, b)) if a <= b && b < len => {
+            let mut r = body(206, a, b - a + 1);
+            r.headers.push(("Content-Range", format!("bytes {a}-{b}/{len}")));
+            r.headers.push(("Accept-Ranges", "bytes".into()));
+            r
+        }
+        Some(_) => {
+            let mut r = http::Response::text(416, "range not satisfiable");
+            r.headers.push(("Content-Range", format!("bytes */{len}")));
+            r
+        }
+        None => {
+            let mut r = body(200, 0, len);
+            r.headers.push(("Accept-Ranges", "bytes".into()));
+            r
+        }
+    }
 }
 
 pub use crate::host::build::{build_id, file_build};

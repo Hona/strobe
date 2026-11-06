@@ -71,6 +71,21 @@ windows = { version = "0.58", features = [
   "Win32_System_Ole",
   "Win32_System_Variant",
   "Win32_UI_Accessibility",
+  # Video of a window (`--video`): Windows.Graphics.Capture frames, scaled by the GPU's video
+  # processor (Direct3D 11) and encoded by Media Foundation; d3d11 and mfplat load on first use.
+  "Foundation",
+  "Graphics",
+  "Graphics_Capture",
+  "Graphics_DirectX",
+  "Graphics_DirectX_Direct3D11",
+  "Win32_Graphics_Direct3D",
+  "Win32_Graphics_Direct3D11",
+  "Win32_Graphics_Dxgi",
+  "Win32_Graphics_Dxgi_Common",
+  "Win32_Media_MediaFoundation",
+  "Win32_System_WinRT",
+  "Win32_System_WinRT_Direct3D11",
+  "Win32_System_WinRT_Graphics_Capture",
 ] }
 # The `implement` macro's paths for strobe's UIA event handlers.
 windows-core = "0.58"

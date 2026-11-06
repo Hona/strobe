@@ -25,6 +25,14 @@ pub fn run(args: &Args) -> Result<Output> {
         return Err(Error::usage(format!("{handle} measured one build (bench --blocks): it compares nothing, so there is no {format} report of it"))
             .hint(format!("strobe query {handle} shows its blocks and their median with an interval ({}); a tracked point shows in strobe history", dir.join("result.json").display())));
     }
+    // A check or a pixels run compares no timed pairs: a PR block, card or badge would state a verdict
+    // it does not have (rule 1). Its HTML report shows what it did.
+    if let (true, Some(format @ ("pr" | "card" | "badge"))) = (experiment, args.get("format"))
+        && let Some(kind @ ("check" | "pixels")) = data["kind"].as_str()
+    {
+        return Err(Error::usage(format!("{handle} is a --{} run: it decides nothing, so there is no --format {format} of it", if kind == "check" { "check" } else { "pixels-only" }))
+            .hint(format!("strobe report experiment {handle} (HTML) shows it; a verdict comes from a comparison (--base, --aa)")));
+    }
     // A card or badge needs only the result: no views, no insights.
     if let Some(format @ ("card" | "badge")) = args.get("format") {
         if !experiment {
@@ -98,6 +106,9 @@ pub fn run(args: &Args) -> Result<Output> {
         data["card"] = card;
         images = files;
     }
+    if format == "html" {
+        attach_videos(&mut data, (!experiment).then_some(dir.as_path()), &Videos::Embed(&out))?;
+    }
     let body = match format {
         "md" => markdown(&data),
         "pr" => super::pr::block(&data),
@@ -135,6 +146,83 @@ pub fn run(args: &Args) -> Result<Output> {
         return Ok(Output::new(body.clone(), json!({ "path": path, "bytes": body.len(), "markdown": body })));
     }
     Ok(Output::new(format!("{path} · {size}\n"), json!({ "path": path, "bytes": body.len() })))
+}
+
+/// Where a report's videos play from.
+pub enum Videos<'a> {
+    /// In the file itself while they add up to at most `EMBED_BYTES`, else copied beside it into
+    /// `<report>.assets/` (the report then needs that folder).
+    Embed(&'a std::path::Path),
+    /// From the daemon that serves the report (`/video/<rec>`).
+    Daemon,
+}
+
+/// A recording's video: its id, its file and its `video.json`.
+type Filmed = (String, std::path::PathBuf, Value);
+
+/// A player to show: where (None: the recording's own; a series' index) and its sides by role.
+type Player = (Option<usize>, Vec<(&'static str, Filmed)>);
+
+/// The most video a report holds inside itself (base64 in the HTML).
+const EMBED_BYTES: u64 = 16 << 20;
+
+/// Each video the report shows (SPEC §11.2): a recording's own, or each series' base and head (their
+/// `video` recordings), as `video_player` beside it: every side's `video.json` and where it plays from.
+pub fn attach_videos(data: &mut Value, recording: Option<&std::path::Path>, src: &Videos) -> Result<()> {
+    let side = |rec: &str| -> Option<Filmed> {
+        let dir = store::resolve(rec).ok()?;
+        let j = store::read_json(&dir.join("video.json")).ok()?;
+        let file = dir.join(j["file"].as_str()?);
+        file.is_file().then(|| (rec.to_string(), file, j))
+    };
+    // (where to put it, its sides by role)
+    let mut players: Vec<Player> = Vec::new();
+    if let Some(dir) = recording {
+        let id = data["id"].as_str().unwrap_or("").to_string();
+        if dir.join("video.json").is_file()
+            && let Some(s) = side(&id)
+        {
+            players.push((None, vec![("recording", s)]));
+        }
+    }
+    for (i, s) in data["series"].as_array().into_iter().flatten().enumerate() {
+        let sides: Vec<(&'static str, Filmed)> = ["base", "head"].into_iter().filter_map(|role| Some((role, side(s["video"][role].as_str()?)?))).collect();
+        if !sides.is_empty() {
+            players.push((Some(i), sides));
+        }
+    }
+    let total: u64 = players.iter().flat_map(|p| &p.1).filter_map(|(_, (_, f, _))| std::fs::metadata(f).ok()).map(|m| m.len()).sum();
+    for (at, sides) in players {
+        let mut out = Vec::new();
+        for (role, (rec, file, j)) in sides {
+            let ext = file.extension().and_then(|e| e.to_str()).unwrap_or("mp4").to_string();
+            let mime = if ext == "webm" { "video/webm" } else { "video/mp4" };
+            let url = match src {
+                Videos::Daemon => format!("/video/{rec}"),
+                Videos::Embed(_) if total <= EMBED_BYTES => {
+                    use base64::Engine as _;
+                    format!("data:{mime};base64,{}", base64::engine::general_purpose::STANDARD.encode(std::fs::read(&file)?))
+                }
+                Videos::Embed(report) => {
+                    let name = format!("{}.assets", report.file_name().and_then(|n| n.to_str()).unwrap_or("report"));
+                    let assets = report.with_file_name(&name);
+                    std::fs::create_dir_all(&assets)?;
+                    std::fs::copy(&file, assets.join(format!("{rec}.{ext}")))?;
+                    // A relative URL: the folder's name percent-encoded (a report named with spaces or `#`).
+                    let enc: String = name.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect();
+                    format!("./{enc}/{rec}.{ext}")
+                }
+            };
+            out.push(json!({ "role": role, "recording": rec, "src": url, "mime": mime, "video": j }));
+        }
+        let kinds: std::collections::BTreeSet<String> = out.iter().filter_map(|s| s["video"]["kind"].as_str().map(str::to_string)).collect();
+        let player = json!({ "sides": out, "mixed": kinds.len() > 1 });
+        match at {
+            None => data["video_player"] = player,
+            Some(i) => data["series"][i]["video_player"] = player,
+        }
+    }
+    Ok(())
 }
 
 /// Writes a report whole or not at all (`store::write_atomic`), so a reader never sees half a report.

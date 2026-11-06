@@ -28,7 +28,8 @@ pub(super) struct Warmup {
 impl Warmup {
     pub(super) fn new(x: &Exec) -> Warmup {
         let measured = if x.set == Set::Memory { 2 * x.runs } else { x.runs };
-        Warmup { first: None, unsteady: false, untimed: x.untimed, keeps_pair: !matches!(x.set, Set::Attribution | Set::Memory), measured }
+        // A video block films the one run after the steady point: run 0 is cold, never the filmed one.
+        Warmup { first: None, unsteady: false, untimed: x.untimed, keeps_pair: !matches!(x.set, Set::Attribution | Set::Memory) && !x.video, measured }
     }
 
     /// Whether another run is due after `ran` runs.

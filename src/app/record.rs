@@ -28,7 +28,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.
     b.set("gpu-store", "exe");
-    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless", "engine", "seed"] {
+    for k in ["target", "params", "id", "pin", "power", "runs", "style", "headless", "engine", "seed", "video"] {
         if let Some(v) = args.get(k) {
             b.set(k, v);
         }
@@ -46,7 +46,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         .into_iter()
         .flatten()
         .filter_map(|s| {
-            Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"], "sampling": s["attribution_sampling"] }))
+            Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"], "sampling": s["attribution_sampling"], "video": s["video"]["head"] }))
         })
         .collect();
     // A case that ran but whose engine strobe has no profiler for (a Firefox launch, a WebKit page) says so.
@@ -76,6 +76,11 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
             .collect();
         if !declared.is_empty() {
             text += &format!("check    {}   (one cold run before it: its own numbers, not this recording's runs)\n", declared.join(" · "));
+        }
+        // `--video`: the check run's video, in the check block's own recording.
+        if let Some(v) = r["video"].as_str() {
+            let meta = store::resolve(v).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).unwrap_or(Value::Null);
+            text += &super::video::line(v, &meta["video"]);
         }
         let meta = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).unwrap_or(Value::Null);
         text += &sampling_line(&meta);
@@ -114,6 +119,7 @@ pub fn run(args: &Args) -> Result<Output> {
     let local = target.strip_prefix("file://").or_else(|| target.strip_prefix("file:")).map(|p| if cfg!(windows) && p.len() > 2 && p.as_bytes()[2] == b':' { &p[1..] } else { p });
     let target = match local {
         Some(path) if page_file(path) => super::look::address(path),
+        Some(_) if args.has("video") => return Err(Error::usage("--video films a target as it runs; file:<trace> imports a capture taken already")),
         Some(path) => return super::query::import(path),
         None if !target.contains(':') || std::path::Path::new(&target).is_file() => {
             if page_file(&target) {
@@ -144,6 +150,7 @@ pub fn run(args: &Args) -> Result<Output> {
 }
 
 fn recorded(args: &Args, target: String) -> Result<Output> {
+    video_refusal(args, &target)?;
     if target.starts_with("pid:") || target.starts_with("proc:") {
         return super::outside::record(args, &target);
     }
@@ -251,6 +258,8 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     let sampler = (!attach).then(|| probe::os::Sampler::start(browser.pid, browser.profile.clone()));
     // `--os-frames`: the OS's present events beside the trace's frames, a cross-check of both.
     let os_frames = (args.has("os-frames") && !attach).then(crate::probe::present::PresentCapture::start);
+    // `--video`: the window (headed) or the renderer's own frames (headless), over the run.
+    let video = args.has("video").then(|| super::video::Recorder::start(host::main_window(&browser.pids()).filter(|_| on_screen).as_ref(), Some(&page), !on_screen)).transpose()?;
     // CPU in cycles over the time stamp counter, as native targets read it: process times move in
     // clock ticks (15.6 ms on Windows), so an idle page read 0.00% on one run and 0.52% on the next.
     let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
@@ -262,6 +271,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     driver.mark("run:0:end")?;
     let t1 = host::now_ns();
     let cpu1 = cycles();
+    let video = video.map(|v| v.finish(&dir, &[("run:0".into(), t0, t1, true)], &[], &[])).transpose()?;
     let os = sampler.map(|s| s.stop().window(t0, t1));
     // The browser's process set (its tree, what carries its profile's stamp, its job), for the OS frames.
     let tree = browser.pids();
@@ -334,8 +344,8 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
         // Rule 3: timing taken with profilers on describes the profiled target, not the target; an
         // app with a debug C runtime is a debug build (`DevBuild`).
-        "timing": if set == Set::Attribution { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
-        "created": now_iso(), "valid": true, "sampling": sampling,
+        "timing": if set == Set::Attribution || video.is_some() { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
+        "created": now_iso(), "valid": true, "sampling": sampling, "video": video,
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -379,6 +389,15 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         ));
     }
     let headless = args.has("headless");
+    if headless && args.has("video") {
+        return Err(Error::refused(
+            "Headless",
+            format!(
+                "--video of a headless {engine} page: there is no window for the OS to film, and stock {engine} has no screencast (Playwright films its own patched builds through screencast commands it added)"
+            ),
+            "record it headed (drop --headless), or headless in Chromium (drop --engine)",
+        ));
+    }
     let patched = web::patched(engine);
     if let Some(why) = &patched {
         progress(format!("! PatchedBrowser  {why}"));
@@ -422,12 +441,15 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     if profiler.is_some() {
         driver.mark("run:0:start")?;
     }
+    // `--video`: the browser's window from the OS (no stock engine but Chromium has a screencast).
+    let video = args.has("video").then(|| super::video::Recorder::start(host::main_window(&browser.pids()).filter(|_| !headless).as_ref(), None, headless)).transpose()?;
     let cpu0 = cycles();
     let t0 = host::now_ns();
     progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     let t1 = host::now_ns();
     let cpu1 = cycles();
+    let video = video.map(|v| v.finish(&dir, &[("run:0".into(), t0, t1, true)], &[], &[])).transpose()?;
     if profiler.is_some() {
         driver.mark("run:0:end")?;
     }
@@ -502,7 +524,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "headless": headless,
         "browser": version, "gpu": gpu, "env": host::env(), "values": values, "refused": refused, "os": os, "os_frames": os_frames, "phases": [],
         // Rule 3: timing taken with the profiler on describes the profiled page.
-        "timing": if attributed { "perturbed" } else { "clean" }, "created": now_iso(), "valid": true, "patched_browser": patched,
+        "timing": if attributed || video.is_some() { "perturbed" } else { "clean" }, "created": now_iso(), "valid": true, "patched_browser": patched, "video": video,
     });
     if attributed {
         meta["runs"] = json!(1);
@@ -523,6 +545,9 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
     use crate::target::native as nt;
     if set == Set::Memory {
         return Err(Error::usage("--probes memory follows a JS heap; a native app has none"));
+    }
+    if app.windowless && args.has("video") {
+        return Err(Error::refused("NotForTarget", format!("--video films a window, and {target} has none (window: false)"), "record an app that opens a window"));
     }
     // `--until-line`: start when the app prints a matching line, not after a fixed settle; `--stop-line`:
     // end at one (`--for` caps it then).
@@ -597,6 +622,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             Some(re) => format!("recording {id} until the app prints a line matching {re}"),
             None => format!("recording {id} for {}", fmt::ms_duration(for_ms)),
         });
+        let video = args.has("video").then(|| super::video::Recorder::start(n.window.as_ref(), None, false)).transpose()?;
         let snap0 = wakes::Snapshot::take(&n.pids());
         let procs0 = (host::now_ns(), host::all_processes());
         let c0 = cycles();
@@ -615,6 +641,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
         let t1 = host::now_ns();
         let for_ms = (t1 - t0) / 1_000_000;
         let c1 = cycles();
+        let video = video.map(|v| v.finish(&dir, &[("run:0".into(), t0, t1, true)], &[], &[])).transpose()?;
         let span = wakes::span(&snap0, &wakes::Snapshot::take(&n.pids()));
         // A launcher that exits cleanly (code 0) and leaves the app running is not the app ending.
         if let Some(code) = n.exited().filter(|&c| running && (c != 0 || n.processes().is_empty())) {
@@ -730,7 +757,7 @@ fn native(args: &Args, app: &isolate::App, target: &str, set: Set, for_ms: u64) 
             "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
             "unpaced": unpaced.map(|(fps, hz)| json!({ "fps": fps, "hz": hz })),
             // A debug build's times describe no build people run (`DevBuild`).
-            "timing": if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
+            "timing": if video.is_some() { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug, "video": video,
             "note": if set == Set::Attribution { format!("native attribution: OS samples; {stacks_note}") } else { String::new() },
             // macOS: the app's XPC services are missing from every number (SPEC §13.2).
             "unattributed": n.unattributed(),
@@ -970,7 +997,29 @@ fn engine_summary(meta: &Value) -> String {
 pub fn summary_text(meta: &Value) -> String {
     let mut s = summary_body(meta);
     s += &context_lines(meta);
+    if meta["video"].is_object() {
+        s += &super::video::line(meta["id"].as_str().unwrap_or(""), &meta["video"]);
+        s += "timing   perturbed: a video was taken during this recording (its capture and encoder share the machine)\n";
+    }
     s
+}
+
+/// `--video` on a record: refused where there is nothing to film, before anything launches.
+fn video_refusal(args: &Args, target: &str) -> Result<()> {
+    if !args.has("video") {
+        return Ok(());
+    }
+    if target.starts_with("pid:") || target.starts_with("proc:") || target.starts_with("cdp:") || target.starts_with("ws://") {
+        return Err(Error::refused(
+            "NotForTarget",
+            format!("--video films a window strobe launched; {target} is a process strobe attached to"),
+            "record the app as app:<id> or exe:<path>, or a page by its address",
+        ));
+    }
+    if args.get("probes") == Some("memory") {
+        return Err(Error::usage("--video records a recording's runs; a memory recording has none (it takes heap snapshots)"));
+    }
+    Ok(())
 }
 
 /// What a recording ran and in what state, where it kept them: the variant's commit, the screen

@@ -340,6 +340,26 @@ header.topbar {
 .eyebrow-meta { font: 500 12px/18px var(--sans); letter-spacing: 0.02em; text-transform: uppercase; color: var(--ink-3); }
 .shown-row { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 10px; font: 400 12px/16px var(--sans); color: var(--ink-2); }
 .shown-row.warn { color: var(--warn-ink); }
+.vid-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 14px; }
+.vid-side { margin: 0; min-width: 0; }
+.vid-cap { font: 400 12px/16px var(--sans); color: var(--ink-2); margin-bottom: 6px; overflow-wrap: anywhere; }
+.vid-el { display: block; width: 100%; background: #000; border-radius: 6px; border: 1px solid var(--border); }
+.vid-ctrl { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin: 12px 0 6px; }
+.vid-rates { display: inline-flex; gap: 4px; }
+.vid-time { color: var(--ink-2); font-size: 12px; margin-left: auto; }
+.vid-strip { display: block; width: 100%; height: auto; cursor: crosshair; }
+.vid-strip .vid-tick { font: 9px var(--mono); fill: var(--ink-4); }
+.vid-strip .vid-grid-line { stroke: var(--hairline); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.vid-strip .vid-run { fill: var(--accent-bg); stroke: var(--accent); stroke-width: 1; vector-effect: non-scaling-stroke; }
+.vid-strip .vid-run.warm { fill: var(--surface-subtle); stroke: var(--border-strong); }
+.vid-strip .vid-phase { fill: var(--ph-style); cursor: pointer; }
+.vid-strip .vid-mark { cursor: pointer; }
+.vid-strip .vid-mark line { stroke: var(--ink); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.vid-strip .vid-mark circle { fill: var(--ink); }
+.vid-strip .vid-mark circle.vid-react { fill: var(--win); }
+.vid-strip .vid-mark:hover line { stroke: var(--accent); }
+.vid-strip .vid-head { stroke: var(--loss); stroke-width: 1.5; vector-effect: non-scaling-stroke; }
+.vid-legend { margin-top: 6px; }
 .shown-side { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .shown-thumb { width: 96px; height: auto; border: 1px solid var(--border); display: block; }
 .shown-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 420px; }
@@ -2052,6 +2072,11 @@ function renderExperiment(r) {
     return;
   }
 
+  if (s.kind === "check") {
+    appendKids(shell, [seriesList.length > 1 ? renderScorecard(seriesList, aa) : null, ...renderCheckSeries(r, s)]);
+    return;
+  }
+
   // Two implementations share no code: no function diffs, flame diffs or heap diffs, only each side
   // on its own (SPEC §11.2).
   if (impl) {
@@ -2061,6 +2086,7 @@ function renderExperiment(r) {
       renderImplPanel(r, baseVar, headVar),
       gap ? null : renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar),
       gap ? null : renderImpactStrip(s, impactI, aa),
+      gap ? null : renderVideoSection(s.video_player),
       gap ? null : renderEvidenceSection(r, s, aa),
       ...renderImplSeries(r, s, baseVar, headVar),
       gap ? null : renderNextStepsSection(r, s, aa),
@@ -2100,6 +2126,7 @@ function renderExperiment(r) {
     seriesList.length > 1 ? renderScorecard(seriesList, aa) : null,
     renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar),
     renderImpactStrip(s, impact, aa),
+    renderVideoSection(s.video_player),
     renderEvidenceSection(r, s, aa),
     renderNextStepsSection(r, s, aa),
     hasDeepDive ? h("div", { class: "zone-divider" }, h("span", { class: "zone-divider-label" }, "Diagnostic deep dive · Why it changed & raw telemetry")) : null,
@@ -2148,6 +2175,16 @@ function renderScorecard(seriesList, aa) {
           h("div", { class: "sc-sub" }, `Leak run · ${sr.leak?.head?.runs || "?"} runs`)
         );
       }
+      // A --check case: passed or failed in one run, nothing compared.
+      if (sr.kind === "check") {
+        const pm = sr.primary?.metric || "";
+        const pv = sr.values?.[pm];
+        return h("button", { type: "button", class: "sc-item", "aria-selected": String(i === state.series), onclick: () => selectSeries(i) },
+          h("div", { class: "sc-top" }, h("span", { class: "sc-name" }, capFirst(sr.case || sr.label || `Case ${i + 1}`)), h("span", { class: `sc-dot ${sr.passed ? "neutral" : "loss"}` })),
+          h("div", { class: `sc-verdict ${sr.passed ? "neutral" : "loss"}` }, sr.passed ? "Check passed" : "Check failed"),
+          h("div", { class: "sc-sub" }, finite(pv) ? `${labelOf(pm)} ${fmtVal(pv, unitOf(pm))} · one run` : "one run, nothing compared")
+        );
+      }
       const c = sr.primary || {};
       const m = c.metric || "";
       const u = unitOf(m);
@@ -2183,8 +2220,9 @@ function shortSeriesOutcome(c, m, u, cl, aa) {
   if (cl.kind === "same") return aa ? "Control passed (±2%)" : `Equivalent (${fmtBound(c, u)})`;
   if (cl.kind === "inconclusive") return "Inconclusive";
   if (cl.kind === "refused") return "Refused (sparse)";
-  const dirWord = cl.tone === "win" ? "better" : "worse";
-  return `${d} (${dirWord})`;
+  // Only a decided shift has a direction (rule 1): no verdict, or a descriptive metric, says so.
+  if (cl.tone !== "win" && cl.tone !== "loss") return cl.kind === "desc" ? "Descriptive" : "No verdict";
+  return `${d} (${cl.tone === "win" ? "better" : "worse"})`;
 }
 
 /* ---------- Layer 1: Verdict Hero ---------- */
@@ -2217,6 +2255,10 @@ function humanHeadline(c, m, u, cl, s, aa) {
   if (cl.kind === "inconclusive") {
     const need = finite(c.needed_pairs) ? `Needs ~${c.needed_pairs} pairs` : "Noise exceeds threshold";
     return { pill: `Inconclusive · ${need}`, headline: `Inconclusive after ${s.pairs || "?"} launch pairs` };
+  }
+  // "Confirmed" only for a decided shift (tone win or loss): anything else has no verdict to state.
+  if (cl.tone !== "win" && cl.tone !== "loss") {
+    return { pill: cl.kind === "desc" ? "Descriptive · not tested" : "No verdict", headline: `${labelOf(m)}: not compared` };
   }
 
   const isWin = cl.tone === "win";
@@ -2285,6 +2327,11 @@ function buildHeroProse(r, s, c, cl, aa) {
         : `Run-to-run variance across ${nPairs} pairs is too wide to resolve ${fmtBound(c, u)} without stabilizing the case first.`
     );
   }
+  if (cl.tone !== "win" && cl.tone !== "loss") {
+    return h("p", { class: "hero-prose" }, cl.kind === "desc"
+      ? `${labelOf(m)} is descriptive here: shown, never tested.`
+      : `${labelOf(m)} has no verdict${nPairs ? ` after ${nPairs} pairs` : ": nothing was compared"}.`);
+  }
 
   const savedWork = m === "main.busy" && workComp && finite(workComp.base) && finite(workComp.head)
     ? `, saving ~${Math.round(Math.abs(workComp.base - workComp.head))} ms of CPU work per ${finite(runDur) ? fmtDuration(runDur) + " " : ""}run`
@@ -2326,6 +2373,157 @@ function renderShown(s) {
         h("span", { class: "shown-label", title: others ? `other blocks: ${others}` : text(v) }, `On screen · ${sideWord(role, true)}: ${text(v)}${others ? ` (+${others})` : ""}`)
       );
     })
+  );
+}
+
+/* ---------- A --check case: one untimed run, passed or failed, nothing compared ---------- */
+function renderCheckSeries(r, s) {
+  const v = s.values || {};
+  const refused = s.refused || {};
+  const declared = s.declared || [s.primary?.metric].filter(Boolean);
+  const extra = Object.keys(v).filter((k) => k.startsWith("launch.") && !declared.includes(k));
+  const rows = [...declared, ...extra].map((k) => h("div", { class: "rec-kv-row" },
+    h("span", { class: "mono", style: "color:var(--ink-2)" }, k),
+    h("span", { class: "mono", style: "font-weight:500" }, finite(v[k]) ? fmtVal(v[k], unitOf(k)) : refused[k] ? `refused · ${String(refused[k]).split(":")[0]}` : "no value")
+  ));
+  const pills = [s.engine && s.engine !== "chromium" ? s.engine : null, s.headless ? "headless" : null, s.session_locked ? "session locked" : null].filter(Boolean);
+  const cmds = [
+    s.recording ? ["The check run's recording", `strobe query ${s.recording} ${s.target_kind === "native" ? "threads" : "summary"}`] : null,
+    s.attribution ? ["Where it spends its time (attribution block)", `strobe query ${s.attribution} hotspots --by package`] : null,
+  ].filter(Boolean);
+  const log = (s.log || []).slice(-10);
+  return [
+    h("section", { class: "card-surface" },
+      h("div", { class: "card-hd" },
+        h("div", { class: "card-hd-left" },
+          h("h2", { class: "sec-title" }, `${capFirst(s.case || s.label)}: check ${s.passed ? "passed" : "failed"}`),
+          h("span", { class: "sec-sub" }, `One cold run, no warmup, nothing compared${finite(s.elapsed_ms) ? ` · ${fmtDuration(s.elapsed_ms)}` : ""}`)
+        ),
+        h("div", { class: "card-hd-right" }, pills.map((p) => h("span", { class: "ref-pill" }, p)), h("span", { class: `status-pill ${s.passed ? "win" : "loss"}` }, s.passed ? "Passed" : "Failed"))
+      ),
+      h("div", { class: "card-bd" },
+        !s.passed && s.error ? h("pre", { class: "cli-pre" }, String(s.error) + (s.hint ? `\nfix: ${s.hint}` : "")) : null,
+        rows.length ? h("div", { class: "rec-kv-cols" }, h("div", { class: "rec-kv-grp" }, h("div", { class: "rig-hd", style: "margin-bottom:4px" }, "Values of the one run (not a verdict)"), rows)) : null,
+        renderShown(s),
+        cmds.length ? h("div", { class: "next-list", style: "margin-top:12px" }, cmds.map(([lbl, c]) => h("div", { class: "next-item" }, h("div", { class: "next-why" }, lbl), cmdRow(c)))) : null,
+        log.length ? h("pre", { class: "cli-pre", style: "margin-top:12px" }, log.join("\n")) : null
+      )
+    ),
+    renderVideoSection(s.video_player),
+  ];
+}
+
+/* ---------- Video (--video): players on one clock, the inputs on their time ---------- */
+// Each side plays from its first measured run's start, so t = 0 is "the run began" on both. A marker
+// is an input strobe sent (or a phase); clicking it seeks both players there.
+function renderVideoSection(player) {
+  if (!player?.sides?.length) return null;
+  const sides = player.sides.map((sd) => {
+    const v = sd.video || {};
+    const runs = v.runs || [];
+    const run = runs.find((x) => x.measured) || runs[0];
+    return { ...sd, v, runs, offset: run ? run.start_s : 0, markers: v.markers || [] };
+  });
+  const label = (sd) => sd.role === "recording" ? "This recording" : sideWord(sd.role, true);
+  const els = sides.map((sd) => {
+    const el = h("video", { class: "vid-el", src: sd.src, preload: "auto", playsinline: true });
+    el.muted = true;
+    return el;
+  });
+  const lo = Math.min(0, ...sides.map((sd) => -sd.offset));
+  const hi = Math.max(0.1, ...sides.map((sd) => (sd.v.duration_s || 0) - sd.offset));
+  const step = 1 / Math.max(30, ...sides.map((sd) => sd.v.fps || sd.v.max_fps || 30));
+  const fmtT = (t) => `${t < 0 ? "−" : ""}${Math.abs(t).toFixed(3)} s`;
+  const clampTo = (el, t) => Math.max(0, Math.min(t, finite(el.duration) ? el.duration - 0.001 : t));
+  const readout = h("span", { class: "mono vid-time" }, fmtT(0));
+  const seek = (t) => els.forEach((el, i) => { el.currentTime = clampTo(el, t + sides[i].offset); });
+  const now = () => (els[0].currentTime || 0) - sides[0].offset;
+  const playBtn = h("button", { type: "button", class: "btn-ghost", onclick: () => {
+    if (els[0].paused) { seek(now()); els.forEach((el) => el.play().catch(() => {})); } else els.forEach((el) => el.pause());
+  } }, "Play");
+  const rates = [0.25, 1].map((r) => h("button", { type: "button", class: "btn-ghost vid-rate", "aria-pressed": String(r === 1), onclick: (e) => {
+    els.forEach((el) => { el.playbackRate = r; });
+    for (const b of e.currentTarget.parentNode.querySelectorAll(".vid-rate")) b.setAttribute("aria-pressed", String(b === e.currentTarget));
+  } }, `${r}×`));
+  // A step is a time, not a captured frame: a constant-rate video repeats a frame until the next one,
+  // and a variable-rate one (≤60 fps) may hold one longer, so a step can show the same picture.
+  const stepText = `1/${Math.round(1 / step)} s`;
+  const frameBtn = (dir, text) => h("button", { type: "button", class: "btn-ghost", title: `${dir < 0 ? "Back" : "Forward"} ${stepText} (the same picture when no new frame came in that time)`, onclick: () => {
+    els.forEach((el) => el.pause());
+    seek(now() + dir * step);
+  } }, text);
+  // The strip: one row per side, its run spans, its inputs and phases on the shared clock.
+  const W = 1000, rowH = 26, top = 18;
+  const x = (t) => ((t - lo) / (hi - lo)) * W;
+  const svg = S("svg", { class: "vid-strip", viewBox: `0 0 ${W} ${top + rowH * sides.length + 4}`, preserveAspectRatio: "none" });
+  for (let k = Math.ceil(lo); k <= hi; k += Math.max(1, Math.round((hi - lo) / 10))) {
+    svg.append(S("line", { x1: x(k), x2: x(k), y1: 12, y2: top + rowH * sides.length, class: "vid-grid-line" }), S("text", { x: x(k) + 2, y: 10, class: "vid-tick" }, `${k}s`));
+  }
+  sides.forEach((sd, i) => {
+    const y = top + i * rowH;
+    if (sides.length > 1) svg.append(S("text", { x: 2, y: y + rowH / 2 + 3, class: "vid-tick" }, label(sd)));
+    for (const r of sd.runs) {
+      svg.append(S("rect", { x: x(r.start_s - sd.offset), y: y + 3, width: Math.max(1, x(r.end_s - sd.offset) - x(r.start_s - sd.offset)), height: rowH - 6, class: r.measured ? "vid-run" : "vid-run warm" }, S("title", {}, `${label(sd)} ${r.run}${r.measured ? "" : " (warmup)"}: ${fmtT(r.start_s - sd.offset)} → ${fmtT(r.end_s - sd.offset)}`)));
+    }
+    for (const m of sd.markers) {
+      const t = m.t_s - sd.offset;
+      const tip = `${label(sd)} · ${m.label} at ${fmtT(t)}${m.press_s != null ? ` (press ${fmtT(m.press_s - sd.offset)})` : ""}${m.reaction_s != null ? ` · reaction on screen ${((m.reaction_s - m.t_s) * 1000).toFixed(0)} ms later` : ""}`;
+      if (m.kind === "phase") {
+        svg.append(S("rect", { x: x(t), y: y + rowH - 7, width: Math.max(2, x((m.end_s ?? m.t_s) - sd.offset) - x(t)), height: 4, class: "vid-phase", onclick: () => seek(t) }, S("title", {}, tip)));
+        continue;
+      }
+      const g = S("g", { class: "vid-mark", onclick: () => { els.forEach((el) => el.pause()); seek(t); } }, S("title", {}, tip));
+      g.append(S("line", { x1: x(t), x2: x(t), y1: y + 2, y2: y + rowH - 2 }), S("circle", { cx: x(t), cy: y + 7, r: 4 }));
+      if (m.reaction_s != null) g.append(S("circle", { cx: x(m.reaction_s - sd.offset), cy: y + rowH - 7, r: 3, class: "vid-react" }));
+      svg.append(g);
+    }
+  });
+  const head = S("line", { x1: x(0), x2: x(0), y1: 12, y2: top + rowH * sides.length, class: "vid-head" });
+  svg.append(head);
+  svg.addEventListener("click", (e) => {
+    if (e.target.closest(".vid-mark")) return;
+    const b = svg.getBoundingClientRect();
+    seek(lo + ((e.clientX - b.left) / b.width) * (hi - lo));
+  });
+  const tick = () => {
+    if (!svg.isConnected) return;
+    const t = now();
+    els.forEach((el, i) => {
+      if (i && !els[0].paused && Math.abs(el.currentTime - (t + sides[i].offset)) > 0.08) el.currentTime = clampTo(el, t + sides[i].offset);
+    });
+    head.setAttribute("x1", x(t));
+    head.setAttribute("x2", x(t));
+    readout.textContent = `t = ${fmtT(t)} from the run's start`;
+    playBtn.textContent = els[0].paused ? "Play" : "Pause";
+    requestAnimationFrame(tick);
+  };
+  els[0].addEventListener("loadedmetadata", () => seek(0), { once: true });
+  requestAnimationFrame(tick);
+  const kinds = [...new Set(sides.map((sd) => sd.v.kind))];
+  return h("section", { class: "card-surface" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, sides.length > 1 ? "Video · both sides on one clock" : "Video"),
+        h("span", { class: "sec-sub" }, "Untimed: filmed after the timed runs (or in a check); the numbers above never include it")
+      ),
+      h("div", { class: "card-hd-right" }, kinds.map((k) => h("span", { class: "ref-pill", title: sides.find((sd) => sd.v.kind === k)?.v.about || "" }, k)))
+    ),
+    h("div", { class: "card-bd" },
+      player.mixed ? h("div", { class: "perturbed-note", style: "margin:-20px -24px 16px" }, h("b", {}, "Different kinds: "), "one side is the screen's copy of the window, the other a renderer's own frames. They are not comparable side by side.") : null,
+      h("div", { class: "vid-grid" },
+        sides.map((sd, i) => h("figure", { class: "vid-side" },
+          h("figcaption", { class: "vid-cap" },
+            h("b", {}, label(sd)),
+            h("span", { class: "meta-dim mono" }, ` ${sd.recording} · ${sd.v.kind} · ${sd.v.width}×${sd.v.height} · ${sd.v.fps ? `${sd.v.fps} fps` : `≤${sd.v.max_fps || 60} fps, each frame at its own time`} · ${sd.v.encoder || ""}`)
+          ),
+          els[i],
+          sd.v.note ? h("div", { class: "sec-sub" }, sd.v.note) : null
+        ))
+      ),
+      h("div", { class: "vid-ctrl" }, playBtn, frameBtn(-1, `◀ ${stepText}`), frameBtn(1, `${stepText} ▶`), h("span", { class: "vid-rates" }, rates), readout),
+      svg,
+      h("div", { class: "sec-sub vid-legend" }, "Bars: runs (pale: warmup). Ticks: inputs strobe sent (dot below: when the measured reaction reached the screen). Thin bars: phases. Click a tick or the strip to seek both players.")
+    )
   );
 }
 
@@ -5821,6 +6019,7 @@ function renderRecording(m) {
           )
         : null
     ),
+    renderVideoSection(m.video_player),
     hasDeepDive ? h("div", { class: "zone-divider" }, h("span", { class: "zone-divider-label" }, "Attribution & memory deep dive")) : null,
     insSec,
     phaseSec,

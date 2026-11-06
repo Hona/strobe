@@ -37,6 +37,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("app", Value, "record look"),
     ("home", Value, "record look"),
     ("os-frames", Switch, "record"),
+    ("video", Switch, "record bench"),
     ("bench", Value, "record"),
     ("gpu-cache", Value, "record"),
     ("until-line", Value, "record"),
@@ -327,7 +328,8 @@ Use
   record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>] [--style]
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
                                   (a native app: --gpu-cache warm|cold, its GPU shader caches from earlier recordings of it)
-  record --bench <file.bench.ts>#<case> [--head <variant>] [--target <name>]
+                                  (--video: also film it, timing perturbed: the window's screen, or a headless page's renderer)
+  record --bench <file.bench.ts>#<case> [--head <variant>] [--target <name>] [--video]
                                   record one bench case (it drives the page: clicks, keys) with the attribution probes
   record pid:<n>|proc:<name> [--probes timing|deep|stacks-unprivileged] [--for 10s]
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
@@ -337,6 +339,7 @@ Use
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
+        [--video]                      (film untimed: the check run, or one warmed run per side after the timed pairs)
         [--bisect good..bad]           (the commit that moved the primary; one series)
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)

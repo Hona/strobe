@@ -368,6 +368,11 @@
         "timing_recordings": { "type": "array" },
         "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base and head (each with its first block's thumb_start and thumb_end as data URLs), changed (builds only)." },
         "pixels": { "description": "--pixels: per snapshot, whether base and head drew the same pixels." },
+        "video": {
+          "type": ["object", "null"],
+          "description": "--video (SPEC 8.8): the recordings that hold each side's video (video.json beside it), and mixed when their kinds differ.",
+          "properties": { "base": { "type": "string" }, "head": { "type": "string" }, "mixed": { "type": "boolean" } }
+        },
         "leak": { "type": "object", "description": "A leak series: growth verdicts per variant (js_heap, dom_nodes or native_host, each with verdict and verdict_kind)." },
         "runs_per_half": { "type": "integer" },
         "halt": { "type": ["object", "null"], "properties": { "code": { "type": "integer" }, "message": { "type": "string" } } },

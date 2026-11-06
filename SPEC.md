@@ -215,7 +215,9 @@ probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (
                 helper.rs (the deep-mode helper, §13.4), present/ (what reached the screen, §7.2:
                 windows.rs ETW present events, sck.rs ScreenCaptureKit, xpresent.rs X11 Present,
                 frames.rs frame metrics). The helper runs present and stack sessions, and both use
-                its access, so they live in one backend.
+                its access, so they live in one backend. video/ (`--video`, §8.8: wgc.rs Windows,
+                avf.rs macOS, x11.rs Linux, screencast.rs a Chromium page's renderer, ffmpeg.rs the
+                external encoder)
 heapsnap.rs     V8 heap snapshots: streaming parse, dominators, classes, retainer paths, diff, leaks
 metrics.rs      a block's trace → metric values
 engine/         trace_processor: the only place that runs it (§15)
@@ -369,8 +371,11 @@ engine, attachable targets (running apps and their bridge state, CDP endpoints f
 
 ```
 strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#<case>]
-                       [--ring <duration>] [--pin] [--name <text>] [--json]
+                       [--ring <duration>] [--pin] [--name <text>] [--video] [--json]
 ```
+
+- `--video` films the recording (§8.8): the window's screen (headed) or a Chromium page's renderer
+  (headless), its `timing` `perturbed`; with `--bench`, the check run's own recording holds it.
 
 - One recording; returns its handle, validity and a summary.
 - Default probe set: `timing`. `--probes attribution,memory` and friends per §8.1.
@@ -441,7 +446,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
              [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--engine chromium|firefox|webkit] [--headless]
-             [--seed <n>] [--json]
+             [--seed <n>] [--video] [--json]
 strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
@@ -461,6 +466,10 @@ error): nothing seeds them. A bisect (§9.7) runs every step with one seed: `--s
 when it already ran (a tracked change's confirmation), else one drawn once; its `result.json` keeps
 it (`seed`). `track` (§25.2) runs its points, confirmations and bisects with one seed per repository
 and bench file.
+
+`--video` (§8.8): with `--check` the check block films its run (`series[].video.head`); on a
+comparison, after every timed pair of a series, one untimed block per variant films a warmed run
+(`series[].video.base`, `.head`, and `mixed` when their kinds differ). Never inside a timed block.
 
 **Stopping and resuming.** Ctrl-C (SIGINT), SIGTERM or `strobe bench --stop <exp>` (from any shell,
 or for a bench the daemon runs) stops a bench once its current block ends; waits (a locked session,
@@ -1555,6 +1564,78 @@ case without a leak `no growth`; the array case read `+104 KB/run` on air too.
 proto), a `.cpuprofile`, a `.heapsnapshot`, or a folder of them (read through its
 `manifest.json`). Imported recordings get `valid: unknown`: nothing proves how they were taken.
 They work with every view, never with `bench`.
+
+### 8.8 Video (`--video`)
+
+A video of what the target showed, for a person to watch beside the numbers (`probe::video`,
+`app::video`). Every source costs CPU and GPU time in strobe, the OS's compositor or encoder, or the
+target's own renderer, so a video is taken only where nothing is timed (rule 3): `record --video`
+(its `timing` is `perturbed`), `bench --check --video` (the check block films its run), and
+`bench --video` on a comparison: every timed pair runs clean first, then one untimed video block per
+variant (warmed, one measured run, kept, in no verdict), each side through the same capture.
+
+Two kinds, named in `video.json` (`kind`), never compared side by side when they differ (the
+series gets `video.mixed` and a `Video` warning):
+
+| kind | source | works |
+|---|---|---|
+| `screen` | the OS's composited copy of the window: Windows.Graphics.Capture (Windows 10 1903+; no cursor, no border on 11) into the GPU's video processor (scale, NV12) and Media Foundation's H.264 encoder (the GPU's when it has one, else software); a ScreenCaptureKit stream of the window alone (`initWithDesktopIndependentWindow:`, 4:2:0) into AVAssetWriter H.264 (macOS 13+); the X server's copy of the window (`GetImage`) at 30 fps into ffmpeg (Linux X11) | headed targets with a window: native apps, headed pages, Electron and webview apps |
+| `renderer` | a Chromium page's own compositor frames: DevTools `Page.startScreencast` (JPEG, at most 1280 px), each at its swap time (`metadata.timestamp`, wall clock mapped to the host clock through the offset read at the start), in a Matroska stream of millisecond times into ffmpeg at a constant 30 fps (as Playwright's `recordVideo` feeds its ffmpeg) | Chromium, Electron, WebView2 over CDP; headless and on a locked session. Not proof that a frame reached a display |
+
+A headless page films its renderer; a headed one films the screen, and falls back to its renderer
+(saying why in `note`) when the OS capture cannot start. Refused (`record` exits 4; a bench says it
+once, `Video`, and goes on): a target with no window (`window: false`, script, cli: `NotForTarget`),
+an attached target (`cdp:`, `pid:`: `NotForTarget`), a headless page in Firefox or WebKit (`Headless`:
+stock builds have no screencast; Playwright films its own patched Firefox through Juggler's
+`Page.startScreencast` and its patched WebKit through `Screencast.startScreencast`, and its BiDi path
+polls `browsingContext.captureScreenshot` every 40 ms stamped on arrival, which re-renders the page
+per frame and is not a frame time), a native Wayland window (`NoPresentSource`: another client's
+pixels come only through the portal's picker, rule 11), no ffmpeg where one is needed
+(`NoPresentSource` with how to install it), and on macOS no Screen Recording permission. A
+`launch` case is not filmed (said once): it starts before the window or page every source films
+from exists, so its video would miss the launch it times.
+
+- Files: `video.mp4` (H.264; WebM VP9/VP8 when the only ffmpeg has no libx264, as Playwright's
+  own build) and `video.json`, both in the block's recording, the video owner-only (`store::adopt`,
+  rule 9), counted in the recordings' disk use like any file there. At most 1280 px on the long edge,
+  at most 60 fps: OS captures write each frame at its own time (Windows holds a frame that comes
+  within 1/60 s of the last and writes it 1/60 s after it, up to 16.7 ms late); ffmpeg writes a
+  constant 30 fps, repeating a frame until the next (a frame lands up to half a frame from its time).
+  Media time 0 is the capture's start: the first frame (the window or page as it was) stands from
+  there, so no run or input sits before the video on an idle window. The last frame is held to the
+  end of the recording. A video block warms up as a timing block does and films the run after the
+  steady pair, never the cold first run. The file is written in a run-folder scratch directory
+  (`probe::video::Scratch`) removed whatever happens (a failed capture, no frame, a block that
+  ended early). Windows: a GPU encoder that fails its first frame gives way to Media Foundation's
+  software encoder, which writes the file from the start.
+- `video.json`: `file`, `kind`, `about`, `source`, `encoder`, `note`, `width`, `height`, `t0_ns`
+  and `t1_ns` (host clock at media time 0 and at the end), `fps` (constant) or `max_fps`,
+  `precision_ms`, `frames` (what the file holds) and `source_frames` (what the source delivered),
+  strobe's capture CPU (`cpu_ms`, `setup_cpu_ms`) and an ffmpeg encoder's (`encoder_cpu_ms`, from its
+  own `wait4` rusage or process handle); `runs` (`run`, `start_s`, `end_s`, `measured`: warmup runs
+  too) and `markers` (`t_s`, `press_s`, `end_s`, `kind`, `label`, `reaction_s`) on media time. A
+  marker is a page call the block served (its name and what it aimed at: an element, a key, a
+  position, a page's address without its query; typed text only by its length), at the input strobe
+  sent inside it when the driver or the OS input logged one, else at the call's start; phases from
+  strobe's host-clock edges (with a trace too: strobe notes each edge's host time beside the trace's
+  mark); `reaction_s` from the recording's action log (`actions.json.gz`, its sample's latency, from
+  the press for a sample timed from one), written before the video so it is there.
+- Usage errors, never ignored: `--video` with `--blocks`, `--pixels-only`, `--probes memory` or
+  `--bisect`, and `record --video` of a `file:` import. `--video` is no part of the rerun ledger's
+  identity (it changes no timed block). An implementation comparison judges each side's target on
+  its own (one may be filmed, the other said why not); a stop (130) or a lock wait that ran out
+  (124) during the video or attribution blocks ends the bench as during the pairs.
+- A locked Windows session: Windows.Graphics.Capture kept delivering a window's frames (a native
+  fixture at 20 fps, 55 frames in 3.3 s, on adais), so a native series that runs locked is filmed;
+  its `note` says these are the compositor's frames while the display showed the lock screen.
+- Cost, measured: adais (Windows 11, RTX 5070 Ti), a 466×312 native window at 20 fps, Media
+  Foundation on the GPU's encoder: the capture thread 15 ms of CPU over 3.3 s (0.45% of a core)
+  after a one-time 290 ms setup (device, encoder), and strobe's whole process in the check run 4.5%
+  → 6.6% of a core (Media Foundation's threads are in it; two runs each). A headless page's renderer
+  at 1280×744: strobe's thread 9 ms and ffmpeg (libx264) 406 ms of CPU over 3.2 s (13% of a core).
+  vps (2 vCPU VM): Playwright's ffmpeg (VP8) 3.1 s of CPU over 3.5 s. air (M4, headless page at
+  60 fps, 1280×750): strobe's thread 6 ms, Homebrew's ffmpeg (libx264) 470 ms over 2.9 s. The capture thread waits for
+  the GPU's copy by sleeping: the driver's own wait spun (350 ms over the same 3.3 s).
 
 ## 9. Experiments (`bench`)
 
@@ -3277,6 +3358,26 @@ stacks for its top 15 rows and the heaviest below them, frames once per side in 
 that stacks index, while recordings and `query` keep all);
 markdown is GitHub-flavoured.
 
+A recording or series with a video (§8.8) gets a video panel (`video_player`): its players side by
+side on one clock (t = 0 at each side's first measured run's start), Play/Pause for both, 0.25×
+and 1×, a step back and forward of one frame time (labelled with it, `1/30 s`: a step shows the same
+picture when no new frame came in that time), and a strip under them per side with its runs (warmup ones pale),
+its input markers (a click seeks both players there; a dot where the action log's reaction reached
+the screen) and phases. Two kinds of video are labelled as such and never presented as comparable.
+The videos are embedded in the HTML (base64) while they add up to at most 16 MB, else copied into
+`<report>.assets/` beside it; the daemon's `/report/<handle>` plays them from `/video/<rec>` (byte
+ranges, so a player seeks, each read from the file 64 KiB at a time as it is sent, never the whole
+file in the daemon's memory). The daemon refuses `/report/` and `/video/` to a request whose
+`Sec-Fetch-Site` is anything but `same-origin` or `none` (another site's page). The PR block and
+markdown are unchanged.
+
+A `--check` experiment's HTML shows each case as a check (`renderCheckSeries`): passed or failed,
+its error and fix, the one run's declared values (not a verdict), what was on screen, its recording
+and attribution commands, its log and video; no interval, pairs or verdict. Its `--format pr`,
+`card` and `badge`, and a `--pixels-only` run's, are usage errors: they decide nothing. Everywhere,
+the hero and scorecard say "Confirmed" only for a decided shift (a better or worse verdict); a
+metric without a verdict says "No verdict" and a descriptive one "Descriptive", never a direction.
+
 An experiment's HTML also carries, per series, the diff flame (`diff_tree`): CPU time (native
 samples when the recordings have no JavaScript profile) and allocations as one call tree of both
 sides' stacks merged by portable frame, each node with its inclusive value per run on each side;
@@ -4712,6 +4813,8 @@ recordings/rec_3f9a1c/
   memory-<n>.json.gz    Firefox: an about:memory report (`memory-0`, `memory-s0`, `memory-<run>`), owner-only (§8.6)
   actions.json.gz       bench blocks: the experiment's `seed`, `truncated`, and each action the hooks made, in
                         order (§9.6 Actions; `store::actions`), owner-only: it holds typed text
+  video.mp4 | video.webm  `--video`: what the target showed (§8.8), owner-only
+  video.json            the video's kind, source, encoder, size, clock map, runs and input markers on media time
 ```
 
 A bench block's `meta.json` names the experiment's `seed` beside `experiment`.
@@ -5731,6 +5834,17 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   outcome from `frames::reactions`, joined after the runs. Until then the native and traceless
   blocks' measured input edges stay instants from `frames.json` on Perfetto's `inputs strobe sent`
   beside the action slices.
+- Video (§8.8) is built: `probe/video/` (Windows.Graphics.Capture + Media Foundation, ScreenCaptureKit +
+  AVAssetWriter, X11 + ffmpeg, DevTools screencast + ffmpeg), `app/video.rs` (markers, `video.json`),
+  `record --video`, `bench --check --video` and a comparison's untimed video blocks, the report's
+  players and the daemon's `/video/<rec>`. Checked: adais (session locked) a native window's screen
+  video through Media Foundation on the GPU's encoder, and a headless page's renderer video through
+  ffmpeg libx264, both with their markers in the report; vps a headless page through Playwright's
+  ffmpeg (VP8, WebM); air a headless page through Homebrew's ffmpeg. Not checked yet: macOS's screen
+  video (ScreenCaptureKit into AVAssetWriter: built and clippy-clean on air, not run there: on battery,
+  in use). Not filmed: `launch` cases (no window or page exists when they start). Not checked yet: Linux X11 (vps has no
+  display), headed Chromium on Windows (the locked session hides its window).
+
 - Implementation comparisons, presentation and family statistics (9.3, 11.2): `stats::repeated_p`,
   `family_min_pairs` and `family`, `app/family.rs` (the scoreboard, the headline, read from a stored
   result), the implementation PR block (`app/pr/implementations.rs`), the split card with its forest
@@ -5928,7 +6042,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   elsewhere, without a domain (macOS shells do not export `HOSTNAME`). `update` runs the new build's
   `up` with its output relayed rather than inherited and returns when it exits, so an older build
   whose daemon inherits handles cannot hold the caller's pipe either.
-- The daemon serves `/mcp`, `/report/<handle>`, `/perfetto/` (§11.4) and `/health` (no `/ui`); it
+- The daemon serves `/mcp`, `/report/<handle>`, `/video/<rec>` (a recording's video, with byte ranges, §8.8), `/perfetto/` (§11.4) and `/health` (no `/ui`); it
   accepts a GET from its own origin (the Perfetto UI fetches fonts and wasm in CORS mode) and no
   other cross-origin request. `up` stops it with the `strobe/quit` RPC. The engine runs one
   `trace_processor -q` per query, and one `server http` per `strobe open`.

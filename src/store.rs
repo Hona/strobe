@@ -111,6 +111,22 @@ pub fn create(path: &Path) -> Result<paths::Atomic> {
     paths::Atomic::create(path, 0o600).map_err(|e| Error::msg(format!("create {}: {e}", path.display())))
 }
 
+/// Moves a finished file another program wrote (an encoder's video, in the run folder) into a
+/// recording's folder as `name`, owner-only like everything of the target's (rule 9). Same volume
+/// (the state folder): a rename, so it appears whole.
+pub fn adopt(dir: &Path, name: &str, from: &Path) -> Result<PathBuf> {
+    let to = dir.join(name);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(from, std::fs::Permissions::from_mode(0o600));
+    }
+    if std::fs::rename(from, &to).is_err() {
+        std::fs::copy(from, &to).map_err(|e| Error::msg(format!("keep {}: {e}", to.display())))?;
+    }
+    Ok(to)
+}
+
 /// A recording's folder until it is complete: dropped before `keep` (an error, a refusal), the folder
 /// and all it holds go, so no recording is left without its `meta.json`. Only `new_recording` and
 /// `claim_recording` make one, over a folder they created, so a draft never deletes a folder it did

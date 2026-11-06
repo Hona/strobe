@@ -326,8 +326,8 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
         }
     }
     // `--seed` is the workload only where a hook used it (`used_random`, set after the runs): the ledger
-    // compares `seed` on its own.
-    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan", "seed"];
+    // compares `seed` on its own. `--video` films untimed blocks after the timed ones: no verdict moves.
+    const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan", "seed", "video"];
     let flags: serde_json::Map<String, Value> = args.to_json()["flags"].as_object().into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
     // An implementation comparison's side is its target at a build: both are its identity, the build
     // resolved in that target's own project (its `cwd`'s repository and app profiles).
@@ -774,15 +774,18 @@ struct Exec {
     /// A counter block (Linux, SPEC §7.5): perf events open on the target's threads, no trace or
     /// present capture, and its time metrics dropped: the events slow every context switch.
     counters: bool,
+    /// `--video` (SPEC §8.8): the block films its runs, so nothing it measures is timed: a `--check`
+    /// block, or the one block per variant after a comparison's timed pairs, never in them.
+    video: bool,
 }
 
 impl Exec {
     fn timed(set: Set, runs: usize, keep: bool) -> Exec {
-        Exec { set, runs, untimed: false, keep, pixels: None, counters: false }
+        Exec { set, runs, untimed: false, keep, pixels: None, counters: false, video: false }
     }
 
     fn untimed(keep: bool, pixels: Option<PathBuf>) -> Exec {
-        Exec { set: Set::Lean, runs: 1, untimed: true, keep, pixels, counters: false }
+        Exec { set: Set::Lean, runs: 1, untimed: true, keep, pixels, counters: false, video: false }
     }
 
     /// This block as a counter block, or as it is.
@@ -790,10 +793,37 @@ impl Exec {
         Exec { counters, ..self }
     }
 
+    /// The video block a comparison runs per variant after its timed pairs: warmed, one measured run,
+    /// kept, its numbers in no verdict.
+    fn filming() -> Exec {
+        Exec { video: true, ..Exec::timed(Set::Lean, 1, true) }
+    }
+
     /// A timing block whose numbers become a verdict: what `--reserve-cpus auto` reserves for.
     fn measures_time(&self) -> bool {
-        !self.untimed && matches!(self.set, Set::Lean | Set::Timing)
+        !self.untimed && !self.video && matches!(self.set, Set::Lean | Set::Timing)
     }
+}
+
+/// Whether a recording kept a video (`video.json`).
+fn has_video(rec: &str) -> bool {
+    store::resolve(rec).is_ok_and(|d| d.join("video.json").is_file())
+}
+
+/// Why the target `name` (one side's, in an implementation comparison) gets no video with `--video`
+/// (it is said, the bench goes on): it opens no window, or it is a headless page in an engine without
+/// a screencast.
+fn no_video(ctx: &Ctx, name: &str) -> Option<String> {
+    let t = &ctx.describe["targets"][name];
+    let windowless = matches!(t["kind"].as_str(), Some("script" | "cli")) || t["window"] == false || profile_of(t).and_then(|id| isolate::app(id, &ctx.config).ok()).is_some_and(|a| a.windowless);
+    if windowless {
+        return Some(format!("{name} opens no window (a script, a command, or window: false)"));
+    }
+    let engine = engine_of(t);
+    if (ctx.headless || t["headless"] == true) && engine != WebEngine::Chromium && !is_native(t) {
+        return Some(format!("{name} is a headless {engine} page: no window to film, and stock {engine} has no screencast (Playwright films only its own patched builds)"));
+    }
+    None
 }
 
 /// Where a series' counter metrics come from (SPEC §7.5). Timing blocks never open Linux's perf
@@ -1253,6 +1283,23 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         if args.num("blocks")?.is_none_or(|b| !b.is_finite() || b < 1.0 || b.fract() != 0.0) {
             return Err(Error::usage(format!("--blocks: a whole number of blocks from 1, not {}", args.get("blocks").unwrap_or(""))));
+        }
+    }
+    // `--video` films a check run or a comparison's untimed blocks (SPEC §8.8); these modes have none.
+    if args.has("video") {
+        let why = if args.has("blocks") {
+            Some("--blocks N times one build and keeps no recording to film")
+        } else if args.has("pixels-only") {
+            Some("--pixels-only compares snapshots and runs no blocks to film")
+        } else if args.get("probes") == Some("memory") {
+            Some("--probes memory is a leak run: heap snapshots between runs, nothing to watch")
+        } else if args.has("bisect") {
+            Some("--bisect runs many builds' blocks to find a commit; film the culprit's own comparison")
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return Err(Error::usage(format!("--video: {why}: drop one of them")));
         }
     }
     if args.has("plan") {
@@ -1757,7 +1804,15 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     // series that counts instructions checks them in an untimed counter block (SPEC §7.5).
     let split = counting(s);
     let main_counters = split == Counting::Only || (split == Counting::Separate && counted_apart(&s.primary));
-    let r = block_on_screen(ctx, s, &variants[0], 0, &Exec::untimed(true, None).counting(main_counters)).and_then(|mut b| {
+    // `--video`: the check block films its run (a counter block films nothing: its times are dropped anyway).
+    let film = ctx.args.has("video") && !main_counters && {
+        let skip = no_video(ctx, variants[0].target_of(s));
+        if let Some(why) = &skip {
+            ctx.warnings.push(validity::info("Video", format!("{}: no video: {why}", s.label())));
+        }
+        skip.is_none()
+    };
+    let r = block_on_screen(ctx, s, &variants[0], 0, &Exec { video: film, ..Exec::untimed(true, None).counting(main_counters) }).and_then(|mut b| {
         if split == Counting::Separate {
             let other = block_on_screen(ctx, s, &variants[0], 0, &Exec::untimed(false, None).counting(!main_counters))?;
             take_metrics(&mut b, &other, |m| counted_apart(m) != main_counters);
@@ -1833,6 +1888,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
+        "video": recording.as_str().filter(|r| film && has_video(r)).map(|r| json!({ "head": r })),
         "log": log, "log_path": ctx.runner.log, "actions": actions,
         // For the parity matrix (`journey::matrix`).
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target), "same": same, "ops": ops, "adapted": s.adapted,
@@ -1920,6 +1976,10 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
             if let Some(n) = s["actions"]["count"].as_u64() {
                 text += &format!("      actions  {n} sent · strobe query {exp} actions\n");
+            }
+            if let Some(rec) = s["video"]["head"].as_str() {
+                let meta = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).unwrap_or(Value::Null);
+                text += &format!("      {}", super::video::line(rec, &meta["video"]));
             }
             if let Some(line) = screen_line(&s["screen"]) {
                 text += &format!("      screen  {line}\n");
@@ -2803,7 +2863,51 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     }
                     recordings[v.role] = json!(b.recording);
                 }
+                // A stop or an unlock wait that ran out ends the bench here, as in the pairs.
+                Err(e) if e.code == 130 || e.code == 124 || stop_requested() => {
+                    halted = Some(if e.code == 124 { e } else { stop_error() });
+                    break;
+                }
                 Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
+            }
+        }
+    }
+    // `--video` (SPEC §8.8): after every timed pair, one untimed block per variant films a warmed run,
+    // through the same OS capture (or renderer) on both sides. Its numbers join no verdict.
+    let mut videos = json!({});
+    if ctx.args.has("video") && halted.is_none() {
+        if s.launch.is_object() {
+            warnings.push(validity::info("Video", format!("{}: no video: a launch case starts before its window or page exists, which every source films from, so a video would miss the launch it times", s.label())));
+        } else {
+            progress("  video blocks (one warmed run per variant; not timed)");
+            for v in variants.iter() {
+                // Each side by its own target: an implementation comparison's may differ.
+                if let Some(why) = no_video(ctx, v.target_of(s)) {
+                    warnings.push(validity::info("Video", format!("{}: no video of {}: {why}", s.label(), side_of(ctx, v))));
+                    continue;
+                }
+                match block_on_screen(ctx, s, v, usize::MAX, &Exec::filming()) {
+                    Ok(b) => match b.recording.filter(|r| has_video(r)) {
+                        Some(r) => videos[v.role] = json!(r),
+                        None => warnings.push(validity::warn("Video", format!("{} video block kept no video", side_of(ctx, v)))),
+                    },
+                    Err(e) if e.code == 130 || e.code == 124 || stop_requested() => {
+                        halted = Some(if e.code == 124 { e } else { stop_error() });
+                        break;
+                    }
+                    Err(e) => warnings.push(validity::warn("Video", format!("{} video block failed: {}", side_of(ctx, v), e.message))),
+                }
+            }
+            // Side by side only when both are the same kind of video (both the screen's, or both a renderer's).
+            let kind = |r: &Value| r.as_str().and_then(|r| store::resolve(r).ok()).and_then(|d| store::read_json(&d.join("video.json")).ok()).map(|j| j["kind"].clone());
+            if let (Some(a), Some(b)) = (kind(&videos["base"]), kind(&videos["head"]))
+                && a != b
+            {
+                videos["mixed"] = json!(true);
+                warnings.push(validity::warn(
+                    "Video",
+                    format!("base's video is the {a}'s and head's the {b}'s: not comparable side by side (one shows what reached the display, the other what a renderer produced)"),
+                ));
             }
         }
     }
@@ -2826,6 +2930,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     });
+    out["video"] = if videos.as_object().is_some_and(|o| !o.is_empty()) { videos } else { Value::Null };
     if ctx.implementations {
         implementation_series(ctx, s, variants, &mut out);
     }
@@ -4320,6 +4425,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             Ok(())
         };
+        // `--video`: the block's film, and the inputs strobe sent while it ran (for its markers).
+        let video: RefCell<Option<super::video::Recorder>> = RefCell::new(None);
+        let video_sent: RefCell<Vec<super::video::Sent>> = RefCell::new(Vec::new());
+        // With a trace, the phases' host-clock edges for the video (traceless blocks keep them in `run_marks`).
+        let video_marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -4351,7 +4461,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     if segment {
                         segments.borrow_mut().push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
                     }
+                    let (started, sent0) = (host::now_ns(), driver.inputs.borrow().len());
                     let r = driver.dispatch(call, &args);
+                    if let Some(v) = video.borrow().as_ref() {
+                        v.note(call, &args, started);
+                        video_sent.borrow_mut().extend(driver.inputs.borrow().iter().skip(sent0).map(|s| super::video::Sent { t_ns: s.t_ns, press_ns: s.press }));
+                    }
                     if segment {
                         probe::cpu::start(cp()?)?;
                         probe::alloc::start(cp()?)?;
@@ -4392,6 +4507,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                         hooks.phase(a)?;
                     } else if let Some(key) = hooks.phase_key(a)? {
                         driver.mark(&key)?;
+                        // The trace's marks are the page's clock: the video's phases need the host's.
+                        if video.borrow().is_some() {
+                            video_marks.borrow_mut().push((key, host::now_ns()));
+                        }
                     }
                     Ok(Value::Bool(true))
                 }
@@ -4515,6 +4634,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let start = shown::page(ctx, s, v, pair, "start", &page);
         shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
         lap("setup");
+        // `--video` (an untimed block): from before the first run to after the last.
+        if x.video {
+            let w = host::main_window(&browser.pids()).filter(|_| !headless);
+            match super::video::Recorder::start(w.as_ref(), page.cdp(), headless) {
+                Ok(r) => *video.borrow_mut() = Some(r),
+                Err(e) => ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: no video: {}", s.label(), e.message))),
+            }
+        }
         let procs0 = (host::now_ns(), host::all_processes());
         // A memory block (a leak run, SPEC §8.6) takes no trace: a live trace subscription would copy
         // every heap snapshot chunk, and nothing in it is timed. Its recording holds the snapshots.
@@ -4672,6 +4799,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &at1.keys().map(|k| k.0).collect::<Vec<_>>(), perf.as_ref());
             // OS input's log: its inputs for latency, its drags for `input.rate` (those begun untimed left out).
             let sent = driver.os.get().map(|os| os.take_log());
+            // The OS's input (from outside) is the video's markers' edges, as the driver's are.
+            if let (Some(l), true) = (&sent, video.borrow().is_some()) {
+                video_sent.borrow_mut().extend(l.sent(&metrics::Timed { t0, t1, untimed: Vec::new() }).into_iter().map(|s| super::video::Sent { t_ns: s.t_ns, press_ns: s.press }));
+            }
             let mut drags = sent.as_ref().map_or_else(|| driver.drags.take(), |l| l.drags.clone());
             drags.retain(|d| d.first().is_none_or(|t| !timed.untimed_at(*t)));
             let input = crate::driver::input_pacing(&drags);
@@ -4855,6 +4986,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
         }
         starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
+        let mut stopped = video.take().map(super::video::Recorder::stop);
         let unsteady = warmup.unsteady();
         let first = warmup.first().unwrap_or(0);
         // Warmup and measured runs interleave with the steadiness check: split the loop by run.
@@ -5170,14 +5302,31 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         };
         // From outside there is no trace to keep: the block's numbers are in result.json. A Firefox block
         // keeps its OS presents for `query <rec> frames`.
-        let recording = if (keep && !outside) || set == Set::Memory {
+        let recording = if (keep && (!outside || x.video)) || set == Set::Memory {
+            // The actions first: the video's markers take their measured reactions from them.
+            keep_actions(ctx, &dir)?;
+            // The video: every run on its time (warmup ones too), the inputs and, without a trace, the phases.
+            let video = match stopped.take() {
+                Some(Ok(st)) => {
+                    let filmed: Vec<super::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, i >= first)).collect();
+                    let marks: Vec<(String, u64)> = if traceless { run_marks.iter().flatten().cloned().collect() } else { video_marks.take() };
+                    st.keep(&dir, &filmed, &video_sent.take(), &marks)
+                        .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: the video was not kept: {}", s.label(), e.message))))
+                        .ok()
+                }
+                Some(Err(e)) => {
+                    ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: no video: {}", s.label(), e.message)));
+                    None
+                }
+                None => None,
+            };
             let mut meta = json!({
                 "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
-                // Rule 3: a block with profilers or a census describes the profiled page.
-                "timing": if set == Set::Timing || set == Set::Lean { "clean" } else { "perturbed" },
-                "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)),
+                // Rule 3: a block with profilers, a census or a video describes the profiled (filmed) page.
+                "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" },
+                "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)), "video": video,
             });
             if !census.is_empty() {
                 meta["census"] = json!(census);
@@ -5206,7 +5355,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .collect();
                 store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": values.get("display.hz"), "runs": per }))?;
             }
-            keep_actions(ctx, &dir)?;
             store::write_json(&dir.join("meta.json"), &meta)?;
             if let Some(d) = draft.take() {
                 d.keep();
@@ -6819,6 +6967,7 @@ fn build_variant(role: &str, root: &Path, build: &Value, copy: Option<(&Path, &P
         }
     }
     std::fs::write(marker, key)?;
+
     // How long this build took here, for `plan` (SPEC §9.1).
     let times = host::paths::sub("builds").join("times.json");
     let mut all = store::read_json(&times).unwrap_or_else(|_| json!({}));
@@ -6922,7 +7071,6 @@ fn http_ok(url: &str) -> bool {
     let head = String::from_utf8_lossy(&buf[..n]);
     head.starts_with("HTTP/1.1 2") || head.starts_with("HTTP/1.1 3") || head.starts_with("HTTP/1.0 2")
 }
-
 
 pub(crate) fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>, Option<u64>, String)> {
     let all: u64 = if topo.logical >= 64 { u64::MAX } else { (1u64 << topo.logical) - 1 };
@@ -7268,6 +7416,15 @@ fn render(r: &Value) -> String {
         let at: Vec<String> = [("base", bn), ("head", hn)].iter().filter_map(|(r, name)| Some(format!("{name} {}", sampled(&s["attribution_sampling"][r])?))).collect();
         if !at.is_empty() {
             out += &format!("       JavaScript {}\n", at.join(" · "));
+        }
+        if s["video"]["base"].is_string() || s["video"]["head"].is_string() {
+            out += &format!(
+                "\nvideo  one warmed run per side, untimed: base {} · head {}{}\n       strobe report experiment {} --open (both players side by side)\n",
+                s["video"]["base"].as_str().unwrap_or("-"),
+                s["video"]["head"].as_str().unwrap_or("-"),
+                if s["video"]["mixed"] == true { " (different kinds: not comparable side by side)" } else { "" },
+                r["id"].as_str().unwrap_or("")
+            );
         }
         if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {
             out += "\npixels\n";

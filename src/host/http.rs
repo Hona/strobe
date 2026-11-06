@@ -19,11 +19,16 @@ pub struct Response {
     pub body: Vec<u8>,
     /// A Content-Security-Policy header, enforced on top of any the page sets itself.
     pub csp: Option<String>,
+    /// Other headers (a video's byte range).
+    pub headers: Vec<(&'static str, String)>,
+    /// A body read from a file as it is sent instead of `body`: its path, offset and length (a video,
+    /// never held whole in the daemon's memory).
+    pub file: Option<(std::path::PathBuf, u64, u64)>,
 }
 
 impl Response {
     pub fn new(status: u16, content_type: &'static str, body: impl Into<Vec<u8>>) -> Response {
-        Response { status, content_type, body: body.into(), csp: None }
+        Response { status, content_type, body: body.into(), csp: None, headers: Vec::new(), file: None }
     }
     pub fn text(status: u16, body: &str) -> Response {
         Response::new(status, "text/plain; charset=utf-8", body.as_bytes().to_vec())
@@ -71,18 +76,34 @@ pub fn write_response(stream: &mut TcpStream, r: &Response) {
     let reason = match r.status {
         200 => "OK",
         202 => "Accepted",
+        206 => "Partial Content",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
         415 => "Unsupported Media Type",
+        416 => "Range Not Satisfiable",
         _ => "Error",
     };
-    let csp = r.csp.as_ref().map(|c| format!("Content-Security-Policy: {c}\r\n")).unwrap_or_default();
-    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{csp}Connection: close\r\n\r\n", r.status, r.content_type, r.body.len());
+    let csp = r.csp.as_ref().map(|c| format!("Content-Security-Policy: {c}\r\n")).unwrap_or_default() + &r.headers.iter().map(|(k, v)| format!("{k}: {v}\r\n")).collect::<String>();
+    let len = r.file.as_ref().map_or(r.body.len() as u64, |f| f.2);
+    let head = format!("HTTP/1.1 {} {reason}\r\nContent-Type: {}\r\nContent-Length: {len}\r\nCache-Control: no-store\r\n{csp}Connection: close\r\n\r\n", r.status, r.content_type);
     let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(&r.body);
+    match &r.file {
+        // 64 KiB at a time from the offset: the file is never read whole.
+        Some((path, offset, len)) => {
+            use std::io::Seek;
+            if let Ok(mut f) = std::fs::File::open(path)
+                && f.seek(std::io::SeekFrom::Start(*offset)).is_ok()
+            {
+                let _ = std::io::copy(&mut std::io::BufReader::with_capacity(64 * 1024, f.take(*len)), stream);
+            }
+        }
+        None => {
+            let _ = stream.write_all(&r.body);
+        }
+    }
     let _ = stream.flush();
 }
 

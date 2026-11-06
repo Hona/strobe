@@ -22,6 +22,7 @@ pub mod top;
 pub mod track;
 pub mod up;
 pub mod update;
+pub mod video;
 
 use crate::cli::{Args, HELP};
 use crate::host;

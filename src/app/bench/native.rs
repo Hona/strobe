@@ -320,6 +320,8 @@ fn runs(
             cost.resume();
         }
     };
+    // `--video`: the block's film (its page calls are its markers).
+    let video: RefCell<Option<crate::app::video::Recorder>> = RefCell::new(None);
     let serve = |op: &str, a: &Value| -> Result<Value> {
         match op {
             "line" => lines.borrow_mut().serve(output.as_ref(), &home.dir, a),
@@ -334,7 +336,12 @@ fn runs(
                 }
                 hooks.op(call, &args);
                 let session = drive.get().map_err(|e| Error { message: format!("page.{call}(): {}", e.message), ..e })?;
-                session.dispatch(call, &args, &presents, pixels.as_deref())
+                let started = host::now_ns();
+                let r = session.dispatch(call, &args, &presents, pixels.as_deref());
+                if let Some(v) = video.borrow().as_ref() {
+                    v.note(call, &args, started);
+                }
+                r
             }
             "count" => {
                 hooks.count(a);
@@ -388,6 +395,13 @@ fn runs(
     if let Some(sc) = &start {
         let se = drive.session.get();
         shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
+    }
+    // `--video` (an untimed block): the app's main window from before the first run to after the last.
+    if x.video {
+        match crate::app::video::Recorder::start(n.window.as_ref(), None, false) {
+            Ok(r) => *video.borrow_mut() = Some(r),
+            Err(e) => ctx.warnings.push(validity::warn("Video", format!("{} · {} block: no video: {}", s.label(), side_of(ctx, v), e.message))),
+        }
     }
     let procs0 = (host::now_ns(), host::all_processes());
     let sampler = probe::os::Sampler::start(n.pid, Some(n.home.clone()));
@@ -547,6 +561,7 @@ fn runs(
         }
     }
     starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
+    let mut stopped = video.take().map(crate::app::video::Recorder::stop);
     let unsteady = warmup.unsteady();
     let first = warmup.first().unwrap_or(0);
     let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
@@ -867,6 +882,29 @@ fn runs(
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }
         store::write_json(&dir.join("memory.json"), &json!({ "readings": readings }))?;
+        // The actions first: the video's markers take their measured reactions from them.
+        super::keep_actions(ctx, &dir)?;
+        // The video: every run on its time (warmup ones too), the inputs strobe posted, the phases.
+        let video = match stopped.take() {
+            Some(Ok(st)) => {
+                let filmed: Vec<crate::app::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, i >= first)).collect();
+                let sent: Vec<crate::app::video::Sent> = runs
+                    .iter()
+                    .flat_map(|r| &r.log.inputs)
+                    .filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first))
+                    .map(|i| crate::app::video::Sent { t_ns: i.t_ns, press_ns: i.press_ns })
+                    .collect();
+                let marks: Vec<(String, u64)> = runs.iter().flat_map(|r| r.log.marks.iter().cloned()).collect();
+                st.keep(&dir, &filmed, &sent, &marks)
+                    .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {} block: the video was not kept: {}", s.label(), side_of(ctx, v), e.message))))
+                    .ok()
+            }
+            Some(Err(e)) => {
+                ctx.warnings.push(validity::warn("Video", format!("{} · {} block: no video: {}", s.label(), side_of(ctx, v), e.message)));
+                None
+            }
+            None => None,
+        };
         // Native stacks of the measured runs only: warmup runs, and each run's reset between them,
         // are sampled too (the session runs throughout) and are not the case.
         let stacks_note = match &stacks {
@@ -893,7 +931,6 @@ fn runs(
             None if set == Set::Attribution => crate::probe::stacks::no_stacks().into(),
             None => String::new(),
         };
-        super::keep_actions(ctx, &dir)?;
         store::write_json(
             &dir.join("meta.json"),
             &json!({
@@ -903,7 +940,7 @@ fn runs(
                 "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
                 // The OS and GPU samples over the measured runs, for `query gpu`.
                 "os": samples.window(measured[0].t0, measured[measured.len() - 1].t1), "leak": leak_result,
-                "timing": if set == Set::Timing || set == Set::Lean { "clean" } else { "perturbed" },
+                "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" }, "video": video,
                 "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
             }),
         )?;

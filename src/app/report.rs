@@ -162,7 +162,10 @@ fn attach_series(data: &mut Value) -> Option<Value> {
         });
         let mut out = json!({});
         for (role, h) in sides {
-            if let Some(h) = h {
+            if let Some(mut h) = h {
+                if implementations {
+                    timed_side(s, role, &mut h["side"]);
+                }
                 out[role] = h;
             }
         }
@@ -274,6 +277,35 @@ fn attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
     Some(h)
 }
 
+/// A side's CPU from its timed blocks, which no profiler slowed (rule 2): a profiled browser spends
+/// many times its timed CPU in its own renderer (the sampler, the trace), a native sampler little,
+/// so profiled totals on one scale would compare the profilers. `cpu_ms_per_run` becomes the timed
+/// pairs' median (the profiled launch's own is kept as `profiled_cpu_ms_per_run`), and a browser's
+/// processes by role come from the timed blocks' per-side shares when the series kept them.
+fn timed_side(s: &Value, role: &str, side: &mut Value) {
+    let comparisons = std::iter::once(&s["primary"]).chain(["secondaries", "descriptive"].iter().flat_map(|k| s[*k].as_array().into_iter().flatten()));
+    let median = |metric: &str| comparisons.clone().find(|c| c["metric"] == metric).and_then(|c| c[role].as_f64()).filter(|x| x.is_finite());
+    side["profiled_cpu_ms_per_run"] = side["cpu_ms_per_run"].clone();
+    side["cpu_ms_per_run"] = json!(median("cpu.work"));
+    let ps = &s["per_side"][role];
+    let (Some(dur), Some(total)) = (median("run.duration"), median("cpu.work")) else { return };
+    let mut rows: Vec<Value> = Vec::new();
+    for (metric, name) in [("cpu.renderer", "renderer"), ("cpu.gpu", "GPU process"), ("cpu.browser", "browser")] {
+        if let Some(pct) = ps[metric]["median"].as_f64() {
+            rows.push(json!({ "name": name, "ms": pct / 100.0 * dur }));
+        }
+    }
+    if rows.is_empty() {
+        return;
+    }
+    let named: f64 = rows.iter().filter_map(|r| r["ms"].as_f64()).sum();
+    if total - named > 0.005 * total {
+        rows.push(json!({ "name": "other (utility, network, …)", "ms": total - named }));
+    }
+    side["processes"] = json!(rows);
+    side["processes_from"] = json!("timed");
+}
+
 /// One side of an implementation comparison on its own (SPEC §11.2), profiled with its own engine's
 /// tools: what `attribution` keeps, its call tree (`tree`, the diff flame's shape with one value per
 /// node) and `side`: CPU per run by process (a browser's roles, a native app's programs) and by
@@ -341,6 +373,7 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
                 rows.push(json!({ "name": "other (utility, network, …)", "ms": total - named }));
             }
             side["processes"] = json!(rows);
+            side["processes_from"] = json!("profiled");
         }
     } else {
         // A native app's processes by program, and its threads by whose code they started in.
@@ -375,6 +408,7 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
             .collect();
         procs.sort_by(|a, b| b["ms"].as_f64().unwrap_or(0.0).total_cmp(&a["ms"].as_f64().unwrap_or(0.0)));
         side["processes"] = json!(procs);
+        side["processes_from"] = json!("profiled");
         // macOS keeps no thread's start module: its threads' origins are unknown, so none are listed.
         if origins.keys().any(|o| o != "unknown") {
             side["origins"] = json!(["app", "driver", "os", "unknown"].iter().filter_map(|o| Some(json!({ "name": o, "ms": origins.get(*o)? }))).collect::<Vec<_>>());

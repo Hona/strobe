@@ -334,7 +334,7 @@
         "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
         "attribution": { "type": ["object", "string", "null"], "description": "The attribution recording per variant (check: the one recording)." },
         "timing_recordings": { "type": "array" },
-        "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base, head, changed." },
+        "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base and head (each with its first block's thumb_start and thumb_end as data URLs), changed (builds only)." },
         "pixels": { "description": "--pixels: per snapshot, whether base and head drew the same pixels." },
         "leak": { "type": "object", "description": "A leak series: growth verdicts per variant (js_heap, dom_nodes or native_host, each with verdict and verdict_kind)." },
         "runs_per_half": { "type": "integer" },

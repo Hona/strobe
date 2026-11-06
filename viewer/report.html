@@ -2529,13 +2529,18 @@ function renderImplAttribution(r, s, nameOf) {
   const ms = (x, role) => `${fmtVal(x, "ms")}${timed(role) ? "" : " *"}`;
   const ms1 = (x) => fmtVal(x, "ms");
   const bytes = (x) => fmtBytes(x);
-  const pair = (title, note, key, fmt) => {
+  const pair = (title, note, key, fmt, foot) => {
     if (!roles.some((role) => lists[key](role).length)) return null;
     return [
       h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, title), note ? h("span", { class: "sec-sub" }, note) : null),
-      h("div", { class: "impl-grid" }, roles.map((role) => h("div", {}, att(role) ? bars(key, role, fmt) : h("div", { class: "sec-sub" }, "not profiled")))),
+      h("div", { class: "impl-grid" }, roles.map((role) => h("div", {},
+        att(role) ? bars(key, role, fmt) : h("div", { class: "sec-sub" }, "not profiled"),
+        foot && foot(role) ? h("div", { class: "sec-sub", style: "margin-top:4px" }, foot(role)) : null))),
     ];
   };
+  const processesFrom = (role) => !lists.processes(role).length ? null
+    : sd(role)?.processes_from === "timed" ? "From the timed blocks (each role's share of a core × the run), no profiler running"
+      : "From its profiled launch: its threads' CPU from the OS";
   const head = (role) => {
     const a = att(role), x = sd(role);
     if (!a) {
@@ -2550,7 +2555,8 @@ function renderImplAttribution(r, s, nameOf) {
       h("div", { class: "impl-kv" },
         h("span", {}, "Profiled with"), h("span", {}, x?.profiler ? `${x.profiler}${x.engine === "native" ? "; threads and memory from the OS" : "; heap snapshot, forced layouts, GC"}` : "no stacks (threads and memory from the OS)"),
         h("span", {}, "Samples named"), h("span", { style: low ? "color:var(--warn-ink)" : "" }, named ? `${(100 * named.share).toFixed(1)}% ${named.what}${low ? " (under 95%: Unresolved)" : ""}` : "—"),
-        h("span", {}, "CPU per run"), h("span", {}, finite(x?.cpu_ms_per_run) ? fmtVal(x.cpu_ms_per_run, "ms") : "—"),
+        h("span", {}, "CPU per run"), h("span", {}, finite(x?.cpu_ms_per_run) ? `${fmtVal(x.cpu_ms_per_run, "ms")} in the timed pairs` : "—"),
+        h("span", {}, "Profiled launch"), h("span", {}, finite(x?.profiled_cpu_ms_per_run) ? `${fmtVal(x.profiled_cpu_ms_per_run, "ms")} per run, its profiler's work included` : "—"),
         h("span", {}, "Measured runs"), h("span", {}, x?.per_run ? String(x.runs) : x?.untimed ? "whole capture (samples carry no times)" : "unknown"),
       ),
       h("div", { style: "margin-top:6px" },
@@ -2638,9 +2644,9 @@ function renderImplAttribution(r, s, nameOf) {
       h("div", { class: "card-hd-right" }, toggle)
     ),
     h("div", { class: "impl-grid" }, roles.map(head)),
-    pair("By process", "CPU per run of each process, from the OS (a browser's by role)", "processes", ms1),
-    pair("By whose threads", "app: started in the app's code · driver: a device driver's user-mode part · os: the OS's pools and services", "origins", ms1),
-    pair("Busiest threads", "CPU per run, from the OS", "threads", ms1),
+    pair("By process", "CPU per run of each process, from the OS (a browser's by role)", "processes", ms1, processesFrom),
+    pair("By whose threads", "in the profiled launch · app: started in the app's code · driver: a device driver's user-mode part · os: the OS's pools and services", "origins", ms1),
+    pair("Busiest threads", "CPU per run in the profiled launch, from the OS", "threads", ms1),
     kinds.length ? [
       h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, "Call trees"), h("span", { class: "sec-sub" }, "A browser's profile covers its JavaScript; native stacks cover every thread · width: time against the larger side")),
       h("div", { class: "impl-grid" }, roles.map((role) => h("div", {}, icicle(role)))),

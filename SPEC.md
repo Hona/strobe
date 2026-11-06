@@ -2796,8 +2796,11 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   their own, Details (Metrics with side-name columns and a footnote whose confidence comes from the
   comparisons and the plan's looks; Pairs; Per implementation, not compared, from
   `series[].per_side`; Equivalence checked; Where each spends its time, from each side's profiled
-  launch, never a diff: CPU per run, its share by process (a browser's renderer, GPU process, browser
-  and the rest; a native app's programs), by whose threads (app, driver, os: native sides), the
+  launch, never a diff: CPU per run in the timed pairs and in the profiled launch (a profiled browser
+  spends many times its timed CPU on its own sampler and trace, a native sampler little, so totals
+  that share a scale come from the timed pairs), its share by process (a browser's renderer, GPU
+  process, browser and the rest from its timed blocks' per-side numbers; a native app's programs from
+  its profiled launch), by whose threads (app, driver, os: native sides), the
   busiest threads, the top packages or crates by their share of the side's sampled time, and how much
   of its samples were named; How it was measured: both identities, machine, window, input, observer and frame
   source, fixture, what CPU counts, method, "Not checked by strobe"), and Rerun (`--base original
@@ -2827,7 +2830,8 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
   table, its per-side numbers, and Where each spends its time: two columns, one per implementation,
   each side's profiled launch read on its own (`hotspots.<side>.side` and `.tree` in the payload,
   `report::side_attribution`): how it was profiled and how much of its samples were named, CPU per
-  run by process and by whose threads, the busiest threads, its call tree as an icicle (CPU time,
+  run (timed, and in the profiled launch) by process (as the PR block takes them) and by whose
+  threads (none on macOS, which keeps no thread's start), the busiest threads, its call tree as an icicle (CPU time,
   or allocations; click to zoom), its top functions and packages by self time, and its memory by
   part, every list on one scale for both columns (ms per run, bytes), so a bar's length compares
   across them; an icicle is as wide as its side's sampled time against the larger side's. Untimed

@@ -504,8 +504,11 @@ impl<'a> Doc<'a> {
                     t += &format!("| {who}{what} | {} | {} |\n", x.unwrap_or_else(dash), y.unwrap_or_else(dash));
                 }
             };
-            row("CPU per run, profiled", b["cpu_ms_per_run"].as_f64().map(|x| nb(&disp(x, "ms"))), h["cpu_ms_per_run"].as_f64().map(|x| nb(&disp(x, "ms"))));
-            row("By process", shares(&b["processes"], 4, None, false), shares(&h["processes"], 4, None, false));
+            let ms = |x: &Value, k: &str| x[k].as_f64().map(|v| nb(&disp(v, "ms")));
+            row("CPU per run, timed pairs", ms(b, "cpu_ms_per_run"), ms(h, "cpu_ms_per_run"));
+            row("CPU per run, profiled launch", ms(b, "profiled_cpu_ms_per_run"), ms(h, "profiled_cpu_ms_per_run"));
+            let from = |x: &Value| if x["processes_from"] == "timed" { " <sub>timed</sub>" } else { "" };
+            row("By process", shares(&b["processes"], 4, None, false).map(|t| t + from(b)), shares(&h["processes"], 4, None, false).map(|t| t + from(h)));
             row("By whose threads", shares(&b["origins"], 4, None, false), shares(&h["origins"], 4, None, false));
             row("Busiest threads", threads(s, "base"), threads(s, "head"));
             // Packages by their share of the side's sampled time, so a long tail reads as such.
@@ -515,7 +518,7 @@ impl<'a> Doc<'a> {
         if !any {
             return String::new();
         }
-        t + "\n<sub>From one profiled launch per implementation, apart from the timed pairs and slowed by the profiler: where each one's time goes, each measured by its own engine's tools (a browser's profile covers its JavaScript; native stacks cover every thread), never a change.</sub>\n\n"
+        t + "\n<sub>From one profiled launch per implementation, apart from the timed pairs and slowed by its profiler (a browser's far more than a native app's, so totals come from the timed pairs): where each one's time goes, each measured by its own engine's tools (a browser's profile covers its JavaScript; native stacks cover every thread), never a change.</sub>\n\n"
     }
 
     /// How it was measured: both implementations, the machine and window, the fixture, the method.

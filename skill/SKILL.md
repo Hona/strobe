@@ -580,6 +580,8 @@ Fewer than 6 pairs never gets a verdict.
   - `bench <file> --base original --head rewrite` (`<target>[=<variant>]`: `rewrite=git:main`, `original=exe:/path`; `target:<name>` when a folder has the name).
   - Each target has a `name` (what every report calls it); `cwd: "../other-repo"` takes that repo's strobe.json for its builds and app profiles.
   - Both talk to one `fixture("<server> --port {port}", { seed })`: strobe starts it per block outside both apps; pass `{fixture.url}` in the targets' `args`, `env` or `files`.
+    - `FixtureMismatch`: no connection the fixture answered, a side served its port itself, or ran its executable (or a copy).
+  - A declared `viewport` holds on both sides (app windows sized through the OS); a side that shows another size, or that strobe cannot measure (a native app on macOS, a native launch), refuses `VariantMismatch` naming it: drop `viewport` from both.
   - Pick a primary both sides measure the same way: `cpu.work`, `run.duration`, `launch.ready`, `memory.app.private`; `main.work` or `ui.cpu` against another engine exits 2 (`NotComparable`).
   - Give each target a `ui` adapter for what differs: `ui: { timeline: ".scroll-view", openSession: ({ page }) => page.click("@row") }`; journeys say `page.scroll("@timeline", …)`, `await ctx.ui.openSession()`, `until: "@timeline"`, `"@row index=-1"` (the last).
   - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case, or just an `@name` its `ui` lacks (a parity gap: listed with the missing name, never run).
@@ -661,6 +663,8 @@ Never put hand-measured timings, single recordings or `--check` smoke numbers in
 - Sandboxed Mac apps (TextEdit) are refused: their data lives in your `~/Library`.
 - macOS counts wakes per process, IO as disk bytes, no VRAM per process, and samples stacks with `/usr/bin/sample` (untimed).
 - A macOS Cocoa app launches isolated only while its `~/Library` data does not exist (`LiveChannel` names the folder).
+  - Its Documents, Application Support and caches land in the home (`CFFIXED_USER_HOME`); its preferences still go to your `~/Library/Preferences`.
+- A copy that adds a file to your real Documents, Desktop or Downloads stops the experiment (an isolation gap, or your own save meanwhile: run again).
 - A source build run as a bare executable with its data folder moved by an env var lists that folder in the profile's `moved`.
 
 ### Background priority

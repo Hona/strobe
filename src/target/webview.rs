@@ -75,7 +75,8 @@ pub fn ask_close(pids: &[u32]) -> usize {
     }
 }
 
-/// The window a webview app's page shows in, as the block has it: with `place`, its main window moved
+/// The window an app's page shows in (a webview's, an Electron app's), as the block has it: with
+/// `place`, its main window moved
 /// to the block's place and, with `size`, its client area sized so the page's viewport is the block's
 /// width × height CSS pixels (a second pass takes off what the app draws around its webview). Returns
 /// the main window's place and the page's own viewport and scale, which is what result.json records.
@@ -91,6 +92,17 @@ pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Windo
         let (w, h, scale) = inner()?;
         return Ok(Window { x: main.rect.0, y: main.rect.1, width: w as u32, height: h as u32, scale: Some(scale) });
     };
+    // macOS moves and sizes another app's window only through the accessibility API: without the
+    // permission nothing would move, and the app would read as one that keeps its size.
+    #[cfg(target_os = "macos")]
+    if size && !crate::host::macos::accessibility_trusted() {
+        let (app, pane) = (crate::host::macos::responsible_app(), crate::host::macos::accessibility_pane());
+        return Err(Error::usage(format!(
+            "sizing {}'s window to the target's viewport needs the accessibility permission, which {app} (the app strobe runs under) does not have",
+            browser.exe.display()
+        ))
+        .hint(format!("{pane}: turn on {app}, or drop viewport from the target")));
+    }
     let want = (at.width as f64, at.height as f64);
     let settled = |client: Option<(u32, u32)>| -> crate::model::Result<(f64, f64, f64)> {
         crate::host::place_window(&main, at.x, at.y, client);

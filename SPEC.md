@@ -2471,21 +2471,29 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   ends it with the block; its output goes to the experiment's `fixture.log`. `{fixture.url}`
   (`http://127.0.0.1:<port>`), `{fixture.port}`, `{fixture.pid}` and `{fixture.home}` (its own
   folder, where a service it starts may register itself) are filled into the target's
-  `args`, `env`, `files` and `url` (a string that is exactly `{fixture.port}` or `{fixture.pid}`
-  becomes a number), and
+  `args`, `env`, `files` and `url` (in a `files` entry a string that is exactly `{fixture.port}` or
+  `{fixture.pid}` becomes a number; an argument or a variable stays a string), and
   hooks get `ctx.fixture { url, port, pid, home }`. A fixture works in any bench, of builds too.
   - It runs on the CPUs the target is not pinned to, given to it at its spawn (not inherited: in the
     daemon only the bench's thread moves there).
   - `cpu.fixture` is the fixture's process tree's CPU per run (cycles where the OS has them), read at
     each run's two ends, in every block with runs, declared or not.
   - `FixtureMismatch` refuses a block whose target's process set held no established TCP connection
-    to the fixture's port after setup, at any run's start or end, or (a launch case) once the launch
-    was ready (Windows `GetExtendedTcpTable`; Linux `/proc/net/tcp`, `tcp6` and the processes'
-    descriptors; macOS each process's TCP sockets through `proc_pidfdinfo`, `TSI_S_ESTABLISHED`), or
-    where a process of the set runs one of the fixture's executables: an app that started its own
-    server. Shells and script runtimes (`node`, `bun`, `deno`, `python`, …) are left out of that
+    that the fixture answered after setup, at any run's start or end, or (a launch case) once the
+    launch was ready. strobe reads the listening and established TCP sockets of the side's processes
+    and the fixture's (its tree and what carries its home's stamp): Windows `GetExtendedTcpTable`;
+    Linux `/proc/net/tcp`, `tcp6` and the processes' descriptors; macOS each process's TCP sockets
+    through `proc_pidfdinfo` (`TSI_S_LISTEN`, `TSI_S_ESTABLISHED`). A loopback connection's other end
+    is the socket with its two ports swapped: one the fixture's processes hold counts; one a side's
+    process holds, or a side's process listening on the fixture's port (on another address, which
+    macOS and Windows allow), refuses the block (the app served the port itself). A connection with no
+    other end among them (not accepted yet, or the fixture's server is a process strobe cannot read,
+    such as a container's port forward) counts unless a side's process listens on that port. Also
+    refused: a process of the set that runs one of the fixture's executables, by path or by content
+    (same size and SHA-256, read once per path: an app that copies a bundled server elsewhere and
+    starts it). Shells and script runtimes (`node`, `bun`, `deno`, `python`, …) are left out of that
     check, since a side may run one for anything: an interpreted fixture is checked by its
-    connections only.
+    connections only. `scripts/dev/fixture.bench.ts` shows each refusal (Windows).
   - result.json's `fixture { command, seed, seed_sha256 (paths and contents of every seed folder
     used), connected {base, head}, cpu_ms_per_run {base, head} }`.
 - **Same conditions** (`VariantMismatch`, §10.1, implementation rules): build command, env, engine
@@ -2495,10 +2503,16 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   `strobe plan` refuses the same. Each side's app profile and guards are checked before anything
   builds against its own project's strobe.json, as a single target's are. After each block: what the app drew in (more than 2 DIP
   apart) or its scale against the other side's first block of the series: a native app's client
-  area from the OS, a page's viewport (`innerWidth` × `innerHeight`, `devicePixelRatio`). Not for a
-  native side on macOS, whose window list gives a window's frame with its title bar, not its content
-  (checked on air: a 640×480 page read 648×611 as a window, a Cocoa app 640×512); there the
-  declared viewports stand. Native sides also their GPU adapter and scale (`admit_setup`, across
+  area from the OS, a page's viewport (`innerWidth` × `innerHeight`, `devicePixelRatio`; a launch
+  case's once it is ready). With a declared viewport each side must also show it (within 2 DIP), or
+  the block refuses naming the side: a page's browser window and an app's window (a webview's, an
+  Electron app's, through the OS as a native app's: DevTools resizes no app window) are sized to it
+  before the runs, a web launch's before its navigation; an app's launch is timed in the window
+  the app opens, unresized. A side strobe cannot measure (a native side on macOS, whose window list
+  gives a window's frame with its title bar, not its content: checked on air, a 640×480 page read
+  648×611 as a window, a Cocoa app 640×512; a native launch) cannot be held to a declared viewport
+  and refuses too; without one it is not compared. result.json's `fairness.window.client_dip` is
+  set only when both sides were measured. Native sides also their GPU adapter and scale (`admit_setup`, across
   the sides). One case means one launch `profile`, priority and CPU pinning for both. Not built yet: a
   page side's `ctx.mock` (a mock one side has and the other cannot) and the GPU adapter of a page side.
 - **Pages from outside.** A timed block of a page or Electron side against a native or script side
@@ -2592,8 +2606,8 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
-| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block) |
-| `FixtureMismatch` | a block's target held no TCP connection to the bench file's fixture at any run's start or end, or one of its processes runs the fixture's executable (it started its own server), §9.10 |
+| `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block); a side whose content area is off its declared viewport by over 2 DIP, or that strobe cannot measure while a viewport is declared (named) |
+| `FixtureMismatch` | a block's target held no TCP connection the bench file's fixture answered at any run's start or end, or one of its processes served the fixture's port itself or runs the fixture's executable or a copy of it (it started its own server), §9.10 |
 | `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10). Also a question with no answer between two implementations: `query a..b` of their recordings, or a base..head view of `query <exp>` (exit 2, §11.1). At exit 2 it stays typed: the error carries the validator (`--json` and MCP give `validator: "NotComparable"`), so nothing reads its message |
 | `InputMismatch` | the sides of an implementation comparison got other input (§9.10): one acted through accessibility actions where the other got pointer or key input, a kind of input call in their runs differs by over 5% (not with steps per target), or their drags' `input.rate` does (the series, from that pair); OS input posted to a page measured from outside did not reach it (the block); a run of a page from outside in an engine strobe gives no OS input sends input |
 | `NotEquivalent` | the sides of an implementation comparison did not do the same journey (§9.10): an `expect.same` element read differently after setup, a run or a reset, or showed on neither side at any point (the series, from that pair); or their latency samples (`interaction.n`, `scroll.n`) are under 0.8 or over 1.25 times each other (refuses `interaction.*` or `scroll.latency.*`) |
@@ -3137,10 +3151,11 @@ implementation name (`variants[].name`), never "before" and "this PR" (`app/pr/i
     leaves either empty or both the same.
   - What CPU summed is said once, in the footer: a CPU time headline says only `CPU time per run`
     (`per launch` for a launch); another Care metric keeps its note under the headline.
-  - A journey row's metric names a launch by what it waited for: `time until the window settles`
-    (or `first paints`, or `time until <milestone>`) when `launch.ready` equals that value in every
-    launch of both sides (`pr::ready_noun`; the PR block's journey line says the same), else
-    `time until ready`.
+  - A journey row's metric names a launch by what it waited for, from the series' `until` in
+    result.json: `time until the window settles` (or `first paints`, `shows`, or `time until
+    <milestone>`), else (a selector) `time until ready` (`pr::ready_noun`; the PR block's journey
+    line says the same). A result from before `until` was recorded is read from its launches: the
+    moment `launch.ready` equals in every launch of both sides.
   - No number is cut: a line too wide shrinks first (the medians break after `→` onto two lines
     below 85%), a journey title keeps its parameters and cuts the words before them, and an ellipsis
     comes only past the smallest size. A gap row's words sit on the background, clear of no
@@ -3520,11 +3535,26 @@ Strobe launches any Electron app the same way, with no change to the app:
   `.local/state`, `.config`, `.cache`, and the known folders `Documents`, `Desktop`, `Downloads`,
   `Pictures`, `Music`, `Videos` (Electron's `app.getPath("documents")` throws when the redirected
   profile lacks them; an isolated desktop app showed "Failed to get 'documents' path"), with
-  `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and `XDG_*_HOME` pointing into it. Every path an app derives from those (its
-  profile, single-instance lock, caches, its own background services' state) lands in the home,
-  so the app's identity or channel does not matter.
+  `USERPROFILE`, `HOME`, `APPDATA`, `LOCALAPPDATA`, `TEMP`, `TMP` and `XDG_*_HOME` pointing into it,
+  and on macOS `CFFIXED_USER_HOME`: Cocoa resolves the home (`NSHomeDirectory`) and the user's
+  folders (`NSSearchPathForDirectoriesInDomains`: Documents, Desktop, Downloads, Application
+  Support, Caches, Logs) from the account, not `HOME`, and only that variable moves them (checked on
+  air, macOS 27: without it an isolated Electron app's `app.getPath("documents")` was the user's own
+  `~/Documents` and its userData `~/Library/Application Support/<name>`; with it both were in the
+  home). Every path an app derives from those (its profile, single-instance lock, caches, its own
+  background services' state) lands in the home, so the app's identity or channel does not matter.
 - `--remote-debugging-port=0`; strobe finds `DevToolsActivePort` wherever the app's userData
-  folder is inside the home (a stale one from a seed is removed first).
+  folder is inside the home (a stale one from a seed is removed first). Chromium keeps the key to
+  an app's encrypted data (Electron's `safeStorage`, cookies) in the user's keychain (macOS) or
+  keyring (Linux), which no home moves: an Electron launch adds `--use-mock-keychain` (macOS) or
+  `--password-store=basic` (Linux), so the copy never reads or adds a user's entry, nor asks the
+  person to allow it (an isolated app that read an existing keychain entry waited on that prompt).
+  Data a seed carries encrypted with the user's key does not decrypt in the copy.
+- **Known folders** (`guard`, below, for every launch): the real home's `Documents`, `Desktop` and
+  `Downloads` (each folder's own time, a `stat`: macOS asks a person before an app lists them) must
+  not change while the copy runs. A file added to or removed from one stops the experiment as a
+  changed guard file does (a person's own save meanwhile reads the same: run again). A write deeper
+  in an existing folder is not seen.
 - **`LiveChannel`**: refuses when the executable is already running, or when a guarded process
   (below) runs from the app's install folder or a data folder of the same name. The user's own
   app is never the thing to experiment on. An interpreter as the executable (python, node, bun,
@@ -3694,9 +3724,11 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   into the home before launch and restores it (or deletes it, if it was absent) on close (Windows).
 - **macOS: `HOME` does not move an app's Library.** Cocoa resolves the home from the user's account,
   never `HOME` (`NSHomeDirectory`, Application Support, caches, saved window state: checked on macOS
-  27), and `cfprefsd` writes preferences for the user. An app that only reads `HOME` (most CLI, Rust
-  and Node apps) is isolated as elsewhere; a Cocoa app's copy would write into the user's own
-  `~/Library` folders for its bundle id. So strobe launches such an app only while none of them exist
+  27); `CFFIXED_USER_HOME` moves those, but `cfprefsd` still writes preferences for the user
+  (checked on air: `defaults write` under it wrote the user's own `~/Library/Preferences`). An app
+  that only reads `HOME` (most CLI, Rust and Node apps) is isolated as elsewhere; a Cocoa app's copy
+  may still write into the user's own `~/Library` folders for its bundle id. So strobe launches such
+  an app only while none of them exist
   (`Preferences/<id>.plist`, `Application Support/<id>` and `/<name>`, `Caches/<id>`, `Saved
   Application State/<id>.savedState`, `HTTPStorages`, `WebKit`, `Cookies`, `Containers/<id>`): a build
   with its own bundle id, or an app this account never ran. It records which may appear and removes

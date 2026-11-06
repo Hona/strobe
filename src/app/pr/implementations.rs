@@ -138,12 +138,22 @@ fn pairs_span(series: &[&Value]) -> String {
     }
 }
 
-/// What a launch journey's `launch.ready` waited for, read from its launches: `time until the window
-/// settles` (or first paints, or reaches a milestone) when ready fell on that moment in every launch
-/// of both sides; None for a selector, a window that showed, or a series that is not a launch.
+/// What a launch journey's `launch.ready` waited for, as the series records it (`until`): `time until
+/// the window settles` (or first paints, shows, or reaches a milestone); None for a selector or a
+/// series that is not a launch. A result from before `until` was recorded is read from its launches:
+/// the moment ready fell on in every launch of both sides.
 pub fn ready_noun(s: &Value) -> Option<String> {
     if s["kind"] != "launch" || s["primary"]["metric"] != "launch.ready" {
         return None;
+    }
+    if let Some(end) = s["until"]["end"].as_str() {
+        return match end {
+            "settled" => Some("time until the window settles".into()),
+            "painted" => Some("time until the window first paints".into()),
+            "visible" => Some("time until the window shows".into()),
+            "milestone" => s["until"]["milestone"].as_str().map(|m| format!("time until {m}")),
+            _ => None,
+        };
     }
     let blocks: Vec<&Value> = s["blocks"].as_array()?.iter().filter(|b| b["values"]["launch.ready"].is_number()).collect();
     let mut ends: Vec<String> = vec!["launch.settled".into(), "launch.painted".into()];

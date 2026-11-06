@@ -602,10 +602,15 @@ pub(super) fn symbolic(spec: &str) -> String {
     format!("exe:…/{}", parts.into_iter().rev().collect::<Vec<_>>().join("/"))
 }
 
-/// A note strobe wrote, in the report's words: this PR and before for head and base, and metric ids by
-/// their names.
-pub(super) fn plain_note(text: &str) -> String {
-    let t = text.replacen("head: ", "this PR: ", 1).replacen("base: ", "before: ", 1);
+/// A note strobe wrote, in the report's words: each side by its word (`before` and `this PR`, or an
+/// implementation's compact name) where the note names base or head (`head: …`, `base attribution
+/// block failed`), and metric ids by their names.
+pub(super) fn plain_note(text: &str, (base, head): (&str, &str)) -> String {
+    let roles = regex_lite::Regex::new(r"\b(base|head)(: | attribution block\b)").expect("pattern");
+    let t = roles.replace_all(text, |c: &regex_lite::Captures| {
+        let side = if &c[1] == "base" { base } else { head };
+        if &c[2] == ": " { format!("{side}: ") } else { format!("{side}'s attribution block") }
+    });
     let ids = regex_lite::Regex::new(r"\b[a-z]+(\.[a-z0-9]+)+\b").expect("pattern");
     ids.replace_all(&t, |c: &regex_lite::Captures| if model::metric(&c[0]).is_some() { lc(&noun(&c[0])) } else { c[0].to_string() }).to_string()
 }

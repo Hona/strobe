@@ -295,6 +295,18 @@ pub struct Guard {
     checks: Vec<Check>,
     /// Seed files the home shares with other launches: none may change.
     pub shared: Vec<Shared>,
+    /// The user's own known folders (`KNOWN_FOLDERS` in the real home) and when each last changed:
+    /// a file the copy added or removed there changes its folder's time.
+    folders: Vec<(PathBuf, Option<std::time::SystemTime>)>,
+}
+
+/// The user's folders an app writes into without being asked to (an onboarding project, a saved or
+/// downloaded file), watched in the real home while a copy runs. Only each folder's own time is read
+/// (a `stat`), never its contents: macOS asks a person before an app lists them.
+const KNOWN_FOLDERS: &[&str] = &["Documents", "Desktop", "Downloads"];
+
+fn modified(p: &Path) -> Option<std::time::SystemTime> {
+    std::fs::metadata(p).ok()?.modified().ok()
 }
 
 #[derive(Clone, Debug)]
@@ -323,12 +335,28 @@ impl Guard {
                 Check { file: g.file.clone(), before, pid, addr }
             })
             .collect();
-        Guard { checks, shared: Vec::new() }
+        let folders = KNOWN_FOLDERS
+            .iter()
+            .map(|d| {
+                let p = host::home().join(d);
+                let when = modified(&p);
+                (p, when)
+            })
+            .collect();
+        Guard { checks, shared: Vec::new(), folders }
     }
 
     /// Fails when a guarded file changed, or its process stopped running or answering, or the app
-    /// wrote to a seed file its home shares with other launches.
+    /// wrote to a seed file its home shares with other launches, or something was added to or
+    /// removed from one of the user's own known folders.
     pub fn check(&self, when: &str) -> Result<()> {
+        if let Some((p, _)) = self.folders.iter().find(|(p, before)| modified(p) != *before) {
+            return Err(Error::msg(format!(
+                "stopped {when}: something added or removed a file in your {} while the copy ran; strobe never measures past disturbed user state",
+                p.display()
+            ))
+            .hint("an isolation gap when the copy wrote it: add the env var, switch or file that keeps that folder in its home to its profile in strobe.json apps; if it was you or another program, run again"));
+        }
         if let Some(s) = self.shared.iter().find(|s| stamp(&s.cache) != Some((s.len, s.modified))) {
             return Err(Error::msg(format!(
                 "stopped {when}: the app changed {}, a large seed file strobe shares read-only between launches (as {}), so later launches would not start from the same seed",
@@ -961,6 +989,13 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
     .collect();
+    // macOS: Cocoa resolves the home (`NSHomeDirectory`) and the user's folders (`NSSearchPath…`:
+    // Documents, Desktop, Downloads, Application Support, Caches, Logs) from the account, not `HOME`;
+    // CoreFoundation's fixed-home variable moves all of them into the home. Preferences still go
+    // through `cfprefsd` to the user's own Library (the Library rule below).
+    if cfg!(target_os = "macos") {
+        env.push(("CFFIXED_USER_HOME".into(), text(&home)));
+    }
     env.extend(app.env.iter().map(|(k, v)| (k.clone(), fill(v))));
     // Last, so no profile replaces them: what tells strobe's launches (and what they start) apart.
     env.extend(launch_env(&home));
@@ -1180,10 +1215,11 @@ pub fn restore_protocols(home: &Path) {
     let _ = home;
 }
 
-/// macOS keeps an app's data where no environment variable reaches: Cocoa resolves the home from the
-/// user's account, never `HOME` (`NSHomeDirectory`, Application Support, caches, saved window state),
-/// and `cfprefsd` writes its preferences for the user. A launched copy writes into the user's own
-/// `~/Library` folders for its bundle id. So strobe launches such an app only while none of those
+/// macOS keeps an app's data where `HOME` does not reach: Cocoa resolves the home from the user's
+/// account (`NSHomeDirectory`, Application Support, caches, saved window state), which only
+/// `CFFIXED_USER_HOME` (set by `prepare_home`) moves, and `cfprefsd` writes its preferences for the
+/// user whatever the process's home. A launched copy may still write into the user's own `~/Library`
+/// folders for its bundle id. So strobe launches such an app only while none of those
 /// folders exist (a build with its own bundle id, or an app this user never ran), records which it
 /// may create, and removes them (and the preferences domain) when the launch is released. A sandboxed
 /// app's container is in the user's Library too: refused.

@@ -1029,6 +1029,14 @@ impl<'a> Doc<'a> {
     pub(super) fn notes(&self) -> String {
         let r = self.r;
         let mut t = String::new();
+        // A note's base and head by the words the block uses for them: an implementation's compact
+        // name, as the card has it.
+        let sides = if crate::app::family::implementations(r) {
+            let (b, h) = side_names(r);
+            super::compact_names(&b, &h)
+        } else {
+            ("before".to_string(), "this PR".to_string())
+        };
         let mut seen: Vec<(String, String, Vec<String>)> = Vec::new();
         for (series, w) in r["warnings"]
             .as_array()
@@ -1048,7 +1056,7 @@ impl<'a> Doc<'a> {
             } else if let (true, Some((_, said))) = (id == "NoPresentSource", permission(raw)) {
                 ("NoPresentSource", said.to_string())
             } else {
-                (id, plain_note(&first_clause(&scrub_paths(raw), 150)))
+                (id, plain_note(&first_clause(&scrub_paths(raw), 150), (&sides.0, &sides.1)))
             };
             match seen.iter_mut().find(|(i, t, _)| i == id && *t == text) {
                 Some(e) => e.2.push(series),

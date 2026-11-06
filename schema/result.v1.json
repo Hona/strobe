@@ -308,6 +308,11 @@
         "session": { "enum": ["unlocked", "locked", "mixed"] },
         "pairs": { "type": "integer" },
         "launches": { "type": "integer" },
+        "until": {
+          "type": ["object", "null"],
+          "description": "A launch series: what each launch was timed until. end is visible, painted or settled (the window), milestone (with milestone, its name) or selector (with selector, the case's until). Null for other series; absent in older results (readers then infer it from the launches' values).",
+          "properties": { "end": { "enum": ["visible", "painted", "settled", "milestone", "selector"] }, "milestone": { "type": "string" }, "selector": {} }
+        },
         "stopped": { "type": "string", "description": "Why the series ended: primary decided, max pairs, max time, …" },
         "bound": { "type": "number" },
         "noworse": { "type": "object", "additionalProperties": { "type": "number" } },

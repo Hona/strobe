@@ -536,9 +536,39 @@ fn client_of(w: &host::TopWindow) -> [f64; 3] {
 
 /// `VariantMismatch` when the two sides of an implementation comparison showed different windows: a
 /// client area more than 2 device-independent pixels apart, or another scale (SPEC §9.10). A
-/// difference there is not the implementation.
+/// difference there is not the implementation. A side whose target asks for a viewport must show it,
+/// and a side strobe cannot measure cannot be held to one: both refuse, naming the side.
 fn admit_window(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()> {
-    let Some(mine) = b.client.filter(|_| ctx.implementations) else { return Ok(()) };
+    if !ctx.implementations {
+        return Ok(());
+    }
+    let target = &ctx.describe["targets"][v.target_of(s)];
+    let windowed = !matches!(target["kind"].as_str(), Some("script" | "cli")) && target["window"] != false;
+    let asked = target["viewport"].as_object().map(|vp| (vp.get("width").and_then(Value::as_f64).unwrap_or(0.0), vp.get("height").and_then(Value::as_f64).unwrap_or(0.0)));
+    let launch = if s.launch.is_object() { " (a launch case times the window the app opens: strobe does not resize it)" } else { "" };
+    match (asked.filter(|_| windowed), b.client) {
+        (Some((w, h)), Some(c)) if (c[0] - w).abs() > 2.0 || (c[1] - h).abs() > 2.0 => {
+            return Err(Error::refused(
+                "VariantMismatch",
+                format!("{}'s window showed {}×{}, not the viewport {w}×{h} its target asks for{launch}", v.name, c[0], c[1]),
+                "drop viewport from both targets (each app's own size is compared then), or let the app take the size",
+            ));
+        }
+        (Some((w, h)), None) => {
+            let why = if cfg!(target_os = "macos") && !s.launch.is_object() {
+                "macOS reports a native window's whole frame, title bar included".to_string()
+            } else {
+                format!("its blocks measure no content area{launch}")
+            };
+            return Err(Error::refused(
+                "VariantMismatch",
+                format!("strobe cannot read the content area of {}'s window ({why}), so it cannot hold it to the viewport {w}×{h} both targets ask for", v.name),
+                "drop viewport from both targets: each app opens at its own size",
+            ));
+        }
+        _ => {}
+    }
+    let Some(mine) = b.client else { return Ok(()) };
     let other = if v.role == "base" { "head" } else { "base" };
     if let Some(theirs) = ctx.windows.get(&format!("{}\n{other}", s.label())).copied()
         && ((mine[0] - theirs[0]).abs() > 2.0 || (mine[1] - theirs[1]).abs() > 2.0 || (mine[2] - theirs[2]).abs() > 0.01)
@@ -592,11 +622,14 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
         Some("native") => "accessibility",
         _ => "none",
     };
-    // What the sides drew in, as measured (`Block.client`), else the window strobe asked for.
-    let measured = series.iter().flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default()).find_map(|b| serde_json::from_value::<[f64; 3]>(b["client"].clone()).ok());
-    let (client, scale) = match measured {
-        Some(c) => (json!([c[0], c[1]]), json!(c[2])),
-        None => (json!([w.width, w.height]), json!(w.scale)),
+    // What the sides drew in, as measured (`Block.client`, which `admit_window` held equal on both),
+    // only when both sides were measured: a side strobe could not measure leaves it unknown.
+    let measured = |role: &str| {
+        series.iter().flat_map(|s| s["blocks"].as_array().cloned().unwrap_or_default()).filter(|b| b["variant"] == role).find_map(|b| serde_json::from_value::<[f64; 3]>(b["client"].clone()).ok())
+    };
+    let (client, scale) = match (measured("base"), measured("head")) {
+        (Some(c), Some(_)) => (json!([c[0], c[1]]), json!(c[2])),
+        _ => (Value::Null, Value::Null),
     };
     let gpu_cache = ctx.gpu_cache.values().next().map(|n| n.split(':').next().unwrap_or("").to_string());
     let some = |v: &Value| v["ops"].as_object().is_some_and(|o| !o.is_empty());
@@ -1601,7 +1634,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     }
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
-        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "primary": { "metric": s.primary }, "declared": declared,
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead,
         "log": log, "log_path": ctx.runner.log,
@@ -2004,6 +2037,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
+        "until": launch::until_of(&s.launch),
         "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
@@ -2540,6 +2574,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut out = json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
+        "until": launch::until_of(&s.launch),
         "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
@@ -3877,15 +3912,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
-        if !app && target.get("viewport").is_some_and(Value::is_object) {
+        let viewport = target.get("viewport").is_some_and(Value::is_object);
+        if !app && viewport {
             browser.fit_viewport(&page, window.width, window.height)?;
         }
-        // A webview app's window is placed like a native app's, and sized to the viewport; the block
+        // A webview app's window is placed like a native app's, and sized to the viewport; so is an
+        // Electron app's given a viewport (DevTools resizes no app window: the OS does). The block
         // records the page's own size, not the one asked for.
         if let (WebBrowser::Chromium(b), Page::Chromium(p)) = (&browser, &page)
-            && b.embedded
+            && (b.embedded || (app && viewport))
         {
-            ctx.used = Some(crate::target::webview::fit(b, p, Some(&window), target.get("viewport").is_some_and(Value::is_object))?);
+            ctx.used = Some(crate::target::webview::fit(b, p, Some(&window), viewport)?);
         }
         // The driver's frame waits use the browser's own rAF, kept before the page's scripts can replace it.
         page.add_init_script(crate::driver::NATIVE_RAF)?;

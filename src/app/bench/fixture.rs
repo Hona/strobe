@@ -1,8 +1,8 @@
 //! The bench file's `fixture()` (SPEC §9.10): a process both sides of a comparison talk to (a server
 //! with seeded data), started by strobe for every block in a group of its own and a home of its own,
 //! so it is in neither side's process set, and ended with the block. Its CPU per run is `cpu.fixture`
-//! (what each side made it do); a block whose app never connected to it, or ran its executable itself
-//! (an app that started its own server), is refused `FixtureMismatch`.
+//! (what each side made it do); a block whose app never connected to it, or served its port itself, or
+//! ran its executable (an app that started its own server), is refused `FixtureMismatch`.
 
 use super::*;
 use std::rc::Rc;
@@ -126,12 +126,24 @@ impl Spec {
         // an app that started its own copy. A script runtime (node, bun, python, …) runs anything, so
         // a side running one says nothing: an interpreted fixture gets no such check.
         let shells = ["cmd", "sh", "bash", "zsh", "dash", "pwsh", "powershell", "fish"];
-        let exes: Vec<PathBuf> = host::process_tree(pid)
+        let exes: Vec<(PathBuf, u64)> = host::process_tree(pid)
             .iter()
             .filter_map(|p| host::exe_of(p.pid))
             .filter(|e| !shells.contains(&e.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default().as_str()) && !isolate::interpreter(e))
+            .filter_map(|e| Some((e.clone(), std::fs::metadata(&e).ok()?.len())))
             .collect();
-        Ok(Rc::new(Running { owned: RefCell::new(Some(owned)), port, pid, home, exes, connected: Cell::new(false), checked: Cell::new(false), own_copy: RefCell::new(None) }))
+        Ok(Rc::new(Running {
+            owned: RefCell::new(Some(owned)),
+            port,
+            pid,
+            home,
+            exes,
+            digests: RefCell::new(BTreeMap::new()),
+            connected: Cell::new(false),
+            checked: Cell::new(false),
+            own_copy: RefCell::new(None),
+            own_port: Cell::new(None),
+        }))
     }
 
     /// What result.json says of the fixture: its command, seed and the seed's hash, whether every block
@@ -175,13 +187,20 @@ pub(super) struct Running {
     pub(super) port: u16,
     pub(super) pid: u32,
     home: PathBuf,
-    exes: Vec<PathBuf>,
+    /// The fixture's executables and their sizes.
+    exes: Vec<(PathBuf, u64)>,
+    /// SHA-256 of an executable, read once per path: a side's copy of the fixture's executable has
+    /// another path but the same bytes.
+    digests: RefCell<BTreeMap<PathBuf, Option<String>>>,
     /// A side's process held a connection to it at a run's start or end.
     connected: Cell<bool>,
     /// The connection was read at least once (a launch case reads none).
     checked: Cell<bool>,
-    /// A side's process that runs the fixture's executable: (pid, executable).
+    /// A side's process that runs the fixture's executable, or a copy of it: (pid, executable).
     own_copy: RefCell<Option<(u32, PathBuf)>>,
+    /// A side's process that served the fixture's port itself: listened on it, or answered a side's
+    /// connection to it.
+    own_port: Cell<Option<u32>>,
 }
 
 impl Running {
@@ -197,12 +216,17 @@ impl Running {
     /// a service it starts may register itself) filled into every string of a target's options (its
     /// args, env, files, url).
     pub(super) fn fill(&self, v: &Value) -> Value {
+        self.fill_in(v, false)
+    }
+
+    /// `fill`; `file` inside a `files` entry, where a JSON file's number stays a number (an argument
+    /// or a variable is always a string).
+    fn fill_in(&self, v: &Value, file: bool) -> Value {
         match v {
             Value::String(s) if s.contains("{fixture.") => {
-                // A JSON file's number stays a number.
                 match s.as_str() {
-                    "{fixture.port}" => return json!(self.port),
-                    "{fixture.pid}" => return json!(self.pid),
+                    "{fixture.port}" if file => return json!(self.port),
+                    "{fixture.pid}" if file => return json!(self.pid),
                     _ => {}
                 }
                 json!(
@@ -212,8 +236,8 @@ impl Running {
                         .replace("{fixture.home}", &self.home.display().to_string())
                 )
             }
-            Value::Array(a) => Value::Array(a.iter().map(|x| self.fill(x)).collect()),
-            Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), self.fill(x))).collect()),
+            Value::Array(a) => Value::Array(a.iter().map(|x| self.fill_in(x, file)).collect()),
+            Value::Object(o) => Value::Object(o.iter().map(|(k, x)| (k.clone(), self.fill_in(x, file || k == "files"))).collect()),
             other => other.clone(),
         }
     }
@@ -223,36 +247,87 @@ impl Running {
         super::script::cpu(self.pid)
     }
 
-    /// Reads which of a side's processes hold a connection to the fixture, and whether one runs the
-    /// fixture's own executable. Outside every timed span.
+    /// Reads whether a side's processes hold a connection that the fixture's own processes answer
+    /// (the other end of each loopback connection to its port, by its pair of ports), whether a side's
+    /// process serves the fixture's port itself, and whether one runs the fixture's executable or a
+    /// copy of it. Outside every timed span.
     pub(super) fn check(&self, side: &[u32]) {
-        if let Some(held) = host::tcp::connected(self.port, side) {
+        let fixture: Vec<u32> = host::process_set(self.pid, Some(&self.home)).iter().map(|p| p.pid).filter(|p| !side.contains(p)).collect();
+        let all: Vec<u32> = side.iter().chain(&fixture).copied().collect();
+        if let Some(socks) = host::tcp::sockets(&all) {
             self.checked.set(true);
-            if !held.is_empty() {
-                self.connected.set(true);
+            let listener = socks.iter().find(|s| s.listening && s.local == self.port && side.contains(&s.pid)).map(|s| s.pid);
+            if listener.is_some() {
+                self.own_port.set(listener);
+            }
+            for c in socks.iter().filter(|s| !s.listening && s.remote == self.port && side.contains(&s.pid)) {
+                // The connection's other end, among the processes read; a connection not accepted yet
+                // has none, and goes to whoever listens on the port.
+                match socks.iter().find(|p| !p.listening && p.local == c.remote && p.remote == c.local) {
+                    Some(p) if side.contains(&p.pid) => self.own_port.set(Some(p.pid)),
+                    Some(p) if fixture.contains(&p.pid) => self.connected.set(true),
+                    Some(_) => {}
+                    None if listener.is_none() => self.connected.set(true),
+                    None => {}
+                }
             }
         }
         if self.own_copy.borrow().is_none()
-            && let Some(hit) = side.iter().find_map(|&p| host::exe_of(p).filter(|e| self.exes.iter().any(|x| same_file(x, e))).map(|e| (p, e)))
+            && let Some(hit) = side.iter().find_map(|&p| host::exe_of(p).filter(|e| self.is_fixture_exe(e)).map(|e| (p, e)))
         {
             *self.own_copy.borrow_mut() = Some(hit);
         }
     }
 
-    /// `FixtureMismatch` for a block whose side never connected to the fixture, or ran its executable.
-    /// Some(connected) when it was read, None when the block read nothing (a launch case).
+    /// `exe` is one of the fixture's executables: the same file, or a copy (same size, same bytes).
+    fn is_fixture_exe(&self, exe: &Path) -> bool {
+        let len = std::fs::metadata(exe).map(|m| m.len()).ok();
+        self.exes.iter().any(|(x, n)| same_file(x, exe) || (len == Some(*n) && self.digest(x).is_some() && self.digest(x) == self.digest(exe)))
+    }
+
+    fn digest(&self, p: &Path) -> Option<String> {
+        use sha2::Digest;
+        use std::io::Read;
+        if let Some(d) = self.digests.borrow().get(p) {
+            return d.clone();
+        }
+        let d = (|| {
+            let mut f = std::fs::File::open(p).ok()?;
+            let (mut h, mut buf) = (sha2::Sha256::new(), vec![0u8; 1 << 20]);
+            loop {
+                match f.read(&mut buf).ok()? {
+                    0 => break,
+                    n => h.update(&buf[..n]),
+                }
+            }
+            Some(format!("{:x}", h.finalize()))
+        })();
+        self.digests.borrow_mut().insert(p.to_path_buf(), d.clone());
+        d
+    }
+
+    /// `FixtureMismatch` for a block whose side never connected to the fixture, served its port
+    /// itself, or ran its executable. Some(connected) when it was read, None when the block read
+    /// nothing (a launch case).
     pub(super) fn verdict(&self, side: &str) -> Result<Option<bool>> {
+        if let Some(pid) = self.own_port.get() {
+            return Err(Error::refused(
+                "FixtureMismatch",
+                format!("{side}'s process {pid} served the fixture's port {} itself (it listened there, or answered a connection to it): the app talked to a server of its own", self.port),
+                "point the app at the fixture ({fixture.url} in the target's args, env or files) and keep it from starting a server on that port",
+            ));
+        }
         if let Some((pid, exe)) = self.own_copy.borrow().clone() {
             return Err(Error::refused(
                 "FixtureMismatch",
-                format!("{side}'s process {pid} runs the fixture's own executable ({}): the app started a server of its own instead of using the fixture", exe.display()),
+                format!("{side}'s process {pid} runs the fixture's own executable or a copy of it ({}): the app started a server of its own instead of using the fixture", exe.display()),
                 "point the app at the fixture ({fixture.url} in the target's args, env or files) so it does not start its own",
             ));
         }
         if self.checked.get() && !self.connected.get() {
             return Err(Error::refused(
                 "FixtureMismatch",
-                format!("none of {side}'s processes held a connection to the fixture (port {}) after setup, at a run's start or end, or once its launch was ready", self.port),
+                format!("none of {side}'s processes held a connection the fixture (port {}) answered after setup, at a run's start or end, or once its launch was ready", self.port),
                 "point the app at the fixture: {fixture.url} or {fixture.port} in the target's args, env or files",
             ));
         }

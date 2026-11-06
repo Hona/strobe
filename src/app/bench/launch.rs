@@ -23,6 +23,24 @@ pub(super) struct Milestone {
 /// A line seen during a launch: when (epoch ms), its text, and where it came from.
 pub(super) type Line = (f64, String, String);
 
+/// What a launch series is timed until, as result.json records it (the series' `until`): `{ end:
+/// "visible" | "painted" | "settled" }` for the window, `{ end: "milestone", milestone }`, or `{ end:
+/// "selector", selector }`. Null for a series that is no launch.
+pub(super) fn until_of(launch: &Value) -> Value {
+    let u = &launch["until"];
+    if !launch.is_object() || u.is_null() {
+        return Value::Null;
+    }
+    // A milestone ends the launch before any window condition does (`native::launch_once`).
+    if let Some(m) = u["milestone"].as_str() {
+        return json!({ "end": "milestone", "milestone": m });
+    }
+    match u["window"].as_str() {
+        Some(w) => json!({ "end": w }),
+        None => json!({ "end": "selector", "selector": u }),
+    }
+}
+
 pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
     let key = format!("{}\n{}", s.label(), v.role);
     // The first launch of a build pays for its files being read from disk and scanned: one launch per
@@ -184,6 +202,10 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let mut cpu0 = 0;
         let started_ms = if web {
             let page = browser.page()?;
+            // The browser's window takes the viewport before the timed navigation, as a run case's does.
+            if target.get("viewport").is_some_and(Value::is_object) {
+                browser.fit_viewport(&page, window.width, window.height)?;
+            }
             let first = if target["prepare"].as_bool() == Some(true) {
                 // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.
                 let init = |op: &str, a: &Value| match (op, a["source"].as_str()) {
@@ -289,6 +311,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         let pixels = sampler.map(joined).unwrap_or_default();
         lap("milestones", &mut steps);
+        // The page's own size in the window the app opened (a launch is never resized), which
+        // `admit_window` holds to the other side's and to a viewport the targets ask for.
+        let client = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
         // The launch's processes once it was ready (what its numbers summed), and whether they talk to
         // the block's fixture by then.
         let procs = browser.processes();
@@ -377,7 +402,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             overhead: None,
             process_set: Some(programs(&procs)),
             fixture_connected: None,
-            client: None,
+            client,
             browser: None,
             directions: BTreeMap::new(),
             ..Block::default()

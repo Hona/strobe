@@ -5471,10 +5471,15 @@ Sampling interval kept (2026-11-07, 8.3 "Interval kept" and Firefox, §19). Unti
 Gecko interval was 1 ms for every Firefox and every view printed the interval asked (`samples at
 1000 µs`, `at 200 µs`) while the samples were 2 ms or 0.52 ms apart. `--check --why always` of a page
 whose click spins named functions, headless (smoke runs, not timed): adais (Windows 11, locked)
-Firefox 159.0.1 `sampled every 2.0 ms (asked 1 ms)`, Firefox Nightly 162.0a1 0.52 ms (asked 0.5 ms),
-Chromium 0.52 ms (asked 0.2 ms); vps (Debian 13 VM) Firefox 159.0.1 0.20 ms (asked 0.2 ms), Chromium
-0.27 ms (asked 0.2 ms). `record --probes attribution` says the same in its summary (adais: Chromium
-0.54 ms, Firefox 159 2.0 ms). Not run on air (offline): macOS keeps 200 µs, the code there unchanged.
+Firefox 159.0.1 `sampled every 2.0 ms (asked 1 ms: 2.0× coarser)` with the `Attribution` note,
+Firefox Nightly 162.0a1 0.53 ms (asked 0.5 ms), Chromium 0.52 ms (asked 0.4 ms; asked 0.5 ms it had
+kept 1.0 ms, 2.0× coarser, so Windows asks 400 µs, not 500); vps (Debian 13 VM) Firefox 159.0.1
+0.20 ms (asked 0.2 ms), Chromium 0.28 ms (asked 0.2 ms). `record --probes attribution`, `record
+--bench` and `query <rec> summary` say the same (adais: Chromium 0.52-0.54 ms, Firefox 159 2.0 ms);
+recordings from before read their own profiles' gaps (asked 200 µs). `record --for 2000` exits 2 (`not
+a duration: 2000; give a unit`). Not run on air (on battery; its clippy is clean): macOS keeps 200 µs. An A/B
+series' `attribution_sampling` (`{base, head}`, null when neither sampled) was not run: timed series
+are the orchestrator's.
 
 Firefox launch cases and where input aims (2026-11-06, 9.6 "Pages in each engine" and "Where input
 aims", 10.1 `OutOfView`, `ClockUnsynced`). A page's launch case runs in Firefox: a fresh browser and

@@ -4831,10 +4831,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         };
         std::fs::create_dir_all(&dir)?;
         let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
-        // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
-        // measured run's own span) and its style, layout and GC rows, then the page's source maps.
         // The interval the page's sampler kept (SPEC §8.3), kept in the recording's meta.
         let mut sampling = None;
+        // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
+        // measured run's own span) and its style, layout and GC rows, then the page's source maps.
         if let Some(g) = gecko.take() {
             let raw = g.stop()?;
             let untimed: Vec<(u64, u64)> = measured.iter().flat_map(|r| r.timed.untimed.iter().copied()).collect();

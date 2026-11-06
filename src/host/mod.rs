@@ -840,29 +840,29 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     }
 }
 
-/// The display strobe places windows on (the primary one, with the menu bar on macOS), in
-/// device-independent pixels from its top left: its bounds, and its work area, what a window may cover
-/// (less the menu bar and the Dock on macOS, the taskbar on Windows, panels the window manager keeps
-/// on X11).
+/// A display, in device-independent pixels on the desktop (from the main display's top left): its
+/// bounds, and its work area, what a window may cover (less the menu bar and the Dock on macOS, the
+/// taskbar on Windows, panels the window manager keeps on X11).
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct WorkArea {
     pub screen: [f64; 4],
     pub work: [f64; 4],
 }
 
-/// `WorkArea` now (the Dock or taskbar may move), or None without a display.
-pub fn work_area() -> Option<WorkArea> {
+/// The `WorkArea` of the display holding the point `at` (a window's centre) now (the Dock or taskbar
+/// may move), or None without a display.
+pub fn work_area(at: (f64, f64)) -> Option<WorkArea> {
     #[cfg(windows)]
     {
-        win::work_area()
+        win::work_area(at)
     }
     #[cfg(target_os = "macos")]
     {
-        macos::work_area()
+        macos::work_area(at)
     }
     #[cfg(target_os = "linux")]
     {
-        x11::work_area()
+        x11::work_area(at)
     }
 }
 

@@ -1467,6 +1467,9 @@ pub fn run(args: &Args) -> Result<Output> {
     ctx.projects = target_projects(&ctx.describe)?;
     ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
     check_engines(&mut series, &ctx.describe, args)?;
+    // A series the display cannot show refuses before anything counts it (journeys, the Holm family).
+    let (describe, headless) = (ctx.describe.clone(), ctx.headless);
+    display_fit(Some(&mut ctx), &mut series, &describe, headless)?;
     // A check of two targets refuses what their comparison would before anything builds.
     if let Some((a, b)) = check_pair(&ctx.describe, args, &project)? {
         let sides = [resolve_side("base", a, None, &ctx.describe, &project, &config)?, resolve_side("head", b, None, &ctx.describe, &project, &config)?];
@@ -1532,8 +1535,6 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(_) => {}
     }
     preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
-    let (describe, headless) = (ctx.describe.clone(), ctx.headless);
-    display_fit(Some(&mut ctx), &mut series, &describe, headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
@@ -4278,6 +4279,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         // The page's changes in the run so far, harvested before a `goto` takes the document with them.
         let harvested: RefCell<PageChanges> = RefCell::new(PageChanges::default());
+        // Keys the measured runs typed in a burst (`type(…, { burst: true })`).
+        let burst_keys = std::cell::Cell::new(0usize);
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
@@ -4846,10 +4849,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             run_marks.borrow_mut().push(hooks.take_marks());
             let index = run_counts.borrow().len();
             run_counts.borrow_mut().push(hooks.counts());
+            let timed_input = |s: &probe::present::frames::Sent| !timed.untimed_at(s.t_ns) && !s.press.is_some_and(|p| timed.untimed_at(p));
+            // Keys typed in a burst: a trace times each key's events, but no frame is any one key's.
+            burst_keys.set(burst_keys.get() + driver.inputs.borrow().iter().filter(|s| s.burst && timed_input(s)).count());
             if changes {
                 let mut seen = harvested.take();
                 seen.extend(page_changes(&page));
-                let timed_input = |s: &probe::present::frames::Sent| !timed.untimed_at(s.t_ns) && !s.press.is_some_and(|p| timed.untimed_at(p));
                 let mut inputs: Vec<probe::present::frames::Sent> = sent.as_ref().map_or_else(|| driver.inputs.take().into_iter().filter(timed_input).collect(), |l| l.sent(&timed));
                 seen.acted(&mut inputs);
                 run_inputs.borrow_mut().push((inputs, seen.changes, timed.clone()));
@@ -5292,6 +5297,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 refused.insert(m.clone(), r);
             }
         }
+        if burst_keys.get() > 0 {
+            let line = probe::present::frames::burst_refusal(burst_keys.get());
+            let names: Vec<String> = declared_metrics(s).into_iter().cloned().chain(values.keys().cloned()).filter(|m| m.starts_with("interaction.")).collect();
+            for m in names {
+                values.remove(&m);
+                if let Some(r) = Refusal::from_line(&line) {
+                    refused.insert(m, r);
+                }
+            }
+        }
         // Undeclared ones go too (default secondaries, descriptive rows): no value the engine cannot give.
         values.retain(|k, _| !(no_webgpu && k.starts_with("canvas.")) && !unseen_start(k) && validity::engine_refusal(engine, k).is_none());
         let phases = metrics::phase_frames(&data);
@@ -5351,7 +5366,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .enumerate()
                     .map(|(j, r)| {
                         let (sent, changes, _) = inputs.get(first + j).cloned().unwrap_or_default();
-                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true, "press_ns": s.press, "acted": s.acted })).collect();
+                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true, "press_ns": s.press, "acted": s.acted, "burst": s.burst })).collect();
                         (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
                     })
                     .collect();
@@ -6135,14 +6150,16 @@ fn check_engines(series: &mut [Series], describe: &Value, args: &Args) -> Result
     Ok(())
 }
 
-/// Before the first block (SPEC 9.6 "Declared viewport"): each headed page target's viewport against the
-/// largest page its browser's window shows on this display. Known from an earlier window of the same
-/// browser on the same work area (`web::known_room`); else, with `open`, measured in one window opened
-/// for it (in the slot); else not known yet. A series whose viewport does not fit refuses
-/// `DisplayTooSmall` alone, naming the most it can be; when that leaves nothing, the run refuses.
+/// Before the first block (SPEC 9.10 "Declared viewport"): each headed page target's viewport against
+/// the largest page its browser's window shows on this display. Known from an earlier window of the same
+/// browser on the same work area (`web::known_room`); else, with a bench's `ctx`, measured in one window
+/// opened for it; else not known yet. One answer per engine, scale and size. A series whose viewport
+/// does not fit refuses `DisplayTooSmall` alone, naming the most it can be; when that leaves nothing,
+/// the run refuses.
 fn display_fit(ctx: Option<&mut Ctx>, series: &mut [Series], describe: &Value, headless: bool) -> Result<()> {
     let mut ctx = ctx;
     let mut answers: BTreeMap<String, Option<Refusal>> = BTreeMap::new();
+    let size = |vp: &serde_json::Map<String, Value>, k: &str, or: u64| vp.get(k).and_then(Value::as_u64).unwrap_or(or) as u32;
     for s in series.iter_mut().filter(|s| s.gap.is_none() && s.refused.is_none()) {
         let names: Vec<String> = match &s.sides {
             Some((b, h)) => vec![b.clone(), h.clone()],
@@ -6150,21 +6167,22 @@ fn display_fit(ctx: Option<&mut Ctx>, series: &mut [Series], describe: &Value, h
         };
         for name in names {
             let t = &describe["targets"][&name];
-            let size = |vp: &serde_json::Map<String, Value>, k: &str, or: u64| vp.get(k).and_then(Value::as_u64).unwrap_or(or) as u32;
             let Some((w, h)) = t["viewport"].as_object().map(|vp| (size(vp, "width", 1400), size(vp, "height", 900))) else { continue };
             if !matches!(t["kind"].as_str(), Some("web" | "url")) || headless || t["headless"] == true {
                 continue;
             }
-            let answer = match answers.get(&name) {
+            let (engine, scale) = (engine_of(t), t["scale"].as_f64());
+            let key = format!("{engine} {scale:?} {w}x{h}");
+            let answer = match answers.get(&key) {
                 Some(a) => a.clone(),
                 None => {
-                    let a = fit_answer(ctx.as_deref_mut(), engine_of(t), t["scale"].as_f64(), (w, h))?;
-                    answers.insert(name.clone(), a.clone());
+                    let a = fit_answer(ctx.as_deref_mut(), engine, scale, (w, h))?;
+                    answers.insert(key, a.clone());
                     a
                 }
             };
             if let Some(r) = answer {
-                let on = if s.sides.is_some() { format!("{} ({}): ", t["name"].as_str().unwrap_or(&name), engine_of(t)) } else { String::new() };
+                let on = if s.sides.is_some() { format!("{} ({engine}): ", t["name"].as_str().unwrap_or(&name)) } else { String::new() };
                 s.refused = Some(Refusal { summary: format!("{on}{}", r.summary), ..r });
                 break;
             }
@@ -6179,8 +6197,10 @@ fn display_fit(ctx: Option<&mut Ctx>, series: &mut [Series], describe: &Value, h
 }
 
 /// Whether a page of `engine` shows `asked` here: from what strobe knows of this browser on this work
-/// area, else (with a bench's `ctx`) one window of it opened and fitted for the purpose. A window that
-/// cannot be opened says nothing: the block's own check still runs.
+/// area, else (with a bench's `ctx`) one window of it opened and fitted for the purpose, in the bench
+/// slot alone (no power plan, nothing held after it: builds come next). No window opens on a locked
+/// session or while a person uses the Mac (input in the last minute): then, as when the window cannot
+/// open, nothing is known here and the block's own fit checks it.
 fn fit_answer(ctx: Option<&mut Ctx>, engine: WebEngine, scale: Option<f64>, asked: (u32, u32)) -> Result<Option<Refusal>> {
     if let Some((browser, room)) = web::known_room(engine, scale)
         && (ctx.is_none() || room.too_small(&browser, asked).is_none())
@@ -6188,16 +6208,32 @@ fn fit_answer(ctx: Option<&mut Ctx>, engine: WebEngine, scale: Option<f64>, aske
         return Ok(room.too_small(&browser, asked));
     }
     let Some(ctx) = ctx else { return Ok(None) };
+    if host::session_locked() || host::person_idle_s().is_some_and(|i| i < 60.0) {
+        progress(format!("  {engine}: whether a {}×{} page fits this display is checked in its first block (no window opens now: the session is locked or in use)", asked.0, asked.1));
+        return Ok(None);
+    }
+    let what = format!("fitting a {}×{} page in a {engine} window", asked.0, asked.1);
+    progress(format!("  {what} on this display"));
+    let held = match ctx.slot {
+        Some(_) => None,
+        None => {
+            let (slot, waited) = ctx.reg.acquire(&what)?;
+            ctx.waited_ms += waited.as_secs_f64() * 1e3;
+            Some(slot)
+        }
+    };
+    ctx.reg.set("running", &what);
     let mut window = ctx.window.clone();
     (window.width, window.height, window.scale) = (asked.0, asked.1, scale);
-    progress(format!("  fitting a {}×{} page in a {engine} window on this display", asked.0, asked.1));
-    let pin = ctx.pin;
-    let fitted = in_slot(ctx, &format!("fitting a {engine} window"), |_| {
-        let browser = web::launch(engine, &window, false, pin)?;
+    let fitted = web::launch(engine, &window, false, ctx.pin).and_then(|browser| {
         let r = browser.page().and_then(|page| browser.fit_viewport(&page, asked.0, asked.1, false));
         browser.close();
         r
     });
+    if held.is_some() {
+        drop(held);
+        ctx.reg.set("preparing", "before the first block");
+    }
     match fitted {
         Ok(()) => Ok(None),
         Err(e) if e.validator() == Some(ValidatorId::DisplayTooSmall) => Ok(e.refusal.map(|r| *r)),

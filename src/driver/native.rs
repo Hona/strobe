@@ -23,6 +23,9 @@ pub struct Input {
     /// A single click's release: when its press was posted (`frames::Sent::press`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub press_ns: Option<u64>,
+    /// A key of `type(…, { burst: true })` (`frames::Sent::burst`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub burst: bool,
 }
 
 /// What a run's page calls did: inputs and phase marks, both on the host clock.
@@ -41,7 +44,7 @@ impl Log {
         self.inputs
             .iter()
             .filter(|i| (i.kind == "discrete" || (i.kind == "scroll" && i.first)) && !run.untimed_at(i.t_ns) && !i.press_ns.is_some_and(|p| run.untimed_at(p)))
-            .map(|i| crate::probe::present::frames::Sent { t_ns: i.t_ns, scroll: i.kind == "scroll", press: i.press_ns, acted: None })
+            .map(|i| crate::probe::present::frames::Sent { t_ns: i.t_ns, scroll: i.kind == "scroll", press: i.press_ns, acted: None, burst: i.burst })
             .collect()
     }
 
@@ -216,7 +219,7 @@ mod imp {
 
         fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
             self.last_input.set(t_ns);
-            self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None });
+            self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None, burst: false });
         }
 
         /// The app's windows to search, main first: `window` (a title, or part of one) picks one.
@@ -875,14 +878,23 @@ mod imp {
                     let refresh = Duration::from_millis(self.frame_ms(0.0, 0.0));
                     self.rest(Duration::ZERO, refresh, presents)?;
                     let mut last = 0;
+                    let typing = crate::driver::Typing::of(&o);
+                    let mut paced = typing == crate::driver::Typing::Paced;
                     for (k, c) in s(1).chars().enumerate() {
                         // Each key is measured: what the last one drew settles first (SPEC 7.4).
-                        if k > 0 {
-                            crate::driver::settle_key(presents, &self.pids.borrow(), last, delay, refresh)?;
+                        if k > 0 && paced {
+                            paced = crate::driver::settle_key(presents, &self.pids.borrow(), last, delay, refresh)?;
+                        } else if k > 0 {
+                            std::thread::sleep(delay);
                         }
                         let key = if c == '\n' { Key::Named(Named::Enter) } else { Key::Char(c) };
                         last = self.poster.press(top, to, Mods::default(), key)?;
                         self.input(last, "discrete", false);
+                        if typing == crate::driver::Typing::Burst
+                            && let Some(i) = self.log.borrow_mut().inputs.last_mut()
+                        {
+                            i.burst = true;
+                        }
                     }
                     self.until(&o, last, presents)?;
                 }

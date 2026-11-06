@@ -55,8 +55,15 @@ export interface Page {
   hover(selector: Element, opts?: Options): Promise<void>
   /** Moves the pointer to a point in the viewport (CSS pixels), such as away from anything that reacts to hover. */
   move(x: number, y: number, opts?: Options): Promise<void>
-  /** Focuses `selector` (clicking it if focus is elsewhere; `""` types where focus is), then sends one key event per character. */
-  type(selector: Element, text: string, opts?: Options & { delay?: number }): Promise<void>
+  /**
+   * Focuses `selector` (clicking it if focus is elsewhere; `""` types where focus is), then sends one key event per character.
+   * Paced: each key waits for the last one's frame and for the target to rest (at most 300 ms; `delay` counts from the key),
+   * so each is an `interaction.*` sample; from OS presents where strobe follows them, else from the page's own frames
+   * (headed Chromium, headless pages). Pacing stops for the rest of the call once the target never rests (an animation).
+   * `burst: true` sends the keys `delay` apart without waiting: no key is a latency sample (`interaction.*` refuses
+   * `AmbiguousInteraction`); measure burst typing by `cpu.work`, `main.work`, `ui.cpu`, `run.duration` or a phase.
+   */
+  type(selector: Element, text: string, opts?: Options & { delay?: number; burst?: boolean }): Promise<void>
   /** A key or chord: `"Enter"`, `"F9"`, `"Control+a"`, `"ControlOrMeta+Shift+P"`. `opts.selector` sends it to that element (clicked into focus first, as `type` does). */
   press(key: string, opts?: Options & { selector?: Element }): Promise<void>
   /**

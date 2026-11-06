@@ -956,16 +956,25 @@ What strobe reads from a native app (§13.7), per run:
     (`driver::settle`): before a press, a measured input (each key of `type`, a `press` after the
     click into its field, a key or button `down`/`up`) or a scroll's first step, until no present of
     the target began or reached the screen in the last 2 refreshes plus 30 ms for the events to reach
-    strobe, at most 300 ms. Before each key of `type` after the first, the first frame begun after the
-    last key reaches the screen first (at most 300 ms; `driver::settle_key`), then the settle, with
-    `delay` counted from the last key. Sent back to back (0.14), the 9 keys of a search field that
-    draws for 100 ms after each went out within about 10 ms, and 7 counted with a p50 of 9.7 ms: the
-    frames already under way for the keys before them (none of the 9 was at rest); settled, all 9 are
-    samples (p50 36.9 ms; `scripts/dev/type.bench.ts` on air). A caret's blink is one frame every
-    530-650 ms (Firefox, the fixture's caret mark; macOS 27's own text caret draws no frame strobe
-    sees as the app's), so a quiet gap comes between blinks; a blink that began in the 2 refreshes
-    before a key still makes that key no sample (its frame reached strobe after the key went out:
-    8 of 9 in a Firefox page field). A single click's press is held that way, at least 60 ms, so its pressed
+    strobe, at most 300 ms. Before each key of `type` after the first (`driver::settle_key`), the first
+    frame begun after the last key reaches the screen, then the settle, both inside one 300 ms budget
+    (or `delay`, counted from the last key, when longer); once a key's settle ends still drawing (an
+    animation that never rests), the call's later keys go `delay` apart without waiting (they are no
+    samples either way). Where strobe follows no presents (headed Chromium, whose trace times each
+    key's events, and every headless page, which draws to no display but still runs its animation
+    frames), the page's own frames pace the keys the same way: the frame after the key, then until a
+    frame passes with no DOM change (`__strobe.settled`, a timer when the page draws no frames), in
+    the same budget. `type(sel, text, { burst: true })` sends the keys `delay` apart with no pacing;
+    each key is marked (`frames::Sent::burst`), and `interaction.*` refuses `AmbiguousInteraction` for
+    a block whose runs typed in a burst, in every engine and app (no frame is any one key's reaction;
+    the fix names `cpu.work`, `main.work`, `ui.cpu`, `run.duration` or a phase). Sent back to back
+    (0.14), the 9 keys of a search field that draws for 100 ms after each went out within about 10 ms,
+    and 7 counted with a p50 of 9.7 ms: the frames already under way for the keys before them (none of
+    the 9 was at rest); paced, all 9 are samples (p50 36.9 ms; `scripts/dev/type.bench.ts` on air). A
+    caret's blink is one frame every 530-650 ms (Firefox, the fixture's caret mark; macOS 27's own text
+    caret draws no frame strobe sees as the app's), so a quiet gap comes between blinks; a blink that
+    began in the 2 refreshes before a key still makes that key no sample (its frame reached strobe
+    after the key went out: 8 of 9 in a Firefox page field). A single click's press is held that way, at least 60 ms, so its pressed
     look (`:active`, a highlight) is on the screen and settled before the release; when the settle
     before the press already hit the cap (the target animates), the press is held the 60 ms only, not
     a second 300 ms. A double or triple click's presses are a frame apart with no settling. A click
@@ -2909,29 +2918,38 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   naming the side. A page's browser window is sized to it, never by emulating a viewport larger than
   the window (no device-metrics override).
   - **Display fit** (headed pages; `web::WebBrowser::fit_viewport`, `display_fit`): the most a page can
-    be is the display's work area less the browser window's own part, in the page's CSS pixels. The
-    work area is the display strobe places windows on (`host::work_area`: `NSScreen`'s visible frame
-    on macOS, less the menu bar and the Dock; the primary monitor's `rcWork` per-monitor DPI aware on
-    Windows, less the taskbar; `_NET_WORKAREA` on X11); the window's part is `outerWidth −
-    innerWidth` by `outerHeight − innerHeight` (title bar, tabs, toolbar, frame); a forced `scale`
-    converts by `screen.width` over the display's width. On Windows a window may reach 8 pixels past
-    the left, right and bottom edges (its invisible resize border). The window is moved inside the
-    work area where it fits (to its top left when it must), and the page read until it takes the size
-    (at most 2 s); one the display cannot show refuses `DisplayTooSmall`, naming the most and how it
-    comes about ("this display shows at most 1470×838 of a page in Firefox 159.0.1, not the viewport
-    1440×900 the target asks for: its work area is 1470×923 and the browser's window takes 0×85 of
-    it"), with the fix: a smaller viewport, a larger display, or headless. Before the first block
-    (`bench`, `--check`) each headed page target with a viewport is checked this way once: from what
-    strobe keeps of that browser on that work area (`<state>/windows.json`, keyed by the browser's
-    identity, the scale and the work area, written by every headed fit), when that says it fits;
-    else in one window of the browser opened and fitted in the slot (a refusal is never taken from
-    the file alone, so a stale entry cannot keep a series refused). A series that does not fit
-    refuses alone, listed with the rest; `strobe plan` refuses from the file only. Headless pages
-    have no window and are not checked. No borderless window is used to make room: Chromium's
-    `--app` window keeps its title bar (and is not the browser people use), Firefox's kiosk mode is
-    full screen only, and Safari has no such mode. On a 1470×956-point MacBook Air with the Dock
-    hidden the work area is 1470×923, so no engine's window shows a 900-point page: at most 1462×839
-    in Edge (its window takes 8×84) and 1470×838 in Firefox (0×85); a 1440×830 page fits in both.
+    be is the work area of the display holding its window less the browser window's own part, in the
+    page's CSS pixels. The work area (`host::work_area`, read live, from any thread) is on macOS the
+    display's bounds (`CGDisplayBounds`) less the on-screen menu bar (the window server's window at
+    the main menu level, 24) and the Dock (its window at the Dock level, 20, along an edge and under
+    half the display across; none while it hides), from the window list: no AppKit in strobe's
+    process (the daemon's memory budget, §19; `NSScreen` updates only on a run loop); on Windows the
+    monitor's `rcWork` (per-monitor DPI aware, less the taskbar); on X11 the RandR monitor holding the
+    window cut to `_NET_WORKAREA` (one rectangle over every monitor). The window's part is
+    `outerWidth − innerWidth` by `outerHeight − innerHeight` (title bar, tabs, toolbar, frame); a
+    forced `scale` converts by `screen.width` over the display's width. On Windows a window may reach
+    8 pixels past the left, right and bottom edges (its invisible resize border). The window is moved
+    inside the work area where it fits (to its top left when it must), and the page read until it
+    takes the size (at most 2 s); one the display cannot show refuses `DisplayTooSmall`, naming the
+    most and how it comes about ("this display shows at most 1470×838 of a page in Firefox 159.0.1,
+    not the viewport 1440×900 the target asks for: its work area is 1470×923 and the browser's window
+    takes 0×85 of it"), with the fix: a smaller viewport, a larger display, or headless. A read that
+    is no measure (no page, a window smaller than its page, a locked session) is neither kept nor
+    refused by. Right after the engine checks, before anything counts the series (journeys, the Holm
+    family, `BackgroundPriority`, the implementation preflight), each headed page target with a
+    viewport is checked once per engine, scale and size: from what strobe keeps of that browser on the
+    work area where it places windows (`<state>/windows.json`, keyed by the browser's identity, the
+    scale and the work area, written by every sane headed fit), when that says it fits; else in one
+    window of the browser opened and fitted in the bench slot alone (no power plan, nothing held after
+    it: builds come next). A refusal is never taken from the file alone, so a stale entry cannot keep a
+    series refused. No window opens on a locked session or while a person uses the Mac (input in the
+    last minute): the series' first block fits it then. A series that does not fit refuses alone,
+    listed with the rest; `strobe plan` refuses from the file only. Headless pages have no window and
+    are not checked. No borderless window is used to make room: Chromium's `--app` window keeps its
+    title bar (and is not the browser people use), Firefox's kiosk mode is full screen only, and
+    Safari has no such mode. On a 1470×956-point MacBook Air with the Dock hidden the work area is
+    1470×923, so no engine's window shows a 900-point page: at most 1462×839 in Edge (its window
+    takes 8×84) and 1470×838 in Firefox (0×85); a 1440×830 page fits in both.
   A page's browser window is sized as above; an app's window (a webview's, an Electron
   app's: DevTools resizes no app window) and a native app's through the OS, before the runs. A page
   is sized from the window's size less the page's (what the app draws around it, the title bar on
@@ -3064,7 +3082,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `WrongScreen` | a block's window or page is not on the screen its case's (or target's) `expect` names (§9.6): a title, a dialog or heading, an address, or selectors that must be visible, read before the runs and after them (never inside one). A first-run dialog over the pane the case meant fails the block instead of timing it. Before a native app's runs, only titles are checked unless setup already drove the app: reading its tree there would connect strobe to it for the runs |
 | `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
 | `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric); every frame and latency metric of a block when the OS's present events lost the way to the screen of any present of the target's processes in its measured runs (Windows: a DirectComposition surface's, as Firefox's WebRender presents; counted with none, its frames would read short or 0) |
-| `AmbiguousInteraction` | over half of a block's inputs were sent while the target was drawing (a present begun before the input began or reached the screen in the 2 refreshes before it: an animation, a caret, a press's look still settling after 300 ms), so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
+| `AmbiguousInteraction` | over half of a block's inputs were sent while the target was drawing (a present begun before the input began or reached the screen in the 2 refreshes before it: an animation, a caret, a press's look still settling after 300 ms), so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4); or the block's runs typed in a burst (`type(…, { burst: true })`: each key before the last one showed), in any engine or app, which refuses `interaction.*` with a fix naming the totals that measure burst typing (`cpu.work`, `main.work`, `ui.cpu`, `run.duration`, a phase) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
@@ -3097,7 +3115,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 | `OutOfView` | a page input's element (a click, hover, drag, scroll, wheel or `down` at it, the click that focuses for `type` or `press`) shows no part in the viewport even scrolled into view: an ancestor clips it away (`overflow: clip`), or what shows is under a pixel. Input aimed there would land beside it; the message names the clipping ancestor (9.6 "Where input aims") |
 | `Covered` | a page input's element shows, but another element is where strobe would aim at every point it tries (its centre, its line boxes, then scrolled to the middle of the viewport, the centre and the centres of its visible part's quarters): a click there would reach that instead, as for a person. The message names the covering element; not transient (an overlay that stays). A native app's covered window is `WindowHidden` (9.6 "Where input aims") |
-| `DisplayTooSmall` | a headed page's declared viewport is larger than this display shows of a page in that browser: its work area (less the menu bar and Dock, the taskbar, panels) less the browser window's own part. Named with the most it can be, the work area and the window's part; checked before the first block (and by `strobe plan` from what strobe kept), refusing that series alone, and again when a block fits its window. Not transient: the device, not the variant (9.10 "Declared viewport") |
+| `DisplayTooSmall` | a headed page's declared viewport is larger than this display shows of a page in that browser: its work area (less the menu bar and Dock, the taskbar, panels) less the browser window's own part. Named with the most it can be, the work area and the window's part; checked right after the engine checks, before the first block (and by `strobe plan` from what strobe kept), refusing that series alone, and again when a block fits its window. Not transient: the device, not the variant (9.10 "Declared viewport") |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -3846,10 +3864,12 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 - Isolated profile per launch.
 - Muted (`--mute-audio`): a game or video under test never plays on the user's speakers. Web Audio
   still renders its graph, so its cost stays in the measurement.
-- Not marked as automated: a preload script in each page of a browser strobe launched makes
-  `navigator.webdriver` false, as for a person (as in Firefox and WebKit). Apps branch on it (a game
-  shell hid its menus and started muted under it), and a measurement of that mode is a measurement of
-  strobe. `--disable-blink-features=AutomationControlled` did it until 0.14 and put a dismissable
+- Not marked as automated: a preload script in each page of a browser strobe launched (a run case's
+  page, and every page a launch case's auto-attach arms) makes `navigator.webdriver` false where the
+  browser says true, as for a person (as in Firefox and WebKit). It reaches the documents of the
+  page's own process: a frame from another site (its own process) and workers keep the browser's
+  answer. Apps branch on it (a game shell hid its menus and started muted under it), and a
+  measurement of that mode is a measurement of strobe. `--disable-blink-features=AutomationControlled` did it until 0.14 and put a dismissable
   "unsupported command-line flag" bar over every headed page (47 points in Edge on macOS, which a
   click could close mid-run, resizing the page).
 

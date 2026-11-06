@@ -6,7 +6,8 @@
 //   swiftc -O scripts/dev/type-app.swift -o /tmp/strobe-type-app     (macOS, for the native target)
 //   strobe bench scripts/dev/type.bench.ts --head . --check --target cocoa      (or firefox, chromium, webkit)
 // `type` prints how many of its 9 keys were samples; `strobe query <rec> frames` says how many came
-// mid-drawing. `caret` counts what a focused field draws in 3 s with no input.
+// mid-drawing. `burst` types them with no pacing (interaction.* refused). `caret` counts what a focused
+// field draws in 3 s with no input.
 import { bench, native, url } from "@hona/strobe"
 
 const page = `<!doctype html><title>type</title>
@@ -43,6 +44,13 @@ export default bench({
       primary: "interaction.p50",
       metrics: ["interaction.p95", "run.duration", "frames.presented.count"],
       run: ({ page, target }) => page.type(target === "cocoa" ? "field" : "#field", text, { until: echo(target === "cocoa", text) }),
+      reset: clear,
+    },
+    // The same keys in a burst: run.duration and cpu.work measure it; interaction.* refuses AmbiguousInteraction.
+    burst: {
+      primary: "run.duration",
+      metrics: ["cpu.work", "interaction.p50"],
+      run: ({ page, target }) => page.type(target === "cocoa" ? "field" : "#field", text, { burst: true, until: echo(target === "cocoa", text) }),
       reset: clear,
     },
     // What a focused field draws with no input: its caret.

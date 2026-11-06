@@ -52,8 +52,10 @@ pub struct Browser {
     pub as_person: bool,
 }
 
-/// `navigator.webdriver` false, as for a person.
-const NOT_AUTOMATED: &str = "Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true })";
+/// `navigator.webdriver` false, as for a person, where the browser says otherwise. A preload reaches the
+/// page's documents in its own process; a frame from another site (its own process) and workers keep
+/// the browser's answer.
+pub const NOT_AUTOMATED: &str = "if (navigator.webdriver) Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true })";
 
 /// An attached page: the session id commands go to.
 #[derive(Clone)]
@@ -311,7 +313,7 @@ impl Browser {
             // Firefox and WebKit: `--disable-blink-features=AutomationControlled` did it too, and put a
             // dismissable "unsupported command-line flag" bar over the page (47 points in Edge on macOS).
             page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": NOT_AUTOMATED }))?;
-            page.eval(&format!("void {NOT_AUTOMATED}"))?;
+            page.eval(&format!("{NOT_AUTOMATED}; true"))?;
         }
         if self.pid != 0 && cfg!(windows) {
             // An occluded Chromium window stops rendering: keep ours on top, without taking focus.

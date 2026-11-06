@@ -360,7 +360,7 @@ impl OsInput {
 
     fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
         self.last_input.set(t_ns);
-        self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None });
+        self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None, burst: false });
     }
 
     fn count(&self, i: usize) {
@@ -549,10 +549,14 @@ impl Driver {
                 let delay = Duration::from_millis(o["delay"].as_f64().unwrap_or(0.0).max(0.0) as u64);
                 os.rest(Duration::ZERO, os.frame())?;
                 let mut last = host::now_ns();
+                let typing = super::Typing::of(&o);
+                let mut paced = typing == super::Typing::Paced;
                 for (k, c) in s(1).chars().enumerate() {
                     // Each key is measured: what the last one drew settles first (SPEC 7.4).
-                    if k > 0 {
-                        super::settle_key(&os.presents, &os.pids.borrow(), last, delay, os.frame())?;
+                    if k > 0 && paced {
+                        paced = super::settle_key(&os.presents, &os.pids.borrow(), last, delay, os.frame())?;
+                    } else if k > 0 {
+                        std::thread::sleep(delay);
                     }
                     let key = match c {
                         '\n' => Key::Named(Named::Enter),
@@ -563,6 +567,11 @@ impl Driver {
                     os.count(KEY_DOWN);
                     os.count(KEY_UP);
                     os.input(last, "discrete", false);
+                    if typing == super::Typing::Burst
+                        && let Some(i) = os.log.borrow_mut().inputs.last_mut()
+                    {
+                        i.burst = true;
+                    }
                 }
                 (o, last)
             }

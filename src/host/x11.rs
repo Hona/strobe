@@ -152,17 +152,32 @@ pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     })
 }
 
-/// The root window and the window manager's work area on the current desktop (`_NET_WORKAREA`, else the
-/// whole root), in device-independent pixels at the display's DPI.
-pub fn work_area() -> Option<super::WorkArea> {
+/// The monitor holding the point `at` (device-independent pixels at the display's DPI; RandR's
+/// monitors, else the whole root) and the part of it the window manager's work area on the current
+/// desktop covers (`_NET_WORKAREA`, one rectangle over every monitor, so cut to this one's).
+pub fn work_area(at: (f64, f64)) -> Option<super::WorkArea> {
+    use x11rb::protocol::randr::ConnectionExt as _;
     with(|x| {
-        let g = x.conn.get_geometry(x.root).ok()?.reply().ok()?;
         let s = x.dpi as f64 / 96.0;
-        let screen = [0.0, 0.0, g.width as f64 / s, g.height as f64 / s];
+        let (px, py) = (at.0 * s, at.1 * s);
+        let g = x.conn.get_geometry(x.root).ok()?.reply().ok()?;
+        let root = [0.0, 0.0, g.width as f64, g.height as f64];
+        let monitors: Vec<[f64; 4]> = x
+            .conn
+            .randr_get_monitors(x.root, true)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .map(|r| r.monitors.iter().map(|m| [m.x as f64, m.y as f64, m.width as f64, m.height as f64]).collect())
+            .unwrap_or_default();
+        let inside = |m: &[f64; 4]| px >= m[0] && px < m[0] + m[2] && py >= m[1] && py < m[1] + m[3];
+        let screen = monitors.iter().find(|m| inside(m)).or(monitors.first()).copied().unwrap_or(root);
         let areas = prop32(x, x.root, "_NET_WORKAREA");
         let desktop = prop32(x, x.root, "_NET_CURRENT_DESKTOP").first().copied().unwrap_or(0) as usize;
-        let work = areas.get(desktop * 4..desktop * 4 + 4).or_else(|| areas.get(..4)).map_or(screen, |a| [a[0] as f64 / s, a[1] as f64 / s, a[2] as f64 / s, a[3] as f64 / s]);
-        Some(super::WorkArea { screen, work })
+        let area = areas.get(desktop * 4..desktop * 4 + 4).or_else(|| areas.get(..4)).map_or(root, |a| [a[0] as f64, a[1] as f64, a[2] as f64, a[3] as f64]);
+        let (l, t) = (screen[0].max(area[0]), screen[1].max(area[1]));
+        let (r, b) = ((screen[0] + screen[2]).min(area[0] + area[2]), (screen[1] + screen[3]).min(area[1] + area[3]));
+        let work = if r > l && b > t { [l, t, r - l, b - t] } else { screen };
+        Some(super::WorkArea { screen: screen.map(|v| v / s), work: work.map(|v| v / s) })
     })
 }
 

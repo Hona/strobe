@@ -921,6 +921,8 @@ enum Observer {
 impl Observer {
     fn start(browser: &WebBrowser, observer: String, profile: bool) -> Result<Observer> {
         match browser {
+            // Every page the launch opens runs as for a person (`chromium::NOT_AUTOMATED`), as a run case's does.
+            WebBrowser::Chromium(b) if b.as_person => Ok(Observer::Cdp(Watch::start(&b.cdp, format!("{};\n{observer}", crate::target::chromium::NOT_AUTOMATED), profile)?)),
             WebBrowser::Chromium(b) => Ok(Observer::Cdp(Watch::start(&b.cdp, observer, profile)?)),
             WebBrowser::Firefox(b) => Ok(Observer::Bidi(Preload::start(b, &observer)?)),
             WebBrowser::Webkit(_) => Err(Error::msg("internal: a WebKit launch case (WebDriver Classic has no preload script)")),

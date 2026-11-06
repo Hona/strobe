@@ -1158,7 +1158,13 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
         let sent: Vec<crate::probe::present::frames::Sent> = inputs
             .iter()
             .filter(|i| i["kind"] == "discrete" || (i["kind"] == "scroll" && i["first"] == true))
-            .map(|i| crate::probe::present::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll", press: i["press_ns"].as_u64(), acted: i["acted"].as_bool() })
+            .map(|i| crate::probe::present::frames::Sent {
+                t_ns: i["t_ns"].as_u64().unwrap_or(0),
+                scroll: i["kind"] == "scroll",
+                press: i["press_ns"].as_u64(),
+                acted: i["acted"].as_bool(),
+                burst: i["burst"] == true,
+            })
             .filter(|s| !timed.untimed_at(s.t_ns) && !s.press.is_some_and(|p| timed.untimed_at(p)))
             .collect();
         // Each change as its earliest and latest time; a recording from before kept one time, the latest.

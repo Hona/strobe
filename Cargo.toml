@@ -57,7 +57,7 @@ object = { version = "0.39", default-features = false, features = ["read_core", 
 [target.'cfg(target_os = "linux")'.dependencies]
 # X11 windows (find, place, keep on top, read pixels), input through XTest and frames from the
 # Present extension's completion events, over the pure-Rust connection; no libxcb.
-x11rb = { version = "0.13", default-features = false, features = ["xtest", "present", "dri3"] }
+x11rb = { version = "0.13", default-features = false, features = ["xtest", "present", "dri3", "randr"] }
 # Unwinding sampled user stacks with the modules' DWARF unwind tables (.eh_frame); pure Rust.
 framehop = { version = "0.16", default-features = false }
 

@@ -31,9 +31,13 @@ const PRESENT_DELIVERY_NS: u64 = 30_000_000;
 /// strobe's own copy of the present events; without a capture it waits `min` alone. Returns whether
 /// the target went quiet (false: still drawing at the cap).
 pub(crate) fn settle(presents: &RefCell<Option<crate::probe::present::PresentCapture>>, pids: &[u32], min: Duration, refresh: Duration) -> Result<bool> {
+    settle_by(presents, pids, min, refresh, Instant::now() + SETTLE_MAX.max(min))
+}
+
+/// `settle`, ending by `until`.
+fn settle_by(presents: &RefCell<Option<crate::probe::present::PresentCapture>>, pids: &[u32], min: Duration, refresh: Duration, until: Instant) -> Result<bool> {
     std::thread::sleep(min);
     let quiet = (refresh * 2).as_nanos() as u64 + PRESENT_DELIVERY_NS;
-    let until = Instant::now() + SETTLE_MAX.saturating_sub(min);
     while let Some(p) = presents.borrow_mut().as_mut() {
         let last = p.last_ns(pids)?;
         let now = crate::host::now_ns();
@@ -49,15 +53,33 @@ pub(crate) fn settle(presents: &RefCell<Option<crate::probe::present::PresentCap
 }
 
 /// Between the keys of `type` (SPEC 7.4): the next key is at rest only once what the last one drew is on
-/// the screen. Waits for the first present of `pids` begun after `sent` to reach it (at most `SETTLE_MAX`:
-/// a key that draws nothing, or nothing that soon, waits no longer), then `settle` with `min` (a `delay`
-/// counts from the key). Without a capture it waits `min` alone.
+/// the screen. Waits for the first present of `pids` begun after `sent` to reach it, then for quiet as
+/// `settle` does, both inside one `SETTLE_MAX` (or `min`, a `delay` counted from the key, when longer):
+/// a key that draws nothing, or nothing that soon, waits no longer. Without a capture it waits `min`
+/// alone. Returns whether the target went quiet; a caller stops pacing once it did not (an animation
+/// that never rests would hold each key the whole budget).
 pub(crate) fn settle_key(presents: &RefCell<Option<crate::probe::present::PresentCapture>>, pids: &[u32], sent: u64, min: Duration, refresh: Duration) -> Result<bool> {
     let since = Instant::now();
+    let until = since + SETTLE_MAX.max(min);
     if let Some(p) = presents.borrow_mut().as_mut() {
-        p.live(pids, sent, SETTLE_MAX)?;
+        p.live(pids, sent, until.saturating_duration_since(Instant::now()))?;
     }
-    settle(presents, pids, min.saturating_sub(since.elapsed()), refresh)
+    settle_by(presents, pids, min.saturating_sub(since.elapsed()), refresh, until)
+}
+
+/// How `type` sends its keys: paced (each waits for the last one to show and the target to rest,
+/// `settle_key`, until one finds it never rests) or in a burst (`burst: true`: `delay` alone, and no key
+/// a latency sample).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Typing {
+    Paced,
+    Burst,
+}
+
+impl Typing {
+    pub(crate) fn of(o: &Value) -> Typing {
+        if o["burst"] == true { Typing::Burst } else { Typing::Paced }
+    }
 }
 
 /// Installed in every document before its scripts run: the browser's own rAF, which a page may replace (a game
@@ -424,6 +446,23 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     return v == null ? null : String(v).trim().replace(/\s+/g, " ")
   }, () => null)
   s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))
+  // Between paced keys where strobe follows no presents: the frame after the key, then until a frame passes
+  // with no DOM change; true when one did within `ms`, false while the page kept changing.
+  s.settled = (ms) => new Promise((r) => {
+    let changed = true
+    const unwatch = observe(() => { changed = true }, { subtree: true, childList: true, attributes: true, characterData: true })
+    let done = false
+    const finish = (v) => { if (!done) { done = true; unwatch(); r(v) } }
+    const end = performance.now() + ms
+    const tick = () => {
+      if (done) return
+      if (!changed || performance.now() > end) finish(!changed)
+      else { changed = false; raf(tick) }
+    }
+    raf(tick)
+    // A page that draws no frames (hidden) never ticks.
+    setTimeout(() => finish(false), ms)
+  })
   s.nodes = () => document.getElementsByTagName("*").length
   return s
 })(), true
@@ -715,7 +754,7 @@ impl Driver {
     /// An input time for `interaction.*` (a single click's release with its press, a key press, a
     /// button's `up`) or `scroll.latency.*` (a scroll's first step).
     fn input_at(&self, scroll: bool, press: Option<u64>) {
-        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll, press, acted: None });
+        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll, press, acted: None, burst: false });
     }
 
     /// Follows the page's OS presents (a headed page whose engine reports no frames of its own): a
@@ -745,13 +784,20 @@ impl Driver {
         }
     }
 
-    /// `settle_key` on the page's presents when strobe follows them; else `min` alone.
+    /// `settle_key` on the page's presents when strobe follows them. Else (headed Chromium, whose trace
+    /// times its keys, and every headless page) from the page's own frames: the frame after the key, then
+    /// until a frame passes with no DOM change (`__strobe.settled`), inside the same budget; `min`
+    /// counts from the key either way.
     fn settle_key(&self, sent: u64, min: Duration) -> Result<bool> {
         match self.live.get() {
             Some(p) => settle_key(p, &self.live_pids.borrow(), sent, min, self.refresh.get()),
             None => {
-                std::thread::sleep(min);
-                Ok(true)
+                let since = Instant::now();
+                let budget = SETTLE_MAX.max(min);
+                // A key that navigated (Enter on a form) leaves no document to ask: pacing stops there.
+                let quiet = helped(&self.page, &format!("__strobe.settled({})", budget.as_millis()), budget + Duration::from_secs(5)).is_ok_and(|v| v == true);
+                std::thread::sleep(min.saturating_sub(since.elapsed()));
+                Ok(quiet)
             }
         }
     }
@@ -957,12 +1003,16 @@ impl Driver {
                 let o = opts(2);
                 self.focus(&sel(0), &o)?;
                 // One key event per character, like a person typing, so each keystroke is an interaction,
-                // sent once what the last one drew has settled (followed presents: SPEC 7.4).
+                // sent once what the last one drew has settled (SPEC 7.4), unless typed in a burst.
                 let delay = Duration::from_millis(o.get("delay").and_then(Value::as_u64).unwrap_or(0));
+                let typing = Typing::of(&o);
+                let mut paced = typing == Typing::Paced;
                 for (i, c) in s(1).chars().enumerate() {
-                    if i > 0 {
+                    if i > 0 && paced {
                         let sent = self.inputs.borrow().last().map_or(0, |s| s.t_ns);
-                        self.settle_key(sent, delay)?;
+                        paced = self.settle_key(sent, delay)?;
+                    } else if i > 0 {
+                        std::thread::sleep(delay);
                     }
                     let k = match c {
                         '\n' => Key::Named(Named::Enter),
@@ -970,6 +1020,11 @@ impl Driver {
                         c => Key::Char(c),
                     };
                     self.stroke(k, 0)?;
+                    if typing == Typing::Burst
+                        && let Some(s) = self.inputs.borrow_mut().last_mut()
+                    {
+                        s.burst = true;
+                    }
                 }
                 self.until(&o)
             }

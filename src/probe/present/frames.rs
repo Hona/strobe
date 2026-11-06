@@ -251,6 +251,17 @@ pub struct Sent {
     /// changes' times decide (`reactions`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub acted: Option<bool>,
+    /// A key of `type(…, { burst: true })`: sent without waiting for the key before it to show, so no
+    /// frame is its reaction alone (`Reactions::burst`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub burst: bool,
+}
+
+/// Why `interaction.*` is refused for a block whose runs typed in a burst (every engine and app).
+pub fn burst_refusal(keys: usize) -> String {
+    format!(
+        "AmbiguousInteraction: interaction.*: the runs typed {keys} keys in a burst (type with burst: true), each sent before the one before it showed, so no frame is any one key's reaction; measure burst typing by cpu.work, main.work, ui.cpu, run.duration or a phase, or type without burst for each key's latency"
+    )
 }
 
 /// The edge of an input its latency is timed from (`interaction.n.press` counts the presses).
@@ -316,6 +327,8 @@ pub struct Reactions {
     pub unshown: (usize, usize),
     /// Inputs after which the model did not change.
     pub unchanged: usize,
+    /// Keys typed in a burst: `interaction.*` is refused when there are any.
+    pub burst: usize,
 }
 
 /// The longest an input waits for its frame: past this its present is something else's.
@@ -357,6 +370,7 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
     // When each earlier input's reaction reached the screen: an input sent before one did came while the
     // target still answered that one (its frame not yet begun, so `drawing` cannot see it), not at rest.
     let mut answered: Vec<u64> = Vec::new();
+    out.burst = sent.iter().filter(|s| s.burst).count();
     for (k, s) in sent.iter().enumerate() {
         let next = sent.get(k + 1).map_or(u64::MAX, |n| n.press.unwrap_or(n.t_ns));
         // A click that acted on its press: the page says so (`acted`), else its first change after the
@@ -440,6 +454,7 @@ impl Reactions {
         self.busy = (self.busy.0 + o.busy.0, self.busy.1 + o.busy.1);
         self.unshown = (self.unshown.0 + o.unshown.0, self.unshown.1 + o.unshown.1);
         self.unchanged += o.unchanged;
+        self.burst += o.burst;
     }
 
     /// The interaction samples timed from a click's press.
@@ -456,7 +471,9 @@ impl Reactions {
         for (prefix, count, v, tried, busy, unshown) in
             [("interaction", "interaction.n", &interaction, self.tried.0, self.busy.0, self.unshown.0), ("scroll.latency", "scroll.n", &self.scroll, self.tried.1, self.busy.1, self.unshown.1)]
         {
-            let why = if tried == 0 {
+            let why = if prefix == "interaction" && self.burst > 0 {
+                Some(burst_refusal(self.burst))
+            } else if tried == 0 {
                 Some(if self.unchanged > 0 {
                     format!("NoPresentSource: {prefix}.*: none of the {} inputs changed the app's accessibility tree, so no frame can be shown to be their reaction", self.unchanged)
                 } else {

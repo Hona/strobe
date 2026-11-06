@@ -97,8 +97,8 @@ pub fn browser_identity(engine: WebEngine, headless: bool) -> String {
 /// window an invisible resize border there (8 pixels at 100%), which may lie past the edge unseen.
 const FRAME_SLACK: f64 = if cfg!(windows) { 8.0 } else { 0.0 };
 
-/// What a headed page's window has on the display strobe places it on (SPEC 9.6 "Declared viewport"), in
-/// the page's CSS pixels: the display's work area (`host::work_area`: less the menu bar and Dock, the
+/// What a headed page's window has on the display it shows on (SPEC 9.10 "Declared viewport"), in the
+/// page's CSS pixels: the display's work area (`host::work_area`: less the menu bar and Dock, the
 /// taskbar, the panels), the window's own part (its size less the page's: title bar, tabs, toolbar,
 /// frame), the page, and where the window is.
 #[derive(Clone, Copy, Debug)]
@@ -114,6 +114,12 @@ impl Room {
     /// The largest page this browser's window shows inside the work area.
     pub fn most(&self) -> (f64, f64) {
         ((self.area[2] + 2.0 * FRAME_SLACK - self.chrome.0).floor(), (self.area[3] + FRAME_SLACK - self.chrome.1).floor())
+    }
+
+    /// A read worth keeping and judging by: a page and a window, the window no smaller than the page,
+    /// on an unlocked session (a locked one may report a window it never laid out).
+    fn sane(&self) -> bool {
+        self.page.0 > 0.0 && self.page.1 > 0.0 && self.chrome.0 >= 0.0 && self.chrome.1 >= 0.0 && self.window[2] >= self.page.0 && self.window[3] >= self.page.1 && !host::session_locked()
     }
 
     /// The window lies inside the work area (within a point, and the frame's slack).
@@ -152,9 +158,10 @@ impl Room {
 
 /// The page's room now, or None without a display strobe can read.
 pub fn room(page: &WebPage) -> Result<Option<Room>> {
-    let Some(display) = host::work_area() else { return Ok(None) };
     let v = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY, screen.width]")?;
     let n = |i: usize| v[i].as_f64().unwrap_or(0.0);
+    // The display holding the window's centre.
+    let Some(display) = host::work_area((n(4) + n(2) / 2.0, n(5) + n(3) / 2.0)) else { return Ok(None) };
     // CSS pixels per device-independent pixel: 1, unless the target forces another scale.
     let k = if display.screen[2] > 0.0 && n(6) > 0.0 { n(6) / display.screen[2] } else { 1.0 };
     Ok(Some(Room { area: display.work.map(|a| a * k), chrome: (n(2) - n(0), n(3) - n(1)), page: (n(0), n(1)), window: [n(4), n(5), n(2), n(3)], display }))
@@ -180,10 +187,11 @@ fn remember(engine: WebEngine, scale: Option<f64>, browser: &str, r: &Room) {
     }
 }
 
-/// The room a headed `engine` page had on this work area before, and the browser it was: what a plan
-/// and a bench check a declared viewport against before they open a window.
+/// The room a headed `engine` page had before on the work area where strobe places its windows, and the
+/// browser it was: what a plan and a bench check a declared viewport against before they open a window.
 pub fn known_room(engine: WebEngine, scale: Option<f64>) -> Option<(String, Room)> {
-    let display = host::work_area()?;
+    let at = Window::default();
+    let display = host::work_area((at.x as f64, at.y as f64))?;
     let all: Value = serde_json::from_slice(&std::fs::read(rooms_file()).ok()?).ok()?;
     let e = &all[room_key(engine, scale, &display)];
     let num = |v: &Value| v.as_f64();
@@ -289,12 +297,14 @@ impl WebBrowser {
         }
     }
 
-    /// Sizes the window so the page is the target's viewport, `width`×`height` CSS pixels (SPEC 9.6
+    /// Sizes the window so the page is the target's viewport, `width`×`height` CSS pixels (SPEC 9.10
     /// "Declared viewport"), never by emulating a viewport the window does not have. Headed, the window
     /// is moved inside the display's work area where it fits there, and the page is read until it takes
     /// the size (at most 2 s): a size this display cannot show refuses `DisplayTooSmall`, naming the
     /// largest page this browser's window shows on it, which strobe keeps for the next plan and bench
-    /// (`known_room`). Any other difference is left to the block's viewport check.
+    /// (`known_room`). A read that is no measure (`Room::sane`: no page, a window smaller than its page,
+    /// a locked session) is neither kept nor refused by. Any other difference is left to the block's
+    /// viewport check.
     pub fn fit_viewport(&self, page: &WebPage, width: u32, height: u32, headless: bool) -> Result<()> {
         let before = if headless { None } else { room(page)? };
         let at = before.map(|r| r.place((self.window().x, self.window().y), (width as f64 + r.chrome.0, height as f64 + r.chrome.1)));
@@ -309,7 +319,9 @@ impl WebBrowser {
             let Some(r) = room(page)? else { return Ok(()) };
             let shown = (r.page.0 - width as f64).abs() <= 1.0 && (r.page.1 - height as f64).abs() <= 1.0 && r.inside();
             if shown {
-                remember(self.engine(), self.window().scale, &browser, &r);
+                if r.sane() {
+                    remember(self.engine(), self.window().scale, &browser, &r);
+                }
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
@@ -317,6 +329,9 @@ impl WebBrowser {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
+        if !r.sane() {
+            return Ok(());
+        }
         remember(self.engine(), self.window().scale, &browser, &r);
         match r.too_small(&browser, (width, height)) {
             Some(refusal) => Err(refusal.into()),

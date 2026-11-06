@@ -119,10 +119,6 @@ unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> *mut c_void;
     fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn objc_msgSend();
-    #[cfg(target_arch = "x86_64")]
-    fn objc_msgSend_stret();
-    fn objc_autoreleasePoolPush() -> *mut c_void;
-    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 #[repr(C)]
@@ -1033,46 +1029,42 @@ fn scale_at(p: CGPoint) -> f64 {
     (px / bounds.size.width).max(1.0)
 }
 
-/// The display with the menu bar (where strobe places windows): `NSScreen`'s frame and visible frame,
-/// in points from its top left. AppKit is loaded for this alone: strobe does not link it.
-pub fn work_area() -> Option<super::WorkArea> {
-    static APPKIT: OnceLock<bool> = OnceLock::new();
-    let path = CString::new("/System/Library/Frameworks/AppKit.framework/AppKit").ok()?;
-    if !*APPKIT.get_or_init(|| !unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) }.is_null()) {
+/// The display holding the point `at` (global points from the main display's top left; else the main
+/// display): its bounds, and what a window may cover there, read live from the window list: less the
+/// menu bar (the window server's window at the main menu level, 24) and the Dock (its window at the
+/// Dock level, 20, along an edge; none while it hides). Thread-safe and without AppKit: strobe's own
+/// process (the daemon too) keeps no AppKit, and `NSScreen` updates only on a run loop.
+pub fn work_area(at: (f64, f64)) -> Option<super::WorkArea> {
+    const MENU_LEVEL: i64 = 24;
+    const DOCK_LEVEL: i64 = 20;
+    let id = display_at(at.0, at.1).unwrap_or(unsafe { CGMainDisplayID() });
+    let b = unsafe { CGDisplayBounds(id) };
+    if b.size.width <= 0.0 || b.size.height <= 0.0 {
         return None;
     }
-    let sel = |s: &str| CString::new(s).ok().map(|c| unsafe { sel_registerName(c.as_ptr()) });
-    let (class, screens, first, frame, visible) = (CString::new("NSScreen").ok()?, sel("screens")?, sel("firstObject")?, sel("frame")?, sel("visibleFrame")?);
-    unsafe {
-        let send: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
-        let pool = objc_autoreleasePoolPush();
-        let cls = objc_getClass(class.as_ptr());
-        let all = if cls.is_null() { std::ptr::null_mut() } else { send(cls, screens) };
-        let screen = if all.is_null() { std::ptr::null_mut() } else { send(all, first) };
-        let rects = if screen.is_null() { None } else { rect_of(screen, frame).zip(rect_of(screen, visible)) };
-        objc_autoreleasePoolPop(pool);
-        let (frame, visible) = rects?;
-        // Cocoa counts up from the bottom of this display; strobe's places count down from its top.
-        let h = frame.size.height;
-        Some(super::WorkArea { screen: [frame.origin.x, 0.0, frame.size.width, h], work: [visible.origin.x, h - (visible.origin.y + visible.size.height), visible.size.width, visible.size.height] })
+    let (x0, y0, x1, y1) = (b.origin.x, b.origin.y, b.origin.x + b.size.width, b.origin.y + b.size.height);
+    let (mut left, mut top, mut right, mut bottom) = (x0, y0, x1, y1);
+    for w in windows(LIST_ON_SCREEN, 0).iter().filter(|w| w.alpha > 0.0) {
+        let (wx0, wy0, wx1, wy1) = (w.bounds.origin.x, w.bounds.origin.y, w.bounds.origin.x + w.bounds.size.width, w.bounds.origin.y + w.bounds.size.height);
+        if wx1 <= x0 || wx0 >= x1 || wy1 <= y0 || wy0 >= y1 {
+            continue;
+        }
+        let (wide, tall) = (w.bounds.size.width, w.bounds.size.height);
+        if w.owner == "Window Server" && w.layer == MENU_LEVEL && wy0 <= y0 + 1.0 && tall < b.size.height / 4.0 {
+            top = top.max(wy1);
+        } else if w.owner == "Dock" && w.layer == DOCK_LEVEL {
+            // Along one edge, and not over half the display across it (a window the size of the display is
+            // no strip to leave out).
+            if tall < b.size.height / 2.0 && wy1 >= y1 - 1.0 {
+                bottom = bottom.min(wy0);
+            } else if wide < b.size.width / 2.0 && wx0 <= x0 + 1.0 {
+                left = left.max(wx1);
+            } else if wide < b.size.width / 2.0 && wx1 >= x1 - 1.0 {
+                right = right.min(wx0);
+            }
+        }
     }
-}
-
-/// An `NSRect` property of an object (`objc_msgSend` returns it in registers on arm64, through memory on x86-64).
-unsafe fn rect_of(obj: *mut c_void, sel: *mut c_void) -> Option<CGRect> {
-    #[cfg(target_arch = "aarch64")]
-    let r = unsafe {
-        let f: extern "C" fn(*mut c_void, *mut c_void) -> CGRect = std::mem::transmute(objc_msgSend as *const ());
-        f(obj, sel)
-    };
-    #[cfg(target_arch = "x86_64")]
-    let r = unsafe {
-        let mut r = CGRect::default();
-        let f: extern "C" fn(*mut CGRect, *mut c_void, *mut c_void) = std::mem::transmute(objc_msgSend_stret as *const ());
-        f(&mut r, obj, sel);
-        r
-    };
-    (r.size.width > 0.0 && r.size.height > 0.0).then_some(r)
+    Some(super::WorkArea { screen: [x0, y0, b.size.width, b.size.height], work: [left, top, (right - left).max(0.0), (bottom - top).max(0.0)] })
 }
 
 /// Every active display: (id, refresh, built in).

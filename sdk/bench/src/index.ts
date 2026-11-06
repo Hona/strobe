@@ -162,7 +162,7 @@ export interface MockRequest {
   url: string
   method: string
   headers: Record<string, string>
-  /** The request body as text, if it had one. */
+  /** The request body as text, if it had one (in Firefox, up to 16 MiB, where the browser collects it). */
   body?: string
   json<T = any>(): T
 }

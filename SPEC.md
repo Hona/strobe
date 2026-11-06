@@ -4924,6 +4924,33 @@ click, type, scroll, drag, a mocked fetch, a snapshot, and a click series for in
 Not checked yet: headed Firefox on Windows (the session stays locked: ETW presents, intervals and drops,
 `interaction.*`), Snap Firefox (no Snap on vps), headed X11 on a real GPU.
 
+Cross-engine bench files (2026-11-06; §5.6 "Refused series", §9.6 init scripts and mocks). Every consumer web
+bench had been refused whole on Firefox: one case's `main.work` primary refused the file, and with
+`--primary cpu.work` every `prepare` failed on `ctx.playwright` (an init script for a WebGPU frame counter,
+or Playwright-route mocks). Now a refused primary refuses its series alone, `ctx.addInitScript` and `ctx.mock`
+work in both engines with no Playwright (the runner's own DevTools session on Chromium; Firefox mocks get
+the request body from a BiDi data collector), and launch cases get `addInitScript` too. Two bugs found on
+the way: the BiDi reader's cloned socket kept the handshake's 10 s read timeout on Windows, so a Firefox run
+quiet for 10 s lost its connection; and a web launch case's observer went into the page strobe navigates
+from about:blank late (its session had the Page domain off), so an `until` already in the HTML was refused
+`RunIncomplete` (0.11.0 too). Checked with short `--check` runs (not timed) of a page served by `ctx.mock`
+(an init script that marks each document and counts WebGPU frames, a JSON echo of a POST body, a
+`main.work`, a `cpu.work`, a reload and a launch case) and of the Hex-site-shaped bench:
+
+- adais (Windows 11, locked, headless): Chromium 4 of 4 (`count.frame` 12 in 1 s through the init
+  script, the echoed body, the launch case on an `until` set by the page's first script); Firefox 159 2 of
+  2 with `main work` and `launch` listed refused, the body echoed, the init script in the first and the
+  reloaded document (no WebGPU headless: `count.frame` 0); the site bench in Firefox 1 of 1 with two
+  `main.busy` cases refused, 3 of 3 with `--primary cpu.work` (its 20 s case lost the BiDi connection
+  before the fix), and in Chromium `count.frame` 82 over 8 s; `strobe plan` lists the refused series with
+  no time and exits 4 only when `--filter` leaves refused series alone; `ctx.playwright` on Firefox fails
+  `EngineUnsupported` with the fix naming `ctx.addInitScript` and `ctx.mock`.
+- vps (Debian 13, Firefox 159.0.1, Chromium, headless): the same 2 of 2 (2 refused) and 4 of 4.
+
+Not checked: a comparison's exit with `--require-verdict` on a refused series (needs a timed bench), WebKit
+(`addInitScript` there lands with the WebKit driver), headed Firefox, an Electron launch case after the
+Page-domain change.
+
 strobe's own overhead (2026-11-06; §8.5, §13.7, §19): the OS sampler reads the target's process set
 and strobe's own process (CPU each tick, GPU and private memory once a second) into `os.strobe` and
 the Perfetto track "strobe itself (its own process)"; the macOS GPU reader keeps the accelerators and

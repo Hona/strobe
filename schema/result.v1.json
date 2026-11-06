@@ -167,7 +167,8 @@
         "NotEquivalent",
         "Untimed",
         "OutOfView",
-        "Covered"
+        "Covered",
+        "DisplayTooSmall"
       ]
     },
     "verdictKind": {

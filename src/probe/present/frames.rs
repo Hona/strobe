@@ -293,7 +293,8 @@ fn after(c: &Change, t: u64) -> bool {
 /// input never claims an unrelated later frame), and the target was at rest when it was sent: no
 /// present of `pids` begun before it reached the screen (or began, when it never did) in the `quiet`
 /// before it, so a frame on its way at the send (a press's look, an animation's) is never taken for its
-/// reaction. Its latency is then to the screen time of the first present that began after it and after
+/// reaction, and every earlier input's reaction already on the screen (a key typed before the last
+/// one showed shares its frame: its latency would be the last one's remainder). Its latency is then to the screen time of the first present that began after it and after
 /// the earliest its change can have happened (a frame begun before the model changed cannot show the
 /// change: a page's `:active` undone at the release is not an asynchronous reaction's frame; an
 /// accessibility event bounds nothing, `notified`), and reached the screen, within a second. Inputs
@@ -308,8 +309,8 @@ pub struct Reactions {
     pub scroll: Vec<f64>,
     /// Inputs that changed the model, per kind: (discrete, scroll).
     pub tried: (usize, usize),
-    /// Of those, the target was still drawing when they were sent, or (a press) an earlier input's
-    /// change was still to come.
+    /// Of those, the target was still drawing when they were sent, an earlier input's reaction was not
+    /// on the screen yet, or (a press) an earlier input's change was still to come.
     pub busy: (usize, usize),
     /// Of those, no present reached the screen within a second.
     pub unshown: (usize, usize),
@@ -353,6 +354,9 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
         let at = mine.partition_point(|p| p.start_ns <= t);
         mine[..at].iter().rev().take_while(|p| p.start_ns + HORIZON_NS > t).any(|p| p.start_ns.max(p.screen_ns) + quiet_ns > t)
     };
+    // When each earlier input's reaction reached the screen: an input sent before one did came while the
+    // target still answered that one (its frame not yet begun, so `drawing` cannot see it), not at rest.
+    let mut answered: Vec<u64> = Vec::new();
     for (k, s) in sent.iter().enumerate() {
         let next = sent.get(k + 1).map_or(u64::MAX, |n| n.press.unwrap_or(n.t_ns));
         // A click that acted on its press: the page says so (`acted`), else its first change after the
@@ -409,11 +413,14 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
         }
         seen.push((s.t_ns, i.map(|i| changes[i].1)));
         bump(&mut out.tried);
-        if drawing(t) {
+        let shown = frame(t, i.map_or(t, |i| changes[i].0));
+        let behind = answered.iter().any(|&at| at > t);
+        answered.extend(shown.map(|p| p.screen_ns));
+        if drawing(t) || behind {
             bump(&mut out.busy);
             continue;
         }
-        match frame(t, i.map_or(t, |i| changes[i].0)) {
+        match shown {
             Some(p) => {
                 let ms = (p.screen_ns - t) as f64 / 1e6;
                 if s.scroll { out.scroll.push(ms) } else { out.interaction.push((ms, edge)) }

@@ -872,11 +872,13 @@ mod imp {
                     let o = opts(2);
                     let delay = Duration::from_millis(o["delay"].as_f64().unwrap_or(0.0).max(0.0) as u64);
                     let (top, to) = self.key_target(&sel(0), &o, presents)?;
-                    self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
+                    let refresh = Duration::from_millis(self.frame_ms(0.0, 0.0));
+                    self.rest(Duration::ZERO, refresh, presents)?;
                     let mut last = 0;
                     for (k, c) in s(1).chars().enumerate() {
-                        if k > 0 && !delay.is_zero() {
-                            std::thread::sleep(delay);
+                        // Each key is measured: what the last one drew settles first (SPEC 7.4).
+                        if k > 0 {
+                            crate::driver::settle_key(presents, &self.pids.borrow(), last, delay, refresh)?;
                         }
                         let key = if c == '\n' { Key::Named(Named::Enter) } else { Key::Char(c) };
                         last = self.poster.press(top, to, Mods::default(), key)?;

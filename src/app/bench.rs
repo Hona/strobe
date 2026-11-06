@@ -1532,6 +1532,8 @@ pub fn run(args: &Args) -> Result<Output> {
         Some(_) => {}
     }
     preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
+    let (describe, headless) = (ctx.describe.clone(), ctx.headless);
+    display_fit(Some(&mut ctx), &mut series, &describe, headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
@@ -4281,7 +4283,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         let viewport = target.get("viewport").is_some_and(Value::is_object);
         if !app && viewport {
-            browser.fit_viewport(&page, window.width, window.height)?;
+            browser.fit_viewport(&page, window.width, window.height, headless)?;
         }
         // An app's window (a webview's, an Electron app's) is placed like a native app's and sized to
         // a viewport (DevTools resizes no app window: the OS does). The block records the page's own
@@ -6131,6 +6133,77 @@ fn check_engines(series: &mut [Series], describe: &Value, args: &Args) -> Result
         return Err(if refused.len() > 1 { r.detail(format!("and every other series too ({} in all)", refused.len())) } else { r }.into());
     }
     Ok(())
+}
+
+/// Before the first block (SPEC 9.6 "Declared viewport"): each headed page target's viewport against the
+/// largest page its browser's window shows on this display. Known from an earlier window of the same
+/// browser on the same work area (`web::known_room`); else, with `open`, measured in one window opened
+/// for it (in the slot); else not known yet. A series whose viewport does not fit refuses
+/// `DisplayTooSmall` alone, naming the most it can be; when that leaves nothing, the run refuses.
+fn display_fit(ctx: Option<&mut Ctx>, series: &mut [Series], describe: &Value, headless: bool) -> Result<()> {
+    let mut ctx = ctx;
+    let mut answers: BTreeMap<String, Option<Refusal>> = BTreeMap::new();
+    for s in series.iter_mut().filter(|s| s.gap.is_none() && s.refused.is_none()) {
+        let names: Vec<String> = match &s.sides {
+            Some((b, h)) => vec![b.clone(), h.clone()],
+            None => vec![s.target.clone()],
+        };
+        for name in names {
+            let t = &describe["targets"][&name];
+            let size = |vp: &serde_json::Map<String, Value>, k: &str, or: u64| vp.get(k).and_then(Value::as_u64).unwrap_or(or) as u32;
+            let Some((w, h)) = t["viewport"].as_object().map(|vp| (size(vp, "width", 1400), size(vp, "height", 900))) else { continue };
+            if !matches!(t["kind"].as_str(), Some("web" | "url")) || headless || t["headless"] == true {
+                continue;
+            }
+            let answer = match answers.get(&name) {
+                Some(a) => a.clone(),
+                None => {
+                    let a = fit_answer(ctx.as_deref_mut(), engine_of(t), t["scale"].as_f64(), (w, h))?;
+                    answers.insert(name.clone(), a.clone());
+                    a
+                }
+            };
+            if let Some(r) = answer {
+                let on = if s.sides.is_some() { format!("{} ({}): ", t["name"].as_str().unwrap_or(&name), engine_of(t)) } else { String::new() };
+                s.refused = Some(Refusal { summary: format!("{on}{}", r.summary), ..r });
+                break;
+            }
+        }
+    }
+    let refused: Vec<(String, &Refusal)> = series.iter().filter(|s| s.gap.is_none()).filter_map(|s| Some((s.label(), s.refused.as_ref()?))).collect();
+    if let Some((label, r)) = refused.first().filter(|_| series.iter().all(|s| s.gap.is_some() || s.refused.is_some())) {
+        let r = Refusal { summary: format!("{label}: {}", r.summary), ..(*r).clone() };
+        return Err(if refused.len() > 1 { r.detail(format!("and every other series too ({} in all)", refused.len())) } else { r }.into());
+    }
+    Ok(())
+}
+
+/// Whether a page of `engine` shows `asked` here: from what strobe knows of this browser on this work
+/// area, else (with a bench's `ctx`) one window of it opened and fitted for the purpose. A window that
+/// cannot be opened says nothing: the block's own check still runs.
+fn fit_answer(ctx: Option<&mut Ctx>, engine: WebEngine, scale: Option<f64>, asked: (u32, u32)) -> Result<Option<Refusal>> {
+    if let Some((browser, room)) = web::known_room(engine, scale)
+        && (ctx.is_none() || room.too_small(&browser, asked).is_none())
+    {
+        return Ok(room.too_small(&browser, asked));
+    }
+    let Some(ctx) = ctx else { return Ok(None) };
+    let mut window = ctx.window.clone();
+    (window.width, window.height, window.scale) = (asked.0, asked.1, scale);
+    progress(format!("  fitting a {}×{} page in a {engine} window on this display", asked.0, asked.1));
+    let pin = ctx.pin;
+    let fitted = in_slot(ctx, &format!("fitting a {engine} window"), |_| {
+        let browser = web::launch(engine, &window, false, pin)?;
+        let r = browser.page().and_then(|page| browser.fit_viewport(&page, asked.0, asked.1, false));
+        browser.close();
+        r
+    });
+    match fitted {
+        Ok(()) => Ok(None),
+        Err(e) if e.validator() == Some(ValidatorId::DisplayTooSmall) => Ok(e.refusal.map(|r| *r)),
+        Err(e) if e.code == 130 => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 /// `check_engines` for one target of a series: a usage error or whole-run refusal, else the series' own

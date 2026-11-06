@@ -991,6 +991,31 @@ pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     }
 }
 
+/// The primary monitor (where strobe places windows at (40, 40)): its rectangle and work area (less the
+/// taskbar and docked bars), read per-monitor DPI aware and divided by its scale.
+pub fn work_area() -> Option<super::WorkArea> {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTOPRIMARY, MONITORINFO};
+    use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForMonitor, MDT_EFFECTIVE_DPI, SetThreadDpiAwarenessContext};
+    unsafe {
+        let before = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        let mon = MonitorFromPoint(POINT { x: 0, y: 0 }, MONITOR_DEFAULTTOPRIMARY);
+        let mut info: MONITORINFO = zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        let ok = GetMonitorInfoW(mon, &mut info) != 0;
+        let (mut dx, mut dy) = (0u32, 0u32);
+        let dpi = GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dx, &mut dy) >= 0 && dx > 0;
+        if !before.is_null() {
+            SetThreadDpiAwarenessContext(before);
+        }
+        if !ok {
+            return None;
+        }
+        let s = if dpi { dx as f64 / 96.0 } else { 1.0 };
+        let dip = |r: windows_sys::Win32::Foundation::RECT| [r.left as f64 / s, r.top as f64 / s, (r.right - r.left) as f64 / s, (r.bottom - r.top) as f64 / s];
+        Some(super::WorkArea { screen: dip(info.rcMonitor), work: dip(info.rcWork) })
+    }
+}
+
 pub fn display_of(hwnd: isize) -> Option<super::DisplayPath> {
     use windows_sys::Win32::Devices::Display::{
         DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME, DISPLAYCONFIG_MODE_INFO, DISPLAYCONFIG_PATH_INFO, DISPLAYCONFIG_SOURCE_DEVICE_NAME, DisplayConfigGetDeviceInfo, GetDisplayConfigBufferSizes,

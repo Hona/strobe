@@ -1196,7 +1196,7 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
             ),
             got.presses(),
             if got.unchanged + got.busy.0 + got.unshown.0 > 0 {
-                format!(" · not counted: {} changed no tree, {} came mid-drawing, {} showed no frame", got.unchanged, got.busy.0, got.unshown.0)
+                format!(" · not counted: {} changed no tree, {} came mid-drawing or before an earlier input showed, {} showed no frame", got.unchanged, got.busy.0, got.unshown.0)
             } else {
                 String::new()
             },
@@ -1213,7 +1213,7 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
     for (ms, run, k) in slow.iter().take(top.min(10)) {
         text += &format!("  {:>9}  {run} {k}\n", fmt::value(*ms, "ms"));
     }
-    text += "an input counts when the app changed its accessibility tree after it and was not drawing already (SPEC §7.4)\n";
+    text += "an input counts when the app changed its accessibility tree after it and was not drawing already or still to show an earlier input (SPEC §7.4)\n";
     Ok(Output::new(text, json!({ "runs": runs_json, "refresh_ms": refresh })))
 }
 /// Busy time by thread from its task loop's tasks. A thread's other tracks hold spans that overlap

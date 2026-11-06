@@ -550,8 +550,9 @@ impl Driver {
                 os.rest(Duration::ZERO, os.frame())?;
                 let mut last = host::now_ns();
                 for (k, c) in s(1).chars().enumerate() {
-                    if k > 0 && !delay.is_zero() {
-                        std::thread::sleep(delay);
+                    // Each key is measured: what the last one drew settles first (SPEC 7.4).
+                    if k > 0 {
+                        super::settle_key(&os.presents, &os.pids.borrow(), last, delay, os.frame())?;
                     }
                     let key = match c {
                         '\n' => Key::Named(Named::Enter),

@@ -119,6 +119,10 @@ unsafe extern "C" {
     fn objc_getClass(name: *const c_char) -> *mut c_void;
     fn sel_registerName(name: *const c_char) -> *mut c_void;
     fn objc_msgSend();
+    #[cfg(target_arch = "x86_64")]
+    fn objc_msgSend_stret();
+    fn objc_autoreleasePoolPush() -> *mut c_void;
+    fn objc_autoreleasePoolPop(pool: *mut c_void);
 }
 
 #[repr(C)]
@@ -1027,6 +1031,48 @@ fn scale_at(p: CGPoint) -> f64 {
     let px = unsafe { CGDisplayModeGetPixelWidth(mode) } as f64;
     unsafe { CGDisplayModeRelease(mode) };
     (px / bounds.size.width).max(1.0)
+}
+
+/// The display with the menu bar (where strobe places windows): `NSScreen`'s frame and visible frame,
+/// in points from its top left. AppKit is loaded for this alone: strobe does not link it.
+pub fn work_area() -> Option<super::WorkArea> {
+    static APPKIT: OnceLock<bool> = OnceLock::new();
+    let path = CString::new("/System/Library/Frameworks/AppKit.framework/AppKit").ok()?;
+    if !*APPKIT.get_or_init(|| !unsafe { libc::dlopen(path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL) }.is_null()) {
+        return None;
+    }
+    let sel = |s: &str| CString::new(s).ok().map(|c| unsafe { sel_registerName(c.as_ptr()) });
+    let (class, screens, first, frame, visible) = (CString::new("NSScreen").ok()?, sel("screens")?, sel("firstObject")?, sel("frame")?, sel("visibleFrame")?);
+    unsafe {
+        let send: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void = std::mem::transmute(objc_msgSend as *const ());
+        let pool = objc_autoreleasePoolPush();
+        let cls = objc_getClass(class.as_ptr());
+        let all = if cls.is_null() { std::ptr::null_mut() } else { send(cls, screens) };
+        let screen = if all.is_null() { std::ptr::null_mut() } else { send(all, first) };
+        let rects = if screen.is_null() { None } else { rect_of(screen, frame).zip(rect_of(screen, visible)) };
+        objc_autoreleasePoolPop(pool);
+        let (frame, visible) = rects?;
+        // Cocoa counts up from the bottom of this display; strobe's places count down from its top.
+        let h = frame.size.height;
+        Some(super::WorkArea { screen: [frame.origin.x, 0.0, frame.size.width, h], work: [visible.origin.x, h - (visible.origin.y + visible.size.height), visible.size.width, visible.size.height] })
+    }
+}
+
+/// An `NSRect` property of an object (`objc_msgSend` returns it in registers on arm64, through memory on x86-64).
+unsafe fn rect_of(obj: *mut c_void, sel: *mut c_void) -> Option<CGRect> {
+    #[cfg(target_arch = "aarch64")]
+    let r = unsafe {
+        let f: extern "C" fn(*mut c_void, *mut c_void) -> CGRect = std::mem::transmute(objc_msgSend as *const ());
+        f(obj, sel)
+    };
+    #[cfg(target_arch = "x86_64")]
+    let r = unsafe {
+        let mut r = CGRect::default();
+        let f: extern "C" fn(*mut CGRect, *mut c_void, *mut c_void) = std::mem::transmute(objc_msgSend_stret as *const ());
+        f(&mut r, obj, sel);
+        r
+    };
+    (r.size.width > 0.0 && r.size.height > 0.0).then_some(r)
 }
 
 /// Every active display: (id, refresh, built in).

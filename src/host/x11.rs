@@ -152,6 +152,20 @@ pub fn main_window(pids: &[u32]) -> Option<TopWindow> {
     })
 }
 
+/// The root window and the window manager's work area on the current desktop (`_NET_WORKAREA`, else the
+/// whole root), in device-independent pixels at the display's DPI.
+pub fn work_area() -> Option<super::WorkArea> {
+    with(|x| {
+        let g = x.conn.get_geometry(x.root).ok()?.reply().ok()?;
+        let s = x.dpi as f64 / 96.0;
+        let screen = [0.0, 0.0, g.width as f64 / s, g.height as f64 / s];
+        let areas = prop32(x, x.root, "_NET_WORKAREA");
+        let desktop = prop32(x, x.root, "_NET_CURRENT_DESKTOP").first().copied().unwrap_or(0) as usize;
+        let work = areas.get(desktop * 4..desktop * 4 + 4).or_else(|| areas.get(..4)).map_or(screen, |a| [a[0] as f64 / s, a[1] as f64 / s, a[2] as f64 / s, a[3] as f64 / s]);
+        Some(super::WorkArea { screen, work })
+    })
+}
+
 pub fn window_state(id: isize) -> Option<TopWindow> {
     with(|x| {
         let stack = clients(x);

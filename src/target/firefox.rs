@@ -269,18 +269,20 @@ impl Browser {
         Ok(page)
     }
 
-    /// Sizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels.
-    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32) -> Result<()> {
-        let inner = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight]")?;
+    /// Sizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels, at
+    /// `at` when given, else where the window was asked to be.
+    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32, at: Option<(i32, i32)>) -> Result<()> {
+        let inner = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY]")?;
         let num = |i: usize| inner[i].as_f64().unwrap_or(0.0);
-        if num(0) as u32 == width && num(1) as u32 == height {
+        let placed = at.is_none_or(|(x, y)| num(4) as i32 == x && num(5) as i32 == y);
+        if placed && num(0) as u32 == width && num(1) as u32 == height {
             return Ok(());
         }
         let (dw, dh) = (num(2) - num(0), num(3) - num(1));
-        let w = &self.window;
+        let (x, y) = at.unwrap_or((self.window.x, self.window.y));
         self.bidi.send(
             "browser.setClientWindowState",
-            json!({ "clientWindow": self.client_window, "state": "normal", "x": w.x, "y": w.y, "width": (width as f64 + dw).round() as u32, "height": (height as f64 + dh).round() as u32 }),
+            json!({ "clientWindow": self.client_window, "state": "normal", "x": x, "y": y, "width": (width as f64 + dw).round() as u32, "height": (height as f64 + dh).round() as u32 }),
         )?;
         Ok(())
     }

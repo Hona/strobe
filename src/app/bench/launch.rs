@@ -226,7 +226,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             let page = browser.page()?;
             // The browser's window takes the viewport before the timed navigation, as a run case's does.
             if target.get("viewport").is_some_and(Value::is_object) {
-                browser.fit_viewport(&page, window.width, window.height)?;
+                browser.fit_viewport(&page, window.width, window.height, headless_of(ctx, s))?;
             }
             let first = if target["prepare"].as_bool() == Some(true) {
                 // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.

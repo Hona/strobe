@@ -541,19 +541,21 @@ impl Browser {
     }
 
     /// Sizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels.
-    /// WPE's headless view is the viewport, sized at launch.
-    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32) -> Result<()> {
-        let inner = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight]")?;
+    /// WPE's headless view is the viewport, sized at launch. The window goes to `at` when given, else
+    /// where it was asked to be.
+    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32, at: Option<(i32, i32)>) -> Result<()> {
+        let inner = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY]")?;
         let num = |i: usize| inner[i].as_f64().unwrap_or(0.0);
-        if num(0) as u32 == width && num(1) as u32 == height {
+        let placed = at.is_none_or(|(x, y)| num(4) as i32 == x && num(5) as i32 == y);
+        if placed && num(0) as u32 == width && num(1) as u32 == height {
             return Ok(());
         }
         if self.flavor == Flavor::Wpe {
             return Err(Error::msg(format!("WPE's view is {}×{}, not the {width}×{height} it was launched with", num(0), num(1))));
         }
         let (dw, dh) = (num(2) - num(0), num(3) - num(1));
-        let w = &self.window;
-        self.session.set_window_rect(w.x, w.y, (width as f64 + dw).round() as u32, (height as f64 + dh).round() as u32)
+        let (x, y) = at.unwrap_or((self.window.x, self.window.y));
+        self.session.set_window_rect(x, y, (width as f64 + dw).round() as u32, (height as f64 + dh).round() as u32)
     }
 
     /// Every process of this browser: its tree and, on macOS, the XPC services responsible to it (web

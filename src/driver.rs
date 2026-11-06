@@ -48,6 +48,18 @@ pub(crate) fn settle(presents: &RefCell<Option<crate::probe::present::PresentCap
     Ok(true)
 }
 
+/// Between the keys of `type` (SPEC 7.4): the next key is at rest only once what the last one drew is on
+/// the screen. Waits for the first present of `pids` begun after `sent` to reach it (at most `SETTLE_MAX`:
+/// a key that draws nothing, or nothing that soon, waits no longer), then `settle` with `min` (a `delay`
+/// counts from the key). Without a capture it waits `min` alone.
+pub(crate) fn settle_key(presents: &RefCell<Option<crate::probe::present::PresentCapture>>, pids: &[u32], sent: u64, min: Duration, refresh: Duration) -> Result<bool> {
+    let since = Instant::now();
+    if let Some(p) = presents.borrow_mut().as_mut() {
+        p.live(pids, sent, SETTLE_MAX)?;
+    }
+    settle(presents, pids, min.saturating_sub(since.elapsed()), refresh)
+}
+
 /// Installed in every document before its scripts run: the browser's own rAF, which a page may replace (a game
 /// frame pacer does) and so delay the driver's waits on its own schedule.
 pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFrame.bind(window)";
@@ -733,6 +745,17 @@ impl Driver {
         }
     }
 
+    /// `settle_key` on the page's presents when strobe follows them; else `min` alone.
+    fn settle_key(&self, sent: u64, min: Duration) -> Result<bool> {
+        match self.live.get() {
+            Some(p) => settle_key(p, &self.live_pids.borrow(), sent, min, self.refresh.get()),
+            None => {
+                std::thread::sleep(min);
+                Ok(true)
+            }
+        }
+    }
+
     /// A pointer move to (x, y) carrying the held buttons. While one is held it is a drag's move: sent
     /// without waiting for the renderer to handle it (`paced`), and its time is kept for `input.rate`.
     fn pointer_move(&self, x: f64, y: f64, paced: bool) -> Result<()> {
@@ -933,11 +956,13 @@ impl Driver {
             "type" => {
                 let o = opts(2);
                 self.focus(&sel(0), &o)?;
-                // One key event per character, like a person typing, so each keystroke is an interaction.
+                // One key event per character, like a person typing, so each keystroke is an interaction,
+                // sent once what the last one drew has settled (followed presents: SPEC 7.4).
                 let delay = Duration::from_millis(o.get("delay").and_then(Value::as_u64).unwrap_or(0));
                 for (i, c) in s(1).chars().enumerate() {
-                    if i > 0 && !delay.is_zero() {
-                        std::thread::sleep(delay);
+                    if i > 0 {
+                        let sent = self.inputs.borrow().last().map_or(0, |s| s.t_ns);
+                        self.settle_key(sent, delay)?;
                     }
                     let k = match c {
                         '\n' => Key::Named(Named::Enter),

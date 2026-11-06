@@ -141,7 +141,7 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let fresh = launching.fresh;
     let (child, profile) = launching.done();
-    Ok((Browser { cdp, ws, child, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone(), embedded: false }, guard, Started { epoch_ms: epoch, output, main }))
+    Ok((Browser { cdp, ws, child, pid, profile, fresh, exe: app.exe.clone(), version, window: window.clone(), embedded: false, as_person: false }, guard, Started { epoch_ms: epoch, output, main }))
 }
 
 /// The browser's own pages (DevTools, settings, extensions), which are never the app's.

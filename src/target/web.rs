@@ -93,6 +93,105 @@ pub fn browser_identity(engine: WebEngine, headless: bool) -> String {
     format!("{} {}{stamp}", engine, exe.display())
 }
 
+/// How far a window may reach past the work area's left, right and bottom edges: Windows gives every
+/// window an invisible resize border there (8 pixels at 100%), which may lie past the edge unseen.
+const FRAME_SLACK: f64 = if cfg!(windows) { 8.0 } else { 0.0 };
+
+/// What a headed page's window has on the display strobe places it on (SPEC 9.6 "Declared viewport"), in
+/// the page's CSS pixels: the display's work area (`host::work_area`: less the menu bar and Dock, the
+/// taskbar, the panels), the window's own part (its size less the page's: title bar, tabs, toolbar,
+/// frame), the page, and where the window is.
+#[derive(Clone, Copy, Debug)]
+pub struct Room {
+    pub area: [f64; 4],
+    pub chrome: (f64, f64),
+    pub page: (f64, f64),
+    window: [f64; 4],
+    display: host::WorkArea,
+}
+
+impl Room {
+    /// The largest page this browser's window shows inside the work area.
+    pub fn most(&self) -> (f64, f64) {
+        ((self.area[2] + 2.0 * FRAME_SLACK - self.chrome.0).floor(), (self.area[3] + FRAME_SLACK - self.chrome.1).floor())
+    }
+
+    /// The window lies inside the work area (within a point, and the frame's slack).
+    fn inside(&self) -> bool {
+        let ([x, y, w, h], [ax, ay, aw, ah], s) = (self.window, self.area, FRAME_SLACK + 1.0);
+        x >= ax - s && y >= ay - 1.0 && x + w <= ax + aw + s && y + h <= ay + ah + s
+    }
+
+    /// Where a window of `outer` size goes so it lies inside the work area: `at`, moved no more than it
+    /// must (to the area's top left when it is larger).
+    fn place(&self, at: (i32, i32), outer: (f64, f64)) -> (i32, i32) {
+        let [ax, ay, aw, ah] = self.area;
+        let x = (at.0 as f64).min(ax + aw + FRAME_SLACK - outer.0).max(ax - FRAME_SLACK);
+        let y = (at.1 as f64).min(ay + ah + FRAME_SLACK - outer.1).max(ay);
+        (x.round() as i32, y.round() as i32)
+    }
+
+    /// `DisplayTooSmall` when a page of `asked` CSS pixels does not fit in `most`.
+    pub fn too_small(&self, browser: &str, asked: (u32, u32)) -> Option<Refusal> {
+        let (mw, mh) = self.most();
+        if asked.0 as f64 <= mw + 1.0 && asked.1 as f64 <= mh + 1.0 {
+            return None;
+        }
+        Some(
+            Refusal::new(
+                ValidatorId::DisplayTooSmall,
+                format!(
+                    "this display shows at most {mw}×{mh} of a page in {browser}, not the viewport {}×{} the target asks for: its work area is {:.0}×{:.0} and the browser's window takes {:.0}×{:.0} of it",
+                    asked.0, asked.1, self.area[2], self.area[3], self.chrome.0, self.chrome.1
+                ),
+            )
+            .fix(format!("declare a viewport no larger than {mw}×{mh}, run on a larger display, or run the page headless (--headless), which has no window to fit")),
+        )
+    }
+}
+
+/// The page's room now, or None without a display strobe can read.
+pub fn room(page: &WebPage) -> Result<Option<Room>> {
+    let Some(display) = host::work_area() else { return Ok(None) };
+    let v = page.eval("[innerWidth, innerHeight, outerWidth, outerHeight, screenX, screenY, screen.width]")?;
+    let n = |i: usize| v[i].as_f64().unwrap_or(0.0);
+    // CSS pixels per device-independent pixel: 1, unless the target forces another scale.
+    let k = if display.screen[2] > 0.0 && n(6) > 0.0 { n(6) / display.screen[2] } else { 1.0 };
+    Ok(Some(Room { area: display.work.map(|a| a * k), chrome: (n(2) - n(0), n(3) - n(1)), page: (n(0), n(1)), window: [n(4), n(5), n(2), n(3)], display }))
+}
+
+/// Where strobe keeps each browser's room per work area, for a plan or a bench before it opens one.
+fn rooms_file() -> PathBuf {
+    host::paths::state_dir().join("windows.json")
+}
+
+fn room_key(engine: WebEngine, scale: Option<f64>, display: &host::WorkArea) -> String {
+    let r = |a: [f64; 4]| a.map(|v| v.round() as i64);
+    format!("{} · scale {} · work area {:?} of {:?}", browser_identity(engine, false), scale.map_or("display".to_string(), |s| s.to_string()), r(display.work), r(display.screen))
+}
+
+fn remember(engine: WebEngine, scale: Option<f64>, browser: &str, r: &Room) {
+    let mut all: Value = std::fs::read(rooms_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
+    let entry = json!({ "browser": browser, "area": r.area, "chrome": [r.chrome.0, r.chrome.1] });
+    let key = room_key(engine, scale, &r.display);
+    if all[&key] != entry {
+        all[&key] = entry;
+        let _ = host::paths::write_atomic(&rooms_file(), &serde_json::to_vec_pretty(&all).unwrap_or_default());
+    }
+}
+
+/// The room a headed `engine` page had on this work area before, and the browser it was: what a plan
+/// and a bench check a declared viewport against before they open a window.
+pub fn known_room(engine: WebEngine, scale: Option<f64>) -> Option<(String, Room)> {
+    let display = host::work_area()?;
+    let all: Value = serde_json::from_slice(&std::fs::read(rooms_file()).ok()?).ok()?;
+    let e = &all[room_key(engine, scale, &display)];
+    let num = |v: &Value| v.as_f64();
+    let area = [num(&e["area"][0])?, num(&e["area"][1])?, num(&e["area"][2])?, num(&e["area"][3])?];
+    let room = Room { area, chrome: (num(&e["chrome"][0])?, num(&e["chrome"][1])?), page: (0.0, 0.0), window: [0.0; 4], display };
+    Some((e["browser"].as_str().unwrap_or("the browser").to_string(), room))
+}
+
 /// Launches a fresh browser of `engine` with an isolated profile. `cpus` pins it and its children.
 pub fn launch(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>) -> Result<WebBrowser> {
     if let Some(e) = refusal(engine, headless) {
@@ -168,14 +267,60 @@ impl WebBrowser {
         })
     }
 
-    pub fn fit_viewport(&self, page: &WebPage, width: u32, height: u32) -> Result<()> {
+    /// The window strobe asked the browser for (its place, size and scale).
+    pub fn window(&self) -> &Window {
+        match self {
+            WebBrowser::Chromium(b) => &b.window,
+            WebBrowser::Firefox(b) => &b.window,
+            WebBrowser::Webkit(b) => &b.window,
+        }
+    }
+
+    /// Sizes the window so the page is `width`×`height` CSS pixels, at `at` (a screen point in CSS pixels)
+    /// when given, else where the window was asked to be.
+    fn fit_viewport_at(&self, page: &WebPage, width: u32, height: u32, at: Option<(i32, i32)>) -> Result<()> {
         match (self, page) {
-            (WebBrowser::Chromium(b), WebPage::Chromium(p)) => b.fit_viewport(p, width, height),
-            (WebBrowser::Firefox(b), WebPage::Firefox(p)) => b.fit_viewport(p, width, height),
-            (WebBrowser::Webkit(b), WebPage::Webkit(p)) => b.fit_viewport(p, width, height),
+            (WebBrowser::Chromium(b), WebPage::Chromium(p)) => b.fit_viewport(p, width, height, at),
+            (WebBrowser::Firefox(b), WebPage::Firefox(p)) => b.fit_viewport(p, width, height, at),
+            (WebBrowser::Webkit(b), WebPage::Webkit(p)) => b.fit_viewport(p, width, height, at),
             (WebBrowser::Chromium(_), WebPage::Firefox(_) | WebPage::Webkit(_))
             | (WebBrowser::Firefox(_), WebPage::Chromium(_) | WebPage::Webkit(_))
             | (WebBrowser::Webkit(_), WebPage::Chromium(_) | WebPage::Firefox(_)) => Err(Error::msg("internal: a page of another browser")),
+        }
+    }
+
+    /// Sizes the window so the page is the target's viewport, `width`×`height` CSS pixels (SPEC 9.6
+    /// "Declared viewport"), never by emulating a viewport the window does not have. Headed, the window
+    /// is moved inside the display's work area where it fits there, and the page is read until it takes
+    /// the size (at most 2 s): a size this display cannot show refuses `DisplayTooSmall`, naming the
+    /// largest page this browser's window shows on it, which strobe keeps for the next plan and bench
+    /// (`known_room`). Any other difference is left to the block's viewport check.
+    pub fn fit_viewport(&self, page: &WebPage, width: u32, height: u32, headless: bool) -> Result<()> {
+        let before = if headless { None } else { room(page)? };
+        let at = before.map(|r| r.place((self.window().x, self.window().y), (width as f64 + r.chrome.0, height as f64 + r.chrome.1)));
+        self.fit_viewport_at(page, width, height, at)?;
+        if before.is_none() {
+            return Ok(());
+        }
+        // Chromium names itself by its product token (`Edg/156.0.4314.58`).
+        let browser = self.version().replacen('/', " ", 1);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let r = loop {
+            let Some(r) = room(page)? else { return Ok(()) };
+            let shown = (r.page.0 - width as f64).abs() <= 1.0 && (r.page.1 - height as f64).abs() <= 1.0 && r.inside();
+            if shown {
+                remember(self.engine(), self.window().scale, &browser, &r);
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                break r;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        remember(self.engine(), self.window().scale, &browser, &r);
+        match r.too_small(&browser, (width, height)) {
+            Some(refusal) => Err(refusal.into()),
+            None => Ok(()),
         }
     }
 

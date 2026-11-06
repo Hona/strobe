@@ -292,6 +292,7 @@ export default bench({
 - `goto`: relative paths resolve against the page.
 - `click`, `hover`, `move(x, y)`.
 - `type`: one key event per character; `delay` ms between.
+  - Measured from outside (native apps, headed Firefox and WebKit pages), each key waits until the last one's frame is on the screen and the app rests (at most 300 ms), so each is an `interaction.*` sample; a key sent before an earlier key's frame showed is none.
 - `press`: `"F9"`, `"PageUp"`, `"Control++"`, `"ControlOrMeta+Shift+P"`: one key table on every target.
 - `click(sel, { button, modifiers, count })`.
   - Aims at the centre of the part of the element that shows (scrolled into view first if none does), in every engine and on native apps; a box taller than the window is clicked where it shows.
@@ -615,6 +616,7 @@ Fewer than 6 pairs never gets a verdict.
   - Both talk to one `fixture("<server> --port {port}", { seed })`: strobe starts it per block outside both apps; pass `{fixture.url}` in the targets' `args`, `env` or `files`.
     - `FixtureMismatch`: no loopback connection the fixture's processes answered (Unix sockets, proxies and containers count for none), a side served its port itself, or a side running its executable (or a copy) serves a port.
   - A declared `viewport` holds in every run-case block, `--check` too (app and native windows sized through the OS; macOS needs the accessibility permission); a window that keeps another size refuses `VariantMismatch` naming the side.
+  - A headed page's viewport must fit the display: its work area less the browser's tabs and toolbar. Checked before the first block (`plan` too, once strobe has seen that browser there); one that does not fit refuses `DisplayTooSmall` with the most this display shows (a 1470×956 MacBook Air shows at most 1470×838 of a page in Firefox). Declare a smaller viewport, use a larger display, or `--headless`.
     - A macOS native window is measured by its frame (title bar included): against a page, up to 32 points taller is the same window.
     - Launches keep the window each app opens; their sides must match each other.
   - Pick a primary both sides measure the same way: `cpu.work`, `run.duration`, `launch.ready`, `memory.app.private`; `main.work` or `ui.cpu` against another engine exits 2 (`NotComparable`).

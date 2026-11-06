@@ -818,10 +818,11 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
   input it sends (host clock); its frame is the first present of the app's processes that started
   after it, no earlier than the change it shows, and reached the screen (a discarded one is passed
   over: a later one shows it). An input counts only when no present of the app began or reached the
-  screen in the two refreshes before it: at rest, the next present is the input's; an app already
-  drawing, or a frame still on its way (a click's pressed look), may present a frame begun before
-  the input, so that input is not counted, and neither is one after which the app's accessibility
-  tree did not change (§7.4). The driver holds a click's press, and waits before a measured input,
+  screen in the two refreshes before it, and every earlier input's frame was on the screen before it:
+  at rest, the next present is the input's; an app already drawing, a frame still on its way (a
+  click's pressed look), or an earlier key whose frame has not begun yet (keys sent faster than the
+  app shows them share its frames) may present a frame begun before the input, so that input is not
+  counted, and neither is one after which the app's accessibility tree did not change (§7.4). The driver holds a click's press, and waits before a measured input,
   until the app settles (at most 300 ms), so a static pressed look is on the screen first. An
   accessibility event carries no source time, so a native frame is bounded only by the input: a frame
   the app draws at once for another reason (an unpress, a periodic redraw) before an asynchronous
@@ -952,10 +953,19 @@ What strobe reads from a native app (§13.7), per run:
     runs only acted refuses `interaction.*`
     (`PatternInput`).
   - The driver lets the target settle around them, on its own live copy of the present events
-    (`driver::settle`): before a press, a measured input (each `type`'s first key, a `press` after the
+    (`driver::settle`): before a press, a measured input (each key of `type`, a `press` after the
     click into its field, a key or button `down`/`up`) or a scroll's first step, until no present of
     the target began or reached the screen in the last 2 refreshes plus 30 ms for the events to reach
-    strobe, at most 300 ms. A single click's press is held that way, at least 60 ms, so its pressed
+    strobe, at most 300 ms. Before each key of `type` after the first, the first frame begun after the
+    last key reaches the screen first (at most 300 ms; `driver::settle_key`), then the settle, with
+    `delay` counted from the last key. Sent back to back (0.14), the 9 keys of a search field that
+    draws for 100 ms after each went out within about 10 ms, and 7 counted with a p50 of 9.7 ms: the
+    frames already under way for the keys before them (none of the 9 was at rest); settled, all 9 are
+    samples (p50 36.9 ms; `scripts/dev/type.bench.ts` on air). A caret's blink is one frame every
+    530-650 ms (Firefox, the fixture's caret mark; macOS 27's own text caret draws no frame strobe
+    sees as the app's), so a quiet gap comes between blinks; a blink that began in the 2 refreshes
+    before a key still makes that key no sample (its frame reached strobe after the key went out:
+    8 of 9 in a Firefox page field). A single click's press is held that way, at least 60 ms, so its pressed
     look (`:active`, a highlight) is on the screen and settled before the release; when the settle
     before the press already hit the cap (the target animates), the press is held the 60 ms only, not
     a second 300 ms. A double or triple click's presses are a frame apart with no settling. A click
@@ -2896,7 +2906,33 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   page side's `ctx.mock` (a mock one side has and the other cannot) and the GPU adapter of a page side.
 - **Declared viewport** (every run case's block: a `--check`, one target's, either side's): what the
   block drew in must be the target's `viewport` within 2 DIP, or the block refuses `VariantMismatch`
-  naming the side. A page's browser window is sized to it; an app's window (a webview's, an Electron
+  naming the side. A page's browser window is sized to it, never by emulating a viewport larger than
+  the window (no device-metrics override).
+  - **Display fit** (headed pages; `web::WebBrowser::fit_viewport`, `display_fit`): the most a page can
+    be is the display's work area less the browser window's own part, in the page's CSS pixels. The
+    work area is the display strobe places windows on (`host::work_area`: `NSScreen`'s visible frame
+    on macOS, less the menu bar and the Dock; the primary monitor's `rcWork` per-monitor DPI aware on
+    Windows, less the taskbar; `_NET_WORKAREA` on X11); the window's part is `outerWidth −
+    innerWidth` by `outerHeight − innerHeight` (title bar, tabs, toolbar, frame); a forced `scale`
+    converts by `screen.width` over the display's width. On Windows a window may reach 8 pixels past
+    the left, right and bottom edges (its invisible resize border). The window is moved inside the
+    work area where it fits (to its top left when it must), and the page read until it takes the size
+    (at most 2 s); one the display cannot show refuses `DisplayTooSmall`, naming the most and how it
+    comes about ("this display shows at most 1470×838 of a page in Firefox 159.0.1, not the viewport
+    1440×900 the target asks for: its work area is 1470×923 and the browser's window takes 0×85 of
+    it"), with the fix: a smaller viewport, a larger display, or headless. Before the first block
+    (`bench`, `--check`) each headed page target with a viewport is checked this way once: from what
+    strobe keeps of that browser on that work area (`<state>/windows.json`, keyed by the browser's
+    identity, the scale and the work area, written by every headed fit), when that says it fits;
+    else in one window of the browser opened and fitted in the slot (a refusal is never taken from
+    the file alone, so a stale entry cannot keep a series refused). A series that does not fit
+    refuses alone, listed with the rest; `strobe plan` refuses from the file only. Headless pages
+    have no window and are not checked. No borderless window is used to make room: Chromium's
+    `--app` window keeps its title bar (and is not the browser people use), Firefox's kiosk mode is
+    full screen only, and Safari has no such mode. On a 1470×956-point MacBook Air with the Dock
+    hidden the work area is 1470×923, so no engine's window shows a 900-point page: at most 1462×839
+    in Edge (its window takes 8×84) and 1470×838 in Firefox (0×85); a 1440×830 page fits in both.
+  A page's browser window is sized as above; an app's window (a webview's, an Electron
   app's: DevTools resizes no app window) and a native app's through the OS, before the runs. A page
   is sized from the window's size less the page's (what the app draws around it, the title bar on
   macOS), read again before each of up to three passes (checked on air with an Electron app, after
@@ -3061,6 +3097,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 | `OutOfView` | a page input's element (a click, hover, drag, scroll, wheel or `down` at it, the click that focuses for `type` or `press`) shows no part in the viewport even scrolled into view: an ancestor clips it away (`overflow: clip`), or what shows is under a pixel. Input aimed there would land beside it; the message names the clipping ancestor (9.6 "Where input aims") |
 | `Covered` | a page input's element shows, but another element is where strobe would aim at every point it tries (its centre, its line boxes, then scrolled to the middle of the viewport, the centre and the centres of its visible part's quarters): a click there would reach that instead, as for a person. The message names the covering element; not transient (an overlay that stays). A native app's covered window is `WindowHidden` (9.6 "Where input aims") |
+| `DisplayTooSmall` | a headed page's declared viewport is larger than this display shows of a page in that browser: its work area (less the menu bar and Dock, the taskbar, panels) less the browser window's own part. Named with the most it can be, the work area and the window's part; checked before the first block (and by `strobe plan` from what strobe kept), refusing that series alone, and again when a block fits its window. Not transient: the device, not the variant (9.10 "Declared viewport") |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -3809,9 +3846,12 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 - Isolated profile per launch.
 - Muted (`--mute-audio`): a game or video under test never plays on the user's speakers. Web Audio
   still renders its graph, so its cost stays in the measurement.
-- Not marked as automated (`--disable-blink-features=AutomationControlled`): `navigator.webdriver`
-  is false, as for a person. Apps branch on it (a game shell hid its menus and started muted under
-  it), and a measurement of that mode is a measurement of strobe.
+- Not marked as automated: a preload script in each page of a browser strobe launched makes
+  `navigator.webdriver` false, as for a person (as in Firefox and WebKit). Apps branch on it (a game
+  shell hid its menus and started muted under it), and a measurement of that mode is a measurement of
+  strobe. `--disable-blink-features=AutomationControlled` did it until 0.14 and put a dismissable
+  "unsupported command-line flag" bar over every headed page (47 points in Edge on macOS, which a
+  click could close mid-run, resizing the page).
 
 **Other engines.** A page target runs in one engine (`model::WebEngine`): Chromium over CDP (the
 default), Firefox over WebDriver BiDi, WebKit over WebDriver Classic (refused `EngineUnsupported` on
@@ -4610,8 +4650,8 @@ toolkit (rule 15).
     the last move), `WM_[LRM]BUTTONDOWN`/`UP` with the button and modifier flags, `…DBLCLK` for a
     second press when the window class asks for it. A click's press is held at least 60 ms and until
     the app rests (no present for two refreshes, at most 300 ms), as a person holds a click, so the
-    release that does the click comes at rest; the first key of `type` and the first wheel step wait
-    for rest the same way after the move or click before them.
+    release that does the click comes at rest; each key of `type` and the first wheel step wait
+    for rest the same way after the move, click or key before them.
     `WM_MOUSEWHEEL`/`WM_MOUSEHWHEEL` carry screen coordinates and 120 units per 100 px (Chromium's
     scroll per notch; what an app scrolls per notch is its own); `scroll` posts one step per refresh
     at its speed. Strobe parks the OS cursor on the point (`SetCursorPos`: no click, no focus), since
@@ -5819,6 +5859,23 @@ a window moved or zoomed mid-run (the refusal path). Firefox launched with `-for
 idle clock passed a minute (seen in its arguments), but its blocks still waited for it: another
 agent's bench posted input on air throughout, which counts as a person, so the exclusion of
 strobe's own posts is not shown end to end.
+
+Display fit and typing at rest (2026-11-07, 7.4, 9.10 "Declared viewport", 10.1 `DisplayTooSmall`,
+13.1). On air (MacBook Air, 1470×956 points, Dock hidden, AC) a page target with a 1440×900 viewport
+refused `DisplayTooSmall` before its first block in `--check`, in one fitting window per engine:
+at most 1462×839 in Edge and 1470×838 in Firefox (0.14.0 had run the block and refused
+`VariantMismatch` with the page at 1440×792 and 1440×838; 0.13 measured the smaller page). A
+1440×830 viewport passed in both, Edge's from what strobe kept (no window opened); `strobe plan`
+refused both from `windows.json` after the first fit and said nothing before it. Edge's window part
+went from 8×131 to 8×84 when `--disable-blink-features=AutomationControlled` gave way to the preload:
+the flag's bar was 47 points; `navigator.webdriver` still reads false. The typing dev bench
+(`scripts/dev/type.bench.ts`, `scripts/dev/type-app.swift`): the 0.14.0 driver's 9 keys counted 7 at
+a p50 of 9.7 ms, which the new rule reads as 0 at rest; settled before each key, 9 of 9 at 36.9 ms
+(run 0.45 s → 2.2 s), and a Firefox page field 8 of 9 at 35.2 ms (0.14.0: 8 at 25.8 ms, 1 at rest
+under the new rule). Headless on adais and vps: the fit is skipped (no window) and typing is
+unchanged. Not run: a headed Windows or Linux page against its work area (adais is locked; vps has
+no display), WebKit (Safari on air belongs to the user), the macOS x86-64 `NSScreen` path (built for
+arm64 only).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

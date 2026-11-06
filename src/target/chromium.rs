@@ -48,7 +48,12 @@ pub struct Browser {
     /// The browser is a webview inside the launched app (`webview.rs`): closing it leaves the app
     /// running, so `close` closes the app instead.
     pub embedded: bool,
+    /// A browser `launch` started for pages: each page it opens gets `NOT_AUTOMATED` first.
+    pub as_person: bool,
 }
+
+/// `navigator.webdriver` false, as for a person.
+const NOT_AUTOMATED: &str = "Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => false, configurable: true })";
 
 /// An attached page: the session id commands go to.
 #[derive(Clone)]
@@ -129,9 +134,6 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--metrics-recording-only".into(),
         // A measurement never plays sound on the user's speakers; Web Audio still renders.
         "--mute-audio".into(),
-        // The page runs as it does for a person: `navigator.webdriver` stays false, so an app that hides its
-        // menus or skips work under automation is measured the way people use it.
-        "--disable-blink-features=AutomationControlled".into(),
         "--password-store=basic".into(),
         "--use-mock-keychain".into(),
         // No banners over the page (Chrome for Testing's notice, launch-at-login offers) and nothing that
@@ -188,7 +190,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     let cdp = Cdp::connect(&ws)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
     let (child, profile) = launching.done();
-    Ok(Browser { cdp, ws, child, pid, profile, fresh: true, exe, version, window: window.clone(), embedded: false })
+    Ok(Browser { cdp, ws, child, pid, profile, fresh: true, exe, version, window: window.clone(), embedded: false, as_person: true })
 }
 
 /// Attaches to a running endpoint: `cdp:<port>`, `cdp:ws://…` or a bare `ws://…`.
@@ -210,7 +212,7 @@ pub fn attach(endpoint: &str) -> Result<Browser> {
     };
     let cdp = Cdp::connect(&url)?;
     let version = cdp.send("Browser.getVersion", json!({}), None)?.get("product").and_then(Value::as_str).unwrap_or("").to_string();
-    Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default(), embedded: false })
+    Ok(Browser { cdp, ws: url, child: None, pid: 0, profile: None, fresh: false, exe: PathBuf::new(), version, window: Window::default(), embedded: false, as_person: false })
 }
 
 /// One GET on a debugging port. Chrome and Node keep the connection open after the reply, even with
@@ -303,6 +305,14 @@ impl Browser {
         let session = attached["sessionId"].as_str().ok_or_else(|| Error::msg("attach: no session"))?.to_string();
         let page = Page { cdp: self.cdp.clone(), session, target };
         page.send("Page.enable", json!({}))?;
+        if self.as_person {
+            // The page runs as it does for a person: `navigator.webdriver` false, so an app that hides its
+            // menus or skips work under automation is measured the way people use it. A preload, as in
+            // Firefox and WebKit: `--disable-blink-features=AutomationControlled` did it too, and put a
+            // dismissable "unsupported command-line flag" bar over the page (47 points in Edge on macOS).
+            page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": NOT_AUTOMATED }))?;
+            page.eval(&format!("void {NOT_AUTOMATED}"))?;
+        }
         if self.pid != 0 && cfg!(windows) {
             // An occluded Chromium window stops rendering: keep ours on top, without taking focus.
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -313,20 +323,23 @@ impl Browser {
         Ok(page)
     }
 
-    /// Resizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels.
-    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32) -> Result<()> {
+    /// Resizes the window so the page's viewport, not the whole window, is `width`×`height` CSS pixels,
+    /// and moves it to `at` when given.
+    pub fn fit_viewport(&self, page: &Page, width: u32, height: u32, at: Option<(i32, i32)>) -> Result<()> {
         let win = self.cdp.send("Browser.getWindowForTarget", json!({ "targetId": page.target }), None)?;
         let inner = page.eval("[innerWidth, innerHeight]")?;
         let num = |v: &Value| v.as_f64().unwrap_or(0.0);
         let (dw, dh) = (num(&win["bounds"]["width"]) - num(&inner[0]), num(&win["bounds"]["height"]) - num(&inner[1]));
-        if dw.abs() < 1.0 && dh.abs() < 1.0 && num(&inner[0]) as u32 == width && num(&inner[1]) as u32 == height {
+        let placed = at.is_none_or(|(x, y)| num(&win["bounds"]["left"]) as i32 == x && num(&win["bounds"]["top"]) as i32 == y);
+        if placed && num(&inner[0]) as u32 == width && num(&inner[1]) as u32 == height {
             return Ok(());
         }
-        self.cdp.send(
-            "Browser.setWindowBounds",
-            json!({ "windowId": win["windowId"], "bounds": { "width": (width as f64 + dw).round() as u32, "height": (height as f64 + dh).round() as u32 } }),
-            None,
-        )?;
+        let mut bounds = json!({ "width": (width as f64 + dw).round() as u32, "height": (height as f64 + dh).round() as u32 });
+        if let Some((x, y)) = at {
+            bounds["left"] = json!(x);
+            bounds["top"] = json!(y);
+        }
+        self.cdp.send("Browser.setWindowBounds", json!({ "windowId": win["windowId"], "bounds": bounds }), None)?;
         Ok(())
     }
 

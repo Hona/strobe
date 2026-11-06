@@ -23,7 +23,35 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 /// Bench flags a track passes on to every bench it runs (points, confirmations, bisects).
-const PASS: &[&str] = &["filter", "target", "params", "pin", "power", "reserve-cpus", "runs", "primary", "equivalence", "trace", "engine", "headless"];
+const PASS: &[&str] = &["filter", "target", "params", "pin", "power", "reserve-cpus", "runs", "primary", "equivalence", "trace", "engine", "headless", "seed"];
+
+/// The seed a track's benches run with (`ctx.seed`, `ctx.random()`) unless `--seed`: one per repository
+/// and bench file (its path in the repository), so every point of a series, its confirmations and its
+/// bisects run one workload, on any clone.
+fn derived_seed(repo: &str, file_rel: &str) -> u32 {
+    use sha2::Digest;
+    let d = sha2::Sha256::digest(format!("{repo}\n{file_rel}").as_bytes());
+    u32::from_be_bytes([d[0], d[1], d[2], d[3]])
+}
+
+/// `args` with the track's seed set: `--seed`, else `derived_seed`.
+fn with_seed(args: &Args, root: &Path, file: &Path) -> Result<Args> {
+    let seed = match args.get("seed") {
+        Some(s) => super::bench::parse_seed(s)?,
+        None => derived_seed(&repo_id(root), &rel(root, file)),
+    };
+    let mut a = args.clone();
+    a.set("seed", &seed.to_string());
+    Ok(a)
+}
+
+/// A point's seed in its series' fingerprint, only when the hooks used it: then another seed is
+/// another workload, and another series.
+fn seed_fingerprint(r: &Value, fingerprint: &mut Value) {
+    if r["plan"]["used_random"] == true {
+        fingerprint["seed"] = r["plan"]["seed"].clone();
+    }
+}
 
 /// Blocks per point unless `--blocks`: the fewest whose interval reaches 95% (a signed-rank interval
 /// of 6 values covers 96.9%).
@@ -68,6 +96,8 @@ pub fn run(args: &Args) -> Result<Output> {
         None => (root.clone(), args.get("ref").unwrap_or("HEAD")),
     };
     let commits = commits(args, &git_root, reference)?;
+    // The benches run with the track's seed; the run key keeps only a `--seed` given.
+    let seeded = with_seed(args, &root, &file)?;
     let blocks = args.num("blocks")?.map_or(BLOCKS, |b| b as usize).max(MIN_BLOCKS);
     let statics = static_fingerprint();
     let each = match &sides {
@@ -90,8 +120,8 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         tried += 1;
         let tracked = match &sides {
-            Some(s) => implementations::point(args, s, &file, &root, c, pairs, &statics, &key),
-            None => point(args, &file, &root, c, blocks, &statics, &key),
+            Some(s) => implementations::point(&seeded, s, &file, &root, c, pairs, &statics, &key),
+            None => point(&seeded, &file, &root, c, blocks, &statics, &key),
         };
         match tracked {
             Ok((ids, lines, ps)) => {
@@ -127,7 +157,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let mut confirmed = Vec::new();
     if !args.has("no-confirm") {
-        let (t, c) = confirm_all(args, Some(&file))?;
+        let (t, c) = confirm_all(&seeded, Some(&file))?;
         text += &t;
         confirmed = c;
     }
@@ -198,7 +228,12 @@ fn driver_versions() -> Vec<String> {
 
 fn run_key(args: &Args, file: &Path, commit: &str, statics: &Value) -> Value {
     let flags: Vec<Value> = ["filter", "target", "params", "primary", "blocks", "engine", "headless"].iter().map(|k| json!(args.get(k))).collect();
-    json!({ "file": file, "commit": commit, "flags": flags, "env": statics })
+    let mut key = json!({ "file": file, "commit": commit, "flags": flags, "env": statics });
+    // The derived seed is the same on every run: only one given is another run (keys from before stay).
+    if let Some(s) = args.get("seed") {
+        key["seed"] = json!(s);
+    }
+    key
 }
 
 /// The bench a point runs: `blocks` timed blocks of the commit alone (`--blocks`), no attribution.
@@ -278,6 +313,7 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
             fingerprint["browser"] = s["browser"].clone();
             fingerprint["headless"] = s["headless"].clone();
         }
+        seed_fingerprint(r, &mut fingerprint);
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });
         let id = history::series_id(&family, &fingerprint);
         if !history::exists(&id) {
@@ -286,7 +322,8 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
                 &json!({
                     "t": "series", "id": id, "family": history::family_id(&family), "device": statics["device"], "repo": repo, "file": file_rel, "abs_file": file, "root": root,
                     "label": label, "case": s["case"], "target": s["target"], "params": s["params"], "metric": metric,
-                    "unit": def.map(|d| d.unit), "better": def.map(|d| d.better), "kind": def.map(|d| d.kind), "fingerprint": fingerprint, "created": super::record::now_iso(),
+                    "unit": def.map(|d| d.unit), "better": def.map(|d| d.better), "kind": def.map(|d| d.kind), "fingerprint": fingerprint, "seed": r["plan"]["seed"],
+                    "created": super::record::now_iso(),
                 }),
             )?;
         }
@@ -462,6 +499,10 @@ fn series_args(args: &Args, s: &history::Series, id: &str) -> Result<Args> {
         a.set("params", &params.join(","));
     }
     a.set("primary", s.meta["metric"].as_str().unwrap_or(""));
+    // The workload the points ran: the series' seed, else (a series from before strobe kept it)
+    // `--seed`, else the one its repository and file give.
+    let seed = s.meta["seed"].as_u64().map(|n| n.to_string()).or_else(|| args.get("seed").map(str::to_string));
+    a.set("seed", &seed.unwrap_or_else(|| derived_seed(s.meta["repo"].as_str().unwrap_or(""), s.meta["file"].as_str().unwrap_or("")).to_string()));
     // The engine and headless mode the series ran in (its fingerprint), so a later `--confirm` without
     // the flags benches what the points measured.
     let fp = &s.meta["fingerprint"];

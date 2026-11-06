@@ -602,7 +602,8 @@ async function handle(op: string, args: any) {
         state.prepared = await target.prepare(prepareContext())
       }
       // A `url` function names the first page from what `prepare` returned, so the block loads one page.
-      const url = typeof target?.url === "function" ? await target.url({ case: state.case, prepared: state.prepared, params: state.params }) : undefined
+      if (typeof target?.url === "function") stream("url")
+      const url = typeof target?.url === "function" ? await target.url(seeded({ case: state.case, prepared: state.prepared, params: state.params })) : undefined
       return { url }
     }
     case "setup":
@@ -629,6 +630,7 @@ async function handle(op: string, args: any) {
       const errors: unknown[] = []
       stream("teardown")
       await Promise.resolve(spec.teardown?.(context())).catch((e) => errors.push(e))
+      stream("target-teardown")
       await Promise.resolve(spec.targets[state.target]?.teardown?.(prepareContext())).catch((e) => errors.push(e))
       if (state.session) await state.session.detach().catch(() => {})
       if (state.playwright) await state.playwright.browser.close().catch(() => {})

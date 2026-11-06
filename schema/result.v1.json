@@ -382,8 +382,8 @@
         "log_path": { "type": "string" },
         "actions": {
           "type": ["object", "null"],
-          "description": "check: a failed case's actions (it has no recording): path (failed-<case>.actions.json beside result.json, owner-only) and count. strobe query <exp> actions reads them.",
-          "properties": { "path": { "type": "string" }, "count": { "type": "integer" } }
+          "description": "check: the actions of a case without a recording (it failed, or its kind keeps none): path (<case>.actions.json.gz, or failed-<case>.actions.json.gz, beside result.json, owner-only), count, and failed. strobe query <exp> actions reads them.",
+          "properties": { "path": { "type": "string" }, "count": { "type": "integer" }, "failed": { "type": "boolean" } }
         },
         "session_locked": { "type": "boolean" },
         "screen": { "type": ["object", "null"] },

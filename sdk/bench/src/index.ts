@@ -177,8 +177,9 @@ export interface Seeded {
   seed: number
   /**
    * A number in [0, 1) from this hook's stream. Each hook call starts its stream over: every `run` from the same
-   * point (so warmup converges and base and head run the same inputs), every `reset`, `setup`, `prepare` and
-   * `before` from its own. Within one call each draw is the next.
+   * point (so warmup converges and base and head run the same inputs), every `reset`, `setup`, `prepare`,
+   * `before`, `url` function and teardown (the file's and the target's) from its own. Within one call each
+   * draw is the next.
    */
   random(): number
 }
@@ -380,8 +381,15 @@ export interface LaunchCase<P> extends CaseBase {
 
 export type Case<P> = RunCase<P> | LaunchCase<P>
 
+/** What a `url` function gets: the case, its params and what `prepare` returned; `random()` draws from its own stream. */
+export interface FirstPageContext<P> extends Seeded {
+  case: string
+  prepared: any
+  params: P
+}
+
 /** The first page a block opens: a path, or a function of what `prepare` returned. */
-export type FirstPage<P> = string | ((ctx: { case: string; prepared: any; params: P }) => string | Promise<string>)
+export type FirstPage<P> = string | ((ctx: FirstPageContext<P>) => string | Promise<string>)
 
 interface Hooks<P> {
   prepare?: (ctx: PrepareContext<P>) => unknown

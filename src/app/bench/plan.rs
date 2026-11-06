@@ -24,6 +24,10 @@ const GUESS_BLOCK_MS: f64 = 22_000.0;
 pub fn run(args: &Args) -> Result<Output> {
     let file = args.pos.first().ok_or_else(|| Error::usage("plan needs a bench file: strobe plan perf/x.bench.ts [--base <variant>] [--head <variant>]"))?;
     let file = std::fs::canonicalize(file).map_err(|_| Error::usage(format!("no such bench file: {file}")))?;
+    // Checked as the bench would, though a plan runs no hook.
+    if let Some(s) = args.get("seed") {
+        super::parse_seed(s)?;
+    }
     if args.has("pilot") {
         pilot(args, &file)?;
     }

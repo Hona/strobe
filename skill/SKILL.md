@@ -103,7 +103,7 @@ strobe query <rec_… | a..b | exp_…> <view> [args]
 
 - Views: `summary` `frames` `threads` `gpu` `hotspots` `waits` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `actions` `sql`.
 - `actions [--phase <name>] [--top N] [--reveal]`: what a bench block's hooks sent the target, in order (hook, run, phase, call, selector, outcome).
-  - On a kept bench recording, or `exp_…` for a check (a failed case's too); typed text shows as its length unless `--reveal`.
+  - On a kept bench recording, or `exp_…` (every check case's, and the recordings a comparison kept); typed text, `act` values, `ctx.call` arguments and `ctx.exec` lines show as their length unless `--reveal`.
 - `hotspots` and `alloc` take `--by function|file|package` (`hotspots`: `--native`, `--thread <name>` for native samples).
 - `waits --thread <name> --phase <name> --by function|package`: where threads were off their CPUs and who woke them.
   - From a capture with `--probes waits` (Linux needs CAP_PERFMON; Windows the deep helper; macOS refuses `NoWaits` when it records).
@@ -111,7 +111,7 @@ strobe query <rec_… | a..b | exp_…> <view> [args]
 - `memory` takes `--by process|layer|allocator` and `--at <i>`.
 - `a..b` (two recordings, per run each) works with `hotspots` `alloc` `layout` `style` `threads` `frames` `summary` `heap` `memory`.
 - `exp_…` takes `summary`, `progress`, `insights`, `actions`, and those views for each series' base..head.
-- `--reveal` shows heap strings and typed text.
+- `--reveal` shows heap strings, and in `actions` typed text, values, call arguments and exec lines.
 - `threads --timeline`: each thread's CPU per second from the launch with the runs marked, exited threads too.
   - A driver thread that starts 25 s in and runs 30 s shows as such.
 
@@ -334,7 +334,8 @@ export default bench({
   - Every hook call starts its stream over: each run sends the same inputs, so warmup converges and base and head run the same workload.
   - `ctx.seed` is the case's seed; to seed the app too, pass it in yourself: `ctx.addInitScript((s) => …, ctx.seed)`. strobe never patches the app's `Math.random`.
   - strobe draws the experiment's seed and prints it (`seed 42`); `bench … --seed 42` replays it, and `query <rec> actions` shows what was sent.
-  - A failed `--check` prints the seed and keeps the case's actions (`query <exp> actions`).
+  - A failed `--check` prints the seed; every check case keeps its actions (`query <exp> actions`).
+  - `--bisect` runs every step with one seed; `track` uses one per repository and bench file (`--seed` to pick it).
 - Never call `page.eval` in `run`.
 
 ### More in a bench file

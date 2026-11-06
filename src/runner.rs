@@ -4,6 +4,7 @@ use crate::host::{self, paths};
 use crate::model::{Error, Refusal, Result};
 use crate::store::actions::{ActionLog, Hook, Outcome};
 use serde_json::{Value, json};
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -84,9 +85,12 @@ pub struct Runner {
     seed: Option<u32>,
     /// Some hook read `ctx.seed` or called `ctx.random()` (SPEC §14.2: only then is `--seed` the workload).
     used_random: bool,
-    /// What the current block's hooks did to the target (`store::actions`), since its `block` call.
-    actions: ActionLog,
-    /// The block's `run` calls so far, its open `ctx.untimed` stretch and `ctx.phase`s.
+    /// What the current block's hooks did to the target (`store::actions`), since its `block` call,
+    /// until the block's recording takes it (`take_actions`).
+    actions: RefCell<ActionLog>,
+    /// Whether blocks from now log their actions (`collect_actions`): only those that keep them.
+    collect: bool,
+    /// The block's `run` calls so far, the current hook's open `ctx.untimed` stretch and `ctx.phase`s.
     runs: u32,
     untimed: bool,
     phases: Vec<String>,
@@ -147,7 +151,7 @@ impl Runner {
             }
         });
         let pid = child.pid();
-        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log, seed: None, used_random: false, actions: ActionLog::default(), runs: 0, untimed: false, phases: Vec::new() };
+        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log, seed: None, used_random: false, actions: RefCell::default(), collect: false, runs: 0, untimed: false, phases: Vec::new() };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -180,13 +184,17 @@ impl Runner {
         let id = self.next;
         self.next += 1;
         if op == "block" {
-            self.actions.clear(self.seed);
-            (self.runs, self.untimed) = (0, false);
-            self.phases.clear();
+            self.actions.borrow_mut().clear(self.seed);
+            self.runs = 0;
         }
         let hook = Hook::of_op(op);
         if hook == Some(Hook::Run) {
             self.runs += 1;
+        }
+        // A stretch or phase a failed hook left open is none of the next one's.
+        if hook.is_some() {
+            self.untimed = false;
+            self.phases.clear();
         }
         // A reset belongs to the run before it.
         let run = matches!(hook, Some(Hook::Run | Hook::Reset)).then(|| self.runs.checked_sub(1)).flatten();
@@ -223,12 +231,12 @@ impl Runner {
             if let Some(rid) = msg.get("id").and_then(Value::as_str) {
                 let req_op = msg.get("op").and_then(Value::as_str).unwrap_or("").to_string();
                 let args = msg.get("args").cloned().unwrap_or(Value::Null);
-                let action = hook.and_then(|h| ActionLog::of_request(h, run, self.untimed, self.phases.last().cloned(), &req_op, &args, host::now_ns()));
+                let action = hook.filter(|_| self.collect).and_then(|h| ActionLog::of_request(h, run, self.untimed, self.phases.last().cloned(), &req_op, &args, host::now_ns()));
                 let served = serve(&req_op, &args);
                 if let Some(mut a) = action {
                     a.end_ns = host::now_ns();
                     a.outcome = Outcome::of(&served);
-                    self.actions.push(a);
+                    self.actions.borrow_mut().push(a);
                 }
                 if served.is_ok() {
                     let start = args["edge"] == "start";
@@ -277,9 +285,17 @@ impl Runner {
         self.used_random
     }
 
-    /// What the current (or last) block's hooks did to the target, since its `block` call.
-    pub fn actions(&self) -> &ActionLog {
-        &self.actions
+    /// Whether the blocks from now log their actions: only one whose recording (or `--check` result)
+    /// keeps them does, so an ordinary timed block reads no clock and copies nothing for them.
+    pub fn collect_actions(&mut self, on: bool) {
+        self.collect = on;
+    }
+
+    /// The current (or last) block's actions since its `block` call, taken: written once.
+    pub fn take_actions(&self) -> ActionLog {
+        let mut log = self.actions.borrow_mut();
+        let seed = log.seed;
+        std::mem::replace(&mut *log, ActionLog { seed, ..ActionLog::default() })
     }
 
     pub fn describe(&mut self) -> Result<Describe> {

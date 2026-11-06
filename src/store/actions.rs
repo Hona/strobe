@@ -120,7 +120,11 @@ pub struct ActionRecord {
     /// The innermost `ctx.phase` it ran in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
-    /// When strobe got the call and when it answered (host clock, ns: the clock of presents and marks).
+    /// When strobe got the call from the runner (its request's arrival) and when it answered, on the
+    /// host clock in ns (the clock of presents and marks). This is the call, not its input: the
+    /// driver's own send time (`frames::Sent::t_ns`) is later by the aim and any wait before it.
+    /// Where the driver reports them, `t_ns` becomes that send time, beside `press_ns`, `hit` and
+    /// `sample` (not yet: SPEC §24.2).
     pub t_ns: u64,
     /// A click's press, when the driver says when it went out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -128,14 +132,18 @@ pub struct ActionRecord {
     pub end_ns: u64,
     /// The method as the bench file called it: `click`, `type`, `goto`, `call`, `exec`, …
     pub call: String,
-    /// What it aimed at, as the bench file named it (its `@name` resolved).
+    /// What it aimed at as the bench file gave it (its `@name` resolved): a selector string, or the
+    /// object form whole (`{ selector, role, text, exact, index, focus }`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub selector: Option<String>,
+    pub selector: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit: Option<Hit>,
-    /// Its other arguments as given (typed text included: views redact it).
+    /// Its other arguments as given (typed text included: views redact it), each string cut at
+    /// `ARG_BYTES` and each array at `ARG_ITEMS` (`args_truncated` then says so).
     #[serde(default)]
     pub args: Vec<Value>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub args_truncated: bool,
     pub outcome: Outcome,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sample: Option<Sample>,
@@ -181,16 +189,17 @@ impl ActionLog {
     /// The action a runner request is, if it is one: a driver input or load, `ctx.call` or `ctx.exec`,
     /// stamped `t_ns` and not yet answered.
     pub fn of_request(hook: Hook, run: Option<u32>, untimed: bool, phase: Option<String>, op: &str, args: &Value, t_ns: u64) -> Option<ActionRecord> {
-        let (call, selector, rest): (String, Option<String>, Vec<Value>) = match op {
+        let (call, selector, rest): (String, Option<Value>, Vec<Value>) = match op {
             "driver" => {
                 let call = args["call"].as_str().filter(|c| DRIVER_ACTIONS.contains(c))?;
-                let mut list = args["args"].as_array().cloned().unwrap_or_default();
-                let selector = (AIMED.contains(&call) && !list.is_empty()).then(|| list.remove(0)).map(|s| match s {
-                    Value::String(s) => s,
-                    Value::Object(o) if o.get("selector").is_some_and(Value::is_string) => o["selector"].as_str().unwrap_or("").to_string(),
-                    other => other.to_string(),
-                });
-                (call.to_string(), selector, list)
+                let list = args["args"].as_array().map(Vec::as_slice).unwrap_or_default();
+                let (selector, rest) = match list.split_first() {
+                    Some((s, rest)) if AIMED.contains(&call) => (Some(s.clone()), rest),
+                    _ => (None, list),
+                };
+                // `""` (type where focus is) and `{}` aim at nothing.
+                let selector = selector.filter(|s| !(s.as_str() == Some("") || s.as_object().is_some_and(|o| o.is_empty()) || s.is_null()));
+                (call.to_string(), selector, rest.to_vec())
             }
             "call" => {
                 let mut list = vec![args["name"].clone()];
@@ -200,23 +209,20 @@ impl ActionLog {
             "exec" => ("exec".into(), None, args["line"].as_str().map(|l| vec![Value::String(l.into())]).unwrap_or_default()),
             _ => return None,
         };
-        Some(ActionRecord { seq: 0, hook, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, call, selector, hit: None, args: rest, outcome: Outcome::Ok, sample: None })
+        let mut rest = rest;
+        let args_truncated = rest.iter_mut().fold(false, |cut, v| bound(v) | cut);
+        Some(ActionRecord { seq: 0, hook, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
     }
 
-    /// Writes the log as `actions.json.gz` in a recording's folder (owner-only).
-    pub fn write(&self, dir: &Path) -> Result<()> {
+    /// Writes the log gzipped at `path` (owner-only): a recording's `actions.json.gz`, or beside a
+    /// `--check` result for a case without a recording.
+    pub fn write(&self, path: &Path) -> Result<()> {
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
         gz.write_all(&serde_json::to_vec(self)?)?;
-        let path = dir.join(FILE);
-        crate::host::paths::write_owner_only(&path, &gz.finish()?).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
+        crate::host::paths::write_owner_only(path, &gz.finish()?).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
     }
 
-    /// Writes the log as plain JSON at `path` (owner-only): a failed `--check` case's, which has no recording.
-    pub fn write_json(&self, path: &Path) -> Result<()> {
-        crate::host::paths::write_owner_only(path, &serde_json::to_vec_pretty(self)?).map_err(|e| Error::msg(format!("write {}: {e}", path.display())))
-    }
-
-    /// A recording's log (`actions.json.gz`) or a failed case's (`.json`); None when there is none.
+    /// A log written by `write` (or plain JSON); None when there is none.
     pub fn read(path: &Path) -> Result<Option<ActionLog>> {
         if !path.is_file() {
             return Ok(None);
@@ -230,6 +236,33 @@ impl ActionLog {
             raw
         };
         Ok(Some(serde_json::from_slice(&text)?))
+    }
+}
+
+/// A string argument longer than this keeps its first part (a pasted document typed in one call).
+const ARG_BYTES: usize = 4096;
+
+/// An array argument longer than this keeps its first items (a drag's path).
+const ARG_ITEMS: usize = 32;
+
+/// Cuts `v`'s strings and arrays to the bounds, at every depth; true when it cut something.
+fn bound(v: &mut Value) -> bool {
+    match v {
+        Value::String(s) if s.len() > ARG_BYTES => {
+            let mut end = ARG_BYTES;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            s.truncate(end);
+            true
+        }
+        Value::Array(a) => {
+            let cut = a.len() > ARG_ITEMS;
+            a.truncate(ARG_ITEMS);
+            a.iter_mut().fold(cut, |c, x| bound(x) | c)
+        }
+        Value::Object(o) => o.values_mut().fold(false, |c, x| bound(x) | c),
+        _ => false,
     }
 }
 

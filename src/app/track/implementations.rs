@@ -334,10 +334,11 @@ pub(super) fn point(args: &Args, sides: &Sides, file: &Path, root: &Path, commit
             None
         };
         let def = model::metric(&metric);
-        let fingerprint = json!({
+        let mut fingerprint = json!({
             "machine": statics, "power": r["env"]["power_plan"], "battery": r["env"]["on_battery"], "pin": r["plan"]["pin"],
             "runs": r["plan"]["runs_per_block"], "session": session, "display": display, "target_kinds": kinds, "headless": args.has("headless"), "engine": args.get("engine"),
         });
+        super::seed_fingerprint(r, &mut fingerprint);
         let fam = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric, "base_target": sides.base_target, "head_target": sides.head_target });
         let id = history::series_id(&fam, &fingerprint);
         if !history::exists(&id) {
@@ -348,7 +349,7 @@ pub(super) fn point(args: &Args, sides: &Sides, file: &Path, root: &Path, commit
                     "abs_file": file, "root": root, "head_root": hr, "label": label, "case": s["case"], "params": s["params"], "metric": metric,
                     "base_target": sides.base_target, "head_target": sides.head_target, "base_spec": sides.base, "base_name": bn, "head_name": hn,
                     "unit": "ln_ratio", "metric_unit": def.map(|d| d.unit), "better": def.map(|d| d.better), "kind": def.map(|d| d.kind), "words": def.map(|d| [d.words.0, d.words.1]),
-                    "fingerprint": fingerprint, "created": crate::app::record::now_iso(),
+                    "fingerprint": fingerprint, "seed": r["plan"]["seed"], "created": crate::app::record::now_iso(),
                 }),
             )?;
         }

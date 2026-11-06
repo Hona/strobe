@@ -74,7 +74,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("resume", Value, "bench"),
     ("gpu-store", Value, ""),
     ("metrics", Value, "run"),
-    ("seed", Number, "record bench plan run"),
+    ("seed", Number, "record bench plan run track"),
     // query, report, open, history.
     ("by", Value, "query"),
     ("top", Number, "query history"),
@@ -358,7 +358,8 @@ Use
   query <rec_…|exp_…|rec_a..rec_b> <view> [--top N] [--by function|file|package] [--reveal] [--native] [--thread <name>]
                                   views: summary frames threads gpu hotspots waits alloc layout style shifts gc heap leaks memory insights
                                   actions sql
-                                  (actions: what a bench block's hooks sent the target, in order; --phase, typed text with --reveal)
+                                  (actions: what a bench block's hooks sent the target, in order; --phase; --reveal shows
+                                  typed text, act values, ctx.call arguments and ctx.exec lines)
                                   (waits: where threads were off their CPUs and who woke them, from a native capture;
                                   --thread <name> --phase <name> --by function|file|package)
                                   (a..b: hotspots alloc layout style threads frames summary heap memory, per-run deltas;

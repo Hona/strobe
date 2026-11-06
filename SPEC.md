@@ -452,10 +452,15 @@ case's `ctx.seed` and `ctx.random()` come (§9.6); without it strobe draws one f
 source. Either way it is printed on the first line (`strobe bench x.bench.ts · exp_… · seed 42`),
 kept in `result.json` `plan.seed` (with `plan.used_random`: whether a hook read `ctx.seed` or called
 `ctx.random()`), in each block recording's `meta.json` (`seed`) and `actions.json.gz` (§14.1), and in
-the saved command line, so `--resume` replays the same workload. The PR block's Rerun drawer and a
-failed `--check`'s footer (`seed  42 …: add --seed 42 to replay the same workload`) print it only
-when a hook used it. `record --bench … --seed <n>` and `strobe run --base … --head …` pass it on;
-`record` of a target and `strobe run -- <command>` refuse it (usage error): nothing seeds them.
+the saved command line, so `--resume` replays the same workload (`state.json` also keeps whether
+the runs before the stop used it, which the resumed runner does not know). The PR block's Rerun
+drawer and a failed `--check`'s footer (`seed  42 …: add --seed 42 to replay the same workload`)
+print it only when a hook used it. `record --bench … --seed <n>` and `strobe run --base … --head …`
+pass it on; `plan` checks it; `record` of a target and `strobe run -- <command>` refuse it (usage
+error): nothing seeds them. A bisect (§9.7) runs every step with one seed: `--seed`, else step 0's
+when it already ran (a tracked change's confirmation), else one drawn once; its `result.json` keeps
+it (`seed`). `track` (§25.2) runs its points, confirmations and bisects with one seed per repository
+and bench file.
 
 **Stopping and resuming.** Ctrl-C (SIGINT), SIGTERM or `strobe bench --stop <exp>` (from any shell,
 or for a bench the daemon runs) stops a bench once its current block ends; waits (a locked session,
@@ -2093,7 +2098,8 @@ exactly from the experiment's seed (`--seed`, §5.6). A case's seed (`ctx.seed`,
 integer) is `mix(experiment seed, case + "\n" + params)`, the params as JSON with keys sorted at
 every level: base and head, and both targets of a journey (§9.10), get the same one, and another
 case or param another. `ctx.random()` gives numbers in [0, 1) from a stream that each hook call
-starts over at `mix(case seed, hook)` (`prepare`, `before`, `setup`, `run`, `reset`, `teardown`;
+starts over at `mix(case seed, hook)` (`prepare`, `url` for a target's `url` function, `before`,
+`setup`, `run`, `reset`, `teardown` for the file's and `target-teardown` for the target's;
 a `ctx.ui` step draws from its hook's): every run, warmup included, draws the same numbers, so
 warmup converges and both sides run the same inputs; within one call each draw is the next. `mix`
 is FNV-1a over the text's UTF-8 bytes started from the seed, then murmur3's 32-bit finalizer; the
@@ -2107,19 +2113,26 @@ context is never copied with spread syntax inside the runner (that would read th
 
 **Actions.** Every input, page load, window or accessibility action (`page.goto`, `click`, `hover`,
 `move`, `type`, `press`, `down`, `up`, `drag`, `scroll`, `wheel`, `window`, `act`), `ctx.call` and
-`ctx.exec` a hook makes is logged by strobe as it serves it (`runner::Runner::call`): no round trip
-to the target, two host-clock reads per call (inside a run they count as strobe's own cost, §8.2).
+`ctx.exec` a hook makes is logged by strobe as it serves it (`runner::Runner::call`), in the blocks
+that keep them only: `--check` (and pixels) blocks, kept blocks (`--keep`, each series' first pair),
+attribution and memory blocks, and attribution launches. Those cost no round trip to the target, two
+host-clock reads and a bounded copy of the arguments per call (inside a run, strobe's own cost,
+§8.2); every other timed block reads no clock and copies nothing for them (`Runner::collect_actions`).
 Each record (`store::actions::ActionRecord`) has `seq`, `hook`, `run` (the block's run from 0,
-warmup included; a reset has its run's), `untimed`, `phase` (the innermost), `t_ns` and `end_ns`
-(when strobe got the call and answered it, host clock), `call`, `selector` (what it aimed at, `@name`
-resolved), `args` (the rest, typed text included), `outcome` (`ok`, `refusal` with its validator and
-summary, or `error`), and where the driver reports them `press_ns`, `hit` (`role`, `key`, `name`,
-`point`, `rect` in the window's client area, `scrolled`) and `sample` (the input's latency sample:
-`edge` `press`, `sent`, `scroll`, `unchanged`, `busy` or `unmatched`, and `latency_ms`). A block's
-log starts at its `block` call and holds at most 100,000 actions (`truncated` past that). It goes
-into the block's recording as `actions.json.gz` (§14.1); a failed `--check` case, which has no
-recording, keeps it as `failed-<case>.actions.json` beside its `result.json` (the case's
-`actions: { path, count }`, and a line under its failure). `query <rec> actions` shows them (§11.1).
+warmup included; a reset has its run's), `untimed`, `phase` (the innermost; a hook starts with none
+open), `t_ns` and `end_ns` (when the runner's request reached strobe and when strobe answered it,
+host clock: the call, not its input, which the driver sends later, after its aim and any wait),
+`call`, `selector` (what it aimed at as given, `@name` resolved: a string, or the object form whole;
+none for `""` or `{}`), `args` (the rest, typed text included; strings cut at 4 KiB and arrays at 32
+items, then `args_truncated`), `outcome` (`ok`, `refusal` with its validator and summary, or
+`error`), and where the driver reports them `press_ns`, `hit` (`role`, `key`, `name`, `point`,
+`rect` in the window's client area, `scrolled`) and `sample` (the input's latency sample: `edge`
+`press`, `sent`, `scroll`, `unchanged`, `busy` or `unmatched`, and `latency_ms`). A block's log
+starts at its `block` call and holds at most 100,000 actions (`truncated` past that). Its recording
+takes it as `actions.json.gz` (§14.1); a `--check` case without a recording (it failed, or its kind
+keeps none: a script, a command, a launch, a page measured from outside) keeps it beside its
+`result.json` as `<case>.actions.json.gz`, or `failed-<case>.actions.json.gz` (the case's `actions:
+{ path, count, failed }`, and a line under it). `query <rec|exp> actions` shows them (§11.1).
 
 **Untimed stretches** (`await ctx.untimed(fn)`): a wait inside a run that is not the journey, such
 as letting the app go idle between two clicks (`await ctx.untimed(() => page.idle())`), leaves the
@@ -3158,7 +3171,7 @@ session.
 | `gpu` | | a trace: the browser GPU process's tasks by name. Without one (a native app, a process from outside): per adapter the tree's engine use and GPU memory (dedicated, shared) from the OS's per-process statistics, the device's counters, what reached the screen or why not, and the lock state |
 | `cpu` | `--cores` `--residency` | per-core load, frequency, which core each thread ran on |
 | `insights` | (`exp_…` too) | rule hits with their numbers and the commands that show the evidence; for an experiment, the largest base/head movers per series first |
-| `actions` | `--phase` `--top` `--reveal` (`exp_…` too) | a bench block's actions in order (§9.6, `actions.json.gz`): seq, hook, run, ms from the first, how long strobe took to serve it, call, selector (and the element it hit, where known), arguments, outcome, untimed and phase; the seed in the header. `--phase` keeps one phase's, `--top` bounds the rows (default 15), `--json` gives every record. Typed text, `act` values and `ctx.call` arguments show as their length (`«18 chars»`) unless `--reveal` (rule 9). `exp_…`: each series' kept recording's and each failed check case's (`failed-<case>.actions.json`) |
+| `actions` | `--phase` `--top` `--reveal` (`exp_…` too) | a bench block's actions in order (§9.6, `actions.json.gz`): seq, hook, run, ms from the first, how long strobe took to serve it, call, selector (and the element it hit, where known), arguments, outcome, untimed and phase; the seed in the header. `--phase` keeps one phase's, `--top` bounds the rows (default 15), `--json` gives every record. Typed text, `act` values, `ctx.call` arguments and `ctx.exec` lines show as their length (`«18 chars»`) unless `--reveal` (rule 9). `exp_…`: each series' kept recordings' (a check's, attribution blocks', kept timing blocks'), each named by what it was, and each check case's kept beside the result (`no recording` or `failed`) |
 | `timeline` | `--from --to --thread` | bounded event list for a range |
 | `progress` | (`exp_…` only) | a running experiment's state and estimate |
 | `sql` | `"<query>"` | rows from trace_processor, row-limited |
@@ -4713,7 +4726,7 @@ experiments/
     result.json         the --json result: series, blocks (variant, values per metric, runs),
                         pairs, intervals, verdicts, warnings, environment, recordings
     blocks/<n>.log      the runner's stderr per block
-    failed-<case>.actions.json  a failed --check case's actions (it has no recording), owner-only
+    [failed-]<case>.actions.json.gz  a --check case's actions when it has no recording, owner-only
 ```
 
 - Experiment ids: `exp_` + 6 hex; any unique prefix works.
@@ -5003,13 +5016,18 @@ headless Chromium, `--check` and `record --bench`, single noisy smoke runs): `--
 the same six clicks and typed words in `query <exp> actions` (`#b2 #b6 #b5 #b3 #b0 #b4`, "charlie
 hotel golf"), `--seed 7` others (`#b5 #b11 #b4 #b5 #b8 #b11`, "delta golf delta"), and `--filter`
 changed none of them (a case's seed comes from the case and its params alone).
-`record --bench seed.bench.ts#walk --seed 42` warmed up in 3 runs and kept 5, and all 8 runs in its
+`record --bench seed.bench.ts#walk --seed 42` warmed up in 3 runs (4 in a later run) and kept 5, and all runs in its
 `actions.json.gz` hold the same 7 actions; `strobe open` drew them as 56 slices on `inputs strobe
 sent` in its Chromium trace recording. A case without `ctx.random()` alone left `plan.used_random`
-false. The failing case kept `failed-broken-fuzz.actions.json` (4 actions, the last its error), and
-the check's footer printed the seed. Not yet: `hit`, `press_ns` and `sample` are never filled (the
-driver reports no aim to the runner yet), and a comparison's ledger line `--seed a → b` has not
-been seen in a timed experiment.
+false. The failing case kept `failed-broken-fuzz.actions.json.gz` (4 actions, the last its error),
+and the check's footer printed the seed. The `exec` case (a `cli()` target, which keeps no
+recording) passed and kept `exec-shell.actions.json.gz`: `--seed 42` ran `bun --version`, `bun
+--revision`, `bun --revision` twice, `--seed 7` `--revision`, `--revision`, `--version`; `query
+<exp> actions` shows the lines redacted (`«14 chars»`) unless `--reveal`. Not yet: `hit`,
+`press_ns` and `sample` are never filled (§24.2); a timed block without actions reads no clock for
+them by construction (`Runner::collect_actions`), not by a measurement; and a comparison's ledger
+line `--seed a → b`, a bisect's one seed and a track's derived seed have not been seen in timed
+runs.
 
 Press edge and untimed stretches (2026-11-06, §7.4, §9.6; `scripts/dev/press.bench.ts` with
 `scripts/dev/press-app.swift`, `--check`). On air, unlocked, two clicks a run, each followed by an
@@ -5670,6 +5688,14 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
 
 ### 24.2 Where the code differs from the design
 
+- Actions (§9.6): `t_ns` is when the runner's request reached strobe (`Runner::call`), not when the
+  driver sent the input, and `press_ns`, `hit` and `sample` are never filled: the driver reports
+  neither its aim (`__strobe.aim`, `Session::find`) nor its send time to the runner yet. When it does,
+  `t_ns` becomes the driver's send time (`frames::Sent::t_ns`, the edge latency samples are timed
+  from), `press_ns` a click's press, `hit` the element the aim found, and `sample` each input's
+  outcome from `frames::reactions`, joined after the runs. Until then the native and traceless
+  blocks' measured input edges stay instants from `frames.json` on Perfetto's `inputs strobe sent`
+  beside the action slices.
 - Implementation comparisons, presentation and family statistics (9.3, 11.2): `stats::repeated_p`,
   `family_min_pairs` and `family`, `app/family.rs` (the scoreboard, the headline, read from a stored
   result), the implementation PR block (`app/pr/implementations.rs`), the split card with its forest
@@ -6135,7 +6161,7 @@ alerts, and neither is retried by itself (`strobe track --confirm <chg_…>` run
 ```
 strobe track <file.bench.ts> [--ref <rev> | --range <a>..<b> [--every N]] [--filter …] [--target …] [--params …]
              [--blocks 6] [--no-confirm] [--again] [--alert regressions|all]
-             [--alert-command '<cmd>'] [--alert-webhook <url>] [bench flags: --pin --power --reserve-cpus --runs --primary --equivalence --engine --headless]
+             [--alert-command '<cmd>'] [--alert-webhook <url>] [bench flags: --pin --power --reserve-cpus --runs --primary --equivalence --engine --headless --seed]
 strobe track <file.bench.ts> --ref <branch> --schedule commits|nightly|<period> [the same flags]
 strobe track --schedules | --unschedule <sch_…> | --confirm [<ser_…|chg_…>]
 ```
@@ -6153,6 +6179,14 @@ strobe track --schedules | --unschedule <sch_…> | --confirm [<ser_…|chg_…>
   from `a` (included) to `b`, `--every N` keeps every Nth and the last. A commit already tracked on
   this device with the same file, flags and machine is skipped unless `--again` (`runs.jsonl`).
 - strobe never fetches: a ref moves when the user or their tooling fetches.
+- **Seed** (§9.6): every bench a track runs (points, confirmations, bisects) gets one seed:
+  `--seed <n>`, else one derived from the repository (its first root commit) and the bench file's
+  path in it (the first 4 bytes of SHA-256 of `<repo>\n<file>`), the same on every clone and run.
+  A series keeps its seed in its meta (`seed`), and its confirmations and bisects run with it (a
+  series from before seeds: `--seed`, else the derived one). The seed joins a series' fingerprint
+  only when its points' hooks used it (`plan.used_random`): another seed is then another workload
+  and another series; otherwise it changes nothing. A `--seed` given joins the run key (`runs.jsonl`),
+  so the derived seed keeps keys from before it.
 - After the points, the detector runs on every series of the file, and each new suspected change
   is confirmed (unless `--no-confirm`), then bisected and alerted.
 

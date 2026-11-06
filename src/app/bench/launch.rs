@@ -56,6 +56,8 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
 /// CPU profiler on (app and exe targets), and every page starts paused until its own profiler runs,
 /// so both profiles cover the launch from the first statement.
 pub(super) fn attribution(ctx: &mut Ctx, s: &Series, v: &Variant) -> Result<Block> {
+    // Its recording keeps the launch's actions (a `before` hook's).
+    ctx.runner.collect_actions(true);
     if is_native(&ctx.describe["targets"][&s.target]) {
         return super::native::launch_once(ctx, s, v, usize::MAX, true);
     }

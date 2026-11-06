@@ -841,6 +841,12 @@ fn runs(
     let background = busiest_others(&procs0, &procs1);
     let screen = screen_state(&procs0, &procs1);
     let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
+    // Teardown before the recording, which keeps its actions too.
+    if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
+        && !ctx.warnings.iter().any(|w| w.id == "Teardown")
+    {
+        ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side_of(ctx, v), e.message)));
+    }
     let recording = if keep || set == Set::Attribution {
         // Discarded on any error before its meta.json: no recording is left half written.
         let (id, draft) = store::new_recording()?;
@@ -906,11 +912,6 @@ fn runs(
     } else {
         None
     };
-    if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
-        && !ctx.warnings.iter().any(|w| w.id == "Teardown")
-    {
-        ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side_of(ctx, v), e.message)));
-    }
     lap("analyse", steps);
     Ok(Block {
         variant: v.role.to_string(),

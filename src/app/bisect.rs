@@ -29,6 +29,18 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>, target:
     let side = target.map(|(t, _)| t);
     let (good, bad) = range.split_once("..").ok_or_else(|| Error::usage("--bisect <good>..<bad>, for example --bisect v1.2..main"))?;
     let (mut good, mut bad) = (rev_parse(&root, good)?, rev_parse(&root, bad)?);
+    // One seed for every step (`ctx.seed`, `ctx.random()`): each commit runs the same workload. `--seed`,
+    // else step 0's when it already ran (a tracked change's confirmation), else one drawn now.
+    let seed = match (args.get("seed"), first) {
+        (None, Some(out)) => match out.json["plan"]["seed"].as_u64().and_then(|n| u32::try_from(n).ok()) {
+            Some(n) => n,
+            None => super::bench::seed_of(args)?,
+        },
+        _ => super::bench::seed_of(args)?,
+    };
+    let mut seeded = args.clone();
+    seeded.set("seed", &seed.to_string());
+    let args = &seeded;
     let id = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
     let dir = store::experiment_dir(&id)?;
     // Its steps' own scopes stack on it: `bench --stop <bisect>` stops the step that runs.
@@ -37,7 +49,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>, target:
     if candidates.is_empty() {
         return Err(Error::usage(format!("{range}: no commits from good to bad on the first-parent line")));
     }
-    progress(format!("strobe bisect {range} · {} commits on the first-parent line · {id}", candidates.len()));
+    progress(format!("strobe bisect {range} · {} commits on the first-parent line · {id} · seed {seed}", candidates.len()));
     let line: Vec<Value> = candidates.iter().map(|c| json!({ "commit": c, "short": short(c), "subject": subject(&root, c) })).collect();
     let first_good = good.clone();
     let first = match first {
@@ -94,7 +106,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>, target:
     let result = json!({
         "id": id, "kind": "bisect", "file": file, "range": range, "created": super::record::now_iso(),
         "metric": steps[0]["metric"], "series": steps[0]["series"], "steps": steps, "culprit": culprit, "verdict": verdict, "verdict_kind": verdict_kind,
-        "outcome": outcome, "good": first_good, "commits": line, "remaining": remaining,
+        "outcome": outcome, "good": first_good, "commits": line, "remaining": remaining, "seed": seed,
     });
     let text = text(&result);
     let mut result = result;

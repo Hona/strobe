@@ -361,17 +361,22 @@ thread_local! {
 const RERUN: &str = "earlier experiments on these same variants ran another bench file, harness, case, primary, margin, seed or flags (the ledger names them): a verdict reached by changing the setup until one says what you hoped is not a verdict";
 
 /// The experiment's seed: `--seed <n>`, else one drawn from the OS's random source.
-fn seed_of(args: &Args) -> Result<u32> {
+pub(crate) fn seed_of(args: &Args) -> Result<u32> {
     match args.get("seed") {
-        Some(s) => s.trim().parse::<u32>().map_err(|_| Error::usage(format!("--seed: a whole number from 0 to 4294967295, not {s}"))),
+        Some(s) => parse_seed(s),
         None => Ok(u32::from_str_radix(&host::paths::csprng_hex(4)?, 16).unwrap_or(0)),
     }
 }
 
+/// `--seed <n>`: a 32-bit unsigned integer.
+pub(crate) fn parse_seed(s: &str) -> Result<u32> {
+    s.trim().parse::<u32>().map_err(|_| Error::usage(format!("--seed: a whole number from 0 to 4294967295, not {s}")))
+}
+
 /// A block's recording keeps what its hooks did to the target (`actions.json.gz`, SPEC §14.1).
 fn keep_actions(ctx: &Ctx, dir: &Path) -> Result<()> {
-    let log = ctx.runner.actions();
-    if log.is_empty() { Ok(()) } else { log.write(dir) }
+    let log = ctx.runner.take_actions();
+    if log.is_empty() { Ok(()) } else { log.write(&dir.join(store::actions::FILE)) }
 }
 
 /// Sleeps for `d`, or until a stop is asked for.
@@ -1617,7 +1622,8 @@ pub fn run(args: &Args) -> Result<Output> {
         ctx.warnings.push(validity::warn("VariantChanged", text.clone()));
     }
     // Now it is known whether a hook used the seed: only then is another `--seed` another workload.
-    let used_random = ctx.runner.used_random();
+    // A resumed bench keeps what the runs before the resume found (`checkpoint`).
+    let used_random = ctx.runner.used_random() || ctx.saved["used_random"] == true;
     if ident.is_object() {
         ident["used_random"] = json!(used_random);
         ledger = store::ledger::for_experiment(&exp, &ledger_at, &ident);
@@ -1773,15 +1779,17 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         Err(e) => (false, json!(e.message), json!(e.hint), Value::Null, Value::Null, false, Value::Null, Value::Null, Value::Null),
     };
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
-    // A failed case has no recording: what its hooks sent before it failed is kept beside the result.
+    // A case without a recording (it failed, or its kind keeps none: a script, a command, a launch, a
+    // page measured from outside) keeps what its hooks sent beside the result. A recording took its own.
     let mut actions = Value::Null;
-    if !passed && !ctx.runner.actions().is_empty() {
+    let sent = ctx.runner.take_actions();
+    if recording.is_null() && !sent.is_empty() {
         // A journey's label names no target: each side's file is its own.
         let name = if s.sides.is_some() { format!("{} {}", s.label(), s.target) } else { s.label() };
         let slug: String = name.split(|c: char| !c.is_ascii_alphanumeric()).filter(|w| !w.is_empty()).map(str::to_ascii_lowercase).collect::<Vec<_>>().join("-");
-        let path = store::experiment_dir(&ctx.exp)?.join(format!("failed-{slug}.actions.json"));
-        match ctx.runner.actions().write_json(&path) {
-            Ok(()) => actions = json!({ "path": path, "count": ctx.runner.actions().actions.len() }),
+        let path = store::experiment_dir(&ctx.exp)?.join(format!("{}{slug}.actions.json.gz", if passed { "" } else { "failed-" }));
+        match sent.write(&path) {
+            Ok(()) => actions = json!({ "path": path, "count": sent.actions.len(), "failed": !passed }),
             Err(e) => ctx.warnings.push(validity::warn("Actions", format!("{}: {}", s.label(), e.message))),
         }
     }
@@ -1902,6 +1910,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             );
             if let Some(rec) = s["recording"].as_str() {
                 text += &format!("      rec  {rec} · strobe query {rec} {}\n", if s["target_kind"] == "native" { "threads" } else { "summary" });
+            }
+            if let Some(n) = s["actions"]["count"].as_u64() {
+                text += &format!("      actions  {n} sent · strobe query {exp} actions\n");
             }
             if let Some(line) = screen_line(&s["screen"]) {
                 text += &format!("      screen  {line}\n");
@@ -2071,6 +2082,10 @@ fn eta(ctx: &mut Ctx, s: &Series, blocks: &[Block], pairs: &[(usize, usize)], ta
 /// that stops or fails keeps them and `--resume` goes on from there.
 fn checkpoint(ctx: &mut Ctx, label: &str, entry: Value) {
     ctx.saved["series"][label] = entry;
+    // Whether the hooks so far used the seed: a resumed bench's runner starts without knowing.
+    if ctx.runner.used_random() {
+        ctx.saved["used_random"] = json!(true);
+    }
     if let Ok(dir) = store::experiment_dir(&ctx.exp) {
         let _ = store::write_json(&dir.join("state.json"), &ctx.saved);
     }
@@ -3827,6 +3842,9 @@ fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
 
 /// One block of whatever kind the target and case are.
 fn kind_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+    // Only a block that keeps its actions logs them (`--check`, `--keep`, attribution and memory
+    // blocks): an ordinary timed block reads no clock and copies nothing for them.
+    ctx.runner.collect_actions(x.untimed || x.keep || matches!(x.set, Set::Attribution | Set::Memory));
     let native = is_native(&ctx.describe["targets"][&s.target]);
     if ctx.describe["targets"][&s.target]["kind"] == "cli" {
         cli::block(ctx, s, v, pair, x)

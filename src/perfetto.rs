@@ -596,7 +596,8 @@ impl Builder {
         let track = self.track("inputs strobe sent", 2, None);
         for a in &log.actions {
             let name = match &a.selector {
-                Some(s) => format!("{} {s}", a.call),
+                Some(Value::String(s)) => format!("{} {s}", a.call),
+                Some(o) => format!("{} {o}", a.call),
                 None => a.call.clone(),
             };
             let mut args: Vec<(String, Value)> = vec![("seq".into(), json!(a.seq)), ("hook".into(), json!(a.hook.name()))];

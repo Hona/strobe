@@ -1268,13 +1268,15 @@ pub fn screen_capture_allowed() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() != 0 }
 }
 
-/// Moves (and with `client`, sizes) the app's window that matches `w`'s frame, through the
-/// accessibility API (Accessibility permission). macOS lets no app keep another's window on top
+/// Moves (and with `client`, sizes) the app's window that matches `w`'s frame as it is now, through
+/// the accessibility API (Accessibility permission). macOS lets no app keep another's window on top
 /// without activating it: strobe checks occlusion instead (`cloaked`).
 pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u32)>) {
     if !accessibility_trusted() {
         return;
     }
+    // The window may have moved since `w` was read (AppKit places a new window after it shows).
+    let w = &window_state(w.hwnd).unwrap_or_else(|| w.clone());
     let Some(app) = Cf::new(unsafe { AXUIElementCreateApplication(w.pid as i32) }) else { return };
     let mut list: CFTypeRef = std::ptr::null();
     if unsafe { AXUIElementCopyAttributeValue(app.0, cfstr("AXWindows").0, &mut list) } != 0 {

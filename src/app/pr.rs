@@ -135,7 +135,7 @@ pub fn hero(r: &Value) -> Hero<'_> {
     let mut wins = Vec::new();
     for s in d.series.iter().copied() {
         let c = &s["primary"];
-        if d.aa || s["kind"] == "leak" || s["not_run"] == true || d.primary_out(s) != Out::Better || beyond_margin(c) {
+        if d.aa || !judged(s) || d.primary_out(s) != Out::Better || beyond_margin(c) {
             continue;
         }
         // The same groups as `win_phrases`, at most three.
@@ -151,7 +151,7 @@ pub fn hero(r: &Value) -> Hero<'_> {
     wins.extend(second);
     let (mut worse, mut late) = (Vec::new(), Vec::new());
     for s in d.series.iter().copied() {
-        if d.aa || s["kind"] == "leak" || s["not_run"] == true {
+        if d.aa || !judged(s) {
             continue;
         }
         if d.primary_out(s) == Out::Worse {

@@ -362,10 +362,35 @@ pub(super) fn refresh(ps: &[Pair], r: &Value) -> f64 {
     v.get(v.len() / 2).copied().or(r["refresh_hz"].as_f64()).unwrap_or(60.0)
 }
 
+/// Whether a block's frames reached a display and were kept: never a headless page's (its gaps time
+/// animation frames no display showed), nor a block that counted none or whose frame metrics a
+/// validator refused (`BackgroundPriority`, `SoftwareGpu`; a percentile's `TailTooShort` only says it
+/// had too few). Results from before blocks cleared such gaps still hold them.
+pub(super) fn frames_kept(s: &Value, b: &Value) -> bool {
+    let refused = b["refused"]
+        .as_object()
+        .is_some_and(|r| r.iter().any(|(m, why)| m.starts_with("frames.") && why.as_str().and_then(model::Refusal::from_line).is_none_or(|x| x.validator != model::ValidatorId::TailTooShort)));
+    s["headless"] != true && bv(b, "frames.n") > 0.0 && !refused
+}
+
+/// The pairs whose two blocks both kept their frames.
+pub(super) fn framed_pairs(s: &Value) -> Vec<Pair<'_>> {
+    pairs(s).into_iter().filter(|p| frames_kept(s, p.base) && frames_kept(s, p.head)).collect()
+}
+
+/// A series whose pairs a hero or a caution may speak for: not a leak run (its own verdict), not one
+/// that never ran, and not one refused before it ran (`VariantMismatch`, an engine without its primary).
+pub(super) fn judged(s: &Value) -> bool {
+    s["kind"] != "leak" && s["kind"] != "refused" && s["not_run"] != true
+}
+
 /// Late frames (a gap of 1.5 frame times or more) as shares of all gaps, before and this PR, and in
-/// how many pairs this PR had a larger share of them, of those with frames on both sides.
+/// how many pairs this PR had a larger share of them, of those that kept frames on both sides.
 pub(super) fn late_frames(s: &Value, r: &Value) -> Option<(f64, f64, usize, usize)> {
-    let ps = pairs(s);
+    if !judged(s) {
+        return None;
+    }
+    let ps = framed_pairs(s);
     let vs = 1000.0 / refresh(&ps, r);
     let gaps = |b: &Value| b["intervals"].as_array().map(|a| a.iter().filter_map(Value::as_f64).collect::<Vec<_>>()).unwrap_or_default();
     let (mut lb, mut tb, mut lh, mut th, mut worse, mut n) = (0usize, 0usize, 0usize, 0usize, 0usize, 0usize);
@@ -789,6 +814,46 @@ pub(super) fn tested(s: &Value) -> Vec<&Value> {
 pub(super) fn variants(r: &Value) -> (Value, Value) {
     let find = |role: &str| r["variants"].as_array().into_iter().flatten().find(|v| v["role"] == role).cloned().unwrap_or(Value::Null);
     (find("base"), find("head"))
+}
+
+/// The window a series measured in, `1400×900` or `390×844 @3x · mobile`: the series' own (`window`),
+/// else its blocks' client area, else the experiment's; nothing for a target without a window or a
+/// series that never ran.
+pub(super) fn window_of(s: &Value, r: &Value) -> String {
+    if s["windowless"] == true || matches!(s["target_kind"].as_str(), Some("script" | "cli")) || s["kind"] == "refused" || s["not_run"] == true {
+        return String::new();
+    }
+    let shape = |w: &Value| {
+        let size = fmt::size(w);
+        let scale = w["scale"].as_f64().filter(|x| (x - 1.0).abs() > 0.01).map(|x| format!(" @{x}x")).unwrap_or_default();
+        let mobile = if w["mobile"] == true { " · mobile" } else { "" };
+        if size.is_empty() { size } else { format!("{size}{scale}{mobile}") }
+    };
+    if let Some(label) = s["window"].as_str() {
+        return label.to_string();
+    }
+    if s["window"].is_object() {
+        return shape(&s["window"]);
+    }
+    let client = s["blocks"].as_array().into_iter().flatten().find_map(|b| b["client"].as_array().filter(|c| c.len() >= 2));
+    match client {
+        Some(c) => shape(&serde_json::json!({ "width": c[0], "height": c[1], "scale": c.get(2) })),
+        None => shape(&r["window"]),
+    }
+}
+
+/// The address a `url()` target loaded on side `role` when that side's variant is a build (a folder,
+/// a commit), which such a target never loads: the variant's or the series' `href`, else the page its
+/// first block showed. None for a variant that is itself an address, or another kind of target.
+pub(super) fn fixed_href(r: &Value, s: &Value, role: &str) -> Option<String> {
+    let (b, h) = variants(r);
+    let v = if role == "base" { b } else { h };
+    let address = v["kind"] == "url" || v["kind"].is_null() && v["spec"].as_str().is_some_and(|x| x.contains("://"));
+    if s["target_kind"] != "url" || address {
+        return None;
+    }
+    let shown = || s["blocks"].as_array().into_iter().flatten().filter(|x| x["variant"] == role).find_map(|x| x["shown"]["start"]["url"].as_str().or(x["shown"]["end"]["url"].as_str()));
+    v["href"].as_str().or(s["href"].as_str()).or_else(shown).map(str::to_string)
 }
 
 pub(super) fn local_path(s: &str) -> bool {

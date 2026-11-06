@@ -119,6 +119,10 @@ impl<'a> Doc<'a> {
         if s["not_run"] == true {
             return Out::NotRun;
         }
+        // Refused before it ran (`VariantMismatch`, an engine without its primary), whatever its verdict says.
+        if s["kind"] == "refused" {
+            return Out::Refused;
+        }
         if s["kind"] == "leak" {
             return if kind(&s["primary"]) == VerdictKind::Worse {
                 Out::Worse
@@ -270,7 +274,7 @@ impl<'a> Doc<'a> {
     /// same metric in several series said once (`19–23% less CPU time`), at most three. A single win
     /// from one series makes room for one tested metric of another kind that also won there.
     pub(super) fn win_phrases(&self) -> (Vec<String>, Option<(&'a Value, &'a Value)>) {
-        let celebrates = |s: &Value| !self.aa && s["kind"] != "leak" && s["not_run"] != true && self.primary_out(s) == Out::Better && !beyond_margin(&s["primary"]);
+        let celebrates = |s: &Value| !self.aa && judged(s) && self.primary_out(s) == Out::Better && !beyond_margin(&s["primary"]);
         let mut groups: Vec<(String, Vec<&'a Value>)> = Vec::new();
         for s in self.series.iter().copied().filter(|s| celebrates(s)) {
             let c = &s["primary"];
@@ -321,7 +325,7 @@ impl<'a> Doc<'a> {
             format!("{}{who} ({k} of {n} pairs)", lc(ph))
         };
         for s in self.series.iter().copied() {
-            if self.aa || s["kind"] == "leak" || s["not_run"] == true {
+            if self.aa || !judged(s) {
                 continue;
             }
             let worse = |c: &Value| {
@@ -413,7 +417,7 @@ impl<'a> Doc<'a> {
     }
 
     pub(super) fn drew_frames(&self) -> bool {
-        self.series.iter().flat_map(|s| s["blocks"].as_array().into_iter().flatten()).any(|b| bv(b, "frames.n") > 0.0)
+        self.series.iter().any(|s| s["blocks"].as_array().into_iter().flatten().any(|b| frames_kept(s, b)))
     }
 
     /// `session locked, display off`: the state every block ran in, which the numbers compare with.
@@ -611,7 +615,7 @@ impl<'a> Doc<'a> {
             return String::new();
         }
         let foreign = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "cpu.foreign.max").is_finite()));
-        let frames = all.iter().any(|(_, ps)| ps.iter().any(|p| bv(p.base, "frames.n") > 0.0 && bv(p.base, "frames.interval.max").is_finite()));
+        let frames = all.iter().any(|(s, ps)| ps.iter().any(|p| frames_kept(s, p.base) && frames_kept(s, p.head) && bv(p.base, "frames.interval.max").is_finite()));
         let metric = if self.multi() { "Main metric".to_string() } else { noun(all[0].0["primary"]["metric"].as_str().unwrap_or("")) };
         let mut t = format!("#### Pairs\n\n| Pair | {}, {} → {} | Change |", cell(&metric), self.side_word(true), self.side_word(false));
         let mut sep = String::from("|:---|---:|---:|");
@@ -670,7 +674,8 @@ impl<'a> Doc<'a> {
                 let d = change(a, b);
                 t += &format!("| {} <sub>{}</sub> | {} | {} |", p.n, if p.ab { "AB" } else { "BA" }, arrow(&disp(a, unit), &disp(b, unit)), nb(&d));
                 if frames {
-                    t += &format!(" {} |", arrow(&disp(bv(p.base, "frames.interval.max"), "ms"), &disp(bv(p.head, "frames.interval.max"), "ms")));
+                    let gap = |b: &Value| if frames_kept(s, b) { bv(b, "frames.interval.max") } else { f64::NAN };
+                    t += &format!(" {} |", arrow(&disp(gap(p.base), "ms"), &disp(gap(p.head), "ms")));
                 }
                 if foreign {
                     let pct = |x: f64| {
@@ -720,11 +725,11 @@ impl<'a> Doc<'a> {
         format!("The … row{who} sums up {which}: {} did better in {w} of {n}{spread}.", self.side_word(false))
     }
 
-    /// Frame pacing, for series that drew frames.
+    /// Frame pacing, for series that drew frames to a display and kept them.
     pub(super) fn pacing_section(&self) -> String {
         let mut t = String::new();
         for s in &self.series {
-            let ps = pairs(s);
+            let ps = framed_pairs(s);
             let pool = |head: bool| -> Vec<f64> {
                 let mut v: Vec<f64> = ps.iter().flat_map(|p| (if head { p.head } else { p.base })["intervals"].as_array().into_iter().flatten().filter_map(Value::as_f64)).collect();
                 v.sort_by(f64::total_cmp);
@@ -965,10 +970,32 @@ impl<'a> Doc<'a> {
         let (b, h) = variants(r);
         let subj = |v: &Value| v["subject"].as_str().map(|s| format!(", *{}*", cell(&no_refs(s)))).unwrap_or_default();
         let mut t = String::from("#### How it was measured\n\n");
+        // A `url()` target loads its address whatever the build: a side is that page, not a commit.
+        let ran: Vec<&Value> = self.series.iter().copied().filter(|s| judged(s)).collect();
+        // The one page every series loaded on a side, if they all did.
+        let shared = |role: &str| -> Option<String> {
+            let pages: Vec<Option<String>> = ran.iter().map(|s| fixed_href(r, s, role)).collect();
+            match pages.as_slice() {
+                [Some(first), rest @ ..] if rest.iter().all(|x| x.as_ref() == Some(first)) => Some(first.clone()),
+                _ => None,
+            }
+        };
+        let side = |role: &str, v: &Value| shared(role).map(|x| code(&x)).unwrap_or_else(|| format!("{}{}", code(&tag(v)), subj(v)));
         if !b.is_null() {
-            t += &format!("- **Before:** {}{}\n", code(&tag(&b)), subj(&b));
+            t += &format!("- **Before:** {}\n", side("base", &b));
         }
-        t += &format!("- **This PR:** {}{}\n", code(&tag(&h)), subj(&h));
+        t += &format!("- **This PR:** {}\n", side("head", &h));
+        // Series that load fixed pages beside others, or different ones: each says its page.
+        if shared("head").is_none() {
+            for s in ran.iter().filter(|s| fixed_href(r, s, "head").is_some()) {
+                let (pb, ph) = (fixed_href(r, s, "base"), fixed_href(r, s, "head").unwrap_or_default());
+                let both = match pb {
+                    Some(x) if x != ph => format!("{} before, {} with this PR", code(&x), code(&ph)),
+                    _ => format!("{} on both sides", code(&ph)),
+                };
+                t += &format!("- **Page{}:** {both}, whatever the build\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() });
+            }
+        }
         if let Some(f) = r["fixture"].as_object() {
             t += &format!(
                 "- Fixture: {}, one per block outside both process sets{}.\n",
@@ -979,7 +1006,23 @@ impl<'a> Doc<'a> {
                     .unwrap_or_default()
             );
         }
-        t += &format!("- **Machine:** {}\n", cell(&self.machine()));
+        // The window each series measured in: once on the machine's line when they share one.
+        let mut windows: Vec<String> = self.series.iter().map(|s| window_of(s, r)).filter(|w| !w.is_empty()).collect();
+        windows.sort();
+        windows.dedup();
+        let machine = match windows.as_slice() {
+            [w] => format!("{}, window {w}", self.machine()),
+            _ => self.machine(),
+        };
+        t += &format!("- **Machine:** {}\n", cell(&machine));
+        if windows.len() > 1 {
+            for s in &self.series {
+                let w = window_of(s, r);
+                if !w.is_empty() {
+                    t += &format!("- **Window, {}:** {}\n", cell(&self.title(s)), cell(&w));
+                }
+            }
+        }
         // What each build showed on screen (`bench::shown_line`), so a reader sees what was measured.
         for s in &self.series {
             if let Some(l) = crate::app::bench::shown_line(s, ("base", "head")) {

@@ -791,7 +791,7 @@ fn arm(cdp: &Cdp, session: &str, observer: &str, profile: bool) {
     let _ = send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": observer }));
     if profile {
         let _ = send("Profiler.enable", json!({}));
-        let _ = send("Profiler.setSamplingInterval", json!({ "interval": probe::cpu::INTERVAL_US }));
+        let _ = send("Profiler.setSamplingInterval", json!({ "interval": probe::cpu::interval_us() }));
         let _ = send("Profiler.start", json!({}));
     }
 }
@@ -1201,6 +1201,8 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
             "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
             "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
             "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
+            // The page's sampler (SPEC §8.3), not the main process's.
+            "sampling": probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, probe::cpu::gaps(&renderer)),
         }),
     )?;
     draft.keep();

@@ -186,6 +186,13 @@
         "hidden": { "enum": ["covered", "not_active", "other"], "description": "WindowHidden: how the window was hidden." }
       }
     },
+    "sampling": {
+      "description": "A JavaScript sampler (SPEC 8.3): the interval asked and the median gap it kept between samples of the page's main thread, in µs, and how many gaps that median is of.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["asked_us", "median_us", "gaps"],
+      "properties": { "asked_us": { "type": "number" }, "median_us": { "type": "number" }, "gaps": { "type": "integer" } }
+    },
     "comparison": {
       "description": "One metric, base against head over the pairs (SPEC 9.3).",
       "type": "object",
@@ -351,9 +358,12 @@
         "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
         "attribution": { "type": ["object", "string", "null"], "description": "The attribution recording per variant (check: the one recording)." },
         "attribution_sampling": {
-          "type": ["object", "null"],
-          "description": "The attribution recordings' JavaScript sampler (SPEC 8.3), per variant (check: the one): the interval asked and the median gap it kept between samples of the page's main thread, in µs. Absent in older results.",
-          "properties": { "asked_us": { "type": "number" }, "median_us": { "type": "number" }, "gaps": { "type": "integer" } }
+          "description": "The attribution recordings' page sampler (SPEC 8.3): check, the one recording's; a comparison, per variant (a side without one is left out); null when none sampled a page. Absent in older results.",
+          "anyOf": [
+            { "type": "null" },
+            { "$ref": "#/definitions/sampling" },
+            { "type": "object", "additionalProperties": false, "properties": { "base": { "$ref": "#/definitions/sampling" }, "head": { "$ref": "#/definitions/sampling" } } }
+          ]
         },
         "timing_recordings": { "type": "array" },
         "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base and head (each with its first block's thumb_start and thumb_end as data URLs), changed (builds only)." },

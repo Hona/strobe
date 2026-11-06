@@ -27,6 +27,7 @@ strobe record pid:<n>|proc:<name> [--probes timing|deep|waits] [--for 10s]
 strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
 ```
 
+- `--for` (and every duration) needs its unit: `500ms`, `10s`, `2m`; a bare number exits 2.
 - `--bench`: a bench case (clicks, keys) under the attribution probes.
 - `pid:<n>|proc:<name>`: any running process from outside: frames from the OS's present events, CPU, threads, IO, GPU, memory.
   - `deep`: native stacks (kernel sampled profile, PDB symbols).
@@ -542,8 +543,8 @@ Fewer than 6 pairs never gets a verdict.
   - Rerunning until one says "faster" shows; paste the ledger line as it is.
 - **Why is it slow?** `bench … --why always` (or `record --probes attribution`), then on the attribution recording:
   - `query hotspots` (CPU by function, full stacks, original file:line:column through source maps)
-    - Its header (and each attribution block's line) gives the interval the sampler kept, not the one asked: `sampled every 2.0 ms (asked 1 ms)`.
-    - Windows keeps about 0.5 ms at best (Chromium asked 0.2 ms); Firefox 160 and older on Windows 2 ms.
+    - Its header (and each attribution block's line, `query <rec> summary`, result `attribution_sampling`) gives the interval the sampler kept, not the one asked: `sampled every 2.0 ms (asked 1 ms: 2.0× coarser)`.
+    - Windows keeps about 0.5 ms at best (Chromium asks 0.4 ms there); Firefox 160 and older on Windows 2 ms.
     - Times hold at any interval (each sample weighs its own gap); a function shorter than one gap shows only by chance.
   - `query layout` (forced layouts by the call that forced them)
   - `query style` (what invalidated style: the class, attribute, pseudo-class or custom property that changed, the nodes, the selector, the script line)

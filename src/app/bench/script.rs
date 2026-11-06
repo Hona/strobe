@@ -60,8 +60,8 @@ impl Host {
             cmd.arg("--expose-gc");
         }
         if let Some(dir) = profiles {
-            // The whole process's profiles, written on a normal exit; 200 µs samples as for pages.
-            cmd.args(["--cpu-prof", &format!("--cpu-prof-interval={}", probe::cpu::INTERVAL_US), "--heap-prof"])
+            // The whole process's profiles, written on a normal exit; samples at the interval pages get.
+            cmd.args(["--cpu-prof", &format!("--cpu-prof-interval={}", probe::cpu::interval_us()), "--heap-prof"])
                 .arg(format!("--cpu-prof-dir={}", dir.display()))
                 .arg(format!("--heap-prof-dir={}", dir.display()));
         }

@@ -1274,6 +1274,10 @@ pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     hotspots_of(&Rec::open(dir), by, top)
 }
 
+/// What a sampler coarser than asked costs a profile (`probe::cpu::Sampling::coarse`).
+pub const COARSE: &str =
+    "coarser than asked: every time is its samples' own gaps, but a function that runs for less than one gap shows only when a sample lands in it (± per row: how sure)";
+
 /// `hotspots` of an opened recording: its JavaScript profile, else its native samples.
 pub fn hotspots_of(rec: &Rec, by: &str, top: usize) -> Result<Output> {
     let stacks = match rec.cpu() {
@@ -1284,14 +1288,11 @@ pub fn hotspots_of(rec: &Rec, by: &str, top: usize) -> Result<Output> {
     // The interval the sampler kept, not the one asked: Firefox 160 and older on Windows sample every
     // 2 ms when asked for 1 ms (`probe::gecko::interval_us`).
     let sampling = rec.sampling();
-    let at = sampling.map(|s| s.text()).unwrap_or_else(|| "interval unknown".into());
-    let mut header = format!("hotspots by {by} · self time · {{samples}} samples, {at}{{mapped}}");
+    let at = sampling.map(|s| format!(", {}", s.text())).unwrap_or_default();
+    let mut header = format!("hotspots by {by} · self time · {{samples}} samples{at}{{mapped}}");
     // Each sample weighs the gap it kept, so the times hold; what a coarser sampler loses is the short.
-    if let Some(s) = sampling.filter(|s| s.coarse()) {
-        header += &format!(
-            "\n! the sampler kept {:.1}× the interval asked: every time below is its samples' own gaps, but a function that runs for less than one gap shows only when a sample lands in it (± per row: how sure)",
-            s.median_us / s.asked_us
-        );
+    if sampling.is_some_and(|s| s.coarse()) {
+        header += &format!("\n! {COARSE}");
     }
     let mut out = rank(stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
     out.json["interval_us"] = json!(sampling.map(|s| s.median_us));

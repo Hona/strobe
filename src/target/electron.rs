@@ -40,7 +40,7 @@ pub struct Started {
     pub main: Option<Arc<Cdp>>,
 }
 
-/// Connects to a paused main process's inspector, starts its CPU profiler at 200 µs and lets it run.
+/// Connects to a paused main process's inspector, starts its CPU profiler (`probe::cpu::interval_us`) and lets it run.
 fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let ws = loop {
@@ -58,7 +58,7 @@ fn profile_from_start(port: u16) -> Result<Arc<Cdp>> {
     };
     let cdp = Cdp::connect(&ws)?;
     cdp.send("Profiler.enable", json!({}), None)?;
-    cdp.send("Profiler.setSamplingInterval", json!({ "interval": 200 }), None)?;
+    cdp.send("Profiler.setSamplingInterval", json!({ "interval": crate::probe::cpu::interval_us() }), None)?;
     cdp.send("Profiler.start", json!({}), None)?;
     cdp.send("Runtime.runIfWaitingForDebugger", json!({}), None)?;
     Ok(cdp)

@@ -291,7 +291,8 @@ impl Args {
     }
 }
 
-/// Parses `500ms`, `10s`, `2m`, `2h`, `1d`, or plain seconds; a negative or non-finite one is refused.
+/// Parses `500ms`, `10s`, `2m`, `2h`, `1d` (and a bare `0`); a negative or non-finite one, or a number
+/// without its unit, is refused: `--for 2000` meant as milliseconds once recorded for 33 minutes.
 pub fn duration_ms(text: &str) -> Result<u64> {
     let t = text.trim();
     let (num, mult) = if let Some(n) = t.strip_suffix("ms") {
@@ -305,6 +306,9 @@ pub fn duration_ms(text: &str) -> Result<u64> {
     } else if let Some(n) = t.strip_suffix('d') {
         (n, 86_400_000.0)
     } else {
+        if t.parse::<f64>().is_ok_and(|v| v != 0.0) {
+            return Err(Error::usage(format!("not a duration: {text}; give a unit: {text}ms or {text}s")));
+        }
         (t, 1000.0)
     };
     match num.trim().parse::<f64>() {

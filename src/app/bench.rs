@@ -1759,7 +1759,8 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         match attributed {
             Ok(b) => {
                 progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
-                sampling = attribution_sampling(b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok()).as_ref(), &b.variant);
+                let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
+                sampling = json!(attribution_sampling(rec.as_ref(), &b.variant, &mut ctx.warnings));
                 attribution = json!(b.recording);
             }
             Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
@@ -2635,7 +2636,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // Attribution: one block per variant with profilers, never timed. By default only when there is a
     // difference to explain; `--why always` keeps them for every series, `--why never` (or
     // `--probes timing`) skips them.
-    let (mut recordings, mut sampling) = (json!({}), json!({}));
+    let (mut recordings, mut sampling) = (json!({}), serde_json::Map::new());
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
     // Each side is profiled with its own engine's tools: an implementation comparison's two may differ,
     // and a side strobe has no profiler for gets no block while the other still gets its own.
@@ -2690,7 +2691,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     let who = if ctx.implementations { v.name.as_str() } else { v.role };
                     let script = side_targets[i]["kind"] == "script";
                     let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
-                    sampling[v.role] = attribution_sampling(rec.as_ref(), &b.variant);
+                    if let Some(sm) = attribution_sampling(rec.as_ref(), who, &mut warnings) {
+                        sampling.insert(v.role.to_string(), json!(sm));
+                    }
                     let hot = rec.as_ref().filter(|_| !script).and_then(|r| super::query::hotspots_of(r, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
                         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
@@ -2737,7 +2740,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
-        "blocks": blocks, "warnings": warnings, "attribution": recordings, "attribution_sampling": sampling, "timing_recordings": timing_recordings, "shown": shown,
+        "blocks": blocks, "warnings": warnings, "attribution": recordings, "attribution_sampling": if sampling.is_empty() { Value::Null } else { Value::Object(sampling) }, "timing_recordings": timing_recordings, "shown": shown,
         "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     });
@@ -2953,10 +2956,14 @@ fn why_text(target: &Value) -> &'static str {
 
 /// What an attribution recording's JavaScript sampler kept against what it was asked for
 /// (`probe::cpu::Sampling`), said under the block's line: `head JavaScript sampled every 2.0 ms (asked 1 ms)`.
-fn attribution_sampling(rec: Option<&super::query::Rec>, who: &str) -> Value {
-    let Some(s) = rec.and_then(|r| r.sampling()) else { return Value::Null };
-    progress(format!("  {who} JavaScript {}{}", s.text(), if s.coarse() { ": coarser than asked, so a function shorter than one gap shows only by chance" } else { "" }));
-    json!(s)
+/// A coarser one is also an `Attribution` note, so it reaches `--json`, `--quiet` and the summary.
+fn attribution_sampling(rec: Option<&super::query::Rec>, who: &str, warnings: &mut Vec<Warning>) -> Option<probe::cpu::Sampling> {
+    let s = rec.and_then(|r| r.sampling())?;
+    progress(format!("  {who} JavaScript {}", s.text()));
+    if s.coarse() {
+        warnings.push(validity::info("Attribution", format!("{who}: JavaScript {}: {}", s.text(), super::query::COARSE)));
+    }
+    Some(s)
 }
 
 /// `sampled every 2.0 ms (asked 1 ms)` from a result's `attribution_sampling` entry.
@@ -4826,10 +4833,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
         // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
         // measured run's own span) and its style, layout and GC rows, then the page's source maps.
+        // The interval the page's sampler kept (SPEC §8.3), kept in the recording's meta.
+        let mut sampling = None;
         if let Some(g) = gecko.take() {
             let raw = g.stop()?;
             let untimed: Vec<(u64, u64)> = measured.iter().flat_map(|r| r.timed.untimed.iter().copied()).collect();
             let got = probe::gecko::convert(&raw, &token, &spans, &untimed, &dir)?;
+            sampling = got.sampling;
             let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
             probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
@@ -4838,6 +4848,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             profiling.set(false);
             let mut segments = segments.take();
             segments.push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
+            sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, segments.iter().flat_map(|(p, _)| probe::cpu::gaps(p)).collect());
             for (k, (profile, allocs)) in segments.iter().enumerate() {
                 store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
                 store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
@@ -5085,6 +5096,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             });
             if !census.is_empty() {
                 meta["census"] = json!(census);
+            }
+            if let Some(sm) = sampling {
+                meta["sampling"] = json!(sm);
             }
             if let Some(l) = &leak {
                 // What `query leaks` reads, as for a memory recording.
@@ -7163,7 +7177,7 @@ fn render(r: &Value) -> String {
                 why_view(&s["target_kind"])
             );
         }
-        let at: Vec<String> = ["base", "head"].iter().filter_map(|r| Some(format!("{r} {}", sampled(&s["attribution_sampling"][r])?))).collect();
+        let at: Vec<String> = [("base", bn), ("head", hn)].iter().filter_map(|(r, name)| Some(format!("{name} {}", sampled(&s["attribution_sampling"][r])?))).collect();
         if !at.is_empty() {
             out += &format!("       JavaScript {}\n", at.join(" · "));
         }

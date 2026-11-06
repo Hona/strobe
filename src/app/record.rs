@@ -45,7 +45,9 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|s| Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"] })))
+        .filter_map(|s| {
+            Some(json!({ "case": s["label"], "recording": s["attribution"].as_str()?, "values": s["values"], "refused": s["refused"], "declared": s["declared"], "headless": s["headless"], "sampling": s["attribution_sampling"] }))
+        })
         .collect();
     // A case that ran but whose engine strobe has no profiler for (a Firefox launch, a WebKit page) says so.
     let unprofiled = out.json["warnings"].as_array().into_iter().flatten().find(|w| w["id"] == "Attribution" && w["text"].as_str().is_some_and(|t| t.contains("no attribution block")));
@@ -76,6 +78,7 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
             text += &format!("check    {}   (one cold run before it: its own numbers, not this recording's runs)\n", declared.join(" · "));
         }
         let meta = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).unwrap_or(Value::Null);
+        text += &sampling_line(&meta);
         let native = meta["native"] == true;
         text += &if native {
             format!("next     strobe query {rec} threads · strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe query {rec} summary\n")
@@ -266,7 +269,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     let mut sampling = None;
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
-        sampling = probe::cpu::Sampling::of_v8(&profile);
+        sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, probe::cpu::gaps(&profile));
         let allocs = probe::alloc::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
         store::write_json(&dir.join("alloc-0.heapprofile"), &allocs)?;

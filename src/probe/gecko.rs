@@ -745,7 +745,6 @@ pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], untimed: &[
     }
     let read = json!({
         "token": token,
-        "interval_us": asked.round() as u64,
         "sampling": sampling,
         "format": profile["meta"]["version"],
         "windows": windows.iter().map(|w| json!([w.0, w.1, w.2])).collect::<Vec<_>>(),

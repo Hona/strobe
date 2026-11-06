@@ -819,6 +819,8 @@ impl Builder {
             let mut stacks: HashMap<u64, Option<u64>> = HashMap::new();
             let samples = prof["samples"].as_array().cloned().unwrap_or_default();
             let deltas: Vec<i64> = prof["timeDeltas"].as_array().into_iter().flatten().map(|d| d.as_i64().unwrap_or(0)).collect();
+            // The last sample has no gap after it: it weighs the profile's median gap.
+            let last = crate::probe::cpu::Sampling::of(0.0, crate::probe::cpu::gaps(&prof)).map_or(1.0, |s| s.median_us).round() as i64;
             let mut t = prof["startTime"].as_i64().unwrap_or(0);
             let task = js.task(pid, tid);
             for (i, s) in samples.iter().enumerate() {
@@ -833,7 +835,7 @@ impl Builder {
                 });
                 let Some(stack) = stack else { continue };
                 // A sample stands for the time to the next one (the profile's own weighting).
-                let us = deltas.get(i + 1).copied().filter(|d| *d > 0).unwrap_or(crate::probe::cpu::INTERVAL_US as i64);
+                let us = deltas.get(i + 1).copied().filter(|d| *d > 0).unwrap_or(last);
                 let ts = t as u64 * 1000;
                 first_ts = Some(first_ts.map_or(ts, |f| f.min(ts)));
                 js.sample(ts, task, None, stack, us as u64 * 1000);

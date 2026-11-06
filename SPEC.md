@@ -270,8 +270,10 @@ commands read it); any other
 flag is a usage error (exit 2) that names the closest one, never a setting silently ignored, and
 so is an unknown short flag (`-x`; a negative number stays an argument). A switch takes
 `--name`, `--name=true` or `--name=false` (off), nothing else. MCP tool schemas take their types
-from the same table (§17). Durations take `500ms`, `10s`, `2m`, `2h`, `1d` or plain seconds; a
-negative or non-finite one is refused.
+from the same table (§17). Durations take `500ms`, `10s`, `2m`, `2h`, `1d` (and a bare `0`); a
+negative or non-finite one is refused, and so is a number without its unit (exit 2, `not a
+duration: 2000; give a unit: 2000ms or 2000s`): `--for 2000` meant as milliseconds once recorded
+for 33 minutes.
 
 Progress lines of long commands go to stderr (stdout stays the result); `--progress stdout` (or
 `STROBE_PROGRESS=stdout`) puts them on stdout, `off` drops them; with `--json` stdout never gets
@@ -1112,7 +1114,7 @@ none and refuses a declared one (`NoCounter`: counters are read around a case's 
 | `threads` | top-level tasks per thread by category, long tasks | trace | timing | low |
 | `os` | process tree CPU and memory, threads, per-core, IO | OS sampler (§13.6) | timing | low |
 | `gpu` | engines and VRAM per process, device clocks, power, PCIe | GPU sampler | timing | low |
-| `cpu` | JS stacks at 200 µs with line ticks | V8 profiler | attribution | med |
+| `cpu` | JS stacks at 200 µs (400 µs on Windows) with line ticks | V8 profiler | attribution | med |
 | `alloc` | allocation sampling with stacks | HeapProfiler.startSampling | attribution | low–med |
 | `invalidation` | forced layouts and style invalidations with JS stacks | trace | attribution | med |
 | `counters` | `count.<name>`: `ctx.count` in the bench file and the page's counter global (§8.4), per run | runner, page | timing, when declared | low |
@@ -1149,26 +1151,38 @@ The difference is printed as `overhead`. Above 2% of main-thread time fails `Pro
 
 ### 8.3 CPU samples
 
-200 µs interval, line ticks kept (at 50 µs the profiler raised a JS-heavy run's main-thread work
-by 35–45%, enough that one profiled launch moved against the timed pairs it was meant to explain).
-Every hotspot row carries its sample count and an interval for its share. Native time stays
-`(program)` unless `deep` resolves it (§12.3).
+200 µs interval on macOS and Linux, 400 µs on Windows (`probe::cpu::interval_us`: pages, an
+Electron app's main process, script targets' `--cpu-prof-interval`), line ticks kept (at 50 µs the
+profiler raised a JS-heavy run's main-thread work by 35–45%, enough that one profiled launch moved
+against the timed pairs it was meant to explain). Windows' timers go no finer than about 0.5 ms and
+V8's sampler there wakes on the tick after its interval: Chromium on adais kept 0.52 ms when asked
+for 200, 300, 400 or 450 µs, 1.0 ms when asked for 500 µs and 1.5 ms for 1 ms, so 400 µs is the finest
+it keeps without asking for much more than it gives. Every hotspot row carries its sample count and
+an interval for its share. Native time stays `(program)` unless `deep` resolves it (§12.3).
 
 **Interval kept** (`probe::cpu::Sampling`): a sampler need not keep the interval asked of it, so
 strobe reports the one it kept: the median gap between consecutive samples of the page's main thread
-in the attribution block (V8: `timeDeltas`; Firefox: its main threads' samples inside the measured
-runs). Every attribution block says it beside its line and in the result (`head JavaScript sampled
-every 2.0 ms (asked 1 ms)`; `attribution_sampling` per variant), `record` in `meta.json`
-(`sampling`) and its summary, and `query hotspots` and Firefox's `query threads` in their headers
-(`sampling` in their JSON). Checked on adais (Windows 11, headless, 2026-11-07): Chromium's V8 kept
-0.52 ms when asked for 200 µs (Windows' timers go no finer than about 0.5 ms); Firefox 159 kept
-2.0 ms when asked for 1 ms, Nightly 162 0.52 ms when asked for 0.5 ms. What strobe claims from a
-profile holds at the interval kept: a sample weighs the gap to the next one (as V8 counts it), so a
-function's self time and the sampling interval of a change (`a..b`, Σ Δt²) are the kept gaps', not
-the asked interval's; a thread's last sample weighs the median gap. What a coarser interval loses is
-the short: a function that runs for less than one gap shows only when a sample lands in it. Where the
-kept interval is more than 1.5 times the asked one, the block's line and `query hotspots` say so; the
-`±` beside each row's share (from its sample count) says how sure it is.
+in the attribution block (V8: the page's `timeDeltas`, never an app's main process's `cpu-main`;
+Firefox: its main threads' samples inside the measured runs), gaps over 50 ms left out (the thread was
+not sampled then: a runtime that skips ticks while idle, a paused process). Every attribution
+recording of a page keeps it in `meta.json` (`sampling`: `asked_us`, `median_us`, `gaps`; a Firefox
+one also in `gecko.json`), and every view says it: the block's line, the experiment's text and its
+result (`head JavaScript sampled every 2.0 ms (asked 1 ms: 2.0× coarser)`; `attribution_sampling`:
+the one sampling of a `--check`, else per variant, null when none), `record` and `record --bench` and
+`query <rec> summary` (`samples` line), `query hotspots` and Firefox's `query threads` (header, and
+`sampling` in their JSON; hotspots' `interval_us` is the median kept). A script target's profile
+covers its whole host process, no page's thread: it gets none. A recording from before 2026-11-07
+reads its own profiles' median gap, asked 200 µs as they all were. Checked on adais (Windows 11,
+headless, 2026-11-07): Chromium kept 0.52 ms asked 400 µs; Firefox 159 2.0 ms asked 1 ms; Nightly 162
+0.53 ms asked 0.5 ms. What strobe claims from a profile holds at the interval kept: a sample weighs
+the gap to the next one (as V8 counts it), so a function's self time and the sampling interval of a
+change (`a..b`, Σ Δt²) are the kept gaps', not the asked interval's; a profile's last sample weighs
+its median gap (V8 and Firefox alike, in the views and in `strobe open`). What a coarser interval
+loses is the short: a function that runs for less than one gap shows only when a sample lands in it.
+Where the kept interval is more than 1.5 times the asked one, the text says how much coarser,
+`query hotspots` says what that costs, and the block adds an `Attribution` note (so `--json`,
+`--quiet` and the summary carry it); the `±` beside each row's share (from its sample count) says how
+sure it is.
 
 **Source maps**: right after the profilers stop, while the target still serves its scripts, strobe
 asks the page to fetch the `sourceMappingURL` (http, an app's custom protocol, or an inline `data:`
@@ -2398,7 +2412,7 @@ experiment's `script.log`.
 - **Memory:** `js.heap.retained` is the heap after a full collection (`Bun.gc(true)`, Node's
   `gc()` under `--expose-gc`) after a run minus before it, read outside the run's span: what each
   run keeps alive. `memory.app.private` is the host tree's private bytes after the runs.
-- **Attribution:** the process starts with `--cpu-prof` (200 µs) and `--heap-prof`; the profiles
+- **Attribution:** the process starts with `--cpu-prof` (200 µs, 400 µs on Windows: §8.3) and `--heap-prof`; the profiles
   cover the whole process and name the harness's and the variant's own source files, so nothing
   needs a source map.
 

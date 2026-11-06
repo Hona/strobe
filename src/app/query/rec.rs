@@ -194,11 +194,18 @@ impl Rec {
         serde_json::from_value(self.gecko()?["parts"].get(format!("{p:?}"))?.clone()).ok()
     }
 
-    /// The interval the recording's JavaScript sampler was asked for and the one it kept: a Firefox
-    /// recording's as strobe read it from the Gecko profile, else the median gap of its CPU profiles.
+    /// The interval the recording's page sampler was asked for and the one it kept: as the recording
+    /// stored it (`meta.json`, a Firefox recording's `gecko.json`), else, for a recording from before
+    /// strobe stored it, the median gap of its page's CPU profiles, asked `INTERVAL_US` as they all were
+    /// (a Firefox one the interval its `gecko.json` gave). None for a script target's profiles: they
+    /// cover a whole host process, no page's thread.
     pub fn sampling(&self) -> Option<Sampling> {
-        if let Some(s) = self.gecko().and_then(|g| serde_json::from_value(g["sampling"].clone()).ok()) {
+        let stored = |v: &Value| serde_json::from_value::<Sampling>(v["sampling"].clone()).ok();
+        if let Some(s) = stored(&self.meta).or_else(|| self.gecko().and_then(stored)) {
             return Some(s);
+        }
+        if self.meta["script"] == true {
+            return None;
         }
         self.cpu().ok()?;
         let asked = self.gecko().and_then(|g| g["interval_us"].as_f64()).unwrap_or(crate::probe::cpu::INTERVAL_US as f64);
@@ -265,8 +272,14 @@ impl Rec {
         for p in profiles {
             let bytes = std::fs::read(&p)?;
             let prof: CpuProfile = parse(&bytes)?;
-            // `timeDeltas[i]`: the gap from sample i − 1 to sample i.
-            self.gaps.lock().unwrap_or_else(|e| e.into_inner()).extend(prof.time_deltas.iter().skip(1).copied());
+            // `timeDeltas[i]`: the gap from sample i − 1 to sample i. A V8 profile's last sample has no
+            // gap after it: it weighs the profile's median gap, as a Firefox thread's last sample does.
+            let gaps: Vec<f64> = prof.time_deltas.iter().skip(1).copied().collect();
+            let last = Sampling::of(0.0, gaps.clone()).map_or(0.0, |s| s.median_us);
+            // The page's sampler only: not an app's main process (`cpu-main`, a launch's).
+            if p.file_stem().is_some_and(|s| s != "cpu-main") {
+                self.gaps.lock().unwrap_or_else(|e| e.into_inner()).extend(gaps);
+            }
             // Parsing runs beside other loads; symbolizing shares the recording's source maps.
             let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
             let index: HashMap<u64, usize> = prof.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();
@@ -282,7 +295,7 @@ impl Rec {
             let mut at: BTreeMap<usize, (f64, u64, f64)> = BTreeMap::new();
             for (i, s) in prof.samples.iter().enumerate() {
                 let Some(&k) = index.get(s) else { continue };
-                let dt = prof.time_deltas.get(i + 1).copied().unwrap_or(0.0).max(0.0);
+                let dt = prof.time_deltas.get(i + 1).copied().unwrap_or(last).max(0.0);
                 let e = at.entry(k).or_default();
                 e.0 += dt;
                 e.1 += 1;

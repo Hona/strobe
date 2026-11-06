@@ -697,6 +697,9 @@ impl Watch {
                 let send = |method: &str, params: Value| cdp.send_timeout(method, params, Some(&session), Duration::from_secs(10));
                 let target = info["targetId"].as_str().unwrap_or("").to_string();
                 if is_page(info) && seen.insert(target.clone()) {
+                    // Without the Page domain on, a session's init script missed the document a page that
+                    // was already open navigated to (about:blank to the launch's URL): the observer went in late.
+                    let _ = send("Page.enable", json!({}));
                     let _ = send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": observer }));
                     if profile {
                         let _ = send("Profiler.enable", json!({}));

@@ -1,6 +1,6 @@
 {
   "name": "@hona/strobe-win32-x64",
-  "version": "0.10.0",
+  "version": "0.11.0",
   "description": "The strobe binary for Windows x64; installed by @hona/strobe",
   "files": ["strobe.exe", "strobew.exe"],
   "os": ["win32"],

@@ -405,6 +405,20 @@ strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#
   and puts everything back when it exits; its exit code is strobe's. It measures nothing itself: the
   harness prints its own numbers. A harness timed the same build at 190 ms and 250–330 ms an hour
   later while other agents kept 60% of the CPUs busy; strobe's reservation covered only its benches.
+- `strobe run --base "<command>" --head "<command>"` (`--aa --head "<command>"` for an A/A,
+  `--check --head "<command>"` to run it once) is a paired A/B of two command lines with everything
+  a bench has: blocks of fresh runs alternating, warmup until steady, Pocock looks, `--noworse`,
+  `verdict_kind`, the slot, power, pin and reserved CPUs, `report` and the PR block. Each run starts
+  the command and waits for its exit, measured from outside (§9.6 `cli()` targets): `cpu.work` (the
+  default primary, `--primary` another), `run.duration`, `cpu.wakes`, `memory.peak`, `io.*`, and
+  `metric.<name>` from the `strobe:metric <name>=<value>` lines it prints (`--metrics metric.x,…`
+  declares them, so they are tested). It is `bench` on a file strobe writes (`<state>/run/cmd-<hash>/`)
+  with `cmd:` variants; `--pairs`, `--runs`, `--equivalence`, `--max-time`, `--require-verdict` and
+  `--id` are bench's. Checked on vps: a 20 M-iteration loop against 22 M read `cpu.work` +9.2%
+  [+8.1 … +11] and `metric.loop_ms` +9.8% after 8 pairs (2.2 s). A/A, the same command on both sides:
+  100 experiments with `cpu.work` primary said `same` 99 times and `better` once (1%); 150 with
+  `run.duration` of a 6 ms command and a 0.3% bound (so almost nothing is `same`, and most went to
+  12–40 pairs) said `better` 4 and `worse` 2 times (4.0%, nominal 5%).
 
 ### 5.6 `strobe bench`
 
@@ -667,8 +681,8 @@ Each metric declares:
 
 | Property | Values |
 |---|---|
-| unit | `ms`, `bytes`, `count`, `score`, `%`, `Hz`, `W`, `MB/s`, `mJ` (energy per run), `instructions` (per run), `/s` (wakes per second) |
-| better | `lower` or `higher` |
+| unit | `ms`, `bytes`, `count`, `score`, `%`, `Hz`, `W`, `MB/s`, `mJ` (energy per run), `instructions` (per run), `/s` (wakes per second), `value` (a number a command printed, in its own units: `metric.<name>`, §9.6) |
+| better | `lower` or `higher` (`metric.<name>`: as the command's lines say, default `lower`) |
 | kind | `timed` (wall or CPU time), `sampled` (statistical estimate), `exact` (a count, compared exactly when it is stable, §9.3) |
 | scale | `ratio` (compare log ratios) or `absolute` (compare differences); counts and scores are absolute, since 0 has no ratio |
 | minimum n | e.g. a percentile p needs `⌈10 / (1 − p)⌉` frames per block |
@@ -677,8 +691,8 @@ Each metric declares:
 
 The catalog lives in `src/model.rs` and in `strobe query <h> summary --catalog`. Families resolve
 by their base: `count.<name>` (what `ctx.count` or the page counted, §8.4), `net.requests` and
-`net.bytes` with an optional `{<url glob>}` (§8.1), `phase.<name>` and `span.<name>` (§7.3), and
-`launch.<milestone>` (§9.6). Metrics a
+`net.bytes` with an optional `{<url glob>}` (§8.1), `phase.<name>` and `span.<name>` (§7.3),
+`metric.<name>` (what a `cli()` target's command printed, §9.6), and `launch.<milestone>` (§9.6). Metrics a
 series declares beyond the defaults may switch on what measures them: `count.*` installs the page
 counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Dawn categories, `net.*` the Network domain, `layout.shift` the trace's `loading` category, `main.gc` its
 `disabled-by-default-v8.gc` category. Only that series' blocks pay for it, base and head alike.
@@ -703,6 +717,33 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
   a metric; the page's epoch milliseconds, whole ones in Firefox, are mapped to the host clock and taken
   as the end of their millisecond). Never the page's Event Timing, whose 16 ms threshold censors fast
   inputs. Headless there are none: refused `Headless`.
+- **Where a frame's time went** (Chromium pages and Electron apps): each `PipelineReporter` slice in the
+  lean trace carries its stages as children, which tile it. A presented frame splits into its
+  renderer side (`BeginImplFrameToSendBeginMainFrame`, `SendBeginMainFrameToCommit`, `Commit`,
+  `Activation`, and `EndActivateToSubmitCompositorFrame` or, with the display tree in the GPU
+  process, `EndActivateToSubmitUpdateDisplayTree`: the compositor and main threads) and its GPU
+  process side (`EndCommitToActivation`, where tiles raster, plus the display compositor's
+  `StartDrawToSwapStart` and the swap, `Swap` or its platform's parts `SwapStartToSwapEnd`,
+  `SwapStartToBufferAvailable` and `BufferAvailableToBufferReady`, under
+  `SubmitCompositorFrameToPresentationCompositorFrame` or
+  `SubmitUpdateDisplayTreeToPresentationCompositorFrame`). The waits in between are in neither: the
+  frame in flight to the display compositor, its deadline, the buffer's latch, and the display after
+  the swap (on adais, `SwapEndToPresentationCompositorFrame` averaged 4.3 ms of a 6.9 ms frame, the
+  vsync wait). `frames.renderer.p95` and `frames.viz.p95` are the 95th percentiles of the two sides'
+  stage spans over the presented frames whose reports carry both (`frames.split.n`, their minimum n
+  as other p95s). They name stages, not engines: a stage is a span of the pipeline, queueing
+  included, not CPU or GPU busy time, so neither says a frame was CPU- or GPU-bound (no such share is
+  given). Invariant: the two sides of a frame never add up to more than the frame; a block with any
+  frame that breaks it splits none (`frames.split.bad`), and a block where under 95% of the presented
+  frames carry both sides splits none either (a split of the frames that carry stages would describe
+  another set of frames); both refuse the two (`NoPresentSource`, saying which and how many). A native
+  app's presents carry no stages (`NotForTarget`). Both are one engine's own (`per_side`, §9.10).
+  `query <rec> frames` prints the split and each worst frame's stages with their children. Checked on
+  two 100 s lean recordings of pages (adais, 165 Hz): every presented frame in their traces carried
+  both sides (6,716 of 6,716, and 26,393 of 26,393), none broke the invariant. The first: renderer p95
+  0.94 ms, GPU process p95 2.14 ms, and its worst frame (97 ms) spent 91 ms in the display
+  compositor's draw (`StartDrawToSwapStart`); the second: renderer p95 6.25 ms, GPU process p95
+  0.74 ms.
 - **Native windows and any process from outside** (Windows): a frame is a present the OS put on the
   screen, from its present events (§8.1 `presents`): one record per present with its start, the
   screen time of its scanout (`displayed`), or `discarded` (replaced before scanout). "One present
@@ -944,6 +985,7 @@ none and refuses a declared one (`NoCounter`: counters are read around a case's 
 | `heap` | heap snapshots per runtime (§8.6) | bridge, CDP, inspector | attribution | high, pauses |
 | `presents` | presents to the screen: displayed (scanout time) or discarded, vertical blanks | ETW real-time session (§13.4) | timing | low |
 | `deep` | native stacks, context switches, core residency | helper (§13.4) | attribution | med |
+| `waits` | `deep` plus off-CPU waits: each switch-out and switch-in of the target's threads with the stack it waited at, and who woke it with theirs (§11.1 `waits`) | Linux perf tracepoints; Windows the helper's CSwitch and ReadyThread | attribution, when asked (`--probes waits`) | high: at every context switch |
 
 Sets: `timing` = frames, threads, os, gpu. `attribution` = cpu, alloc, invalidation,
 counters. `memory` = census, heap. `deep` = deep. Probes can be listed one by one.
@@ -1521,8 +1563,10 @@ reserved for tools that list a project's bench files; strobe does not read it ye
 }
 ```
 
-- A variant is `git:<ref>`, `app:<id>`, `exe:<path>`, or a bare value: an existing directory,
-  else a git ref.
+- A variant is `git:<ref>`, `app:<id>`, `exe:<path>`, `cmd:<line>`, or a bare value: an existing
+  directory, else a git ref. `cmd:<line>` is a command line for a `cli()` target (§9.6), run in the
+  folder strobe runs from, with nothing built (what `strobe run --base … --head …` writes); on any other
+  target it is a usage error.
 - A git ref becomes a detached worktree under `builds/`, never one of the user's worktrees, made
   from the bench file's repository (`git -C <project>`, wherever strobe runs from, the daemon
   included). A worktree kept from an earlier bench is reset to its ref first (`checkout --force`,
@@ -1643,8 +1687,8 @@ export default bench({
   is an Electron app by its profile in strobe.json `apps` (§13.2): `home` is a seed directory
   copied into a fresh isolated home for every block (`{param}` placeholders allowed; the seed
   must open with both variants, so create it with the base build). `exe(path, { app?, home? })`
-  (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)` and `script(entry,
-  opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, unset?, window? })` is a
+  (`app` borrows a profile) and `url(href)` also exist. `command(run, opts)`, `script(entry,
+  opts)` and `cli(run?, opts)` are below. `native(appIdOrPath, { home?, viewport?, args?, env?, unset?, window? })` is a
   native app (§13.7): `viewport` sizes the main window's client area in device-independent pixels
   where the app allows; `window: false` is an app with no window (a tray app).
   `webview(appIdOrPath, { home?, viewport?, gpuCache?, expect? })` is an app on the OS's webview
@@ -1895,6 +1939,65 @@ experiment's `script.log`.
   cover the whole process and name the harness's and the variant's own source files, so nothing
   needs a source map.
 
+**CLI targets** (`cli(run?, { env?, build?, side? })`): a command run to its exit, once per
+`ctx.exec(line?)` in a case's run (`run: (ctx) => ctx.exec()`), in the variant's folder, pinned like
+any target. The line is the call's own, else a `cmd:<line>` variant's, else the target's `run`;
+`{fixture.*}` is filled into all three and into `env` (§9.10). Unix runs one simple command as `sh -c
+"exec <line>"` (the command is the child, not a shell around it), and any other line as `sh -c
+"<line>"`: one with a variable assignment in front, `;`, `&`, `|`, a redirect, a subshell, a command
+substitution, a newline, or a shell keyword or builtin first. Windows starts the line's first word as
+the program (a `.cmd` or `.bat`, a word that is no executable, or arguments the program's command
+line cannot carry run under `cmd`). `ctx.exec` resolves with the exit code and output; a nonzero exit
+fails the run (`RunIncomplete`, with the last lines), as does a command that runs past the case's
+`timeout` (strobe ends it and what it started), a command that left processes running 100 ms after
+it exited (strobe ends them; what they did is not counted whole), and a run that ran no command.
+Left-running includes what left the command's group or job (a `setsid` daemon, a job breakaway):
+every command carries a stamp of its block (`STROBE_HOME`, `STROBE_OWNER`, §13.2) that strobe finds
+them by. Output goes to the experiment's `cli.log`.
+
+- **Measured from outside, whole command:** what the OS counted for the command and everything it
+  started (`host::spawn::Owned::run_to_exit`), summed over the run's commands:
+  - `run.duration`: spawn to exit, summed over the run's commands (not the runner's round trip).
+  - `cpu.work` (the default primary) and `cpu.app.total` (`cpu.work` over the commands' wall time).
+    Linux and macOS: `wait4`'s rusage of the child, which includes every descendant its tree waited
+    for (exact: the kernel's per-task runtime). Windows: the command's own process from its cycle
+    counter (exact; where cycles are not time, refused `NotOnThisOs` as for script targets, never
+    replaced by clock ticks), plus the processes it started from the job's clock-tick times (sampled
+    at the timer interrupt, 15.6 ms a tick). A run whose commands started any process (a shell around
+    the program, a `.cmd`, a child) gets `cpu.work` only when that part is 64 ticks (1 s) a run or
+    more, said once per experiment as a share of `cpu.work` (`TickSampledCpu`); below, `cpu.work` and
+    `cpu.app.total` are refused (`NotOnThisOs`: one tick more or less, or work under a tick that reads
+    0, is several percent of the run), and `run.duration` still compares. Without a job of its own
+    (strobe's own job refused a nested one) nothing counts the processes it started, so refused too.
+  - `cpu.wakes`: the command's context switches (voluntary and involuntary, rusage) per second of
+    its wall time. Refused on Windows (`NotOnThisOs`): a job counts no context switches, and an ended
+    process's are gone.
+  - `memory.peak`: the most memory one of its processes held at once (Linux and macOS `ru_maxrss`, a
+    resident set; Windows the job's `PeakProcessMemoryUsed`, a commit), the largest over the run.
+  - `io.read`, `io.write`: Linux the zombie's `/proc/<pid>/io` (`rchar`, `wchar`: its own and its
+    reaped children's, before strobe reaps it); Windows the job's transfer counts; macOS the process's
+    disk bytes (`ri_diskio_*`), refused (`NotOnThisOs`) for a command that started children, whose
+    disk bytes macOS keeps nowhere.
+  - `metric.<name>`: each `strobe:metric <name>=<value> [lower|higher]` line the command printed
+    (stdout or stderr, at a line's start), summed per run (unit `value`). The command's own number,
+    not strobe's: lower is better unless its lines say `higher` (a rate, a score), and the comparison
+    uses that direction. Every command of every measured run must print it, else `NoMetric` (a command
+    that printed none is not 0); lines, runs or base and head that disagree on its direction refuse it
+    `NoMetric`, as does a line strobe cannot read. Compared across implementations (`compared`).
+- **Not counted:** on Unix a process the command detached (a double fork) that ended before it,
+  which no one in its tree waited for; on Windows a process that broke away from the job. Counters
+  (`energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`) are refused (`NoCounter`): a command ends
+  inside the run. Nothing of strobe runs in the command: the runner and strobe's reader threads stay
+  on the other CPUs.
+- **No attribution blocks:** a command ends inside each run, so there is nothing to profile it with;
+  `--why` runs none, and `record --bench` of a cli case is a usage error. Profile a long-running
+  command with `record pid:<n> --probes deep`.
+- **Locked sessions:** a cli series needs no window and runs through a lock, as a script target does.
+- **`strobe run --base "<A>" --head "<B>"`** (§5.5) is a bench of a written file with one `cli()`
+  target whose variants are the two lines (`cmd:<line>`), one case `run` with primary `cpu.work`
+  (`--primary` picks another; `--metrics` declares more): pairs, looks, verdicts, the result and
+  `report` as any bench, and its rerun line is `strobe run …` again.
+
 **How it runs:**
 
 ```mermaid
@@ -2128,6 +2231,8 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 | `LiveChannel` | an app profile would launch the user's own running app, or a macOS app whose data lives in the user's Library (§13.2) |
 | `NoPhase`, `NoInput` | a declared `phase.<name>` no measured run entered; `input.*` with no drag in the runs (refuse that metric) |
 | `NoSpan` | a declared `span.<name>` no measured run's page measured, or a target with no page (§7.3) |
+| `NoMetric` | a declared `metric.<name>` that a measured run of a `cli()` target's command did not print (`strobe:metric <name>=<value>`): a run that printed none is not 0 (9.6) |
+| `NoWaits` | `query <rec> waits` on a capture without off-CPU waits: not asked for (`--probes waits`), macOS, Linux without CAP_PERFMON or tracefs, Windows without this build's deep helper (11.1) |
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
@@ -2306,6 +2411,7 @@ session.
 | `frames` | `--phase` | frame percentiles, dropped vsyncs, budget misses, worst frames with handles |
 | `threads` | `--phase` | busy share by thread and category, long tasks |
 | `hotspots` | `--by function\|file\|package\|category` `--phase` `--thread` `--native` | rows with self and total time, sample counts, intervals, handles; native samples (`deep`) in the same shape, with the share that resolved (a recording without a JavaScript profile shows them by default) |
+| `waits` | `--by function\|file\|package` `--thread` `--phase` | off-CPU waits of a native capture taken with `--probes waits` (attribution only, rule 3): per row (the innermost frame of the wait's stack outside the OS, the kernel and the language runtime), the time off CPU, waits, the longest, the part waiting and the part runnable (preempted, or woken and queued for a CPU), who woke them (a thread with the frame it woke them from, or an interrupt: a timer or a device) and the heaviest full stack; the header gives the threads, waits, totals and the share with a known waker. `--phase` clips each wait to the phase's spans. A capture without waits refuses (`NoWaits`, saying why) |
 | `alloc` | `--by function\|file\|package` | bytes allocated per row from sampled allocations (collected objects included), with complete locations and the three heaviest full stacks per function |
 | `layout` | | forced (synchronous) layouts and style recalculations by the JavaScript call site that forced them, with full stacks; per-run counts and time, forced and in the frame lifecycle |
 | `shifts` | | the five largest layout shifts of an attribution block (a series declaring `layout.shift`): score, run, time into it, and the elements that moved with their rects before and after |
@@ -2346,6 +2452,58 @@ are read longest first, so nesting counts the outer one. `frames`, `threads` and
 perturbed (§1 rule 3) and that one recording per side has no interval. `threads` of a trace counts
 the task loop's tasks (`RunTask`) that started in each measured run, by process type and thread
 name: a thread's other tracks hold spans that overlap its tasks (animation frames, GC sweeping).
+
+**Off-CPU waits** (`waits`): what a blocked thread waited on and who woke it, from the scheduler's own
+events, never timing (rule 3): only a native capture that asks (`record pid:<n> --probes waits`, a
+native app's `record --probes waits`, `bench --why always --probes waits` for its native attribution
+blocks) takes them, and its timing is perturbed as every attribution recording's. Each wait runs
+from a thread's switch-out to its next switch-in, with the task state it left in (`blocked`, `io`
+for an uninterruptible wait, `preempted`), the stack it waited at, and the last wake-up of that
+thread inside it (`ready_ns`, the waker's thread and stack, or an interrupt). Stored in the
+recording's `deep.json.gz` beside the samples (`waits`, or `waits_refused` with the typed reason),
+symbolized as native samples are (`waits-symbols.json.gz`). In a bench's native attribution blocks
+the waits are clipped to the measured runs (a launch's to the launch until ready), as the samples
+are. Waits asked for and not taken refuse the recording at once (`NoWaits`, exit 4, with why), not
+at its first `query`; `--probes waits` on a target that is no native capture (a page, a script) is
+a usage error. The events the OS dropped are counted in the waits (`events_lost`) and `query waits`
+says so.
+
+- **Linux:** per thread of the target (followed every 50 ms, as the sampler follows them), the
+  `sched:sched_switch` tracepoint, which fires in the thread leaving its CPU, sampled with its user
+  registers, 16 KB of its user stack (unwound with DWARF, as samples are) and its raw `prev_state`, and
+  the same event's context-switch records, whose switch-ins end each wait; per CPU, `sched:sched_waking`
+  filtered on the followed threads (`pid == …`), sampled in whoever wakes one, its common flags
+  telling an interrupt (hard or soft IRQ, or the idle task) from a thread. Event ids and field
+  offsets come from tracefs. Raw tracepoint samples need CAP_PERFMON or root (or
+  `perf_event_paranoid` -1): without, `NoWaits` names the setcap (`cap_perfmon,cap_ipc_lock`). One
+  ring per thread and per CPU: strobe raises its open-file limit to the hard limit first, and a ring
+  the perf mlock budget refuses (no CAP_IPC_LOCK) is tried smaller (64, 16, then 4 pages). `prev_state`
+  is read as `TASK_REPORT`'s bits (masked to 8): a thread leaving in `X` or `Z` is ending and opens no
+  wait. Lost ring records are counted and said; a thread whose ring lost records drops the wait it
+  had open (its switch-in may be among them, and a later one would make a phantom).
+- **Windows:** the helper's kernel session (§13.4) with thread events (tid to process), `CSwitch`
+  and `ReadyThread`, each with a stack walk: a wait ends at the CSwitch that switches its thread back
+  in, whose stack walk is that thread's (where it waited); its waker is the last ReadyThread of it
+  inside the wait, whose stack walk is the readying thread's (pid 0, the idle process: an interrupt
+  or DPC). The wait reason names the state (`UserRequest`, `WrAlertByThreadId`, page-in reasons as
+  `io`; Ready, Standby and DeferredReady as `preempted`). A real-time session delivers each CPU's
+  buffers on their own, so events from two CPUs arrive out of order: thread starts and ends,
+  CSwitch and ReadyThread records are kept and sorted by time when the session stops, then paired. A
+  thread switched out as Terminated (state 4) opens no wait, and a thread's end (thread end or its
+  rundown, opcodes 2 and 4) drops what it had open. A stack walk is a profile sample only when it
+  follows a SampledProfile (opcode 46) of the same thread and time on its CPU (or completes one), so
+  stack walks of switches and wake-ups are never samples. Without the helper,
+  or with another build's (whose operations may differ), stacks come from strobe's own sampler and
+  waits are refused `NoWaits` (`strobe up` installs this build's helper).
+- **macOS:** refused (`NoWaits`): context switches and wake-ups of another process need kdebug
+  tracing, which needs root.
+- **Calibrated** on vps (a planted binary: a holder thread locks a mutex and sleeps 200 ms, a waiter
+  blocks on the mutex; 5 s, `record pid: --probes waits`): every 200 ms mutex wait was recovered at
+  200.1–204.3 ms against the waiter's own 197.7–202.7 ms (each within 1%), each woken by the holder
+  at the line that drops the guard; the holder's 200 ms sleeps woken by an interrupt; 0 events lost.
+- **Cost** (vps, 2 vCPU VM, a ping-pong between two threads at about 600,000 context switches a
+  second): 33.7 ms per 5,000 round trips alone, 98 ms under `--probes deep`, 241 ms under `--probes
+  waits` (about 7 µs more per switch than `deep`): why waits are a probe of their own, asked for.
 
 ### 11.2 Report views
 
@@ -3588,8 +3746,11 @@ recordings/rec_3f9a1c/
   cpu-<n>.cpuprofile.gz
   heap/<process>-<n>.heapsnapshot.gz
   census-<n>.json
-  deep.json.gz          native samples from the helper (modules, unique stacks, samples), symbolized on read
+  deep.json.gz          native samples from the helper (modules, unique stacks, samples), symbolized on read;
+                        with --probes waits also the off-CPU waits (`waits`: each wait's thread, span, kind,
+                        reason, stack and waker, their modules, events lost) or why there are none (`waits_refused`)
   deep-symbols.json.gz  their symbols, cached on first read
+  waits-symbols.json.gz the waits' symbols (their own modules and stacks), cached on first `query <rec> waits`
   presents.json.gz      OS present events: every present (start, screen time or discarded) and vertical blank
   runs.json             native apps: per measured run, wall and CPU time, wakes, IO, counts, accessibility elements
   frames.json           native apps: the app's pids, and per measured run its span, strobe's inputs, phase marks and accessibility change times
@@ -3744,6 +3905,10 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 - The MCP token and `strobe open`'s session tokens come from the OS's secure random source
   (`host::paths::csprng_hex`); the token file and each session file (the key to its trace)
   are 0600, in folders only the user can enter, on Unix.
+- The descriptions say what each tool's newer inputs take, as the CLI does: `record`'s and
+  `bench`'s `probes` name `waits` (native captures; `NoWaits`, exit 4, where they cannot be taken),
+  `bench`'s `base` and `head` name `cmd:<line>`, and `query`'s `view` names `waits` with its `by`,
+  `thread` and `phase`.
 - Output rules for agents: verdict first; handles instead of payloads; top-K and `max_bytes`
   (head and tail kept); provenance inline; a refusal names the validator and the fix.
 
@@ -3768,6 +3933,8 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | timing probe overhead | ≤ 1% main-thread time (fails at 2%, §8.2) |
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block; Linux on vps 0.16–0.22%) |
 | counters (§7.5) | macOS: one `proc_pid_rusage` per process at each end of a run, nothing in the target; Linux perf events: per context switch in the target (4.4 µs in a VM), so they open only in counter blocks, never in a timing block |
+| off-CPU waits (`--probes waits`, attribution only, §11.1) | none in timing blocks: per context switch in the target (Linux about 7 µs on top of `deep` in a VM), so only a capture that asks takes them |
+| `cli()` targets (§9.6) | nothing in the command; per command run strobe spawns it, reads its output on two threads and, after its exit, the OS's accounting (Linux also scans `/proc` for its process group), on strobe's CPUs |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
 
@@ -3794,7 +3961,7 @@ read 40–80% (script) and 7% (native): strobe's own between-run reads, never in
     linux-x64 and linux-arm64 (Linux builds are static musl binaries, for glibc and musl alike).
     `STROBE_BINARY` points it at another build. `strobe up` still copies the binary to the per-user
     install folder (§5.3), so the daemon never runs from a project's `node_modules`.
-  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `native`, `webview` and the types of bench
+  - **The SDK:** `bench`, `web`, `url`, `app`, `exe`, `command`, `script`, `cli`, `native`, `webview` and the types of bench
     files (§9.6), built from `sdk/bench` (`dist/index.js`, `dist/index.d.ts`). strobe embeds the
     SDK, the runner and the script host and rewrites a bench file's `@hona/strobe` import (or the old
     `@hona/strobe-bench`) to its own copy, so a bench file runs with the SDK of the binary running it,
@@ -4599,6 +4766,43 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `headless`; `result.v1.json` has `outcome`, `blocksPrimary`, `headless` and `overhead` (every
   local result.json since `verdict_kind` validates: 198 on adais, 183 on air). Page and script blocks
   refuse a declared `phase.<name>` no measured run entered (`NoPhase`), as native blocks did.
+- New measurements, W4-G2 (2026-11-06):
+  - `strobe run --base "<A>" --head "<B>"` and `cli()` targets (§5.5, §9.6), with `cmd:<line>`
+    variants and the `metric.<name>` family (`NoMetric`). `host::spawn::Owned::run_to_exit` reads what
+    the OS counted for a command and what it started (Unix: the zombie, then `wait4`; Windows: the
+    job). Checked: vps (A/B and the A/A runs in §5.5; `--check` of a loop printing a metric) and adais
+    (`--check` of `bun -e` printing a metric on a locked session: `cpu.work` 154 ms, the metric read,
+    `cpu.wakes` refused `NotOnThisOs`). Not checked: an A/A on Windows or macOS (adais takes no timed
+    runs from builders; air was on battery), and Windows' tick-sampled part for a command that starts
+    children. After review: `metric.<name>` lines carry a direction (`lower`, `higher`) that the
+    comparison uses, refused `NoMetric` when lines, runs or sides disagree, and every command of a
+    run must print a metric it declares; Unix runs only a simple command under `exec` and anything
+    else as a shell line; the case's `timeout` ends a command and what it started (`RunIncomplete`);
+    Windows refuses `cpu.work` where cycles are not time and where the clock-tick part of a run is
+    under 64 ticks, with no fallback to the job's tick times (`TickSampledCpu` warns above);
+    leftovers skip zombies, wait 100 ms, and include what left the group or job (the block's
+    `STROBE_HOME` stamp); `record --bench` of a cli case is a usage error; `cli()` takes `side` and
+    `{fixture.*}` on its variant's own target.
+  - `frames.renderer.p95` and `frames.viz.p95` from the frame reports' stages (§7.2), and the worst
+    frames' stages in `query frames`; checked on stored adais lean recordings (a live page needs an
+    unlocked session). After review: stage-honest names (they were `frames.cpu.*`, `frames.gpu.*`),
+    no CPU- or GPU-bound share, the latch stages out of either side, the display-tree stage names
+    added, and a block splits only when 95% of its presented frames carry stages.
+  - `query <rec> waits` from `--probes waits` (§8.1, §11.1, `NoWaits`): calibrated on vps (Linux).
+    The Windows path (the helper's CSwitch and ReadyThread with stack walks) builds and its degrade
+    without the helper, or with another build's, refuses `NoWaits`; its capture is not yet run: it
+    needs `strobe up` (one UAC prompt) on an unlocked Windows session to install this build's helper.
+    After review: Windows records are sorted by time before pairing (real-time ETW delivers CPUs'
+    buffers out of order), stack walks are matched to SampledProfile explicitly, Terminated
+    switch-outs and ended threads open nothing, and lost events are said in the waits; Linux raises
+    its fd limit, shrinks rings without CAP_IPC_LOCK, opens no wait for `X`/`Z`, and drops a thread's
+    open wait when its ring lost records; waits are clipped to measured spans, `record --bench`
+    forwards `--probes`, and a capture that asked for waits and got none refuses `NoWaits` at record
+    time.
+  - Not built here: Perfetto tracks and flow arrows for waits (`perfetto.rs`: a waker → wakee arrow per
+    wait, a track of each thread's off-CPU stretches) and present-side GPU timing (`probe/present/*`:
+    per-frame GPU busy from the OS's GPU queue events, so `frames.viz.*` gets a busy-time sibling for
+    native apps); both belong with the present and Perfetto owners.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

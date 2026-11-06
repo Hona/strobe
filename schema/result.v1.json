@@ -42,7 +42,7 @@
           "spec": { "type": "string" },
           "label": { "type": "string" },
           "subject": {},
-          "kind": { "enum": ["dir", "git", "url", "app", "exe"] },
+          "kind": { "enum": ["dir", "git", "url", "app", "exe", "cmd"] },
           "commit": { "type": ["string", "null"] },
           "dirty": {},
           "process_set": {
@@ -160,7 +160,9 @@
         "NotComparable",
         "ParityGap",
         "InputMismatch",
-        "Headless"
+        "Headless",
+        "NoMetric",
+        "NoWaits"
       ]
     },
     "verdictKind": {
@@ -324,7 +326,8 @@
               "refused": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Metrics the block refused: \"<validator>: <why>\"." },
               "recording": { "type": ["string", "null"] },
               "locked": { "type": "boolean" },
-              "overhead": { "$ref": "#/definitions/overhead" }
+              "overhead": { "$ref": "#/definitions/overhead" },
+              "directions": { "type": "object", "additionalProperties": { "enum": ["lower", "higher"] }, "description": "cli() targets: the direction each metric.<name> is better in, as the command's lines said." }
             }
           }
         },

@@ -23,13 +23,14 @@ strobe status [--calibrate]
 strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
 strobe record https://… --engine firefox [--headless] [--for 10s]
 strobe record --bench <file.bench.ts>#<case> [--head <variant>]
-strobe record pid:<n>|proc:<name> [--probes timing|deep] [--for 10s]
+strobe record pid:<n>|proc:<name> [--probes timing|deep|waits] [--for 10s]
 strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
 ```
 
 - `--bench`: a bench case (clicks, keys) under the attribution probes.
 - `pid:<n>|proc:<name>`: any running process from outside: frames from the OS's present events, CPU, threads, IO, GPU, memory.
   - `deep`: native stacks (kernel sampled profile, PDB symbols).
+  - `waits`: `deep` plus off-CPU waits (`query <rec> waits`); costs the target at every context switch.
 - `--until-line`: a native app from the line it prints when ready (to the next line), not a fixed settle.
 - `--engine firefox`: the page in Firefox, from outside: CPU, GPU, memory, DOM nodes, and headed the OS's frames.
 
@@ -67,9 +68,19 @@ strobe plan <file.bench.ts> [--base <v>] [--head <v>] [--filter …] [--effect 3
 
 ```text
 strobe run [--pin auto] [--reserve-cpus on|off] -- <command>
+strobe run --base "<command>" --head "<command>" [--aa | --check] [--primary cpu.work]
+    [--metrics metric.<name>,…] [--pairs auto|N] [--runs 5] [--noworse 2%] [--require-verdict]
 ```
 
-- Your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs.
+- `-- <command>`: your own harness as a bench block runs: the bench slot, the fastest plan, pinned, others kept off its CPUs.
+- `--base … --head …`: a paired A/B of two commands, a full bench (verdict, `report`, PR block).
+  - Each run starts the command and waits for its exit, measured from outside with what it starts.
+  - `cpu.work` (primary), `run.duration`, `cpu.wakes` (not Windows), `memory.peak`, `io.read`, `io.write`.
+  - A line `strobe:metric <name>=<value>` it prints adds to `metric.<name>` (lower is better; end the line with `higher` for a rate or score).
+  - Declare one with `--metrics metric.parse_ms` to test it; every command of every run must print it, in one direction (`NoMetric`).
+  - A simple command runs under `exec`; pipes, `;`, `&&`, redirects or `VAR=x cmd` run as a shell line.
+  - Past the case's timeout, or leaving a process running (a daemon, a background job), fails the run (`RunIncomplete`).
+  - `--aa --head "<command>"` checks the method; `--check --head` runs it once.
 
 ### `strobe query`
 
@@ -77,8 +88,11 @@ strobe run [--pin auto] [--reserve-cpus on|off] -- <command>
 strobe query <rec_… | a..b | exp_…> <view> [args]
 ```
 
-- Views: `summary` `frames` `threads` `gpu` `hotspots` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `sql`.
+- Views: `summary` `frames` `threads` `gpu` `hotspots` `waits` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `sql`.
 - `hotspots` and `alloc` take `--by function|file|package` (`hotspots`: `--native`, `--thread <name>` for native samples).
+- `waits --thread <name> --phase <name> --by function|package`: where threads were off their CPUs and who woke them.
+  - From a capture with `--probes waits` (Linux needs CAP_PERFMON; Windows the deep helper; macOS refuses `NoWaits` when it records).
+- `frames` (pages): the renderer vs GPU process stage split and each worst frame's pipeline stages.
 - `memory` takes `--by process|layer|allocator` and `--at <i>`.
 - `a..b` (two recordings, per run each) works with `hotspots` `alloc` `layout` `style` `threads` `frames` `summary` `heap` `memory`.
 - `exp_…` takes `summary`, `progress`, `insights`, and those views for each series' base..head.
@@ -198,6 +212,7 @@ strobe update [<version>] [--from <path>] [--check]
 - `attribution`: CPU stacks, allocations, forced layouts, GC, a heap snapshot; its times are perturbed
 - `memory`: three heap snapshots for leaks, no trace
 - `deep`: native stacks of a process tree, Windows; perturbed
+- `waits`: `deep` plus off-CPU waits with who woke each thread (`record pid:`, a native app's `record`, `bench --why always --probes waits`); heavier, at every context switch
 
 ### Windows: present events and native stacks
 
@@ -292,6 +307,9 @@ export default bench({
 - `command("bun run dev:desktop", { cwd, env: { X: "{home}" }, unset: ["APP_*"] })`: an app started by a dev command, attached where it prints `DevTools listening on ws://…`.
   - `before(ctx)` deletes caches for a cold start.
 - `script("src/parse.ts")`: a Bun or Node module per block; cases `await ctx.call("parse", input)`, primary `cpu.work`.
+- `cli("./target/release/tool input.txt")`: a command run to its exit per `ctx.exec()` (`run: (ctx) => ctx.exec()`) in the variant's folder, measured from outside.
+  - `cpu.work`, `run.duration`, `cpu.wakes`, `memory.peak`, `io.*`, `metric.<name>` from its `strobe:metric` lines; a nonzero exit fails the run.
+  - No attribution blocks (the command ends inside each run).
 - `params: { files: { run: [100, 10_000], more: [1, 1_000] } }`: `more` only with `--params all`.
 - `targets: ["web"]` on a case limits where it runs.
 - Source maps without changing what ships: strobe builds with `STROBE_SOURCEMAP=hidden`; let the bundler read it (Vite: `build: { sourcemap: process.env.STROBE_SOURCEMAP }`).
@@ -413,6 +431,7 @@ export default bench({
 - A declared metric gets a value or a typed refusal:
   - `NotOnThisOs`: the OS cannot read it (macOS: `gpu.vram`, `gpu.shared`, `memory.app.host`, `ui.wakes`; a GPU whose per-process statistics did not open or left a process unread; Windows where cycle times are not time, as on Arm before 11 24H2 (core clock cycles) or CPUs that disagree: every metric made of cycles, `cpu.work`, `cpu.app.total`, `cpu.process.total`, `ui.cpu`, `cpu.renderer`, `cpu.gpu`, `cpu.browser`, `cpu.foreign`, `cpu.foreign.max`; `strobe status` prints the cycle clock on its `cycles` line, checked once per boot and cached).
   - `NotForTarget`: the target or case has none (a run's metric on a launch case, `ui.*` without a window).
+  - `NoMetric`: a declared `metric.<name>` a run's command did not print; `NoWaits`: `query waits` on a capture without waits, saying why.
 - A native app that exits is refused `RunIncomplete` with its exit code and, with `output: true` on the target, its last output lines.
 - `strobe <command> --help` lists that command's flags.
 - `strobe config` checks the project's strobe.json and every app profile on this OS without a bench, read-only.
@@ -438,6 +457,9 @@ export default bench({
 - A WebGPU canvas's own frames, at its own frame rate: `canvas.frames`, `canvas.interval.p95`.
   - A 60 fps game or a 30 fps animation on a faster display; presented frames count the display's vsyncs instead.
 - Where the CPU goes by process: `cpu.renderer`, `cpu.gpu`, `cpu.browser`.
+- Where a page's frame time goes: `frames.renderer.p95` (renderer stages: main and compositor threads), `frames.viz.p95` (GPU process stages: raster and the display compositor's draw and swap).
+  - Pipeline stage spans (queueing included), not busy time, so neither says CPU- or GPU-bound; the waits for the display are in neither.
+  - Refused (`NoPresentSource`) when under 95% of the presented frames carry stages.
 - Shader and pipeline work in the GPU process: `gpu.compile`.
 
 ### Primary metric
@@ -497,6 +519,11 @@ Fewer than 6 pairs never gets a verdict.
 - **Where is the memory?** `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting).
   - A native app or process: what holds it (host heap, GPU memory mapped in, unmapped commit, shared, files, images; `--by layer` for totals) with `gpu.vram` beside it.
   - On Windows, `memory.app.private` also counts the VRAM a GPU driver maps into the process: quote `memory.app.host` for the app's own memory.
+- **Is this command faster than that one?** `run --base "<old command>" --head "<new command>"` (a build flag, a binary, an input).
+  - Print `strobe:metric <name>=<value>` from the program for its own stages; `--metrics metric.<name>` tests one.
+- **What is a thread waiting on (a lock, IO, a timer), and who wakes it?** `record pid:<n> --probes waits --for 10s` (or `record app:<id> --probes waits`), then `query <rec> waits --thread <name>`.
+  - Rows by where it waited (its first frame outside the OS and runtime), with the waker's thread and frame, or an interrupt.
+- **Is a slow page frame in the renderer or the GPU process?** `frames.renderer.p95` vs `frames.viz.p95`, and `query <rec> frames` (each worst frame's stages).
 - **Which commit moved it?** `bench <file> --filter <case> --bisect <good>..<bad>` (one series; each step is a full experiment).
 - **Did anything regress since last week?** `track <file> --range <old>..<branch> --every 3` (or a `--schedule` on the branch), then `history <file>` or `query changes`.
   - A `confirmed` change has a paired verdict and a culprit; `suspected`, `unclear` and `rejected` are not findings.

@@ -403,7 +403,7 @@ fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
             .filter(|(_, (ms, _, _))| *ms > 0.0)
             .map(|(pid, (ms, modules, exe))| {
                 let program = exe.or_else(|| modules.into_iter().max_by_key(|(m, n)| (*n, std::cmp::Reverse(m.clone()))).map(|(m, _)| m));
-                json!({ "name": program.map(|p| format!("{p} · {pid}")).unwrap_or_else(|| format!("pid {pid}")), "ms": ms })
+                json!({ "name": program.unwrap_or_else(|| format!("pid {pid}")), "pid": pid, "ms": ms })
             })
             .collect();
         procs.sort_by(|a, b| b["ms"].as_f64().unwrap_or(0.0).total_cmp(&a["ms"].as_f64().unwrap_or(0.0)));

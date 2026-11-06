@@ -4724,8 +4724,13 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   The bench writes `scoreboard`, `p_repeated` and `holm_decided` (`family::Board::write`, also the
   text output's `family` line) and runs a primary decided better or worse on to
   `family_min_pairs(journeys)`; reports read a result without them by computing the family from its
-  blocks. Not built yet: `equivalence` (phase 2), per-side attribution (phase 4), so Where each
-  spends its time and the thumbnails show only once those exist. Every
+  blocks. Per-side attribution (phase 4) is built: checked on air with OpenCode Electron (a perf
+  build) against OpenCode (Rune) on one fixture, idle journey, `--why always`, 3 pairs (a smoke
+  run): each side got its own block, 100% of the Electron side's script samples source-mapped and
+  100% of the Rune side's native samples symbolized; `query` of the two recordings and of the
+  experiment refused `NotComparable` (exit 2); the report drew both columns. The profiled Electron
+  launch spent 548 ms of CPU per 5 s run against 5.80 ms in its timed blocks (Rune: 3.80 against
+  3.34 ms), which is why totals and a browser's processes come from the timed pairs. Every
   card's pair strip is now on a log-ratio scale (it was `(head − base) / base`, which drew −80% four
   times closer to no change than +400%); builds-mode PR blocks are unchanged (55 stored experiments
   matched byte for byte, the version line aside); 2 of their 55 cards moved their dots. A note's

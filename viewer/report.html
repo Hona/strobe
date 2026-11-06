@@ -2502,7 +2502,7 @@ function renderImplAttribution(r, s, nameOf) {
   }
   const pos = (x) => finite(x?.ms) && x.ms > 0;
   const lists = {
-    processes: (role) => (sd(role)?.processes || []).filter(pos),
+    processes: (role) => (sd(role)?.processes || []).filter(pos).map((p) => ({ ...p, title: p.pid ? `${p.name} · pid ${p.pid}` : p.name })),
     origins: (role) => (sd(role)?.origins || []).filter(pos),
     threads: (role) => (att(role)?.threads?.threads || []).map((t) => ({ name: t.name || "(unnamed)", ms: t.cpu_ms_per_run, title: [t.module, t.origin].filter(Boolean).join(" · ") })).filter(pos).sort((a, b) => b.ms - a.ms).slice(0, 10),
     functions: (role) => (sd(role)?.functions || []).map((f) => ({ name: f.name, ms: f.ms, title: f.where })).filter(pos).slice(0, 10),

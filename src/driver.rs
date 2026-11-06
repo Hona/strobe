@@ -869,18 +869,12 @@ impl Driver {
         let down: Vec<Value> = mod_keys(press).into_iter().map(|k| key_action(k, true)).collect::<Result<_>>()?;
         let up: Vec<Value> = mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<_>>()?;
         let list = |actions: Vec<Value>| json!([{ "type": "key", "id": "keyboard", "actions": actions }]);
-        // Safari sometimes drops a key that comes in the same action list as the Shift its window has not
-        // taken yet ("hello orld!" once in three cold runs): there the modifiers go down in a list of their
-        // own, and the key's input time is taken again right before it.
-        if self.page.shift_takes_base_key() && !down.is_empty() {
-            self.page.actions(list(down))?;
-            if let Some(last) = self.inputs.borrow_mut().last_mut() {
-                last.0 = crate::host::now_ns();
-            }
-            self.page.actions(list(vec![key_action(key, true)?, key_action(key, false)?]))?;
-            return self.page.actions(list(up));
-        }
         let mut actions = down;
+        // Safari sometimes dropped a key that came right after the Shift in its list ("hello orld!" in
+        // some cold runs; Shift released in a list of its own stayed held): one frame's pause between them.
+        if self.page.shift_takes_base_key() && !actions.is_empty() {
+            actions.push(json!({ "type": "pause", "duration": 16 }));
+        }
         actions.push(key_action(key, true)?);
         actions.push(key_action(key, false)?);
         actions.extend(up);

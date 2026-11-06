@@ -2307,14 +2307,16 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // `--probes timing`) skips them.
     let mut recordings = json!({});
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
-    let profiled = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) == WebEngine::Chromium;
+    // Each side is profiled with its own engine's tools: an implementation comparison's two may differ,
+    // and a side strobe has no profiler for gets no block while the other still gets its own.
+    let side_targets: Vec<Value> = variants.iter().map(|v| ctx.describe["targets"][v.target_of(s)].clone()).collect();
+    let unprofiled: Vec<(usize, String)> = side_targets.iter().enumerate().filter_map(|(i, t)| Some((i, no_profiler(t)?))).collect();
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
         // A command ends inside each run: there is nothing to profile it with.
-        _ if target["kind"] == "cli" => false,
-        // Profilers are Chromium's DevTools: another engine's page gets none yet.
-        "always" | "auto" if !profiled => {
-            progress(format!("  no attribution blocks: {} pages have no profilers in strobe yet", engine_of(&target)));
+        _ if side_targets.iter().all(|t| t["kind"] == "cli") => false,
+        "always" | "auto" if unprofiled.len() == variants.len() => {
+            progress(format!("  no attribution blocks: {}", unprofiled[0].1));
             false
         }
         "always" => true,
@@ -2326,8 +2328,18 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         progress("  no attribution blocks: nothing to explain (--why always runs them anyway)");
     }
     if why {
-        progress(format!("  attribution blocks ({}; not timed)", why_text(&target)));
-        for v in variants.iter() {
+        if !ctx.implementations {
+            progress(format!("  attribution blocks ({}; not timed)", why_text(&target)));
+        }
+        for (i, v) in variants.iter().enumerate() {
+            if let Some((_, no)) = unprofiled.iter().find(|u| u.0 == i) {
+                progress(format!("  no attribution block for {}: {no}", v.name));
+                warnings.push(validity::info("Attribution", format!("{}: no attribution block: {no}", v.name)));
+                continue;
+            }
+            if ctx.implementations {
+                progress(format!("  {} attribution block ({}; not timed)", v.name, why_text(&side_targets[i])));
+            }
             // A launch's attribution is a launch of its own, profiled from the first statement.
             let attributed = if s.launch.is_object() {
                 in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| as_side(ctx, s, v, |ctx, s| launch::attribution(ctx, s, v)))
@@ -2342,9 +2354,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     {
                         progress(format!("  {} {line}", b.variant));
                     }
-                    // `Unresolved` (SPEC §10.2): script samples the stored source maps could not name.
-                    // A script target's profile names its own source files: nothing to map.
-                    let script = ctx.describe["targets"][&s.target]["kind"] == "script";
+                    // `Unresolved` (SPEC §10.2): script samples the stored source maps could not name,
+                    // native samples no symbols named. A script target's profile names its own source
+                    // files: nothing to map.
+                    let who = if ctx.implementations { v.name.as_str() } else { v.role };
+                    let script = side_targets[i]["kind"] == "script";
                     let hot = b.recording.as_deref().filter(|_| !script).and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
                         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
@@ -2352,16 +2366,27 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                             warnings.push(validity::warn(
                                 "Unresolved",
                                 format!(
-                                    "{}: {:.0}% of script samples have no source map, so their names and files stay minified; strobe builds with STROBE_SOURCEMAP=hidden: let the bundler read it (Vite: build: {{ sourcemap: process.env.STROBE_SOURCEMAP }}), which ships the same scripts",
-                                    v.role,
+                                    "{who}: {:.0}% of script samples have no source map, so their names and files stay minified; strobe builds with STROBE_SOURCEMAP=hidden: let the bundler read it (Vite: build: {{ sourcemap: process.env.STROBE_SOURCEMAP }}), which ships the same scripts",
                                     100.0 * (1.0 - mapped / scripts)
+                                ),
+                            ));
+                        }
+                        let resolved = h["resolved_share"].as_f64().filter(|_| h["native"] == true && h["samples"].as_u64().unwrap_or(0) > 0);
+                        if let Some(share) = resolved.filter(|r| *r < 0.95) {
+                            let missing: Vec<String> = h["unsymbolized"].as_array().into_iter().flatten().take(3).map(|m| m["module"].as_str().unwrap_or("").to_string()).collect();
+                            warnings.push(validity::warn(
+                                "Unresolved",
+                                format!(
+                                    "{who}: {:.0}% of native samples have no symbol ({}), so their time names no function; build the app with symbols (a PDB beside it, a dSYM or DWARF)",
+                                    100.0 * (1.0 - share),
+                                    if missing.is_empty() { "modules without symbols".to_string() } else { missing.join(", ") }
                                 ),
                             ));
                         }
                     }
                     recordings[v.role] = json!(b.recording);
                 }
-                Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", v.role, e.message))),
+                Err(e) => warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", if ctx.implementations { v.name.as_str() } else { v.role }, e.message))),
             }
         }
     }
@@ -2536,6 +2561,16 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
     };
     let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
     (def.min_n > 1 && least < def.min_n).then(|| Refusal::new(ValidatorId::TailTooShort, format!("{least} {what} < {}", def.min_n)))
+}
+
+/// Why strobe has no attribution block for this target: a command ends inside each run, and only
+/// Chromium's DevTools profile a page yet. None when its own engine's tools profile it.
+fn no_profiler(target: &Value) -> Option<String> {
+    match target["kind"].as_str() {
+        Some("cli") => Some("a command ends inside each run: there is nothing to profile it with".into()),
+        Some("web" | "url") if engine_of(target) != WebEngine::Chromium => Some(format!("{} pages have no profilers in strobe yet", engine_of(target))),
+        _ => None,
+    }
 }
 
 /// What an attribution block records for this target.
@@ -6221,7 +6256,19 @@ fn render(r: &Value) -> String {
             }
         }
         let attr = &s["attribution"];
-        if attr.get("base").is_some() || attr.get("head").is_some() {
+        if sides && (attr["base"].is_string() || attr["head"].is_string()) {
+            // Each implementation on its own, with its own kind's view: two share no code to diff.
+            let kinds = &s["target_kinds"];
+            let line = |role: &str, name: &str| attr[role].as_str().map(|rec| format!("       {name}: strobe query {rec} {}\n", why_view(&kinds[role])));
+            out += &format!(
+                "\nwhy    attribution blocks, each on its own: {bn} {} · {hn} {}\n{}{}       strobe report experiment {} --open (both side by side)\n",
+                attr["base"].as_str().unwrap_or("—"),
+                attr["head"].as_str().unwrap_or("—"),
+                line("base", bn).unwrap_or_default(),
+                line("head", hn).unwrap_or_default(),
+                r["id"].as_str().unwrap_or("")
+            );
+        } else if attr.get("base").is_some() || attr.get("head").is_some() {
             out += &format!(
                 "\nwhy    attribution blocks: base {} · head {}\n       strobe query {} {}\n",
                 attr["base"].as_str().unwrap_or("—"),

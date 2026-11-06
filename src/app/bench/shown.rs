@@ -523,10 +523,16 @@ fn side(blocks: &[&Shown]) -> Value {
     }
     counts.sort_by_key(|c| std::cmp::Reverse(c.1));
     let first = blocks.first().map(|b| &b.end);
-    let thumb = first.and_then(|f| f.thumb.as_deref()).and_then(|p| std::fs::read(p).ok()).map(|b| {
-        use base64::Engine;
-        format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(b))
-    });
+    let data_url = |s: Option<&Screen>| {
+        s.and_then(|f| f.thumb.as_deref()).and_then(|p| std::fs::read(p).ok()).map(|b| {
+            use base64::Engine;
+            format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(b))
+        })
+    };
+    let thumb_end = data_url(first);
+    // The first block's screens before its warmup and after its runs, for a side-by-side look at both
+    // implementations (SPEC §11.2); a launch has no start.
+    let thumb_start = data_url(blocks.first().map(|b| &b.start));
     // Pixels that moved far from the first block's, where no text tells the screens apart.
     let far = blocks.iter().filter(|b| matches!((first.and_then(Screen::bits), b.end.bits()), (Some(a), Some(x)) if (a ^ x).count_ones() >= DIFFERENT_BITS)).count();
     json!({
@@ -536,7 +542,8 @@ fn side(blocks: &[&Shown]) -> Value {
         "others": counts.iter().skip(1).map(|(l, n)| json!({ "label": l, "blocks": n })).collect::<Vec<_>>(),
         "looked_apart": far,
         "hash": first.and_then(|f| f.hash.clone()),
-        "thumb": thumb,
+        "thumb_start": thumb_start,
+        "thumb_end": thumb_end,
         "thumb_path": first.and_then(|f| f.thumb.clone()),
         "missing": first.map(|f| f.missing.clone()).unwrap_or_default(),
     })

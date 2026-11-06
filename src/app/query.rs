@@ -16,7 +16,7 @@ use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub use diff::{ATTRIBUTION_PARTS, diff_tree, series_insights};
+pub use diff::{ATTRIBUTION_PARTS, diff_tree, series_insights, side_tree};
 pub use rec::{Part, Rec, Stacks, Weight};
 
 pub fn run(args: &Args) -> Result<Output> {
@@ -521,7 +521,7 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
 }
 
 /// A native recording's memory by what holds it (`memory.json`): one reading (`--at`, default the last).
-fn native_memory(dir: &Path, meta: &Value, by: &str, top: usize, at: Option<&str>) -> Result<Output> {
+pub fn native_memory(dir: &Path, meta: &Value, by: &str, top: usize, at: Option<&str>) -> Result<Output> {
     let (r, label) = reading_at(dir, at)?;
     let (text, json) = crate::probe::memory::view(&r, &label, if by == "process" { "process" } else { "layer" }, top, &meta["values"]);
     Ok(Output::new(text, json))
@@ -1156,6 +1156,7 @@ pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>,
     let facts = &n.facts;
     let mut out = rank(&n.stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
     out.json["native"] = json!(true);
+    out.json["untimed"] = json!(n.untimed);
     out.json["interval_us"] = json!(n.interval_us);
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     out.json["resolved_samples"] = facts["resolved_samples"].clone();

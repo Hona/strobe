@@ -19,7 +19,31 @@ pub const VIEWS: [&str; 9] = ["hotspots", "alloc", "layout", "style", "threads",
 pub const ATTRIBUTION_PARTS: [Part; 3] = [Part::Layout, Part::Gc, Part::LongTasks];
 
 pub fn run(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize) -> Result<Output> {
+    if let (Some(x), Some(y)) = (implementation(a), implementation(b))
+        && x.0 != y.0
+    {
+        return Err(not_comparable(&format!("{} ran {} and {} ran {}", a.id, x.1, b.id, y.1), view, &[&a.id, &b.id]));
+    }
     run_with(a, b, view, args, top, None)
+}
+
+/// The side of an implementation comparison a recording ran (SPEC §9.10): its target and the name
+/// texts call it. None for any other recording.
+fn implementation(rec: &Rec) -> Option<(String, String)> {
+    let exp = crate::store::resolve(rec.meta["experiment"].as_str()?).ok()?;
+    let r = crate::store::read_json(&exp.join("result.json")).ok()?;
+    if r["comparison"] != "implementations" {
+        return None;
+    }
+    let v = r["variants"].as_array()?.iter().find(|v| v["role"] == rec.meta["variant"])?;
+    Some((v["target"].as_str()?.to_string(), v["name"].as_str().or(v["target"].as_str())?.to_string()))
+}
+
+/// `NotComparable`: two implementations share no code, so no view of one is a diff of the other's.
+/// The hint names each recording's own view.
+fn not_comparable(what: &str, view: &str, recs: &[&str]) -> Error {
+    Error::usage(format!("NotComparable: {what}, two implementations that share no code: a..b {view} would match functions, threads or heaps that are not the same thing"))
+        .hint(recs.iter().map(|r| format!("strobe query {r} {view}")).collect::<Vec<_>>().join(" · "))
 }
 
 fn run_with(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize, plan_runs: Option<u64>) -> Result<Output> {
@@ -65,6 +89,16 @@ fn run_with(a: &Rec, b: &Rec, view: &str, args: &Args, top: usize, plan_runs: Op
 
 /// `query <exp> <view>`: the view of each series' base and head attribution recordings.
 pub fn experiment(result: &Value, view: &str, args: &Args, top: usize) -> Result<Output> {
+    if result["comparison"] == "implementations" {
+        let recs: Vec<&str> = result["series"].as_array().into_iter().flatten().flat_map(|s| ["base", "head"].map(|r| s["attribution"][r].as_str())).flatten().collect();
+        let name = |i: usize| result["variants"][i]["name"].as_str().unwrap_or(if i == 0 { "base" } else { "head" }).to_string();
+        let what = format!("{} compares {} with {}", result["id"].as_str().unwrap_or("this experiment"), name(1), name(0));
+        let mut e = not_comparable(&what, view, &recs);
+        if recs.is_empty() {
+            e = e.hint(format!("this experiment kept no attribution recordings (bench --why always keeps one per side); its per-side numbers: strobe query {} summary", result["id"].as_str().unwrap_or("")));
+        }
+        return Err(e);
+    }
     let plan_runs = result["plan"]["runs_per_block"].as_u64();
     let (mut text, mut out) = (String::new(), Vec::new());
     for s in result["series"].as_array().into_iter().flatten() {
@@ -487,20 +521,36 @@ pub fn diff_tree(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Value {
     out
 }
 
+/// One implementation's call tree on its own (SPEC §11.2): CPU time (its JavaScript profile, else its
+/// native samples) and allocations, each node with its inclusive value per run, in the diff flame's
+/// shape with one value per node. Two implementations share no code, so their trees never merge.
+pub fn side_tree(rec: &Rec, plan_runs: Option<u64>) -> Value {
+    let mut out = json!({});
+    let cpu = if rec.cpu().is_err() && rec.dir.join("deep.json.gz").is_file() { Kind::Native } else { Kind::Cpu };
+    for (name, kind) in [("cpu", cpu), ("alloc", Kind::Alloc)] {
+        if let Ok(s) = side(rec, kind, plan_runs, None) {
+            out[name] = tree([s], kind);
+        }
+    }
+    out
+}
+
 const MAX_NODES: usize = 3000;
 
-fn tree(sides: [Side; 2], kind: Kind) -> Value {
-    struct Node {
+/// The call tree of `N` sides' stacks merged by portable frame: each node `[frame, parent, v…]` with
+/// its inclusive value per run on each side.
+fn tree<const N: usize>(sides: [Side; N], kind: Kind) -> Value {
+    struct Node<const N: usize> {
         frame: u32,
         parent: usize,
-        v: [f64; 2],
+        v: [f64; N],
         kids: HashMap<u32, usize>,
     }
-    // Per run only when both sides know their runs (untimed native samples never do).
+    // Per run only when every side knows its runs (untimed native samples never do).
     let per_run = sides.iter().all(|s| s.runs.is_some());
     let runs = sides.each_ref().map(|s| if per_run { s.runs.unwrap_or(1).max(1) as f64 } else { 1.0 });
     let mut portable = Portable::default();
-    let mut nodes = vec![Node { frame: u32::MAX, parent: usize::MAX, v: [0.0; 2], kids: HashMap::new() }];
+    let mut nodes = vec![Node { frame: u32::MAX, parent: usize::MAX, v: [0.0; N], kids: HashMap::new() }];
     for (s, side) in sides.iter().enumerate() {
         let ids = portable.ids(side.stacks);
         for wt in &side.stacks.weights {
@@ -516,7 +566,7 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
                     Some(&k) => k,
                     None => {
                         let k = nodes.len();
-                        nodes.push(Node { frame: f, parent: at, v: [0.0; 2], kids: HashMap::new() });
+                        nodes.push(Node { frame: f, parent: at, v: [0.0; N], kids: HashMap::new() });
                         nodes[at].kids.insert(f, k);
                         k
                     }
@@ -526,7 +576,8 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
         }
     }
     // A child never holds more than its parent on either side, so a threshold keeps whole subtrees.
-    let mut sizes: Vec<f64> = nodes.iter().map(|n| n.v[0].max(n.v[1])).collect();
+    let size = |n: &Node<N>| n.v.iter().copied().fold(0.0, f64::max);
+    let mut sizes: Vec<f64> = nodes.iter().map(size).collect();
     let mut floor = 0.002 * sizes[0];
     if sizes.len() > MAX_NODES {
         sizes.sort_by(|a, b| b.total_cmp(a));
@@ -540,7 +591,7 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
     let round = |v: f64| (v * 1e4).round() / 1e4;
     for i in 0..nodes.len() {
         let n = &nodes[i];
-        if n.v[0].max(n.v[1]) < floor && i != 0 {
+        if size(n) < floor && i != 0 {
             continue;
         }
         if i != 0 && index[n.parent] == usize::MAX {
@@ -555,10 +606,12 @@ fn tree(sides: [Side; 2], kind: Kind) -> Value {
                 frames.len() - 1
             }) as i64
         };
-        kept.push(json!([f, if i == 0 { -1 } else { index[n.parent] as i64 }, round(n.v[0]), round(n.v[1])]));
+        let mut node = vec![json!(f), json!(if i == 0 { -1 } else { index[n.parent] as i64 })];
+        node.extend(n.v.iter().map(|&v| json!(round(v))));
+        kept.push(Value::Array(node));
     }
     json!({
-        "what": kind.what(), "unit": kind.unit(), "runs": runs, "per_run": per_run, "untimed": sides.iter().any(|s| s.untimed),
+        "what": kind.what(), "unit": kind.unit(), "runs": runs.as_slice(), "per_run": per_run, "untimed": sides.iter().any(|s| s.untimed),
         "floor": floor, "nodes_total": nodes.len(),
         "frames": frames.iter().map(|&f| json!(portable.frames[f as usize])).collect::<Vec<_>>(),
         "nodes": kept,

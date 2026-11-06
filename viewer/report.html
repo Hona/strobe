@@ -1321,6 +1321,8 @@ svg .zeroline { stroke: var(--ink-4); stroke-width: 1; }
 .impl-thumbs figure { margin: 0; }
 .impl-thumbs img { width: 240px; height: auto; border: 1px solid var(--border); display: block; }
 .impl-thumbs figcaption { font: 11px/16px var(--mono); color: var(--ink-3); margin-top: 4px; }
+.impl-attr-sub { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px; padding: 10px 24px 0; border-top: 1px solid var(--border); }
+.impl-attr-title { font: 600 12px/18px var(--sans); color: var(--ink-2); }
 .impl-bar-row { display: grid; grid-template-columns: minmax(0, 150px) minmax(0, 1fr) 64px; gap: 8px; align-items: center; font: 12px/18px var(--sans); padding: 2px 0; }
 .impl-bar-row .fn-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .impl-bar-track { height: 8px; background: var(--surface-subtle); position: relative; }
@@ -1983,6 +1985,7 @@ function renderExperiment(r) {
   // Two implementations are named by their targets, never by build.
   const baseTag = impl ? sideName(baseVar, "base") : shortRef(baseVar, headVar);
   const headTag = impl ? sideName(headVar, "head") : shortRef(headVar, baseVar);
+  SIDES = impl ? { base: baseTag, head: headTag } : null;
 
   const createdStr = r.created
     ? new Date(r.created).toLocaleString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })
@@ -2252,7 +2255,7 @@ function buildHeroProse(r, s, c, cl, aa) {
   }
   if (cl.kind === "same") {
     return h("p", { class: "hero-prose" },
-      `${labelOf(m)} held steady at `, h("strong", {}, fmtVal(c.head, u)), " vs ", h("strong", {}, fmtVal(c.base, u)),
+      SIDES ? `${labelOf(m)} the same on both: ${SIDES.head} ` : `${labelOf(m)} held steady at `, h("strong", {}, fmtVal(c.head, u)), SIDES ? ` vs ${SIDES.base} ` : " vs ", h("strong", {}, fmtVal(c.base, u)),
       ` (${fmtDelta(c.estimate, c, u)}). Across ${nPairs} fresh-launch pairs, the true change is bounded within `,
       h("strong", {}, fmtRange(c, u)), `, inside the ${fmtBound(c, u)} practical equivalence zone.`
     );
@@ -2262,7 +2265,7 @@ function buildHeroProse(r, s, c, cl, aa) {
       ? ` (~${fmtDuration((s.elapsed_ms / s.pairs) * c.needed_pairs)})`
       : "";
     return h("p", { class: "hero-prose" },
-      `${labelOf(m)} measured `, h("strong", {}, fmtVal(c.head, u)), " vs ", h("strong", {}, fmtVal(c.base, u)),
+      SIDES ? `${labelOf(m)}: ${SIDES.head} ` : `${labelOf(m)} measured `, h("strong", {}, fmtVal(c.head, u)), SIDES ? ` vs ${SIDES.base} ` : " vs ", h("strong", {}, fmtVal(c.base, u)),
       ` (${fmtDelta(c.estimate, c, u)}), with true change between `, h("strong", {}, fmtRange(c, u)), ". ",
       finite(c.needed_pairs) && c.needed_pairs < 5000
         ? `Run-to-run variance across ${nPairs} pairs is wider than ${fmtBound(c, u)}; resolving a ${fmtBound(c, u)} shift requires ~${c.needed_pairs} pairs${estMins}.`
@@ -2278,8 +2281,15 @@ function buildHeroProse(r, s, c, cl, aa) {
 
   const smallCaveat = cl.kind.endsWith("-small")
     ? ` Statistically confirmed (${wins} of ${nPairs} pairs moved in the same direction), though the conservative bound (${fmtRange(c, u)}) reaches inside the ${fmtBound(c, u)} practical threshold.`
-    : ` Head ${cl.tone === "win" ? "outperformed" : "trailed"} base in ${wins === nPairs ? `all ${nPairs} of ${nPairs}` : `${wins} of ${nPairs}`} fresh-launch pairs.`;
+    : ` ${sideWord("head", true)} ${cl.tone === "win" ? "outperformed" : "trailed"} ${sideWord("base")} in ${wins === nPairs ? `all ${nPairs} of ${nPairs}` : `${wins} of ${nPairs}`} fresh-launch pairs.`;
 
+  // Two implementations: one number each, never a shift from one to the other.
+  if (SIDES) {
+    return h("p", { class: "hero-prose" },
+      `${labelOf(m)}: ${SIDES.base} `, h("strong", {}, fmtVal(c.base, u)), `, ${SIDES.head} `, h("strong", {}, fmtVal(c.head, u)),
+      " (medians).", smallCaveat
+    );
+  }
   return h("p", { class: "hero-prose" },
     `${labelOf(m)} shifted from `, h("strong", {}, fmtVal(c.base, u)), " to ", h("strong", {}, fmtVal(c.head, u)),
     savedWork, ".", smallCaveat
@@ -2291,7 +2301,7 @@ function buildHeroProse(r, s, c, cl, aa) {
 function renderShown(s) {
   const sh = s?.shown;
   if (!sh) return null;
-  const roles = ["base", "head"].filter((r) => sh[r] && (sh[r].end || sh[r].thumb));
+  const roles = ["base", "head"].filter((r) => sh[r] && (sh[r].end || sh[r].thumb_end));
   if (!roles.length) return null;
   const text = (v) => !v.end ? "nothing read" : v.start && v.start !== v.end ? `'${v.start}' → '${v.end}'` : `'${v.end}'`;
   return h("div", { class: `shown-row${sh.changed ? " warn" : ""}`, title: sh.changed ? "Base and head showed different screens (ScreenChanged)" : "What each build showed on screen" },
@@ -2299,8 +2309,8 @@ function renderShown(s) {
       const v = sh[role];
       const others = (v.others || []).map((o) => `${o.blocks} on '${o.label}'`).join(", ");
       return h("div", { class: "shown-side" },
-        v.thumb ? h("img", { class: "shown-thumb", src: v.thumb, alt: `${role} screen` }) : null,
-        h("span", { class: "shown-label", title: others ? `other blocks: ${others}` : text(v) }, `On screen · ${capFirst(role)}: ${text(v)}${others ? ` (+${others})` : ""}`)
+        v.thumb_end ? h("img", { class: "shown-thumb", src: v.thumb_end, alt: `${sideWord(role)} screen` }) : null,
+        h("span", { class: "shown-label", title: others ? `other blocks: ${others}` : text(v) }, `On screen · ${sideWord(role, true)}: ${text(v)}${others ? ` (+${others})` : ""}`)
       );
     })
   );
@@ -2309,6 +2319,13 @@ function renderShown(s) {
 /* ---------- Implementation comparisons (two targets) ---------- */
 const isImpl = (r) => r?.comparison === "implementations";
 const sideName = (v, role) => v?.name || v?.target || role;
+// What the shared panels call each side: an implementation comparison's names, else base and head.
+let SIDES = null;
+function sideWord(role, cap) {
+  if (SIDES) return SIDES[role];
+  const w = role === "base" ? "base" : "head";
+  return cap ? capFirst(w) : w;
+}
 const isGap = (s) => !!s?.gap || s?.primary?.refusal?.validator === "ParityGap";
 
 // The scoreboard as pills (one per journey, in the bench file's order), the family's count, and what
@@ -2442,35 +2459,193 @@ function renderImplSeries(r, s, baseVar, headVar) {
   }
   const ps = s.per_side || {};
   const keys = [...new Set([...Object.keys(ps.base || {}), ...Object.keys(ps.head || {})])].sort();
-  const threads = (role) => (s.hotspots?.[role]?.threads?.threads || []).filter((t) => finite(t.cpu_ms_per_run) && t.cpu_ms_per_run > 0).sort((a, b) => b.cpu_ms_per_run - a.cpu_ms_per_run).slice(0, 12);
-  const tb = threads("base"), th = threads("head");
-  if (keys.length || tb.length || th.length) {
-    // One scale for both columns, so widths compare across implementations.
-    const max = Math.max(1e-9, ...tb.map((t) => t.cpu_ms_per_run), ...th.map((t) => t.cpu_ms_per_run));
-    const col = (role, list) => h("div", {},
-      h("div", { class: "impl-side-name" }, role === "base" ? bn : hn),
-      keys.length ? h("table", { class: "impl-table", style: "margin-bottom:10px" }, h("tbody", {}, keys.map((k) => {
-        const v = ps[role]?.[k];
-        const u = v?.unit || unitOf(k);
-        const x = v?.median ?? v?.value;
-        return h("tr", {}, h("td", {}, labelOf(k)), h("td", { class: "num" }, v ? (u === "bytes" ? fmtBytes(x) : fmtVal(x, u)) : "—"));
-      }))) : null,
-      list.length ? [h("div", { class: "sec-sub" }, "Threads, CPU per run (profiled)"), list.map((t) => h("div", { class: "impl-bar-row" },
-        h("span", { class: "fn-name mono", title: t.module || "" }, t.name || "(unnamed)"),
-        h("div", { class: "impl-bar-track" }, h("i", { style: `width:${(100 * t.cpu_ms_per_run) / max}%` })),
-        h("span", { class: "mono", style: "text-align:right" }, fmtVal(t.cpu_ms_per_run, "ms"))
-      ))] : null,
-      s.attribution?.[role] ? h("div", { class: "sec-sub", style: "margin-top:6px" }, cmdRow(`strobe open ${s.attribution[role]}`)) : null
-    );
+  const roles = ["base", "head"];
+  const nameOf = (role) => (role === "base" ? bn : hn);
+  if (keys.length) {
     out.push(h("section", { class: "card-surface" },
       h("div", { class: "card-hd" }, h("div", { class: "card-hd-left" },
-        h("h2", { class: "sec-title" }, "Each implementation on its own"),
-        h("span", { class: "sec-sub" }, "Never compared: each measures its engine its own way · bars share one ms-per-run scale")
+        h("h2", { class: "sec-title" }, "Per implementation, not compared"),
+        h("span", { class: "sec-sub" }, "Each engine's own numbers from the timed blocks, measured its own way")
       )),
-      h("div", { class: "impl-grid" }, col("base", tb), col("head", th))
+      h("div", { class: "impl-grid" }, roles.map((role) => h("div", {},
+        h("div", { class: "impl-side-name" }, nameOf(role)),
+        h("table", { class: "impl-table" }, h("tbody", {}, keys.map((k) => {
+          const v = ps[role]?.[k];
+          const u = v?.unit || unitOf(k);
+          const x = v?.median ?? v?.value;
+          return h("tr", {}, h("td", {}, labelOf(k)), h("td", { class: "num" }, v ? (u === "bytes" ? fmtBytes(x) : fmtVal(x, u)) : "—"));
+        })))
+      )))
     ));
   }
+  const attr = renderImplAttribution(r, s, nameOf);
+  if (attr) out.push(attr);
   return out;
+}
+
+// Where each implementation spends its time (SPEC §11.2): each side's profiled launch, read with its
+// own engine's tools, in two columns. Every list shares one scale across both columns (ms per run, or
+// bytes), so a bar's length compares across implementations; a side whose samples carry no times
+// (macOS `sample`: per recording) draws its sampled lists on a scale of its own and says so. Never a
+// diff: two implementations share no code.
+function renderImplAttribution(r, s, nameOf) {
+  const roles = ["base", "head"];
+  const att = (role) => s.hotspots?.[role] || null;
+  const sd = (role) => att(role)?.side || null;
+  if (!roles.some(att)) {
+    const why = dedupWarnings([...(r.warnings || []), ...(s.warnings || [])]).filter((w) => w.id === "Attribution");
+    if (!s.attribution && !why.length) return null;
+    return h("section", { class: "card-surface card-bd" },
+      h("h2", { class: "sec-title" }, "Where each spends its time"),
+      h("p", { class: "sec-sub" }, why.length ? why.map((w) => w.text).join(" · ") : "No profiled launches: strobe bench --why always profiles each side once, apart from the timed pairs.")
+    );
+  }
+  const pos = (x) => finite(x?.ms) && x.ms > 0;
+  const lists = {
+    processes: (role) => (sd(role)?.processes || []).filter(pos),
+    origins: (role) => (sd(role)?.origins || []).filter(pos),
+    threads: (role) => (att(role)?.threads?.threads || []).map((t) => ({ name: t.name || "(unnamed)", ms: t.cpu_ms_per_run, title: [t.module, t.origin].filter(Boolean).join(" · ") })).filter(pos).sort((a, b) => b.ms - a.ms).slice(0, 10),
+    functions: (role) => (sd(role)?.functions || []).map((f) => ({ name: f.name, ms: f.ms, title: f.where })).filter(pos).slice(0, 10),
+    packages: (role) => (sd(role)?.packages || []).filter(pos).slice(0, 8),
+    memory: (role) => (sd(role)?.memory?.parts || []).map((p) => ({ name: p.name, ms: p.bytes })).filter(pos),
+  };
+  const sampled = (key) => key === "functions" || key === "packages";
+  const timed = (role) => sd(role)?.per_run !== false;
+  // One maximum for both columns; an untimed side's sampled list keeps its own.
+  const maxOf = (key, role) => {
+    const over = sampled(key) && !timed(role) ? [role] : roles.filter((x) => !sampled(key) || timed(x));
+    return Math.max(1e-9, ...over.flatMap((x) => lists[key](x).map((t) => t.ms)));
+  };
+  const bars = (key, role, fmt) => {
+    const list = lists[key](role);
+    if (!list.length) return h("div", { class: "sec-sub" }, "—");
+    const max = maxOf(key, role);
+    return list.map((t) => h("div", { class: "impl-bar-row" },
+      h("span", { class: "fn-name mono", title: t.title || t.name }, t.name),
+      h("div", { class: "impl-bar-track" }, h("i", { style: `width:${(100 * t.ms) / max}%` })),
+      h("span", { class: "mono", style: "text-align:right" }, fmt(t.ms, role))
+    ));
+  };
+  const ms = (x, role) => `${fmtVal(x, "ms")}${timed(role) ? "" : " *"}`;
+  const ms1 = (x) => fmtVal(x, "ms");
+  const bytes = (x) => fmtBytes(x);
+  const pair = (title, note, key, fmt) => {
+    if (!roles.some((role) => lists[key](role).length)) return null;
+    return [
+      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, title), note ? h("span", { class: "sec-sub" }, note) : null),
+      h("div", { class: "impl-grid" }, roles.map((role) => h("div", {}, att(role) ? bars(key, role, fmt) : h("div", { class: "sec-sub" }, "not profiled")))),
+    ];
+  };
+  const head = (role) => {
+    const a = att(role), x = sd(role);
+    if (!a) {
+      const why = dedupWarnings([...(r.warnings || []), ...(s.warnings || [])]).find((w) => w.id === "Attribution" && String(w.text).startsWith(nameOf(role)));
+      return h("div", {}, h("div", { class: "impl-side-name" }, nameOf(role)), h("div", { class: "sec-sub" }, why ? why.text : "No profiled launch of this side."));
+    }
+    const named = finite(x?.resolved_share) ? { share: x.resolved_share, what: "of native samples resolved to a symbol" }
+      : finite(x?.mapped_share) ? { share: x.mapped_share, what: "of script samples source-mapped" } : null;
+    const low = named && named.share < 0.95;
+    return h("div", {},
+      h("div", { class: "impl-side-name" }, nameOf(role)),
+      h("div", { class: "impl-kv" },
+        h("span", {}, "Profiled with"), h("span", {}, x?.profiler ? `${x.profiler}${x.engine === "native" ? "; threads and memory from the OS" : "; heap snapshot, forced layouts, GC"}` : "no stacks (threads and memory from the OS)"),
+        h("span", {}, "Samples named"), h("span", { style: low ? "color:var(--warn-ink)" : "" }, named ? `${(100 * named.share).toFixed(1)}% ${named.what}${low ? " (under 95%: Unresolved)" : ""}` : "—"),
+        h("span", {}, "CPU per run"), h("span", {}, finite(x?.cpu_ms_per_run) ? fmtVal(x.cpu_ms_per_run, "ms") : "—"),
+        h("span", {}, "Measured runs"), h("span", {}, x?.per_run ? String(x.runs) : x?.untimed ? "whole capture (samples carry no times)" : "unknown"),
+      ),
+      h("div", { style: "margin-top:6px" },
+        cmdRow(`strobe open ${r.id}/${role}`),
+        cmdRow(`strobe query ${a.recording} ${x?.engine === "native" ? "threads" : "hotspots --by package"}`)
+      )
+    );
+  };
+  // The call tree of each side as an icicle, its width the side's sampled time against the larger.
+  const kinds = [["cpu", "CPU time"], ["alloc", "Allocations"]].filter(([k]) => roles.some((role) => (att(role)?.tree?.[k]?.nodes?.length || 0) > 1));
+  state.implZoom = state.implZoom || {};
+  if (kinds.length && !kinds.some(([k]) => k === state.flameKind)) state.flameKind = kinds[0][0];
+  const kind = state.flameKind;
+  const treeOf = (role) => att(role)?.tree?.[kind] || null;
+  const rootOf = (role) => treeOf(role)?.nodes?.[0]?.[2] || 0;
+  const icicleMax = (role) => {
+    const t = treeOf(role);
+    if (!t) return 1e-9;
+    const over = t.per_run ? roles.filter((x) => treeOf(x)?.per_run && treeOf(x).unit === t.unit) : [role];
+    return Math.max(1e-9, ...over.map(rootOf));
+  };
+  const icicle = (role) => {
+    const t = treeOf(role);
+    if (!t || (t.nodes?.length || 0) < 2) return h("div", { class: "sec-sub" }, "—");
+    const isBytes = t.unit === "bytes";
+    const fmtV = (v) => (isBytes ? fmtBytes(v) : fmtVal(v, "ms"));
+    const nodes = t.nodes.map(([f, p, v], i) => ({ i, f, p, v, kids: [] }));
+    for (const n of nodes) if (n.p >= 0 && nodes[n.p]) nodes[n.p].kids.push(n);
+    const zkey = `${state.series}:${role}:${kind}`;
+    const zoom = nodes[state.implZoom[zkey]] || nodes[0];
+    const label = (n) => (n.f < 0 ? "all" : t.frames[n.f]?.[0] || "?");
+    const file = (n) => (n.f < 0 ? "" : t.frames[n.f]?.[1] || "");
+    const rowH = 18, maxDepth = 24;
+    const cells = [];
+    let depth = 0;
+    const place = (n, left, width, d) => {
+      if (width < 0.15 || d > maxDepth) return;
+      depth = Math.max(depth, d);
+      cells.push({ n, left, width, d });
+      let x = left;
+      for (const k of n.kids.slice().sort((a, b) => b.v - a.v)) {
+        const w = (width * k.v) / (n.v || 1e-12);
+        place(k, x, w, d + 1);
+        x += w;
+      }
+    };
+    // Unzoomed, the root's width is its time against the larger side's; zoomed, a frame fills its column.
+    place(zoom, 0, zoom === nodes[0] ? (100 * zoom.v) / icicleMax(role) : 100, 0);
+    const all = nodes[0].v || 1e-12;
+    return h("div", {},
+      h("div", { class: "flame", style: `height:${(depth + 1) * rowH}px;margin:8px 0 4px` },
+        cells.map(({ n, left, width, d }) => {
+          const el = h("div", {
+            class: "fl-node",
+            style: `left:${left}%;width:calc(${width}% - 1px);top:${d * rowH}px;background:var(--surface-subtle)`,
+            onclick: () => { state.implZoom[zkey] = n === zoom && n.p >= 0 ? n.p : n.i; render(); },
+          }, width > 4 ? label(n) : "");
+          el.addEventListener("pointerenter", (e) => showTip(e, label(n), [
+            file(n) ? ["File", file(n)] : null,
+            [nameOf(role), `${fmtV(n.v)}${t.per_run ? " / run" : " (whole capture)"}`],
+            ["Share", `${((100 * n.v) / all).toFixed(1)}% of this side's ${t.what}`],
+          ].filter(Boolean)));
+          el.addEventListener("pointermove", moveTip);
+          el.addEventListener("pointerleave", hideTip);
+          return el;
+        })
+      ),
+      h("div", { class: "sec-sub" }, `${t.what} · ${fmtV(nodes[0].v)}${t.per_run ? " per run" : " over the whole capture (no times: its own scale)"} · ${t.nodes.length} of ${t.nodes_total} frames${zoom !== nodes[0] ? " · zoomed: click the top frame to go up" : " · click to zoom"}`)
+    );
+  };
+  const toggle = kinds.length > 1
+    ? h("div", { class: "seg", role: "group", "aria-label": "Call trees of" },
+        kinds.map(([k, lbl]) => h("button", { type: "button", "aria-pressed": String(kind === k), onclick: () => { state.flameKind = k; state.implZoom = {}; render(); } }, lbl)))
+    : null;
+  const untimedNote = roles.some((role) => att(role) && !timed(role)) ? " · * whole capture, not per run (these samples carry no times), on its own scale" : "";
+  return h("section", { class: "card-surface", id: "impl-attribution" },
+    h("div", { class: "card-hd" },
+      h("div", { class: "card-hd-left" },
+        h("h2", { class: "sec-title" }, "Where each spends its time"),
+        h("span", { class: "sec-sub" }, "One profiled launch per implementation, apart from the timed pairs and slowed by its profiler · each read with its own engine's tools · bars share one scale across both columns · never a diff")
+      ),
+      h("div", { class: "card-hd-right" }, toggle)
+    ),
+    h("div", { class: "impl-grid" }, roles.map(head)),
+    pair("By process", "CPU per run of each process, from the OS (a browser's by role)", "processes", ms1),
+    pair("By whose threads", "app: started in the app's code · driver: a device driver's user-mode part · os: the OS's pools and services", "origins", ms1),
+    pair("Busiest threads", "CPU per run, from the OS", "threads", ms1),
+    kinds.length ? [
+      h("div", { class: "impl-attr-sub" }, h("span", { class: "impl-attr-title" }, "Call trees"), h("span", { class: "sec-sub" }, "A browser's profile covers its JavaScript; native stacks cover every thread · width: time against the larger side")),
+      h("div", { class: "impl-grid" }, roles.map((role) => h("div", {}, icicle(role)))),
+    ] : null,
+    pair("Top functions", `self time per run, sampled${untimedNote}`, "functions", ms),
+    pair("Top packages", `self time per run, sampled${untimedNote}`, "packages", ms),
+    pair("Memory by part", "after the runs: a native app's by what holds it, a browser's by allocator across its processes", "memory", bytes),
+  );
 }
 
 function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
@@ -2478,7 +2653,19 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
   const m = c.metric || "?";
   const u = unitOf(m);
   const cl = classify(c, m, aa);
-  const { pill, headline } = humanHeadline(c, m, u, cl, s, aa);
+  let { pill, headline } = humanHeadline(c, m, u, cl, s, aa);
+  // Two implementations, in the PR block's words: "OpenCode (Rune) uses 62% less CPU time than
+  // Electron", counted as decided only once it held across the journeys (Holm).
+  if (SIDES && (cl.tone === "win" || cl.tone === "loss")) {
+    const better = cl.tone === "win";
+    if (s.claim) headline = `${SIDES.head} ${s.claim} than ${SIDES.base}`;
+    pill = c.holm_decided === false
+      ? `${better ? "Better" : "Worse"} on its own · not after Holm across the journeys`
+      : `${better ? "Better" : "Worse"} than ${SIDES.base}`;
+  } else if (SIDES && cl.kind === "same") {
+    pill = `The same as ${SIDES.base} (${fmtBound(c, u)})`;
+    headline = `No meaningful difference from ${SIDES.base}`;
+  }
 
   const realWarnings = dedupWarnings([...(r.warnings || []), ...(s.warnings || [])]).filter((w) => w.level === "warn" || w.level === "error");
   const caveatEl = realWarnings.length
@@ -2515,18 +2702,19 @@ function renderVerdictCard(r, s, aa, baseTag, headTag, baseVar, headVar) {
         ),
         h("h1", { class: "hero-headline" }, headline),
         buildHeroProse(r, s, c, cl, aa),
-        renderShown(s)
+        // Two implementations show their screens side by side above the equivalence checks.
+        SIDES ? null : renderShown(s)
       ),
       h("div", { class: "hero-metrics-grid" },
         h("div", { style: "min-width:0" },
           h("div", { class: "ba-compare" },
             h("div", { class: "ba-col" },
-              h("span", { class: "ba-label" }, h("i", { class: "swatch base" }), `Base · ${baseTag}`),
+              h("span", { class: "ba-label" }, h("i", { class: "swatch base" }), SIDES ? baseTag : `Base · ${baseTag}`),
               h("span", { class: "ba-val muted" }, fmtVal(c.base, u))
             ),
-            h("span", { class: "ba-arrow" }, "→"),
+            h("span", { class: "ba-arrow" }, SIDES ? "vs" : "→"),
             h("div", { class: "ba-col" },
-              h("span", { class: "ba-label" }, h("i", { class: `swatch head ${cl.tone}` }), `Head · ${headTag}`),
+              h("span", { class: "ba-label" }, h("i", { class: `swatch head ${cl.tone}` }), SIDES ? headTag : `Head · ${headTag}`),
               h("span", { class: "ba-val" }, fmtVal(c.head, u))
             )
           ),
@@ -2787,10 +2975,11 @@ function renderEvidenceSection(r, s, aa) {
   let winSummary = `${P} launch pairs`;
   let winTone = "";
   if (P > 0) {
+    const hd = sideWord("head", true);
     if (aa) winSummary = `Head lower in ${ps.filter((p) => p.b < p.a).length} of ${P} pairs`;
-    else if (cl.tone === "win") { winSummary = `Head won ${wins} of ${P} pairs`; winTone = "win"; }
-    else if (cl.tone === "loss") { winSummary = `Head regressed in ${P - wins} of ${P} pairs`; winTone = "loss"; }
-    else winSummary = `Head better in ${wins} of ${P} pairs`;
+    else if (cl.tone === "win") { winSummary = SIDES ? `${hd} better in ${wins} of ${P} pairs` : `Head won ${wins} of ${P} pairs`; winTone = "win"; }
+    else if (cl.tone === "loss") { winSummary = SIDES ? `${hd} worse in ${P - wins} of ${P} pairs` : `Head regressed in ${P - wins} of ${P} pairs`; winTone = "loss"; }
+    else winSummary = `${hd} better in ${wins} of ${P} pairs`;
   }
 
   let geoLeft = null, geoRight = null;
@@ -2807,8 +2996,8 @@ function renderEvidenceSection(r, s, aa) {
       const p = ps[k - 1];
       const dStr = rel ? fmtPct(deltas[k - 1]) : fmtSigned(deltas[k - 1], absUnit(u));
       showTip(e, `Launch Pair ${k} (${p.order})`, [
-        ["Base", fmtVal(p.a, u)],
-        ["Head", fmtVal(p.b, u)],
+        [sideWord("base", true), fmtVal(p.a, u)],
+        [sideWord("head", true), fmtVal(p.b, u)],
         ["Pair Δ", dStr],
         p.base.recording ? ["Recordings", `${p.base.recording} · ${p.head.recording}`] : null,
       ]);
@@ -2842,7 +3031,7 @@ function renderEvidenceSection(r, s, aa) {
     h("div", { class: "card-bd" },
       h("div", { class: "evi-grid" },
         h("div", { class: "plot-col" },
-          h("div", { class: "plot-caption" }, h("span", {}, `${labelOf(metric)} per launch`), h("span", { class: "dim" }, "○ Base  →  ● Head")),
+          h("div", { class: "plot-caption" }, h("span", {}, `${labelOf(metric)} per launch`), h("span", { class: "dim" }, `○ ${sideWord("base", true)}  ${SIDES ? "vs" : "→"}  ● ${sideWord("head", true)}`)),
           leftBox
         ),
         h("div", { class: "plot-col" },
@@ -2972,6 +3161,11 @@ function quoteArg(v) {
   return /^[\w.:/\\=@,+~-]+$/.test(v) ? v : `"${String(v).replace(/"/g, '\\"')}"`;
 }
 
+// A side as `--base`/`--head` take it: an implementation comparison's `<target>=<variant>`.
+function sideArg(v) {
+  return v.target ? (v.commit ? `${v.target}=${String(v.commit).slice(0, 10)}` : v.kind === "exe" || v.kind === "app" ? `${v.target}=${v.spec}` : v.target) : v.spec;
+}
+
 function renderNextStepsSection(r, s, aa) {
   const c = s.primary || {};
   const m = c.metric || "";
@@ -2985,8 +3179,8 @@ function renderNextStepsSection(r, s, aa) {
     extra,
     quoteArg(file),
     aa ? "--aa" : null,
-    !aa && baseVar ? `--base ${quoteArg(baseVar.spec)}` : null,
-    headVar ? `--head ${quoteArg(headVar.spec)}` : null,
+    !aa && baseVar ? `--base ${quoteArg(sideArg(baseVar))}` : null,
+    headVar ? `--head ${quoteArg(sideArg(headVar))}` : null,
     (r.series || []).length > 1 && s.case ? `--filter ${quoteArg(s.case)}` : null,
   ].filter(Boolean).join(" ");
 

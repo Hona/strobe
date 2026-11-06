@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::app::family;
+use serde_json::json;
 
 /// `2.4`, `12`: a factor with the digits it needs.
 fn factor(ratio: f64) -> String {
@@ -468,32 +469,50 @@ impl<'a> Doc<'a> {
         let (bn, hn) = side_names(self.r);
         let mut t = format!("#### Where each spends its time, in profiled launches\n\n| | {} | {} |\n|:---|:---|:---|\n", cell(&bn), cell(&hn));
         let mut any = false;
-        let side = |s: &Value, k: &str| -> Option<(f64, String)> {
-            let mut threads: Vec<(String, f64)> = s["hotspots"][k]["threads"]["threads"]
-                .as_array()?
-                .iter()
-                .map(|x| (x["name"].as_str().unwrap_or("(unnamed)").to_string(), f(&x["cpu_ms_per_run"])))
-                .filter(|x| x.1.is_finite() && x.1 > 0.0)
-                .collect();
-            let total: f64 = threads.iter().map(|x| x.1).sum();
-            if total <= 0.0 {
+        // `name 61% · name 22%`: the largest parts of a list of {name, ms} by their share of `total`.
+        let shares = |rows: &Value, n: usize, total: Option<f64>, quote: bool| -> Option<String> {
+            let mut xs: Vec<(String, f64)> = rows.as_array()?.iter().map(|x| (x["name"].as_str().unwrap_or("?").to_string(), f(&x["ms"]))).filter(|x| x.1.is_finite() && x.1 > 0.0).collect();
+            let total = total.unwrap_or_else(|| xs.iter().map(|x| x.1).sum());
+            if xs.is_empty() || total <= 0.0 {
                 return None;
             }
-            threads.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
-            let top: Vec<String> = threads.iter().take(4).map(|(n, ms)| format!("{} {:.0}%", code(n), 100.0 * ms / total)).collect();
-            Some((total, top.join(" · ")))
+            xs.sort_by(|a, b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            Some(xs.iter().take(n).map(|(name, ms)| format!("{} {:.0}%", if quote { code(name) } else { cell(name) }, 100.0 * ms / total)).collect::<Vec<_>>().join(" · "))
+        };
+        let threads = |s: &Value, k: &str| -> Option<String> {
+            let rows: Vec<Value> = s["hotspots"][k]["threads"]["threads"].as_array()?.iter().map(|x| json!({ "name": x["name"].as_str().unwrap_or("(unnamed)"), "ms": x["cpu_ms_per_run"] })).collect();
+            shares(&json!(rows), 3, None, true)
+        };
+        let named = |x: &Value| match (x["resolved_share"].as_f64(), x["mapped_share"].as_f64()) {
+            (Some(r), _) => Some(format!("{:.0}% of native samples resolved", 100.0 * r)),
+            (_, Some(m)) => Some(format!("{:.0}% of script samples source-mapped", 100.0 * m)),
+            _ => None,
         };
         for s in &self.series {
-            let (Some(b), Some(h)) = (side(s, "base"), side(s, "head")) else { continue };
+            let (b, h) = (&s["hotspots"]["base"]["side"], &s["hotspots"]["head"]["side"]);
+            if !b.is_object() && !h.is_object() {
+                continue;
+            }
             any = true;
             let who = if self.multi() { format!("{}: ", cell(&self.title(s))) } else { String::new() };
-            t += &format!("| {who}CPU per run, profiled | {} | {} |\n", nb(&disp(b.0, "ms")), nb(&disp(h.0, "ms")));
-            t += &format!("| {who}By thread | {} | {} |\n", b.1, h.1);
+            let dash = || "—".to_string();
+            let mut row = |what: &str, x: Option<String>, y: Option<String>| {
+                if x.is_some() || y.is_some() {
+                    t += &format!("| {who}{what} | {} | {} |\n", x.unwrap_or_else(dash), y.unwrap_or_else(dash));
+                }
+            };
+            row("CPU per run, profiled", b["cpu_ms_per_run"].as_f64().map(|x| nb(&disp(x, "ms"))), h["cpu_ms_per_run"].as_f64().map(|x| nb(&disp(x, "ms"))));
+            row("By process", shares(&b["processes"], 4, None, false), shares(&h["processes"], 4, None, false));
+            row("By whose threads", shares(&b["origins"], 4, None, false), shares(&h["origins"], 4, None, false));
+            row("Busiest threads", threads(s, "base"), threads(s, "head"));
+            // Packages by their share of the side's sampled time, so a long tail reads as such.
+            row("Top packages, sampled", shares(&b["packages"], 3, b["sampled_ms"].as_f64(), true), shares(&h["packages"], 3, h["sampled_ms"].as_f64(), true));
+            row("Samples named", named(b), named(h));
         }
         if !any {
             return String::new();
         }
-        t + "\n<sub>From one profiled launch per implementation, apart from the timed pairs and slowed by the profiler: where each one's time goes, not a change.</sub>\n\n"
+        t + "\n<sub>From one profiled launch per implementation, apart from the timed pairs and slowed by the profiler: where each one's time goes, each measured by its own engine's tools (a browser's profile covers its JavaScript; native stacks cover every thread), never a change.</sub>\n\n"
     }
 
     /// How it was measured: both implementations, the machine and window, the fixture, the method.

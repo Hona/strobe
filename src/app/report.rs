@@ -6,6 +6,7 @@ use crate::cli::Args;
 use crate::model::{Error, Result};
 use crate::store;
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 
 pub fn run(args: &Args) -> Result<Output> {
     let view = args.pos.first().ok_or_else(|| Error::usage("report <view> <handle…>: views experiment, recording"))?;
@@ -148,12 +149,15 @@ pub(super) fn write_whole(path: &std::path::Path, body: &[u8]) -> Result<()> {
 fn attach_series(data: &mut Value) -> Option<Value> {
     let plan_runs = data["plan"]["runs_per_block"].as_u64();
     let id = data["id"].clone();
+    // Two implementations share no code: each side is read on its own, never diffed (SPEC §11.2).
+    let implementations = super::family::implementations(data);
     let series = data["series"].as_array_mut()?;
     let mut insights = Vec::new();
     for s in series {
         let recs: Vec<(&str, Rec)> = ["base", "head"].into_iter().filter_map(|role| Some((role, Rec::resolve(s["attribution"][role].as_str()?).ok()?))).collect();
         let sides: Vec<(&str, Option<Value>)> = std::thread::scope(|scope| {
-            let handles: Vec<_> = recs.iter().map(|(role, rec)| (*role, scope.spawn(move || attribution(rec, plan_runs)))).collect();
+            let handles: Vec<_> =
+                recs.iter().map(|(role, rec)| (*role, scope.spawn(move || if implementations { side_attribution(rec, plan_runs) } else { attribution(rec, plan_runs) }))).collect();
             handles.into_iter().map(|(role, h)| (role, h.join().ok().flatten())).collect()
         });
         let mut out = json!({});
@@ -164,6 +168,13 @@ fn attach_series(data: &mut Value) -> Option<Value> {
         }
         if out.as_object().is_some_and(|o| !o.is_empty()) {
             s["hotspots"] = out;
+        }
+        if implementations {
+            // The headline's words for this journey, as the PR block says them (`uses 62% less CPU time`).
+            if s["primary"]["estimate"].is_number() {
+                s["claim"] = json!(super::pr::claim(&s["primary"]).pr(false));
+            }
+            continue;
         }
         let [(_, a), (_, b)] = recs.as_slice() else { continue };
         if let Ok(d) = query::heap_diff(a, b, 15, false) {
@@ -262,6 +273,128 @@ fn attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
     }
     Some(h)
 }
+
+/// One side of an implementation comparison on its own (SPEC §11.2), profiled with its own engine's
+/// tools: what `attribution` keeps, its call tree (`tree`, the diff flame's shape with one value per
+/// node) and `side`: CPU per run by process (a browser's roles, a native app's programs) and by
+/// thread origin (native), self time by function and package, memory by part, and how much of its
+/// samples were named. Per run where its samples carry times; untimed native samples (macOS
+/// `sample`) cover the whole capture, so they are per recording and say so.
+fn side_attribution(rec: &Rec, plan_runs: Option<u64>) -> Option<Value> {
+    let mut h = attribution(rec, plan_runs)?;
+    let tree = query::side_tree(rec, plan_runs);
+    if tree.as_object().is_some_and(|o| !o.is_empty()) {
+        h["tree"] = tree;
+    }
+    let native = h["native"] == true;
+    let untimed = native && h["untimed"] == true;
+    let runs = rec.runs().or(plan_runs).filter(|_| !untimed);
+    let per = |weight_us: f64| weight_us / 1000.0 / runs.unwrap_or(1).max(1) as f64;
+    let values = &rec.meta["values"];
+    let v = |k: &str| values[k].as_f64().filter(|x| x.is_finite());
+    let mut side = json!({
+        "engine": if native || rec.dir.join("threads.json").exists() { "native" } else { "chromium" },
+        "per_run": runs.is_some(), "runs": runs, "untimed": untimed,
+        "cpu_ms_per_run": v("cpu.work"),
+    });
+    if native {
+        side["profiler"] = json!("native stacks");
+        side["resolved_share"] = h["resolved_share"].clone();
+        side["samples"] = h["samples"].clone();
+    } else if h["samples"].as_u64().unwrap_or(0) > 0 {
+        side["profiler"] = json!("V8 CPU profile");
+        let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
+        side["mapped_share"] = if scripts > 0.0 { json!(mapped / scripts) } else { Value::Null };
+        side["samples"] = h["samples"].clone();
+    }
+    // Self time by function, leaving out a profile's idle time and root.
+    let functions: Vec<Value> = h["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|r| !matches!(r["name"].as_str(), Some("(idle)" | "(root)")))
+        .take(12)
+        .map(|r| json!({ "name": r["name"], "where": r["where"], "ms": per(r["weight"].as_f64().unwrap_or(0.0)) }))
+        .collect();
+    side["functions"] = json!(functions);
+    let idle: f64 = h["rows"].as_array().into_iter().flatten().filter(|r| r["name"] == "(idle)").filter_map(|r| r["weight"].as_f64()).sum();
+    if let Some(total) = h["total"].as_f64().filter(|t| *t > idle) {
+        side["sampled_ms"] = json!(per(total - idle));
+    }
+    if let Ok(o) = query::hotspots_of(rec, "package", 12) {
+        let rows: Vec<Value> =
+            o.json["rows"].as_array().into_iter().flatten().filter(|r| r["name"] != "(idle)").map(|r| json!({ "name": r["name"], "ms": per(r["weight"].as_f64().unwrap_or(0.0)) })).collect();
+        side["packages"] = json!(rows);
+    }
+    let threads: Vec<Value> = store::read_json(&rec.dir.join("threads.json")).ok().and_then(|t| t.as_array().cloned()).unwrap_or_default();
+    if threads.is_empty() {
+        // A browser's processes by role: each role's share of a core over the runs, as ms per run.
+        if let Some(dur) = v("run.duration") {
+            let mut rows: Vec<Value> = Vec::new();
+            for (metric, name) in [("cpu.renderer", "renderer"), ("cpu.gpu", "GPU process"), ("cpu.browser", "browser")] {
+                if let Some(pct) = v(metric) {
+                    rows.push(json!({ "name": name, "ms": pct / 100.0 * dur }));
+                }
+            }
+            let named: f64 = rows.iter().filter_map(|r| r["ms"].as_f64()).sum();
+            if let Some(total) = v("cpu.app.total").map(|p| p / 100.0 * dur).filter(|t| !rows.is_empty() && t - named > 0.005 * t) {
+                rows.push(json!({ "name": "other (utility, network, …)", "ms": total - named }));
+            }
+            side["processes"] = json!(rows);
+        }
+    } else {
+        // A native app's processes by program, and its threads by whose code they started in.
+        // Per pid: CPU per run, the app's threads by start module, and macOS's executable.
+        type Process = (f64, BTreeMap<String, usize>, Option<String>);
+        let mut by_pid: BTreeMap<u64, Process> = BTreeMap::new();
+        let mut origins: BTreeMap<String, f64> = BTreeMap::new();
+        for t in &threads {
+            let ms = t["cpu_ms_per_run"].as_f64().unwrap_or(0.0);
+            let e = by_pid.entry(t["pid"].as_u64().unwrap_or(0)).or_default();
+            e.0 += ms;
+            if let Some(m) = t["module"].as_str() {
+                // macOS's per-process row names its executable; elsewhere the module the app's own
+                // threads started in is its program.
+                if t["tid"] == 0 {
+                    e.2 = Some(m.to_string());
+                } else if t["origin"] == "app" {
+                    *e.1.entry(m.to_string()).or_default() += 1;
+                }
+            }
+            if ms > 0.0 {
+                *origins.entry(t["origin"].as_str().unwrap_or("unknown").to_string()).or_default() += ms;
+            }
+        }
+        let mut procs: Vec<Value> = by_pid
+            .into_iter()
+            .filter(|(_, (ms, _, _))| *ms > 0.0)
+            .map(|(pid, (ms, modules, exe))| {
+                let program = exe.or_else(|| modules.into_iter().max_by_key(|(m, n)| (*n, std::cmp::Reverse(m.clone()))).map(|(m, _)| m));
+                json!({ "name": program.map(|p| format!("{p} · {pid}")).unwrap_or_else(|| format!("pid {pid}")), "ms": ms })
+            })
+            .collect();
+        procs.sort_by(|a, b| b["ms"].as_f64().unwrap_or(0.0).total_cmp(&a["ms"].as_f64().unwrap_or(0.0)));
+        side["processes"] = json!(procs);
+        side["origins"] = json!(["app", "driver", "os", "unknown"].iter().filter_map(|o| Some(json!({ "name": o, "ms": origins.get(*o)? }))).collect::<Vec<_>>());
+    }
+    // Memory by part: a native app's by what holds it (host, GPU mapped, …), a browser's by allocator
+    // layer across its processes.
+    if rec.dir.join("memory.json").exists() {
+        if let Ok(o) = query::native_memory(&rec.dir, &rec.meta, "layer", 10, None) {
+            let parts = crate::probe::memory::totals(&o.json["reading"]);
+            let total = parts.iter().find(|p| p.0 == "private").map(|p| p.1);
+            let rows: Vec<Value> = parts.iter().filter(|p| !matches!(p.0.as_str(), "private" | "working_set")).filter(|p| p.1 > 0.0).map(|(k, b)| json!({ "name": k, "bytes": b })).collect();
+            side["memory"] = json!({ "total": { "name": "private", "bytes": total }, "parts": rows });
+        }
+    } else if h["memory_layers"].is_object() {
+        let m = &h["memory_layers"];
+        let rows: Vec<Value> = m["layers"].as_array().into_iter().flatten().take(10).map(|l| json!({ "name": l["layer"], "bytes": l["effective_bytes"] })).collect();
+        side["memory"] = json!({ "total": { "name": "OS private", "bytes": m["os_private_bytes"] }, "parts": rows });
+    }
+    h["side"] = side;
+    Some(h)
+}
+
 const TEMPLATE: &str = include_str!("../../viewer/report.html");
 
 pub fn html(view: &str, data: &Value) -> String {

@@ -4559,9 +4559,16 @@ example.com for 3 s read 17–25 OS presents (ScreenCaptureKit), `cpu.app.total`
 over Safari and its XPC services; `bench --check` passed 9 of 9 twice (click with `count.adds` 1,
 typing with a shifted `W` and `!`, scroll, a drag with `input.*` refused, `net.*` refused, a page load
 with `count.*` refused, a snapshot), with `cpu.renderer` (web content), `cpu.gpu` (the GPU service) and
-`cpu.browser` all read from the XPC-inclusive set, and `interaction.p50` 54–56 ms (`p95` 58–60 ms) over
-8 clicks with 16–19 presents; Safari's WebDriver events carry a `timeStamp` on another clock (about
-8×10¹¹ ms), so there the input time is the page listener's. After every run no Safari ran and no
+`cpu.browser` all read from the XPC-inclusive set. With the clicks the seam now holds 60 ms (a person's
+press) and the input time strobe's own send before the release, the 8-click series refuses
+`interaction.*` `AmbiguousInteraction` on Safari (8 of 8 inputs came while it drew the button's pressed
+state) in four of four runs; Firefox headed on the same Mac refused it in most runs (5–8 of 8 inputs:
+main's build and this one alike, alternated three runs each: main refused three, this one two) and in the
+others read `interaction.p50` 30.9–32.7 ms, `p95` 33.3–43.5 ms (27.9 and 42.3 ms when it was first
+checked, before clicks held their press). An earlier build that took the page listener's time read Safari's
+p50 54–56 ms; that start is not used (it would hide a blocked main thread, §7.2). After the review, 9 of 9
+again twice, with a shifted letter sent as Shift and its key's own character (sent as `W` it was dropped
+after a click in some cold runs). After every run no Safari ran and no
 `com.apple.WebKit.*` service was responsible to a Safari or orphaned (a check by
 `responsibility_get_pid_responsible_for_pid`; one GPU service left beside them belonged to
 SoftwareUpdateNotificationManager). An A/A of the click case on AC (6 pairs): `cpu.work` 0.0%

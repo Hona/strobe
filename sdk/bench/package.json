@@ -1,6 +1,6 @@
 {
   "name": "@hona/strobe",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "description": "Measure and explain performance: the strobe CLI and the types and helpers for its bench files",
   "type": "module",
   "types": "./dist/index.d.ts",
@@ -22,11 +22,11 @@
     "build": "bun build src/index.ts --outdir dist --target node --format esm && tsc -p tsconfig.json && bun -e \"const fs = require('node:fs'); fs.rmSync('schema', { recursive: true, force: true }); fs.cpSync('../../schema', 'schema', { recursive: true })\""
   },
   "optionalDependencies": {
-    "@hona/strobe-darwin-arm64": "0.11.0",
-    "@hona/strobe-darwin-x64": "0.11.0",
-    "@hona/strobe-linux-arm64": "0.11.0",
-    "@hona/strobe-linux-x64": "0.11.0",
-    "@hona/strobe-win32-x64": "0.11.0"
+    "@hona/strobe-darwin-arm64": "0.12.0",
+    "@hona/strobe-darwin-x64": "0.12.0",
+    "@hona/strobe-linux-arm64": "0.12.0",
+    "@hona/strobe-linux-x64": "0.12.0",
+    "@hona/strobe-win32-x64": "0.12.0"
   },
   "devDependencies": {
     "typescript": "^5.9.0"

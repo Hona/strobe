@@ -5181,18 +5181,21 @@ launch adds `--use-mock-keychain` (macOS) or `--password-store=basic` (Linux). C
 gave the user's `~/Documents` and `~/Library/Application Support/<name>`; with it every path was in
 the home, `safeStorage` encrypted without a keychain prompt (the prompt had hung an unmocked run), and
 nothing appeared in the user's Library; `cfprefsd` still wrote the user's own Preferences (so the
-Library rule stays). The known-folder guard stopped a `--check` on air and on adais (Windows) when a
-file was added to and removed from the real Downloads while the copy ran. An Electron app's window
-took a 1000×700 viewport on air (`webview::fit`, which had never moved a macOS window: it took the
-app's 1470×33 menu bar strip, before its window showed, for the main window). The fixture's socket
-ownership and copy checks were run with `scripts/dev/fixture.bench.ts` on adais and vps: `use` passes,
-`own`, `port` and a copied runtime each refuse `FixtureMismatch`; `{fixture.port}` in a target's `args`
-or `env` had become a JSON number that native targets dropped (now only `files` keep numbers). A
-launch series records `until` (checked in a headless `--check` on adais); the PR notes of an old
-implementation result on air name each side by its compact name (`<name>:`, `<name>'s attribution block
-failed`), where they said `before:` and `this PR:`.
-Not run: a timed implementation comparison (the per-side viewport check after a block runs only
-there), the fixture checks on macOS.
+Library rule stays). The Documents/Desktop guard stopped a `--check` on air and on adais (Windows,
+`SHGetKnownFolderPath`) when files appeared on the real Desktop while the copy ran, naming them. An
+Electron app's window took a 1000×700 viewport on air (`webview::fit`, which had never moved a macOS
+window: it took the app's 1470×33 menu bar strip, before its window showed, for the main window). A
+native Cocoa app's window took a 640×480 viewport by its frame on air only once placing asked again
+while the new window did not take it (macOS answered its first accessibility calls too early), and a
+3000×2400 viewport refused `VariantMismatch` (the screen clamped it to 1430×916). The fixture checks
+ran with `scripts/dev/fixture.bench.ts` on adais, air and vps: `use` and `both` pass, `own` and
+`port` refuse, and with a copied runtime `both` (serving a port) refuses while `use` (serving nothing)
+passes; `{fixture.port}` in a target's `args` or `env` had become a JSON number that native targets
+dropped (now only `files` keep numbers). A launch series records `until` (checked in a headless
+`--check` on adais); the PR notes of an old implementation result on air name each side by its
+compact name, where they said `before:` and `this PR:`; new notes name implementations at the source.
+Not run: a timed implementation comparison (the cross-side window check with a macOS frame against a
+page, the `UserFolders` caution of later launches, the plan line of a windowless series).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

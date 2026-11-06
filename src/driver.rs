@@ -861,8 +861,9 @@ impl Driver {
         let shift = if matches!(key, Key::Char(c) if keys::us_key(c).is_some_and(|k| k.1)) { 8 } else { 0 };
         let press = (extra | shift) & !self.mods.get();
         let key = match key {
-            // Safari types a symbol with Shift only from its key's own character.
-            Key::Char(c) if (m | shift) & 8 != 0 && !c.is_ascii_alphabetic() && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
+            // Safari types a shifted character with Shift only from its key's own character (`1` for `!`;
+            // `w` for `W`, which it sometimes dropped as `W` after a click).
+            Key::Char(c) if (m | shift) & 8 != 0 && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
             Key::Char(c) if (m | shift) & 8 != 0 && c.is_ascii_graphic() => Key::Char(keys::us_shifted(c)),
             k => k,
         };
@@ -870,11 +871,6 @@ impl Driver {
         let up: Vec<Value> = mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<_>>()?;
         let list = |actions: Vec<Value>| json!([{ "type": "key", "id": "keyboard", "actions": actions }]);
         let mut actions = down;
-        // Safari sometimes dropped a key that came right after the Shift in its list ("hello orld!" in
-        // some cold runs; Shift released in a list of its own stayed held): one frame's pause between them.
-        if self.page.shift_takes_base_key() && !actions.is_empty() {
-            actions.push(json!({ "type": "pause", "duration": 16 }));
-        }
         actions.push(key_action(key, true)?);
         actions.push(key_action(key, false)?);
         actions.extend(up);
@@ -935,9 +931,9 @@ impl Driver {
             Page::Chromium(p) => p.send("Input.dispatchKeyEvent", e).map(|_| ()),
             // The session's input state holds the modifiers already down.
             Page::Firefox(_) | Page::Webkit(_) => {
-                // Safari types a symbol with Shift held only from its key's own character (`stroke`).
+                // Safari types a shifted character with Shift held only from its key's own character (`stroke`).
                 let key = match key {
-                    Key::Char(c) if self.mods.get() & 8 != 0 && !c.is_ascii_alphabetic() && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
+                    Key::Char(c) if self.mods.get() & 8 != 0 && self.page.shift_takes_base_key() => Key::Char(keys::us_key(c).map_or(c, |k| k.0)),
                     k => k,
                 };
                 self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": [key_action(key, down)?] }]))

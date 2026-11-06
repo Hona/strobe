@@ -3129,7 +3129,7 @@ is the stable path: Safari's BiDi is not usable yet.
   refuses (`EngineUnsupported`) instead of doing nothing; keys and wheel steps reach the page. It also
   checks in a field how the browser types a shifted symbol: Safari 27 turns Shift with `!` into a dead
   key and types nothing, but types `!` from Shift with `1` (its key's own character), which strobe then
-  sends; WPE types `1` for that and takes Shift with `!`. The checks run on a blank page strobe loads,
+  sends; WPE types `1` for that and takes Shift with `!`. On Safari a shifted letter goes the same way (Shift with `w`): sent as `W` it was sometimes dropped after a click (1 in 5 in a probe, every cold `type` case in three bench runs on air). The checks run on a blank page strobe loads,
   with the window brought forward where macOS lets it; a Safari that does not answer them behind other
   apps refuses `WindowHidden` (the block waits until nobody has used the Mac for a minute).
 - Known differences from a person's browser, where the engine gives no switch: the page's own first

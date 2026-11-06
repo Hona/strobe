@@ -4528,13 +4528,25 @@ frames are 57% of an attribution recording's samples), so `Unsampled` stays for 
 WebKit pages (13.1; 2026-11-06): `target::webdriver` (Classic over std `TcpStream`) and
 `target::webkit` behind `WebPage::Webkit`, sharing the driver's WebDriver input with Firefox.
 Checked against the real drivers before building on them: safaridriver 27.0.1 (macOS 27.0.1, air),
-WebKitWebDriver 2.54 and WPEWebDriver 2.48.3 (Debian 13, vps). On air (in the bench slot), remote
-automation is off and needs an administrator: `record --engine webkit` exits 3 with
-`safaridriver --enable`, and the Safari the failed session request started was ended (none ran
-after); with a Safari started beforehand it refuses `LiveChannel`; `--headless` refuses
-`EngineUnsupported`. Not checked (needs remote automation on, or Safari Technology Preview): a Safari
-session, its XPC process set, roles, window placement, OS frames and the interaction join, and that
-closing leaves no `com.apple.WebKit.*` responsible to it. On vps: WPE headless `--check` passes keys
+WebKitWebDriver 2.54 and WPEWebDriver 2.48.3 (Debian 13, vps). On air (M4, in the bench slot) with
+remote automation off: `record --engine webkit` exits 3 with `safaridriver --enable`, and the Safari the
+failed session request started was ended (none ran after); with a Safari started beforehand it refuses
+`LiveChannel`; `--headless` refuses `EngineUnsupported`. With remote automation on (Safari 27.0.1, no
+Technology Preview): safaridriver refuses a null script timeout (strobe sets a day); `record` of
+example.com for 3 s read 17–25 OS presents (ScreenCaptureKit), `cpu.app.total` 6.8–33% and 229–262 MB
+over Safari and its XPC services; `bench --check` passed 9 of 9 twice (click with `count.adds` 1,
+typing with a shifted `W` and `!`, scroll, a drag with `input.*` refused, `net.*` refused, a page load
+with `count.*` refused, a snapshot), with `cpu.renderer` (web content), `cpu.gpu` (the GPU service) and
+`cpu.browser` all read from the XPC-inclusive set, and `interaction.p50` 54–56 ms (`p95` 58–60 ms) over
+8 clicks with 16–19 presents; Safari's WebDriver events carry a `timeStamp` on another clock (about
+8×10¹¹ ms), so there the input time is the page listener's. After every run no Safari ran and no
+`com.apple.WebKit.*` service was responsible to a Safari or orphaned (a check by
+`responsibility_get_pid_responsible_for_pid`; one GPU service left beside them belonged to
+SoftwareUpdateNotificationManager). An A/A of the click case on AC (6 pairs): `cpu.work` 0.0%
+(−29% … +12%), underpowered, no verdict; the OS sampler used 1.1% of a core over the XPC set
+(`OverheadBudget` warning). One earlier `--check` while other agents' benches kept the Mac busy and
+Safari behind other apps had two launch-time checks time out (now `WindowHidden`, which waits) and
+lost one typed character. Not checked: Safari Technology Preview. On vps: WPE headless `--check` passes keys
 (typing into a focused field), scroll, a page load (with `count.*` refused) and a snapshot, with no
 WebKit process left; WPE's headless view dropped every pointer action without an error (also with
 `cog --platform=headless`), so clicks and drags refuse there (`EngineUnsupported`, from the check at

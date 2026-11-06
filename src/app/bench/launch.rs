@@ -339,8 +339,12 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         // What the launch ended on, once its values and profiles are taken.
         let end = shown::page(ctx, s, v, pair, "end", &shown_page);
         shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| shown::page_shows(&shown_page, sel))?;
+        // `expect.same` once ready, outside the launch's timed span (SPEC 9.10).
+        let same = super::journey::Same::new(s, &ctx.describe["targets"])?;
+        same.read(super::journey::When::Setup, &|sel| crate::driver::text(&shown_page, sel, Duration::from_secs(2)))?;
         Ok(Block {
             shown: Some(shown::Shown { start: shown::Screen::default(), end }),
+            same: same.take(0),
             variant: v.role.to_string(),
             pair,
             values,

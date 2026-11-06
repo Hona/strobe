@@ -142,6 +142,11 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   }
   // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
   // `:focus` selector would otherwise never resolve.
+  // The page's time in strobe's element lookups (`driver.read_ms`): what a read costs its main thread,
+  // never the time a wait spends waiting for the page.
+  s.spent = 0
+  const lookup = s.find
+  s.find = (q) => { const t = performance.now(); try { return lookup(q) } finally { s.spent += performance.now() - t } }
   s.waitFor = (q, timeout, label) => new Promise((resolve, reject) => {
     if (s.find(q)) return resolve(true)
     let done = false
@@ -259,6 +264,9 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     for (const e of events) document.addEventListener(e, yes, true)
     const t = setTimeout(() => done(false), timeout)
   })
+  // An input's whole look at the page in one call (`driver.reads` counts it once): wait for the element,
+  // then its centre (scrolled into view) and whether focus is in it; the wait's timeout rejects.
+  s.aim = (q, timeout, label) => s.waitFor(q, timeout, label).then(() => { const b = s.box(q); return b && { ...b, focused: s.focused(q) } })
   // What `expect.same` compares: a field's value, else the element's text; null when it never showed.
   s.text = (q, timeout) => s.waitFor(q, timeout, "").then(() => {
     const el = s.find(q)
@@ -428,8 +436,9 @@ pub struct Driver {
     pub inputs: RefCell<Vec<(u64, bool)>>,
     /// A page measured from outside against a native implementation: its input goes through the OS.
     pub os: std::cell::OnceCell<os::OsInput>,
-    /// Reads of the page through the probe (a wait, finding an element): `driver.reads` per run.
-    pub reads: Cell<u64>,
+    /// strobe's looks at the page through the probe since the last `take_reads` (an input's aim, an
+    /// `until` or `waitFor` selector; never `idle` or `frame`): `driver.reads`.
+    reads: Cell<u64>,
 }
 
 impl Driver {
@@ -450,6 +459,19 @@ impl Driver {
             os: std::cell::OnceCell::new(),
             reads: Cell::new(0),
         }
+    }
+
+    /// The reads of the page since the last call, and the page's time in them (ms, its main thread's
+    /// lookups, from the probe): `driver.reads`, `driver.read_ms`. Read between runs, never inside one.
+    pub fn take_reads(&self) -> (u64, f64) {
+        let ms = self.page.eval("(() => { const s = window.__strobe; if (!s) return 0; const v = s.spent ?? 0; s.spent = 0; return v })()").ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
+        (self.reads.replace(0), ms)
+    }
+
+    /// A look at the page that `driver.reads` counts.
+    fn read(&self, expr: &str, timeout: Duration) -> Result<Value> {
+        self.reads.set(self.reads.get() + 1);
+        self.wait(expr, timeout)
     }
 
     fn sel(v: &Value) -> Result<Selector> {
@@ -602,13 +624,11 @@ impl Driver {
     }
 
     fn call(&self, expr: &str) -> Result<Value> {
-        self.reads.set(self.reads.get() + 1);
         helped(&self.page, expr, Duration::from_secs(60))
     }
 
     /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
     fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
-        self.reads.set(self.reads.get() + 1);
         // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
         // a destroyed context, which says nothing about what happened to the page.
         helped(&self.page, expr, timeout + Duration::from_secs(10)).map_err(|e| {
@@ -622,7 +642,7 @@ impl Driver {
 
     /// Waits for a visible element `sel` matches.
     fn wait_for(&self, sel: &Selector, t: Duration) -> Result<Value> {
-        self.wait(&format!("__strobe.waitFor({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)
+        self.read(&format!("__strobe.waitFor({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)
     }
 
     /// Writes a `performance.mark` that the trace (or Firefox's profiler) records on its own clock.
@@ -662,8 +682,8 @@ impl Driver {
             return Ok(());
         }
         let sel = Self::sel(sel)?;
-        let (x, y) = self.locate(&sel, o)?;
-        if self.call(&format!("__strobe.focused({})", sel.page_spec()))?.as_bool() != Some(true) {
+        let (x, y, focused) = self.aim(&sel, o)?;
+        if !focused {
             let held = self.buttons.get().0;
             self.pointer.set((x, y));
             self.mouse("mouseMoved", (x, y), None, held, 0, 0)?;
@@ -855,12 +875,17 @@ impl Driver {
 
     /// Waits for the element, then returns the point to send input at.
     fn locate(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64)> {
-        self.wait_for(sel, self.timeout(opts))?;
-        let b = self.call(&format!("__strobe.box({})", sel.page_spec()))?;
+        self.aim(sel, opts).map(|(x, y, _)| (x, y))
+    }
+
+    /// `locate`, and whether focus is in the element: one look at the page (`__strobe.aim`).
+    fn aim(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64, bool)> {
+        let t = self.timeout(opts);
+        let b = self.read(&format!("__strobe.aim({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)?;
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
-        Ok((b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0)))
+        Ok((b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0), b["focused"] == true))
     }
 
     fn until(&self, opts: &Value) -> Result<Value> {

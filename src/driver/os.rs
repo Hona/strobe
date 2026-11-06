@@ -45,14 +45,21 @@ const SCRIPT: &str = r#"window.__strobeOs ??= (() => {
 /// Quiet that counts as the page at rest before a measured input (as for native apps, §7.4).
 const REST_MAX: Duration = Duration::from_millis(300);
 
+/// A window's frame and client size.
+type Geometry = ((i32, i32, i32, i32), (i32, i32));
+
 pub struct OsInput {
     poster: Poster,
     pids: RefCell<Vec<u32>>,
-    /// The browser's window: keys go to it.
-    top: isize,
+    /// The browser's window (keys go to it), and its frame and client size when strobe last mapped
+    /// the page onto the screen: a window that moved, resized or was replaced is mapped again.
+    top: Cell<isize>,
+    geometry: Cell<Geometry>,
     /// Screen = origin + page point × scale (screen units: physical pixels, points on macOS).
-    origin: (f64, f64),
-    scale: (f64, f64),
+    origin: Cell<(f64, f64)>,
+    scale: Cell<(f64, f64)>,
+    /// The display's refresh period under the window (ms), from its display path.
+    frame_ms: Cell<f64>,
     presents: Presents,
     log: RefCell<Log>,
     last_input: Cell<u64>,
@@ -65,6 +72,9 @@ pub struct OsInput {
     document: Cell<f64>,
     parked: Cell<Option<bool>>,
     pacer: super::Pacer,
+    /// The series reads `expect.same`, which shows whether a menu chord did on the page what it did on
+    /// the other side (macOS, `press`).
+    pub vouched: Cell<bool>,
 }
 
 fn refused(summary: String) -> Error {
@@ -73,49 +83,77 @@ fn refused(summary: String) -> Error {
         .into()
 }
 
+fn locked() -> Error {
+    Error::refused("SessionLocked", "OS input to the page: the session is locked, so the OS hit-tests every point to the lock screen", "run pointer and key journeys on an unlocked session")
+}
+
 impl OsInput {
     /// Measures where the page lies on the screen from two posted pointer moves, which must reach it.
     pub fn attach(page: &Page, pids: Vec<u32>, presents: Presents) -> Result<OsInput> {
         page.add_init_script(SCRIPT)?;
         page.eval(SCRIPT)?;
+        let os = OsInput {
+            poster: Poster::start()?,
+            pids: RefCell::new(pids),
+            top: Cell::new(0),
+            geometry: Cell::new(((0, 0, 0, 0), (0, 0))),
+            origin: Cell::new((0.0, 0.0)),
+            scale: Cell::new((1.0, 1.0)),
+            frame_ms: Cell::new(1000.0 / 60.0),
+            presents,
+            log: RefCell::new(Log::default()),
+            last_input: Cell::new(0),
+            pointer: Cell::new(None),
+            pressed: Cell::new(None),
+            posted: Cell::new([0; 3]),
+            document: Cell::new(0.0),
+            parked: Cell::new(None),
+            pacer: super::Pacer::default(),
+            vouched: Cell::new(false),
+        };
+        os.map(page)?;
+        Ok(os)
+    }
+
+    /// Maps the page onto the screen again when its window moved, resized or was replaced since the
+    /// last map (setup may do any of those): after setup, before the runs.
+    pub fn recheck(&self, page: &Page) -> Result<()> {
+        let w = host::main_window(&self.pids.borrow()).ok_or_else(|| Error::msg("OS input to the page: the browser shows no window"))?;
+        if w.hwnd != self.top.get() || (w.rect, w.client) != self.geometry.get() { self.map(page) } else { Ok(()) }
+    }
+
+    /// Two points in the page's lower part, as screen points through the input thread's own
+    /// (DPI-aware) coordinates, each posted as a move from just beside it; where the trusted
+    /// `pointermove`s landed in the page gives the origin and scale, and proves posted input reaches it.
+    fn map(&self, page: &Page) -> Result<()> {
         if host::session_locked() {
-            return Err(Error::refused(
-                "SessionLocked",
-                "OS input to the page: the session is locked, so the OS hit-tests every point to the lock screen",
-                "run pointer and key journeys on an unlocked session",
-            ));
+            return Err(locked());
         }
+        let pids = self.pids.borrow().clone();
         let w = host::main_window(&pids).ok_or_else(|| Error::msg("OS input to the page: the browser shows no window"))?;
-        let poster = Poster::start()?;
-        let (x, y, ww, wh) = (w.rect.0 as f64, w.rect.1 as f64, w.rect.2 as f64, w.rect.3 as f64);
-        // Two points well inside the window's lower part, where the page draws (a title bar or a
-        // browser's toolbar is above it), far apart for an exact scale.
-        let probes = [(x + 0.3 * ww, y + 0.55 * wh), (x + 0.7 * ww, y + 0.85 * wh)];
+        let size = page.eval("[innerWidth, innerHeight]")?;
+        let (iw, ih) = (size[0].as_f64().unwrap_or(0.0), size[1].as_f64().unwrap_or(0.0));
+        let dip = [(0.3 * iw, 0.55 * ih), (0.7 * iw, 0.85 * ih)];
+        let mut probes = Vec::new();
         let mut landed = Vec::new();
-        for (px, py) in probes {
-            let t = poster.target(&pids, px, py)?;
-            poster.park(px, py)?;
+        for (dx, dy) in dip {
+            let (px, py) = self.poster.client_point(w.hwnd, dx, dy)?;
+            let t = self.poster.target(&pids, px, py)?;
+            self.poster.park(px, py)?;
+            // A move onto the point the pointer already sits on sends nothing on X11: come from beside
+            // it, let that move arrive, and only then look for the one onto the point.
             page.eval("__strobeOs.moves = [], true")?;
-            // A move onto the point the pointer already sits on sends nothing on X11: come from beside it.
-            poster.move_to(t.moved(px - 3.0, py - 3.0), 0)?;
-            poster.move_to(t, 0)?;
-            let until = Instant::now() + Duration::from_secs(1);
-            let got = loop {
-                let m = page.eval("JSON.stringify(__strobeOs.moves.at(-1) ?? null)")?;
-                if let Some(p) = m.as_str().and_then(|s| serde_json::from_str::<Option<[f64; 2]>>(s).ok()).flatten() {
-                    // The move onto the point, not the one beside it.
-                    std::thread::sleep(Duration::from_millis(30));
-                    let last = page.eval("JSON.stringify(__strobeOs.moves.at(-1))")?;
-                    break last.as_str().and_then(|s| serde_json::from_str::<[f64; 2]>(s).ok()).unwrap_or(p);
-                }
-                if Instant::now() >= until {
-                    return Err(refused(format!(
-                        "OS pointer input did not reach the page: no trusted pointer move came to it within a second of strobe posting one at ({px:.0}, {py:.0}) through the OS{}",
-                        if cfg!(windows) { " (posted window messages)" } else { "" }
-                    )));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-            };
+            self.poster.move_to(t.moved(px - 3.0, py - 3.0), 0)?;
+            self.wait_move(page, Duration::from_millis(300))?;
+            page.eval("__strobeOs.moves = [], true")?;
+            self.poster.move_to(t, 0)?;
+            let got = self.wait_move(page, Duration::from_secs(1))?.ok_or_else(|| {
+                refused(format!(
+                    "OS pointer input did not reach the page: no trusted pointer move came to it within a second of strobe posting one at ({px:.0}, {py:.0}) through the OS{}",
+                    if cfg!(windows) { " (posted window messages)" } else { "" }
+                ))
+            })?;
+            probes.push((px, py));
             landed.push(got);
         }
         let (dx, dy) = (landed[1][0] - landed[0][0], landed[1][1] - landed[0][1]);
@@ -128,24 +166,28 @@ impl OsInput {
                 probes[1].1 - probes[0].1
             )));
         }
-        let origin = (probes[0].0 - landed[0][0] * scale.0, probes[0].1 - landed[0][1] * scale.1);
-        let document = page.eval("performance.timeOrigin")?.as_f64().unwrap_or(0.0);
-        Ok(OsInput {
-            poster,
-            pids: RefCell::new(pids),
-            top: w.hwnd,
-            origin,
-            scale,
-            presents,
-            log: RefCell::new(Log::default()),
-            last_input: Cell::new(0),
-            pointer: Cell::new(None),
-            pressed: Cell::new(None),
-            posted: Cell::new([0; 3]),
-            document: Cell::new(document),
-            parked: Cell::new(None),
-            pacer: super::Pacer::default(),
-        })
+        self.origin.set((probes[0].0 - landed[0][0] * scale.0, probes[0].1 - landed[0][1] * scale.1));
+        self.scale.set(scale);
+        self.top.set(w.hwnd);
+        self.geometry.set((w.rect, w.client));
+        self.frame_ms.set(host::display_of(w.hwnd).filter(|d| d.hz > 1.0).map_or(1000.0 / 60.0, |d| 1000.0 / d.hz));
+        self.document.set(page.eval("performance.timeOrigin")?.as_f64().unwrap_or(0.0));
+        Ok(())
+    }
+
+    /// The last trusted pointer move the page saw, once one came within `t`.
+    fn wait_move(&self, page: &Page, t: Duration) -> Result<Option<[f64; 2]>> {
+        let until = Instant::now() + t;
+        loop {
+            let m = page.eval("JSON.stringify(__strobeOs.moves.at(-1) ?? null)")?;
+            if let Some(p) = m.as_str().and_then(|s| serde_json::from_str::<Option<[f64; 2]>>(s).ok()).flatten() {
+                return Ok(Some(p));
+            }
+            if Instant::now() >= until {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     /// The browser's processes now (a renderer may come or go): what the pointer may hit.
@@ -164,7 +206,8 @@ impl OsInput {
     }
 
     fn screen(&self, x: f64, y: f64) -> (f64, f64) {
-        (self.origin.0 + x * self.scale.0, self.origin.1 + y * self.scale.1)
+        let (o, k) = (self.origin.get(), self.scale.get());
+        (o.0 + x * k.0, o.1 + y * k.1)
     }
 
     fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
@@ -178,9 +221,9 @@ impl OsInput {
         self.posted.set(p);
     }
 
-    /// The display's frame period at a screen point.
-    fn frame(&self, x: f64, y: f64) -> Duration {
-        Duration::from_millis(host::refresh_at(x as i32, y as i32).map_or(16, |hz| (1000 / hz.max(1)).max(4) as u64))
+    /// The display's refresh period, whole milliseconds (the native driver's waits between steps).
+    fn frame(&self) -> Duration {
+        Duration::from_millis((self.frame_ms.get() as u64).max(4))
     }
 
     fn park(&self, x: f64, y: f64) -> Result<()> {
@@ -191,7 +234,7 @@ impl OsInput {
     /// The window the OS hit-tests at a screen point, which must be the browser's.
     fn target(&self, x: f64, y: f64) -> Result<Target> {
         if host::session_locked() {
-            return Err(Error::refused("SessionLocked", "OS input to the page: the session is locked", "run pointer and key journeys on an unlocked session"));
+            return Err(locked());
         }
         self.poster.target(&self.pids.borrow(), x, y)
     }
@@ -212,7 +255,7 @@ impl OsInput {
 
     fn button(&self, b: Button, down: bool) -> Result<u64> {
         let (_, _, t) = self.pointer.get().ok_or_else(|| Error::usage("page.down(\"Mouse\") presses where the pointer is: move it first (hover, move, or down's at option)"))?;
-        let at = self.poster.button(t, b, down, false, Mods::default(), self.top)?;
+        let at = self.poster.button(t, b, down, false, Mods::default(), self.top.get())?;
         self.pressed.set(down.then_some(b));
         if down {
             self.count(1);
@@ -244,7 +287,7 @@ impl OsInput {
         if let Some(b) = self.pressed.get() {
             let _ = self.button(b, false);
         }
-        self.poster.release_all(self.top);
+        self.poster.release_all(self.top.get());
     }
 
     /// The run's inputs a latency is measured from (a click's release, a key press, a scroll's first
@@ -253,33 +296,42 @@ impl OsInput {
         log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| (i.t_ns, i.kind == "scroll")).collect()
     }
 
-    /// Refuses `InputMismatch` when keys, button presses or wheel turns strobe posted since the last
-    /// check reached the page as none, a second after it began looking (posted input reaches the page
-    /// on its own time; a document that changed meanwhile, a navigation, leaves it to the next check).
-    /// Read between runs.
+    /// Starts a count of what arrives (before each run, and its reset): strobe's posted input and the
+    /// page's trusted events from zero, so one stretch's input never covers for another's.
+    pub fn begin(&self, page: &Page) -> Result<()> {
+        self.posted.set([0; 3]);
+        let v = page.eval("window.__strobeOs && (__strobeOs.keys = __strobeOs.presses = __strobeOs.wheels = 0), performance.timeOrigin")?;
+        self.document.set(v.as_f64().unwrap_or(0.0));
+        Ok(())
+    }
+
+    /// Refuses `InputMismatch` unless what strobe posted since `begin` reached the page as trusted
+    /// events: keys and button presses at least 95% of those posted, wheel turns some (a page
+    /// coalesces them), within a second of looking (posted input reaches the page on its own time). A
+    /// document that changed meanwhile (a navigation) took its counts with it: nothing to check.
     pub fn delivered(&self, page: &Page) -> Result<()> {
         let posted = self.posted.get();
         if posted == [0; 3] {
             return Ok(());
         }
+        let enough = |i: usize, got: f64| if i == 2 { posted[i] == 0 || got > 0.0 } else { got >= 0.95 * posted[i] as f64 };
         let until = Instant::now() + Duration::from_secs(1);
         let r = loop {
-            let v = page.eval("JSON.stringify([performance.timeOrigin, __strobeOs?.keys ?? 0, __strobeOs?.presses ?? 0, __strobeOs?.wheels ?? 0])")?;
+            let v = page.eval("JSON.stringify([performance.timeOrigin, window.__strobeOs?.keys ?? 0, window.__strobeOs?.presses ?? 0, window.__strobeOs?.wheels ?? 0])")?;
             let r: Vec<f64> = v.as_str().and_then(|s| serde_json::from_str::<Vec<f64>>(s).ok()).unwrap_or_default();
             if r.len() < 4 || r[0] != self.document.get() {
+                self.posted.set([0; 3]);
                 self.document.set(r.first().copied().unwrap_or(0.0));
                 return Ok(());
             }
-            if (0..3).all(|i| posted[i] == 0 || r[i + 1] > 0.0) || Instant::now() >= until {
+            if (0..3).all(|i| enough(i, r[i + 1])) || Instant::now() >= until {
                 break r;
             }
             std::thread::sleep(Duration::from_millis(20));
         };
-        page.eval("__strobeOs && (__strobeOs.keys = __strobeOs.presses = __strobeOs.wheels = 0), true")?;
-        self.posted.set([0; 3]);
         for (i, what) in ["keys", "mouse button presses", "wheel turns"].iter().enumerate() {
-            if posted[i] > 0 && r[i + 1] == 0.0 {
-                return Err(refused(format!("OS input did not reach the page: strobe posted {} {what} through the OS and the page received none in a second", posted[i])));
+            if !enough(i, r[i + 1]) {
+                return Err(refused(format!("OS input did not reach the page: strobe posted {} {what} through the OS and the page received {} in a second", posted[i], r[i + 1])));
             }
         }
         Ok(())
@@ -295,6 +347,24 @@ impl OsInput {
         }
         Ok(Some(v.next_screen_ns))
     }
+}
+
+/// macOS: Command+A, C, V, X and Z posted through the OS reach the page's keydown with their
+/// modifiers, but the browser's menu, which does what they do in a field (select all, copy, paste,
+/// cut, undo), never sees them, whether posted to its process or into the session's or the HID event
+/// stream (checked on air): the page side would skip what the native side did. Refused unless
+/// `expect.same` shows both sides reached the same place.
+fn menu_chord(os: &OsInput, text: &str, mods: Mods, key: Key) -> Result<()> {
+    let edit = matches!(key, Key::Char(c) if "acvxz".contains(c.to_ascii_lowercase()));
+    if cfg!(target_os = "macos") && mods.meta && edit && !os.vouched.get() {
+        return Err(Refusal::new(
+            ValidatorId::InputMismatch,
+            format!("press({text:?}) through the OS: macOS gives the page the keys, never the browser's menu, which does what the chord does in a field, so the page side would skip it"),
+        )
+        .fix("declare expect.same on what the chord changes, so a pair whose sides ended apart is refused; or give the page side the chord's effect another way")
+        .into());
+    }
+    Ok(())
 }
 
 impl Driver {
@@ -322,7 +392,7 @@ impl Driver {
                 let o = opts(2);
                 self.os_focus(os, &sel(0), &o)?;
                 let delay = Duration::from_millis(o["delay"].as_f64().unwrap_or(0.0).max(0.0) as u64);
-                os.rest(Duration::ZERO, os.frame(os.origin.0, os.origin.1))?;
+                os.rest(Duration::ZERO, os.frame())?;
                 let mut last = host::now_ns();
                 for (k, c) in s(1).chars().enumerate() {
                     if k > 0 && !delay.is_zero() {
@@ -333,7 +403,7 @@ impl Driver {
                         '\t' => Key::Named(Named::Tab),
                         c => Key::Char(c),
                     };
-                    last = os.poster.press(os.top, None, Mods::default(), key)?;
+                    last = os.poster.press(os.top.get(), None, Mods::default(), key)?;
                     os.count(0);
                     os.input(last, "discrete", false);
                 }
@@ -343,7 +413,8 @@ impl Driver {
                 let o = opts(1);
                 self.os_focus(os, &o["selector"], &o)?;
                 let (mods, key) = keys::parse_chord(&s(0))?;
-                let at = os.poster.press(os.top, None, mods, key)?;
+                menu_chord(os, &s(0), mods, key)?;
+                let at = os.poster.press(os.top.get(), None, mods, key)?;
                 os.count(0);
                 os.input(at, "discrete", false);
                 (o, at)
@@ -369,7 +440,7 @@ impl Driver {
                 if mods.any() {
                     return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
                 }
-                let at = if call == "down" { os.poster.hold(os.top, key)? } else { os.poster.release(os.top, key)? };
+                let at = if call == "down" { os.poster.hold(os.top.get(), key)? } else { os.poster.release(os.top.get(), key)? };
                 if call == "down" {
                     os.count(0);
                 }
@@ -382,7 +453,7 @@ impl Driver {
                 let (x, y, t) = self.os_aim(os, &sel(0), &o)?;
                 os.park(x, y)?;
                 os.input(os.poster.move_to(t, 0)?, "pointer", false);
-                let frame = os.frame(x, y);
+                let frame = os.frame();
                 os.rest(Duration::ZERO, frame)?;
                 let (by_y, by_x) = (d["by"].as_f64().unwrap_or(0.0), d["byX"].as_f64().unwrap_or(0.0));
                 // The native driver's pace: one wheel step per refresh at `speed` (default 3000 px/s).
@@ -420,7 +491,7 @@ impl Driver {
                 };
                 os.park(x, y)?;
                 os.input(os.poster.move_to(t, 0)?, "pointer", false);
-                os.rest(Duration::ZERO, os.frame(x, y))?;
+                os.rest(Duration::ZERO, os.frame())?;
                 let (dx, dy) = (d["dx"].as_f64().unwrap_or(0.0), d["dy"].as_f64().unwrap_or(0.0));
                 let at = os.poster.wheel(t, dx, dy)?;
                 if at == 0 {
@@ -446,32 +517,42 @@ impl Driver {
     /// The element's centre (scrolled into view) as a screen point, and the browser window the OS
     /// hit-tests there (another window over it refuses `WindowHidden`).
     fn os_aim(&self, os: &OsInput, sel: &Value, o: &Value) -> Result<(f64, f64, Target)> {
-        let (cx, cy) = self.locate(&Self::sel(sel)?, o)?;
+        self.os_aim_focus(os, sel, o).map(|(x, y, t, _)| (x, y, t))
+    }
+
+    /// `os_aim`, and whether focus is in the element: one look at the page.
+    fn os_aim_focus(&self, os: &OsInput, sel: &Value, o: &Value) -> Result<(f64, f64, Target, bool)> {
+        let (cx, cy, focused) = self.aim(&Self::sel(sel)?, o)?;
         let (x, y) = os.screen(cx, cy);
-        Ok((x, y, os.target(x, y)?))
+        Ok((x, y, os.target(x, y)?, focused))
     }
 
     fn os_click(&self, os: &OsInput, sel: &Value, o: &Value, kind: &'static str) -> Result<u64> {
-        let (x, y, t) = self.os_aim(os, sel, o)?;
+        let aimed = self.os_aim(os, sel, o)?;
+        self.os_click_at(os, aimed, o, kind)
+    }
+
+    /// A click at an aimed point.
+    fn os_click_at(&self, os: &OsInput, (x, y, t): (f64, f64, Target), o: &Value, kind: &'static str) -> Result<u64> {
         let b = Button::parse(o["button"].as_str())?;
         let mods = Mods::parse_list(&o["modifiers"])?;
         let count = o["count"].as_u64().unwrap_or(1).clamp(1, 3);
         os.park(x, y)?;
         os.input(os.poster.move_to(t, 0)?, "pointer", false);
         os.pointer.set(Some((x, y, t)));
-        let gap = os.frame(x, y);
+        let gap = os.frame();
         let mut last = 0;
         for k in 0..count {
             // The press shows a pressed look at most; the release is the click's action, held as a
             // person holds a click (a double click's second press follows at once).
-            os.input(os.poster.button(t, b, true, k > 0, mods, os.top)?, "pointer", false);
+            os.input(os.poster.button(t, b, true, k > 0, mods, os.top.get())?, "pointer", false);
             os.count(1);
             if count > 1 {
                 std::thread::sleep(gap);
             } else {
                 os.rest(Duration::from_millis(60), gap)?;
             }
-            last = os.poster.button(t, b, false, false, mods, os.top)?;
+            last = os.poster.button(t, b, false, false, mods, os.top.get())?;
             os.input(last, kind, false);
         }
         Ok(last)
@@ -483,10 +564,9 @@ impl Driver {
         if no_selector(sel) {
             return Ok(());
         }
-        let parsed = Self::sel(sel)?;
-        self.locate(&parsed, o)?;
-        if self.call(&format!("__strobe.focused({})", parsed.page_spec()))?.as_bool() != Some(true) {
-            self.os_click(os, sel, &json!({}), "pointer")?;
+        let (x, y, t, focused) = self.os_aim_focus(os, sel, o)?;
+        if !focused {
+            self.os_click_at(os, (x, y, t), &json!({}), "pointer")?;
         }
         Ok(())
     }
@@ -503,7 +583,7 @@ impl Driver {
         let b = Button::parse(o["button"].as_str())?;
         let point = |t: f64| {
             let (dx, dy) = keys::path_at(&path, t);
-            (x0 + dx * os.scale.0, y0 + dy * os.scale.1)
+            (x0 + dx * os.scale.get().0, y0 + dy * os.scale.get().1)
         };
         let (x, y) = point(0.0);
         os.pointer_to(x, y, t0.moved(x, y))?;
@@ -515,7 +595,7 @@ impl Driver {
         }
         let duration = o["duration"].as_f64().unwrap_or(1000.0).max(1.0);
         // The refresh period unrounded (16.67 ms at 60 Hz), as the native driver paces its drags.
-        let frame = host::refresh_at(x0 as i32, y0 as i32).map_or(1000.0 / 60.0, |hz| 1000.0 / hz.max(1) as f64);
+        let frame = os.frame_ms.get();
         let steps = (duration / frame).ceil().max(1.0) as u32;
         let start = Instant::now();
         let mut last = 0;

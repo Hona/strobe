@@ -10,19 +10,25 @@ use super::*;
 /// `@name` (and any filters after it, `@row index=-1`) as `target`'s adapter entry (`ui`); any
 /// other selector as it is. The bench file's hooks resolve their own in the runner; this is for the
 /// selectors strobe reads from the file (`expect`, a launch's `until`).
-pub(super) fn alias(sel: &Value, ui: &Value, target: &str) -> Result<Value> {
+/// `targets`: the bench file's targets, whose adapters say whether a missing name is a gap (another
+/// target has it) or a typo (none has it).
+pub(super) fn alias(sel: &Value, targets: &Value, target: &str) -> Result<Value> {
+    let ui = &targets[target]["ui"];
     match sel {
         Value::String(s) if s.starts_with('@') => {
             let (name, rest) = s[1..].split_once(char::is_whitespace).map_or((&s[1..], ""), |(n, r)| (n, r.trim()));
             match &ui[name] {
                 Value::String(e) => Ok(Value::String(if rest.is_empty() { e.clone() } else { format!("{e} {rest}") })),
+                Value::Null if !targets.as_object().into_iter().flatten().any(|(_, t)| !t["ui"][name].is_null()) => {
+                    Err(Error::usage(format!("{s:?}: @{name} is in no target's ui (a typo?): give the targets that run the case a ui entry {name}")))
+                }
                 Value::Null => Err(Refusal::new(ValidatorId::ParityGap, format!("{target} has no @{name}")).fix(format!("give {target}'s ui @{name}, or mark the case unsupported there")).into()),
                 _ => Err(Error::usage(format!("@{name} is a step of {target}'s ui, not a selector: expect and until take a selector entry"))),
             }
         }
         Value::Object(o) if o.get("selector").and_then(Value::as_str).is_some_and(|s| s.starts_with('@')) => {
             let mut o = o.clone();
-            o["selector"] = alias(&o["selector"], ui, target)?;
+            o["selector"] = alias(&o["selector"], targets, target)?;
             Ok(Value::Object(o))
         }
         _ => Ok(sel.clone()),
@@ -31,27 +37,27 @@ pub(super) fn alias(sel: &Value, ui: &Value, target: &str) -> Result<Value> {
 
 /// A target's `expect` with the case's over it, its `visible` selectors through the target's
 /// adapter. `same` stays as the file wrote it: its names key the equivalence table.
-pub(super) fn side_expect(target_def: &Value, case_expect: &Value, target: &str) -> Result<Value> {
-    let mut e = merged_expect(target_def, case_expect);
-    let ui = &target_def["ui"];
+pub(super) fn side_expect(targets: &Value, case_expect: &Value, target: &str) -> Result<Value> {
+    let mut e = merged_expect(&targets[target], case_expect);
     match &e["visible"] {
-        Value::Array(a) => e["visible"] = Value::Array(a.iter().map(|v| alias(v, ui, target)).collect::<Result<_>>()?),
-        v if !v.is_null() => e["visible"] = alias(v, ui, target)?,
+        Value::Array(a) => e["visible"] = Value::Array(a.iter().map(|v| alias(v, targets, target)).collect::<Result<_>>()?),
+        v if !v.is_null() => e["visible"] = alias(v, targets, target)?,
         _ => {}
     }
     Ok(e)
 }
 
 /// A launch case's `launch` with its `until` selector through the target's adapter.
-pub(super) fn side_launch(launch: &Value, ui: &Value, target: &str) -> Result<Value> {
+pub(super) fn side_launch(launch: &Value, targets: &Value, target: &str) -> Result<Value> {
     let mut l = launch.clone();
     if launch["until"].is_string() || launch["until"].get("selector").is_some() {
-        l["until"] = alias(&launch["until"], ui, target)?;
+        l["until"] = alias(&launch["until"], targets, target)?;
     }
     Ok(l)
 }
 
-/// What one `expect.same` element read in a block: after setup, after each run, after each reset.
+/// What one `expect.same` element read in a block: after setup (a launch: once ready), after each
+/// measured run and each reset after it, in order.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, serde::Deserialize)]
 #[serde(default)]
 pub(super) struct Reads {
@@ -64,6 +70,11 @@ impl Reads {
     /// What the journey ended on: the last run's read, else setup's.
     fn last(&self) -> Option<&String> {
         self.run.last().or(self.setup.as_ref())
+    }
+
+    /// Every read found no element.
+    fn never(&self) -> bool {
+        self.setup.iter().chain(&self.run).chain(&self.reset).all(|r| r == NONE)
     }
 }
 
@@ -90,18 +101,23 @@ pub(super) struct Same {
 }
 
 impl Same {
-    pub(super) fn new(s: &Series, target_def: &Value) -> Result<Same> {
-        let list = s.expect["same"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|v| Ok((v.as_str().map_or_else(|| v.to_string(), str::to_string), alias(v, &target_def["ui"], &s.target)?)))
-            .collect::<Result<Vec<_>>>()?;
+    /// `targets`: the bench file's targets.
+    pub(super) fn new(s: &Series, targets: &Value) -> Result<Same> {
+        let list =
+            s.expect["same"].as_array().into_iter().flatten().map(|v| Ok((v.as_str().map_or_else(|| v.to_string(), str::to_string), alias(v, targets, &s.target)?))).collect::<Result<Vec<_>>>()?;
         Ok(Same { list, reads: RefCell::new(BTreeMap::new()) })
     }
 
     pub(super) fn on(&self) -> bool {
         !self.list.is_empty()
+    }
+
+    /// Nothing to read when `off` (a windowless app).
+    pub(super) fn unless(mut self, off: bool) -> Same {
+        if off {
+            self.list.clear();
+        }
+        self
     }
 
     /// Reads each element now with `text` (its normalized text or value; None when it never showed).
@@ -119,8 +135,15 @@ impl Same {
         Ok(())
     }
 
-    pub(super) fn take(&self) -> BTreeMap<String, Reads> {
-        std::mem::take(&mut self.reads.borrow_mut())
+    /// The reads, without those of the `first` warmup runs (and their resets): the sides' warmups
+    /// differ in length, their measured runs do not.
+    pub(super) fn take(&self, first: usize) -> BTreeMap<String, Reads> {
+        let mut out = std::mem::take(&mut *self.reads.borrow_mut());
+        for r in out.values_mut() {
+            r.run.drain(..first.min(r.run.len()));
+            r.reset.drain(..first.min(r.reset.len()));
+        }
+        out
     }
 }
 
@@ -159,8 +182,15 @@ pub(super) fn pair_refusal(adapted: bool, names: (&str, &str), base: &Block, hea
     let keys: std::collections::BTreeSet<&String> = base.same.keys().chain(head.same.keys()).collect();
     for name in keys {
         let (b, h) = (base.same.get(name).cloned().unwrap_or_default(), head.same.get(name).cloned().unwrap_or_default());
+        // Two sides that never showed it agree on nothing.
+        if b.never() && h.never() {
+            return Some(
+                Refusal::new(ValidatorId::NotEquivalent, format!("{name} showed on neither side ({} nor {}): nothing shows that both reached the same place", names.0, names.1))
+                    .fix("point expect.same at an element both sides show, through each side's ui"),
+            );
+        }
         if let Some((when, x, y)) = disagree(&b, &h) {
-            let show = |v: &Set| v.iter().map(|t| format!("{:?}", t.chars().take(80).collect::<String>())).collect::<Vec<_>>().join(" / ");
+            let show = |v: &[String]| v.iter().map(|t| format!("{:?}", t.chars().take(80).collect::<String>())).collect::<Vec<_>>().join(" / ");
             return Some(
                 Refusal::new(ValidatorId::NotEquivalent, format!("{name} read differently {when}: {} {} vs {} {}", names.0, show(&x), names.1, show(&y)))
                     .fix("make both sides end on the same screen and data (the same fixture seed, the same steps), or name an element both show the same way"),
@@ -183,11 +213,14 @@ pub(super) fn pair_refusal(adapted: bool, names: (&str, &str), base: &Block, hea
         ));
     }
     if !adapted {
+        // Each kind of call within 5% of the side that gave more of it: two clicks are not a press and a click.
         let keys: std::collections::BTreeSet<&String> = base.ops.keys().chain(head.ops.keys()).collect();
-        let off: f64 = keys.iter().map(|k| (base.ops.get(*k).copied().unwrap_or(0.0) - head.ops.get(*k).copied().unwrap_or(0.0)).abs()).sum();
-        let most = total(&base.ops).max(total(&head.ops)) + base.ops.get("act").copied().unwrap_or(0.0).max(head.ops.get("act").copied().unwrap_or(0.0));
-        if most > 0.0 && off / most > 0.05 {
-            return mismatch(format!("the sides' runs gave other input ({}: {}; {}: {})", names.0, ops_text(&base.ops), names.1, ops_text(&head.ops)));
+        let off = keys.into_iter().find(|k| {
+            let (a, b) = (base.ops.get(*k).copied().unwrap_or(0.0), head.ops.get(*k).copied().unwrap_or(0.0));
+            (a - b).abs() > 0.05 * a.max(b)
+        });
+        if let Some(k) = off {
+            return mismatch(format!("the sides' runs gave other input ({k}; {}: {}; {}: {})", names.0, ops_text(&base.ops), names.1, ops_text(&head.ops)));
         }
     }
     if let (Some(&a), Some(&b)) = (base.values.get("input.rate"), head.values.get("input.rate"))
@@ -209,7 +242,7 @@ pub(super) fn equivalence(blocks: &[Block]) -> Value {
         .into_iter()
         .map(|name| {
             let read = |i: usize| blocks[i].same.get(name).cloned().unwrap_or_default();
-            let ok = pairs.iter().all(|&(a, b)| disagree(&read(a), &read(b)).is_none());
+            let ok = pairs.iter().all(|&(a, b)| disagree(&read(a), &read(b)).is_none() && !(read(a).never() && read(b).never()));
             let last = pairs.last().map(|&(a, b)| (read(a), read(b))).unwrap_or_default();
             json!({ "selector": name, "base": last.0.last(), "head": last.1.last(), "ok": ok, "pairs": pairs.len() })
         })
@@ -217,21 +250,19 @@ pub(super) fn equivalence(blocks: &[Block]) -> Value {
         .into()
 }
 
-type Set = std::collections::BTreeSet<String>;
-
-/// Where two blocks' reads of one element differ, with what each read there: after setup, or the
-/// values read after its runs or its resets (a block's warmup runs read too, so as sets).
-fn disagree(a: &Reads, b: &Reads) -> Option<(&'static str, Set, Set)> {
-    let set = |v: &[String]| v.iter().cloned().collect::<Set>();
-    [("after setup", a.setup.iter().cloned().collect(), b.setup.iter().cloned().collect()), ("after a run", set(&a.run), set(&b.run)), ("after a reset", set(&a.reset), set(&b.reset))]
+/// Where two blocks' reads of one element differ, with what each read there: after setup, or after
+/// their measured runs or resets, run by run.
+fn disagree(a: &Reads, b: &Reads) -> Option<(&'static str, Vec<String>, Vec<String>)> {
+    [("after setup", a.setup.iter().cloned().collect(), b.setup.iter().cloned().collect()), ("after the runs", a.run.clone(), b.run.clone()), ("after the resets", a.reset.clone(), b.reset.clone())]
         .into_iter()
         .find(|(_, x, y)| x != y)
 }
 
 /// `NotEquivalent` for input latency: both sides' samples come from one rule (an input at rest, a
 /// change of the app's model within a second, a present within a second), and a side whose runs gave
-/// fewer than 0.8 or more than 1.25 times the other's samples measured other inputs. By metric
-/// prefix (`interaction.`, `scroll.latency.`).
+/// fewer than 0.8 or more than 1.25 times the other's samples measured other inputs (with a few
+/// samples a block, one apart is alike: 2 and 3 are one input). By metric prefix (`interaction.`,
+/// `scroll.latency.`).
 pub(super) fn latency_skew(blocks: &[Block], names: (&str, &str)) -> Vec<(&'static str, Refusal)> {
     let mut out = Vec::new();
     for (prefix, count, what) in [("interaction.", "interaction.n", "inputs"), ("scroll.latency.", "scroll.n", "scroll gestures")] {
@@ -241,13 +272,17 @@ pub(super) fn latency_skew(blocks: &[Block], names: (&str, &str)) -> Vec<(&'stat
         };
         if let (Some(b), Some(h)) = (side("base"), side("head"))
             && (b.min(h) <= 0.0 || !(0.8..=1.25).contains(&(h / b)))
+            && !(b.min(h) >= 2.0 && (b - h).abs() <= 1.0)
             && b.max(h) > 0.0
         {
             out.push((
                 prefix,
                 Refusal::new(
                     ValidatorId::NotEquivalent,
-                    format!("{} gave {b:.0} latency samples a block from its {what}, {} {h:.0}: outside 0.8 to 1.25 times each other, so they timed other inputs", names.0, names.1),
+                    format!(
+                        "{} gave {b:.0} latency samples a block from its {what}, {} {h:.0}: outside 0.8 to 1.25 times each other (and more than one apart), so they timed other inputs",
+                        names.0, names.1
+                    ),
                 )
                 .fix("give both sides the same input at rest, each changing what the app shows"),
             ));
@@ -256,30 +291,33 @@ pub(super) fn latency_skew(blocks: &[Block], names: (&str, &str)) -> Vec<(&'stat
     out
 }
 
-/// strobe's reads of a side's page or tree inside its measured runs, per run and per second
-/// (medians over its blocks), from each block's `driver.reads`.
+/// strobe's reads of a side's page or tree inside its measured runs: per run, and their share of the
+/// run's wall time (medians over its blocks), from each block's `driver.reads` and `driver.read_ms`.
 fn reads_of(blocks: &[Block], role: &str) -> Option<(f64, f64)> {
-    let per_run: Vec<f64> = blocks.iter().filter(|b| b.variant == role).filter_map(|b| b.values.get("driver.reads").copied()).collect();
-    let per_s: Vec<f64> = blocks.iter().filter(|b| b.variant == role).filter_map(|b| Some(b.values.get("driver.reads")? / (metrics::median(&b.run_ms) / 1e3).max(1e-3))).collect();
-    (!per_run.is_empty()).then(|| (metrics::median(&per_run), metrics::median(&per_s)))
+    let mine: Vec<&Block> = blocks.iter().filter(|b| b.variant == role).collect();
+    let per_run: Vec<f64> = mine.iter().filter_map(|b| b.values.get("driver.reads").copied()).collect();
+    let share: Vec<f64> = mine.iter().filter_map(|b| Some(b.values.get("driver.read_ms")? / metrics::median(&b.run_ms).max(1e-3))).collect();
+    (!per_run.is_empty()).then(|| (metrics::median(&per_run), if share.is_empty() { 0.0 } else { metrics::median(&share) }))
 }
 
 /// `ObserverCost` (SPEC §10.2): strobe reads each side through what it offers (a page's DOM, a native
-/// app's accessibility tree), and a read inside a run costs the app work it would not do for a
-/// person (a lazy accessibility provider builds and updates its tree once a client reads it). Warned
-/// when a side's runs read over twice a second, or one side reads over 4 times as often as the other
-/// (above half a read a second).
+/// app's accessibility tree), and a read inside a run costs the app work a person's use would not (a
+/// lazy accessibility provider builds and updates its tree once a client reads it). Warned when a
+/// side's reads took over 2% of its runs' wall time, when a side's runs read over 8 times, or when one
+/// side reads at least 4 more times a run than the other and over 4 times as often.
 pub(super) fn observer_cost(blocks: &[Block], names: (&str, &str)) -> Option<Warning> {
     let (b, h) = (reads_of(blocks, "base")?, reads_of(blocks, "head")?);
-    let (hi, lo) = (b.1.max(h.1), b.1.min(h.1));
-    let text = format!("strobe read {} {:.1} times a run ({:.2}/s) and {} {:.1} times a run ({:.2}/s) inside the measured runs", names.0, b.0, b.1, names.1, h.0, h.1);
-    if hi > 2.0 {
-        return Some(validity::warn(
-            "ObserverCost",
-            format!("{text}: over 2 a second costs the side read its own work (wait on until: \"frame\" or \"idle\", which read nothing, or keep waits out of runs)"),
-        ));
-    }
-    (hi > 0.5 && hi > 4.0 * lo).then(|| validity::warn("ObserverCost", format!("{text}: one side is read over 4 times as often, and each read costs that app work the other does not do")))
+    let text = format!("strobe read {} {:.1} times a run ({:.1}% of its wall time) and {} {:.1} times a run ({:.1}%) inside the measured runs", names.0, b.0, 100.0 * b.1, names.1, h.0, 100.0 * h.1);
+    let why = if b.1.max(h.1) > 0.02 {
+        "reading took over 2% of a run, time the side being read spent answering strobe"
+    } else if b.0.max(h.0) > 8.0 {
+        "over 8 reads a run: each costs the side read work a person's use does not (wait on until: \"frame\" or \"idle\", which read nothing)"
+    } else if (b.0 - h.0).abs() >= 4.0 && b.0.max(h.0) > 4.0 * b.0.min(h.0) {
+        "one side is read over 4 times as often, and each read costs that app work the other does not do"
+    } else {
+        return None;
+    };
+    Some(validity::warn("ObserverCost", format!("{text}: {why}")))
 }
 
 /// Each side's reads per run, for `fairness.observer.reads_per_run`.

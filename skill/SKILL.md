@@ -575,7 +575,8 @@ Fewer than 6 pairs never gets a verdict.
   - Give each target a `ui` adapter for what differs: `ui: { timeline: ".scroll-view", openSession: ({ page }) => page.click("@row") }`; journeys say `page.scroll("@timeline", …)`, `await ctx.ui.openSession()`, `until: "@timeline"`, `"@row index=-1"` (the last).
   - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case, or just an `@name` its `ui` lacks (a parity gap: listed with the missing name, never run).
   - `expect: { same: ["@topRow"] }`: both sides must read it the same after setup, each run and each reset, or the series is refused `NotEquivalent`. Steps that differ entirely: `run: { original: fn, rewrite: fn }` (needs `expect.same`).
-  - Same input on both sides: a page against a native app gets OS input like the native side; `page.act` on one side and `click` on the other, or other call counts, is `InputMismatch`. Keep waits in runs on `until: "frame"`/`"idle"` (`driver.reads`, `ObserverCost`).
+  - Same input on both sides: a page against a native app gets OS input like the native side; `page.act` on one side and `click` on the other, or any kind of call over 5% apart, is `InputMismatch`. Keep waits in runs on `until: "frame"`/`"idle"`: selector waits read the app inside the run (`driver.reads`, `driver.read_ms`; `ObserverCost` past 8 reads a run or 2% of its time).
+  - An `@name` no target's `ui` has is a typo (exit 2); one another target has is a gap, even when only met mid-run.
   - Give the app under test its own bundle id (macOS) through its build's own config overrides, so strobe may launch it beside your installed copy (`LiveChannel`).
   - `--check` runs every target's cases once and prints the parity matrix (ok, gap, what `expect.same` read, why journeys differ); `--check --head <target>` one side's; `--noworse 5%` asks "no worse anywhere".
   - Where each spends its time: `--why always` profiles each side once with its own engine's tools.

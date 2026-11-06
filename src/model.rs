@@ -659,7 +659,17 @@ pub const METRICS: &[MetricDef] = &[
         words: COUNT,
         min_n: 0,
         across: Across::Compared,
-        about: "reads strobe made of the page or the accessibility tree inside a run (a wait's checks, finding an element): what driving the app cost it (ObserverCost)",
+        about: "strobe's looks at the page or the accessibility tree inside a run (an input's aim, an until or waitFor selector; never idle or frame): what driving the app cost it (ObserverCost)",
+    },
+    MetricDef {
+        name: "driver.read_ms",
+        unit: "ms",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: TIME,
+        min_n: 0,
+        across: Across::Compared,
+        about: "what strobe's driver.reads inside a run cost: a page's main-thread time in its element lookups, a native app's tree reads (ObserverCost)",
     },
     MetricDef {
         name: "scroll.latency.p50",

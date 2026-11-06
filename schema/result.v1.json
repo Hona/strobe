@@ -71,7 +71,7 @@
       "properties": {
         "window": { "type": ["object", "null"], "properties": { "client_dip": { "type": "array", "items": { "type": "number" } }, "scale": { "type": ["number", "null"] }, "display": { "type": ["string", "null"] }, "hz": { "type": ["number", "null"] } } },
         "adapter": { "type": ["string", "null"] },
-        "input": { "enum": ["os", "none"], "description": "os: both sides got OS input; none: the runs sent no input." },
+        "input": { "enum": ["os", "devtools", "none"], "description": "os: the sides got OS input (a native side, or a page measured from outside); devtools: two pages driven through DevTools; none: the runs sent no input." },
         "frames": { "type": ["string", "null"], "description": "Where frames came from on both sides (the OS present source), or null without frames." },
         "gpu_cache": { "enum": ["warm", "cold", "os", null], "description": "os: the OS keeps the GPU shader caches per app where no launch can move them (macOS), shared by both sides." },
         "priority": { "type": ["string", "null"] },

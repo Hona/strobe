@@ -554,7 +554,7 @@ export function exe<P = any>(path: string, opts: { app?: string } & AppOptions &
 }
 
 /** An app started by a command in the variant's folder (a dev server that launches it), attached through the DevTools endpoint it prints. */
-export function command<P = any>(run: string, opts: Omit<CommandOptions, "run"> = {}): Target<P> {
+export function command<P = any>(run: string, opts: Omit<CommandOptions, "run"> & Side = {}): Target<P> {
   return { kind: "command", run, ...opts }
 }
 

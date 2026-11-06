@@ -104,8 +104,8 @@ struct Run {
     changes: Vec<u64>,
     /// Elements in the app's windows at the run's end, when strobe drives it (`StateDrift`).
     elements: Option<usize>,
-    /// Reads of the app's tree inside the run (`driver.reads`), when strobe drives it.
-    reads: Option<f64>,
+    /// Reads of the app's tree inside the run and their time (ms): `driver.reads` (none without a session).
+    reads: (u64, f64),
     t0: u64,
     t1: u64,
     total: f64,
@@ -312,9 +312,10 @@ fn runs(
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     hooks.check_fixture();
     // `expect.same` (SPEC §9.10): read through the session after setup, each run and each reset.
-    let same = super::journey::Same::new(s, target)?;
+    // A windowless app shows nothing to read.
+    let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
     let read_same = |when| same.read(when, &|sel| drive.get()?.text(sel, Duration::from_secs(2)));
-    if same.on() && !windowless {
+    if same.on() {
         read_same(super::journey::When::Setup)?;
     }
     lap("setup", steps);
@@ -411,7 +412,7 @@ fn runs(
         hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
-        let reads = drive.session.get().map(|se| se.take_reads() as f64);
+        let reads = drive.session.get().map(Session::take_reads).unwrap_or_default();
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
         runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), elements, reads, t0, t1, total: 0.0 });
@@ -553,9 +554,8 @@ fn runs(
     let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice())).collect();
     extra.extend(super::block::per_run_hooks(s, &key, &hooked));
     // strobe's own reads of the app's tree inside the runs (`ObserverCost`).
-    if measured.iter().any(|r| r.reads.is_some()) {
-        extra.insert("driver.reads".into(), per_run(&|r| r.reads.unwrap_or(0.0)));
-    }
+    extra.insert("driver.reads".into(), per_run(&|r| r.reads.0 as f64));
+    extra.insert("driver.read_ms".into(), per_run(&|r| r.reads.1));
     // Drags: the moves strobe posted, beside the frames the app drew.
     if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
         extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
@@ -832,7 +832,7 @@ fn runs(
         // content size to compare there.
         client: n.window.as_ref().filter(|_| !cfg!(target_os = "macos")).map(client_of),
         directions: BTreeMap::new(),
-        same: same.take(),
+        same: same.take(first),
         ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
         ..Block::default()
     })
@@ -1287,11 +1287,14 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         let pixels = watcher.map(joined).unwrap_or_default();
         lap("milestones", &mut steps);
         // What the launch ended on (the window it was waiting for, or a first-run dialog over it).
+        let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
         let shown = match host::main_window(&n.pids()).filter(|_| !windowless) {
             Some(w) => {
                 let session = Session::open(&n.pids(), w.hwnd);
                 let end = shown::native(ctx, s, v, pair, "end", &n.pids(), Some(w.hwnd), session.as_ref().map_err(|e| e.message.clone()));
                 shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| session.as_ref().map_err(|e| Error::msg(e.message.clone())).and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
+                // `expect.same` once ready, outside the launch's timed span (SPEC 9.10).
+                same.read(super::journey::When::Setup, &|sel| session.as_ref().map_err(|e| Error::msg(e.message.clone()))?.text(sel, Duration::from_secs(2)))?;
                 Some(shown::Shown { start: shown::Screen::default(), end })
             }
             None => None,
@@ -1381,7 +1384,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
         } else {
             None
         };
-        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, process_set: Some(programs(&procs)), ..Block::default() })
+        Ok(Block { variant: v.role.to_string(), pair, values, run_ms: vec![ready_ms], recording, steps: steps.clone(), shown, refused, process_set: Some(programs(&procs)), same: same.take(0), ..Block::default() })
     })();
     // A launch that failed before its recording still ends the helper's session.
     if let Some(Ok(c)) = stacks.take() {

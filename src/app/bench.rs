@@ -401,8 +401,8 @@ struct Run {
     input: Option<(f64, f64)>,
     /// What the OS counted for the target's processes (`energy.cpu`, `cpu.instructions`, …).
     counted: probe::wakes::Counted,
-    /// strobe's reads of the page inside the run (`driver.reads`).
-    reads: f64,
+    /// strobe's reads of the page inside the run and their time (ms): `driver.reads`, `driver.read_ms`.
+    reads: (u64, f64),
 }
 
 /// A browser's process roles (`WebBrowser::process_roles`) and the metric each one's CPU goes to.
@@ -587,11 +587,14 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
         None => (json!([w.width, w.height]), json!(w.scale)),
     };
     let gpu_cache = ctx.gpu_cache.values().next().map(|n| n.split(':').next().unwrap_or("").to_string());
+    let some = |v: &Value| v["ops"].as_object().is_some_and(|o| !o.is_empty());
+    let gave_input = series.iter().any(|s| some(s) || s["blocks"].as_array().into_iter().flatten().any(some));
     json!({
         "window": { "client_dip": client, "scale": scale, "display": Value::Null, "hz": host::refresh_at(w.x + 20, w.y + 20) },
         "adapter": ctx.gpu["devices"].as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
-        // Pages against a native implementation get OS input, as native apps always do; two pages DevTools input.
-        "input": if ctx.cross_engine || variants.iter().all(|v| observer(Some(v)) == "accessibility") { "os" } else { "devtools" },
+        // Pages against a native implementation get OS input, as native apps always do; two pages DevTools
+        // input; runs that gave no input (scripts, commands, journeys without steps) none.
+        "input": if !gave_input { "none" } else if ctx.cross_engine || variants.iter().all(|v| observer(Some(v)) == "accessibility") { "os" } else { "devtools" },
         "frames": frames.then_some(source),
         "gpu_cache": gpu_cache,
         "priority": ctx.qos.clone().unwrap_or_else(|| "normal".into()),
@@ -1357,17 +1360,6 @@ pub fn run(args: &Args) -> Result<Output> {
         };
         let out = match r {
             Ok(out) => out,
-            // A side that reached for an adapter entry it lacks, which the runner's scan of the file
-            // did not see (a name built at run time): the journey is a gap, its blocks discarded.
-            Err(e) if e.validator() == Some(ValidatorId::ParityGap) && s.sides.is_some() => {
-                let summary = e.refusal.as_ref().map_or(e.message.clone(), |r| r.summary.clone());
-                let side =
-                    if variants.first().and_then(|v| v.target.as_deref()).is_some_and(|t| summary.starts_with(ctx.describe["targets"][t]["name"].as_str().unwrap_or(t))) { "base" } else { "head" };
-                let missing = summary.split_whitespace().find(|w| w.starts_with('@')).map(str::to_string);
-                let g = gap_series(&Series { gap: Some((side, summary, missing)), ..s.clone() }, &variants, &ctx.describe);
-                progress(format!("\n{}  not compared: {}", s.label(), g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
-                g
-            }
             Err(e) => {
                 halted = Some(if e.code == 130 || stop_requested() { stop_error() } else { e });
                 not_run.push(s.label());
@@ -1538,6 +1530,12 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         Ok(b)
     });
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    // An adapter entry the target lacks, met as the case ran: a gap in the matrix, not a failure.
+    if let Err(e) = &r
+        && e.validator() == Some(ValidatorId::ParityGap)
+    {
+        return Ok(runtime_gap(ctx, s, variants, 0, e, &[]));
+    }
     // What the bench file's hooks printed during this case (console.log/error go to runner.log).
     let log: Vec<String> = std::fs::read(&ctx.runner.log)
         .ok()
@@ -2054,6 +2052,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                 let keep = ctx.keep_all || pair == 0;
                 let b = match block_on_screen(ctx, s, &variants[v], pair, &Exec::timed(timed_set(ctx), ctx.runs, keep).counting(main_counters)) {
                     Ok(b) => b,
+                    // A side that reached for an adapter entry it lacks, which the runner's scan did not
+                    // see (a name built at run time): at any pair the journey is a gap, never half run.
+                    Err(e) if e.validator() == Some(ValidatorId::ParityGap) => return Ok(runtime_gap(ctx, s, variants, v, &e, &blocks)),
                     // A stop, or an error once pairs are done: the half pair goes, the finished ones stay.
                     Err(e) if e.code == 130 || stop_requested() || !pairs.is_empty() => {
                         blocks.truncate(start);
@@ -2778,6 +2779,21 @@ fn gap_series(s: &Series, variants: &[Variant], describe: &Value) -> Value {
     })
 }
 
+/// A series whose side `v` met a missing adapter entry while it ran (`ParityGap` from the runner): a
+/// gap on that side, its blocks and their recordings discarded.
+fn runtime_gap(ctx: &Ctx, s: &Series, variants: &[Variant], v: usize, e: &Error, blocks: &[Block]) -> Value {
+    for b in blocks {
+        if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+    let summary = e.refusal.as_ref().map_or_else(|| e.message.clone(), |r| r.summary.clone());
+    let missing = summary.split_whitespace().find(|w| w.starts_with('@')).map(str::to_string);
+    let g = gap_series(&Series { gap: Some((variants[v].role, summary, missing)), ..s.clone() }, variants, &ctx.describe);
+    progress(format!("  gap: {}", g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
+    g
+}
+
 /// A block's refused metrics as result.json keeps them: `"<metric>": "<validator>: <why>"`.
 fn refusal_map(refused: &BTreeMap<String, Refusal>) -> Value {
     refused.iter().map(|(k, r)| (k.clone(), Value::String(r.message()))).collect::<serde_json::Map<_, _>>().into()
@@ -3106,9 +3122,9 @@ fn as_side<T>(ctx: &mut Ctx, s: &Series, v: &Variant, f: impl FnOnce(&mut Ctx, &
     // Its `expect` and a launch's `until` through that target's adapter (`@name`).
     let side = match v.target.as_deref().filter(|t| *t != s.target) {
         Some(t) => {
-            let def = &ctx.describe["targets"][t];
-            let launch = journey::side_launch(&ctx.describe["cases"][&s.case]["launch"], &def["ui"], t)?;
-            Some(Series { target: t.to_string(), expect: journey::side_expect(def, &s.case_expect, t)?, launch, ..s.clone() })
+            let targets = &ctx.describe["targets"];
+            let launch = journey::side_launch(&ctx.describe["cases"][&s.case]["launch"], targets, t)?;
+            Some(Series { target: t.to_string(), expect: journey::side_expect(targets, &s.case_expect, t)?, launch, ..s.clone() })
         }
         None => None,
     };
@@ -3976,7 +3992,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // From outside, every input of the block (setup's and reset's too) comes from the OS, as the
         // native side's does: set up once the window shows and is in front.
         if os_input {
-            let _ = driver.os.set(crate::driver::os::OsInput::attach(&page, browser.pids(), presents_rc.clone())?);
+            let os = crate::driver::os::OsInput::attach(&page, browser.pids(), presents_rc.clone())?;
+            os.vouched.set(s.expect["same"].as_array().is_some_and(|a| !a.is_empty()));
+            let _ = driver.os.set(os);
         }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
@@ -3985,11 +4003,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // context) draws no frame the canvas hook sees: canvas.* refused, never 0. Read on the page the
         // runs start from, after setup.
         let no_webgpu = canvas && page.eval("typeof GPUCanvasContext === 'undefined'")?.as_bool() == Some(true);
+        // Setup's OS input reached the page, and setup left the window where strobe mapped it (or it is
+        // mapped again).
         if let Some(os) = driver.os.get() {
             os.delivered(&page)?;
+            os.recheck(&page)?;
         }
         // `expect.same` (SPEC §9.10): read after setup, each run and each reset, outside the runs.
-        let same = journey::Same::new(s, &target)?;
+        let same = journey::Same::new(s, &ctx.describe["targets"])?;
         let read_same = |when| same.read(when, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)));
         if same.on() {
             read_same(journey::When::Setup)?;
@@ -4124,10 +4145,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 harvested.borrow_mut().clear();
             }
             let docs = page.documents();
-            driver.reads.set(0);
+            driver.take_reads();
             if let Some(os) = driver.os.get() {
                 os.set_pids(browser.pids());
                 os.take_log();
+                os.begin(&page)?;
             }
             // From outside the run is strobe's own span on the host clock, as a native app's: no page
             // mark, and no wait for the page's next frame.
@@ -4143,7 +4165,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
-            let reads = driver.reads.get() as f64;
             if !outside {
                 driver.dispatch("frame", &[])?;
             }
@@ -4158,6 +4179,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if !traceless || gecko_on {
                 driver.mark(&format!("{key}:end"))?;
             }
+            // Read once the run's span and CPU window closed: the page's own count of its time.
+            let reads = driver.take_reads();
             roles.extend(process_roles(&browser));
             let (role0, role1) = (by_role(&procs_start, &roles), by_role(&procs_end, &roles));
             if !counted.is_empty() {
@@ -4192,10 +4215,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 read_same(journey::When::Run)?;
             }
             if s.reset {
+                if let Some(os) = driver.os.get() {
+                    os.begin(&page)?;
+                }
                 ctx.runner
                     .call("reset", json!({ "case": s.case }), run_timeout, &serve)
                     .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
                 driver.release_all()?;
+                // A reset's OS input is checked on its own: a click there must not cover a run's lost one.
+                if let Some(os) = driver.os.get() {
+                    os.delivered(&page)?;
+                }
                 if same.on() {
                     read_same(journey::When::Reset)?;
                 }
@@ -4472,7 +4502,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // The same CPU as time per run, as a native or script target's: what an implementation
         // comparison compares on both sides.
         extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
-        extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads)).collect());
+        extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.0 as f64)).collect());
+        extra.insert("driver.read_ms".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.1)).collect());
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
         let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
@@ -4669,7 +4700,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             client: content,
             browser: Some(seen),
             directions: BTreeMap::new(),
-            same: same.take(),
+            same: same.take(first),
             ops: journey::ops(&run_counts.iter().skip(first).collect::<Vec<_>>()),
         })
     })();
@@ -5156,6 +5187,13 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
         if filter.is_some_and(|f| !case_matches(f, &case)) {
             continue;
         }
+        // A selector's `@name` that no target's ui has is a typo, not a gap.
+        if let Some(t) = c["typos"].as_array().filter(|a| !a.is_empty()) {
+            return Err(Error::usage(format!(
+                "{case}: {} in no target's ui (a typo?): give the targets that run the case a ui entry of that name",
+                t.iter().filter_map(Value::as_str).collect::<Vec<_>>().join(", ")
+            )));
+        }
         // Steps per target prove nothing reaches the same place without reads that show it.
         if c["adapted"].is_string() && !c["expect"]["same"].as_array().is_some_and(|a| !a.is_empty()) {
             return Err(Error::usage(format!("{case}: run gives each target its own steps, so the case needs expect.same: elements both sides must read the same after setup and after each run")));
@@ -5190,7 +5228,7 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
             // A gap's own selectors may name what its target lacks: nothing of it runs.
             let (expect, launch) = match &gap {
                 Some(_) => (merged_expect(&targets[target], &c["expect"]), c["launch"].clone()),
-                None => (journey::side_expect(&targets[target], &c["expect"], target)?, journey::side_launch(&c["launch"], &targets[target]["ui"], target)?),
+                None => (journey::side_expect(&describe["targets"], &c["expect"], target)?, journey::side_launch(&c["launch"], &describe["targets"], target)?),
             };
             for p in &combos {
                 out.push(Series {

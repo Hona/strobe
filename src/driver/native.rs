@@ -65,8 +65,8 @@ mod imp {
         pointer: Cell<Option<(f64, f64, Target)>>,
         pressed: Cell<Option<(Button, isize)>>,
         pacer: crate::driver::Pacer,
-        /// Reads of the app's tree since the last `take_reads` (`driver.reads`).
-        reads: Cell<u64>,
+        /// Reads of the app's tree since the last `take_reads`, and their time (ms): `driver.reads`.
+        reads: Cell<(u64, f64)>,
     }
 
     impl Session {
@@ -82,23 +82,44 @@ mod imp {
                 pointer: Cell::new(None),
                 pressed: Cell::new(None),
                 pacer: crate::driver::Pacer::default(),
-                reads: Cell::new(0),
+                reads: Cell::new((0, 0.0)),
             })
         }
 
-        /// The reads of the app's tree since the last call (`driver.reads`).
-        pub fn take_reads(&self) -> u64 {
-            self.reads.replace(0)
+        /// The reads of the app's tree since the last call, and their time (ms): `driver.reads`,
+        /// `driver.read_ms`.
+        pub fn take_reads(&self) -> (u64, f64) {
+            self.reads.replace((0, 0.0))
         }
 
-        /// The value (else the name) of the element `sel` matches, waiting up to `t` for it, with its
-        /// whitespace collapsed (`expect.same`); None when it never showed.
+        /// Counts one read of the app's tree that took since `at`.
+        fn counted<T>(&self, at: Instant, r: T) -> T {
+            let (n, ms) = self.reads.get();
+            self.reads.set((n + 1, ms + at.elapsed().as_secs_f64() * 1e3));
+            r
+        }
+
+        /// What `expect.same` reads of the element `sel` matches, waiting up to `t` for it, with its
+        /// whitespace collapsed: a control with a value its value (an empty field is "", never its
+        /// label), else its name, else (a container) its visible descendants' names and values in tree
+        /// order, as a page's `innerText` joins its text. None when it never showed.
         pub fn text(&self, sel: &Value, t: Duration) -> Result<Option<String>> {
-            match self.find(&parse_sel(sel)?, None, t) {
+            match self.find_in(&parse_sel(sel)?, None, t, true) {
                 Ok((tree, i)) => {
                     let n = &tree.nodes[i];
-                    let v = n.value.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or(&n.name);
-                    Ok(Some(v.split_whitespace().collect::<Vec<_>>().join(" ")))
+                    let own = match &n.value {
+                        Some(v) => v.clone(),
+                        None if !n.name.trim().is_empty() => n.name.clone(),
+                        None => {
+                            let inner = (i + 1..tree.nodes.len()).take_while(|&j| tree.within(j, i)).filter(|&j| tree.visible_rect(j).is_some());
+                            inner
+                                .map(|j| tree.nodes[j].value.clone().filter(|v| !v.trim().is_empty()).unwrap_or_else(|| tree.nodes[j].name.clone()))
+                                .filter(|s| !s.trim().is_empty())
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }
+                    };
+                    Ok(Some(own.split_whitespace().collect::<Vec<_>>().join(" ")))
                 }
                 Err(e) if e.code == 124 => Ok(None),
                 Err(e) => Err(e),
@@ -193,7 +214,8 @@ mod imp {
         }
 
         fn snapshot(&self, window: Option<&str>) -> Result<Tree> {
-            self.a11y.snapshot(&self.windows(window)?)
+            let at = Instant::now();
+            self.counted(at, self.a11y.snapshot(&self.windows(window)?))
         }
 
         /// A read of the tree inside a wait (`reads`: how many it took so far, and when the last
@@ -217,7 +239,10 @@ mod imp {
         fn read_for(&self, window: Option<&str>, sel: &Selector, subtree: bool) -> Result<Tree> {
             let windows = self.windows(window)?;
             let (mut before, mut found) = (0, None);
-            self.a11y.snapshot_until(&windows, &mut |t, j| {
+            let at = Instant::now();
+            // A negative index (`index=-1`) never meets `before`: the whole tree is read, and `Tree::find`
+            // counts from its end.
+            let r = self.a11y.snapshot_until(&windows, &mut |t, j| {
                 if let Some(i) = found {
                     return !t.within(j, i);
                 }
@@ -229,7 +254,8 @@ mod imp {
                     before += 1;
                 }
                 false
-            })
+            });
+            self.counted(at, r)
         }
 
         /// The first visible element `sel` matches, waiting up to `timeout` for the app's tree to show

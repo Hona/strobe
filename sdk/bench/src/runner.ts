@@ -43,6 +43,7 @@ function alias(sel: unknown): unknown {
   const [, name, rest] = sel.match(/^@([A-Za-z_$][\w$]*)\s*(.*)$/s) ?? []
   if (!name) return sel
   const entry = ui(state.target)[name]
+  if (entry === undefined && !names.has(name)) throw new Error(`@${name} is in no target's ui (${[...names].map((n) => "@" + n).join(", ") || "none has one"}): a typo?`)
   if (entry === undefined) throw new ParityGap(state.target, `@${name}`)
   if (typeof entry !== "string") throw new Error(`@${name} is a step of ${state.target}'s ui, not a selector: call ctx.ui.${name}()`)
   return rest ? `${entry} ${rest}` : entry
@@ -56,9 +57,40 @@ const opts = (o: any) => {
   return out
 }
 
+// A function's source without its comments (a commented-out step names nothing), strings kept.
+function code(source: string): string {
+  let out = ""
+  for (let i = 0; i < source.length; i++) {
+    const c = source[i]
+    if (c === '"' || c === "'" || c === "`") {
+      let j = i + 1
+      while (j < source.length && source[j] !== c) j += source[j] === "\\" ? 2 : 1
+      out += source.slice(i, j + 1)
+      i = j
+    } else if (c === "/" && source[i + 1] === "/") {
+      while (i < source.length && source[i] !== "\n") i++
+      out += "\n"
+    } else if (c === "/" && source[i + 1] === "*") {
+      const end = source.indexOf("*/", i + 2)
+      i = end < 0 ? source.length : end + 1
+    } else out += c
+  }
+  return out
+}
+
+// `@name`s in a selector's place (an action's first argument, `until`, `selector`, `at`) that no
+// target's ui has: a typo, said before anything runs. Elsewhere `@word` may be typed text.
+function typos(source: string): string[] {
+  const out = new Set<string>()
+  const at = /(?:\.(?:click|hover|type|scroll|wheel|drag|act|query|waitFor)\(\s*|\b(?:until|selector|at)\s*:\s*)["'`]@([A-Za-z_$][\w$]*)/g
+  for (const m of code(source).matchAll(at)) if (!names.has(m[1])) out.add(`@${m[1]}`)
+  return [...out]
+}
+
 // The `@name`s and `ui.<name>`s a function's source names (only names some target's ui has: typed
 // text such as "@mention" is no adapter entry).
-function named(source: string): string[] {
+function named(raw: string): string[] {
+  const source = code(raw)
   const out = new Set<string>()
   for (const m of source.matchAll(/["'`]@([A-Za-z_$][\w$]*)/g)) if (names.has(m[1])) out.add(m[1])
   for (const m of source.matchAll(/\bui\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([A-Za-z_$][\w$]*)["'`]\s*\])/g)) if (names.has(m[1] ?? m[2])) out.add(m[1] ?? m[2])
@@ -72,7 +104,8 @@ const hookFor = (h: any, target: string) => (typeof h === "function" ? h : h && 
 // adapter entries its hooks, `expect` and `until` name, through the steps they call, or its own run.
 function gapOf(c: any, target: string): { missing: string; reason: string } | undefined {
   if (c.run && typeof c.run === "object" && typeof c.run[target] !== "function") return { missing: "run", reason: `the case gives no run for ${target}` }
-  const sources = [spec.setup, hookFor(c.run, target), hookFor(c.reset, target)].filter((f) => typeof f === "function").map(String)
+  // A launch case runs no setup; its `before` hook runs before the launch.
+  const sources = [c.launch ? c.launch.before : spec.setup, hookFor(c.run, target), hookFor(c.reset, target)].filter((f) => typeof f === "function").map(String)
   sources.push(JSON.stringify(plain(c.expect ?? null)), JSON.stringify(plain(c.launch?.until ?? null)))
   const own = ui(target)
   const seen = new Set<string>()
@@ -81,7 +114,7 @@ function gapOf(c: any, target: string): { missing: string; reason: string } | un
     const n = todo.pop()!
     if (seen.has(n)) continue
     seen.add(n)
-    if (!(n in own)) return { missing: `@${n}`, reason: `no @${n} in ${target}'s ui` }
+    if (own[n] === undefined) return { missing: `@${n}`, reason: `no @${n} in ${target}'s ui` }
     if (typeof own[n] === "function") todo.push(...named(String(own[n])))
   }
 }
@@ -248,6 +281,7 @@ function describe() {
         reset: !!c.reset,
         adapted: c.run && typeof c.run === "object" ? "steps" : null,
         gaps: Object.fromEntries(Object.keys(spec.targets ?? {}).flatMap((t) => { const g = gapOf(c, t); return g ? [[t, g]] : [] })),
+        typos: [...new Set([spec.setup, c.launch?.before, c.run, c.reset].flatMap((h) => (typeof h === "function" ? [h] : h && typeof h === "object" ? Object.values(h) : [])).flatMap((f: any) => typos(String(f))))],
         resetCheck: c.resetCheck !== false,
         targets: c.targets,
         timeout: c.timeout,

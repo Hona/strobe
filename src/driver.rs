@@ -866,11 +866,25 @@ impl Driver {
             Key::Char(c) if (m | shift) & 8 != 0 && c.is_ascii_graphic() => Key::Char(keys::us_shifted(c)),
             k => k,
         };
-        let mut actions: Vec<Value> = mod_keys(press).into_iter().map(|k| key_action(k, true)).collect::<Result<_>>()?;
+        let down: Vec<Value> = mod_keys(press).into_iter().map(|k| key_action(k, true)).collect::<Result<_>>()?;
+        let up: Vec<Value> = mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<_>>()?;
+        let list = |actions: Vec<Value>| json!([{ "type": "key", "id": "keyboard", "actions": actions }]);
+        // Safari sometimes drops a key that comes in the same action list as the Shift its window has not
+        // taken yet ("hello orld!" once in three cold runs): there the modifiers go down in a list of their
+        // own, and the key's input time is taken again right before it.
+        if self.page.shift_takes_base_key() && !down.is_empty() {
+            self.page.actions(list(down))?;
+            if let Some(last) = self.inputs.borrow_mut().last_mut() {
+                last.0 = crate::host::now_ns();
+            }
+            self.page.actions(list(vec![key_action(key, true)?, key_action(key, false)?]))?;
+            return self.page.actions(list(up));
+        }
+        let mut actions = down;
         actions.push(key_action(key, true)?);
         actions.push(key_action(key, false)?);
-        actions.extend(mod_keys(press).into_iter().rev().map(|k| key_action(k, false)).collect::<Result<Vec<_>>>()?);
-        self.page.actions(json!([{ "type": "key", "id": "keyboard", "actions": actions }]))
+        actions.extend(up);
+        self.page.actions(list(actions))
     }
 
     /// `scroll` over WebDriver, which has no scroll gesture: wheel steps of the distance at `speed` (CSS

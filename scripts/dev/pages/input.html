@@ -1,0 +1,31 @@
+<!doctype html>
+<!-- What the page sees of the input devices: the hover and pointer media queries, touch points and the user agent. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>input</title>
+    <style>
+      body { margin: 0; padding: 12px; font: 11px/16px ui-monospace, monospace; white-space: pre; }
+    </style>
+  </head>
+  <body>
+    <script>
+      const q = (m) => matchMedia(m).matches
+      const seen = {
+        "(hover: hover)": q("(hover: hover)"),
+        "(hover: none)": q("(hover: none)"),
+        "(any-hover: hover)": q("(any-hover: hover)"),
+        "(pointer: fine)": q("(pointer: fine)"),
+        "(pointer: coarse)": q("(pointer: coarse)"),
+        "(pointer: none)": q("(pointer: none)"),
+        "(any-pointer: fine)": q("(any-pointer: fine)"),
+        "(any-pointer: coarse)": q("(any-pointer: coarse)"),
+        maxTouchPoints: navigator.maxTouchPoints,
+        ontouchstart: "ontouchstart" in window,
+        userAgent: navigator.userAgent,
+      }
+      globalThis.__input = seen
+      document.body.textContent = JSON.stringify(seen, null, 2)
+    </script>
+  </body>
+</html>

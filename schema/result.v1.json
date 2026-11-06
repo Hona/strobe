@@ -168,7 +168,8 @@
         "Untimed",
         "OutOfView",
         "Covered",
-        "DisplayTooSmall"
+        "DisplayTooSmall",
+        "DeviceMismatch"
       ]
     },
     "verdictKind": {
@@ -311,6 +312,7 @@
         "primary": { "anyOf": [{ "$ref": "#/definitions/comparison" }, { "$ref": "#/definitions/leakPrimary" }, { "$ref": "#/definitions/checkPrimary" }, { "$ref": "#/definitions/blocksPrimary" }] },
         "headless": { "type": "boolean", "description": "A page target ran in a headless browser (--headless, or the target's headless): no display, so its frame, input-to-screen latency, scroll, canvas and GPU-use metrics are refused (Headless); CPU, counters, memory and input pacing stay." },
         "engine": { "enum": ["chromium", "firefox", "webkit", null], "description": "A page target's browser engine (--engine, or the target's engine)." },
+        "input": { "enum": ["desktop", null], "description": "The input devices a page target's pages saw, checked before setup (DeviceMismatch): desktop is a fine pointer that hovers and no touch points, headless too; part of a tracked series' fingerprint. Null for other targets and results from before strobe set it." },
         "browser": { "type": ["string", "null"], "description": "The browser versions this series' blocks ran (`a / b` when the sides of an implementation comparison ran two); part of a tracked series' fingerprint." },
         "overhead": { "$ref": "#/definitions/overhead" },
         "untimed": {

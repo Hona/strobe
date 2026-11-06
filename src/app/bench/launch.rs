@@ -335,6 +335,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         if !profile {
             validity::dev_build(&shown_page)?;
         }
+        if web {
+            validity::desktop_input(&shown_page)?;
+        }
         let headless = headless_of(ctx, s);
         let seen = browser_seen(ctx, s, headless, &browser)?;
         // Milestones may land after ready (a service that comes up behind the window), and the screen

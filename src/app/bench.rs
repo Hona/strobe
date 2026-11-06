@@ -1540,15 +1540,15 @@ pub fn run(args: &Args) -> Result<Output> {
     let compares = !check && !leak_run && variants.len() == 2;
     let mut ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config, &ctx.projects) } else { Value::Null };
     if compares {
-        // The browser a page ran in is part of what was measured: another engine, version or a headless
-        // run is another experiment, never the same one rerun.
+        // The browser a page ran in is part of what was measured: another engine, version, a headless
+        // run or other input devices is another experiment, never the same one rerun.
         let pages: BTreeMap<String, Value> = series
             .iter()
             .map(|s| &s.target)
             .filter(|t| matches!(ctx.describe["targets"][*t]["kind"].as_str(), Some("web" | "url")))
             .map(|t| {
                 let target = &ctx.describe["targets"][t];
-                (t.clone(), json!({ "engine": engine_of(target), "browser": web::browser_identity(engine_of(target), target["headless"] == true), "headless": target["headless"] == true }))
+                (t.clone(), json!({ "engine": engine_of(target), "browser": web::browser_identity(engine_of(target), target["headless"] == true), "headless": target["headless"] == true, "input": validity::DESKTOP_INPUT }))
             })
             .collect();
         if !pages.is_empty() {
@@ -1889,7 +1889,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
+        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "input": input_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
         "video": recording.as_str().filter(|r| film && has_video(r)).map(|r| json!({ "head": r })),
         "log": log, "log_path": ctx.runner.log, "actions": actions,
@@ -2099,7 +2099,7 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     let (metric, part) = if leak["head"]["native_host"].is_object() { ("memory.app.host", "native_host") } else { ("js.heap.growth", "js_heap") };
     let head = &leak["head"][part];
     Ok(json!({
-        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak", "engine": ctx.describe["targets"][&s.target]["engine"],
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak", "engine": ctx.describe["targets"][&s.target]["engine"], "input": input_of(ctx, s),
         "primary": { "metric": metric, "verdict": head["verdict"], "verdict_kind": head["verdict_kind"], "decided": head["decided"] },
         "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
         "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
@@ -2332,7 +2332,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
         "until": launch::until_of(&s.launch), "windowless": series_windowless(ctx, s),
-        "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
+        "engine": target["engine"], "headless": headless_of(ctx, s), "input": input_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
@@ -2934,6 +2934,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     });
     out["video"] = if videos.as_object().is_some_and(|o| !o.is_empty()) { videos } else { Value::Null };
+    out["input"] = input_of(ctx, s);
     if ctx.implementations {
         implementation_series(ctx, s, variants, &mut out);
     }
@@ -3279,7 +3280,7 @@ fn refused_series(ctx: &Ctx, s: &Series, r: &Refusal) -> Value {
     json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "refused",
         "targets": { "base": b, "head": h }, "hero": s.hero, "primary": primary, "decided": false, "passed": false, "pairs": 0, "launches": 0,
-        "headless": headless_of(ctx, s), "engine": engine_of(target), "target_kind": target["kind"],
+        "headless": headless_of(ctx, s), "input": input_of(ctx, s), "engine": engine_of(target), "target_kind": target["kind"],
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target),
     })
 }
@@ -4554,6 +4555,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         init_docs.set(page.documents());
         lap("load");
         validity::dev_build(&page)?;
+        if !app {
+            validity::desktop_input(&page)?;
+        }
         let mut during = Some(Foreign::start(&browser));
         let speed = validity::speed_check(&page)?;
         // The calibration is Chromium's: another engine's JS speed is compared with its own reference
@@ -5340,7 +5344,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let mut meta = json!({
                 "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
-                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
+                "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "input": (!app).then_some(validity::DESKTOP_INPUT), "background": background, "screen": screen,
                 // Rule 3: a block with profilers, a census or a video describes the profiled (filmed) page.
                 "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" },
                 "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)), "video": video,
@@ -6081,6 +6085,15 @@ fn engine_of(target: &Value) -> WebEngine {
 /// Whether a series' page runs headless: `--headless`, or its target's `headless`.
 fn headless_of(ctx: &Ctx, s: &Series) -> bool {
     ctx.headless || ctx.describe["targets"][&s.target]["headless"] == true
+}
+
+/// The input devices a series' pages see (`validity::desktop_input`): a desktop's when it measures a page
+/// target (on either side of an implementation comparison), else null. In its result and track's
+/// fingerprint, so a series measured before strobe set them is never one history with these.
+fn input_of(ctx: &Ctx, s: &Series) -> Value {
+    let page = |t: &str| matches!(ctx.describe["targets"][t]["kind"].as_str(), Some("web" | "url"));
+    let sides = s.sides.as_ref().is_some_and(|(b, h)| page(b) || page(h));
+    if page(&s.target) || sides { json!(validity::DESKTOP_INPUT) } else { Value::Null }
 }
 
 /// `--engine` and the targets' own `engine` and `headless` (SPEC §9.6): every page target gets its engine
@@ -7291,7 +7304,8 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     let values: Vec<f64> = s["blocks"].as_array().into_iter().flatten().filter_map(|b| b["values"][metric].as_f64()).filter(|v| v.is_finite()).collect();
     let blocks = s["blocks"].as_array().map_or(0, Vec::len);
     let mut out = format!("strobe bench {file} · {} · head {} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""), r["variants"][0]["label"].as_str().unwrap_or(""));
-    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), if s["headless"] == true { "headless (no display)" } else { "" }]);
+    let input = s["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default();
+    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), &input, if s["headless"] == true { "headless (no display)" } else { "" }]);
     if !engine.is_empty() {
         out += &format!("env    {engine}\n");
     }
@@ -7392,7 +7406,8 @@ fn render(r: &Value) -> String {
             r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default()
         };
         let browser = s["browser"].as_str().or(r["browser"].as_str()).unwrap_or("");
-        let display = fmt::fields([browser, gpu, &window, &refresh]);
+        let input = s["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default();
+        let display = fmt::fields([browser, &input, gpu, &window, &refresh]);
         if !display.is_empty() {
             out += &format!("       {display}\n");
         }

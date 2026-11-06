@@ -122,6 +122,7 @@ fn fingerprint_text(s: &Series) -> String {
         f["pin"].as_str().unwrap_or("").to_string(),
         f["browser"].as_str().unwrap_or("").to_string(),
         if f["headless"] == true { "headless".to_string() } else { String::new() },
+        f["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default(),
     ])
 }
 

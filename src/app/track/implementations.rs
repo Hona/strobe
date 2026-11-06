@@ -338,6 +338,9 @@ pub(super) fn point(args: &Args, sides: &Sides, file: &Path, root: &Path, commit
             "machine": statics, "power": r["env"]["power_plan"], "battery": r["env"]["on_battery"], "pin": r["plan"]["pin"],
             "runs": r["plan"]["runs_per_block"], "session": session, "display": display, "target_kinds": kinds, "headless": args.has("headless"), "engine": args.get("engine"),
         });
+        if !s["input"].is_null() {
+            fingerprint["input"] = s["input"].clone();
+        }
         super::seed_fingerprint(r, &mut fingerprint);
         let fam = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric, "base_target": sides.base_target, "head_target": sides.head_target });
         let id = history::series_id(&fam, &fingerprint);

@@ -115,6 +115,13 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
     dirs.into_iter().map(|d| d.1).collect()
 }
 
+/// A desktop's input devices whatever the machine has (`validity::desktop_input`): a fine pointer that
+/// hovers, in Blink's `ui::PointerType` and `ui::HoverType` bits (ui/base/pointer/pointer_device.h:
+/// `POINTER_TYPE_FINE` 1 << 2, `HOVER_TYPE_HOVER` 1 << 1). Without it a machine with no mouse (a server, a
+/// VM) has its pages match (hover: none) and no pointer. DevTools' media emulation has no hover or pointer.
+/// Chromium keeps only the last `--blink-settings`: any other Blink setting strobe passes joins this list.
+const DESKTOP_INPUT: &str = "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2";
+
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
     let exe = find().ok_or_else(|| Error::msg("no Chromium found").hint("install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER"))?;
@@ -146,6 +153,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--disable-search-engine-choice-screen".into(),
         format!("--window-position={},{}", window.x, window.y),
         format!("--window-size={},{}", window.width, window.height),
+        DESKTOP_INPUT.into(),
     ];
     if let Some(s) = window.scale {
         args.push(format!("--force-device-scale-factor={s}"));

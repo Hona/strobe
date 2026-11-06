@@ -13,8 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 /// What every strobe profile sets before Firefox starts: nothing that phones home, updates, studies,
-/// first-run pages, session restore, the default-browser offer or sound; everything that shapes how a
-/// page runs stays Firefox's own default. `remote.prefs.recommended` off: the remote agent would set
+/// first-run pages, session restore, the default-browser offer or sound, and a desktop's input devices;
+/// everything else that shapes how a page runs stays Firefox's own default. `remote.prefs.recommended` off: the remote agent would set
 /// its test preferences (no hang monitor, no process priority manager, focus test mode, no window
 /// occlusion tracking), which a person's Firefox does not run with.
 const USER_JS: &[(&str, &str)] = &[
@@ -72,6 +72,11 @@ const USER_JS: &[(&str, &str)] = &[
     ("media.gmp-manager.url", "\"\""),
     // A measurement never plays sound on the user's speakers; the page's audio graph still runs.
     ("media.volume_scale", "\"0.0\""),
+    // A desktop's input devices whatever the machine has (`validity::desktop_input`): a fine pointer that
+    // hovers (LookAndFeel's PointerCapabilities bits: Coarse 1, Fine 2, Hover 4). A machine with no
+    // mouse (a server, a VM) otherwise has its pages match (hover: none) and no pointer.
+    ("ui.primaryPointerCapabilities", "6"),
+    ("ui.allPointerCapabilities", "6"),
 ];
 
 /// A Firefox strobe launched, with its one BiDi session. Dropped without `close`, it still ends

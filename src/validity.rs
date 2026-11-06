@@ -67,6 +67,34 @@ pub fn dev_build(page: &Page) -> Result<()> {
     Ok(())
 }
 
+/// What a desktop page target's page sees of its input devices (`input` in a series and its block).
+pub const DESKTOP_INPUT: &str = "desktop";
+
+/// `DeviceMismatch` (SPEC 10.1): a desktop page target sees a desktop's input, a fine pointer that
+/// hovers and no touch points, headless too. A machine without a mouse (a server, a VM) reports
+/// (hover: none) and no pointer, and the page takes its touch paths: another workload than people's
+/// desktops run. strobe sets that input at launch where the engine has a setting for it (Chromium,
+/// Firefox); this reads what the page sees, before anything is measured.
+pub fn desktop_input(page: &Page) -> Result<()> {
+    let v = page.eval("[matchMedia('(hover: hover)').matches, matchMedia('(pointer: fine)').matches, matchMedia('(any-pointer: fine)').matches, navigator.maxTouchPoints]")?;
+    let queries = ["(hover: hover)", "(pointer: fine)", "(any-pointer: fine)"];
+    let touch = v[3].as_f64();
+    let mut wrong: Vec<String> = queries.iter().enumerate().filter(|(i, _)| v[*i].as_bool() != Some(true)).map(|(_, q)| format!("{q} does not match")).collect();
+    if touch != Some(0.0) {
+        wrong.push(format!("navigator.maxTouchPoints is {}", v[3]));
+    }
+    if wrong.is_empty() {
+        return Ok(());
+    }
+    let seen = queries.iter().enumerate().map(|(i, q)| format!("{q} {}", v[i])).chain([format!("navigator.maxTouchPoints {}", v[3])]).collect::<Vec<_>>().join(", ");
+    let fix = match page.engine() {
+        WebEngine::Chromium => "strobe launches Chromium with a fine pointer that hovers (--blink-settings): a STROBE_BROWSER wrapper that passes its own --blink-settings replaces them, and a touch screen adds touch points; drop the wrapper's, or measure on a machine without a touch screen",
+        WebEngine::Firefox => "strobe sets Firefox's ui.primaryPointerCapabilities and ui.allPointerCapabilities to a fine pointer that hovers: a touch screen adds touch points; measure on a machine without one",
+        WebEngine::Webkit => "WebKit has no setting for the input devices a page sees: measure it headed on a machine with a mouse and no touch screen, or the page in Chromium or Firefox",
+    };
+    Err(Refusal::new(ValidatorId::DeviceMismatch, format!("a desktop page target's page does not see a desktop's input: {}", wrong.join(", "))).detail(format!("the page sees {seen}")).fix(fix).into())
+}
+
 /// The fixed speed-check workload; returns its time in ms (median of 3).
 pub fn speed_check(page: &Page) -> Result<f64> {
     let v = page.eval(

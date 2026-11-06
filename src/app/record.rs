@@ -218,6 +218,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     } else if !attach {
         progress(format!("loading {target}"));
         page.navigate(&target, Duration::from_secs(60))?;
+        validity::desktop_input(&page.clone().into())?;
     }
     let gpu = gpu?;
     // A launched target inherits strobe's priority; an attached one runs as its user left it.
@@ -407,6 +408,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     let page = browser.page()?;
     progress(format!("loading {target} in {}", browser.version()));
     page.navigate(target, Duration::from_secs(60))?;
+    validity::desktop_input(&page)?;
     let qos = host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid())));
     validity::window_visible(&page)?;
     if !headless && host::session_locked() {

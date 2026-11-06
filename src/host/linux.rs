@@ -5,7 +5,7 @@
 //! `/proc/<tid>/schedstat`, never `/proc/<pid>/stat`'s 10 ms ticks. The "cycle" counter of
 //! `ProcTimes::cycles` is therefore nanoseconds of CPU, and `host::tsc` is `now_ns`.
 
-use super::{CacheGroup, ProcInfo, ProcTimes, ThreadInfo, Topology};
+use super::{CacheGroup, Core, ProcInfo, ProcTimes, ThreadInfo, Topology};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -385,7 +385,36 @@ pub fn topology() -> Topology {
         }
     }
     groups.sort_by_key(|g| g.mask.trailing_zeros());
-    Topology { logical, groups }
+    Topology { logical, groups, cores: cores(logical) }
+}
+
+/// Physical cores from each CPU's `thread_siblings_list` (a vCPU without one, or listing only
+/// itself, is its own core). Core kinds: Intel hybrid CPUs list their efficiency cores in
+/// `/sys/devices/cpu_atom/cpus`; elsewhere (Arm big.LITTLE) each kind has its own `cpu_capacity`.
+fn cores(logical: u32) -> Vec<Core> {
+    let n = logical.min(64);
+    let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+    let cpu = |c: u32, f: &str| read(format!("/sys/devices/system/cpu/cpu{c}/{f}"));
+    let atom = read("/sys/devices/cpu_atom/cpus").map(|s| cpu_list(&s));
+    let capacity: Vec<Option<u32>> = (0..n).map(|c| cpu(c, "cpu_capacity").and_then(|s| s.trim().parse().ok())).collect();
+    let mut kinds: Vec<u32> = capacity.iter().flatten().copied().collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let class = |c: u32| -> u8 {
+        match (atom, capacity[c as usize]) {
+            (Some(a), _) => ((a >> c) & 1 == 0) as u8,
+            (None, Some(cap)) => kinds.iter().position(|&k| k == cap).unwrap_or(0) as u8,
+            (None, None) => 0,
+        }
+    };
+    let mut cores: Vec<Core> = Vec::new();
+    for c in 0..n {
+        let siblings = cpu(c, "topology/thread_siblings_list").map(|s| cpu_list(&s) & all).filter(|m| (m >> c) & 1 == 1).unwrap_or(1 << c);
+        if !cores.iter().any(|k| k.mask & siblings != 0) {
+            cores.push(Core { mask: siblings, class: class(c) });
+        }
+    }
+    cores
 }
 
 /// (parent, start ticks, name) of a live process.

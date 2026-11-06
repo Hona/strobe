@@ -1,6 +1,6 @@
 //! Win32 calls behind `host`. Each function reads an OS API directly; nothing spawns.
 
-use super::{CacheGroup, ProcTimes, Topology};
+use super::{CacheGroup, Core, ProcTimes, Topology};
 use std::collections::HashMap;
 use std::mem::{size_of, zeroed};
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerf
 use windows_sys::Win32::System::Power::{GetSystemPowerStatus, PowerGetActiveScheme, SYSTEM_POWER_STATUS};
 use windows_sys::Win32::System::ProcessStatus::{K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
 use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, RelationCache, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
+use windows_sys::Win32::System::SystemInformation::{GetLogicalProcessorInformationEx, LOGICAL_PROCESSOR_RELATIONSHIP, RelationCache, RelationProcessorCore, SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX};
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinityMask, GetProcessTimes, GetSystemTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, SetProcessAffinityMask};
 use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
 
@@ -281,25 +281,46 @@ pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
 pub fn topology() -> Topology {
     let logical = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
     let mut groups = Vec::new();
+    processor_info(RelationCache, |info| {
+        let cache = unsafe { &info.Anonymous.Cache };
+        if cache.Level == 3 {
+            let mask = unsafe { cache.Anonymous.GroupMask.Mask } as u64;
+            groups.push(CacheGroup { mask, cpus: mask.count_ones(), l3_mb: cache.CacheSize / (1024 * 1024) });
+        }
+    });
+    // Physical cores of processor group 0 (strobe's masks), each with its SMT siblings; the
+    // efficiency class is higher on faster cores of a hybrid CPU and 0 everywhere on others.
+    let mut cores = Vec::new();
+    processor_info(RelationProcessorCore, |info| {
+        let p = unsafe { &info.Anonymous.Processor };
+        let g = p.GroupMask[0];
+        if p.GroupCount >= 1 && g.Group == 0 && g.Mask != 0 {
+            cores.push(Core { mask: g.Mask as u64, class: p.EfficiencyClass });
+        }
+    });
+    cores.sort_by_key(|c| c.mask.trailing_zeros());
+    Topology { logical, groups, cores }
+}
+
+/// Each record `GetLogicalProcessorInformationEx` returns for `relation`.
+fn processor_info(relation: LOGICAL_PROCESSOR_RELATIONSHIP, mut each: impl FnMut(&SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX)) {
     unsafe {
         let mut len = 0u32;
-        GetLogicalProcessorInformationEx(RelationCache, std::ptr::null_mut(), &mut len);
+        GetLogicalProcessorInformationEx(relation, std::ptr::null_mut(), &mut len);
         if len == 0 {
-            return Topology { logical, groups };
+            return;
         }
-        let mut buf = vec![0u8; len as usize];
-        if GetLogicalProcessorInformationEx(RelationCache, buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, &mut len) == 0 {
-            return Topology { logical, groups };
+        // u64 words: the records hold 8-byte masks.
+        let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+        if GetLogicalProcessorInformationEx(relation, buf.as_mut_ptr() as *mut SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX, &mut len) == 0 {
+            return;
         }
+        let base = buf.as_ptr() as *const u8;
         let mut off = 0usize;
-        while off < len as usize {
-            let info = &*(buf.as_ptr().add(off) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
-            if info.Relationship == RelationCache {
-                let cache = &info.Anonymous.Cache;
-                if cache.Level == 3 {
-                    let mask = cache.Anonymous.GroupMask.Mask as u64;
-                    groups.push(CacheGroup { mask, cpus: mask.count_ones(), l3_mb: cache.CacheSize / (1024 * 1024) });
-                }
+        while off + std::mem::size_of::<u32>() * 2 <= len as usize {
+            let info = &*(base.add(off) as *const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX);
+            if info.Relationship == relation {
+                each(info);
             }
             if info.Size == 0 {
                 break;
@@ -307,7 +328,6 @@ pub fn topology() -> Topology {
             off += info.Size as usize;
         }
     }
-    Topology { logical, groups }
 }
 
 pub fn set_affinity(mask: u64) -> Option<u64> {

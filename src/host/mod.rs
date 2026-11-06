@@ -678,10 +678,34 @@ pub struct CacheGroup {
     pub l3_mb: u32,
 }
 
+/// One physical core: its logical CPUs (SMT siblings) and how fast its kind is among this CPU's.
+#[derive(Clone, Debug, Serialize)]
+pub struct Core {
+    pub mask: u64,
+    /// 0 for the slowest kind of core; higher is faster. Equal on every core of a CPU with one kind,
+    /// lower on the efficiency cores of a hybrid one.
+    pub class: u8,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct Topology {
     pub logical: u32,
     pub groups: Vec<CacheGroup>,
+    /// The physical cores of the first 64 logical CPUs, by first CPU; none on macOS (no CPU
+    /// affinity). Where the OS says nothing of SMT (most virtual machines' vCPUs) each logical CPU is
+    /// its own core.
+    pub cores: Vec<Core>,
+}
+
+/// What `--pin auto` picks on this machine (`Topology::auto_pin`).
+#[derive(Clone, Debug, Serialize)]
+pub struct AutoPin {
+    /// The target's CPUs; None leaves it unpinned.
+    pub target: Option<u64>,
+    /// Every other CPU: strobe's, the runner's and those of the processes kept off the target's.
+    pub reserved: Option<u64>,
+    /// What was picked and why, in one line.
+    pub reason: String,
 }
 
 impl Topology {
@@ -694,6 +718,76 @@ impl Topology {
         }
         self.groups.iter().find(|g| g.l3_mb == max)
     }
+
+    /// Every logical CPU strobe's masks cover (the first 64).
+    pub fn all(&self) -> u64 {
+        if self.logical >= 64 { u64::MAX } else { (1u64 << self.logical) - 1 }
+    }
+
+    /// Where `--pin auto` puts the target, and strobe, the runner and the user's other processes
+    /// apart from it (SPEC §9.4):
+    /// - L3 groups that differ: the target on the largest (3D V-Cache), the rest on the others.
+    /// - Equal L3 groups: the target on the first, the rest on the others.
+    /// - One L3 (or none known) and 4 or more logical CPUs: max(1, cores/4) whole physical cores
+    ///   (SMT siblings together; the last ones, efficiency cores first on a hybrid CPU) kept for
+    ///   the rest, the target on every other core.
+    /// - Fewer CPUs, or macOS (no CPU affinity): unpinned, saying why.
+    pub fn auto_pin(&self) -> AutoPin {
+        let unpinned = |why: String| AutoPin { target: None, reserved: None, reason: format!("unpinned ({why})") };
+        if cfg!(target_os = "macos") {
+            return unpinned("macOS has no CPU affinity: the OS places every thread".into());
+        }
+        let all = self.all();
+        let split = |target: u64, what: String| AutoPin {
+            target: Some(target),
+            reserved: Some(all & !target),
+            reason: format!("{what} · strobe, the runner and other processes on CPUs {}", cpu_text(all & !target)),
+        };
+        if self.groups.len() > 1 {
+            let (i, g, why) = match self.vcache() {
+                Some(v) => (self.groups.iter().position(|x| x.mask == v.mask).unwrap_or(0), v, "V-Cache".to_string()),
+                None => (0, &self.groups[0], format!("first of {} equal L3 groups", self.groups.len())),
+            };
+            return split(g.mask & all, format!("CCD{i} ({} MB L3, {} CPUs) · {why}", g.l3_mb, g.cpus));
+        }
+        if self.logical < 4 {
+            return unpinned(match self.logical {
+                0 | 1 => "1 CPU: nothing to keep apart".into(),
+                n => format!("{n} CPUs, too few to keep one apart by default: --pin {} pins the target there and leaves CPU {} to strobe", cpu_text(all & !(1 << (n - 1))), n - 1),
+            });
+        }
+        let cores: Vec<Core> = if self.cores.is_empty() { (0..self.logical.min(64)).map(|c| Core { mask: 1 << c, class: 0 }).collect() } else { self.cores.clone() };
+        let keep = (cores.len() / 4).max(1);
+        // The slowest kind first, then the last cores of each kind.
+        let mut order: Vec<&Core> = cores.iter().collect();
+        order.sort_by_key(|c| (c.class, std::cmp::Reverse(c.mask.trailing_zeros())));
+        let kept = order.iter().take(keep).fold(0u64, |m, c| m | c.mask);
+        let target = all & !kept;
+        if target == 0 {
+            return unpinned("no core left for the target".into());
+        }
+        let slowest = order[0].class;
+        let efficiency = if cores.iter().any(|c| c.class != slowest) && order.iter().take(keep).all(|c| c.class == slowest) { " (efficiency cores)" } else { "" };
+        split(target, format!("CPUs {} · one L3: {keep} of {} cores kept apart{efficiency}", cpu_text(target), cores.len()))
+    }
+}
+
+/// A CPU mask as a list: `0-5,8,10-11`.
+pub fn cpu_text(mask: u64) -> String {
+    let mut parts = Vec::new();
+    let mut c = 0u32;
+    while c < 64 {
+        if (mask >> c) & 1 == 0 {
+            c += 1;
+            continue;
+        }
+        let start = c;
+        while c < 64 && (mask >> c) & 1 == 1 {
+            c += 1;
+        }
+        parts.push(if c - 1 == start { start.to_string() } else { format!("{start}-{}", c - 1) });
+    }
+    parts.join(",")
 }
 
 pub fn topology() -> Topology {

@@ -764,9 +764,10 @@ pub fn system_busy(ms: u64) -> f64 {
     if total <= 0.0 { 0.0 } else { (1.0 - i1.saturating_sub(i0) as f64 / total).clamp(0.0, 1.0) }
 }
 
-/// Apple Silicon has no per-cluster L3 to pin to: no cache groups. The core kinds are in `cpu_name`.
+/// Apple Silicon has no per-cluster L3 to pin to: no cache groups, and with no CPU affinity no
+/// cores to name either. The core kinds are in `cpu_name`.
 pub fn topology() -> Topology {
-    Topology { logical: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1), groups: Vec::new() }
+    Topology { logical: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1), groups: Vec::new(), cores: Vec::new() }
 }
 
 pub fn os_name() -> String {

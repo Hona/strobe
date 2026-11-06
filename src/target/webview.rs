@@ -83,7 +83,16 @@ pub fn ask_close(pids: &[u32]) -> usize {
 /// An app that keeps its size is refused: its page never had the asked viewport.
 pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Window>, size: bool) -> crate::model::Result<Window> {
     use std::time::{Duration, Instant};
-    let main = crate::host::main_window(&browser.pids()).ok_or_else(|| Error::msg(format!("{} shows no window", browser.exe.display())))?;
+    // The page may be there before its window shows (an app's other window, such as macOS's menu bar
+    // strip, would be taken for it): the visible main window, waited for up to 5 s.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let main = loop {
+        match crate::host::main_window(&browser.pids()) {
+            Some(w) if w.visible && !w.iconic => break w,
+            found if Instant::now() > deadline => break found.ok_or_else(|| Error::msg(format!("{} shows no window", browser.exe.display())))?,
+            _ => std::thread::sleep(Duration::from_millis(50)),
+        }
+    };
     let inner = || -> crate::model::Result<(f64, f64, f64)> {
         let v = page.eval("[innerWidth, innerHeight, devicePixelRatio]")?;
         Ok((v[0].as_f64().unwrap_or(0.0), v[1].as_f64().unwrap_or(0.0), v[2].as_f64().unwrap_or(1.0)))
@@ -105,7 +114,8 @@ pub fn fit(browser: &Browser, page: &super::chromium::Page, place: Option<&Windo
     }
     let want = (at.width as f64, at.height as f64);
     let settled = |client: Option<(u32, u32)>| -> crate::model::Result<(f64, f64, f64)> {
-        crate::host::place_window(&main, at.x, at.y, client);
+        // As it is now: the first pass moved it.
+        crate::host::place_window(&crate::host::window_state(main.hwnd).unwrap_or_else(|| main.clone()), at.x, at.y, client);
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             let now = inner()?;

@@ -113,6 +113,10 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         None => target,
     };
+    // An engine this OS cannot run refuses before anything changes (the power plan below).
+    if let Some(e) = args.get("engine").map(WebEngine::parse).transpose()?.and_then(|e| crate::target::web::refusal(e, args.has("headless"))) {
+        return Err(e);
+    }
     // A timed recording runs on the fastest power plan, as a bench does (SPEC §9.4); attribution,
     // deep and memory recordings are not timed. A plan it switched to is said in the result, not as
     // a progress line on stderr that reads like an error.

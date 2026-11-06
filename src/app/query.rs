@@ -31,6 +31,15 @@ pub fn run(args: &Args) -> Result<Output> {
         if !dir.join("result.json").exists() {
             let log = std::fs::read_to_string(dir.join("progress.log")).unwrap_or_default();
             let tail: Vec<&str> = log.lines().rev().take(12).collect::<Vec<_>>().into_iter().rev().collect();
+            // Running only while a bench on this device has it (itself, or a bisect's step of it):
+            // one that died or was refused before it wrote a result has ended.
+            let id = dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+            let ours = |e: &str| e == id || e.strip_prefix(id.as_str()).and_then(|r| r.strip_prefix("_s")).is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()));
+            if !super::bench::slot::list().iter().any(|b| b["exp"].as_str().is_some_and(ours)) {
+                let resume = if dir.join("state.json").is_file() { format!("; strobe bench --resume {id} goes on") } else { String::new() };
+                let text = format!("{id} ended without a result (no bench runs it{resume}); its last lines:\n{}\n", tail.join("\n"));
+                return Ok(Output::new(text, json!({ "id": id, "state": "ended", "progress": tail })));
+            }
             let text = format!("{handle} is running\n{}\n", tail.join("\n"));
             return Ok(Output::new(text, json!({ "id": handle, "state": "running", "progress": tail })));
         }
@@ -1914,7 +1923,8 @@ pub fn package(url: &str) -> String {
         return "(app)".into();
     }
     let path = short_url(url);
-    let mut parts = path.split('/').filter(|s| !s.is_empty());
+    // A relative script URL (`../chunk.js`) names its folder, never `..`.
+    let mut parts = path.split('/').filter(|s| !s.is_empty() && *s != "." && *s != "..");
     match parts.next() {
         Some(scope) if scope.starts_with('@') => format!("{scope}/{}", parts.next().unwrap_or("")),
         Some(first) => first.to_string(),

@@ -6629,10 +6629,19 @@ fn render(r: &Value) -> String {
         let cpus = env["logical_cpus"].as_u64().map(|n| format!("{n} logical CPUs")).unwrap_or_default();
         out += &format!("env    {}\n", fmt::fields([env["os"].as_str().unwrap_or(""), env["cpu"].as_str().unwrap_or(""), &cpus]));
         let gpu = r["gpu"]["devices"].as_array().and_then(|a| a.first()).and_then(Value::as_str).unwrap_or("");
-        let window = Some(fmt::size(&r["window"])).filter(|s| !s.is_empty()).map(|s| format!("window {s}")).unwrap_or_default();
+        // A script or command line (every side's) has no window and draws to no display.
+        let kinds = if sides { vec![&s["target_kinds"]["base"], &s["target_kinds"]["head"]] } else { vec![&s["target_kind"]] };
+        let windowless = kinds.iter().all(|k| matches!(k.as_str(), Some("script" | "cli")));
+        let window = Some(fmt::size(&r["window"])).filter(|s| !s.is_empty() && !windowless).map(|s| format!("window {s}")).unwrap_or_default();
         // A headless page drew to no display: no refresh, no visibility to claim.
         let headless = s["headless"] == true;
-        let refresh = if headless { "headless (no display)".to_string() } else { r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default() };
+        let refresh = if headless {
+            "headless (no display)".to_string()
+        } else if windowless {
+            String::new()
+        } else {
+            r["refresh_hz"].as_f64().map(|h| format!("display {h:.0} Hz")).unwrap_or_default()
+        };
         let browser = s["browser"].as_str().or(r["browser"].as_str()).unwrap_or("");
         let display = fmt::fields([browser, gpu, &window, &refresh]);
         if !display.is_empty() {

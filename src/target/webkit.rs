@@ -191,6 +191,20 @@ impl Started {
     }
 }
 
+/// macOS: a process's document windows (host::macos::normal_windows); none elsewhere, where strobe
+/// never shares a browser with a person.
+fn windows_of(pid: u32) -> Vec<isize> {
+    #[cfg(target_os = "macos")]
+    {
+        host::macos::normal_windows(&[pid])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
 /// Whether a browser process runs in automation mode, as its WebDriver server starts it (macOS: Safari's
 /// `--automation` argument). Elsewhere the browser is always the driver's own child.
 fn automation(pid: u32) -> bool {
@@ -412,7 +426,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         _ => Error { message: format!("{}'s input check on a blank page: {}", install.flavor.name(), e.message), ..e },
     })?;
     // macOS: the session's own windows, so a window a person opens in this Safari later shows (`own`).
-    let own_windows: Vec<isize> = if cfg!(target_os = "macos") { host::top_windows(&[pid]).into_iter().map(|w| w.0).collect() } else { Vec::new() };
+    let own_windows = windows_of(pid);
     let (driver, home) = launching.done();
     started.armed = false;
     Ok(Browser {
@@ -583,7 +597,7 @@ impl Browser {
         if !cfg!(target_os = "macos") || self.pid == 0 {
             return 0;
         }
-        host::top_windows(&[self.pid]).into_iter().filter(|w| !self.own_windows.contains(&w.0)).count()
+        windows_of(self.pid).into_iter().filter(|w| !self.own_windows.contains(w)).count()
     }
 
     /// `LiveChannel` once a person has opened a window in strobe's Safari: what the block measured ran
@@ -613,10 +627,10 @@ impl Browser {
         let deleted = self.session.delete(Duration::from_secs(10)).is_ok();
         // The session's windows close with it: one still there is a person's.
         let deadline = Instant::now() + Duration::from_secs(1);
-        let mut theirs = deleted && cfg!(target_os = "macos") && !host::top_windows(&[self.pid]).is_empty();
+        let mut theirs = deleted && cfg!(target_os = "macos") && !windows_of(self.pid).is_empty();
         while theirs && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(100));
-            theirs = !host::top_windows(&[self.pid]).is_empty();
+            theirs = !windows_of(self.pid).is_empty();
         }
         if theirs || self.foreign_windows() > 0 {
             self.pid = 0;

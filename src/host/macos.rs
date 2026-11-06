@@ -1354,6 +1354,16 @@ pub fn top_windows(pids: &[u32]) -> Vec<(isize, String, bool)> {
         .collect()
 }
 
+/// The on-screen document windows of `pids`: layer 0 and at least 100×100 points, so not the strips and
+/// overlays an app keeps beside them (Safari's link status bar is a 16-point-high window of its own).
+pub fn normal_windows(pids: &[u32]) -> Vec<isize> {
+    windows(LIST_ON_SCREEN | EXCLUDE_DESKTOP, 0)
+        .into_iter()
+        .filter(|w| pids.contains(&w.pid) && w.layer == 0 && w.alpha > 0.0 && w.bounds.size.width >= 100.0 && w.bounds.size.height >= 100.0)
+        .map(|w| w.id as isize)
+        .collect()
+}
+
 /// The on-screen windows of `pids` (as `top_windows` lists them) that the app excludes from screen
 /// capture (`NSWindowSharingNone`): a ScreenCaptureKit stream of one never holds its content, so
 /// nothing it draws can be seen.

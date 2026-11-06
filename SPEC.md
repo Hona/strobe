@@ -3073,7 +3073,9 @@ is the stable path: Safari's BiDi is not usable yet.
     driver is strobe's tool and is never in the set.
   - A window that is not the session's in strobe's Safari (a link a person opened from another app
     lands in the running Safari) refuses the block `LiveChannel`, and that Safari is left running for
-    them: strobe reads the session's windows once its checks have run, and again after the runs.
+    them: strobe reads the session's windows once its checks have run, and again after the runs. A
+    window here is an on-screen document window (layer 0, at least 100×100 points): Safari keeps its
+    link status bar (738×16 on air) and menu bar strips as windows of their own.
   - Closing reads the process set (with start times) while Safari still runs, deletes the session, ends
     the driver, sends Safari SIGTERM (5 s to go), then ends its tree and every process of that set still
     running with its start time (XPC services of a Safari that already quit too). A Safari that still

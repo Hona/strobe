@@ -1644,8 +1644,19 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
         }
         // The declared metrics' values: one run's worth, enough to see that a counter counts.
+        // A percentile with fewer events than a timed block needs prints none: one run's tail is no tail.
         let shown = |name: &str| {
-            s["values"][name].as_f64().map(|v| format!("{name} {}", fmt::value(v, model::metric(name).map_or("", |m| m.unit)))).or_else(|| s["refused"][name].is_string().then(|| format!("{name} refused")))
+            s["values"][name]
+                .as_f64()
+                .map(|v| {
+                    let def = model::metric(name);
+                    let (count, what) = tail_of(name);
+                    match (def.filter(|d| d.min_n > 1), s["values"][count].as_f64()) {
+                        (Some(d), n) if (n.unwrap_or(0.0) as usize) < d.min_n => format!("{name} — ({} {what} < {} in 1 check run)", n.unwrap_or(0.0) as usize, d.min_n),
+                        _ => format!("{name} {}", fmt::value(v, def.map_or("", |m| m.unit))),
+                    }
+                })
+                .or_else(|| s["refused"][name].is_string().then(|| format!("{name} refused")))
         };
         // A launch's milestones too, declared or not: when each line or pixel change came.
         let declared: Vec<&str> = s["declared"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
@@ -2266,8 +2277,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         };
         primary.set_verdict(kind, verdict);
     }
-    // Tail percentiles need enough frames in every block.
+    // Tail percentiles need enough frames in every block: a primary refused so decides nothing (its
+    // secondaries stay untested, no attribution, `--require-verdict` exits 4).
     let primary = tail_check(def, &blocks, primary);
+    let primary_decided = primary_decided && primary.decided;
     // A series of both counters and times (SPEC §7.5): K pairs of the other kind of block, the
     // fewest that let its secondaries clear Holm (at least the first look), never more than the
     // series ran: counter blocks after timing pairs, or timing blocks after counter pairs.
@@ -2679,17 +2692,44 @@ fn tail_check(def: &MetricDef, blocks: &[Block], mut c: Comparison) -> Compariso
     c
 }
 
-/// `TailTooShort` when a block had fewer of a percentile's events than it needs.
-fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
-    let (count, what) = match def.name.split('.').next() {
+/// The count a percentile is a percentile of, and its events in words.
+fn tail_of(name: &str) -> (&'static str, &'static str) {
+    match name.split('.').next() {
         Some("interaction") => ("interaction.n", "inputs"),
         Some("scroll") => ("scroll.n", "scroll updates"),
         Some("canvas") => ("canvas.n", "canvas frame gaps"),
-        _ if metrics::split_metric(def.name) => ("frames.split.n", "frames with their stages"),
+        _ if metrics::split_metric(name) => ("frames.split.n", "frames with their stages"),
         _ => ("frames.n", "frames"),
-    };
+    }
+}
+
+/// `TailTooShort` when a block had fewer of a percentile's events than it needs.
+fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
+    let (count, what) = tail_of(def.name);
     let least = blocks.iter().map(|b| b.values.get(count).copied().unwrap_or(0.0) as usize).min().unwrap_or(0);
     (def.min_n > 1 && least < def.min_n).then(|| Refusal::new(ValidatorId::TailTooShort, format!("{least} {what} < {}", def.min_n)))
+}
+
+/// `TailTooShort` per timed block: a percentile with fewer events than its minimum n in this block has
+/// no value, and is refused when the series declared it, so a primary like that fails the first block
+/// instead of pairing values no comparison could use.
+fn tail_state(x: &Exec, mut b: Block) -> Block {
+    if !x.measures_time() {
+        return b;
+    }
+    let short: Vec<(String, Refusal)> = b
+        .values
+        .keys()
+        .filter_map(|name| {
+            let def = model::metric(name).filter(|d| d.min_n > 1)?;
+            tail_refusal(def, std::slice::from_ref(&b)).map(|r| (name.clone(), r))
+        })
+        .collect();
+    for (name, r) in short {
+        b.values.remove(&name);
+        b.refused.entry(name).or_insert(r);
+    }
+    b
 }
 
 /// Why strobe has no attribution block for this target: a command ends inside each run, and only
@@ -3411,7 +3451,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).inspect(|b| restate_recording(ctx, s, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).map(|b| tail_state(x, b)).inspect(|b| restate_recording(ctx, s, b));
         // A timed or check block that refused its primary refuses the block, as a native one does:
         // pairs of nothing would end `unclear` instead of saying why.
         let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
@@ -3833,7 +3873,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             page.eval(CHANGES_SCRIPT)?;
         }
         // The page's changes in the run so far, harvested before a `goto` takes the document with them.
-        let harvested: RefCell<Vec<u64>> = RefCell::new(Vec::new());
+        let harvested: RefCell<Vec<probe::present::frames::Change>> = RefCell::new(Vec::new());
         if let Some(g) = &guard {
             g.check("after the app opened its window")?;
         }
@@ -4088,6 +4128,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let os = crate::driver::os::OsInput::attach(&page, browser.pids(), presents_rc.clone())?;
             os.vouched.set(s.expect["same"].as_array().is_some_and(|a| !a.is_empty()));
             let _ = driver.os.set(os);
+        } else if os_frames_on {
+            // Headed in an engine without frames of its own: the page's clicks are held, and its measured
+            // inputs wait, on the OS's presents of its browser (SPEC 7.4), as the OS input's are.
+            let refresh = host::main_window(&browser.pids()).and_then(|w| host::display_of(w.hwnd)).map(|d| 1000.0 / d.hz);
+            driver.watch(presents_rc.clone(), browser.pids(), refresh);
         }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
@@ -4236,6 +4281,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let c0 = counters();
             driver.drags.borrow_mut().clear();
             driver.inputs.borrow_mut().clear();
+            driver.set_pids(browser.pids());
+            // The capture follows windows that opened since (the drivers' settles read it without looking).
+            if let Some(p) = presents_rc.borrow_mut().as_mut() {
+                p.track(&browser.pids());
+            }
             if changes {
                 page_changes(&page);
                 harvested.borrow_mut().clear();
@@ -4755,11 +4805,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                     .enumerate()
                     .map(|(j, r)| {
                         let (sent, changes) = inputs.get(first + j).cloned().unwrap_or_default();
-                        let sent: Vec<Value> = sent.iter().map(|&(t, scroll)| json!({ "t_ns": t, "kind": if scroll { "scroll" } else { "discrete" }, "first": true })).collect();
+                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true })).collect();
                         (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
                     })
                     .collect();
-                store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "runs": per }))?;
+                store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": values.get("display.hz"), "runs": per }))?;
             }
             store::write_json(&dir.join("meta.json"), &meta)?;
             if let Some(d) = draft.take() {
@@ -5395,7 +5445,7 @@ fn margins(v: &Value, primary: &str) -> std::result::Result<BTreeMap<String, f64
 
 /// One run's inputs strobe sent (host clock, and whether each was a scroll) and the page's own changes
 /// (host clock), for input latency from the OS's presents.
-type RunInputs = (Vec<(u64, bool)>, Vec<u64>);
+type RunInputs = (Vec<probe::present::frames::Sent>, Vec<probe::present::frames::Change>);
 
 /// The page engine a target runs in (`web`, `url`; `apply_engines` set it): Chromium unless it says.
 fn engine_of(target: &Value) -> WebEngine {
@@ -5527,11 +5577,12 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
     })
 }
 
-/// The page's own changes since the last read (`CHANGES_SCRIPT`), on the host clock. The read returns the
-/// page's monotonic clock with them, between two host-clock reads; each change goes back from the later
-/// one by its distance from that clock, plus the 1 ms the page's clock may be coarsened to, so that a
-/// change is never placed before the input that caused it (it can land up to the read's own length late).
-fn page_changes(page: &Page) -> Vec<u64> {
+/// The page's own changes since the last read (`CHANGES_SCRIPT`), on the host clock, as the earliest and
+/// latest each can have happened. The read returns the page's monotonic clock with them, between two
+/// host-clock reads; each change goes back from those by its distance from that clock, give or take the
+/// 1 ms the page's clock may be coarsened to. The latest says whether it can have followed an input; the
+/// earliest is the soonest a frame showing it can have begun.
+fn page_changes(page: &Page) -> Vec<probe::present::frames::Change> {
     let h0 = host::now_ns();
     let read: Vec<f64> = page
         .eval("JSON.stringify([performance.now(), ...(globalThis.__strobeChanges?.splice(0) ?? [])])")
@@ -5540,7 +5591,8 @@ fn page_changes(page: &Page) -> Vec<u64> {
         .unwrap_or_default();
     let h1 = host::now_ns().max(h0) as f64;
     let Some((&now, times)) = read.split_first() else { return Vec::new() };
-    times.iter().map(|t| (h1 - ((now - t - 1.0).max(0.0)) * 1e6).max(0.0) as u64).collect()
+    let back = |h: f64, ms: f64| (h - ms.max(0.0) * 1e6).max(0.0) as u64;
+    times.iter().map(|t| (back(h0 as f64, now - t + 1.0), back(h1, now - t - 1.0))).collect()
 }
 
 /// The page's own changes, for input latency where the browser reports none (Firefox): when the DOM
@@ -5622,8 +5674,7 @@ fn os_frames(
         let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
         let mut reactions = frames::Reactions::default();
         for (sent, changes) in inputs {
-            let sent: Vec<frames::Sent> = sent.iter().map(|&(t_ns, scroll)| frames::Sent { t_ns, scroll }).collect();
-            let got = frames::reactions(&sent, changes, &p.presents, pids, quiet);
+            let got = frames::reactions(sent, changes, &p.presents, pids, quiet);
             reactions.interaction.extend(got.interaction);
             reactions.scroll.extend(got.scroll);
             reactions.tried = (reactions.tried.0 + got.tried.0, reactions.tried.1 + got.tried.1);

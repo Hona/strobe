@@ -5,6 +5,7 @@ pub mod native;
 pub mod os;
 
 use crate::model::{Error, Result};
+use crate::probe::present::frames::Sent;
 use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
 use crate::target::a11y::{Dialect, Selector};
 use crate::target::bidi;
@@ -13,6 +14,39 @@ use crate::target::web::WebPage as Page;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
+
+/// The longest strobe waits for a target to settle before a measured input: a target still drawing
+/// then (an animation, a caret, a press ripple) is not at rest, and the input is no sample (SPEC 7.4).
+const SETTLE_MAX: Duration = Duration::from_millis(300);
+
+/// How late a present's event may reach strobe after it began or reached the screen (a flush of the
+/// session's events), allowed for before quiet is called quiet, as `idle` does.
+const PRESENT_DELIVERY_NS: u64 = 30_000_000;
+
+/// Before a measured input (a click's release, a key press, a scroll's first step) and before a press
+/// whose frame must not overlap what came before: at least `min`, then until no present of `pids`
+/// began or reached the screen in the last two refreshes plus the events' delivery time, at most
+/// `SETTLE_MAX` (SPEC 7.4). A click's press is held this way, so its pressed look is on the screen
+/// and settled before the release, as an earlier step's last frame is before the next press. Reads
+/// strobe's own copy of the present events; without a capture it waits `min` alone. Returns whether
+/// the target went quiet (false: still drawing at the cap).
+pub(crate) fn settle(presents: &RefCell<Option<crate::probe::present::PresentCapture>>, pids: &[u32], min: Duration, refresh: Duration) -> Result<bool> {
+    std::thread::sleep(min);
+    let quiet = (refresh * 2).as_nanos() as u64 + PRESENT_DELIVERY_NS;
+    let until = Instant::now() + SETTLE_MAX.saturating_sub(min);
+    while let Some(p) = presents.borrow_mut().as_mut() {
+        let last = p.last_ns(pids)?;
+        let now = crate::host::now_ns();
+        if last + quiet <= now {
+            break;
+        }
+        if Instant::now() >= until {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_nanos(last + quiet - now).min(Duration::from_millis(20)));
+    }
+    Ok(true)
+}
 
 /// Installed in every document before its scripts run: the browser's own rAF, which a page may replace (a game
 /// frame pacer does) and so delay the driver's waits on its own schedule.
@@ -430,10 +464,15 @@ pub struct Driver {
     /// `input.rate` and `input.gap.p95`; the block takes them per run.
     pub drags: RefCell<Vec<Vec<u64>>>,
     /// The inputs a person's interaction latency is measured from (a click's release, each key press,
-    /// a scroll's first wheel step), on the host clock as strobe sent them, with whether it was a
-    /// scroll: a page without the browser's own input latencies (Firefox) joins them to the frames
-    /// that showed them.
-    pub inputs: RefCell<Vec<(u64, bool)>>,
+    /// a scroll's first wheel step, a mouse button's release), on the host clock as strobe sent them,
+    /// with whether it was a scroll: a page without the browser's own input latencies (Firefox, WebKit)
+    /// joins them to the frames that showed them.
+    pub inputs: RefCell<Vec<Sent>>,
+    /// That page's OS present capture (shared with the block), its browser's processes and the
+    /// display's refresh period: what a click's hold and a measured input wait on (`settle`).
+    live: std::cell::OnceCell<os::Presents>,
+    live_pids: RefCell<Vec<u32>>,
+    refresh: Cell<Duration>,
     /// A page measured from outside against a native implementation: its input goes through the OS.
     pub os: std::cell::OnceCell<os::OsInput>,
     /// strobe's looks at the page through the probe since the last `take_reads` (an input's aim, an
@@ -456,6 +495,9 @@ impl Driver {
             pacer: Pacer::default(),
             drags: RefCell::new(Vec::new()),
             inputs: RefCell::new(Vec::new()),
+            live: std::cell::OnceCell::new(),
+            live_pids: RefCell::new(Vec::new()),
+            refresh: Cell::new(Duration::from_micros(16_667)),
             os: std::cell::OnceCell::new(),
             reads: Cell::new(0),
         }
@@ -519,11 +561,23 @@ impl Driver {
         }
         let gap = Duration::from_millis(if count > 1 { 16 } else { 60 });
         let result = (|| -> Result<()> {
-            for k in 1..=count {
+            // A frame of what came before (the move's hover, an earlier step) settles before the press.
+            let quiet = self.settle(Duration::ZERO)?;
+            for _ in 1..=count {
                 p.actions(json!([pointer(vec![json!({ "type": "pointerDown", "button": n })])]))?;
-                std::thread::sleep(gap);
-                if k == count {
+                if count == 1 {
+                    // Held until the pressed look is on the screen and settled (SPEC 7.4); a target that
+                    // was still drawing before the press is held the minimum only.
+                    if quiet {
+                        self.settle(gap)?;
+                    } else {
+                        std::thread::sleep(gap);
+                    }
                     self.input_at(false);
+                } else {
+                    // A double or triple click's presses follow at once: no settling inside the gesture,
+                    // and no sample (SPEC 7.4).
+                    std::thread::sleep(gap);
                 }
                 p.actions(json!([pointer(vec![json!({ "type": "pointerUp", "button": n })])]))?;
             }
@@ -539,9 +593,37 @@ impl Driver {
         result
     }
 
-    /// The pointer's input time for `interaction.*` (a click's release).
+    /// An input time for `interaction.*` (a single click's release, a key press, a button's `up`) or
+    /// `scroll.latency.*` (a scroll's first step).
     fn input_at(&self, scroll: bool) {
-        self.inputs.borrow_mut().push((crate::host::now_ns(), scroll));
+        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll });
+    }
+
+    /// Follows the page's OS presents (a headed page whose engine reports no frames of its own): a
+    /// click's press is then held until its frame settles, and each measured input waits for the page
+    /// to rest, as a native app's do (SPEC 7.4).
+    pub fn watch(&self, presents: os::Presents, pids: Vec<u32>, refresh_ms: Option<f64>) {
+        let _ = self.live.set(presents);
+        *self.live_pids.borrow_mut() = pids;
+        if let Some(ms) = refresh_ms.filter(|ms| *ms > 1.0) {
+            self.refresh.set(Duration::from_secs_f64(ms / 1e3));
+        }
+    }
+
+    /// The browser's processes now (a renderer may come or go).
+    pub fn set_pids(&self, pids: Vec<u32>) {
+        *self.live_pids.borrow_mut() = pids;
+    }
+
+    /// `settle` on the page's presents when strobe follows them; else `min` alone.
+    fn settle(&self, min: Duration) -> Result<bool> {
+        match self.live.get() {
+            Some(p) => settle(p, &self.live_pids.borrow(), min, self.refresh.get()),
+            None => {
+                std::thread::sleep(min);
+                Ok(true)
+            }
+        }
     }
 
     /// A pointer move to (x, y) carrying the held buttons. While one is held it is a drag's move: sent
@@ -566,14 +648,18 @@ impl Driver {
         }
     }
 
-    /// A mouse button going down or up where the pointer is.
-    fn pointer_button(&self, b: Button, down: bool) -> Result<()> {
+    /// A mouse button going down or up where the pointer is; a release is a latency sample only when
+    /// `sample` (`up`; not a drag's end or `release_all`).
+    fn pointer_button(&self, b: Button, down: bool, sample: bool) -> Result<()> {
         let (x, y) = self.pointer.get();
         let bit = cdp_button(b).1;
         let mask = if down { self.buttons.get().0 | bit } else { self.buttons.get().0 & !bit };
         self.buttons.set((mask, Some(b)));
         if down {
             self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
+        } else if sample {
+            // A release is a sample, as a native app's is (SPEC 7.4).
+            self.input_at(false);
         }
         self.mouse(if down { "mousePressed" } else { "mouseReleased" }, (x, y), Some(b), mask, 1, 0)
     }
@@ -608,7 +694,7 @@ impl Driver {
         if held {
             self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
         } else {
-            self.pointer_button(b, true)?;
+            self.pointer_button(b, true, false)?;
         }
         let steps = (duration / frame).ceil().max(1.0) as u32;
         let start = Instant::now();
@@ -618,7 +704,7 @@ impl Driver {
             self.pointer_move(x0 + dx, y0 + dy, true)?;
         }
         if !held {
-            self.pointer_button(b, false)?;
+            self.pointer_button(b, false, false)?;
         }
         self.until(o)
     }
@@ -666,7 +752,7 @@ impl Driver {
         let (mask, _) = self.buttons.get();
         for b in [Button::Left, Button::Right, Button::Middle] {
             if mask & cdp_button(b).1 != 0 {
-                self.pointer_button(b, false)?;
+                self.pointer_button(b, false, false)?;
             }
         }
         let held: Vec<Key> = self.held.borrow().clone();
@@ -679,18 +765,21 @@ impl Driver {
     /// Clicks into the element unless focus is already in it, so a second call keeps typing where the caret is.
     fn focus(&self, sel: &Value, o: &Value) -> Result<()> {
         if no_selector(sel) {
-            return Ok(());
+            return self.settle(Duration::ZERO).map(drop);
         }
         let sel = Self::sel(sel)?;
         let (x, y, focused) = self.aim(&sel, o)?;
-        if !focused {
-            let held = self.buttons.get().0;
-            self.pointer.set((x, y));
-            self.mouse("mouseMoved", (x, y), None, held, 0, 0)?;
-            self.mouse("mousePressed", (x, y), Some(Button::Left), held | 1, 1, 0)?;
-            self.mouse("mouseReleased", (x, y), Some(Button::Left), held, 1, 0)?;
+        if focused {
+            return self.settle(Duration::ZERO).map(drop);
         }
-        Ok(())
+        let held = self.buttons.get().0;
+        self.pointer.set((x, y));
+        self.mouse("mouseMoved", (x, y), None, held, 0, 0)?;
+        self.mouse("mousePressed", (x, y), Some(Button::Left), held | 1, 1, 0)?;
+        self.mouse("mouseReleased", (x, y), Some(Button::Left), held, 1, 0)?;
+        // The click's frames (a focus ring, a caret) settle before the first key, which is measured: at
+        // least 2 refreshes, since the click's first frame may not have begun yet.
+        self.settle(self.refresh.get() * 2).map(drop)
     }
 
     /// Dispatches one driver call from the runner: `{ call, args }`.
@@ -730,9 +819,6 @@ impl Driver {
                 // Each press of a double or triple click carries its count, as a mouse's do.
                 for k in 1..=count {
                     self.mouse("mousePressed", (x, y), Some(b), held | bit, k, mods)?;
-                    if k == count {
-                        self.input_at(false);
-                    }
                     self.mouse("mouseReleased", (x, y), Some(b), held, k, mods)?;
                 }
                 self.until(&o)
@@ -800,6 +886,7 @@ impl Driver {
                 };
                 let delta = |k: &str| d.get(k).and_then(Value::as_f64).unwrap_or(0.0);
                 let (mask, last) = self.buttons.get();
+                self.settle(Duration::ZERO)?;
                 self.input_at(true);
                 match &self.page {
                     Page::Chromium(p) => {
@@ -846,11 +933,19 @@ impl Driver {
                         Some(Value::Array(p)) => self.pointer_move(p.first().and_then(Value::as_f64).unwrap_or(0.0), p.get(1).and_then(Value::as_f64).unwrap_or(0.0), false)?,
                         _ => {}
                     }
-                    self.pointer_button(b, call == "down")?;
+                    // A release is measured as a click's is: what the press drew settles first.
+                    if call == "up" {
+                        self.settle(Duration::ZERO)?;
+                    }
+                    self.pointer_button(b, call == "down", true)?;
                 } else {
                     let (mods, key) = keys::parse_chord(&s(0))?;
                     if mods.any() {
                         return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
+                    }
+                    // A key going down is measured, as a press is.
+                    if call == "down" {
+                        self.settle(Duration::ZERO)?;
                     }
                     self.key(key, call == "down")?;
                 }
@@ -940,6 +1035,7 @@ impl Driver {
         let frame = self.frame_period()?;
         let dist = dx.hypot(dy);
         let steps = ((dist / speed.max(1.0)) * 1e3 / frame).ceil().max(1.0) as u32;
+        self.settle(Duration::ZERO)?;
         let start = Instant::now();
         let mut sent = (0.0, 0.0);
         for k in 1..=steps {

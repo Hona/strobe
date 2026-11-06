@@ -210,56 +210,75 @@ pub fn values(runs: &[RunFrames], refresh_ms: Option<f64>) -> BTreeMap<String, f
     out
 }
 
-/// An input strobe gave a native app: when it was posted (host clock), and whether it is a
-/// discrete one (a click's release, a key press) or the first wheel step of a scroll.
-#[derive(Clone, Copy, Debug)]
+/// An input strobe gave a target: when it was sent (host clock), and whether it is a discrete one (a
+/// single click's release, a key press, a button's `up`) or the first wheel step of a scroll.
+#[derive(Clone, Copy, Debug, serde::Serialize)]
 pub struct Sent {
     pub t_ns: u64,
     pub scroll: bool,
 }
 
-/// Input latencies from outside the app (SPEC §7.4), in ms: discrete inputs for `interaction.*`,
-/// gesture-starting wheel steps for `scroll.latency.*`. An input counts when the app changed its
-/// accessibility tree within a second after it (`changes`, host clock: a press highlight or a caret
-/// blink changes none, so such an input never claims an unrelated later frame), and the app was at
-/// rest when it came (no present started in the `quiet` before it); its latency is then to the
-/// screen time of the first present of `pids` that started after it and reached the screen, within
-/// a second. Nothing carries over between inputs.
+/// A change of the target's model (its accessibility tree, a page's DOM) on the host clock, as the
+/// earliest and the latest it can have happened.
+pub type Change = (u64, u64);
+
+/// A change strobe heard of at `at` (an accessibility event): it happened by then, and how long before
+/// is not known (events carry no source time). A provider may announce a change long after drawing it
+/// (one toolkit's tree on macOS: 350–440 ms after its pane switch began to draw), so the event's time is
+/// no bound on the reaction's frame.
+pub fn notified(at: u64) -> Change {
+    (0, at)
+}
+
+/// Input latencies from outside the target (SPEC §7.4), in ms: discrete inputs for `interaction.*`,
+/// gesture-starting wheel steps for `scroll.latency.*`. An input counts when the target's model changed
+/// within a second after it (`changes`: a press highlight or a caret blink changes none, so such an
+/// input never claims an unrelated later frame), and the target was at rest when it was sent: no
+/// present of `pids` begun before it reached the screen (or began, when it never did) in the `quiet`
+/// before it, so a frame on its way at the send (a press's look, an animation's) is never taken for its
+/// reaction. Its latency is then to the screen time of the first present that began after it and after
+/// the earliest its first change can have happened (a frame begun before the model changed cannot show
+/// the change: a page's `:active` undone at the release is not an asynchronous reaction's frame; an
+/// accessibility event bounds nothing, `notified`), and reached the screen, within a second. Nothing
+/// carries over between inputs.
 #[derive(Clone, Debug, Default)]
 pub struct Reactions {
     pub interaction: Vec<f64>,
     pub scroll: Vec<f64>,
-    /// Inputs that changed the tree, per kind: (discrete, scroll).
+    /// Inputs that changed the model, per kind: (discrete, scroll).
     pub tried: (usize, usize),
-    /// Of those, the app was already drawing when they came.
+    /// Of those, the target was still drawing when they were sent.
     pub busy: (usize, usize),
     /// Of those, no present reached the screen within a second.
     pub unshown: (usize, usize),
-    /// Inputs after which the tree did not change.
+    /// Inputs after which the model did not change.
     pub unchanged: usize,
 }
 
 /// The longest an input waits for its frame: past this its present is something else's.
 const HORIZON_NS: u64 = 1_000_000_000;
 
-pub fn reactions(sent: &[Sent], changes: &[u64], presents: &[Present], pids: &[u32], quiet_ns: u64) -> Reactions {
-    let mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid) && p.state != "lost" && p.state != "failed").collect();
+pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: &[u32], quiet_ns: u64) -> Reactions {
+    let mut mine: Vec<&Present> = presents.iter().filter(|p| pids.contains(&p.pid) && p.state != "lost" && p.state != "failed").collect();
+    // Sources deliver presents as they complete, not as they began: the searches below need start order.
+    mine.sort_by_key(|p| p.start_ns);
     let mut out = Reactions::default();
     for s in sent {
-        let changed = changes.iter().any(|&c| c > s.t_ns && c <= s.t_ns + HORIZON_NS);
-        if !changed {
+        // The earliest the first change after the input can have happened.
+        let Some(changed) = changes.iter().filter(|c| c.1 > s.t_ns && c.1 <= s.t_ns + HORIZON_NS).map(|c| c.0).min() else {
             out.unchanged += 1;
             continue;
-        }
+        };
         let k = usize::from(s.scroll);
         let bump = |t: &mut (usize, usize)| if k == 1 { t.1 += 1 } else { t.0 += 1 };
         bump(&mut out.tried);
         let at = mine.partition_point(|p| p.start_ns <= s.t_ns);
-        if at > 0 && mine[at - 1].start_ns + quiet_ns > s.t_ns {
+        let drawing = mine[..at].iter().rev().take_while(|p| p.start_ns + HORIZON_NS > s.t_ns).any(|p| p.start_ns.max(p.screen_ns) + quiet_ns > s.t_ns);
+        if drawing {
             bump(&mut out.busy);
             continue;
         }
-        match mine[at..].iter().take_while(|p| p.start_ns <= s.t_ns + HORIZON_NS).find(|p| p.state == "displayed" && p.screen_ns > s.t_ns) {
+        match mine[at..].iter().take_while(|p| p.start_ns <= s.t_ns + HORIZON_NS).find(|p| p.state == "displayed" && p.screen_ns > s.t_ns && p.start_ns >= changed) {
             Some(p) => {
                 let ms = (p.screen_ns - s.t_ns) as f64 / 1e6;
                 if s.scroll { out.scroll.push(ms) } else { out.interaction.push(ms) }
@@ -285,7 +304,7 @@ impl Reactions {
                     format!("NoPresentSource: {prefix}.*: the runs sent no input of this kind")
                 })
             } else if busy * 2 > tried {
-                Some(format!("AmbiguousInteraction: {prefix}.*: the app was already drawing when {busy} of {tried} inputs came (an animation or a caret), so the next frame may not be their reaction"))
+                Some(format!("AmbiguousInteraction: {prefix}.*: the app was still drawing when {busy} of {tried} inputs were sent (an animation, a caret, or a press's own look still on its way after 300 ms), so the next frame may not be their reaction"))
             } else if events_lost == 0 && unshown as f64 > UNMATCHED_MAX * (tried - busy) as f64 {
                 Some(format!(
                     "PresentsUnmatched: {prefix}.*: {unshown} of {} inputs that changed the app's tree showed no frame within a second: the app presents in a way the session does not follow, or reacted only in its tree",

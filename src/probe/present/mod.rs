@@ -132,7 +132,8 @@ pub struct Live {
     cv: std::sync::Condvar,
 }
 
-/// The presents, and each process's latest start: a wait asks for that between every sleep, and
+/// The presents, and each process's latest present (its start, or its screen time when later): a
+/// wait asks for that between every sleep, and
 /// finding it in the queue (65,536 presents after a few minutes of frames) cost strobe's main thread
 /// most of its CPU inside a native block's runs on air.
 #[derive(Default)]
@@ -142,7 +143,8 @@ struct LiveQueue {
 }
 
 /// What `Live` says about some processes: the first present that reached the screen after a time
-/// (0 when none yet), and the start of their latest present of any fate (0 when none).
+/// (0 when none yet), and the latest one of theirs began or reached the screen, of any fate (0 when
+/// none; the field keeps its name for the deep-mode helper's answers).
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 pub struct LiveView {
     pub next_start_ns: u64,
@@ -158,7 +160,7 @@ impl Live {
             q.all.pop_front();
         }
         let last = q.last.entry(pid).or_default();
-        *last = (*last).max(start);
+        *last = (*last).max(start.max(screen));
         self.cv.notify_all();
     }
 
@@ -267,6 +269,19 @@ impl PresentCapture {
                 c.track(pids);
                 Ok(c.live.view(pids, after, wait))
             }
+        }
+    }
+
+    /// The latest a present of `pids` began or reached the screen (0 when none), without looking for
+    /// new windows (`track` reads the window list): what a settle polls every few milliseconds.
+    pub fn last_ns(&mut self, pids: &[u32]) -> crate::model::Result<u64> {
+        match self {
+            #[cfg(windows)]
+            PresentCapture::Local(_) | PresentCapture::Helper(_) => Ok(self.live(pids, u64::MAX, std::time::Duration::ZERO)?.last_start_ns),
+            #[cfg(target_os = "macos")]
+            PresentCapture::Screen(c) => Ok(c.live.view(pids, u64::MAX, std::time::Duration::ZERO).last_start_ns),
+            #[cfg(target_os = "linux")]
+            PresentCapture::X11(c) => Ok(c.live.view(pids, u64::MAX, std::time::Duration::ZERO).last_start_ns),
         }
     }
 

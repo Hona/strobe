@@ -1119,7 +1119,12 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
         serde_json::from_str(&text)?
     };
     let pids: Vec<u32> = f["pids"].as_array().into_iter().flatten().filter_map(|p| p.as_u64().map(|p| p as u32)).collect();
-    let refresh = crate::probe::present::frames::refresh_ms(&presents.vsyncs, presents.t0_ns, presents.t1_ns, None);
+    // The block's own display rate when it kept one: macOS and X11 sessions have no vertical blanks.
+    let refresh = f["display_hz"]
+        .as_f64()
+        .filter(|hz| *hz > 1.0)
+        .map(|hz| 1000.0 / hz)
+        .or_else(|| crate::probe::present::frames::refresh_ms(&presents.vsyncs, presents.t0_ns, presents.t1_ns, None));
     let quiet = crate::probe::present::frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
     let mut text = String::new();
     let mut runs_json = Vec::new();
@@ -1138,7 +1143,17 @@ fn native_frames(dir: &Path, top: usize) -> Result<Output> {
             .filter(|i| i["kind"] == "discrete" || (i["kind"] == "scroll" && i["first"] == true))
             .map(|i| crate::probe::present::frames::Sent { t_ns: i["t_ns"].as_u64().unwrap_or(0), scroll: i["kind"] == "scroll" })
             .collect();
-        let changes: Vec<u64> = r["changes"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+        // Each change as its earliest and latest time; a recording from before kept one time, the latest.
+        let changes: Vec<crate::probe::present::frames::Change> = r["changes"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| match (c.as_u64(), c[0].as_u64(), c[1].as_u64()) {
+                (Some(t), _, _) => Some(crate::probe::present::frames::notified(t)),
+                (None, Some(lo), Some(hi)) => Some((lo, hi)),
+                _ => None,
+            })
+            .collect();
         let got = crate::probe::present::frames::reactions(&sent, &changes, &presents.presents, &pids, quiet);
         slow.extend(got.interaction.iter().map(|ms| (*ms, run.clone(), "input")));
         slow.extend(got.scroll.iter().map(|ms| (*ms, run.clone(), "scroll")));

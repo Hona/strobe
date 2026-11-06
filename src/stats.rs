@@ -420,8 +420,10 @@ impl Comparison {
         self.refusal = None;
     }
 
-    /// Refuses the metric: `refused (<validator>): <summary>`, undecided.
+    /// Refuses the metric: `refused (<validator>): <summary>`, undecided, with no numbers (they print —):
+    /// a refused comparison's values are not a measurement anyone should read.
     pub fn refuse(&mut self, r: Refusal) {
+        (self.base, self.head, self.estimate, self.lo, self.hi) = (f64::NAN, f64::NAN, f64::NAN, f64::NAN, f64::NAN);
         self.verdict = format!("refused ({}): {}", r.validator, r.summary);
         self.kind = VerdictKind::Refused;
         self.decided = false;

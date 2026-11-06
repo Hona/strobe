@@ -787,10 +787,16 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
   frame begin, so `frames.presented.*` (begin to screen) is refused.
 - **Inputs to the screen** (the generic path, for any native app strobe drives): strobe stamps each
   input it sends (host clock); its frame is the first present of the app's processes that started
-  after it and reached the screen (a discarded one is passed over: a later one shows it). An input
-  counts only when the app presented nothing for two refreshes before it: at rest, the next present
-  is the input's; an app already drawing may present a frame begun before the input, so that input
-  is not counted, and neither is one after which the app's accessibility tree did not change (§7.4).
+  after it, no earlier than the change it shows, and reached the screen (a discarded one is passed
+  over: a later one shows it). An input counts only when no present of the app began or reached the
+  screen in the two refreshes before it: at rest, the next present is the input's; an app already
+  drawing, or a frame still on its way (a click's pressed look), may present a frame begun before
+  the input, so that input is not counted, and neither is one after which the app's accessibility
+  tree did not change (§7.4). The driver holds a click's press, and waits before a measured input,
+  until the app settles (at most 300 ms), so a static pressed look is on the screen first. An
+  accessibility event carries no source time, so a native frame is bounded only by the input: a frame
+  the app draws at once for another reason (an unpress, a periodic redraw) before an asynchronous
+  update is taken as the reaction (§7.4).
   An input with no displayed present within a second is unmatched; over 5% of them with no events
   lost refuses `interaction.*` (`PresentsUnmatched`). `interaction.*` is screen time − input time.
 - **Refresh**: `display.hz` and the refresh period are the target window's display path's
@@ -906,24 +912,72 @@ What strobe reads from a native app (§13.7), per run:
   refreshed, plus ten, refuses the frame metrics (`UnpacedSpin`).
 - **Interaction latency** (`interaction.p50|p95`, `interaction.n`; `scroll.latency.p50|p95`,
   `scroll.n`), from strobe's own inputs (§13.7) to the presents that showed them:
-  - Inputs: a click's release (its press shows a pressed look at most; the release does the click),
-    each key press of `type`, `press` and `down`, and for `scroll.latency.*` the first wheel step of
-    each `scroll` or `wheel`. Moves, hovers, presses and releases of keys are never samples, and
-    inputs given through accessibility actions (`page.act`) skip hit testing and pointer handling:
-    they are never samples, and a series whose runs only acted refuses `interaction.*`
+  - Inputs: a single click's release (its press shows a pressed look at most; the release does the
+    click), a mouse button's release by `up`, each key going down in `type`, `press` and `down`, and
+    for `scroll.latency.*` the first wheel step of each `scroll` or `wheel`. Moves, hovers, mouse
+    button presses, key releases, a drag's end, the releases `release_all` sends between runs, and a
+    double or triple click's releases are never samples: a multi-click's presses follow a frame apart,
+    so its pressed looks are still on their way at each release, and settling inside the gesture
+    would stretch it past the OS's double-click time. Inputs given through accessibility actions
+    (`page.act`) skip hit testing and pointer handling: they are never samples, and a series whose
+    runs only acted refuses `interaction.*`
     (`PatternInput`).
+  - The driver lets the target settle around them, on its own live copy of the present events
+    (`driver::settle`): before a press, a measured input (each `type`'s first key, a `press` after the
+    click into its field, a key or button `down`/`up`) or a scroll's first step, until no present of
+    the target began or reached the screen in the last 2 refreshes plus 30 ms for the events to reach
+    strobe, at most 300 ms. A single click's press is held that way, at least 60 ms, so its pressed
+    look (`:active`, a highlight) is on the screen and settled before the release; when the settle
+    before the press already hit the cap (the target animates), the press is held the 60 ms only, not
+    a second 300 ms. A double or triple click's presses are a frame apart with no settling. A click
+    into a field before keys (`type`, `press` with a selector) settles at least 2 refreshes after its
+    release, since its first frame may not have begun yet. A target still drawing after 300 ms (a
+    ripple, a transition, a caret, an animation) is not at rest, and the input goes out anyway and is
+    no sample (below). A blind 60 ms hold refused most clicks: the pressed look reached the screen
+    35–50 ms after the press (Safari, Firefox on air), within the 2 refreshes before the release. The
+    settle reads the latest present without looking for new windows (reading the window list every
+    poll raised the macOS capture's consumer past its budget); each run re-tracks the target's windows
+    once before it starts, outside its span. The macOS capture streams no window under 32 points a
+    side (a tooltip, a badge): a stream opened mid-block for a browser's 66×20 tooltip did the same.
   - An input reacts when the app changed its accessibility tree (a structure, property or focus event
     from its windows) within 1 s after strobe posted it. An input that changes no tree (a press
     highlight, a hover, a key the app ignores) is not a sample, so no later frame of something else
     (a caret blink, a timer) is ever attributed to it. Reactions that change only pixels are not
     measured; an app with no accessibility tree has no `interaction.*`.
   - Its latency is from the post time (host clock) to the screen time of the first present of the
-    app's processes that started after it and reached the screen, within 1 s. Each input is resolved
-    on its own after the run: nothing pending carries over between inputs, runs or a reset, and a
-    present after several inputs is the reaction of each (latency from each).
-  - Refused when ambiguous: an input that came while the app was drawing (a present started in the 2
-    refreshes before it) is not a sample, since the next frame may be its animation's; more than half
-    of a block's inputs like that refuses `interaction.*` (`AmbiguousInteraction`). No reacting input
+    app's processes that started after it, and no earlier than its first change can have happened,
+    and reached the screen, within 1 s. A frame begun before the model changed cannot show the change:
+    a pressed look undone at the release (`:active` reverting a refresh later) is not the frame of a
+    reaction that changes the model 100 ms on. Each change is kept as the earliest and latest it can
+    have happened: a page's change (`CHANGES_SCRIPT`) between the host-clock reads around the page's
+    clock; an accessibility event only by when strobe heard of it, with no earliest, since events
+    carry no source time and a provider may announce a change long after drawing it (one toolkit's tree
+    on macOS: 350–440 ms after its pane switch began to draw at 87 ms; bounding by the event took the
+    frame at 420 ms). The latest decides whether it followed the input; the earliest bounds the frame.
+    So a native app's frame may precede its change: the residual exposure is a frame the app draws at
+    once and for another reason, before an asynchronous update (an immediate unpress frame, a
+    periodic redraw), matched as the reaction. The settled press hold removes the pressed look's own
+    frames; an unpress frame drawn with no model change is still taken. Pages have no such exposure:
+    in an implementation comparison of a page with a native app, the page's side is bounded by its
+    changes and the native side is not, so a native side whose app redraws at once may read faster
+    (§9.10). After each native run, strobe waits (outside its span, before releasing keys, its reset or
+    the next run) until the app announced a change after the run's last measured input, or a second
+    after that input passed, and the run's changes end there: none of another step's join it, with a
+    reset or without, and nothing is waited when the change already came. Each input is resolved on
+    its own after the run: nothing pending carries over between inputs, runs or a reset, and a present
+    after several inputs is the reaction of each (latency from each).
+  - Refused when ambiguous: an input sent while the app was drawing is not a sample, since the next
+    frame may be that drawing's: a present that began before the input and began or reached the
+    screen within the 2 refreshes before it (one begun before and shown after the input is on its way
+    at the input, whatever the source: macOS and X11 see only screen times, Windows sees the present
+    call after the frame's work). More than half of a block's inputs like that refuses `interaction.*`
+    (`AmbiguousInteraction`). `interaction.p95` needs 20 samples a block, as `scroll.latency.p95` does
+    (`TailTooShort`: one sample is its own 95th percentile); `interaction.p50` takes one. Each timed
+    block applies every percentile's minimum n itself: a value below it is dropped and refused, so a
+    primary like that fails the first block, and a refused primary decides nothing (secondaries stay
+    untested, no attribution, `--require-verdict` exits 4); a refused comparison carries no numbers
+    (they print —). `--check` prints such a percentile as `interaction.p95 — (3 inputs < 20 in 1
+    check run)` and still passes. No reacting input
     or no shown frame refuses it (`NoPresentSource`, with the reason), as does a block without
     present events.
   - It is testable: `probe::present::frames::reactions` takes the posted inputs, the change times and the
@@ -2369,7 +2423,11 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
   take samples by one rule (§7.4: an input at rest, the app's model changing within a second, a
   present within a second); a side whose blocks gave under 0.8 or over 1.25 times the other's samples
   (`interaction.n`, `scroll.n`, medians) timed other inputs, and those metrics are refused. With a few
-  samples a block (both at least 2), one apart is alike.
+  samples a block (both at least 2), one apart is alike. One asymmetry stays: a page's reaction frame
+  begins no earlier than its first change (the page's clock bounds it), and a native app's only after
+  the input, since an accessibility event carries no source time. A native side that draws a frame at
+  once for another reason (an unpress, a periodic redraw) before an asynchronous update has it taken
+  as the reaction and may read faster than a page doing the same (§7.4).
 - **What driving costs** (`driver.reads`, `ObserverCost`): strobe reads each side through what it
   offers, a page's DOM through its probe and a native app's accessibility tree, and a read inside a run
   costs the app work a person's use would not (a lazy provider builds and updates its tree once a
@@ -2530,7 +2588,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `WrongScreen` | a block's window or page is not on the screen its case's (or target's) `expect` names (§9.6): a title, a dialog or heading, an address, or selectors that must be visible, read before the runs and after them (never inside one). A first-run dialog over the pane the case meant fails the block instead of timing it. Before a native app's runs, only titles are checked unless setup already drove the app: reading its tree there would connect strobe to it for the runs |
 | `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
 | `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric) |
-| `AmbiguousInteraction` | over half of a block's inputs came while the native app was drawing, so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
+| `AmbiguousInteraction` | over half of a block's inputs were sent while the target was drawing (a present begun before the input began or reached the screen in the 2 refreshes before it: an animation, a caret, a press's look still settling after 300 ms), so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |

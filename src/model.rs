@@ -627,7 +627,7 @@ pub const METRICS: &[MetricDef] = &[
         better: Better::Lower,
         kind: Kind::Timed,
         words: TIME,
-        min_n: 1,
+        min_n: 20,
         across: Across::Compared,
         about: "input to presentation, 95th percentile of discrete inputs",
     },

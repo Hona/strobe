@@ -446,6 +446,11 @@ fn on_screen(pids: &[u32]) -> Vec<OnScreen> {
                 return None;
             }
             let b = cf_rect(cf_get(d, "kCGWindowBounds"))?;
+            // A window under 32 points a side (a tooltip, a badge) holds no reaction worth a stream: one
+            // opened mid-block for a browser's tooltip pushed the consumer past its budget.
+            if b.size.width < 32.0 || b.size.height < 32.0 {
+                return None;
+            }
             let rect = (b.origin.x as i32, b.origin.y as i32, b.size.width as i32, b.size.height as i32);
             Some(OnScreen { id: cf_i64(cf_get(d, "kCGWindowNumber"))? as u32, pid, rect, shared: cf_i64(cf_get(d, "kCGWindowSharingState")).unwrap_or(1) != 0 })
         })

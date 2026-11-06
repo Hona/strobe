@@ -145,8 +145,9 @@ mod imp {
             Ok(at)
         }
 
-        /// A mouse button going down or up where the pointer is.
-        fn pointer_button(&self, b: Button, down: bool) -> Result<u64> {
+        /// A mouse button going down or up where the pointer is; a release is a latency sample only when
+        /// `sample` (`up`; not a drag's end or `release_all`).
+        fn pointer_button(&self, b: Button, down: bool, sample: bool) -> Result<u64> {
             let (_, _, t) = self.pointer.get().ok_or_else(|| Error::usage("page.down(\"Mouse\") presses where the pointer is: move it first (hover, move, or down's at option)"))?;
             let top = self.main.get();
             let at = self.poster.button(t, b, down, false, Mods::default(), top)?;
@@ -154,7 +155,7 @@ mod imp {
             if down {
                 self.log.borrow_mut().drags.push(vec![at]);
             }
-            self.input(at, if down { "pointer" } else { "discrete" }, false);
+            self.input(at, if !down && sample { "discrete" } else { "pointer" }, false);
             Ok(at)
         }
 
@@ -177,7 +178,7 @@ mod imp {
 
         pub fn release_all(&self) {
             if let Some((b, _)) = self.pressed.get() {
-                let _ = self.pointer_button(b, false);
+                let _ = self.pointer_button(b, false, false);
             }
             self.poster.release_all(self.main.get());
         }
@@ -550,28 +551,28 @@ mod imp {
             Ok((self.snapshot(None)?, seen))
         }
 
+        /// Waits until the app has announced a change later than `after` (host clock), or `until`: at once
+        /// when one already came.
+        pub fn wait_change_after(&self, after: u64, until: Instant) {
+            loop {
+                let c = self.a11y.changes();
+                if c.last_ns > after || Instant::now() >= until {
+                    return;
+                }
+                self.a11y.wait_change(c.count, until);
+            }
+        }
+
         /// Waits until the app announces a change after the `seen`th, or `t` passes.
         pub fn wait_change(&self, seen: u64, t: Duration) {
             self.a11y.wait_change(seen, Instant::now() + t);
         }
 
-        /// Before an input that is measured: at least `min`, then until the app has presented
-        /// nothing for two refreshes (at most 300 ms), so a frame of what came before (a hover, a
-        /// click's pressed look) is not taken for the input's (SPEC §7.4). Reads only strobe's own
-        /// copy of the present events.
-        fn rest(&self, min: Duration, refresh: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<()> {
-            std::thread::sleep(min);
-            let quiet = (refresh * 2).as_nanos() as u64;
-            let until = Instant::now() + Duration::from_millis(300);
-            while let Some(p) = presents.borrow_mut().as_mut() {
-                let last = p.live(&self.pids.borrow(), u64::MAX, Duration::ZERO)?.last_start_ns;
-                let now = host::now_ns();
-                if last + quiet <= now || Instant::now() >= until {
-                    break;
-                }
-                std::thread::sleep(Duration::from_nanos(last + quiet - now).min(Duration::from_millis(20)));
-            }
-            Ok(())
+        /// Before an input that is measured, and before a press: `driver::settle` on the app's processes
+        /// (SPEC 7.4).
+        /// Returns whether the app went quiet.
+        fn rest(&self, min: Duration, refresh: Duration, presents: &RefCell<Option<PresentCapture>>) -> Result<bool> {
+            crate::driver::settle(presents, &self.pids.borrow(), min, refresh)
         }
 
         /// Where keys for `sel` go: its window, and the element's own window when it is one (a
@@ -589,6 +590,10 @@ mod imp {
             let to = (own != 0 && own != top).then_some(own);
             if !tree.focus_within(i) && !(to.is_some() && host::session_locked()) {
                 self.click(sel, &json!({ "window": o["window"] }), presents, "pointer")?;
+                // Its frames (a focus ring, a caret) settle before the first key, which is measured: at
+                // least 2 refreshes, since the click's first frame may not have begun yet.
+                let frame = Duration::from_millis(self.frame_ms(0.0, 0.0));
+                self.rest(frame * 2, frame, presents)?;
             }
             Ok((top, to))
         }
@@ -622,7 +627,7 @@ mod imp {
             if held {
                 self.log.borrow_mut().drags.push(Vec::new());
             } else {
-                self.pointer_button(b, true)?;
+                self.pointer_button(b, true, false)?;
             }
             let duration = o["duration"].as_f64().unwrap_or(1000.0).max(1.0);
             let frame = host::refresh_at(x0 as i32, y0 as i32).map_or(1000.0 / 60.0, |hz| 1000.0 / hz.max(1) as f64);
@@ -635,7 +640,7 @@ mod imp {
                 last = self.pointer_to(x, y, t0.moved(x, y))?;
             }
             if !held {
-                last = self.pointer_button(b, false)?;
+                last = self.pointer_button(b, false, false)?;
             }
             Ok(last)
         }
@@ -694,18 +699,23 @@ mod imp {
             let gap = Duration::from_millis(self.frame_ms(x, y));
             self.input(self.poster.move_to(t, 0)?, "pointer", false);
             self.pointer.set(Some((x, y, t)));
+            // A frame of what came before (a hover, an earlier step) settles before the press.
+            let quiet = self.rest(Duration::ZERO, gap, presents)?;
             let mut last = 0;
             for k in 0..count {
                 // The press shows a pressed look at most; the release is the click's action, held
-                // as a person holds a click (a double click's second press follows at once).
+                // as a person holds a click, until the pressed look is on the screen (the minimum
+                // only when the app was still drawing before the press). A double click's presses
+                // follow at once, with no settling inside the gesture, and its releases are no
+                // samples: only a single click's release is (SPEC 7.4).
                 self.input(self.poster.button(t, b, true, k > 0, mods, top)?, "pointer", false);
-                if count > 1 {
-                    std::thread::sleep(gap);
-                } else {
+                if count == 1 && quiet {
                     self.rest(Duration::from_millis(60), gap, presents)?;
+                } else {
+                    std::thread::sleep(if count == 1 { Duration::from_millis(60) } else { gap });
                 }
                 last = self.poster.button(t, b, false, false, mods, top)?;
-                self.input(last, kind, false);
+                self.input(last, if count == 1 { kind } else { "pointer" }, false);
             }
             self.until(opts, last, presents).map_err(|e| self.moved(e, &selector, opts, aimed))
         }
@@ -848,6 +858,8 @@ mod imp {
                     let (mods, key) = input::parse_chord(&s(0))?;
                     let o = opts(1);
                     let (top, to) = self.key_target(&o["selector"], &o, presents)?;
+                    // After the click into the field, if there was one: its frames settle first.
+                    self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
                     let at = self.poster.press(top, to, mods, key)?;
                     self.input(at, "discrete", false);
                     self.until(&opts(1), at, presents)?;
@@ -869,13 +881,21 @@ mod imp {
                         }
                         _ => {}
                     }
-                    let at = self.pointer_button(b, call == "down")?;
+                    // A release is measured as a click's is: what the press drew settles first.
+                    if call == "up" {
+                        self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
+                    }
+                    let at = self.pointer_button(b, call == "down", true)?;
                     self.until(&o, at, presents)?;
                 }
                 "down" | "up" => {
                     let (mods, key) = input::parse_chord(&s(0))?;
                     if mods.any() {
                         return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
+                    }
+                    // A key going down is measured, as a press is.
+                    if call == "down" {
+                        self.rest(Duration::ZERO, Duration::from_millis(self.frame_ms(0.0, 0.0)), presents)?;
                     }
                     let at = if call == "down" { self.poster.hold(main, key)? } else { self.poster.release(main, key)? };
                     self.input(at, if call == "down" { "discrete" } else { "pointer" }, false);

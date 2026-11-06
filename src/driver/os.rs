@@ -14,6 +14,7 @@ use crate::driver::native::{Input, Log};
 use crate::host;
 use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::present::PresentCapture;
+use crate::probe::present::frames::Sent;
 use crate::target::a11y::input::{self, Button, Key, Mods, Named, Poster, Target};
 use crate::target::a11y::keys;
 use crate::target::web::WebPage as Page;
@@ -41,9 +42,6 @@ const SCRIPT: &str = r#"window.__strobeOs ??= (() => {
   return s
 })(), true
 //# sourceURL=strobe-os-input.js"#;
-
-/// Quiet that counts as the page at rest before a measured input (as for native apps, §7.4).
-const REST_MAX: Duration = Duration::from_millis(300);
 
 /// A window's frame and client size.
 type Geometry = ((i32, i32, i32, i32), (i32, i32));
@@ -253,7 +251,7 @@ impl OsInput {
         Ok(at)
     }
 
-    fn button(&self, b: Button, down: bool) -> Result<u64> {
+    fn button(&self, b: Button, down: bool, sample: bool) -> Result<u64> {
         let (_, _, t) = self.pointer.get().ok_or_else(|| Error::usage("page.down(\"Mouse\") presses where the pointer is: move it first (hover, move, or down's at option)"))?;
         let at = self.poster.button(t, b, down, false, Mods::default(), self.top.get())?;
         self.pressed.set(down.then_some(b));
@@ -261,39 +259,28 @@ impl OsInput {
             self.count(1);
             self.log.borrow_mut().drags.push(vec![at]);
         }
-        self.input(at, if down { "pointer" } else { "discrete" }, false);
+        self.input(at, if !down && sample { "discrete" } else { "pointer" }, false);
         Ok(at)
     }
 
-    /// Before a measured input: at least `min`, then until the page's processes presented nothing for
-    /// two refreshes (at most 300 ms), as for a native app (SPEC §7.4).
-    fn rest(&self, min: Duration, refresh: Duration) -> Result<()> {
-        std::thread::sleep(min);
-        let quiet = (refresh * 2).as_nanos() as u64;
-        let until = Instant::now() + REST_MAX;
-        while let Some(p) = self.presents.borrow_mut().as_mut() {
-            let last = p.live(&self.pids.borrow(), u64::MAX, Duration::ZERO)?.last_start_ns;
-            let now = host::now_ns();
-            if last + quiet <= now || Instant::now() >= until {
-                break;
-            }
-            std::thread::sleep(Duration::from_nanos(last + quiet - now).min(Duration::from_millis(20)));
-        }
-        Ok(())
+    /// Before a measured input, and before a press: `driver::settle` on the page's processes (SPEC 7.4).
+    /// Returns whether the page went quiet.
+    fn rest(&self, min: Duration, refresh: Duration) -> Result<bool> {
+        super::settle(&self.presents, &self.pids.borrow(), min, refresh)
     }
 
     /// Lets go of a held button and keys (between runs).
     pub fn release_all(&self) {
         if let Some(b) = self.pressed.get() {
-            let _ = self.button(b, false);
+            let _ = self.button(b, false, false);
         }
         self.poster.release_all(self.top.get());
     }
 
     /// The run's inputs a latency is measured from (a click's release, a key press, a scroll's first
     /// wheel step), with whether each was a scroll: what `run_inputs` keeps.
-    pub fn sent(log: &Log) -> Vec<(u64, bool)> {
-        log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| (i.t_ns, i.kind == "scroll")).collect()
+    pub fn sent(log: &Log) -> Vec<Sent> {
+        log.inputs.iter().filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| Sent { t_ns: i.t_ns, scroll: i.kind == "scroll" }).collect()
     }
 
     /// Starts a count of what arrives (before each run, and its reset): strobe's posted input and the
@@ -414,6 +401,8 @@ impl Driver {
                 self.os_focus(os, &o["selector"], &o)?;
                 let (mods, key) = keys::parse_chord(&s(0))?;
                 menu_chord(os, &s(0), mods, key)?;
+                // After the click into the field, if there was one: its frames settle first.
+                os.rest(Duration::ZERO, os.frame())?;
                 let at = os.poster.press(os.top.get(), None, mods, key)?;
                 os.count(0);
                 os.input(at, "discrete", false);
@@ -433,12 +422,20 @@ impl Driver {
                     }
                     _ => {}
                 }
-                (o.clone(), os.button(b, call == "down")?)
+                // A release is measured as a click's is: what the press drew settles first.
+                if call == "up" {
+                    os.rest(Duration::ZERO, os.frame())?;
+                }
+                (o.clone(), os.button(b, call == "down", true)?)
             }
             "down" | "up" => {
                 let (mods, key) = keys::parse_chord(&s(0))?;
                 if mods.any() {
                     return Err(Error::usage(format!("page.{call}({:?}): one key, not a chord (hold each with its own down)", s(0))));
+                }
+                // A key going down is measured, as a press is.
+                if call == "down" {
+                    os.rest(Duration::ZERO, os.frame())?;
                 }
                 let at = if call == "down" { os.poster.hold(os.top.get(), key)? } else { os.poster.release(os.top.get(), key)? };
                 if call == "down" {
@@ -541,19 +538,24 @@ impl Driver {
         os.input(os.poster.move_to(t, 0)?, "pointer", false);
         os.pointer.set(Some((x, y, t)));
         let gap = os.frame();
+        // A frame of what came before (a hover, an earlier step) settles before the press.
+        let quiet = os.rest(Duration::ZERO, gap)?;
         let mut last = 0;
         for k in 0..count {
             // The press shows a pressed look at most; the release is the click's action, held as a
-            // person holds a click (a double click's second press follows at once).
+            // person holds a click, until the pressed look is on the screen (the minimum only when the
+            // page was still drawing before the press). A double click's presses follow at once, with
+            // no settling inside the gesture, and its releases are no samples: only a single click's
+            // release is (SPEC 7.4).
             os.input(os.poster.button(t, b, true, k > 0, mods, os.top.get())?, "pointer", false);
             os.count(1);
-            if count > 1 {
-                std::thread::sleep(gap);
-            } else {
+            if count == 1 && quiet {
                 os.rest(Duration::from_millis(60), gap)?;
+            } else {
+                std::thread::sleep(if count == 1 { Duration::from_millis(60) } else { gap });
             }
             last = os.poster.button(t, b, false, false, mods, os.top.get())?;
-            os.input(last, kind, false);
+            os.input(last, if count == 1 { kind } else { "pointer" }, false);
         }
         Ok(last)
     }
@@ -567,6 +569,9 @@ impl Driver {
         let (x, y, t, focused) = self.os_aim_focus(os, sel, o)?;
         if !focused {
             self.os_click_at(os, (x, y, t), &json!({}), "pointer")?;
+            // Its frames (a focus ring, a caret) settle before the first key, which is measured: at least
+            // 2 refreshes, since the click's first frame may not have begun yet.
+            os.rest(os.frame() * 2, os.frame())?;
         }
         Ok(())
     }
@@ -591,7 +596,7 @@ impl Driver {
         if held {
             os.log.borrow_mut().drags.push(Vec::new());
         } else {
-            os.button(b, true)?;
+            os.button(b, true, false)?;
         }
         let duration = o["duration"].as_f64().unwrap_or(1000.0).max(1.0);
         // The refresh period unrounded (16.67 ms at 60 Hz), as the native driver paces its drags.
@@ -605,7 +610,7 @@ impl Driver {
             last = os.pointer_to(x, y, t0.moved(x, y))?;
         }
         if !held {
-            last = os.button(b, false)?;
+            last = os.button(b, false, false)?;
         }
         Ok(last)
     }

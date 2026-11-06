@@ -100,8 +100,12 @@ struct Run {
     counts: BTreeMap<String, f64>,
     /// What the page calls did in the run: inputs and phase marks (host clock).
     log: Log,
-    /// When the app announced accessibility changes, from the run's start to a second after its end.
-    changes: Vec<u64>,
+    /// The app's accessibility changes from the run's start to `window_end` (`frames::notified`).
+    changes: Vec<frames::Change>,
+    /// Where the run's changes end: once the app announced a change after the run's last measured
+    /// input, or a second after that input, waited for after the run and before strobe acts on the app
+    /// again (releasing keys, the reset, the next run), so no other step's changes join the run's.
+    window_end: u64,
     /// Elements in the app's windows at the run's end, when strobe drives it (`StateDrift`).
     elements: Option<usize>,
     /// Reads of the app's tree inside the run and their time (ms): `driver.reads` (none without a session).
@@ -379,6 +383,10 @@ fn runs(
             se.set_pids(&n.pids());
             starts.check(i + 1, false, &read_start, &wait_start)?;
         }
+        // The capture follows windows that opened since (the drivers' settles read it without looking).
+        if let Some(p) = presents.borrow_mut().as_mut() {
+            p.track(&n.pids());
+        }
         let began = Instant::now();
         // One read of the app's processes per end of a run: what the session follows, what the
         // snapshot covers, and (at the end) the cycles.
@@ -415,7 +423,16 @@ fn runs(
         let reads = drive.session.get().map(Session::take_reads).unwrap_or_default();
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), elements, reads, t0, t1, total: 0.0 });
+        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), window_end: t1, elements, reads, t0, t1, total: 0.0 });
+        // The last measured input's change: an app may announce it after the run's `until` (a read).
+        if let Some(se) = drive.session.get() {
+            let sample = |i: &&crate::driver::native::Input| i.kind == "discrete" || (i.kind == "scroll" && i.first);
+            if let Some(last) = runs[i].log.inputs.iter().filter(sample).map(|i| i.t_ns).max() {
+                let left = (last + 1_000_000_000).saturating_sub(host::now_ns());
+                se.wait_change_after(last, Instant::now() + Duration::from_nanos(left));
+            }
+            runs[i].window_end = host::now_ns();
+        }
         if same.on() {
             read_same(super::journey::When::Run)?;
         }
@@ -450,10 +467,10 @@ fn runs(
     steps.push(("warmup".into(), warm_ms));
     steps.push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
     lapped.set(Instant::now());
-    // Accessibility changes a second past each run still count for its last inputs.
+    // Each run's changes, to the end of its window.
     let changes = drive.session.get().map(Session::changes).unwrap_or_default();
     for r in &mut runs {
-        r.changes = changes.iter().copied().filter(|&c| c >= r.t0 && c <= r.t1 + 1_000_000_000).collect();
+        r.changes = changes.iter().copied().filter(|&c| c >= r.t0 && c <= r.window_end).map(frames::notified).collect();
     }
     let (strobe_pct, runner_pct) = cost.share(first);
     let samples = sampler.stop();
@@ -757,7 +774,7 @@ fn runs(
         store::write_json(&dir.join("runs.json"), &json!(run_rows))?;
         let per: serde_json::Map<String, Value> =
             measured.iter().enumerate().map(|(j, r)| (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
-        store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "runs": per }))?;
+        store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "display_hz": values.get("display.hz"), "runs": per }))?;
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }

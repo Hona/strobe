@@ -423,7 +423,9 @@ export default bench({
 ### Every run starts from the same state
 
 - Before each run and after the last reset, strobe compares the values of editable controls and the states of check boxes, radio buttons and switches with run 1's start (not labels, clocks, headings or focus).
-- A reset that takes back nothing, or a typing run with no reset, is refused `ResetIncomplete`, naming the control: `history-search "cache keycache key" (was "")`.
+- A reset that takes back nothing, or a typing run with no reset, is refused `ResetIncomplete`, naming the control: `the reset did not restore history-search "cache keycache key" (was "")`.
+  - Controls "not there at run 1" mean the screen was still loading then (wait in setup) or the run left something open.
+  - strobe waits for the first start to settle; a control that changes by itself (a clock, a meter) is not compared.
   - Select-all is `ControlOrMeta+a`: Control+a moves to the line start on macOS.
 - `resetCheck: false` on a case whose runs build on each other on purpose.
 

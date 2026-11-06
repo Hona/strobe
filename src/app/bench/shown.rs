@@ -389,21 +389,43 @@ impl Starts {
             wait(left.min(Duration::from_millis(250)));
             now = read();
         }
-        let diffs: Vec<String> = match &now {
+        const RESET: &str = "every run must start from the same state: the case's reset has to take back what its run changes (add a reset if it has none); select-all is Meta+a on macOS and Control+a elsewhere: ControlOrMeta+a works on every OS. A case whose runs build on each other on purpose sets resetCheck: false";
+        const LOADING: &str = "if the screen was still loading when run 1 started, wait in the case's setup until it has (page.waitFor the control, or page.idle()); if the run opens what holds them, its reset has to close it. A case whose runs build on each other on purpose sets resetCheck: false";
+        // Controls whose value changed (the reset did not restore them), those that appeared (the screen
+        // was still loading at the first start, or the run left something open) and those that went.
+        let (mut changed, mut appeared, mut gone) = (Vec::new(), Vec::new(), Vec::new());
+        match &now {
             Some(n) if n == first => return Ok(()),
-            None => vec!["its state could not be read again".into()],
+            None => changed.push("its state could not be read again".to_string()),
             Some(n) => {
                 let keys: std::collections::BTreeSet<&String> = first.keys().chain(n.keys()).collect();
-                let show = |v: Option<&String>| v.map_or("(not there)".to_string(), |v| v.clone());
-                keys.into_iter().filter(|k| first.get(*k) != n.get(*k)).take(3).map(|k| format!("{k} {} (was {})", show(n.get(k)), show(first.get(k)))).collect()
+                for k in keys {
+                    match (first.get(k), n.get(k)) {
+                        (Some(a), Some(b)) if a != b => changed.push(format!("{k} {b} (was {a})")),
+                        (None, Some(b)) => appeared.push(format!("{k} {b}")),
+                        (Some(a), None) => gone.push(format!("{k} (was {a})")),
+                        _ => {}
+                    }
+                }
             }
-        };
+        }
         let when = if after { format!("a run after the last (run {}) would start", run.saturating_sub(1)) } else { format!("run {run} started") };
-        Err(Error::refused(
-            "ResetIncomplete",
-            format!("{when} from a different state than {first_when} did: {}", diffs.join("; ")),
-            "every run must start from the same state: the case's reset has to take back what its run changes (add a reset if it has none); select-all is Meta+a on macOS and Control+a elsewhere: ControlOrMeta+a works on every OS. A case whose runs build on each other on purpose sets resetCheck: false",
-        ))
+        let list = |v: &[String]| {
+            let more = if v.len() > 3 { format!(" and {} more", v.len() - 3) } else { String::new() };
+            format!("{}{more}", v.iter().take(3).cloned().collect::<Vec<_>>().join("; "))
+        };
+        let mut parts = Vec::new();
+        if !changed.is_empty() {
+            parts.push(format!("the reset did not restore {}", list(&changed)));
+        }
+        if !appeared.is_empty() {
+            parts.push(format!("not there at {first_when} (still loading then, or left open by the run): {}", list(&appeared)));
+        }
+        if !gone.is_empty() {
+            parts.push(format!("gone since {first_when}: {}", list(&gone)));
+        }
+        let fix = if changed.is_empty() && gone.is_empty() { LOADING } else { RESET };
+        Err(Error::refused("ResetIncomplete", format!("{when} from a different state than {first_when} did: {}", parts.join(" · ")), fix))
     }
 }
 

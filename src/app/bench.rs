@@ -295,7 +295,8 @@ fn variant_identity(v: &Variant, project: &Path, config: &Value) -> String {
 /// The experiment's identity for the rerun ledger (`store::ledger`, SPEC §14.2): its variants, the bench
 /// file and harness by content, its series with their primaries and margins, and the flags that chose
 /// what ran and how it was judged.
-fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, series: &[Series], project: &Path, config: &Value) -> Value {
+#[allow(clippy::too_many_arguments)]
+fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, series: &[Series], project: &Path, config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> Value {
     use sha2::Digest;
     let short = |d: &[u8]| d.iter().take(6).map(|b| format!("{b:02x}")).collect::<String>();
     let file_hash = std::fs::read(file).map(|b| short(&sha2::Sha256::digest(&b))).unwrap_or_default();
@@ -321,8 +322,16 @@ fn identity(variants: &[Variant], file: &Path, harness: &Harness, args: &Args, s
     }
     const SKIP: &[&str] = &["base", "head", "aa", "id", "json", "quiet", "verbose", "resume", "stop", "keep", "open", "progress", "max-time", "plan"];
     let flags: serde_json::Map<String, Value> = args.to_json()["flags"].as_object().into_iter().flatten().filter(|(k, _)| !SKIP.contains(&k.as_str())).map(|(k, v)| (k.clone(), v.clone())).collect();
-    // An implementation comparison's side is its target at a build: both are its identity.
-    let mut ids: Vec<String> = variants.iter().map(|v| format!("{}{}", v.target.as_deref().map(|t| format!("{t}=")).unwrap_or_default(), variant_identity(v, project, config))).collect();
+    // An implementation comparison's side is its target at a build: both are its identity, the build
+    // resolved in that target's own project (its `cwd`'s repository and app profiles).
+    let own = |v: &Variant| v.target.as_deref().and_then(|t| projects.get(t)).map_or((project, config), |(p, c)| (p.as_path(), c));
+    let mut ids: Vec<String> = variants
+        .iter()
+        .map(|v| {
+            let (p, c) = own(v);
+            format!("{}{}", v.target.as_deref().map(|t| format!("{t}=")).unwrap_or_default(), variant_identity(v, p, c))
+        })
+        .collect();
     if ids.len() == 1 {
         ids.insert(0, ids[0].clone());
     }
@@ -1273,7 +1282,7 @@ pub fn run(args: &Args) -> Result<Output> {
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
-    let mut ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config) } else { Value::Null };
+    let mut ident = if compares { identity(&variants, &file, &ctx.harness, args, &series, &project, &config, &ctx.projects) } else { Value::Null };
     if compares {
         // The browser a page ran in is part of what was measured: another engine, version or a headless
         // run is another experiment, never the same one rerun.
@@ -5787,7 +5796,7 @@ fn side_spec<'a>(spec: &'a str, describe: &Value, project: &Path) -> Result<Opti
 
 /// The project a target's builds and app profiles come from: its `cwd`'s strobe.json root (another
 /// repository), else none (the bench file's own).
-fn target_project(describe: &Value, name: &str) -> Result<Option<(PathBuf, Value)>> {
+pub(crate) fn target_project(describe: &Value, name: &str) -> Result<Option<(PathBuf, Value)>> {
     let Some(cwd) = describe["targets"][name]["cwd"].as_str().filter(|_| describe["targets"][name]["kind"] != "command") else { return Ok(None) };
     let file = Path::new(describe["file"].as_str().unwrap_or("."));
     let dir = file.parent().unwrap_or(Path::new(".")).join(cwd);

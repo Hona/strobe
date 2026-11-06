@@ -2227,7 +2227,8 @@ to bisect). The midpoint is never `bad` itself. Every step is a full experiment 
 (`<id>_s<k>`, with the bisect's flags; `--why never` unless given), and the file must narrow to
 one series. A step without a verdict counts as "not moved" and makes the result `unclear`, naming
 the range the culprit may still hide in. `--require-verdict` exits 5 unless the result is `found`
-or `no change`.
+or `no change`. A tracked port's bisect (§25.7) walks the head target's repository and benches
+`<head>=git:<commit>` on both sides of each step.
 
 ### 9.8 Devices
 
@@ -5027,8 +5028,8 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   their types from that table (§17).
 - Implementation comparisons, phase 1 (§9.10): sides, per-target projects, fixtures, comparability,
   pages from outside, parity gaps. Phase 2 (see the entry after this one) added journeys with input.
-  Not built yet: per-side attribution, tracking (the scoreboard, its card and PR block came after:
-  see the entry above). Checked
+  Not built yet: per-side attribution (the scoreboard, its card and PR block came after: see the
+  entry above; tracking a port: §25.7). Checked
   with a windowless app that spins `--work` ms every 25 ms and asks the fixture (a copy of it) once a
   tick, 1 s runs, 8 pairs each: vps (Linux VM) A/A through two targets `+0.2% [−0.3 … +0.7]` no worse
   (≤2%); planted 2× `+97% [+96 … +98]` and its mirror `−49%` (ln ratios +0.678 and −0.673); the tick's
@@ -5503,7 +5504,7 @@ their hooks.
   the same as JSON. Agents use them through MCP's `query` tool (rule 8: views, not tools).
 - `report history <ser_…|file>`: a self-contained page (`viewer/history.html`, the report viewer's
   look): each series' points with their intervals over commits, segment medians, change points
-  coloured by state, the culprit, and the tables.
+  coloured by state, the culprit, and the tables. A port's views, card and badge: §25.7.
 
 ### 25.6 Storage and schedules
 
@@ -5527,7 +5528,9 @@ history/
 - Events append; a change's state is its latest event's fields over the earlier ones. Points are in
   commit order (commits reachable from it, committer time, time tracked).
 - **Schedules** (§16): the daemon checks each once a minute (one `git rev-parse` per schedule).
-  `commits` tracks the ref whenever it points at a commit not tracked yet; `nightly` or a period
+  `commits` tracks the ref whenever it points at a commit not tracked yet (`runs.jsonl` says whether
+  a run tracked it; a commit whose run failed is tried again an hour later at the soonest, and a
+  `track` whose every commit failed exits 1); `nightly` or a period
   (`6h`, `2d`) tracks it at most once per period, when it moved. The daemon starts a detached
   `strobe track --ref <commit> --from-schedule <id>`, which holds the schedule's lock (a slow run
   is never doubled) and queues for the bench slot like any bench: it waits for an unlock when its
@@ -5538,3 +5541,97 @@ with 30% more work planted at commit 11, tracked every third commit): 8 points (
 68.6–69.7 ms after, each ±1–3 ms), one suspected regression +37% between commits 10 and 13
 (p 3·10⁻⁹), confirmed by the paired A/B (+35% [+31% … +37%]), bisected in 2 more steps to commit 11,
 and the alert command ran with the payload.
+
+### 25.7 Tracking a port (two implementations)
+
+A rewrite is tracked against the app it replaces, commit by commit of the rewrite:
+
+```
+strobe track <file.bench.ts> --base <target>[=<variant>] --head <target>=git:<ref> [--range <a>..<b> [--every N]]
+             [--pairs 3] [--filter …] [--params …] [--no-confirm] [--again] [--alert …] [bench flags as in 25.2]
+strobe track <file.bench.ts> --base … --head <target>=git:<branch> --schedule commits|nightly|<period>
+```
+
+- **The sides** are an implementation comparison's (§9.10): two targets of the file. `--head` names
+  the ref it follows (`git:<ref>`, resolved in the head target's own repository: its `cwd`'s
+  project, else the bench file's), so `--ref` is a usage error, and so are `--target` and `--blocks`.
+  The base is the comparator and must not move: its default build (its checkout) in the head's own
+  repository, a folder in that repository, and a branch or `HEAD` (`=git:main`, `=main`) are usage
+  errors that ask to pin it: `=exe:<path>`, `=app:<id>`, `=git:<tag or commit>`, or a checkout of
+  another repository (whose own changes then show as epochs).
+- **A point** per head commit is `bench --base <base> --head <head>=git:<commit> --pairs 3 --why
+  never` (`--pairs N` from 3: with fewer, three points on a side of a change can never reach the
+  detector's p < 0.001, and 2 pairs reach only 50%): a short implementation comparison with the bench
+  slot and every rule of a bench. Each journey gets a point: the pairs' `ln(head / base)` of its
+  primary, their median and Hodges–Lehmann interval with the confidence it reaches (`confidence`: 3
+  pairs 75%, 4 pairs 87.5%), each side's median, its parity state (`compared` or `gap` with the
+  reason), and both sides' identities: the head's commit, and the base's identity and that identity
+  as people read it. An executable or app comparator is identified by content: the SHA-256 of its
+  executable and, when it has them, of its `app.asar` and its bundle's version (`Info.plist`), so a
+  copy or a touch is the same comparator and a rebuild another; any other base by the rerun ledger's
+  identity (§14.2: a commit, a URL), resolved in its target's own project (`cwd`'s repository and app
+  profiles); a page's browser version beside it. A point without a value says why (a gap, a refusal, a
+  pair that read 0, fewer than 3 pairs, pairs both locked and unlocked, the display changing). A bench
+  that ended early (a build that failed) leaves no point and is tried again next time; a track whose
+  every commit failed exits 1.
+- **Series.** The family adds the two targets (`base_target`, `head_target`) to 25.6's; the
+  fingerprint is 25.6's without the target kind (both kinds instead) and the browser, with the
+  `--engine` and `--headless` the points ran with. The base's identity is not in it: a comparator
+  that changes stays in one timeline, marked. A gap journey takes the experiment's lock and display
+  state, so its points join the series its compared points make.
+- **Detection** is 25.3's on the points' log ratios (the bound `ln(1 + bound)`, the rank test on the
+  pairs), run separately on each run of consecutive points with one comparator identity, after a
+  commit tracked again counts once per comparator (its latest point). A comparator update is
+  therefore never a suspicion: it is a mark (an epoch), with nothing confirmed, bisected or alerted,
+  and a change in the head is looked for only inside one comparator's points (a regression that lands
+  with a comparator update cannot be told from it, and is not reported). A suspicion is confirmed as
+  25.4 says, by an ordinary A/B of the head alone (`--base <head>=git:<good> --head
+  <head>=git:<bad>`, `--pairs auto`, the series' engine and headless mode), and bisected in the
+  head's repository (§9.7, each step `<head>=git:<commit>` on both sides). The alert names both sides.
+- **Marks** (appended once each, `t: "parity"` and `t: "epoch"` in the series' file): a journey that
+  went from a gap to compared, or back, between two tracked commits; the comparator's identity
+  changing between two points (`Comparator updated (<base name> <old> → <new>)`).
+- **Points are evidence, not verdicts.** Everything that shows one says what it is: its pairs and
+  confidence (`3 pairs, 75%`), and the scoreboard says `tracked`. Green and red are only for changes a
+  paired A/B confirmed.
+- **Views.** `strobe history <file>` draws each port as journeys × commits: a row per commit (date,
+  commit, subject), a column per journey, the comparator's updates between rows, a cell in words only
+  when its whole interval lies past the bound (`less −50%`, `more +18%` in the metric's words, `same`,
+  else `unclear −3%`; `gap`, `no value`), `◆` at a change; under it the scoreboard at the newest
+  tracked commit (each journey's point there and no older one; a journey without one counts as
+  `without a value there`), the changes and the marks. `--top N` keeps the last N commits (40).
+  `query history <file>` gives `ports[]` (commits, journeys with cells, epochs, parity, scoreboard,
+  pairs, confidence). A port's `ser_…` shows its points as changes (`−50% [−52% … −48%]  3 pairs,
+  75%`) and its marks; the HTML report shows each point's pairs and confidence.
+- **Card** (`report history <file|ser_…> --format card`, 1200×630, §11.2's visual system): header
+  `<head> vs <base> · <file>` and the device; left, `tracked, 3 pairs, 75% · at <commit>`, the
+  scoreboard at the newest commit very large and neutral (`4 of 5`), `journeys better than <base>`,
+  the other counts, then where the port started, the commits tracked, the confirmed changes (relative,
+  or in the metric's unit) and the journeys compared since a commit while they still are; right, a row
+  per journey (every one worse at the newest commit kept first when they do not all fit): its points
+  in grey over the commits, on the row's own scale from its lowest point to its highest with no change
+  and the bound inside it, better below, gaps as grey dashes, confirmed changes as red or green
+  triangles, a comparator update as a dashed line through every row, the newest commit's change at
+  the right; the scoreboard under the rows. Footer: device, OS, CPU, pairs per commit and their
+  confidence, and the latest comparator update (or that the comparator stayed the same).
+- **Badge** (`--format badge [--scoreboard]`): `vs <base> (tracked, 3 pairs) | better in 4/5 · worse
+  in 1 · 1 gap` from the newest commit's points, grey unless a confirmed change gives it a tone: red
+  when some journey's latest confirmed change is a regression, green when none is and one is an
+  improvement; `--badge-url` prints the shields.io URL. `report history` takes `--format html`
+  (default), `card` or `badge`, and `--scoreboard` only with a badge; MCP's `report` takes a
+  `.bench.ts` handle as tracked history.
+- **Schedules** keep the head target and its repository: the daemon follows the ref there and starts
+  `strobe track --head <head>=git:<commit>` with the schedule's other flags. As for every schedule, a
+  commit counts as done when `runs.jsonl` says a run tracked it; one whose run failed is tried again
+  an hour later at the soonest.
+
+Checked on adais (2026-11-06, session locked, a windowless app that spins its work every 25 ms; the
+comparator a fixed copy at 2 ms, the head built per commit with 1 ms, 1.2 ms from c06): 7 commits
+backfilled every second one read −49% to −52% before and −40% to −42% after (3 pairs, 75%); one
+suspected regression +19% between c05 and c07 (p 1.4·10⁻⁴), confirmed by the A/B of the head alone
+(+20% [+15% … +21%]), bisected to c06, the alert command ran. Porting the gap journey (c13) marked
+it gap → compared. Swapping the comparator for one at 2.5 ms (another SHA-256) moved both journeys
+to −52%: an epoch mark between c14 and c15, no suspicion, nothing confirmed or alerted. A branch,
+`HEAD` or `.` as the base was refused; a tag and a commit hash were taken. `history <ser_…>`, `history
+<file>` and `query changes` of the device's earlier single-target series printed byte for byte what
+0.11.0 did.

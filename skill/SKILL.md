@@ -154,6 +154,11 @@ strobe track <file.bench.ts> [--ref <rev> | --range a..b [--every N]] [--filter 
 - Change points (E-divisive) are only suspicions: each is confirmed by a paired A/B of the commits around it, then bisected to the culprit.
 - Only confirmed regressions alert.
 - `--schedule commits|nightly|6h` with `--ref <branch>`: the daemon does it.
+- A port (two implementations): `track <file> --base <target>=exe:<path> --head <target>=git:<branch>`. Each head commit gets 3 alternating pairs (`--pairs N`, from 3), one `ln(head/base)` point per journey with a 75% interval: evidence, not a verdict.
+  - Pin the base (`=exe:`, `=app:`, `=git:<tag or commit>`, another repository's checkout): a branch, `HEAD` or a folder of the head's repository is refused.
+  - A move is confirmed by an A/B of the head alone between the two commits, then bisected in the head's repository.
+  - A comparator whose identity changed is an epoch ("Comparator updated (…)"), never an alert.
+  - A journey going gap → compared (or back) is marked `parity`.
 
 ### `strobe history`
 
@@ -162,6 +167,8 @@ strobe history [<ser_…|file>]
 ```
 
 - Tracked series: points, sparkline, changes, culprits (`query history|changes`; `report history <ser_…>`).
+- A port's file shows journeys × commits (`less -50%`, `same`, `gap`, `unclear -3%`), the latest scoreboard, changes and marks.
+- `report history <file> --format card` draws the port's progress; `--format badge --scoreboard` draws `vs <base> (tracked, 3 pairs) | better in 4/5 · 1 gap` from the newest commit's points (grey unless a change was confirmed).
 
 ### `strobe look`
 
@@ -583,6 +590,7 @@ Fewer than 6 pairs never gets a verdict.
   - Read each side alone (`query <rec> threads`, `hotspots --by package`); `query a..b` across implementations is refused (`NotComparable`).
   - `report experiment <exp> --open`: both sides in two columns; a shared scale only where both come from one source.
   - Profiled launches are perturbed (a browser's profiler far more than a native sampler): compare totals from the timed pairs.
+  - Over time: `track <file> --base original=exe:/path --head rewrite=git:main --schedule commits`, then `history <file>` and `report history <file> --format card`.
 
 ## Every performance claim in a PR comes from strobe
 

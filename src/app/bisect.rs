@@ -15,15 +15,18 @@ use std::path::Path;
 /// `good`, until one commit is left: the culprit. A step without a verdict can hide the culprit
 /// behind it, so the result names those steps and is `unclear` instead of found.
 pub fn run(args: &Args, range: &str) -> Result<Output> {
-    run_from(args, range, None)
+    run_from(args, range, None, None)
 }
 
 /// A bisect whose step 0 (`bad` against `good`) already ran: a tracked change's paired confirmation
-/// (SPEC §25.4) is that bench, so the bisect does not run it again.
-pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Result<Output> {
+/// (SPEC §25.4) is that bench, so the bisect does not run it again. `target`: the bench file's target
+/// whose commits it walks, in that target's own repository (`(name, root)`, an implementation
+/// comparison's head, SPEC §25.7): each step benches `<name>=git:<commit>` on both sides.
+pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>, target: Option<(&str, &Path)>) -> Result<Output> {
     let file = args.pos.first().ok_or_else(|| Error::usage("bench needs a bench file"))?;
     let file = std::fs::canonicalize(file).map_err(|_| Error::usage(format!("no such bench file: {file}")))?;
-    let root = config::project_root(file.parent().unwrap_or(Path::new(".")));
+    let root = target.map_or_else(|| config::project_root(file.parent().unwrap_or(Path::new("."))), |(_, r)| r.to_path_buf());
+    let side = target.map(|(t, _)| t);
     let (good, bad) = range.split_once("..").ok_or_else(|| Error::usage("--bisect <good>..<bad>, for example --bisect v1.2..main"))?;
     let (mut good, mut bad) = (rev_parse(&root, good)?, rev_parse(&root, bad)?);
     let id = args.get("id").map(str::to_string).unwrap_or_else(|| store::new_id("exp"));
@@ -39,7 +42,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
     let first_good = good.clone();
     let first = match first {
         Some(out) => step_json(out, &root, 0, &good, &bad)?,
-        None => step(args, &id, &root, 0, &good, &bad)?,
+        None => step(args, &id, &root, side, 0, &good, &bad)?,
     };
     let direction = moved(&first);
     let mut steps = vec![first];
@@ -50,7 +53,7 @@ pub(crate) fn run_from(args: &Args, range: &str, first: Option<&Output>) -> Resu
             // The middle commit, never `bad` itself: `bad` is already known to have moved.
             let at = (candidates.len() - 1) / 2;
             let mid = candidates[at].clone();
-            let s = step(args, &id, &root, steps.len(), &good, &mid)?;
+            let s = step(args, &id, &root, side, steps.len(), &good, &mid)?;
             if moved(&s) == Some(sign) {
                 bad = mid;
                 candidates.truncate(at + 1);
@@ -123,12 +126,14 @@ impl Outcome {
     }
 }
 
-/// One bisect step: a full experiment of `head` against `base` with the bisect's own settings.
-fn step(args: &Args, id: &str, root: &Path, k: usize, base: &str, head: &str) -> Result<Value> {
+/// One bisect step: a full experiment of `head` against `base` with the bisect's own settings (of
+/// `target` alone, on both sides, when it walks one target's commits).
+fn step(args: &Args, id: &str, root: &Path, target: Option<&str>, k: usize, base: &str, head: &str) -> Result<Value> {
     let mut a = args.clone();
     a.remove("bisect");
-    a.set("base", &format!("git:{base}"));
-    a.set("head", &format!("git:{head}"));
+    let side = target.map(|t| format!("{t}=")).unwrap_or_default();
+    a.set("base", &format!("{side}git:{base}"));
+    a.set("head", &format!("{side}git:{head}"));
     a.set("id", &format!("{id}_s{k}"));
     if !args.has("why") {
         // Profiled launches explain a move; a bisect only needs to know whether one happened.

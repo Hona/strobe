@@ -65,6 +65,8 @@ const DATA = /*STROBE_DATA*/null;
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
 function val(v, unit) {
   if (v == null || !isFinite(v)) return "—";
+  // A port's point: ln(head / base), shown as the change.
+  if (unit === "ln_ratio") return pct(Math.exp(v) - 1);
   const d = Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2;
   if (unit === "bytes") { const a = Math.abs(v); return a >= 1048576 ? (v / 1048576).toFixed(1) + " MB" : a >= 1024 ? (v / 1024).toFixed(0) + " KB" : v.toFixed(0) + " B"; }
   if (unit === "%") return v.toFixed(d) + "%";
@@ -72,6 +74,8 @@ function val(v, unit) {
   return v.toFixed(d) + (unit ? " " + unit : "");
 }
 const pct = r => r == null || !isFinite(r) ? "—" : (r > 0.0005 ? "+" : r < -0.0005 ? "−" : "") + Math.abs(r * 100).toFixed(Math.abs(r) < 0.1 ? 1 : 0) + "%";
+// What a point is made of and how sure its interval is: `6 blocks · 97%`, a port's `3 pairs · 75%`.
+const sizeOf = (s, p) => `${p.n} ${s.meta.comparison === "implementations" ? "pairs" : "blocks"}${p.confidence ? " · " + Math.round(p.confidence * 100) + "%" : ""}`;
 const tone = c => c.state === "confirmed" ? (c.direction === "regression" ? "loss" : "win") : c.state === "rejected" ? "" : "warn";
 const colorOf = c => ({ loss: "var(--loss)", win: "var(--win)", warn: "var(--warn)", "": "var(--ink-4)" })[tone(c)];
 
@@ -118,7 +122,7 @@ function chart(s, host) {
     if (i == null) { tip.style.display = "none"; return; }
     const p = pts[+i];
     tip.innerHTML = `<div class="mono">${esc(p.short)} · ${esc((p.at || "").slice(0, 16))}</div><div>${esc(p.subject)}</div>` +
-      (p.valid ? `<div class="mono">${esc(val(p.median, unit))} [${esc(val(p.lo, unit))} … ${esc(val(p.hi, unit))}] · ${p.n} blocks</div>` : `<div>no value: ${esc(p.why)}</div>`) +
+      (p.valid ? `<div class="mono">${esc(val(p.median, unit))} [${esc(val(p.lo, unit))} … ${esc(val(p.hi, unit))}] · ${esc(sizeOf(s, p))}</div>` : `<div>no value: ${esc(p.why)}</div>`) +
       `<div class="mono sub">${esc(p.exp)}</div>`;
     const r = host.getBoundingClientRect();
     tip.style.display = "block";
@@ -129,7 +133,8 @@ function chart(s, host) {
 }
 
 function changeRow(s, c) {
-  const unit = s.meta.unit || "";
+  // A port's confirmation compares the head alone, in its metric's unit (never a log ratio).
+  const unit = (s.meta.comparison === "implementations" ? s.meta.metric_unit : s.meta.unit) || "";
   const f = (v, rel) => rel ? pct(v) : val(v, unit);
   const cf = c.confirm || {};
   return `<tr><td class="mono">${esc(c.id)}</td><td><span class="pill ${tone(c)}">${esc(c.state)} ${esc(c.direction)}</span></td>
@@ -142,19 +147,21 @@ function render() {
   const app = document.getElementById("app");
   if (!DATA) { app.innerHTML = "<p>No data.</p>"; return; }
   let html = `<div><h1>History</h1><div class="sub">${esc(DATA.device)} · ${DATA.series.length} series · ${esc(DATA.created)}</div></div>
-    <div class="legend"><span>● median of a commit's blocks</span><span>│ its 95% interval</span><span>— segment median</span><span>┊ change point (confirmed regressions red, improvements green, unconfirmed amber, rejected grey)</span><span>× no value (refused)</span></div>`;
+    <div class="legend"><span>● median of a commit's blocks</span><span>│ its interval (each point says how sure: 6 blocks reach 97%, 3 pairs 75%)</span><span>— segment median</span><span>┊ change point (confirmed regressions red, improvements green, unconfirmed amber, rejected grey)</span><span>× no value (refused)</span></div>`;
   DATA.series.forEach((s, k) => {
     const fp = s.meta.fingerprint || {};
     const m = fp.machine || {};
-    html += `<section class="card"><div><h2>${esc(s.meta.label)} · ${esc(s.meta.metric)}</h2>
+    const port = s.meta.comparison === "implementations";
+    html += `<section class="card"><div><h2>${esc(s.meta.label)} · ${esc(s.meta.metric)}${port ? ` · ${esc(s.meta.head_name)} / ${esc(s.meta.base_name)}` : ""}</h2>
       <div class="sub mono">${esc(s.id)} · ${esc(s.meta.file)}</div>
       <div class="sub">${esc([m.os, m.cpu, m.gpu, "strobe " + m.strobe, "power " + fp.power, "session " + fp.session, "display " + fp.display, fp.pin].filter(Boolean).join(" · "))}</div></div>
       <div class="chart" id="c${k}"></div>
       ${s.changes.length ? `<table><tr><th>change</th><th>state</th><th>range</th><th>history</th><th>paired A/B</th><th>culprit</th></tr>${s.changes.map(c => changeRow(s, c)).join("")}</table>` : `<p class="note">No change points.</p>`}
-      <details><summary>${s.points.length} points</summary><table><tr><th>date</th><th>commit</th><th>subject</th><th>median</th><th>95% interval</th><th>n</th><th>experiment</th></tr>
+      <details><summary>${s.points.length} points</summary><table><tr><th>date</th><th>commit</th><th>subject</th><th>median</th><th>interval</th><th>n</th><th>experiment</th></tr>
       ${s.points.slice().reverse().map(p => `<tr class="${p.valid ? "" : "invalid"}"><td class="mono">${esc((p.at || "").slice(0, 10))}</td><td class="mono">${esc(p.short)}</td><td>${esc(p.subject)}</td>
-        <td class="num mono">${p.valid ? esc(val(p.median, s.meta.unit)) : "—"}</td><td class="mono">${p.valid ? esc(val(p.lo, s.meta.unit)) + " … " + esc(val(p.hi, s.meta.unit)) : esc(p.why)}</td><td class="num mono">${p.n}</td><td class="mono sub">${esc(p.exp)}</td></tr>`).join("")}</table></details>
-      <p class="note">Points are single-build blocks and never decide anything: a change point is a suspicion until a paired A/B of the commits around it confirms it.</p></section>`;
+        <td class="num mono">${p.valid ? esc(val(p.median, s.meta.unit)) : "—"}</td><td class="mono">${p.valid ? esc(val(p.lo, s.meta.unit)) + " … " + esc(val(p.hi, s.meta.unit)) : esc(p.why)}</td><td class="num mono">${p.valid ? esc(sizeOf(s, p)) : p.n}</td><td class="mono sub">${esc(p.exp)}</td></tr>`).join("")}</table></details>
+      ${(s.marks || []).length ? `<p class="note">${s.marks.map(m => m.t === "epoch" ? `Comparator updated (${esc(m.name)} ${esc(m.from)} → ${esc(m.to)}) at ${esc(m.short)}` : `${esc(m.from)} → ${esc(m.to)} at ${esc(m.short)}`).join("<br>")}</p>` : ""}
+      <p class="note">${port ? `Points are ln(${esc(s.meta.head_name)} / ${esc(s.meta.base_name)}) of a few alternating pairs and never decide anything: a change point is a suspicion until a paired A/B of ${esc(s.meta.head_name)} alone at the commits around it confirms it.` : "Points are single-build blocks and never decide anything: a change point is a suspicion until a paired A/B of the commits around it confirms it."}</p></section>`;
   });
   app.innerHTML = html;
   DATA.series.forEach((s, k) => chart(s, document.getElementById("c" + k)));

@@ -17,6 +17,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
 
 mod forest;
+mod history;
+
+pub(crate) use history::report as history_report;
 
 const W: f32 = 1200.0;
 const H: f32 = 630.0;

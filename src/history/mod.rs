@@ -1,7 +1,9 @@
 //! Tracked history (SPEC §25): per device, one append-only file per series, under `<state>/history/`.
 //! The only writer of `history/`. A series is one case × target × params × primary metric of one bench
 //! file in one repository, on one device and one environment fingerprint: a change to the OS, the
-//! GPU driver, the power plan, the session's lock state or strobe's version starts a new series.
+//! GPU driver, the power plan, the session's lock state or strobe's version starts a new series. A
+//! port's series (§25.7) is one journey of two targets, its points `ln(head / base)`; the base's
+//! identity stays out of its fingerprint and is marked where it changes.
 
 pub mod detect;
 
@@ -42,11 +44,16 @@ pub fn change_id(series: &str, good: &str, bad: &str) -> String {
     format!("chg_{}", &hash8(&json!([series, good, bad]))[..6])
 }
 
+/// A mark's id (`par_…`, `epo_…`): one per series, commit and the state it marks the start of.
+pub fn mark_id(prefix: &str, series: &str, commit: &str, to: &str) -> String {
+    format!("{prefix}_{}", &hash8(&json!([series, commit, to]))[..6])
+}
+
 fn path(id: &str) -> PathBuf {
     dir().join(format!("{id}.jsonl"))
 }
 
-/// Appends one event (`t`: `series`, `point` or `change`) to a series' file.
+/// Appends one event (`t`: `series`, `point`, `change`, `parity` or `epoch`) to a series' file.
 pub fn append(id: &str, event: &Value) -> Result<()> {
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path(id))?;
     writeln!(f, "{event}")?;
@@ -68,16 +75,25 @@ fn read_lines(p: &std::path::Path) -> Vec<Value> {
     std::fs::read_to_string(p).unwrap_or_default().lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()).collect()
 }
 
-/// One series folded from its events: points in commit order, changes at their latest state.
+/// One series folded from its events: points in commit order, changes at their latest state, and
+/// (an implementation comparison's) marks: `parity` (a journey went gap → compared or back) and
+/// `epoch` (the comparator's identity changed), in the order they were written.
 #[derive(Clone, Debug)]
 pub struct Series {
     pub id: String,
     pub meta: Value,
     pub points: Vec<Value>,
     pub changes: Vec<Value>,
+    pub marks: Vec<Value>,
 }
 
 impl Series {
+    /// A series of an implementation comparison (`track --base <target> --head <target>=git:<ref>`):
+    /// its points are `ln(head / base)` of paired blocks.
+    pub fn implementations(&self) -> bool {
+        self.meta["comparison"] == "implementations"
+    }
+
     /// Points that carry a value the detector may use.
     pub fn valid(&self) -> Vec<&Value> {
         self.points.iter().filter(|p| p["valid"] == true).collect()
@@ -120,7 +136,8 @@ pub fn load(id: &str) -> Option<Series> {
         latest.insert(cid, merged);
     }
     let changes = order.into_iter().filter_map(|c| latest.remove(&c)).collect();
-    Some(Series { id: id.to_string(), meta, points, changes })
+    let marks = events.iter().filter(|e| e["t"] == "parity" || e["t"] == "epoch").cloned().collect();
+    Some(Series { id: id.to_string(), meta, points, changes, marks })
 }
 
 /// Every series of this device, newest point first.

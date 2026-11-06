@@ -145,7 +145,7 @@ const TOOLS: &[Tool] = &[
     Tool {
         name: "report",
         description: "Write a self-contained HTML (or markdown) report from a recording or experiment and return its path, to show in the Review pane.",
-        args: &[("handle", "rec_…, exp_… or ser_… (a tracked series)"), ("view", "experiment, recording or history (default from the handle)")],
+        args: &[("handle", "rec_…, exp_… or ser_… (a tracked series); a .bench.ts file for its tracked history"), ("view", "experiment, recording or history (default from the handle)")],
         flags: &[
             ("format", "html (default), md, pr (an experiment's pull request block), card (its result as a 1200×630 PNG) or badge (an SVG badge)"),
             ("out", "where to write it"),
@@ -285,7 +285,8 @@ fn to_args(name: &str, input: &Value) -> Result<(Vec<String>, u64, Option<String
         "report" => {
             let h = get("handle").ok_or_else(|| Error::usage("report needs handle"))?;
             let view = get("view").unwrap_or_else(|| {
-                if h.starts_with("ser_") {
+                // A tracked series, or a bench file's tracked history (a port's card and badge).
+                if h.starts_with("ser_") || h.ends_with(".bench.ts") {
                     "history".into()
                 } else if store::resolve(&h).is_ok_and(|d| store::is_experiment(&d)) {
                     "experiment".into()

@@ -51,7 +51,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("primary", Value, "bench track run"),
     ("equivalence", Number, "bench plan track run"),
     ("noworse", Value, "bench plan run"),
-    ("pairs", Value, "bench plan run"),
+    ("pairs", Value, "bench plan run track"),
     ("runs", Number, "record bench plan track run"),
     ("repeat", Number, "bench"),
     ("why", Value, "bench plan track"),
@@ -375,9 +375,14 @@ Use
                                   a point per series per commit in this device's history; change points are confirmed
                                   by a paired A/B of the commits around them, then bisected; only confirmed ones alert
   track <file> --ref <branch> --schedule commits|nightly|6h    the daemon tracks the branch (--schedules, --unschedule <id>)
+  track <file> --base <target>[=<variant>] --head <target>=git:<ref> [--range a..b] [--pairs 3] [--schedule …]
+                                  a port: per head commit, a few alternating pairs of both implementations, ln(head/base)
+                                  per journey; a move is confirmed by an A/B of the head alone and bisected; a comparator
+                                  that changed is an epoch, never an alert; journeys going gap -> compared are marked
   track --confirm [<ser_…|chg_…>] confirm suspected changes (or one again)
-  history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits
-                                  (query history|changes, query <ser_…> history|changes; report history <ser_…|file>)
+  history [<ser_…|file>]          tracked series: points with intervals, a sparkline, changes and culprits; a port's
+                                  journeys x commits (query history|changes, query <ser_…> history|changes;
+                                  report history <ser_…|file> [--format card | --format badge [--scoreboard]])
   look <url|file> [--until <css>] [--wait 1s] [--size 1280x800] [--out <png>] [--chars 4000] [--full | --element <css>] [--headed]
   look app:<id> | exe:<path> [--app <id>] [--build] [--until <selector>] [--wait 2s] [--keys 40]
                                   a page in a headless browser, nothing measured: title, address, headings, visible text,

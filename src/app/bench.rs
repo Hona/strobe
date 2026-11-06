@@ -142,6 +142,9 @@ struct Series {
     gap: Option<(&'static str, String, Option<String>)>,
     /// `steps`: the case gives each target its own run (`run: { <target>: fn }`).
     adapted: Option<String>,
+    /// Refused before anything builds (`check_engines`): a primary this series' engine cannot measure, or
+    /// a headless page cannot show; a launch case in an engine without one. Listed; the rest still runs.
+    refused: Option<Refusal>,
     /// The case says `hero: true`: reports lead with it when it is decided.
     hero: bool,
     /// The sides run on different engines: metrics of one engine (`Across::PerSide`) are kept per side
@@ -1212,7 +1215,7 @@ pub fn run(args: &Args) -> Result<Output> {
         }
         progress(text);
     }
-    let (series, mut variants) = series_and_sides(&ctx.describe, args, base_spec.as_deref(), &head_spec, &project, &config)?;
+    let (mut series, mut variants) = series_and_sides(&ctx.describe, args, base_spec.as_deref(), &head_spec, &project, &config)?;
     if series.is_empty() {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
@@ -1231,9 +1234,9 @@ pub fn run(args: &Args) -> Result<Output> {
         };
     }
     ctx.fixture = fixture::Spec::from(&ctx.describe)?;
-    check_engines(&series, &ctx.describe, args)?;
+    check_engines(&mut series, &ctx.describe, args)?;
     let mut engines: Vec<WebEngine> = Vec::new();
-    for e in series.iter().map(|s| &ctx.describe["targets"][&s.target]).filter(|t| matches!(t["kind"].as_str(), Some("web" | "url"))).map(engine_of) {
+    for e in series.iter().filter(|s| s.refused.is_none()).map(|s| &ctx.describe["targets"][&s.target]).filter(|t| matches!(t["kind"].as_str(), Some("web" | "url"))).map(engine_of) {
         if !engines.contains(&e) {
             engines.push(e);
         }
@@ -1250,7 +1253,7 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(why) = ctx.qos.clone() {
         // Frames and input latencies at background priority describe no person's machine: refused
         // (before anything builds when a primary is one). CPU metrics stay, with this warning.
-        if let Some(s) = series.iter().find(|s| foreground_metric(&s.primary)).filter(|_| !check) {
+        if let Some(s) = series.iter().find(|s| s.refused.is_none() && foreground_metric(&s.primary)).filter(|_| !check) {
             return Err(background_refusal(&why, &format!("{}'s primary {}", s.case, s.primary)));
         }
         ctx.warnings.push(validity::warn(
@@ -1354,6 +1357,11 @@ pub fn run(args: &Args) -> Result<Output> {
             series_out.push(g);
             continue;
         }
+        if let Some(r) = &s.refused {
+            progress(format!("\n{}  refused: {}", s.label(), refused_text(&json!(r))));
+            series_out.push(refused_series(s, r));
+            continue;
+        }
         let r = match mode {
             Mode::Check => check_series(&mut ctx, s, &mut variants, &config),
             Mode::Pixels => (|| -> Result<Value> {
@@ -1445,6 +1453,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let refresh = host::refresh_at(ctx.window.x + 20, ctx.window.y + 20);
     let series_out_gaps = series_out.iter().filter(|s| s["kind"] == "gap").count();
+    let series_out_refused = series_out.iter().filter(|s| s["kind"] == "refused").count();
     let result_json = json!({
         "id": exp, "kind": "experiment", "file": file, "created": super::record::now_iso(),
         // A refresh only where some series drew to a display (a headless page has none).
@@ -1505,6 +1514,10 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     // A parity gap is listed and exits 0, unless the bench guards a finished port.
     if (args.has("require-parity") || args.has("require-verdict")) && series_out_gaps > 0 {
+        out.code = 4;
+    }
+    // A series refused before it ran is listed and exits 0, as a gap is, unless every series must decide.
+    if args.has("require-verdict") && series_out_refused > 0 {
         out.code = 4;
     }
     if let Some(h) = &halted {
@@ -1600,12 +1613,22 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
 fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool) -> Result<Output> {
     // A gap is listed, not failed; journeys whose sides differ (`journey_refusal`) fail.
     let gaps = series.iter().filter(|s| s["kind"] == "gap").count();
+    // Refused before it ran (`check_engines`): listed, not failed, as a gap is; the rest of the file ran.
+    let before = series.iter().filter(|s| s["kind"] == "refused").count();
     let refused = series.iter().filter(|s| s["journey_refusal"].is_object()).count();
-    let failed = series.iter().filter(|s| s["kind"] != "gap" && (s["passed"] != true || s["journey_refusal"].is_object())).count();
+    let failed = series.iter().filter(|s| !matches!(s["kind"].as_str(), Some("gap" | "refused")) && (s["passed"] != true || s["journey_refusal"].is_object())).count();
     let mut text = String::new();
     for s in &series {
         if s["kind"] == "gap" {
             text += &format!("gap   {}  {}\n", s["label"].as_str().unwrap_or(""), s["gap"]["reason"].as_str().unwrap_or(""));
+            continue;
+        }
+        if s["kind"] == "refused" {
+            let r = &s["primary"]["refusal"];
+            text += &format!("refused  {}  {}: {}\n", s["label"].as_str().unwrap_or(""), r["validator"].as_str().unwrap_or(""), r["summary"].as_str().unwrap_or(""));
+            if let Some(f) = r["fix"].as_str() {
+                text += &format!("      fix: {f}\n");
+            }
             continue;
         }
         // Why each refused metric was refused, said once per reason under the case: a missing
@@ -1692,12 +1715,13 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     if let Some(m) = &matrix {
         text += &format!("\nparity\n{m}");
     }
-    let ran = series.len() - gaps;
+    let ran = series.len() - gaps - before;
     text += &format!(
-        "\n{} of {ran} cases passed{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; nothing compared)\n",
+        "\n{} of {ran} cases passed{}{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; nothing compared)\n",
         ran - failed,
         if refused > 0 { format!(", {refused} where the targets' journeys differ") } else { String::new() },
-        if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() }
+        if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() },
+        if before > 0 { format!(", {before} refused before running") } else { String::new() }
     );
     for w in &warnings {
         text += &format!("{} {:<24}{}\n", if w.level == "warn" { "!" } else { "i" }, w.id, w.text);
@@ -2803,6 +2827,19 @@ fn runtime_gap(ctx: &Ctx, s: &Series, variants: &[Variant], v: usize, e: &Error,
     g
 }
 
+/// A series refused before anything built (`check_engines`): listed with why and the closest primary it
+/// can measure, never run, and undecided (`--require-verdict` exits 4 on it).
+fn refused_series(s: &Series, r: &Refusal) -> Value {
+    let primary = json!({ "metric": s.primary, "verdict": format!("refused ({}): {}", r.validator, r.summary), "verdict_kind": VerdictKind::Refused, "decided": false, "refusal": r });
+    json!({ "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "refused", "primary": primary, "decided": false, "passed": false, "pairs": 0 })
+}
+
+/// `<validator>: <summary> · fix: <fix>`, for a refusal as result.json keeps it.
+pub(super) fn refused_text(r: &Value) -> String {
+    let fix = r["fix"].as_str().map(|f| format!(" · fix: {f}")).unwrap_or_default();
+    format!("{}: {}{fix}", r["validator"].as_str().unwrap_or(""), r["summary"].as_str().unwrap_or(""))
+}
+
 /// A block's refused metrics as result.json keeps them: `"<metric>": "<validator>: <why>"`.
 fn refusal_map(refused: &BTreeMap<String, Refusal>) -> Value {
     refused.iter().map(|(k, r)| (k.clone(), Value::String(r.message()))).collect::<serde_json::Map<_, _>>().into()
@@ -3860,6 +3897,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let profiling = Cell::new(false);
         let segments: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
         let mocks = mocks::Mocks::default();
+        // An init script in an engine without preload scripts (WebKit): it ran after the document's own.
+        let late_init = Cell::new(false);
         let serve = |op: &str, a: &Value| -> Result<Value> {
             match op {
                 "driver" => {
@@ -3874,6 +3913,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                             format!("page.{call}() in a run of a {engine} page measured against a native implementation: strobe gives that engine no OS input yet, and the other side gets the OS's"),
                         )
                         .fix("keep input out of runs (setup and reset may use it), or measure the page in Chromium")
+                        .into());
+                    }
+                    if call == "goto" && late_init.get() {
+                        return Err(Refusal::new(
+                            ValidatorId::EngineUnsupported,
+                            format!("page.goto() after ctx.addInitScript in {engine}: it has no preload script, so the new document's own scripts would run before the init script"),
+                        )
+                        .fix("measure the case in Chromium or Firefox, or keep it on the first document (no page.goto after the init script)")
                         .into());
                     }
                     if call == "goto" && hooks.in_run() {
@@ -3904,6 +3951,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 // `ctx.mock` on an engine without the runner's CDP session: strobe answers through the page's
                 // network interception (`mocks`), asking the runner's handlers.
                 "mock" => mocks.add(&page, a),
+                // `ctx.addInitScript` (prepare, setup) through strobe's own connection, so it works in every
+                // engine: before the page's scripts in each new document. WebKit has no preload: the script runs
+                // once strobe first touches the document, and a later `goto` is refused (above).
+                "init" => {
+                    let source = a["source"].as_str().filter(|s| !s.trim().is_empty()).ok_or_else(|| Error::usage("addInitScript(script): a function, or JavaScript as a string"))?;
+                    // A line comment at its end must not swallow what an engine wraps it in.
+                    page.add_init_script(&format!("{source}\n"))?;
+                    late_init.set(engine == WebEngine::Webkit);
+                    Ok(Value::Bool(true))
+                }
                 "count" => {
                     hooks.count(a);
                     Ok(Value::Bool(true))
@@ -4007,6 +4064,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        if late_init.get() && !ctx.warnings.iter().any(|w| w.id == "InitScript") {
+            ctx.warnings.push(validity::info("InitScript", format!("{}: {engine} has no preload script: ctx.addInitScript ran after the first document's own scripts (the block loads no other)", s.label())));
+        }
         hooks.check_fixture();
         // A page without WebGPU (an engine or OS that does not ship it, or an origin that is not a secure
         // context) draws no frame the canvas hook sees: canvas.* refused, never 0. Read on the page the
@@ -5246,6 +5306,7 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
                     sides: sides.map(|(b, h)| (b.to_string(), h.to_string())),
                     gap: gap.clone(),
                     adapted: c["adapted"].as_str().map(str::to_string),
+                    refused: None,
                     hero: c["hero"] == true,
                     cross_engine: sides.is_some_and(|(b, h)| engine(targets[b]["kind"].as_str().unwrap_or("")) != engine(targets[h]["kind"].as_str().unwrap_or(""))) || (check && engines.len() > 1),
                     case: case.clone(),
@@ -5359,11 +5420,13 @@ fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
     Ok(())
 }
 
-/// Before anything builds: `--engine` on a series that is no page; a primary the series' engine cannot
-/// measure (`EngineUnsupported`, with the closest one it can) or a headless page cannot show
-/// (`Headless`). Declared secondaries are refused per block instead.
-fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()> {
-    for s in series {
+/// Before anything builds: `--engine` on a series that is no page (the run refuses). A primary the series'
+/// engine cannot measure (`EngineUnsupported`, with the closest one it can), a headless page cannot show
+/// (`Headless`), or a launch case in an engine without one refuses that series alone (`Series::refused`):
+/// it is listed and the rest runs; when that leaves nothing to run, the first refusal is the run's.
+/// Declared secondaries are refused per block instead.
+fn check_engines(series: &mut [Series], describe: &Value, args: &Args) -> Result<()> {
+    for s in series.iter_mut() {
         let t = &describe["targets"][&s.target];
         let page = matches!(t["kind"].as_str(), Some("web" | "url"));
         if args.get("engine").is_some() && !page {
@@ -5386,17 +5449,6 @@ fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()>
                 "drop the target's scale for --engine webkit, or measure the scaled page in Chromium or Firefox",
             ));
         }
-        if engine != WebEngine::Chromium && s.launch.is_object() {
-            return Err(Error::refused("EngineUnsupported", format!("{}: launch cases time a launch through Chromium's DevTools; {engine} launch cases are not built yet", s.label()), "measure the launch in Chromium, or time the load in a run case (phase around page.goto)"));
-        }
-        if let Some(r) = validity::engine_refusal(engine, &s.primary) {
-            return Err(Refusal { summary: format!("{}: the primary {}", s.label(), r.summary), ..r }.into());
-        }
-        if (t["headless"] == true || args.has("headless")) && (display_metric(&s.primary) || gpu_use(&s.primary)) {
-            return Err(Refusal::new(ValidatorId::Headless, format!("{}: the primary {} needs a display, and the page runs headless: nothing it draws reaches one", s.label(), s.primary))
-                .fix("drop --headless (and the target's headless) to measure it on screen, or choose a CPU primary: cpu.work, cpu.app.total, run.duration or phase.<name> (main.work in Chromium)")
-                .into());
-        }
         // Firefox attributes with its own profiler and leak-checks with about:memory (`probe::gecko`); a
         // WebKit page has neither in strobe.
         if engine == WebEngine::Webkit && matches!(args.get("probes"), Some("attribution" | "memory")) {
@@ -5406,6 +5458,26 @@ fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()>
                 "attribute or leak-check the page in Chromium or Firefox (--engine firefox)",
             ));
         }
+        s.refused = if engine != WebEngine::Chromium && s.launch.is_object() {
+            Some(
+                Refusal::new(ValidatorId::EngineUnsupported, format!("{}: launch cases time a launch through Chromium's DevTools; {engine} launch cases are not built yet", s.label()))
+                    .fix("measure the launch in Chromium, or time the load in a run case (phase around page.goto)"),
+            )
+        } else if let Some(r) = validity::engine_refusal(engine, &s.primary) {
+            Some(Refusal { summary: format!("{}: the primary {}", s.label(), r.summary), ..r })
+        } else if (t["headless"] == true || args.has("headless")) && (display_metric(&s.primary) || gpu_use(&s.primary)) {
+            Some(
+                Refusal::new(ValidatorId::Headless, format!("{}: the primary {} needs a display, and the page runs headless: nothing it draws reaches one", s.label(), s.primary))
+                    .fix("drop --headless (and the target's headless) to measure it on screen, or choose a CPU primary: cpu.work, cpu.app.total, run.duration or phase.<name> (main.work in Chromium)"),
+            )
+        } else {
+            None
+        };
+    }
+    let refused: Vec<&Refusal> = series.iter().filter_map(|s| s.refused.as_ref()).collect();
+    if let Some(r) = refused.first().filter(|_| series.iter().all(|s| s.gap.is_some() || s.refused.is_some())) {
+        let r = (*r).clone();
+        return Err(if refused.len() > 1 { r.detail(format!("and every other series too ({} in all)", refused.len())) } else { r }.into());
     }
     Ok(())
 }
@@ -6412,6 +6484,10 @@ fn render(r: &Value) -> String {
             out += &format!("strobe bench {file} · {}   {bn} vs {hn}\n  not compared: {}\n\n", s["label"].as_str().unwrap_or(""), s["primary"]["refusal"]["summary"].as_str().unwrap_or(""));
             continue;
         }
+        if s["kind"] == "refused" {
+            out += &format!("strobe bench {file} · {}\n  not run: {}\n\n", s["label"].as_str().unwrap_or(""), refused_text(&s["primary"]["refusal"]));
+            continue;
+        }
         if sides {
             out += &format!("strobe bench {file} · {}   {bn} ({})   vs   {hn} ({})\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
         } else {
@@ -6588,7 +6664,7 @@ fn render(r: &Value) -> String {
         out += &format!("ledger  {t}\n");
     }
     // `--blocks` compares nothing, so it has no report: its blocks are in its result.json.
-    if r["series"].as_array().is_some_and(|a| !a.is_empty() && a.iter().all(|s| s["kind"] == "blocks")) {
+    if r["series"].as_array().is_some_and(|a| a.iter().any(|s| s["kind"] == "blocks") && a.iter().all(|s| s["kind"] == "blocks" || s["kind"] == "refused")) {
         out += &format!("{id} · strobe query {id}\n");
     } else {
         out += &format!("{id} · strobe report experiment {id} --open\n");

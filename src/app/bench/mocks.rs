@@ -12,6 +12,9 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+/// The largest request body the handlers get (bytes); a larger one comes without `body`.
+const BODY_MAX: u64 = 16 << 20;
+
 #[derive(Default)]
 pub(super) struct Mocks {
     relay: RefCell<Option<Relay>>,
@@ -67,6 +70,12 @@ fn start(p: &crate::target::firefox::Page) -> Result<Relay> {
     let token = host::paths::csprng_hex(16)?;
     let (globs, stop) = (Arc::new(Mutex::new(Vec::<String>::new())), Arc::new(AtomicBool::new(false)));
     p.bidi.send("session.subscribe", json!({ "events": ["network.beforeRequestSent"], "contexts": [p.context] }))?;
+    // Request bodies for the handlers (`network.getData`), where the browser collects them; else no `body`.
+    let collector = p
+        .bidi
+        .send("network.addDataCollector", json!({ "dataTypes": ["request"], "maxEncodedDataSize": BODY_MAX, "contexts": [p.context] }))
+        .ok()
+        .and_then(|r| r["collector"].as_str().map(str::to_string));
     let rx = p.bidi.events();
     let (bidi, context, g, s, t) = (p.bidi.clone(), p.context.clone(), globs.clone(), stop.clone(), token.clone());
     std::thread::Builder::new().name("mock-relay".into()).spawn(move || {
@@ -87,7 +96,15 @@ fn start(p: &crate::target::firefox::Page) -> Result<Relay> {
                 continue;
             }
             let headers: serde_json::Map<String, Value> = q["request"]["headers"].as_array().into_iter().flatten().filter_map(|h| Some((h["name"].as_str()?.to_lowercase(), h["value"]["value"].clone()))).collect();
-            let ask = json!({ "id": id, "url": url, "method": q["request"]["method"], "headers": headers });
+            let mut ask = json!({ "id": id, "url": url, "method": q["request"]["method"], "headers": headers });
+            // A request with a body (`bodySize` > 0) gets it as base64, read from the collector.
+            if let Some(c) = collector.as_deref().filter(|_| q["request"]["bodySize"].as_u64().is_some_and(|n| n > 0)) {
+                let data = bidi.send_timeout("network.getData", json!({ "dataType": "request", "request": id, "collector": c, "disown": true }), Duration::from_secs(5));
+                if let Ok(d) = data {
+                    let bytes = &d["bytes"];
+                    ask["body"] = json!(if bytes["type"] == "base64" { bytes["value"].as_str().unwrap_or("").to_string() } else { base64::Engine::encode(&base64::engine::general_purpose::STANDARD, bytes["value"].as_str().unwrap_or("")) });
+                }
+            }
             let answer = ask_runner(&listener, &mut conn, &t, &ask);
             let _ = match answer {
                 Some(a) if a["pass"] == true => bidi.post("network.continueRequest", json!({ "request": id })),

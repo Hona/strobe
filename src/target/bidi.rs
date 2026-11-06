@@ -37,7 +37,10 @@ impl Bidi {
         stream.set_read_timeout(Some(Duration::from_secs(10))).ok();
         let config = WebSocketConfig { max_message_size: Some(1 << 30), max_frame_size: Some(1 << 30), ..Default::default() };
         let (reader, _) = client::client_with_config(url, stream.try_clone()?, Some(config)).map_err(|e| Error::unreachable(format!("bidi handshake: {e}")))?;
+        // On the reader's own handle too: on Windows a cloned socket kept the 10 s timeout, and a block whose
+        // run was quiet for 10 s (a page left alone 20 s) lost its connection.
         stream.set_read_timeout(None).ok();
+        reader.get_ref().set_read_timeout(None).ok();
         let writer = WebSocket::from_raw_socket(stream, Role::Client, None);
         let bidi = Arc::new(Bidi {
             writer: Mutex::new(writer),

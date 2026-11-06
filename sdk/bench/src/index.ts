@@ -187,15 +187,33 @@ export interface PrepareContext<P> {
   url: string
   /** The variant's folder: a git ref's worktree, or the directory it names. */
   root: string
-  /** Playwright, connected to this block's browser. Only on Chromium targets; reading it on another engine throws (EngineUnsupported). */
+  /**
+   * Playwright, connected to this block's browser, when it is installed next to the bench file. Only on Chromium
+   * targets; reading it on another engine throws (EngineUnsupported). Prefer `addInitScript` and `mock`, which work
+   * in every engine.
+   */
   playwright: { browser: any; context: any; page: any }
   /**
-   * Answers requests whose URL matches `pattern` (`*` is any run of characters) in this block's page.
+   * Answers requests whose URL matches `pattern` (`*` is any run of characters) in this block's page, in any engine.
    * Unlike Playwright's `page.route`, the browser's HTTP cache stays on: scripts and styles a reload
    * fetches come from the cache, as for a person. Later calls add patterns and are asked first; a
    * handler that returns `undefined` passes the request to earlier ones, as Playwright's routes do.
    */
   mock(pattern: string, handler: MockHandler): Promise<void>
+  addInitScript: AddInitScript
+}
+
+/**
+ * Runs `script` in every new document of the block's page before the page's own scripts (Playwright's
+ * `page.addInitScript`, in any engine): a function is called with `arg` (JSON), a string is evaluated as is. Not in
+ * the document already loaded. WebKit has no preload: there the script runs after the first document's own scripts,
+ * and a block that loads another document is refused (EngineUnsupported).
+ */
+export type AddInitScript = <A = undefined>(script: string | ((arg: A) => unknown), arg?: A) => Promise<void>
+
+/** `setup`'s context: a run's, plus {@link AddInitScript} for the documents the block loads next. */
+export interface SetupContext<P> extends Context<P> {
+  addInitScript: AddInitScript
 }
 
 /** What a launch's `before` hook gets: the launch has not started yet. */
@@ -522,7 +540,7 @@ export interface Bench<Params extends Record<string, ParamValues>> {
   /** A process every block talks to (a server with seeded data): see {@link fixture}. */
   fixture?: Fixture
   /** Once per block, after load. Never measured. */
-  setup?(ctx: Context<Values<Params>>): unknown
+  setup?(ctx: SetupContext<Values<Params>>): unknown
   /** Once per block, when it closes. Never measured. */
   teardown?(ctx: Context<Values<Params>>): unknown
   cases: Record<string, Case<Values<Params>>>

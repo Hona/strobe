@@ -183,7 +183,12 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let started_ms = if web {
             let page = browser.page()?;
             let first = if target["prepare"].as_bool() == Some(true) {
-                let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &no_page)?;
+                // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.
+                let init = |op: &str, a: &Value| match (op, a["source"].as_str()) {
+                    ("init", Some(source)) => page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": format!("{source}\n") })).map(|_| Value::Bool(true)),
+                    _ => no_page(op, a),
+                };
+                let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &init)?;
                 let base = variant_url(v, &target)?;
                 r.get("url").and_then(Value::as_str).map(|u| join_url(origin(&base), u)).unwrap_or(base)
             } else {

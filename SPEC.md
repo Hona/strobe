@@ -503,8 +503,8 @@ pixels (`launch.painted`, `launch.settled`) and GPU use are refused `Headless` (
 headless"), each declared one (`--noworse` keys included); a software rasterizer refuses nothing
 there but GPU memory, which no GPU held. The report says "headless (no display)" where it would name
 the display's refresh, and the result has no `refresh_hz` when every series ran headless. A
-primary among them refuses the bench before anything builds (`Headless`, exit 4, naming CPU primaries
-to use instead): no frame or latency verdict ever comes from a headless browser, while a CPU verdict
+primary among them refuses its series before anything builds (`Headless`, naming CPU primaries to use
+instead; see "Refused series" below): no frame or latency verdict ever comes from a headless browser, while a CPU verdict
 (`cpu.work`, `main.work`) of a headless page is a CPU verdict of that headless page, and the series and
 the ledger say headless (a change of a page's engine, browser or mode is listed among what changed
 between attempts). `--headless` on a native, app, exe or command target is a usage error, in `--plan` too.
@@ -515,9 +515,17 @@ of engine `e` (`web({ engine: "firefox" })`), only those run; otherwise every pa
 error (narrow it with `--target`). `webkit` refuses on Windows for good (`EngineUnsupported`: no WebKit
 browser runs there for people), and with `--headless` on macOS (Safari has no headless mode); on Linux
 `--headless` picks WPE WebKit, headed WebKitGTK (§13.1). A primary the engine cannot measure
-refuses before anything builds (`EngineUnsupported`, with the closest metric it can), as does a launch
-case or `--probes attribution|memory` in another engine than Chromium; declared secondaries it cannot
-measure are refused per block. The engine, the browser's version and headless go into the rerun ledger's
+refuses its series before anything builds (`EngineUnsupported`, with the closest metric it can), as does
+a launch case in another engine than Chromium; `--probes attribution|memory` on a WebKit page refuses
+the run. Declared secondaries the engine cannot measure are refused per block.
+**Refused series:** a series refused before anything builds (one case's Chromium-only primary in a
+file run on Firefox) is listed, never run, and the rest of the file runs: `--check` prints `refused
+<series>  <validator>: <why>` with its fix and counts it apart from the cases that passed or failed
+(exit 0 when the rest pass); a comparison lists it `not run: <validator>: <why> · fix: …` with its
+primary refused (`verdict_kind: refused`, the refusal in `primary.refusal`, series `kind: "refused"`),
+undecided, and exits 0 unless `--require-verdict`, which exits 4 on it as on a parity gap; `--plan`
+lists it with no time. When every series is refused, the run is refused (exit 4) with the first
+series' refusal. The engine, the browser's version and headless go into the rerun ledger's
 identity (§14.2) and track's fingerprints (§25): a run in another engine, version or mode is another
 experiment and another series.
 `--blocks N` measures `--head` alone: N timed blocks, each warmed until steady as a bench's, and
@@ -1777,8 +1785,8 @@ export default bench({
   targets: {
     web: web({
       viewport: { width: 1366, height: 768 },
-      prepare: ({ playwright, params, url }) =>
-        mockFeed(playwright.page, { items: params.items, server: new URL(url).origin }),
+      prepare: ({ mock, params, url }) =>
+        mockFeed(mock, { items: params.items, server: new URL(url).origin }),
     }),
     desktop: app("desktop", { home: "perf/fixtures/home-{items}" }),
   },
@@ -1845,13 +1853,24 @@ export default bench({
   `fixture(command, opts)` at the top level starts a process per block that both sides talk to
   (§9.10). `web()` and `url()` also take `engine` (`"chromium"`, the default, `"firefox"`,
   `"webkit"`: §13.1, `--engine` above) and `headless` (§5.6).
-- `prepare(ctx)`: per block, before the first page load. The only place with Playwright
-  (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), and only on
-  targets with a debug port: on a page in another engine reading `ctx.playwright` throws, typed as
-  `EngineUnsupported` (Playwright connects over CDP); `ctx.mock` works there. `ctx.url` is the URL strobe opens next; a production web build is
+- `prepare(ctx)`: per block, before the first page load. `ctx.addInitScript(script, arg?)` and
+  `ctx.mock(pattern, handler)` (below) work in every engine and are how a bench file sets up a page:
+  a script before the page's own (a frame counter, seeded storage) and network mocks. The only place
+  with Playwright (`ctx.playwright.page`, the very page strobe drives, matched by CDP target id), when
+  Playwright is installed next to the bench file, and only on targets with a debug port: on a page in
+  another engine reading `ctx.playwright` throws, typed as `EngineUnsupported` (Playwright connects
+  over CDP), with the fix naming `ctx.addInitScript` and `ctx.mock`. `ctx.url` is the URL strobe opens next; a production web build is
   its own server, so mock the API under `new URL(url).origin`. Playwright stays connected for the
   whole block, so routes and init scripts keep working. What `prepare` returns is
   `ctx.prepared` in `setup`, `run` and `reset` (for example a mock's event transport).
+- **Init scripts** (`ctx.addInitScript(script, arg?)`, in `prepare` and `setup`): Playwright's
+  `page.addInitScript` through strobe's own connection: every new document of the block's page runs
+  the script before its own (Chromium `Page.addScriptToEvaluateOnNewDocument`, Firefox BiDi
+  `script.addPreloadScript`; a launch case's page too). A function is sent as its source and called
+  with `arg` as JSON; a string runs as it is (a string with an argument is an error). The document
+  already loaded does not run it. WebKit (WebDriver Classic) has no preload script: there the script
+  runs after the first document's own scripts, the block says so (`InitScript`, info), and a
+  `page.goto` after it is refused (`EngineUnsupported`: the new document's scripts would run first).
 - On app and exe targets, `setup`, `run`, `reset` and `teardown` also get `ctx.home` (the launch's
   private home), `ctx.env` (the environment it launched with) and `ctx.exe` (the variant's
   executable), the same as a launch's `before`. A bench drives the copy through the app's own CLI
@@ -1895,12 +1914,12 @@ answered at once, so strobe serves the hook's other calls meanwhile and `const s
 ctx.waitForLine(/saved/); await page.click(…); await saved` misses nothing and never deadlocks;
 output lines no watch waits for are dropped), `fixture` (the block's fixture: `{ url, port, pid }`, or null, §9.10), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
 file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
-`head`, for logging only), `url`, `root` (the variant's folder), `prepared`, and in `prepare` only
-`playwright` and `mock(pattern, handler)`.
+`head`, for logging only), `url`, `root` (the variant's folder), `prepared`, in `prepare` and `setup`
+`addInitScript(script, arg?)`, and in `prepare` only `playwright` and `mock(pattern, handler)`.
 
 **Mocks** (`ctx.mock(pattern, handler)` in `prepare`): answers requests whose URL matches
 `pattern` (`*` any run of characters, `?` one) through the Fetch domain with only those patterns
-paused. Playwright's `page.route` turns the HTTP cache off for the whole page, so a case that
+paused, on a DevTools session of the runner's own on strobe's page (no Playwright needed). Playwright's `page.route` turns the HTTP cache off for the whole page, so a case that
 reloads in `reset` refetched every script, which no person does; with `mock` the scripts come from
 the cache. A handler gets `{ url, method, headers, body, json() }` and returns `{ status?, headers?,
 body? }` (text, bytes, or any other value as JSON) or `undefined` to let the request through.
@@ -1913,8 +1932,10 @@ handlers over a loopback socket of their own (a random token, one line each way)
 `network.provideResponse` or letting it go (`continueRequest`); the HTTP cache stays on. BiDi's URL
 patterns have no wildcards, so the intercept is the glob's literal URL, else its literal origin, else
 every request of the page, and a paused request no glob matches goes on at once (one round trip in
-strobe). The handler's request has no `body` there (BiDi does not carry it). On a WebKit page (WebDriver
-Classic: no interception) `mock` refuses `EngineUnsupported`; serve such responses from a local server.
+strobe). A request's body comes from a BiDi data collector strobe adds for the page (`network.addDataCollector`
+for `request` data, read with `network.getData` for a request with a body, up to 16 MiB); where the
+browser has none, the handler's request has no `body`. On a WebKit page (WebDriver Classic: no
+interception) `mock` refuses `EngineUnsupported`; serve such responses from a local server.
 
 An element is visible to the driver when it has a box and `checkVisibility({ checkOpacity,
 checkVisibilityCSS })` holds: `visibility: hidden`, `opacity: 0` or `content-visibility` on it or an
@@ -2509,8 +2530,8 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
-| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses before anything builds, with the closest metric the engine has; a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
-| `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses before anything builds; a secondary is refused per block |
+| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
+| `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
 | `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |

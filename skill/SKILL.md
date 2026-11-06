@@ -61,7 +61,8 @@ strobe bench <file.bench.ts> --head <variant>
   - `alloc`, `heap`, `leaks` and `style` refuse `EngineUnsupported` on a Firefox recording.
   - Leak runs (`--probes memory`) read about:memory after every run: page JS memory and DOM growth,
     no suspects (no heap snapshots).
-  - No launch cases in Firefox yet. `ctx.mock` works; `ctx.playwright` throws.
+  - No launch cases in Firefox yet. `ctx.mock` and `ctx.addInitScript` work; `ctx.playwright` throws.
+  - A case whose primary Firefox cannot measure is listed `refused` with the closest primary it has; the other cases still run.
 - `--headless`: page targets headless, timed too; runs through a lock. Frame, latency, scroll, canvas and GPU-use metrics refuse `Headless`; `input.rate` stays. Pages only (an app or native target is a usage error).
 
 ### `strobe plan`
@@ -250,7 +251,7 @@ export default bench({
   targets: {
     web: web({
       viewport: { width: 1366, height: 768 },
-      prepare: ({ playwright, url }) => mockFeed(playwright.page, { server: new URL(url).origin }),
+      prepare: ({ mock, url }) => mockFeed(mock, { server: new URL(url).origin }),
       url: ({ prepared }) => prepared.path,
     }),
     desktop: app("desktop", { home: "perf/fixtures/home" }),
@@ -309,8 +310,9 @@ export default bench({
 ### Case lifecycle
 
 - `reset` puts state back between runs and is never measured.
-- Playwright only in `prepare` on `web` targets.
+- Playwright only in `prepare` on `web` targets, and Chromium only: prefer `ctx.addInitScript` and `ctx.mock`, which work in every engine.
 - What `prepare` returns is `ctx.prepared` in `setup`, `run` and `reset`, and it keeps working for the whole block.
+- Scripts before the page's own (a frame counter, seeded `localStorage`): `ctx.addInitScript(fn, arg?)` in `prepare` or `setup`, Playwright's `page.addInitScript` in any engine; new documents only.
 - Mock APIs with `ctx.mock(pattern, handler)` in `prepare`: Playwright's `page.route` turns the HTTP cache off, so reloads refetch every script.
 - `teardown` (target or file) stops what `prepare` started.
 - Never call `page.eval` in `run`.

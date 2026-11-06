@@ -139,5 +139,9 @@ jobs:
         run: |
           want="v$(grep -m1 '^version = ' Cargo.toml | cut -d '"' -f2)"
           [ "$GITHUB_REF_NAME" = "$want" ] || { echo "::error::tag $GITHUB_REF_NAME, Cargo.toml says $want"; exit 1; }
+      # Platform packages first; @hona/strobe only once npm serves every one of them (npm view and the abbreviated
+      # document installers read), and @hona/strobe-bench once @hona/strobe is served, polled for up to 15 minutes
+      # each. An install right after the release then never resolves @hona/strobe without a platform package.
       - name: Publish
+        timeout-minutes: 60
         run: bun scripts/release.ts --bin bin ${{ startsWith(github.ref, 'refs/tags/v') && '--publish' || '' }}

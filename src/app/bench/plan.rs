@@ -6,7 +6,7 @@
 //! slot's queue. `bench` prints the same plan when it starts and keeps an ETA from it.
 
 use super::super::{Output, fmt, progress};
-use super::{FUTILITY_FROM, Kind, LOOKS, POCOCK_ALPHA, Series, Variant, slot};
+use super::{FUTILITY_FROM, Kind, LOOKS, POCOCK_ALPHA, Series, Variant, refused_text, slot};
 use crate::cli::Args;
 use crate::model::{self, Error, Result};
 use crate::runner::Runner;
@@ -46,12 +46,12 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     let head = args.get("head").unwrap_or(".");
     let base = args.get("base").or(args.has("aa").then_some(head));
-    let (series, variants) = super::series_and_sides(&describe, args, base, head, &project, &config)?;
+    let (mut series, variants) = super::series_and_sides(&describe, args, base, head, &project, &config)?;
     if series.is_empty() {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
-    // What a bench would refuse before anything builds, the plan refuses too.
-    super::check_engines(&series, &describe, args)?;
+    // What a bench would refuse before anything builds, the plan refuses (or lists, per series) too.
+    super::check_engines(&mut series, &describe, args)?;
     if variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2 {
         super::implementation_preflight(&describe, &series, &variants, &config, &super::target_projects(&describe)?)?;
     }
@@ -234,6 +234,10 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
     let mut out = Vec::new();
     let mut total = 0.0;
     for s in series {
+        if let Some(r) = &s.refused {
+            out.push(json!({ "label": s.label(), "case": s.case, "target": s.target, "primary": s.primary, "refused": r, "pairs": 0, "ms": 0.0 }));
+            continue;
+        }
         let target = &describe["targets"][&s.target];
         let kind = target["kind"].as_str().unwrap_or("");
         let def = model::metric(&s.primary);
@@ -424,6 +428,9 @@ pub(super) fn summary(plan: &Value) -> Vec<String> {
 }
 
 fn series_line(s: &Value) -> String {
+    if let Some(r) = s["refused"].as_object() {
+        return format!("{}: refused ({}), not run", s["label"].as_str().unwrap_or(""), r["validator"].as_str().unwrap_or(""));
+    }
     let what = match (s["sigma"].as_f64(), s["look"].as_u64()) {
         (None, _) => format!("{} pairs at least; spread unknown, so no estimate of when it decides", s["pairs"]),
         (Some(_), Some(l)) => format!("{} by pair {l} (~{} pairs needed)", s["expect"].as_str().unwrap_or(""), s["pairs_needed"].as_f64().unwrap_or(0.0)),
@@ -471,6 +478,10 @@ fn text(file: &Path, variants: &[Variant], plan: &Value, notes: &[String]) -> St
         t += &format!("build  {} {}\n", b["role"].as_str().unwrap_or(""), b["state"].as_str().unwrap_or(""));
     }
     for s in plan["series"].as_array().into_iter().flatten() {
+        if s["refused"].is_object() {
+            t += &format!("\n{}\n  refused  {}\n", s["label"].as_str().unwrap_or(""), refused_text(&s["refused"]));
+            continue;
+        }
         let unit = if s["relative"] == true { "" } else { " (in the metric's unit)" };
         let pct = |x: f64| if s["relative"] == true { format!("{:.1}%", 100.0 * (x.exp() - 1.0)) } else { format!("{x:.2}") };
         t += &format!(

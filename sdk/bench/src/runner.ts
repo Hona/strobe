@@ -174,7 +174,8 @@ const state: {
   fixture: { url: string; port: number; pid: number; home: string } | null
   engine: string
   relay: any
-} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null }
+  devtools: { endpoint: string; target: string } | null
+} = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null, devtools: null }
 
 // `ctx.ui.<name>`: the side's selector, or its step called with this context; a name it lacks is a parity gap.
 const uiOf = (ctx: () => object) =>
@@ -228,6 +229,15 @@ const context = (): any => ({
   },
 })
 
+// A script every new document of the block's page runs before its own, in any engine: strobe adds it
+// through its own connection (CDP's Page.addScriptToEvaluateOnNewDocument, BiDi's script.addPreloadScript).
+// A function is sent as its source, called with `arg` (JSON), as Playwright's page.addInitScript does.
+function addInitScript(script: string | Function, arg?: unknown) {
+  if (typeof script === "string" && arg !== undefined) throw new Error("addInitScript: a string script takes no argument; pass a function")
+  const source = typeof script === "function" ? `(${script.toString()})(${arg === undefined ? "" : JSON.stringify(arg)})` : String(script)
+  return request("init", { source }).then(() => undefined)
+}
+
 // Playwright connects over CDP, which only Chromium speaks: on another engine reading it throws, typed
 // as strobe's EngineUnsupported refusal, so the bench names the cause instead of a null page failing later.
 const prepareContext = () => ({
@@ -238,15 +248,19 @@ const prepareContext = () => ({
   url: state.url,
   root: state.root,
   get playwright() {
-    if (state.engine === "chromium") return state.playwright
+    if (state.engine === "chromium") {
+      if (!state.playwright) throw new Error(`ctx.playwright needs Playwright: install playwright or @playwright/test next to ${file}`)
+      return state.playwright
+    }
     const summary = `ctx.playwright connects over Chromium's DevTools protocol; this target runs in ${state.engine}`
     const fix =
       state.engine === "webkit"
-        ? "use the page driver, serve mocked responses from a local server (WebKit has no ctx.mock), or run the target in Chromium"
-        : "use ctx.mock for network mocks and the page driver for the rest, or run the target in Chromium"
+        ? "use ctx.addInitScript (WebKit runs it after the first document's own scripts), the page driver, serve mocked responses from a local server (WebKit has no ctx.mock), or run the target in Chromium"
+        : "use ctx.addInitScript for scripts before the page's own, ctx.mock for network mocks and the page driver for the rest (they work in Chromium and Firefox), or run the target in Chromium with Playwright installed"
     throw Object.assign(new Error(`EngineUnsupported: ${summary}`), { hint: fix, refusal: { validator: "EngineUnsupported", summary, fix } })
   },
   mock,
+  addInitScript,
 })
 
 // The bench file's own options, as JSON: functions become flags, RegExps their source.
@@ -305,11 +319,13 @@ function describe() {
   return { file, targets, params: spec.params ?? {}, cases, setup: !!spec.setup, teardown: !!spec.teardown, fixture: spec.fixture && plain(spec.fixture) }
 }
 
+// Playwright, when it is installed next to the bench file: a prepare that uses only ctx.addInitScript and
+// ctx.mock needs none on another engine, and none on Chromium but for ctx.mock.
 async function playwright(endpoint: string, target: string) {
   const from = path.dirname(file)
   const names = ["playwright", "@playwright/test", "playwright-core"]
   const resolved = names.map((n) => { try { return Bun.resolveSync(n, from) } catch { return undefined } }).find(Boolean)
-  if (!resolved) throw new Error(`prepare needs Playwright: install playwright or @playwright/test next to ${file}`)
+  if (!resolved) return null
   // A bench path canonicalized on Windows starts with \\?\, which Bun's import() cannot load.
   const { chromium } = await import(resolved.replace(/^\\\\\?\\/, ""))
   const browser = await chromium.connectOverCDP(endpoint)
@@ -343,13 +359,48 @@ async function mock(pattern: string, handler: Function) {
     if (!state.relay) state.relay = await relay(where.port, where.token)
     return
   }
-  if (!state.playwright) throw new Error("mock needs the block's browser: call it in prepare")
+  if (!state.devtools) throw new Error("mock needs the block's browser: call it in prepare")
   state.mocks.push({ pattern, test, handler })
   if (!state.session) {
-    state.session = await state.playwright.context.newCDPSession(state.playwright.page)
+    state.session = await cdpSession(state.devtools.endpoint, state.devtools.target)
     state.session.on("Fetch.requestPaused", (event: any) => void answer(state.session, event))
   }
   await state.session.send("Fetch.enable", { patterns: state.mocks.map((m) => ({ urlPattern: m.pattern, requestStage: "Request" })) })
+}
+
+// A DevTools session of the runner's own on the page strobe drives (by its target id), with no Playwright:
+// `send` and `on` for its events, as Playwright's CDPSession has them.
+async function cdpSession(endpoint: string, target: string) {
+  const ws = new WebSocket(endpoint)
+  await new Promise((resolve, reject) => {
+    ws.onopen = resolve
+    ws.onerror = () => reject(new Error(`mock: the browser's DevTools endpoint ${endpoint} did not answer`))
+  })
+  let seq = 0
+  let sessionId: string | undefined
+  const waiting = new Map<number, { resolve: (v: any) => void; reject: (e: Error) => void }>()
+  const listeners = new Map<string, ((params: any) => void)[]>()
+  ws.onmessage = (e) => {
+    const m = JSON.parse(String(e.data))
+    const w = m.id === undefined ? undefined : waiting.get(m.id)
+    if (w) {
+      waiting.delete(m.id)
+      return m.error ? w.reject(new Error(`cdp: ${m.error.message}`)) : w.resolve(m.result)
+    }
+    if (m.method && m.sessionId === sessionId) for (const f of listeners.get(m.method) ?? []) f(m.params)
+  }
+  const send = (method: string, params: object = {}, session = sessionId) =>
+    new Promise<any>((resolve, reject) => {
+      const id = ++seq
+      waiting.set(id, { resolve, reject })
+      ws.send(JSON.stringify({ id, method, params, ...(session ? { sessionId: session } : {}) }))
+    })
+  sessionId = (await send("Target.attachToTarget", { targetId: target, flatten: true })).sessionId
+  return {
+    send,
+    on: (method: string, f: (params: any) => void) => void listeners.set(method, [...(listeners.get(method) ?? []), f]),
+    detach: async () => ws.close(),
+  }
 }
 
 // The handler's response as plain parts: status, header pairs and the body's bytes.
@@ -368,7 +419,7 @@ async function respond(req: any): Promise<{ status: number; headers: [string, st
 }
 
 // strobe's relay for an engine without a CDP session: one line per paused request, one line back.
-// The request body is not given (WebDriver BiDi does not carry it), so `body` is undefined there.
+// The request body comes as base64 where the browser collects it for strobe (BiDi's data collectors).
 async function relay(port: number, token: string) {
   const sock = connect(port, "127.0.0.1")
   await new Promise((resolve, reject) => {
@@ -383,7 +434,8 @@ async function relay(port: number, token: string) {
   lines.on("error", () => {})
   lines.on("line", async (line) => {
     const r = JSON.parse(line)
-    const req = { url: r.url, method: r.method, headers: r.headers ?? {}, body: undefined, json: () => null }
+    const body: string | undefined = r.body === undefined ? undefined : Buffer.from(r.body, "base64").toString()
+    const req = { url: r.url, method: r.method, headers: r.headers ?? {}, body, json: () => JSON.parse(body ?? "null") }
     try {
       const res = await respond(req)
       sock.write(JSON.stringify(res ? { id: r.id, status: res.status, headers: res.headers, body: Buffer.from(res.body).toString("base64") } : { id: r.id, pass: true }) + "\n")
@@ -448,6 +500,7 @@ async function handle(op: string, args: any) {
         session: null,
         engine: args.engine ?? "chromium",
         relay: null,
+        devtools: null,
       })
       return true
     case "before":
@@ -466,6 +519,7 @@ async function handle(op: string, args: any) {
     case "prepare": {
       const target = spec.targets[state.target]
       if (target?.prepare) {
+        state.devtools = args.endpoint ? { endpoint: args.endpoint, target: args.target } : null
         if (args.endpoint) state.playwright = await playwright(args.endpoint, args.target)
         state.prepared = await target.prepare(prepareContext())
       }
@@ -474,7 +528,7 @@ async function handle(op: string, args: any) {
       return { url }
     }
     case "setup":
-      await spec.setup?.(context())
+      await spec.setup?.({ ...context(), addInitScript })
       return true
     case "run": {
       const run = hookFor(spec.cases[args.case].run, state.target)
@@ -496,7 +550,7 @@ async function handle(op: string, args: any) {
       if (state.session) await state.session.detach().catch(() => {})
       if (state.playwright) await state.playwright.browser.close().catch(() => {})
       if (state.relay) state.relay.end()
-      Object.assign(state, { playwright: null, session: null, mocks: [], relay: null })
+      Object.assign(state, { playwright: null, session: null, mocks: [], relay: null, devtools: null })
       if (errors.length) throw new AggregateError(errors, `teardown failed: ${errors.map((e) => (e instanceof Error ? e.message : String(e))).join("; ")}`)
       return true
     }

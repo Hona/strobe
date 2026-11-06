@@ -2813,6 +2813,10 @@ fn growth(ys: &[f64], n: usize, bound: f64, show: &dyn Fn(f64) -> String) -> Val
     json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "verdict_kind": kind, "decided": kind.decided() })
 }
 
+/// What `Foreign::stop` read: other work on the target's CPUs (% of one core, None when unreadable) and
+/// the busiest processes on the machine.
+type OtherWork = (Option<f64>, Vec<(String, f64)>);
+
 /// Other work on the target's CPUs over a span (a page's speed check), as `validity`'s native check
 /// measures it: their busy time from idle cycles, less the target browser's own CPU, and the busiest
 /// processes outside strobe's tree (the browser is in it).
@@ -2834,7 +2838,7 @@ impl Foreign {
     /// stamp counter could not be read), and the busiest processes on the machine outside strobe's
     /// tree and the target browser, as % of one core: their cycles over the span's time stamp counter,
     /// a process that started meanwhile counted from zero.
-    fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> (Option<f64>, Vec<(String, f64)>) {
+    fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> OtherWork {
         let mut idle = Vec::new();
         let ok = host::idle_cycles(&mut idle);
         let theirs = browser.processes();
@@ -3760,7 +3764,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let speed = validity::speed_check(&page)?;
         // The calibration is Chromium's: another engine's JS speed is compared with its own reference
         // only, which a check under other work never joins.
-        let mut loaded: Option<(Option<f64>, Vec<(String, f64)>)> = None;
+        let mut loaded: Option<OtherWork> = None;
         let checked = match engine {
             WebEngine::Chromium => validity::throttled(speed, ctx.baseline),
             WebEngine::Firefox | WebEngine::Webkit => {

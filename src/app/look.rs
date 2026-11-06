@@ -264,7 +264,7 @@ pub fn run(args: &Args) -> Result<Output> {
         let clip = match args.get("element") {
             Some(sel) => {
                 let sel = Selector::parse(&Value::String(sel.to_string()), Dialect::Page)?;
-                match crate::driver::element_box(&page, &sel, Duration::from_secs(10))? {
+                match crate::driver::element_box(&page.clone().into(), &sel, Duration::from_secs(10))? {
                     Some([x, y, w, h]) if w >= 1.0 && h >= 1.0 => Some(json!({ "x": x, "y": y, "width": w, "height": h, "scale": 1 })),
                     Some(_) => return Err(Error::usage(format!("--element {:?}: the element has no size to show (0×0)", sel.source))),
                     None => return Err(Error::usage(format!("--element {:?}: no visible element matches it", sel.source)).hint("strobe look <page> lists the headings and text; a selector is CSS, then role=, text=, index=")),

@@ -338,7 +338,7 @@ fn relative_variant(spec: &str) -> Option<&str> {
     if let Some(exe) = v.strip_prefix("exe:") {
         return std::path::Path::new(exe).is_relative().then_some(exe);
     }
-    if ["url:", "git:", "app:", "target:"].iter().any(|p| v.starts_with(p)) {
+    if ["url:", "git:", "app:", "target:", "cmd:"].iter().any(|p| v.starts_with(p)) {
         return None;
     }
     let dotted = v == "." || v == ".." || ["./", ".\\", "../", "..\\"].iter().any(|p| v.starts_with(p));

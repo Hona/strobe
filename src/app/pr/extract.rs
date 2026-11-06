@@ -127,7 +127,12 @@ pub(super) fn range(c: &Value) -> String {
     if a == b { a.replace(' ', "\u{a0}") } else { format!("{a} to {b}").replace(' ', "\u{a0}") }
 }
 
+/// A side's median, `—` for a refused comparison: results from before `Comparison::refuse` cleared
+/// them still hold numbers no one should read.
 pub(super) fn value(c: &Value, side: &str) -> String {
+    if kind(c) == VerdictKind::Refused {
+        return "—".into();
+    }
     disp(f(&c[side]), unit_of(c["metric"].as_str().unwrap_or("")))
 }
 
@@ -364,12 +369,14 @@ pub(super) fn refresh(ps: &[Pair], r: &Value) -> f64 {
 
 /// Whether a block's frames reached a display and were kept: never a headless page's (its gaps time
 /// animation frames no display showed), nor a block that counted none or whose frame metrics a
-/// validator refused (`BackgroundPriority`, `SoftwareGpu`; a percentile's `TailTooShort` only says it
-/// had too few). Results from before blocks cleared such gaps still hold them.
+/// validator refused (`BackgroundPriority`, `SoftwareGpu`). Only the frames and their gaps count: a
+/// percentile's `TailTooShort` only says it had too few, and a refused stage split
+/// (`frames.renderer.*`, `frames.viz.*`) or frame latency (`frames.presented.*`) leaves the gaps
+/// standing. Results from before blocks cleared such gaps still hold them.
 pub(super) fn frames_kept(s: &Value, b: &Value) -> bool {
-    let refused = b["refused"]
-        .as_object()
-        .is_some_and(|r| r.iter().any(|(m, why)| m.starts_with("frames.") && why.as_str().and_then(model::Refusal::from_line).is_none_or(|x| x.validator != model::ValidatorId::TailTooShort)));
+    let gaps = |m: &str| m == "frames.n" || m.starts_with("frames.interval.") || m.starts_with("frames.dropped");
+    let refused =
+        b["refused"].as_object().is_some_and(|r| r.iter().any(|(m, why)| gaps(m) && why.as_str().and_then(model::Refusal::from_line).is_none_or(|x| x.validator != model::ValidatorId::TailTooShort)));
     s["headless"] != true && bv(b, "frames.n") > 0.0 && !refused
 }
 
@@ -378,10 +385,16 @@ pub(super) fn framed_pairs(s: &Value) -> Vec<Pair<'_>> {
     pairs(s).into_iter().filter(|p| frames_kept(s, p.base) && frames_kept(s, p.head)).collect()
 }
 
-/// A series whose pairs a hero or a caution may speak for: not a leak run (its own verdict), not one
-/// that never ran, and not one refused before it ran (`VariantMismatch`, an engine without its primary).
-pub(super) fn judged(s: &Value) -> bool {
-    s["kind"] != "leak" && s["kind"] != "refused" && s["not_run"] != true
+/// A series whose pairs a hero or a caution may speak for: not a leak run (its own verdict), a parity
+/// gap or a check, not one that never ran, and not one refused before it ran (`VariantMismatch`, an
+/// engine without its primary).
+pub(crate) fn judged(s: &Value) -> bool {
+    !matches!(s["kind"].as_str(), Some("leak" | "refused" | "gap" | "check")) && s["not_run"] != true
+}
+
+/// A series that measured something: a judged one or a leak run.
+pub(super) fn measured(s: &Value) -> bool {
+    judged(s) || s["kind"] == "leak" && s["not_run"] != true
 }
 
 /// Late frames (a gap of 1.5 frame times or more) as shares of all gaps, before and this PR, and in
@@ -820,12 +833,14 @@ pub(super) fn variants(r: &Value) -> (Value, Value) {
 /// else its blocks' client area, else the experiment's; nothing for a target without a window or a
 /// series that never ran.
 pub(super) fn window_of(s: &Value, r: &Value) -> String {
-    if s["windowless"] == true || matches!(s["target_kind"].as_str(), Some("script" | "cli")) || s["kind"] == "refused" || s["not_run"] == true {
+    if s["windowless"] == true || matches!(s["target_kind"].as_str(), Some("script" | "cli")) || !measured(s) {
         return String::new();
     }
     let shape = |w: &Value| {
         let size = fmt::size(w);
-        let scale = w["scale"].as_f64().filter(|x| (x - 1.0).abs() > 0.01).map(|x| format!(" @{x}x")).unwrap_or_default();
+        // `@1.5x`, `@1.25x`: two decimals at most, no trailing zeros.
+        let round = |x: f64| format!("{x:.2}").trim_end_matches('0').trim_end_matches('.').to_string();
+        let scale = w["scale"].as_f64().filter(|x| (x - 1.0).abs() > 0.005).map(|x| format!(" @{}x", round(x))).unwrap_or_default();
         let mobile = if w["mobile"] == true { " · mobile" } else { "" };
         if size.is_empty() { size } else { format!("{size}{scale}{mobile}") }
     };
@@ -843,8 +858,8 @@ pub(super) fn window_of(s: &Value, r: &Value) -> String {
 }
 
 /// The address a `url()` target loaded on side `role` when that side's variant is a build (a folder,
-/// a commit), which such a target never loads: the variant's or the series' `href`, else the page its
-/// first block showed. None for a variant that is itself an address, or another kind of target.
+/// a commit), which such a target never loads: the series' `href`, else the variant's. None for a
+/// variant that is itself an address, another kind of target, or a result that names no `href`.
 pub(super) fn fixed_href(r: &Value, s: &Value, role: &str) -> Option<String> {
     let (b, h) = variants(r);
     let v = if role == "base" { b } else { h };
@@ -852,8 +867,7 @@ pub(super) fn fixed_href(r: &Value, s: &Value, role: &str) -> Option<String> {
     if s["target_kind"] != "url" || address {
         return None;
     }
-    let shown = || s["blocks"].as_array().into_iter().flatten().filter(|x| x["variant"] == role).find_map(|x| x["shown"]["start"]["url"].as_str().or(x["shown"]["end"]["url"].as_str()));
-    v["href"].as_str().or(s["href"].as_str()).or_else(shown).map(str::to_string)
+    s["href"].as_str().or(v["href"].as_str()).map(str::to_string)
 }
 
 pub(super) fn local_path(s: &str) -> bool {

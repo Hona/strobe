@@ -13,6 +13,7 @@ mod implementations;
 mod markdown;
 
 use extract::*;
+pub(crate) use extract::judged;
 use github::*;
 pub use github::{Updated, hero_level, relevel, splice, update_pr};
 pub use implementations::{claim, cpu_scope, factor_or_pct, fairness, range_x, ready_noun};

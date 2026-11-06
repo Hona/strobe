@@ -3058,7 +3058,7 @@ function buildImpactModel(r, s) {
   const vs = hz > 0 ? 1000 / hz : NaN;
   const fpl = median(blocks.map((b) => b.values?.["frames.n"]));
   const ipl = median(blocks.map((b) => (b.intervals ? b.intervals.length : NaN)));
-  const hasStream = finite(ipl) ? ipl >= 30 : fpl >= 30 && blocks.some((b) => b.intervals?.length >= 30);
+  const hasStream = blocks.some((b) => framesKept(s, b)) && (finite(ipl) ? ipl >= 30 : fpl >= 30 && blocks.some((b) => b.intervals?.length >= 30));
   const prim = s.primary?.metric;
   const items = allComparisons(s);
   const find = (m) => items.find((x) => x.c.metric === m) || null;
@@ -4506,8 +4506,17 @@ function renderLiveHeapSingleSection(heap, customTitle) {
 }
 
 /* ---------- Deep Dive 5: Frame Pacing & Tail Jank ---------- */
+// A block's frames reached a display and were kept (as the PR block's frames_kept): never a headless
+// page's, nor a block that counted none or whose frames or gaps a validator refused (a percentile's
+// TailTooShort only says it had too few). Older results kept such gaps beside the refusal.
+function framesKept(s, b) {
+  const gaps = (m) => m === "frames.n" || m.startsWith("frames.interval.") || m.startsWith("frames.dropped");
+  const refused = Object.entries(b.refused || {}).some(([m, why]) => gaps(m) && !String(why).startsWith("TailTooShort"));
+  return s.headless !== true && (b.values?.["frames.n"] || 0) > 0 && !refused;
+}
+
 function getFrameArrays(s, kind) {
-  const blocks = timedBlocks(s);
+  const blocks = timedBlocks(s).filter((b) => framesKept(s, b));
   const per = blocks
     .map((b) => ({ variant: b.variant, arr: Float64Array.from((kind === "gaps" ? b.intervals : b.frames) || []).sort() }))
     .filter((x) => x.arr.length > 0);

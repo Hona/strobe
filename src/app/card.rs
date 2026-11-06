@@ -185,6 +185,10 @@ fn primary_out(s: &Value, aa: bool) -> Out {
     if s["not_run"] == true {
         return Out::NotRun;
     }
+    // Refused before it ran (`VariantMismatch`, an engine without its primary), as the PR block reads it.
+    if s["kind"] == "refused" {
+        return Out::Refused;
+    }
     if s["kind"] == "leak" {
         return if stats::kind_of(&s["primary"]) == VerdictKind::Worse {
             Out::Worse
@@ -436,6 +440,8 @@ struct Card {
     alt: String,
     /// One badge per series: (series label, noun, value, tone).
     badges: Vec<(String, String, String, Tone)>,
+    /// The badge that heads a card without tiles: the first series that ran.
+    lead: usize,
 }
 
 /// The same results as `--format pr`'s hero line and caution (`pr::hero`): the wins in its order and
@@ -481,8 +487,10 @@ fn build(r: &Value) -> Card {
     }
 
     let id = r["id"].as_str().unwrap_or("").to_string();
+    // Without tiles, the series that ran: one refused before it ran, or never run, only when none did.
+    let ran: Vec<&Value> = series.iter().copied().filter(|s| super::pr::judged(s) || s["kind"] == "leak" && s["not_run"] != true).collect();
     if tiles.is_empty() {
-        shown = series.clone();
+        shown = if ran.is_empty() { series.clone() } else { ran.clone() };
     }
     let mut titles: Vec<String> = Vec::new();
     for s in &shown {
@@ -510,6 +518,8 @@ fn build(r: &Value) -> Card {
     };
 
     let badges = series.iter().map(|s| badge_of(s, aa)).collect();
+    // The headline badge without tiles: the first series that ran, else the first.
+    let lead = series.iter().position(|s| ran.iter().any(|x| std::ptr::eq(*x, *s))).unwrap_or(0);
     let (body, alt) = if tiles.is_empty() {
         let (detail, tile) = calm(&series, aa);
         let heading = hero.calm;
@@ -527,7 +537,7 @@ fn build(r: &Value) -> Card {
         (Body::Tiles(tiles), parts.join("; "))
     };
     let alt = if more.is_empty() { format!("{alt}.") } else { format!("{alt}; {more}.") };
-    Card { id, subject, body, footer, more, alt, badges }
+    Card { id, subject, body, footer, more, alt, badges, lead }
 }
 
 /// Under the calm heading (`pr::hero`'s, which it follows in order): the line on why, and the series
@@ -555,6 +565,14 @@ fn calm(series: &[&Value], aa: bool) -> (String, Option<Box<Tile>>) {
         let n = s["primary"]["n"].as_u64().or(s["pairs"].as_u64()).unwrap_or(0);
         return (format!("{}: no clear change in {n} pairs", noun(s)), with_tile(s));
     }
+    // A series that decided says more than one refused (as `pr::hero`'s calm heading has it).
+    if let Some(s) = find(Out::Same) {
+        let c = &s["primary"];
+        let unit = unit_of(metric(c));
+        let b = f(&c["bound"]);
+        let bound = if c["relative"] == true { format!("±{:.0}%", b * 100.0) } else { format!("±{}", disp(b, abs_unit(unit))) };
+        return (format!("{}: {} → {}, within {bound}", noun(s), disp(f(&c["base"]), unit), disp(f(&c["head"]), unit)), with_tile(s));
+    }
     if let Some(s) = find(Out::Refused) {
         let v = verdict(&s["primary"]);
         // Results from before comparisons kept their refusal: from the verdict's words.
@@ -565,13 +583,6 @@ fn calm(series: &[&Value], aa: bool) -> (String, Option<Box<Tile>>) {
             None => why.to_string(),
         };
         return (format!("{}: {plain}", noun(s)), None);
-    }
-    if let Some(s) = find(Out::Same) {
-        let c = &s["primary"];
-        let unit = unit_of(metric(c));
-        let b = f(&c["bound"]);
-        let bound = if c["relative"] == true { format!("±{:.0}%", b * 100.0) } else { format!("±{}", disp(b, abs_unit(unit))) };
-        return (format!("{}: {} → {}, within {bound}", noun(s), disp(f(&c["base"]), unit), disp(f(&c["head"]), unit)), with_tile(s));
     }
     if find(Out::NotRun).is_some() {
         return ("The bench stopped before this series ran".into(), None);
@@ -1006,11 +1017,11 @@ fn shields_url(noun: &str, value: &str, tone: Tone) -> String {
     format!("https://img.shields.io/badge/{}-{}-{colour}?style=flat-square", part(noun), part(value))
 }
 
-/// The headline badge: the card's first tile, else the first series' main metric.
+/// The headline badge: the card's first tile, else the main metric of the first series that ran.
 fn headline(card: &Card) -> (String, String, Tone) {
     match &card.body {
         Body::Tiles(t) => (t[0].noun.clone(), t[0].delta.clone(), t[0].tone),
-        _ => card.badges.first().map(|b| (b.1.clone(), b.2.clone(), b.3)).unwrap_or(("strobe".into(), "no result".into(), Tone::Plain)),
+        _ => card.badges.get(card.lead).map(|b| (b.1.clone(), b.2.clone(), b.3)).unwrap_or(("strobe".into(), "no result".into(), Tone::Plain)),
     }
 }
 

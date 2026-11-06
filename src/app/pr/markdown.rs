@@ -202,6 +202,10 @@ impl<'a> Doc<'a> {
             Out::NoWorse => format!("{noun} no worse, within the {margin} allowed ({medians})."),
             Out::NoWorseSlower => format!("{noun} **{change}** per pair ({medians}), worse but within the {margin} allowed."),
             Out::Worse => format!("{noun} **{change}** per pair ({medians}), more than the {margin} allowed."),
+            Out::Refused if s["kind"] == "refused" => {
+                let (id, why) = refusal(c);
+                format!("not run ({id}): {}.", plain_refusal(&id, &why).trim_end_matches('.'))
+            }
             Out::Refused => {
                 let (id, why) = refusal(c);
                 format!("{noun} not measured: {}.", plain_refusal(&id, &why))
@@ -218,7 +222,7 @@ impl<'a> Doc<'a> {
     /// Untested metrics whose whole likely range lies past the bound on the worse side: not decided,
     /// so a plain line, never the caution. An unsteady case drifts by itself, so it says none.
     pub(super) fn drift(&self, s: &Value) -> Option<String> {
-        if unsteady(s) {
+        if unsteady(s) || !judged(s) {
             return None;
         }
         let mut untested: Vec<(f64, String)> = Vec::new();
@@ -420,8 +424,19 @@ impl<'a> Doc<'a> {
         self.series.iter().any(|s| s["blocks"].as_array().into_iter().flatten().any(|b| frames_kept(s, b)))
     }
 
+    /// Every series that measured something ran headless: a refused one, or one that never ran, has
+    /// no say either way.
+    pub(super) fn headless(&self) -> bool {
+        let ran: Vec<&&Value> = self.series.iter().filter(|s| measured(s)).collect();
+        !ran.is_empty() && ran.iter().all(|s| s["headless"] == true)
+    }
+
     /// `session locked, display off`: the state every block ran in, which the numbers compare with.
     pub(super) fn regime(&self) -> String {
+        // A headless page drew to no display: that, not the lock, is what its numbers compare with.
+        if self.headless() {
+            return "headless (no display)".into();
+        }
         let ran: Vec<&&Value> = self.series.iter().filter(|s| s["session"].is_string()).collect();
         if ran.is_empty() {
             return String::new();
@@ -429,10 +444,6 @@ impl<'a> Doc<'a> {
         let locked = ran.iter().all(|s| s["session"] == "locked");
         let mixed = ran.iter().any(|s| s["session"] == "mixed") || (!locked && ran.iter().any(|s| s["session"] == "locked"));
         let dark = ran.iter().all(|s| has_warning(s, "DisplayOff"));
-        // A headless page drew to no display: that, not the lock, is what its numbers compare with.
-        if !ran.is_empty() && ran.iter().all(|s| s["headless"] == true) {
-            return "headless (no display)".into();
-        }
         match (mixed, locked, dark) {
             (true, _, _) => "session lock state mixed".into(),
             (_, true, true) => "session locked, display off".into(),
@@ -741,34 +752,36 @@ impl<'a> Doc<'a> {
             }
             let vs = 1000.0 / refresh(&ps, self.r);
             let share = |v: &[f64], lo: f64, hi: f64| v.iter().filter(|x| **x >= lo * vs && **x < hi * vs).count() as f64 / v.len() as f64;
-            // Percentiles as frames.interval.* defines them (each launch's own, the median across launches).
-            let rows = all_rows(s);
-            // Only pacing that changed: on-time frames by half a point, or the p99 gap by a tenth.
-            let p99 = |side: &str, v: &[f64]| {
-                rows.iter().find(|c| c["metric"] == "frames.interval.p99").map(|c| f(&c[side])).filter(|x| x.is_finite()).unwrap_or(v[((v.len() - 1) as f64 * 0.99).round() as usize])
+            // Gap percentiles as frames.interval.* defines them: each launch's own, then the median
+            // across launches. Each launch must hold the percentile's minimum of gaps and not have
+            // refused it, else the side has no value (rule 1: nothing undefended is printed).
+            let gap = |name: &str, head: bool| -> f64 {
+                let q = match name {
+                    "frames.interval.p50" => 0.50,
+                    "frames.interval.p95" => 0.95,
+                    "frames.interval.p99" => 0.99,
+                    _ => 1.0,
+                };
+                let min_n = model::metric(name).map_or(1, |d| d.min_n);
+                let mut each = Vec::new();
+                for p in &ps {
+                    let blk = if head { p.head } else { p.base };
+                    let mut v: Vec<f64> = blk["intervals"].as_array().into_iter().flatten().filter_map(Value::as_f64).collect();
+                    if v.len() < min_n.max(1) || blk["refused"][name].is_string() {
+                        return f64::NAN;
+                    }
+                    v.sort_by(f64::total_cmp);
+                    each.push(crate::metrics::percentile(&v, q));
+                }
+                crate::metrics::median(&each)
             };
-            let (pb, ph) = (p99("base", &b), p99("head", &h));
-            if (share(&b, 0.0, 1.5) - share(&h, 0.0, 1.5)).abs() < 0.005 && (ph / pb - 1.0).abs() < 0.10 {
+            // Only pacing that changed: on-time frames by half a point, or a defended p99 gap by a tenth.
+            let (pb, ph) = (gap("frames.interval.p99", false), gap("frames.interval.p99", true));
+            let p99_moved = pb.is_finite() && ph.is_finite() && (ph / pb - 1.0).abs() >= 0.10;
+            if (share(&b, 0.0, 1.5) - share(&h, 0.0, 1.5)).abs() < 0.005 && !p99_moved {
                 continue;
             }
-            let gap = |name: &str, side: &str| {
-                let pooled = |v: &[f64]| {
-                    if name.ends_with("max") {
-                        v[v.len() - 1]
-                    } else {
-                        v[((v.len() - 1) as f64
-                            * if name.ends_with("p99") {
-                                0.99
-                            } else if name.ends_with("p95") {
-                                0.95
-                            } else {
-                                0.5
-                            })
-                        .round() as usize]
-                    }
-                };
-                nb(&disp(rows.iter().find(|c| c["metric"] == name).map(|c| f(&c[side])).unwrap_or_else(|| pooled(if side == "base" { &b } else { &h })), "ms"))
-            };
+            let gap = |name: &str, side: &str| nb(&disp(gap(name, side == "head"), "ms"));
             let title = if self.multi() { format!(": {}", self.title(s)) } else { String::new() };
             t += &format!("#### Frame pacing{title}\n\n| {:.0} Hz display | Before | This PR |\n|:---|---:|---:|\n", 1000.0 / vs);
             t += &format!("| On time | {} | {} |\n", pct2(share(&b, 0.0, 1.5)), pct2(share(&h, 0.0, 1.5)));
@@ -985,16 +998,20 @@ impl<'a> Doc<'a> {
             t += &format!("- **Before:** {}\n", side("base", &b));
         }
         t += &format!("- **This PR:** {}\n", side("head", &h));
-        // Series that load fixed pages beside others, or different ones: each says its page.
-        if shared("head").is_none() {
-            for s in ran.iter().filter(|s| fixed_href(r, s, "head").is_some()) {
-                let (pb, ph) = (fixed_href(r, s, "base"), fixed_href(r, s, "head").unwrap_or_default());
-                let both = match pb {
-                    Some(x) if x != ph => format!("{} before, {} with this PR", code(&x), code(&ph)),
-                    _ => format!("{} on both sides", code(&ph)),
-                };
-                t += &format!("- **Page{}:** {both}, whatever the build\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() });
-            }
+        // A page the side's label does not already name (fixed pages beside builds, or different
+        // ones): each series says it, for the sides it is known on.
+        let (sb, sh) = (shared("base"), shared("head"));
+        for s in &ran {
+            let pb = fixed_href(r, s, "base").filter(|_| sb.is_none());
+            let ph = fixed_href(r, s, "head").filter(|_| sh.is_none());
+            let page = match (pb, ph) {
+                (Some(x), Some(y)) if x == y => format!("{} on both sides", code(&x)),
+                (Some(x), Some(y)) => format!("{} before, {} with this PR", code(&x), code(&y)),
+                (Some(x), None) => format!("{} before", code(&x)),
+                (None, Some(y)) => format!("{} with this PR", code(&y)),
+                (None, None) => continue,
+            };
+            t += &format!("- **Page{}:** {page}, whatever the build\n", if self.multi() { format!(", {}", cell(&self.title(s))) } else { String::new() });
         }
         if let Some(f) = r["fixture"].as_object() {
             t += &format!(
@@ -1052,7 +1069,7 @@ impl<'a> Doc<'a> {
         hw.push(r["env"]["power_plan"].as_str().map(|p| format!("{p} power plan")).unwrap_or_default());
         let browsers: Vec<&str> = self.series.iter().filter_map(|s| s["browser"].as_str()).collect();
         hw.push(browsers.first().copied().or(r["browser"].as_str()).unwrap_or("").replace('/', " "));
-        if !self.series.is_empty() && self.series.iter().all(|s| s["headless"] == true) {
+        if self.headless() {
             hw.push("headless browser (no display)".into());
         }
         if self.drew_frames() {

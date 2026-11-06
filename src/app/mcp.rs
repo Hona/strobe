@@ -53,7 +53,10 @@ const TOOLS: &[Tool] = &[
             ("native", "exe:<path> is a native app (no browser engine): recorded from outside: CPU, thread wakes, IO, GPU, memory, the UI thread's CPU and what reached the screen"),
             ("app", "exe:<path>: the strobe.json app profile it borrows"),
             ("headless", "draw off screen: attribution data stays meaningful, frame metrics do not"),
-            ("engine", "a page's browser engine: chromium (default) or firefox (CPU, GPU, memory and OS frames; no trace or profilers)"),
+            (
+                "engine",
+                "a page's browser engine: chromium (default) or firefox (CPU, GPU, memory and OS frames, no trace; probes attribution runs Firefox's own profiler and about:memory; probes memory refuses)",
+            ),
             ("served", "folder the target's http origin serves, to resolve source-mapped frames to files on disk"),
             ("style", "also trace what invalidated style (query <rec> style)"),
             ("os-frames", "a Chromium record also takes the OS present events beside its trace"),

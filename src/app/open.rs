@@ -159,7 +159,9 @@ union all select 'stat', name, value, severity from stats where value > 0 and se
     }
     let mut stacks = Vec::new();
     let mut short = Vec::new();
-    for (source, n, what) in [("javascript", b.js_samples, "JavaScript CPU"), ("javascript.allocations", b.alloc_samples, "allocation"), ("native", b.native_samples, "native")] {
+    for (source, n, what) in
+        [("javascript", b.js_samples, "JavaScript CPU"), ("javascript.allocations", b.alloc_samples, "allocation"), ("native", b.native_samples, "native"), ("firefox", b.gecko_samples, "Firefox CPU")]
+    {
         if n == 0 {
             continue;
         }

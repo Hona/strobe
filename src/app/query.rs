@@ -71,6 +71,8 @@ pub fn run(args: &Args) -> Result<Output> {
     let rec = Rec::open(&dir);
     let meta = &rec.meta;
     let trace = dir.join("trace.pftrace");
+    // A page in Firefox or WebKit: no Chrome trace.
+    let other_engine = meta["engine"].as_str().is_some_and(|e| e != "chromium");
     match view {
         "summary" => {
             let mut text = super::record::summary_text(meta);
@@ -82,6 +84,10 @@ pub fn run(args: &Args) -> Result<Output> {
             Ok(Output::new(text, json))
         }
         "style" => style(&rec, top),
+        "sql" if !trace.is_file() => Err(Error::usage(format!(
+            "this recording has no trace to query{}",
+            if other_engine { ": a page in another engine than Chromium is measured without one (strobe open shows what it holds)" } else { "" }
+        ))),
         "sql" => {
             let sql = args.pos.get(2).ok_or_else(|| Error::usage("query <h> sql \"select …\""))?;
             sql_view(&trace, sql, top.max(50))
@@ -89,6 +95,18 @@ pub fn run(args: &Args) -> Result<Output> {
         "frames" if dir.join("frames.json").exists() || meta["native"] == true => native_frames(&dir, top),
         "threads" if args.has("timeline") => thread_timeline(&dir, top),
         "threads" if dir.join("threads.json").exists() => native_threads(&dir, top),
+        // A page in another engine has no trace: threads from Firefox's profile (attribution), frames
+        // from the OS's presents (headed).
+        "threads" if !trace.exists() && dir.join(crate::probe::gecko::READ).is_file() => gecko_threads(&rec, top),
+        "frames" | "threads" if !trace.exists() && other_engine => Err(Error::usage(format!(
+            "this {} recording has no {view}: {}",
+            meta["engine"].as_str().unwrap_or(""),
+            if view == "frames" {
+                meta["os_frames"]["refused"].as_str().unwrap_or("its frames come from the OS's presents of a headed page").to_string()
+            } else {
+                "threads come from Firefox's profiler, in Firefox attribution recordings (--probes attribution)".to_string()
+            }
+        ))),
         "frames" => frames(&trace, meta, top),
         "threads" => threads(&trace, top),
         "gpu" if !trace.exists() => native_gpu(&dir, meta),
@@ -153,6 +171,33 @@ pub fn heap_diff(a: &Rec, b: &Rec, top: usize, reveal: bool) -> Result<Output> {
     Ok(Output::new(crate::heapsnap::diff_text(&v, top), v))
 }
 
+/// What a Firefox recording holds no source for.
+#[derive(Clone, Copy)]
+enum Gap {
+    Heap,
+    Alloc,
+    Style,
+}
+
+/// Refuses a view a Firefox recording cannot answer (`EngineUnsupported`), with what answers instead.
+fn firefox_gap(rec: &Rec, gap: Gap) -> Result<()> {
+    if rec.meta["engine"] != "firefox" {
+        return Ok(());
+    }
+    let (summary, fix) = match gap {
+        Gap::Heap => (
+            "heap snapshots: Firefox takes them inside the content process (ChromeUtils.saveHeapSnapshot), which strobe's WebDriver BiDi chrome scope does not reach",
+            "query memory reads Firefox's about:memory by process, layer and allocator; a leak run gives the page's JS memory growth; heap snapshots and retainers come from Chromium",
+        ),
+        Gap::Alloc => ("allocation samples: strobe reads none from Firefox's profiler yet", "query hotspots and query gc show where time and collections go; sampled allocations come from Chromium"),
+        Gap::Style => (
+            "style invalidation tracking: Chromium's trace records each invalidation; Firefox's profiler records only the first cause of each restyle",
+            "query layout ranks Firefox's forced style flushes and reflows by the script that forced them",
+        ),
+    };
+    Err(crate::model::Refusal::new(crate::model::ValidatorId::EngineUnsupported, summary).fix(fix).into())
+}
+
 /// Insights (SPEC §11.3): rules over one recording's own data, each hit with its numbers and the
 /// commands that show the evidence. Facts with thresholds, never a verdict strobe cannot back.
 pub fn insights(rec: &Rec) -> Result<Output> {
@@ -211,7 +256,7 @@ pub fn insights(rec: &Rec) -> Result<Output> {
                     if sites.is_empty() { "no allocation profile".into() } else { sites.join(", ") }
                 ),
                 json!({ "gc": g["values"], "share_of_work": share, "sites": sites }),
-                vec![q("gc"), q("alloc")],
+                if meta["engine"] == "firefox" { vec![q("gc"), q("hotspots")] } else { vec![q("gc"), q("alloc")] },
             );
         }
     }
@@ -255,7 +300,11 @@ pub fn insights(rec: &Rec) -> Result<Output> {
                 "warn",
                 format!("long tasks: {n:.0} main-thread tasks over 50 ms in the recording, the longest {}: input waits that long", fmt::value(worst, "ms")),
                 json!({ "count": n, "longest_ms": worst }),
-                vec![format!("strobe query {id} sql \"select ts, dur / 1e6 as ms from slice where name = 'RunTask' and depth = 0 and dur > 50e6 order by dur desc limit 20\""), q("hotspots")],
+                if dir.join("trace.pftrace").is_file() {
+                    vec![format!("strobe query {id} sql \"select ts, dur / 1e6 as ms from slice where name = 'RunTask' and depth = 0 and dur > 50e6 order by dur desc limit 20\""), q("hotspots")]
+                } else {
+                    vec![q("hotspots"), format!("strobe open {id}")]
+                },
             );
         }
     }
@@ -349,7 +398,8 @@ pub fn insights(rec: &Rec) -> Result<Output> {
             if crate::stats::kind_of(&meta["leak"]["js_heap"]) == crate::model::VerdictKind::Worse { "warn" } else { "info" },
             format!("js heap: {}", l["verdict"].as_str().unwrap_or("")),
             json!(l),
-            vec![q("leaks"), q("memory")],
+            // Firefox keeps about:memory censuses, no heap snapshots to list leaks from.
+            if meta["engine"] == "firefox" { vec![q("memory --at 0"), q("memory")] } else { vec![q("leaks"), q("memory")] },
         );
     } else if meta["probes"] == "memory" && meta["leaks"]["count"].as_u64().unwrap_or(0) > 0 {
         hit(
@@ -435,12 +485,15 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
     // The page's renderer: the one whose V8 heap matches the page's (other renderers serve workers or
     // extensions). Only it was snapshotted, so only its OS readings are inflated after a snapshot.
     let js_total = c["js_heap_total_bytes"].as_f64().unwrap_or(f64::NAN);
-    let page_pid = procs
-        .iter()
-        .filter(|p| p["type"] == "renderer")
-        .filter_map(|p| Some((p["pid"].to_string(), (layers(&p["pid"].to_string()).get("v8")? - js_total).abs())))
-        .min_by(|a, b| a.1.total_cmp(&b.1))
-        .map(|x| x.0);
+    // Firefox's census names the page's content process itself.
+    let page_pid = c["page_pid"].as_u64().map(|p| p.to_string()).or_else(|| {
+        procs
+            .iter()
+            .filter(|p| p["type"] == "renderer")
+            .filter_map(|p| Some((p["pid"].to_string(), (layers(&p["pid"].to_string()).get("v8")? - js_total).abs())))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|x| x.0)
+    });
     // A utility process by its service (`network.mojom.NetworkService` → network); the tracing service
     // runs because strobe traces, so it is strobe's, not the target's (rule 2).
     let kind = |p: &Value| -> String {
@@ -460,7 +513,11 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
         })
         .collect();
     let target_procs: Vec<&Value> = procs.iter().filter(|p| p["kind"] != "tracing (strobe's)").collect();
-    let mut text = format!("memory by {by} · {label}{}\n", if alloc.is_object() && alloc.get("error").is_none() { "" } else { " · no allocator dump" });
+    let mut text = format!(
+        "memory by {by} · {label}{}{}\n",
+        c["taken"].as_str().map(|t| format!(" · taken {t}")).unwrap_or_default(),
+        if alloc.is_object() && alloc.get("error").is_none() { "" } else { " · no allocator dump" }
+    );
     let json = match by {
         "layer" => {
             let mut sums: BTreeMap<String, f64> = BTreeMap::new();
@@ -472,8 +529,10 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
             let mut rows: Vec<(String, f64)> = sums.into_iter().collect();
             rows.sort_by(|a, b| b.1.total_cmp(&a.1));
             let private: f64 = target_procs.iter().filter_map(|p| p["private_bytes"].as_f64()).sum();
-            text += &format!("  {:>10}  OS private, all {} target processes (strobe's tracing service left out)\n", mb(private), target_procs.len());
-            text += &format!("  {:>10}  JS heap of the page (used, after GC)\n", mb(c["js_heap_bytes"].as_f64().unwrap_or(f64::NAN)));
+            let left_out = if c["engine"] == "firefox" { "" } else { " (strobe's tracing service left out)" };
+            text += &format!("  {:>10}  OS private, all {} target processes{left_out}\n", mb(private), target_procs.len());
+            let what = if c["engine"] == "firefox" { "JavaScript memory of the page (SpiderMonkey's reporters, after GC and CC)" } else { "JS heap of the page (used, after GC)" };
+            text += &format!("  {:>10}  {what}\n", mb(c["js_heap_bytes"].as_f64().unwrap_or(f64::NAN)));
             for (k, v) in rows.iter().take(top) {
                 text += &format!("  {:>10}  {k}\n", mb(*v));
             }
@@ -521,14 +580,25 @@ pub fn memory(dir: &Path, by: &str, top: usize, at: Option<&str>) -> Result<Outp
                 );
                 rows.push(json!({ "pid": p["pid"], "type": ty, "strobe_own": ty == "tracing (strobe's)", "page": page_pid.as_deref() == Some(pid.as_str()), "name": p["name"], "private_bytes": private, "working_set_bytes": p["working_set_bytes"], "allocator_bytes": if has { json!(tracked) } else { Value::Null }, "unexplained_bytes": if has { json!(private - tracked) } else { Value::Null }, "layers": layers(&pid) }));
             }
-            text += &format!(
-                "page      JS heap {} used of {} · {} DOM nodes · {} documents · {} listeners\n",
-                mb(c["js_heap_bytes"].as_f64().unwrap_or(f64::NAN)),
-                mb(c["js_heap_total_bytes"].as_f64().unwrap_or(f64::NAN)),
-                c["dom"]["nodes"],
-                c["dom"]["documents"],
-                c["dom"]["listeners"]
-            );
+            if c["engine"] == "firefox" {
+                text += &format!(
+                    "page      JavaScript {} used of {} (about:memory) · {} DOM nodes in the document · DOM {} ({} in nodes no document holds)\n",
+                    mb(c["js_heap_bytes"].as_f64().unwrap_or(f64::NAN)),
+                    mb(c["js_heap_total_bytes"].as_f64().unwrap_or(f64::NAN)),
+                    c["dom"]["nodes"],
+                    mb(c["dom"]["bytes"].as_f64().unwrap_or(f64::NAN)),
+                    mb(c["dom"]["orphan_bytes"].as_f64().unwrap_or(f64::NAN))
+                );
+            } else {
+                text += &format!(
+                    "page      JS heap {} used of {} · {} DOM nodes · {} documents · {} listeners\n",
+                    mb(c["js_heap_bytes"].as_f64().unwrap_or(f64::NAN)),
+                    mb(c["js_heap_total_bytes"].as_f64().unwrap_or(f64::NAN)),
+                    c["dom"]["nodes"],
+                    c["dom"]["documents"],
+                    c["dom"]["listeners"]
+                );
+            }
             if inflated && page_pid.is_some() {
                 text += "* read after a heap snapshot of this process, which raises its memory (CensusContaminated)\n";
             }
@@ -615,6 +685,7 @@ fn census_at(dir: &Path, at: Option<&str>) -> Result<(Value, String)> {
 /// Leak suspects of a memory recording: objects allocated between its first and middle snapshots that
 /// are still alive in the last, by class, with retainer paths (SPEC §8.6).
 pub fn leaks(rec: &Rec, top: usize, reveal: bool) -> Result<Output> {
+    firefox_gap(rec, Gap::Heap)?;
     let s = |name: &str| rec.dir.join(format!("{name}.heapsnapshot.gz"));
     if !s("heap-s0").exists() || !s("heap-s1").exists() || !s("heap-0").exists() {
         return Err(Error::usage("this recording has no leak snapshots; record with --probes memory"));
@@ -1129,6 +1200,34 @@ fn threads(trace: &Path, top: usize) -> Result<Output> {
     Ok(out)
 }
 
+/// A Firefox attribution recording's threads by CPU in its measured runs, every process's, from the
+/// CPU each profile sample carries (`threadCPUDelta`).
+fn gecko_threads(rec: &Rec, top: usize) -> Result<Output> {
+    let g = store::read_json(&rec.dir.join(crate::probe::gecko::READ))?;
+    let rows = g["thread_cpu"].as_array().cloned().unwrap_or_default();
+    if rows.is_empty() {
+        return Err(Error::usage("this Firefox profile carries no CPU per thread (its samples give CPU in cycles, not time)"));
+    }
+    let runs = rec.meta["runs"].as_f64().unwrap_or(1.0).max(1.0);
+    let mut text = format!(
+        "threads by CPU per run · the threads Firefox's profiler sampled (main, compositor, renderer, DOM workers) · {runs:.0} measured run{}\n  cpu/run   process                       thread\n",
+        if runs == 1.0 { "" } else { "s" }
+    );
+    let mut out = Vec::new();
+    for r in rows.iter().take(top) {
+        let ms = r["cpu_ms"].as_f64().unwrap_or(0.0) / runs;
+        let process = format!("{}{} {}", r["process"].as_str().unwrap_or(""), if r["page"] == true { " (page)" } else { "" }, r["pid"]);
+        text += &format!("  {:>9}  {:<28}  {} {}\n", fmt::value(ms, "ms"), process, r["thread"].as_str().unwrap_or(""), r["tid"]);
+        let mut row = r.clone();
+        row["cpu_ms_per_run"] = json!(ms);
+        out.push(row);
+    }
+    if rows.len() > top {
+        text += &format!("  … {} more threads (--top)\n", rows.len() - top);
+    }
+    Ok(Output::new(text, json!({ "runs": runs, "threads": out })))
+}
+
 /// Self time per function, file or package from the recording's CPU profiles (attribution only).
 pub fn hotspots(dir: &Path, by: &str, top: usize) -> Result<Output> {
     hotspots_of(&Rec::open(dir), by, top)
@@ -1141,9 +1240,11 @@ pub fn hotspots_of(rec: &Rec, by: &str, top: usize) -> Result<Output> {
         Err(_) if rec.dir.join("deep.json.gz").is_file() => return native_hotspots_of(rec, by, top, None, None),
         Err(e) => return Err(e),
     };
-    let header = format!("hotspots by {by} · self time · {{samples}} samples at {} µs{{mapped}}", crate::probe::cpu::INTERVAL_US);
+    // Firefox's profile says its own interval (1 ms on Windows: `probe::gecko::interval_us`).
+    let interval = store::read_json(&rec.dir.join(crate::probe::gecko::READ)).ok().and_then(|g| g["interval_us"].as_u64()).unwrap_or(crate::probe::cpu::INTERVAL_US);
+    let header = format!("hotspots by {by} · self time · {{samples}} samples at {interval} µs{{mapped}}");
     let mut out = rank(stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
-    out.json["interval_us"] = json!(crate::probe::cpu::INTERVAL_US);
+    out.json["interval_us"] = json!(interval);
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
@@ -1265,6 +1366,8 @@ pub struct Forced {
     totals: [[(u64, f64); 2]; 2],
     pub runs: usize,
     runs_text: String,
+    /// Call sites located at their function's start: Firefox gave no running line for them.
+    at_start: u64,
 }
 
 fn forced(rec: &Rec) -> Result<&Forced> {
@@ -1273,10 +1376,11 @@ fn forced(rec: &Rec) -> Result<&Forced> {
         let rows = rec.part(Part::Layout)?;
         let measured = measured_runs(&rec.meta, &rows);
         let sym = rec.sym.lock().unwrap_or_else(|e| e.into_inner());
-        let mut sites: BTreeMap<(String, i64, i64, String), u32> = BTreeMap::new();
+        let mut sites: BTreeMap<TraceFrame, u32> = BTreeMap::new();
         let mut stacks = Stacks::default();
         let mut totals = [[(0u64, 0.0f64); 2]; 2];
         let mut outer_end: BTreeMap<String, i64> = BTreeMap::new();
+        let mut at_start = 0u64;
         for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
             let cell = |i: usize| row.get(i).cloned().flatten().unwrap_or_default();
             if !measured.contains(&cell(0)) {
@@ -1290,6 +1394,7 @@ fn forced(rec: &Rec) -> Result<&Forced> {
             }
             *end = ts + dur;
             let stack = trace_stack(&cell(5));
+            at_start += stack.first().is_some_and(|f| f.4 > 0 && (f.1, f.2) == (f.4, f.5)) as u64;
             let kind = usize::from(cell(1) == "UpdateLayoutTree");
             let lifecycle = usize::from(stack.is_empty());
             totals[lifecycle][kind].0 += 1;
@@ -1304,7 +1409,7 @@ fn forced(rec: &Rec) -> Result<&Forced> {
                 .map(|f| match sites.get(&f) {
                     Some(&i) => i,
                     None => {
-                        let i = stacks.intern(sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3));
+                        let i = stacks.intern(site(&sym, &f));
                         sites.insert(f, i);
                         i
                     }
@@ -1313,7 +1418,7 @@ fn forced(rec: &Rec) -> Result<&Forced> {
             // Traced, not sampled: each forced layout is counted, with no sampling variance.
             stacks.weights.push(Weight { stack: ids, w: dur as f64 / 1e3, n: 1, var: 0.0 });
         }
-        Ok(Forced { stacks, totals, runs: measured.len(), runs_text: runs_text(measured.len(), &rows) })
+        Ok(Forced { stacks, totals, runs: measured.len(), runs_text: runs_text(measured.len(), &rows), at_start })
     }))
 }
 
@@ -1340,6 +1445,13 @@ pub fn layout(rec: &Rec, top: usize) -> Result<Output> {
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
+    if f.at_start > 0 {
+        out.text += &format!(
+            "i {} forced call sites are located at their function's start, not the call: Firefox gives no running line for the innermost JIT-compiled frame of a marker's stack\n",
+            f.at_start
+        );
+        out.json["located_at_function_start"] = json!(f.at_start);
+    }
     Ok(out)
 }
 
@@ -1360,6 +1472,7 @@ pub struct Invalidation {
 }
 
 fn invalidation(rec: &Rec) -> Result<Invalidation> {
+    firefox_gap(rec, Gap::Style)?;
     attribution_meta(&rec.meta)?;
     let rows = rec.part(Part::Style)?;
     let measured = measured_runs(&rec.meta, &rows);
@@ -1400,7 +1513,7 @@ fn invalidation(rec: &Rec) -> Result<Invalidation> {
             *v.selectors.entry(sel.to_string()).or_default() += 1;
         }
         if let Some(f) = trace_stack(&cell(8)).into_iter().next() {
-            let mut fr = sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3);
+            let mut fr = site(&sym, &f);
             if fr.name.is_empty() {
                 fr.name = "(anonymous)".into();
             }
@@ -1510,7 +1623,10 @@ pub fn run_phases(rec: &Rec) -> Option<(String, Value)> {
     }
     let mut text = format!("per run  {} · renderer main thread\n         style ms (elements restyled)   layout ms   paint ms\n", runs_text(measured.len(), &rows));
     let mut out = Vec::new();
-    for (k, (ms, el)) in &per {
+    // In run order: `run:10` after `run:9`.
+    let mut ordered: Vec<(&String, &([f64; 3], f64))> = per.iter().collect();
+    ordered.sort_by_key(|(k, _)| k.rsplit(':').next().and_then(|i| i.parse::<u64>().ok()));
+    for (k, (ms, el)) in ordered {
         text += &format!("  {:<6} {:>8.1} ({:>8})          {:>9.1}   {:>8.1}\n", k.rsplit(':').next().map(|i| format!("run {i}")).unwrap_or_default(), ms[0], fmt::value(*el, "count"), ms[1], ms[2]);
         out.push(json!({ "run": k, "style_ms": ms[0], "elements_restyled": el, "layout_ms": ms[1], "paint_ms": ms[2] }));
     }
@@ -1561,22 +1677,36 @@ pub fn gc(rec: &Rec) -> Result<Output> {
         "helper_ms_per_run": med(|r| r.helper_ms),
         "freed_bytes_per_run": med(|r| r.freed),
     });
+    // Firefox's markers time the page's main thread only: its GC helper threads are not sampled.
+    let firefox = rec.meta["engine"] == "firefox";
+    let mut values = values;
+    if firefox {
+        values["helper_ms_per_run"] = Value::Null;
+    }
     let g = |k: &str| values[k].as_f64().unwrap_or(f64::NAN);
+    let helpers = if firefox {
+        "not recorded (Firefox's profiler marks no GC helper-thread work)".to_string()
+    } else {
+        format!("{} per run (concurrent and parallel work)", fmt::value(g("helper_ms_per_run"), "ms"))
+    };
     let mut text = format!(
-        "garbage collection · median of {}\n  collections   {:.0} minor · {:.0} major per run\n  main thread   {} per run (pauses and incremental marking)\n  helpers       {} per run (concurrent and parallel work)\n  freed         {} per run\n",
+        "garbage collection · median of {}\n  collections   {:.0} minor · {:.0} major per run\n  main thread   {} per run (pauses and incremental marking{})\n  helpers       {helpers}\n  freed         {} per run\n",
         runs_text(runs.len(), &rows),
         g("minor_per_run"),
         g("major_per_run"),
         fmt::value(g("main_ms_per_run"), "ms"),
-        fmt::value(g("helper_ms_per_run"), "ms"),
+        if firefox { " slices" } else { "" },
         fmt::bytes(g("freed_bytes_per_run")),
     );
     text += "  per run       minor major   main ms  helper ms\n";
-    let per_run: Vec<Value> = runs
-        .iter()
+    let mut ordered: Vec<(&String, &Run)> = runs.iter().collect();
+    ordered.sort_by_key(|(k, _)| k.rsplit(':').next().and_then(|i| i.parse::<u64>().ok()));
+    let per_run: Vec<Value> = ordered
+        .into_iter()
         .map(|(k, r)| {
-            text += &format!("  {:<12}  {:>5} {:>5}  {:>8.1}  {:>9.1}\n", k.rsplit(':').next().map(|i| format!("run {i}")).unwrap_or_default(), r.minor, r.major, r.main_ms, r.helper_ms);
-            json!({ "run": k, "minor": r.minor, "major": r.major, "main_ms": r.main_ms, "helper_ms": r.helper_ms, "freed_bytes": r.freed })
+            let helper = if firefox { "—".to_string() } else { format!("{:.1}", r.helper_ms) };
+            text += &format!("  {:<12}  {:>5} {:>5}  {:>8.1}  {:>9}\n", k.rsplit(':').next().map(|i| format!("run {i}")).unwrap_or_default(), r.minor, r.major, r.main_ms, helper);
+            json!({ "run": k, "minor": r.minor, "major": r.major, "main_ms": r.main_ms, "helper_ms": if firefox { Value::Null } else { json!(r.helper_ms) }, "freed_bytes": r.freed })
         })
         .collect();
     Ok(Output::new(text, json!({ "values": values, "runs": per_run })))
@@ -1613,10 +1743,20 @@ fn runs_text(measured: usize, rows: &[Vec<Option<String>>]) -> String {
     if all > measured { format!("{measured} measured run{s} ({all} in the trace: {} warmup before)", all - measured) } else { format!("{measured} measured run{s}") }
 }
 
-/// Frames of a trace event's `beginData.stackTrace` from `key \x1f value` pairs joined by `\x1e`:
-/// (url, line, column, function name), innermost first.
-fn trace_stack(raw: &str) -> Vec<(String, i64, i64, String)> {
-    let mut frames: BTreeMap<usize, (String, i64, i64, String)> = BTreeMap::new();
+/// A frame of a trace stack: url, 1-based line and column of the call, the function's name, and the
+/// function's own start where the stack says it (Firefox's markers), else 0.
+type TraceFrame = (String, i64, i64, String, i64, i64);
+
+/// The call site of a trace stack frame: named after the function its stack says it is in, else after
+/// the innermost function around it in the stored maps.
+fn site(sym: &crate::probe::symbols::Symbolizer, f: &TraceFrame) -> Frame {
+    if f.4 > 0 { sym.call_in(&f.0, f.1 - 1, f.2 - 1, f.4 - 1, f.5 - 1, &f.3) } else { sym.call_site(&f.0, f.1 - 1, f.2 - 1, &f.3) }
+}
+
+/// Frames of a trace event's `beginData.stackTrace` from `key \x1f value` pairs joined by `\x1e`,
+/// innermost first.
+fn trace_stack(raw: &str) -> Vec<TraceFrame> {
+    let mut frames: BTreeMap<usize, TraceFrame> = BTreeMap::new();
     for pair in raw.split('\u{1e}').filter(|p| !p.is_empty()) {
         let Some((key, value)) = pair.split_once('\u{1f}') else { continue };
         let Some((index, field)) = key.split_once('[').and_then(|(_, r)| r.split_once("].")) else { continue };
@@ -1627,6 +1767,8 @@ fn trace_stack(raw: &str) -> Vec<(String, i64, i64, String)> {
             "lineNumber" => f.1 = value.parse().unwrap_or(0),
             "columnNumber" => f.2 = value.parse().unwrap_or(0),
             "functionName" => f.3 = value.to_string(),
+            "functionLine" => f.4 = value.parse().unwrap_or(0),
+            "functionColumn" => f.5 = value.parse().unwrap_or(0),
             _ => {}
         }
     }

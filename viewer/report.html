@@ -4586,7 +4586,8 @@ function renderTraceQueriesDisclosure(r, s) {
   if (a.head) {
     cmds.push(["CPU hotspots in head (by package)", `strobe query ${a.head} hotspots --by package`]);
     cmds.push(["Forced layout & style stacks in head", `strobe query ${a.head} layout`]);
-    cmds.push(["Heap allocations & GC in head", `strobe query ${a.head} alloc`]);
+    // Firefox recordings hold no allocation samples: GC alone.
+    cmds.push(s.engine === "firefox" ? ["GC in head", `strobe query ${a.head} gc`] : ["Heap allocations & GC in head", `strobe query ${a.head} alloc`]);
   }
   if (a.base) {
     cmds.push(["CPU hotspots in base (by package)", `strobe query ${a.base} hotspots --by package`]);
@@ -5345,7 +5346,7 @@ function renderMemoryRecording(m) {
   const durSec = Math.max(30, Math.round(((m.duration_ms || 6000) * 4) / 1000));
   const cmds = [
     ["Record over a longer window to observe how post-GC heap and surviving objects change over time:", `strobe record ${quoteArg(m.target || "<target>")} --probes memory --for ${durSec}s`],
-    ["Query surviving first-half objects from the CLI:", `strobe query ${recId} leaks`],
+    m.engine === "firefox" ? ["The first about:memory census, to compare with the last:", `strobe query ${recId} memory --at 0`] : ["Query surviving first-half objects from the CLI:", `strobe query ${recId} leaks`],
     heap ? ["Query full S2 heap snapshot:", `strobe query ${recId} heap`] : null,
   ].filter(Boolean);
 
@@ -5678,15 +5679,19 @@ function renderRecording(m) {
   }
 
   const recId = m.id || "<rec_id>";
+  const otherEngine = !!m.engine && m.engine !== "chromium";
   const cmds = [
     ["Open in Perfetto: one timeline with flame graphs, runs, threads and presents", `strobe open ${recId}`],
     ["Worst frames in this recording", `strobe query ${recId} frames`],
     ["Busy share by thread", `strobe query ${recId} threads`],
     /attribution|cpu/.test(String(m.probes || "")) ? ["CPU hotspots by package", `strobe query ${recId} hotspots --by package`] : null,
     /attribution/.test(String(m.probes || "")) ? ["Forced layout & style call sites", `strobe query ${recId} layout`] : null,
-    /attribution/.test(String(m.probes || "")) ? ["Sampled allocations & GC", `strobe query ${recId} alloc`] : null,
+    /attribution/.test(String(m.probes || "")) && !otherEngine ? ["Sampled allocations & GC", `strobe query ${recId} alloc`] : null,
+    /attribution/.test(String(m.probes || "")) && otherEngine ? ["GC per run", `strobe query ${recId} gc`] : null,
+    otherEngine ? ["Memory by process, layer and allocator (about:memory)", `strobe query ${recId} memory`] : null,
     att?.heap ? ["Live heap snapshot & leaks", `strobe query ${recId} heap`] : null,
-    ["Raw Perfetto SQL query", `strobe query ${recId} sql "select name, count(*) n from slice group by 1 order by n desc limit 20"`],
+    // A page in another engine than Chromium has no Chrome trace to query.
+    otherEngine ? null : ["Raw Perfetto SQL query", `strobe query ${recId} sql "select name, count(*) n from slice group by 1 order by n desc limit 20"`],
   ].filter(Boolean);
 
   const insSec = renderRecordingInsightsSection(m);
@@ -6403,8 +6408,10 @@ function renderLeakSeries(shell, r, s, seriesList, aa, baseVar, headVar, baseTag
   const recHandle = mainSide.recording || s.attribution?.head;
   const cmds = [
     !s.decided ? ["Run with a higher --repeat count to narrow the slope interval:", `strobe bench ${quoteArg(cleanPath(r.file || "<file>"))} --probes memory --repeat ${(halfN || 5) * 2}`] : null,
-    recHandle ? ["Inspect surviving objects & retainer chains from CLI:", `strobe query ${recHandle} leaks`] : null,
-    recHandle ? ["Inspect full end-of-run S2 heap snapshot:", `strobe query ${recHandle} heap`] : null,
+    // Firefox leak runs keep about:memory censuses, no heap snapshots.
+    recHandle && s.engine !== "firefox" ? ["Inspect surviving objects & retainer chains from CLI:", `strobe query ${recHandle} leaks`] : null,
+    recHandle && s.engine !== "firefox" ? ["Inspect full end-of-run S2 heap snapshot:", `strobe query ${recHandle} heap`] : null,
+    recHandle && s.engine === "firefox" ? ["about:memory after the first and the last run:", `strobe query ${recHandle} memory --at 0 · strobe query ${recHandle} memory`] : null,
     ["Export Markdown summary:", `strobe report experiment ${r.id} --format md`],
   ].filter(Boolean);
 

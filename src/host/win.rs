@@ -16,15 +16,20 @@ use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessAffinit
 use windows_sys::Win32::System::WindowsProgramming::QueryProcessCycleTime;
 
 pub fn qpc_ns() -> u64 {
+    let mut c = 0i64;
+    unsafe { QueryPerformanceCounter(&mut c) };
+    qpc_ticks_ns(c)
+}
+
+/// A `QueryPerformanceCounter` value (another process's, such as a profiler's start) on strobe's clock.
+pub fn qpc_ticks_ns(ticks: i64) -> u64 {
     static FREQ: OnceLock<i64> = OnceLock::new();
     let freq = *FREQ.get_or_init(|| {
         let mut f = 0i64;
         unsafe { QueryPerformanceFrequency(&mut f) };
         f.max(1)
     });
-    let mut c = 0i64;
-    unsafe { QueryPerformanceCounter(&mut c) };
-    ((c as i128) * 1_000_000_000 / freq as i128) as u64
+    ((ticks as i128) * 1_000_000_000 / freq as i128) as u64
 }
 
 fn ft(t: &FILETIME) -> u64 {

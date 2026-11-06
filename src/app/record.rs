@@ -70,9 +70,13 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
         if !declared.is_empty() {
             text += &format!("check    {}   (one cold run before it: its own numbers, not this recording's runs)\n", declared.join(" · "));
         }
-        let native = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).is_some_and(|m| m["native"] == true);
+        let meta = store::resolve(rec).ok().and_then(|d| store::read_json(&d.join("meta.json")).ok()).unwrap_or(Value::Null);
+        let native = meta["native"] == true;
         text += &if native {
             format!("next     strobe query {rec} threads · strobe query {rec} hotspots --by package · strobe query {rec} gpu · strobe query {rec} summary\n")
+        } else if meta["engine"].as_str().is_some_and(|e| e != "chromium") {
+            // No style invalidation tracking outside Chromium's trace.
+            format!("next     strobe query {rec} hotspots --by package · strobe query {rec} layout · strobe query {rec} summary (per run) · strobe report recording {rec} --open\n")
         } else {
             format!("next     strobe query {rec} hotspots --by package · strobe query {rec} summary (per run) · strobe query {rec} style · strobe report recording {rec} --open\n")
         };
@@ -259,7 +263,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         let mut scripts = std::collections::BTreeSet::new();
         probe::symbols::urls(&profile, &mut scripts);
         probe::symbols::urls(&allocs, &mut scripts);
-        probe::symbols::store_maps(&page, &scripts, &dir, args.get("served").map(std::path::Path::new))?;
+        probe::symbols::store_maps(&page.clone().into(), &scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let bytes = tracing.stop(&dir.join("trace.pftrace"))?;
     if set == Set::Attribution {
@@ -337,11 +341,25 @@ fn with_gpu_store(args: &Args, app: &isolate::App) -> Result<isolate::App> {
 
 /// A page in an engine other than Chromium (`--engine firefox`) for `for_ms`: what needs no Chromium
 /// trace, from outside as for a native app: its processes' CPU in cycles, GPU use and memory from the OS,
-/// the DOM's size, and headed, the OS's presents of its processes (`frames.*`, SPEC §7.2). Profilers,
-/// heap snapshots and the census are Chromium's DevTools: `--probes attribution|memory` refuses.
+/// the DOM's size, and headed, the OS's presents of its processes (`frames.*`, SPEC §7.2).
+/// `--probes attribution` adds Firefox's own profiler (CPU samples, style, layout and GC markers) and
+/// about:memory (`probe::gecko`); a memory recording follows heap snapshots, which Firefox gives none of.
 fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u64) -> Result<Output> {
-    if set != Set::Timing {
-        return Err(Error::refused("EngineUnsupported", format!("--probes {}: profilers, heap snapshots and the memory census are Chromium's DevTools; {engine} has none in strobe yet", args.get("probes").unwrap_or("")), "record the page in Chromium (drop --engine) for attribution or memory"));
+    // Attribution and memory need the engine's own profiler and census: Firefox's are built, a WebKit
+    // page's are not (an attribution recording without them would hold no data).
+    if let (WebEngine::Chromium | WebEngine::Webkit, Set::Attribution | Set::Memory) = (engine, set) {
+        return Err(Error::refused(
+            "EngineUnsupported",
+            format!("--probes {}: {engine} pages have no profilers or memory census in strobe", args.get("probes").unwrap_or("")),
+            "record the page in Chromium (drop --engine) or Firefox (--engine firefox) for attribution",
+        ));
+    }
+    if set == Set::Memory {
+        return Err(Error::refused(
+            "EngineUnsupported",
+            format!("--probes memory: a memory recording follows heap snapshots and their retainers; {engine} gives strobe none (its snapshots are taken inside the content process)"),
+            "leak-check the page with a bench leak run (strobe bench <file> --probes memory --engine firefox), which reads about:memory after every run; or record --probes attribution for one about:memory census",
+        ));
     }
     let headless = args.has("headless");
     let patched = web::patched(engine);
@@ -371,17 +389,43 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         })
     });
     let cycles = || -> (u64, Option<u64>) { (browser.processes().iter().map(|p| p.cycles).sum(), host::tsc()) };
+    // Attribution: Firefox's profiler over the recording, which strobe's marks bracket in the page.
+    let token = id.trim_start_matches("rec_").to_string();
+    let firefox = match &browser {
+        web::WebBrowser::Firefox(b) if set == Set::Attribution => Some(b),
+        _ => None,
+    };
+    let driver = Driver::new(page.clone(), token.clone());
+    // about:memory before the profiler starts: its own memory would count as the page's.
+    let mut census = Vec::new();
+    if let Some(b) = firefox {
+        census.push(probe::gecko::census(b, &page, &dir.join("memory-0.json.gz"), "before the profiler started and the recording")?);
+    }
+    let profiler = firefox.map(probe::gecko::start).transpose()?;
+    if profiler.is_some() {
+        driver.mark("run:0:start")?;
+    }
     let cpu0 = cycles();
     let t0 = host::now_ns();
     progress(format!("recording {id} for {}", fmt::ms_duration(for_ms)));
     std::thread::sleep(Duration::from_millis(for_ms));
     let t1 = host::now_ns();
     let cpu1 = cycles();
+    if profiler.is_some() {
+        driver.mark("run:0:end")?;
+    }
     let os = sampler.stop().window(t0, t1);
     let tree = browser.pids();
     let presents = presents.map(|r| r.and_then(|c| c.stop()));
     if !headless && (awake.locks() > 0 || host::session_locked()) {
         return Err(validity::locked());
+    }
+    // The profiler ends here whatever happens, before the browser closes.
+    let profile = profiler.map(probe::gecko::Profiler::stop).transpose()?;
+    if let Some(raw) = profile {
+        progress("reading Firefox's profile");
+        let got = probe::gecko::convert(&raw, &token, &[("run:0".to_string(), t0, t1)], &dir)?;
+        probe::symbols::store_maps(&page, &got.scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
     let mut refused = serde_json::Map::new();
@@ -434,11 +478,17 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     let version = browser.version().to_string();
     browser.own()?;
     browser.close();
+    let attributed = set == Set::Attribution;
     let mut meta = json!({
-        "id": id, "kind": "record", "target": target, "probes": set, "token": "", "duration_ms": for_ms, "engine": engine, "headless": headless,
+        "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "headless": headless,
         "browser": version, "gpu": gpu, "env": host::env(), "values": values, "refused": refused, "os": os, "os_frames": os_frames, "phases": [],
-        "timing": "clean", "created": now_iso(), "valid": true, "patched_browser": patched,
+        // Rule 3: timing taken with the profiler on describes the profiled page.
+        "timing": if attributed { "perturbed" } else { "clean" }, "created": now_iso(), "valid": true, "patched_browser": patched,
     });
+    if attributed {
+        meta["runs"] = json!(1);
+        meta["census"] = json!(census);
+    }
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
     draft.keep();
@@ -848,11 +898,12 @@ fn engine_summary(meta: &Value) -> String {
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     let id = meta["id"].as_str().unwrap_or("");
     let mut s = format!(
-        "{id} · {} · {} · {}{}\n",
+        "{id} · {} · {} · {}{} · {}\n",
         meta["target"].as_str().unwrap_or(""),
         fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
         meta["browser"].as_str().unwrap_or(""),
-        if meta["headless"] == true { " · headless" } else { "" }
+        if meta["headless"] == true { " · headless" } else { "" },
+        meta["probes"].as_str().unwrap_or("timing")
     );
     s += &format!("cpu      {} of one core (cpu.app.total) · {} in the window (cpu.work), all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
     s += &format!("memory   {} private · {} DOM nodes\n", fmt::value(get("memory.app.private"), "MB"), fmt::value(get("dom.nodes"), "count"));
@@ -871,7 +922,13 @@ fn engine_summary(meta: &Value) -> String {
             }
         }
     }
-    s += &format!("next     strobe query {id} summary\n");
+    s += &refused_lines(meta);
+    if meta["timing"] == "perturbed" {
+        s += "timing   perturbed: Firefox's profiler ran during this recording (a sampler in every process walks its threads' stacks), so its CPU and times are not the page's; take them with --probes timing\n";
+        s += &format!("next     strobe query {id} hotspots · strobe query {id} layout · strobe query {id} memory · strobe open {id}\n");
+    } else {
+        s += &format!("next     strobe query {id} summary\n");
+    }
     s
 }
 

@@ -600,13 +600,10 @@ impl Driver {
         self.wait(&format!("__strobe.waitFor({}, {}, {})", sel.page_spec(), t.as_millis(), json!(sel.source)), t)
     }
 
-    /// Writes a `performance.mark` that the trace records on its own clock.
-    /// A page without such a trace (Firefox) takes none: its runs and phases are strobe's own spans on
-    /// the host clock, as a native app's.
+    /// Writes a `performance.mark` that the trace (or Firefox's profiler) records on its own clock.
+    /// A Firefox timing block takes none: its runs and phases are strobe's own spans on the host clock,
+    /// as a native app's; its attribution block marks its runs so the profile names the page's process.
     pub fn mark(&self, name: &str) -> Result<()> {
-        if self.page.cdp().is_none() {
-            return Ok(());
-        }
         let full = format!("strobe:{}:{}", self.token, name.replace(['"', '\\', '\n'], "_"));
         self.page.eval(&format!(r#"performance.mark("{full}"), performance.clearMarks("{full}"), true"#)).map(|_| ())
     }

@@ -921,7 +921,7 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
     }
     let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
     let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
-    probe::symbols::store_maps(page, &scripts, &dir, served.as_deref())?;
+    probe::symbols::store_maps(&page.clone().into(), &scripts, &dir, served.as_deref())?;
     store::write_json(
         &dir.join("meta.json"),
         &json!({

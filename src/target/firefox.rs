@@ -171,6 +171,12 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     if let Some(s) = window.scale {
         prefs.push(("layout.css.devPixelsPerPx".into(), format!("\"{s}\"")));
     }
+    // Where `moz:profiler.stop` saves a profile: the profile's own folder, never the user's downloads.
+    let downloads = profile.join("downloads");
+    host::paths::owner_only_dir(&downloads);
+    prefs.push(("browser.download.folderList".into(), "2".into()));
+    prefs.push(("browser.download.useDownloadDir".into(), "true".into()));
+    prefs.push(("browser.download.dir".into(), serde_json::to_string(&downloads.display().to_string())?));
     let user_js: String = prefs.iter().map(|(k, v)| format!("user_pref(\"{k}\", {v});\n")).collect();
     std::fs::write(profile.join("user.js"), user_js)?;
     let mut args: Vec<String> = vec!["-no-remote".into(), "-profile".into(), profile.display().to_string(), "--remote-debugging-port".into(), "0".into(), "--new-instance".into()];
@@ -280,30 +286,58 @@ impl Browser {
         self.processes().iter().map(|p| p.pid).collect()
     }
 
-    /// An expression in the browser's own (chrome) scope, read-only: process roles and the compositor.
-    fn chrome_eval(&self, expression: &str) -> Result<Value> {
+    /// The top-level browsing context strobe drives.
+    pub fn context(&self) -> &str {
+        &self.context
+    }
+
+    /// An expression in the browser's own (chrome) scope: process roles, the compositor, and in
+    /// attribution and memory blocks the profiler and about:memory.
+    pub fn chrome_eval(&self, expression: &str) -> Result<Value> {
+        self.chrome_eval_timeout(expression, Duration::from_secs(60))
+    }
+
+    pub fn chrome_eval_timeout(&self, expression: &str, timeout: Duration) -> Result<Value> {
         let tree = self.bidi.send("browsingContext.getTree", json!({ "maxDepth": 0, "moz:scope": "chrome" }))?;
         let context = tree["contexts"][0]["context"].as_str().ok_or_else(|| Error::msg("Firefox gave no chrome context"))?.to_string();
-        Page { bidi: self.bidi.clone(), context }.eval(expression)
+        Page { bidi: self.bidi.clone(), context }.eval_timeout(expression, timeout)
+    }
+
+    /// The content process that holds the page's document now: strobe's browsing context, found by its
+    /// BiDi id the way the remote agent finds it (`NavigableManager`).
+    pub fn page_process(&self) -> Option<u32> {
+        let call = format!(
+            "String(ChromeUtils.importESModule('chrome://remote/content/shared/NavigableManager.sys.mjs').NavigableManager.getBrowsingContextById({})?.currentWindowGlobal?.osPid ?? '')",
+            json!(self.context)
+        );
+        self.chrome_eval(&call).ok()?.as_str()?.parse().ok()
     }
 
     /// Each process's role by pid (`ChromeUtils.requestProcInfo`): its content processes are
     /// `renderer`, its GPU process (Windows; macOS and Linux composite in the browser process, so they
     /// have none: no `cpu.gpu` rather than 0) `gpu`, the browser itself `browser`.
     pub fn process_roles(&self) -> Vec<(u32, &'static str)> {
+        self.process_types()
+            .into_iter()
+            .filter_map(|(p, t)| {
+                let role = match t.as_str() {
+                    "browser" => "browser",
+                    t if t.starts_with("web") || t == "file" || t == "withCoopCoep" => "renderer",
+                    "gpu" => "gpu",
+                    _ => return None,
+                };
+                Some((p, role))
+            })
+            .collect()
+    }
+
+    /// Each process's type as Firefox names it: `browser` for itself, then its children's (`webIsolated`,
+    /// `gpu`, `socket`, `rdd`, `utility`, `extension`, `preallocated`, …).
+    pub fn process_types(&self) -> Vec<(u32, String)> {
         let Ok(info) = self.chrome_eval("ChromeUtils.requestProcInfo().then(i => JSON.stringify({ pid: i.pid, children: i.children.map(c => [c.pid, c.type]) }))") else { return Vec::new() };
         let Some(v) = info.as_str().and_then(|s| serde_json::from_str::<Value>(s).ok()) else { return Vec::new() };
-        let mut out: Vec<(u32, &'static str)> = v["pid"].as_u64().map(|p| (p as u32, "browser")).into_iter().collect();
-        for c in v["children"].as_array().into_iter().flatten() {
-            let role = match c[1].as_str().unwrap_or("") {
-                t if t.starts_with("web") || t == "file" || t == "withCoopCoep" => "renderer",
-                "gpu" => "gpu",
-                _ => continue,
-            };
-            if let Some(p) = c[0].as_u64() {
-                out.push((p as u32, role));
-            }
-        }
+        let mut out: Vec<(u32, String)> = v["pid"].as_u64().map(|p| (p as u32, "browser".to_string())).into_iter().collect();
+        out.extend(v["children"].as_array().into_iter().flatten().filter_map(|c| Some((c[0].as_u64()? as u32, c[1].as_str()?.to_string()))));
         out
     }
 

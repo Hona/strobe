@@ -28,6 +28,8 @@ pub struct Rec {
     pub(super) forced: OnceLock<Result<Forced>>,
     /// Trace views by part: those asked for together run in one trace_processor pass.
     trace: Mutex<BTreeMap<Part, Result<Arc<Rows>>>>,
+    /// What strobe read out of a Firefox recording's Gecko profile.
+    gecko: OnceLock<Option<Value>>,
 }
 
 pub(super) type Rows = Vec<Vec<Option<String>>>;
@@ -117,6 +119,7 @@ impl Rec {
             heap: OnceLock::new(),
             forced: OnceLock::new(),
             trace: Mutex::new(BTreeMap::new()),
+            gecko: OnceLock::new(),
         }
     }
 
@@ -146,7 +149,10 @@ impl Rec {
     }
 
     pub fn snapshot(&self) -> Result<&crate::heapsnap::Snapshot> {
-        cached(self.heap.get_or_init(|| crate::heapsnap::read(&super::heap_file(&self.dir)?)))
+        cached(self.heap.get_or_init(|| {
+            super::firefox_gap(self, super::Gap::Heap)?;
+            crate::heapsnap::read(&super::heap_file(&self.dir)?)
+        }))
     }
 
     /// Loads the sources the given views read, all at once (each its own file read or trace pass).
@@ -166,15 +172,32 @@ impl Rec {
     }
 
     /// Whether this recording's trace can answer a part: run marks, and an attribution trace for
-    /// stacks, GC phases and invalidation tracking.
+    /// stacks, GC phases and invalidation tracking. A Firefox attribution recording answers from the
+    /// rows strobe read out of its Gecko profile (`gecko.json`).
     pub(super) fn has(&self, p: Part) -> bool {
         let token = self.meta["token"].as_str().unwrap_or("");
-        !token.is_empty() && self.dir.join("trace.pftrace").is_file() && (!p.attribution_only() || self.meta["probes"] == "attribution")
+        let source = self.dir.join("trace.pftrace").is_file() || self.gecko_rows(p).is_some();
+        !token.is_empty() && source && (!p.attribution_only() || self.meta["probes"] == "attribution")
+    }
+
+    /// A part's rows from a Firefox recording's Gecko profile.
+    fn gecko_rows(&self, p: Part) -> Option<Rows> {
+        let g = self.gecko.get_or_init(|| store::read_json(&self.dir.join(crate::probe::gecko::READ)).ok());
+        serde_json::from_value(g.as_ref()?["parts"].get(format!("{p:?}"))?.clone()).ok()
     }
 
     /// Runs the parts not yet read in one trace_processor pass: one load of the trace for all of them.
     pub fn prefetch(&self, parts: &[Part]) {
         let mut cache = self.trace.lock().unwrap_or_else(|e| e.into_inner());
+        if !self.dir.join("trace.pftrace").is_file() {
+            let todo: Vec<Part> = parts.iter().copied().filter(|p| !cache.contains_key(p) && self.has(*p)).collect();
+            for p in todo {
+                if let Some(rows) = self.gecko_rows(p) {
+                    cache.insert(p, Ok(Arc::new(rows)));
+                }
+            }
+            return;
+        }
         let mut todo: Vec<Part> = parts.iter().copied().filter(|p| !cache.contains_key(p) && self.has(*p)).collect();
         todo.sort();
         todo.dedup();
@@ -254,6 +277,7 @@ impl Rec {
     }
 
     fn load_alloc(&self) -> Result<Stacks> {
+        super::firefox_gap(self, super::Gap::Alloc)?;
         let profiles = files(&self.dir, "heapprofile")?;
         if profiles.is_empty() {
             return Err(Error::usage("this recording has no allocation profile; record with --probes attribution"));

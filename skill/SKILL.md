@@ -21,7 +21,7 @@ strobe status [--calibrate]
 
 ```text
 strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
-strobe record https://… --engine firefox [--headless] [--for 10s]
+strobe record https://… --engine firefox [--probes timing|attribution] [--headless] [--for 10s]
 strobe record --bench <file.bench.ts>#<case> [--head <variant>]
 strobe record pid:<n>|proc:<name> [--probes timing|deep|waits] [--for 10s]
 strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
@@ -33,6 +33,8 @@ strobe record app:<id> --until-line "<regex>" [--stop-line "<regex>"]
   - `waits`: `deep` plus off-CPU waits (`query <rec> waits`); costs the target at every context switch.
 - `--until-line`: a native app from the line it prints when ready (to the next line), not a fixed settle.
 - `--engine firefox`: the page in Firefox, from outside: CPU, GPU, memory, DOM nodes, and headed the OS's frames.
+  - `--probes attribution`: Firefox's profiler and about:memory (`hotspots`, `layout`, `gc`, `memory`).
+  - `--probes memory` refuses: Firefox gives no heap snapshots; use a bench leak run.
 
 ### `strobe bench`
 
@@ -53,7 +55,13 @@ strobe bench <file.bench.ts> --head <variant>
   - No trace there: `main.*`, `layout.*`, `js.heap.*`, `span.*`, `frames.presented.p*` refuse.
   - Use `cpu.work` (every page block has it, in both engines), `phase.<name>`, `count.<name>`, `net.*`.
   - Headed: frames and `interaction.*` from the OS's presents (macOS, Linux: counts only).
-  - No attribution blocks, launch cases or leak runs in Firefox yet. `ctx.mock` works; `ctx.playwright` throws.
+  - Attribution blocks run Firefox's profiler: `hotspots` (source-mapped, with the browser's labels:
+    `Reflow`, `Styles`, `Minor GC`, DOM calls), `layout` (forced reflows and style flushes by script),
+    `gc`, `memory` (about:memory by process, layer, allocator), `insights`, `a..b`, `open`.
+  - `alloc`, `heap`, `leaks` and `style` refuse `EngineUnsupported` on a Firefox recording.
+  - Leak runs (`--probes memory`) read about:memory after every run: page JS memory and DOM growth,
+    no suspects (no heap snapshots).
+  - No launch cases in Firefox yet. `ctx.mock` works; `ctx.playwright` throws.
 - `--headless`: page targets headless, timed too; runs through a lock. Frame, latency, scroll, canvas and GPU-use metrics refuse `Headless`; `input.rate` stays. Pages only (an app or native target is a usage error).
 
 ### `strobe plan`

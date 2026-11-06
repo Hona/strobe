@@ -698,8 +698,30 @@ type ByName = BTreeMap<String, f64>;
 /// measured run.
 fn threads(a: &Rec, b: &Rec, top: usize) -> Result<Output> {
     let native = |r: &Rec| r.dir.join("threads.json").is_file();
+    let gecko = |r: &Rec| r.dir.join(crate::probe::gecko::READ).is_file() && !r.dir.join("trace.pftrace").is_file();
     let (mut text, mut json);
-    if native(a) && native(b) {
+    if gecko(a) && gecko(b) {
+        // Firefox: each sampled thread's CPU in the measured runs, from its profile.
+        let read = |r: &Rec| -> Result<ByName> {
+            let runs = r.meta["runs"].as_f64().unwrap_or(1.0).max(1.0);
+            let mut cpu = BTreeMap::new();
+            for t in crate::store::read_json(&r.dir.join(crate::probe::gecko::READ))?["thread_cpu"].as_array().into_iter().flatten() {
+                let key = format!("{}{} · {}", t["process"].as_str().unwrap_or("?"), if t["page"] == true { " (page)" } else { "" }, t["thread"].as_str().unwrap_or("?"));
+                *cpu.entry(key).or_default() += t["cpu_ms"].as_f64().unwrap_or(0.0) / runs;
+            }
+            Ok(cpu)
+        };
+        let (ca, cb) = (read(a)?, read(b)?);
+        text = format!("threads · base {} → head {} · CPU per measured run of the threads Firefox's profiler sampled, processes of one kind summed\n", a.id, b.id);
+        text += &format!("  {:>10}  {:>10}  {:>11}  process · thread\n", "base", "head", "Δ");
+        let mut rows_json = Vec::new();
+        for (k, x, y) in keyed(&ca, &cb).iter().take(top) {
+            let ms = |v: f64| fmt::value(v, "ms");
+            text += &format!("  {:>10}  {:>10}  {:>11}  {k}\n", ms(*x), ms(*y), signed(y - x, &ms));
+            rows_json.push(json!({ "thread": k, "base_cpu_ms_per_run": x, "head_cpu_ms_per_run": y, "delta_cpu_ms": y - x }));
+        }
+        json = json!({ "firefox": true, "rows": rows_json });
+    } else if native(a) && native(b) {
         // Wakes only where the OS counts them per thread (macOS counts them per process: `—`). The
         // CPU of threads that exited during a run is a row of its own, as in `query <rec> threads`.
         const EXITED: &str = "(threads that exited during a run)";
@@ -787,7 +809,11 @@ fn frame_values(r: &Rec) -> Result<Vec<(&'static str, f64, &'static str)>> {
             ("inputs counted", lat.len() as f64, "count"),
         ]);
     }
-    let f = super::frames(&r.dir.join("trace.pftrace"), &r.meta, 10)?.json;
+    let trace = r.dir.join("trace.pftrace");
+    if !trace.is_file() {
+        return Err(Error::usage(format!("{} has no frames: no trace, and no OS presents (a headless page, or an engine measured without them)", r.id)));
+    }
+    let f = super::frames(&trace, &r.meta, 10)?.json;
     let runs = r.runs().unwrap_or(1).max(1) as f64;
     let v = |k: &str| f["values"][k].as_f64().unwrap_or(f64::NAN);
     Ok(vec![

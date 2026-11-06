@@ -207,7 +207,7 @@ target/         finding and driving targets → chromium.rs (CDP), firefox.rs an
 driver/         the bench file's `page`: over CDP, or a native app's accessibility tree and
                 message loop (native.rs)
 probe/          collecting → trace.rs, cpu.rs, alloc.rs, heap.rs, symbols.rs (source maps),
-                census.rs, coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
+                census.rs, gecko.rs (Firefox's profiler and about:memory), coverage.rs, os/{windows,linux,macos}.rs, gpu/{pdh,nvml,d3dkmt,drm,ioreport}.rs,
                 stacks.rs (native stacks: `Deep`, one sampler per OS: kernel_profile.rs in the helper,
                 suspend.rs on Windows, perf.rs on Linux, sample.rs on macOS), etw.rs (ETW sessions),
                 helper.rs (the deep-mode helper, §13.4), present/ (what reached the screen, §7.2:
@@ -1005,7 +1005,9 @@ none and refuses a declared one (`NoCounter`: counters are read around a case's 
 | `waits` | `deep` plus off-CPU waits: each switch-out and switch-in of the target's threads with the stack it waited at, and who woke it with theirs (§11.1 `waits`) | Linux perf tracepoints; Windows the helper's CSwitch and ReadyThread | attribution, when asked (`--probes waits`) | high: at every context switch |
 
 Sets: `timing` = frames, threads, os, gpu. `attribution` = cpu, alloc, invalidation,
-counters. `memory` = census, heap. `deep` = deep. Probes can be listed one by one.
+counters. `memory` = census, heap. `deep` = deep. Probes can be listed one by one. In Firefox,
+`attribution` is the Gecko profiler with its markers and about:memory, and `memory` about:memory alone
+(8.3, 8.6).
 
 Bench timing blocks trace **lean**: only `disabled-by-default-devtools.timeline.frame`
 (PipelineReporter), `input.scrolling` (EventLatency, every input type), `blink.user_timing`
@@ -1040,11 +1042,23 @@ resolves frames at query time, so CPU samples, allocation sites and trace stacks
 `{ name, name_from, file, line, column, url, source_mapped }`, where `file` is the absolute path on
 disk when strobe knows the folder the origin serves (strobe.json `serve.dir`, else `build.output`;
 `record --served <dir>`) and the file exists, else the source path exactly as the map records it;
-line and column are 1-based. A function frame takes the map's name at the function's start; when
-the map names none, strobe reads the original declaration on disk (`function name(`, `name(`,
-`name = (…) =>`) and records `name_from: "source"`. A call site (trace stacks) is located at the
-call itself and named after the innermost function range that contains it, resolved the same way.
-A build without maps keeps minified names.
+line and column are 1-based. A function frame (a CPU or allocation profile's: V8 places both at the
+function's start, checked) is named by its original declaration where strobe can read it, on disk,
+else in the source the map carries (`sourcesContent`; some bundlers write maps with no `names` at
+all): `function name(`, a method `name(` with TypeScript's modifiers (`private`, `public`,
+`protected`, `override`, `readonly`, `static`, `export`), `name = (…) =>` and `name: Type = (…) =>`,
+generic `name<T>(` and `<T,>(…) =>`, with `name_from: "source"`. Else the map's name at the
+function's start (`name_from: "map"`), except where the source shows the function anonymous: a
+callback in an argument list or at a call's callee, an arrow placed at its own parameter, or a map
+name that is the function's first parameter or one found further along the line (maps often name an
+arrow by its first parameter: `(event) =>` minified to `e=>`). A call site's position is never read
+as a declaration: a call site (trace stacks) is located at the call itself and named after the
+innermost function range that contains it, resolved the same way; a Firefox stack frame says which
+function it is in, so it is named after that function's start. A build without maps keeps minified
+names. Checked against 0.11.0's names on eight recordings: Bun bundles without `names` now read
+`plantedHotFunction`, `spin`, `spinMultiline` (were `c`, `o`, `U`); esbuild's maps that named
+functions by a parameter (`ms`, `dt`, `ctx`, `scene`) now read `spin`, `spinStatic`, `frame`, `draw`;
+two opencode recordings whose sources are on disk read the same names as before, row for row.
 
 **Allocations** (`alloc`): `HeapProfiler.startSampling` every 32 KB on average, objects already
 collected by minor or major GC included, so short-lived garbage counts; `query alloc` ranks bytes by
@@ -1059,6 +1073,66 @@ with the JavaScript stack that forced them (`devtools.timeline.stack`) and every
 `query layout` ranks forced layouts and style recalculations by call site; `query gc` gives
 collections, main-thread GC time (union of GC slices, incremental marking included) and helper
 thread GC time per measured run.
+
+**Firefox** (`probe::gecko`; attribution blocks and `record --engine firefox --probes attribution`).
+Firefox's own Gecko profiler, started at the steady point with WebDriver BiDi's `moz:profiler.start`
+(the chrome scope's `Services.profiler` where a Firefox lacks the module), with JavaScript, native
+stack walking and CPU use, on each process's main thread, the compositor, WebRender's renderer and DOM
+workers, every 200 µs, and every 1 ms on Windows: there Gecko's sampler thread spins through any
+interval under 1 ms, so every process's sampler kept a core busy (§19). `moz:profiler.stop` saves into
+the downloads folder, which `user.js` points at the launch's own profile (never the user's). Every
+process records its start on the host's monotonic clock (`startTimeAsQueryPerformanceCounterValue`,
+`startTimeAsClockMonotonicNanosecondsSinceBoot`, `startTimeAsMachAbsoluteTimeNanoseconds`, read as
+integers; checked in Firefox 159 on Windows, Linux and macOS), so every sample and marker lands on
+strobe's clock (in i64 ns) and counts only inside a measured run's own host-clock span; a profile
+without that start refuses `ClockUnsynced`. strobe marks each measured run in the page
+(`performance.mark` just before and after it, outside its span): every measured run must have both
+marks in the profile, else `RunIncomplete` (a full buffer drops its oldest data, a start mark
+first), and they must bracket the run's span within 1 ms, else `ClockUnsynced`, which checks the
+profile's clock against strobe's every time. The page's processes are those holding the marks (a run
+that loads another site moves the page). A measured run with no sample of the page's main thread
+refuses `RunIncomplete`. The recording keeps the profile as Firefox wrote it (`gecko-profile.json.gz`,
+owner-only, which the Firefox Profiler opens) and what strobe read from it:
+
+- `cpu-g<thread>-r<run>.cpuprofile`: one V8-format profile per page thread (main and DOM workers) and
+  measured run, so `hotspots`, `a..b`, the diff flame and the reports read them as Chromium's. The
+  page's JavaScript sits at its function's start (SpiderMonkey places a function at its parameter list
+  as V8 does) and resolves through the stored maps; the browser's labels for its own work (`Reflow
+  /path`, `Styles`, `get HTMLElement.offsetWidth`, `Minor GC`; a URL in a label is cut to its path, so
+  a row matches across runs served on other ports) and its own scripts (chrome, resource and
+  self-hosted, named with their file) are frames without a script; native frames fold into the frame
+  above them (Firefox ships no symbols); `(idle)` where the stack is in the Idle category, `(program)`
+  where only native code ran, `(profiler)` where the profiler captured a marker's stack. A sample
+  weighs the time to the next one (as V8 counts it), cut to the run's span and to 50 ms (the sampler
+  is late at times: 1 ms at the 99th percentile on a busy adais, up to 30 ms; past that the thread was
+  not being sampled); a thread's last sample weighs one interval. Times are whole µs on a rounded
+  timeline: each sample's weight is the next delta, the last one's a trailing delta (`timeDeltas` is
+  one longer than `samples`); where the 50 ms cut a weight, the timeline closes the gap.
+- `gecko.json`: the rows the views read from a trace's SQL, from the page's main threads: `Reflow`
+  intervals as layouts and `Styles` as style recalcs (`query layout`: forced when the page's script
+  is on the stack, a reflow's own, a style recalc's from the `DoFlushPendingNotifications` around
+  it; a frame Firefox gives no running line for, as the innermost JIT-compiled one of a marker's stack
+  in Firefox 159, is located at its function's start, which `query layout` says); `GCMinor` with the
+  nursery's freed bytes, `GCSlice` (main-thread pauses) and `GCMajor` (counted once, with no time of
+  its own: its slices are its pauses) for `query gc`, whose helper-thread time reads `—` (Firefox marks
+  none); style, layout and display-list building per run for the summary; `LongTask` markers for
+  insights; and every sampled thread's CPU over the measured runs, from the CPU each sample carries
+  (`threadCPUDelta`: ns on Windows and Linux, µs on macOS), which `query threads` and `a..b threads`
+  read.
+- Not from Firefox: allocation samples (`query alloc`), heap snapshots (`heap`, `leaks`) and style
+  invalidation tracking (`style`: Firefox records only each restyle's first cause) refuse
+  `EngineUnsupported` (exit 4) with what answers instead; neither views nor reports suggest them, or
+  `query sql`, for a Firefox recording.
+
+A Firefox attribution block's `meta.json` says `timing: perturbed`, as every attribution block does
+(rule 3). Calibration (a page bundled and minified by Bun with a linked map that has no `names`; a
+click runs a 60 ms planted hot function, 40 planted forced reflows that write two styles and read
+`offsetWidth`, and object churn), headless: on adais (Windows) and air (macOS)
+`plantedHotFunction ../src/app.ts:11:35` is the first row after `(idle)` (292 ms over 5 runs of
+60 ms); on vps (a 2-core Linux VM) it reads 292 ms too, but the planted reflows cost more there
+(the `Reflow` label 342 ms) and rank above it. `query layout` counts exactly 40 forced layouts and
+40 forced style recalcs per run on all three, all at `plantedForcedReflow ../src/app.ts:20:36`, and
+`query gc` 3 minor collections per run (6 on vps).
 
 **Where work went, in every block**: `Performance.getMetrics` at each run's start and end gives
 `main.script`, `main.layout`, `main.style` (ms per run) and `layout.count`, `style.count`, cheap
@@ -1265,6 +1339,37 @@ freed memory for reuse, so a heap that fills and holds reads `grows, then levels
 the readings say how much, not which objects. Checked on a planted leak (a windowless app keeping 1 MB
 every 250 ms, 1 s runs, N = 4): `leaks +5.2 MB/run [+4.8 … +5.8]`; the same app without the leak:
 `unclear: +0 B … +201 KB/run`.
+
+**Firefox: about:memory** (`probe::gecko::census`, built). `nsIMemoryInfoDumper` in the chrome scope
+writes every process's memory reports after about:memory's "Minimize memory usage" (GC and CC in
+every process first); the report is kept beside the recording (`memory-<n>.json.gz`). An attribution
+block and `record --probes attribution` take it once, right before the profiler starts: after a
+profile the profiler keeps its own memory (on Linux its unwinder's tables, 40-48 MB in every process
+on vps), which would read as the browser's; its `explicit/profiler` reports are left out of the
+layers anyway. A leak run takes it at S0 and after every run, with no profiler. Each census says when
+it was taken (`taken`), which `query memory` prints. As a census: every process's OS private bytes and
+working set with Firefox's process type (the page's content process, the `osPid` of strobe's own
+browsing context found by its BiDi id through the remote agent's `NavigableManager`, is `renderer`);
+the report and this file are owner-only (rule 9: about:memory names every page the browser holds); per process the
+`explicit/` tree by layer (its first level, plus `heap-unclassified`: heap allocated that no report
+claims) and by allocator (its second level), which `query memory --by layer|allocator` shows; the
+page's JavaScript memory (its window's `js-zone` and `js-realm` reports: objects, strings, shapes,
+scripts and their buffers; `unused-gc-things` counts toward the total only; SpiderMonkey reports JIT
+code per runtime, so none is in it); DOM nodes in the document, DOM bytes and `orphan-nodes` bytes
+(nodes no document holds). No heap snapshot: Firefox takes them inside the content process
+(`ChromeUtils.saveHeapSnapshot`), which BiDi's chrome scope does not reach, so `heap` and `leaks`
+refuse `EngineUnsupported`.
+
+**Firefox leak runs** (`bench <file> --engine firefox --probes memory --repeat <N>`, built): as
+Chromium's, with about:memory as the census: growth per run of the page's JavaScript memory and of
+DOM nodes, judged against the same bounds. No snapshots, so no suspects and no `no app leak` split
+(the series holds no JIT code to split off). DOM nodes are the document's: a detached node shows only
+in the census's `orphan-nodes` bytes, which the leak run's text names. A census that could not name the
+page's content process has no page JavaScript memory: the leak run refuses `RunIncomplete`.
+`record --engine firefox --probes memory` refuses `EngineUnsupported` and names the leak run. Checked on adais (N = 6): a 100 KB `Uint8Array` kept per
+run read `leaks +100 KB/run [+100 … +100]`, a kept 12,800-element array `+104 KB/run` (100 KB of
+elements and their capacity), 2,000 small objects per run `+316 KB/run`, and the same page's work
+case without a leak `no growth`; the array case read `+104 KB/run` on air too.
 
 ### 8.7 Imports (`file:`)
 
@@ -2905,6 +3010,13 @@ protobuf written by hand (no generated code, no C):
   are interned with their source-mapped (§8.3) or PDB/DWARF (§12.2) name, source file and line, kind
   (native, kernel, JIT JavaScript, GC, runtime) and a mapping (the module, or the script URL); each
   inline frame is its own frame, so the flame graph shows what was inlined where.
+- A Firefox attribution recording draws its Gecko profile (8.3) instead of the CPU profiles cut from
+  it: a `firefox` sequence with every sampled thread of every process under its own process and
+  thread (waits left out; each sample weighs the time to the next, at most 50 intervals), the page's
+  JavaScript source-mapped, the browser's labels, and native frames by library (no symbols, so a run
+  of one library's frames is one frame); each thread's markers on a child track per marker name
+  (bookkeeping such as `Awake` and task queueing left out); and its measured runs when nothing else
+  drew them (a headless block has no OS presents).
 - strobe's own data as tracks under one `strobe <rec>` root: `recording` (one slice over the
   recording whose arguments are its meta: validity, timing, probes, note, warnings, environment,
   values, OS averages), `runs and phases` (from strobe's marks in the Chrome trace, or a native
@@ -3038,7 +3150,8 @@ profilers, heap snapshots, the census, Playwright) asks for the Chromium side an
   reaps `run/`), stamped with `STROBE_HOME` and `STROBE_OWNER` like every launch (§13.2). Its `user.js`
   turns off what phones home or shows itself (telemetry, studies, Normandy, updates, Pocket, the new tab
   feeds, Safe Browsing, captive portal and connectivity checks, push, remote settings, first-run and
-  default-browser pages, session restore) and mutes audio (`media.volume_scale` 0); everything that
+  default-browser pages, session restore) and mutes audio (`media.volume_scale` 0); its downloads
+  folder is the profile's own `downloads` (where `moz:profiler.stop` saves); everything that
   shapes how a page runs stays Firefox's default. `remote.prefs.recommended` is off: the remote agent
   would otherwise apply its test preferences (no process priority manager, no hang monitor, focus test
   mode, no window occlusion tracking), which a person's Firefox does not run with (checked in
@@ -3084,8 +3197,11 @@ profilers, heap snapshots, the census, Playwright) asks for the Chromium side an
   not once per experiment: one file may run a headless Chromium target and a headed Firefox one. Each
   block records what its browser was (`Block.browser`), a series the versions its blocks ran
   (`series.browser`).
-- Not yet: attribution (the Gecko profiler, reflow and GC markers, about:memory), launch cases, leak
-  runs, `span.*`.
+- Attribution blocks and `record --probes attribution` run Firefox's Gecko profiler (its CPU samples,
+  reflow, style and GC markers) and about:memory (8.3, 8.6); leak runs read about:memory after every
+  run (8.6). Not yet: launch cases (refused `EngineUnsupported`: their timing is built on Chromium's
+  DevTools, so the profiler's startup mode, `MOZ_PROFILER_STARTUP`, has nothing to attribute yet),
+  `span.*`, allocation samples, heap snapshots.
 
 **WebKit** (`target::webkit`, `target::webdriver`): W3C WebDriver Classic over loopback HTTP (std
 `TcpStream`, one connection per command; a driver runs one command of a session at a time). Classic
@@ -3966,6 +4082,11 @@ recordings/rec_3f9a1c/
   threads.json          native apps: per thread wakes per second, CPU per run, name
   timeline.json.gz      native apps: each thread's CPU and wakes per second from the launch (§7.4)
   perfetto.pftrace      `strobe open`'s merged trace (§11.4), rebuilt on every open
+  gecko-profile.json.gz Firefox: the Gecko profile as Firefox wrote it, owner-only (§8.3)
+  gecko.json            Firefox: what strobe read from it: run windows and marks, page threads, each
+                        thread's CPU in the runs, the rows `layout`, `gc`, the summary and insights read
+  cpu-g<t>-r<n>.cpuprofile  Firefox: one V8-format profile per page thread and measured run
+  memory-<n>.json.gz    Firefox: an about:memory report (`memory-0`, `memory-s0`, `memory-<run>`), owner-only (§8.6)
 ```
 
 A native recording's stacks go to `deep.json.gz` beside these, symbolized against the variant's
@@ -4146,6 +4267,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block; Linux on vps 0.16–0.22%) |
 | counters (§7.5) | macOS: one `proc_pid_rusage` per process at each end of a run, nothing in the target; Linux perf events: per context switch in the target (4.4 µs in a VM), so they open only in counter blocks, never in a timing block |
 | off-CPU waits (`--probes waits`, attribution only, §11.1) | none in timing blocks: per context switch in the target (Linux about 7 µs on top of `deep` in a VM), so only a capture that asks takes them |
+| Firefox's profiler (attribution only, §8.3) | the browser's own samplers, in the target's processes: 1 ms on Windows, where any shorter interval makes every process's sampler spin a core (10-11 cores for a page's Firefox on adais at 200 µs or 500 µs, 0.4-0.9 cores at 1 ms, 0.4-1.2 with no profiler); 200 µs on macOS and Linux (air 0.3-0.6 cores and vps 0.1-0.5 at any interval, no profiler alike) |
 | `cli()` targets (§9.6) | nothing in the command; per command run strobe spawns it, reads its output on two threads and, after its exit, the OS's accounting (Linux also scans `/proc` for its process group), on strobe's CPUs |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |
@@ -4231,7 +4353,7 @@ Phase 0 runs two tracks in parallel.
 
 ## 23. Out of scope for v1
 
-Uploading or sharing recordings · hosted dashboards · Firefox and WebKit traces and profilers · mobile · GPU frame
+Uploading or sharing recordings · hosted dashboards · WebKit traces and profilers (Firefox attributes with its own profiler: §8.3) · mobile · GPU frame
 capture (RenderDoc or PIX level) · macOS deep mode · any automated tests.
 
 ## 24. As built (2026-11-05)
@@ -4712,6 +4834,31 @@ a short block, 9.4 ms on adais, so a 1 s `--check` run reads the sampler at 1.1�
 memory stay on the tick that read them; a GPU client that names no creator yet is asked again;
 `host::process_set` leaves strobe out; the moved-element error compares visible parts and stays the
 `until`'s own when the element is gone.
+
+Firefox attribution (2026-11-06, engines phase 3: 8.3 Firefox, 8.6 Firefox, 11.4, 13.1). Checked
+against Firefox 159 before building: WebDriver BiDi has a `moz:profiler` module (`start` with entries,
+interval, features, threads and `activeContext`; `stop` saves the profile into the preferred downloads
+folder and returns its path), so the chrome-scope `Services.profiler` is only the fallback; the raw
+profile (format 36) keeps each process's own start and its start on the host's monotonic clock; a JS
+frame's location is `name (url:line:col)[source]` with the function's start at its parameter list (as
+V8 places it) and the running line and column in the frame table; `Reflow (sync)` comes as start and
+end markers with the reflow's stack, `Styles` as an interval with the stack of its first cause, and
+`DoFlushPendingNotifications` (`Layout`, `InterruptibleLayout`) as an interval with its caller's stack;
+the feature `cpu` is accepted and left out of the profile's own configuration list while samples still
+carry `threadCPUDelta`; about:memory's dumper takes 0.2-0.4 s with its GC and CC passes; on Linux the
+profiler keeps 40-48 MB of unwinder tables per process after it stops. Checked with the planted page of
+8.3 (short smoke runs; no timed bench): adais (Windows 11, locked, headless), air (macOS 27, AC,
+headless, and headed: the same hotspots and 40 forced layouts per run, with the page's GPU process
+in `query threads` and OS presents beside the Firefox markers in `strobe open`) and vps (Debian 13
+VM, headless) as 8.3 and 8.6 say; `record --engine firefox
+--probes attribution` of the same page doing its work by itself (3 s) counted exactly 300 forced
+layouts; `query a..b hotspots` and `layout`, `report recording` and `strobe open` (Firefox CPU samples
+and markers read back by trace_processor with no import errors) work on Firefox recordings; `alloc`,
+`heap`, `leaks`, `style` and `record --probes memory` refuse `EngineUnsupported` (exit 4).
+
+Not built: Firefox launch cases (and so launch attribution through `MOZ_PROFILER_STARTUP`), sampled
+allocations (the profiler's `jsallocations`), Linux WebKit attribution through the Web Inspector
+(waits for the WebKit drivers to land). Not checked: headed Firefox attribution on Windows (locked).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

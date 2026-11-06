@@ -1517,7 +1517,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
     let mut attribution = Value::Null;
-    let profiled_engine = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) == WebEngine::Chromium;
+    let profiled_engine = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) != WebEngine::Webkit;
     if passed && ctx.args.get("why") == Some("always") && !profiled_engine {
         ctx.warnings.push(validity::info("Attribution", format!("{}: {} pages have no profilers in strobe yet: no attribution block (profile it in Chromium)", s.label(), engine_of(&target))));
     }
@@ -1676,7 +1676,7 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     let (metric, part) = if leak["head"]["native_host"].is_object() { ("memory.app.host", "native_host") } else { ("js.heap.growth", "js_heap") };
     let head = &leak["head"][part];
     Ok(json!({
-        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak",
+        "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak", "engine": ctx.describe["targets"][&s.target]["engine"],
         "primary": { "metric": metric, "verdict": head["verdict"], "verdict_kind": head["verdict_kind"], "decided": head["decided"] },
         "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
         "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
@@ -2564,11 +2564,12 @@ fn tail_refusal(def: &MetricDef, blocks: &[Block]) -> Option<Refusal> {
 }
 
 /// Why strobe has no attribution block for this target: a command ends inside each run, and only
-/// Chromium's DevTools profile a page yet. None when its own engine's tools profile it.
+/// Chromium's DevTools and Firefox's own profiler profile a page; a WebKit page has none in strobe.
+/// None when its own engine's tools profile it.
 fn no_profiler(target: &Value) -> Option<String> {
     match target["kind"].as_str() {
         Some("cli") => Some("a command ends inside each run: there is nothing to profile it with".into()),
-        Some("web" | "url") if engine_of(target) != WebEngine::Chromium => Some(format!("{} pages have no profilers in strobe yet", engine_of(target))),
+        Some("web" | "url") if engine_of(target) == WebEngine::Webkit => Some(format!("{} pages have no profilers in strobe yet", engine_of(target))),
         _ => None,
     }
 }
@@ -2581,6 +2582,8 @@ fn why_text(target: &Value) -> &'static str {
         } else {
             "OS samples and native stacks (sampled without the deep helper: user frames, a short stall per sample)"
         }
+    } else if matches!(target["kind"].as_str(), Some("web" | "url")) && engine_of(target) == WebEngine::Firefox {
+        "Firefox's profiler: CPU stacks, style, layout and GC markers; about:memory"
     } else {
         "CPU and allocation stacks, forced layouts, GC, a heap snapshot"
     }
@@ -2803,6 +2806,18 @@ fn leak_analysis(census: &[Value], dir: &Path, n: usize) -> Result<Value> {
     let mut js_v = growth(&js, n, bound, &bytes);
     let dom_v = growth(&dom, n, 1.0, &nodes);
     let s = |name: &str| dir.join(format!("{name}.heapsnapshot.gz"));
+    // Firefox's census is about:memory's: the page's JavaScript from SpiderMonkey's reporters, which hold
+    // no JIT code, and no heap snapshot to name what grew.
+    if census.first().is_some_and(|c| c["engine"] == "firefox") {
+        // The page's JS memory needs the page's process: a census that could not name it has none.
+        if let Some(c) = census.iter().find(|c| !c["js_heap_bytes"].is_number()) {
+            let when = c["taken"].as_str().unwrap_or("one census");
+            return Err(Refusal::new(ValidatorId::RunIncomplete, format!("about:memory {when}: the page's content process could not be named, so its JavaScript memory is unknown")).into());
+        }
+        store::write_json(&dir.join("census.json"), &json!(census))?;
+        let none = "Firefox gives strobe no heap snapshot: the growth is about:memory's, with no objects named";
+        return Ok(json!({ "runs": 2 * n, "censuses": census.len(), "js_heap": js_v, "dom_nodes": dom_v, "js_heap_bytes": js, "dom_node_counts": dom, "suspects": { "refused": none } }));
+    }
     let suspects = crate::heapsnap::leaks(&crate::heapsnap::ids(&s("heap-s0"))?, &crate::heapsnap::ids(&s("heap-s1"))?, &crate::heapsnap::read(&s("heap-0"))?, 15, false);
     // A growing heap is a leak only when the app's own objects explain it: V8's compiled code and
     // internals keep growing while the JIT compiles and optimizes, and that stops on its own.
@@ -3663,9 +3678,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             page.add_init_script(CANVAS_SCRIPT)?;
             page.eval(CANVAS_SCRIPT)?;
         }
-        // Profilers, heap snapshots and the memory census are Chromium's DevTools: an attribution or memory
-        // block of another engine is refused before it launches (`engine_blocks`).
-        let no_cdp = || Error::refused("EngineUnsupported", format!("{engine} pages have no profilers, heap snapshots or memory census in strobe yet"), "attribute in Chromium");
+        // Profilers, heap snapshots and the memory census over CDP are Chromium's; Firefox's attribution
+        // and memory blocks use its own profiler and about:memory (`probe::gecko`).
+        let no_cdp = || Error::refused("EngineUnsupported", format!("{engine} pages have no DevTools profilers or heap snapshots"), "attribute in Chromium");
+        let firefox = if let WebBrowser::Firefox(b) = &browser { Some(b) } else { None };
+        // A Firefox attribution block marks its runs in the page, so its profile names the page's process.
+        let gecko_on = set == Set::Attribution && firefox.is_some();
         let cp = || page.cdp().ok_or_else(no_cdp);
         let cb = || browser.cdp().ok_or_else(no_cdp);
         lap("attach");
@@ -3879,6 +3897,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // A kept recording is claimed for this block alone and discarded on any error before its meta.json.
         let mut draft: Option<store::Draft> = None;
         let mem_dir = if set == Set::Memory { Some(draft.insert(store::claim_recording(&id)?).dir().to_path_buf()) } else { None };
+        // A Firefox attribution block takes its about:memory census before its profiler starts, into
+        // the recording claimed now: the profiler's own memory (tens of MB per process on Linux) would
+        // count as the page's.
+        let gecko_dir = if gecko_on { Some(draft.insert(store::claim_recording(&id)?).dir().to_path_buf()) } else { None };
         // A leak run measures 2 × N runs (`Warmup`): N to S1 and N more to S2.
         let mut census: Vec<Value> = Vec::new();
         // GPU engines and VRAM of the target's process tree, read from the OS (SPEC §13.6).
@@ -3977,7 +3999,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let docs = page.documents();
             // From outside the run is strobe's own span on the host clock, as a native app's: no page
             // mark, and no wait for the page's next frame.
-            if !traceless {
+            if !traceless || gecko_on {
                 driver.mark(&format!("{key}:start"))?;
             }
             let listed = probe::wakes::wall_us();
@@ -3998,7 +4020,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
             let input = crate::driver::input_pacing(&driver.drags.take());
             let c1 = counters();
-            if !traceless {
+            if !traceless || gecko_on {
                 driver.mark(&format!("{key}:end"))?;
             }
             roles.extend(process_roles(&browser));
@@ -4066,14 +4088,20 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let wait_start = |t: Duration| {
             let _ = crate::driver::wait_change(&page, t);
         };
+        // Firefox's profiler, from the steady point to the end of the runs.
+        let mut gecko: Option<probe::gecko::Profiler> = None;
         while warmup.more(runs.len()) {
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
             starts.check(i + 1, false, &read_start, &wait_start)?;
             runs.push(run_once(&format!("run:{i}"))?);
             if let Some(f) = warmup.first() {
-                // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N.
-                if let Some(dir) = &mem_dir {
+                // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N. Firefox
+                // takes about:memory's after its own GC and CC, and no heap snapshot.
+                if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
+                    let done = runs.len() - f;
+                    census.push(probe::gecko::census(b, &page, &dir.join(format!("memory-{done}.json.gz")), &format!("after run {done} of the leak run"))?);
+                } else if let Some(dir) = &mem_dir {
                     let mut c = probe::census::take(cb()?, cp()?);
                     c["os_after_snapshot"] = json!(true);
                     let done = runs.len() - f;
@@ -4096,12 +4124,20 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // gives no CPU time (cycles refused), the run's wall time.
             let work: Vec<f64> = runs.iter().map(|r| if !traceless { r.task } else if r.work.is_finite() { r.work } else { r.ms }).collect();
             if warmup.after(&work) && !x.untimed {
-                if set == Set::Attribution {
+                if let (Some(dir), Some(b)) = (&gecko_dir, firefox) {
+                    match probe::gecko::census(b, &page, &dir.join("memory-0.json.gz"), "after warmup, before the profiler started and the measured runs") {
+                        Ok(c) => census.push(c),
+                        Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", v.role, e.message))),
+                    }
+                    gecko = Some(probe::gecko::start(b)?);
+                } else if set == Set::Attribution {
                     probe::cpu::start(cp()?)?;
                     probe::alloc::start(cp()?)?;
                     profiling.set(true);
                 }
-                if let Some(dir) = &mem_dir {
+                if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
+                    census.push(probe::gecko::census(b, &page, &dir.join("memory-s0.json.gz"), "after warmup, before the leak run's runs (S0)")?);
+                } else if let Some(dir) = &mem_dir {
                     let mut c = probe::census::take(cb()?, cp()?);
                     c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
                     census.push(c);
@@ -4171,7 +4207,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         };
         std::fs::create_dir_all(&dir)?;
         let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
-        if set == Set::Attribution {
+        // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
+        // measured run's own span) and its style, layout and GC rows, then the page's source maps.
+        if let Some(g) = gecko.take() {
+            let raw = g.stop()?;
+            let got = probe::gecko::convert(&raw, &token, &spans, &dir)?;
+            let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
+            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
+            probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
+            lap("maps");
+        } else if set == Set::Attribution {
             profiling.set(false);
             let mut segments = segments.take();
             segments.push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
@@ -4189,7 +4234,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 probe::symbols::urls(profile, &mut scripts);
                 probe::symbols::urls(allocs, &mut scripts);
             }
-            probe::symbols::store_maps(cp()?, &scripts, &dir, served.as_deref())?;
+            probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
             lap("maps");
         }
         let trace = dir.join("trace.pftrace");
@@ -4198,13 +4243,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             lap("trace");
         }
         // `layout.shift`'s explanation: the largest shifts and what moved, named while the page is open.
-        if set == Set::Attribution && shift {
+        if set == Set::Attribution && shift && page.cdp().is_some() {
             match probe::shifts::largest(&trace, &token, cp()?, first, 5) {
                 Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
                 Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", v.role, e.message))),
             }
         }
-        if set == Set::Attribution {
+        // A Firefox block's census came before its profiler; Firefox gives strobe no heap snapshot.
+        if set == Set::Attribution && firefox.is_none() {
             // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
             let mut c = probe::census::take(cb()?, cp()?);
             c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
@@ -4420,6 +4466,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 "id": id, "kind": "block", "experiment": ctx.exp, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "background": background, "screen": screen,
+                // Rule 3: a block with profilers or a census describes the profiled page.
+                "timing": if set == Set::Timing || set == Set::Lean { "clean" } else { "perturbed" },
                 "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)),
             });
             if !census.is_empty() {
@@ -5135,8 +5183,14 @@ fn check_engines(series: &[Series], describe: &Value, args: &Args) -> Result<()>
                 .fix("drop --headless (and the target's headless) to measure it on screen, or choose a CPU primary: cpu.work, cpu.app.total, run.duration or phase.<name> (main.work in Chromium)")
                 .into());
         }
-        if engine != WebEngine::Chromium && matches!(args.get("probes"), Some("attribution" | "memory")) {
-            return Err(Error::refused("EngineUnsupported", format!("{}: --probes {}: profilers, heap snapshots and the memory census are Chromium's DevTools; {engine} has none in strobe yet", s.label(), args.get("probes").unwrap_or("")), "attribute or leak-check the page in Chromium"));
+        // Firefox attributes with its own profiler and leak-checks with about:memory (`probe::gecko`); a
+        // WebKit page has neither in strobe.
+        if engine == WebEngine::Webkit && matches!(args.get("probes"), Some("attribution" | "memory")) {
+            return Err(Error::refused(
+                "EngineUnsupported",
+                format!("{}: --probes {}: WebKit pages have no profilers or memory census in strobe", s.label(), args.get("probes").unwrap_or("")),
+                "attribute or leak-check the page in Chromium or Firefox (--engine firefox)",
+            ));
         }
     }
     Ok(())
@@ -6043,6 +6097,12 @@ fn leak_text(r: &Value, s: &Value, file: &str) -> String {
         out += &format!("  js heap   {}  · {}\n", l["js_heap"]["verdict"].as_str().unwrap_or(""), range(&l["js_heap"], &bytes));
         out += &format!("  dom       {}  · {}\n", l["dom_nodes"]["verdict"].as_str().unwrap_or(""), range(&l["dom_nodes"], &nodes));
         let sus = &l["suspects"];
+        if let Some(why) = sus["refused"].as_str() {
+            out += "            (dom: nodes in the document; nodes no document holds show as orphan DOM bytes in query memory)\n";
+            out += &format!("  suspects  none named: {why}\n");
+            out += &format!("  next      strobe query {} memory --at 0 · strobe query {} memory\n", l["recording"].as_str().unwrap_or(""), l["recording"].as_str().unwrap_or(""));
+            continue;
+        }
         out += &format!("  suspects  {} objects from runs 1–{n} still alive after run {} · {} retained\n", sus["count"], 2 * n, fmt::bytes(sus["retained_size"].as_f64().unwrap_or(0.0)));
         for c in sus["classes"].as_array().into_iter().flatten().take(5) {
             out += &format!("            {:>9}  {:>6}  {}\n", fmt::bytes(c["retained_size"].as_f64().unwrap_or(0.0)), c["count"], c["class"].as_str().unwrap_or(""));

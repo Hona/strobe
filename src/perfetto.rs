@@ -24,6 +24,7 @@ const SEQ_TRACKS: u32 = 0x7374_0001;
 const SEQ_JS: u32 = 0x7374_0002;
 const SEQ_ALLOC: u32 = 0x7374_0003;
 const SEQ_NATIVE: u32 = 0x7374_0004;
+const SEQ_GECKO: u32 = 0x7374_0005;
 const UUID_BASE: u64 = 0x5354_524F_0000_0000;
 
 /// A protobuf message being written.
@@ -79,6 +80,8 @@ pub struct Built {
     pub js_samples: u64,
     pub alloc_samples: u64,
     pub native_samples: u64,
+    /// Firefox's profiler: every sampled thread's stacks.
+    pub gecko_samples: u64,
     /// Distinct frames in the samples, and how many carry a source file and line.
     pub frames: u64,
     pub located_frames: u64,
@@ -116,7 +119,12 @@ pub fn build(dir: &Path, out: &Path) -> Result<Built> {
     b.presents(dir, &meta);
     b.memory(dir);
     b.strobe_itself(&meta);
-    b.js(dir, &page, &meta);
+    // Firefox's profile is drawn whole, its CPU profiles being cut from it.
+    if dir.join(crate::probe::gecko::PROFILE).is_file() {
+        b.gecko(dir);
+    } else {
+        b.js(dir, &page, &meta);
+    }
     b.native(dir);
     b.summary(&meta);
     // A trace without Chrome's clock snapshots gets one: strobe's clock is the trace's.
@@ -878,6 +886,102 @@ impl Builder {
         if !scripts.is_empty() {
             self.built.notes.push(format!("{} of {} distinct script frames source-mapped to original files", mapped.len(), scripts.len()));
         }
+    }
+
+    /// Firefox's profile (attribution): each sampled thread of each process with its stacks (the page's
+    /// JavaScript source-mapped, the browser's labels, native frames by library) and its markers, one
+    /// child track per marker name; and the measured runs when no other source drew them.
+    fn gecko(&mut self, dir: &Path) {
+        let Some(t) = crate::probe::gecko::timeline(dir) else {
+            self.built.notes.push("Firefox's profile could not be read".into());
+            return;
+        };
+        if self.runs.is_empty() && !t.runs.is_empty() {
+            let track = self.track("runs and phases", 0, None);
+            for (k, a, b) in &t.runs {
+                self.runs.push((*a, *b));
+                self.slice(track, MONOTONIC, *a, *b, &span_name(k), &[]);
+                self.count("runs and phases");
+            }
+        }
+        let sym = Symbolizer::open(dir);
+        let lib_of = |a: u64| -> Option<&(u64, u64, String, String)> {
+            let i = t.libs.partition_point(|l| l.0 <= a).checked_sub(1)?;
+            Some(&t.libs[i]).filter(|l| a < l.1)
+        };
+        let mut st = Stacks::new(SEQ_GECKO, "firefox", "CPU time", 1);
+        let mut named: HashSet<u32> = HashSet::new();
+        for th in &t.threads {
+            if named.insert(th.pid) {
+                let uuid = self.uuid();
+                self.descriptor(|d| {
+                    d.u(1, uuid).m(3, |p| {
+                        p.u(1, u64::from(th.pid)).s(6, &th.process);
+                    });
+                });
+            }
+            let thread = self.thread_track(th.pid, th.tid, Some(&th.name));
+            let ids: Vec<u64> = th
+                .stacks
+                .iter()
+                .map(|frames| {
+                    let mut out: Vec<StackFrame> = Vec::new();
+                    for f in frames {
+                        let frame = match f {
+                            crate::probe::gecko::TimelineFrame::Js { name, url, line0, column0 } => {
+                                let f = sym.frame(url, *line0, *column0, name);
+                                StackFrame {
+                                    name: f.name,
+                                    file: if f.file.is_empty() { f.url.clone() } else { f.file },
+                                    line: u32::try_from(f.line).unwrap_or(0),
+                                    column: f.column,
+                                    mapping: Some(f.url),
+                                    rel_pc: None,
+                                    kind: None,
+                                    kind_str: Some("javascript"),
+                                    ok: true,
+                                }
+                            }
+                            crate::probe::gecko::TimelineFrame::Label(l) => {
+                                StackFrame { name: l.clone(), file: String::new(), line: 0, column: 0, mapping: None, rel_pc: None, kind: None, kind_str: None, ok: true }
+                            }
+                            crate::probe::gecko::TimelineFrame::Native(a) => {
+                                let (name, path, rel) = lib_of(*a).map_or(("(native)".to_string(), None, *a), |l| (l.2.clone(), Some(l.3.clone()), a - l.0));
+                                // Consecutive frames of one library are one frame to a reader (no symbols).
+                                if out.last().is_some_and(|p| !p.ok && p.name == name) {
+                                    continue;
+                                }
+                                StackFrame { name, file: String::new(), line: 0, column: 0, mapping: path, rel_pc: Some(rel), kind: Some(1), kind_str: None, ok: false }
+                            }
+                        };
+                        out.push(frame);
+                    }
+                    st.callstack(&out)
+                })
+                .collect();
+            let task = st.task(th.pid, th.tid);
+            for &(ts, w, i) in &th.samples {
+                st.sample(ts, task, None, ids[i], w);
+                self.seen(ts);
+                self.built.gecko_samples += 1;
+            }
+            if !th.samples.is_empty() {
+                self.built.sampled_threads += 1;
+            }
+            for (name, a, b, args) in &th.markers {
+                let track = self.track_under(Some(thread), name, 0, None);
+                if a == b {
+                    self.instant(track, MONOTONIC, *a, name, args);
+                } else {
+                    self.slice(track, MONOTONIC, *a, *b, name, args);
+                }
+                self.count("Firefox markers");
+            }
+        }
+        self.built.frames += st.frames.len() as u64;
+        self.built.located_frames += st.located;
+        self.out.extend_from_slice(&st.out);
+        self.built.notes.push("Firefox's profile: every sampled thread, the waits left out; native frames by library (Firefox ships no symbols)".into());
     }
 
     /// Native stacks (ETW, perf, macOS sample, or strobe's own sampler) with their PDB or DWARF

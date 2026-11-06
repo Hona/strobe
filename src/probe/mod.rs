@@ -5,6 +5,7 @@ pub mod census;
 pub mod cpu;
 #[cfg(windows)]
 pub mod etw;
+pub mod gecko;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod gpu_linux;

@@ -15,6 +15,7 @@
     "result": { "type": "string", "description": "--json only: the path of result.json." },
     "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
     "passed": { "type": "boolean", "description": "check: every case passed." },
+    "parity": { "type": ["string", "null"], "description": "check of several targets: the parity matrix, as the text output prints it." },
     "env": { "type": "object", "description": "The device: OS, CPU, GPU, displays, power, strobe's build." },
     "browser": { "type": ["string", "null"], "description": "The first page target's browser version (each series has its own: series.browser)." },
     "gpu": { "type": ["object", "null"], "description": "The first page target's browser GPU: devices, compositing, software." },
@@ -162,7 +163,8 @@
         "InputMismatch",
         "Headless",
         "NoMetric",
-        "NoWaits"
+        "NoWaits",
+        "NotEquivalent"
       ]
     },
     "verdictKind": {
@@ -324,6 +326,8 @@
               "pair": { "type": "integer" },
               "values": { "type": "object", "additionalProperties": { "type": ["number", "null"] } },
               "refused": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Metrics the block refused: \"<validator>: <why>\"." },
+              "same": { "type": "object", "description": "implementations: what each expect.same element read, by its name: { setup, run[], reset[] }." },
+              "ops": { "type": "object", "additionalProperties": { "type": "number" }, "description": "implementations: the measured runs' input calls, each call's median count per run (a typed character each)." },
               "recording": { "type": ["string", "null"] },
               "locked": { "type": "boolean" },
               "overhead": { "$ref": "#/definitions/overhead" },
@@ -353,8 +357,17 @@
         "hero": { "type": "boolean", "description": "implementations: the case says hero: true." },
         "targets": { "type": ["object", "null"], "description": "implementations: the target each side ran (base, head)." },
         "target_kinds": { "type": ["object", "null"], "description": "implementations: each side's target kind (base, head)." },
-        "adapted": { "enum": ["selectors", "steps", null], "description": "implementations: how the journey maps onto each side (phase 2)." },
-        "equivalence": { "type": "array", "description": "implementations: expect.same checks (phase 2): selector, base, head, ok, pairs." },
+        "adapted": { "enum": ["steps", null], "description": "implementations: steps means the case gives each target its own run (run: { <target>: fn }); null: one run through each side's ui." },
+        "equivalence": {
+          "type": "array",
+          "description": "implementations: each expect.same element, what both sides read at the end of the journey in the last pair, whether every pair agreed, and how many pairs were read.",
+          "items": { "type": "object", "properties": { "selector": { "type": "string" }, "base": { "type": ["string", "null"] }, "head": { "type": ["string", "null"] }, "ok": { "type": "boolean" }, "pairs": { "type": "integer" } } }
+        },
+        "journey": { "type": "string", "description": "check: the case and its params, whatever target ran it (a row of the parity matrix)." },
+        "side_name": { "type": "string", "description": "check: the target's name." },
+        "same": { "type": ["object", "null"], "description": "check: what each expect.same element read ({ setup, run[], reset[] }), as blocks keep it." },
+        "ops": { "type": ["object", "null"], "description": "check: the run's input calls (call -> count), as blocks keep them." },
+        "journey_refusal": { "$ref": "#/definitions/refusal", "description": "check: why this target's journey is not the first target's (NotEquivalent, InputMismatch)." },
         "per_side": {
           "type": ["object", "null"],
           "description": "implementations: per_side metrics per role, never compared.",

@@ -116,6 +116,7 @@ validators!(
     Headless,
     NoMetric,
     NoWaits,
+    NotEquivalent,
 );
 
 impl ValidatorId {
@@ -132,7 +133,7 @@ impl ValidatorId {
             SessionLocked | WindowHidden | Background => true,
             SoftwareGpu | DevBuild | DebuggerAttached | WrongScreen | UnpacedSpin | NoPresentSource | AmbiguousInteraction | PatternInput | ConcurrentBench | VariantMismatch | RunIncomplete
             | Throttled | BackgroundPriority | PresentsUnmatched | OverheadBudget | NoDisplayForBudget | TailTooShort | ClockUnsynced | LiveChannel | NoPhase | NoInput | NoSpan | NoCounter
-            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless | NoMetric | NoWaits => false,
+            | NotOnThisOs | NotForTarget | ResetIncomplete | EngineUnsupported | FixtureMismatch | NotComparable | ParityGap | InputMismatch | Headless | NoMetric | NoWaits | NotEquivalent => false,
         }
     }
 }
@@ -649,6 +650,16 @@ pub const METRICS: &[MetricDef] = &[
         min_n: 0,
         across: Across::Compared,
         about: "95th percentile gap between consecutive pointer moves of a drag, as strobe sent them",
+    },
+    MetricDef {
+        name: "driver.reads",
+        unit: "count",
+        better: Better::Lower,
+        kind: Kind::Timed,
+        words: COUNT,
+        min_n: 0,
+        across: Across::Compared,
+        about: "reads strobe made of the page or the accessibility tree inside a run (a wait's checks, finding an element): what driving the app cost it (ObserverCost)",
     },
     MetricDef {
         name: "scroll.latency.p50",

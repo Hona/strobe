@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 mod block;
 mod cli;
 mod fixture;
+mod journey;
 mod launch;
 mod mocks;
 mod native;
@@ -136,8 +137,11 @@ struct Series {
     /// An implementation comparison (SPEC §9.10): the base's and the head's targets. The series is
     /// case × params; each block runs its side's target (`side_series`).
     sides: Option<(String, String)>,
-    /// A parity gap: the side that cannot run this journey (its role) and why. Nothing runs.
-    gap: Option<(&'static str, String)>,
+    /// A parity gap: the side that cannot run this journey (its role), why, and the adapter entry it
+    /// lacks (`@find`) when that is why. Nothing runs.
+    gap: Option<(&'static str, String, Option<String>)>,
+    /// `steps`: the case gives each target its own run (`run: { <target>: fn }`).
+    adapted: Option<String>,
     /// The case says `hero: true`: reports lead with it when it is decided.
     hero: bool,
     /// The sides run on different engines: metrics of one engine (`Across::PerSide`) are kept per side
@@ -165,7 +169,19 @@ impl Series {
 
     fn label(&self) -> String {
         // An implementation comparison's series is the journey: its sides name the targets.
-        let mut s = if self.sides.is_some() { self.case.clone() } else { format!("{} · {}", self.case, self.target) };
+        if self.sides.is_some() {
+            return self.journey();
+        }
+        let mut s = format!("{} · {}", self.case, self.target);
+        for (k, v) in &self.params {
+            s += &format!(" · {k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
+        }
+        s
+    }
+
+    /// The case and its params, whatever target runs it: a row of the parity matrix.
+    fn journey(&self) -> String {
+        let mut s = self.case.clone();
         for (k, v) in &self.params {
             s += &format!(" · {k}={}", v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string()));
         }
@@ -385,6 +401,8 @@ struct Run {
     input: Option<(f64, f64)>,
     /// What the OS counted for the target's processes (`energy.cpu`, `cpu.instructions`, …).
     counted: probe::wakes::Counted,
+    /// strobe's reads of the page inside the run (`driver.reads`).
+    reads: f64,
 }
 
 /// A browser's process roles (`WebBrowser::process_roles`) and the metric each one's CPU goes to.
@@ -456,6 +474,12 @@ struct Block {
     /// command's lines said it (`cli()` targets).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     directions: BTreeMap<String, String>,
+    /// What each `expect.same` element read (SPEC §9.10), by the name the file gives it.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    same: BTreeMap<String, journey::Reads>,
+    /// The input calls of the measured runs, each one's median per run (`InputMismatch`).
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    ops: BTreeMap<String, f64>,
 }
 
 /// What a page block's browser was (`Block::browser`): read once per target and headless mode, since
@@ -566,11 +590,12 @@ fn fairness(ctx: &Ctx, variants: &[Variant], series: &[Value]) -> Value {
     json!({
         "window": { "client_dip": client, "scale": scale, "display": Value::Null, "hz": host::refresh_at(w.x + 20, w.y + 20) },
         "adapter": ctx.gpu["devices"].as_array().and_then(|a| a.first()).cloned().unwrap_or(Value::Null),
-        "input": "none",
+        // Pages against a native implementation get OS input, as native apps always do; two pages DevTools input.
+        "input": if ctx.cross_engine || variants.iter().all(|v| observer(Some(v)) == "accessibility") { "os" } else { "devtools" },
         "frames": frames.then_some(source),
         "gpu_cache": gpu_cache,
         "priority": ctx.qos.clone().unwrap_or_else(|| "normal".into()),
-        "observer": { "base": observer(variants.iter().find(|v| v.role == "base")), "head": observer(variants.iter().find(|v| v.role == "head")), "reads_per_run": {} },
+        "observer": { "base": observer(variants.iter().find(|v| v.role == "base")), "head": observer(variants.iter().find(|v| v.role == "head")), "reads_per_run": journey::reads_per_run(series) },
     })
 }
 
@@ -1312,8 +1337,8 @@ pub fn run(args: &Args) -> Result<Output> {
             continue;
         }
         if s.gap.is_some() {
-            let g = gap_series(s, &variants);
-            progress(format!("\n{}  not compared: {}", s.label(), g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
+            let g = gap_series(s, &variants, &ctx.describe);
+            progress(format!("\n{}  {}: {}", s.label(), if check { "gap" } else { "not compared" }, g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
             series_out.push(g);
             continue;
         }
@@ -1332,6 +1357,17 @@ pub fn run(args: &Args) -> Result<Output> {
         };
         let out = match r {
             Ok(out) => out,
+            // A side that reached for an adapter entry it lacks, which the runner's scan of the file
+            // did not see (a name built at run time): the journey is a gap, its blocks discarded.
+            Err(e) if e.validator() == Some(ValidatorId::ParityGap) && s.sides.is_some() => {
+                let summary = e.refusal.as_ref().map_or(e.message.clone(), |r| r.summary.clone());
+                let side =
+                    if variants.first().and_then(|v| v.target.as_deref()).is_some_and(|t| summary.starts_with(ctx.describe["targets"][t]["name"].as_str().unwrap_or(t))) { "base" } else { "head" };
+                let missing = summary.split_whitespace().find(|w| w.starts_with('@')).map(str::to_string);
+                let g = gap_series(&Series { gap: Some((side, summary, missing)), ..s.clone() }, &variants, &ctx.describe);
+                progress(format!("\n{}  not compared: {}", s.label(), g["primary"]["refusal"]["summary"].as_str().unwrap_or("")));
+                g
+            }
             Err(e) => {
                 halted = Some(if e.code == 130 || stop_requested() { stop_error() } else { e });
                 not_run.push(s.label());
@@ -1385,7 +1421,9 @@ pub fn run(args: &Args) -> Result<Output> {
         ctx.warnings.push(validity::warn("Stopped", format!("{}; not run: {}", h.message, not_run.join(", "))));
     }
     if check {
-        return check_output(&exp, &dir, &file, series_out, ctx.warnings);
+        let mut series_out = series_out;
+        let matrix = journey::matrix(&mut series_out);
+        return check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"));
     }
     if pixels_only {
         let mut text = String::new();
@@ -1506,6 +1544,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
         .unwrap_or_default();
     let overhead = r.as_ref().ok().and_then(|b| b.overhead.clone());
+    let (same, ops) = r.as_ref().map(|b| (json!(b.same), json!(b.ops))).unwrap_or_default();
     let (passed, error, hint, values, refused, locked, recording, screen, shown) = match r {
         Ok(b) => {
             let shown = shown::summarize(std::slice::from_ref(&b), false).0;
@@ -1546,13 +1585,22 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead,
         "log": log, "log_path": ctx.runner.log,
+        // For the parity matrix (`journey::matrix`).
+        "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target), "same": same, "ops": ops, "adapted": s.adapted,
     }))
 }
 
-fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>) -> Result<Output> {
-    let failed = series.iter().filter(|s| s["passed"] != true).count();
+fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool) -> Result<Output> {
+    // A gap is listed, not failed; journeys whose sides differ (`journey_refusal`) fail.
+    let gaps = series.iter().filter(|s| s["kind"] == "gap").count();
+    let refused = series.iter().filter(|s| s["journey_refusal"].is_object()).count();
+    let failed = series.iter().filter(|s| s["kind"] != "gap" && (s["passed"] != true || s["journey_refusal"].is_object())).count();
     let mut text = String::new();
     for s in &series {
+        if s["kind"] == "gap" {
+            text += &format!("gap   {}  {}\n", s["label"].as_str().unwrap_or(""), s["gap"]["reason"].as_str().unwrap_or(""));
+            continue;
+        }
         // Why each refused metric was refused, said once per reason under the case: a missing
         // permission refuses every frame metric with the same paragraph.
         let mut reasons: Vec<(String, Vec<String>)> = Vec::new();
@@ -1619,6 +1667,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         for (why, names) in &reasons {
             text += &format!("      refused  {}: {why}\n", names.join(", "));
         }
+        if let Some(r) = s["journey_refusal"].as_object() {
+            text += &format!("      refused  this journey: {}: {}\n", r.get("validator").and_then(Value::as_str).unwrap_or(""), r.get("summary").and_then(Value::as_str).unwrap_or(""));
+        }
         // The case's own console output: the last 10 lines, and where the rest is.
         let log: Vec<&str> = s["log"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
         if !log.is_empty() {
@@ -1631,16 +1682,28 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
         }
     }
-    text += &format!("\n{} of {} cases passed (one cold run each on head, no warmup: values include first-run work such as shader compiles; nothing compared)\n", series.len() - failed, series.len());
+    if let Some(m) = &matrix {
+        text += &format!("\nparity\n{m}");
+    }
+    let ran = series.len() - gaps;
+    text += &format!(
+        "\n{} of {ran} cases passed{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; nothing compared)\n",
+        ran - failed,
+        if refused > 0 { format!(", {refused} where the targets' journeys differ") } else { String::new() },
+        if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() }
+    );
     for w in &warnings {
         text += &format!("{} {:<24}{}\n", if w.level == "warn" { "!" } else { "i" }, w.id, w.text);
     }
     text += &format!("\n{exp}\n");
-    let result = json!({ "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "series": series, "warnings": warnings, "passed": failed == 0, "text": text });
+    let result =
+        json!({ "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "text": text });
     store::write_json(&dir.join("result.json"), &result)?;
     let mut out = Output::new(text, result);
     if failed > 0 {
         out.code = 1;
+    } else if gaps > 0 && require_parity {
+        out.code = 4;
     }
     Ok(out)
 }
@@ -1968,6 +2031,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     let mut halted: Option<Error> = None;
     // The primary's verdict at the look that decided it, kept while pairs continue for the secondaries.
     let mut decided_at: Option<Comparison> = None;
+    // Why the two sides' journeys are not one (`NotEquivalent`, `InputMismatch`), from the pair that showed it.
+    let mut journey_refused: Option<Refusal> = None;
     // Discarded warm-up blocks and their wall time, for `plan` (SPEC §9.1).
     let (warmup_blocks, warmup_ms) = if pairs.is_empty() { warm_gpu(ctx, s, variants, &mut halted)? } else { (0, 0.0) };
     // Linux's perf events never run in a timing block (SPEC §7.5): the paired loop runs on counter
@@ -2026,6 +2091,16 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         checkpoint(ctx, &s.label(), json!({ "blocks": blocks, "pairs": pairs }));
         let primary_pairs: Vec<(f64, f64)> = pairs.iter().map(|&(a, b)| (val(&blocks[a], &s.primary), val(&blocks[b], &s.primary))).collect();
         let n = pair + 1;
+        // The two sides did not do the same journey (SPEC §9.10): nothing of the series compares.
+        if s.sides.is_some()
+            && let Some(r) = journey::pair_refusal(s.adapted.is_some(), (&variants[0].name, &variants[1].name), &blocks[idx[0]], &blocks[idx[1]])
+        {
+            progress(format!("  pair {n}: {}", r.message()));
+            last = Some(compare_primary(&primary_pairs, def));
+            journey_refused = Some(r);
+            stopped = "journeys differ".into();
+            break;
+        }
         // Decided at a look, then run on to the pairs the secondaries need to clear Holm (and the
         // journeys' family, `family`).
         if let Some(c) = &decided_at {
@@ -2280,6 +2355,26 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if let Some(why) = blocks.iter().find_map(|b| b.refused.get(&s.primary)) {
         primary.refuse(why.clone());
         primary_decided = false;
+    }
+    if let Some(why) = &journey_refused {
+        primary.refuse(why.clone());
+        primary_decided = false;
+        for c in secondaries.iter_mut().chain(descriptive.iter_mut()) {
+            c.refuse(why.clone());
+        }
+    }
+    // Latency samples taken by one rule on both sides, but in numbers too far apart to be the same inputs.
+    if s.sides.is_some() {
+        let names = (variants[0].name.as_str(), variants[1].name.as_str());
+        for (prefix, why) in journey::latency_skew(&blocks, names) {
+            for c in std::iter::once(&mut primary).chain(secondaries.iter_mut()).chain(descriptive.iter_mut()).filter(|c| c.metric.starts_with(prefix) && c.kind != VerdictKind::Refused) {
+                c.refuse(why.clone());
+            }
+            if s.primary.starts_with(prefix) {
+                primary_decided = false;
+            }
+        }
+        warnings.extend(journey::observer_cost(&blocks, names));
     }
     if session == "mixed" {
         let why = Refusal::new(ValidatorId::SessionLocked, format!("{locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len()));
@@ -2614,8 +2709,9 @@ fn implementation_series(ctx: &Ctx, s: &Series, variants: &[Variant], out: &mut 
     out["targets"] = json!({ "base": b, "head": h });
     out["target_kinds"] = json!({ "base": ctx.describe["targets"][b]["kind"], "head": ctx.describe["targets"][h]["kind"] });
     out["hero"] = json!(s.hero);
-    out["adapted"] = Value::Null;
-    out["equivalence"] = json!([]);
+    out["adapted"] = json!(s.adapted);
+    let blocks: Vec<Block> = serde_json::from_value(out["blocks"].clone()).unwrap_or_default();
+    out["equivalence"] = journey::equivalence(&blocks);
     let mark = |c: &mut Value| {
         if let Some(d) = c["metric"].as_str().and_then(model::metric) {
             c["across"] = json!(d.across.name());
@@ -2665,10 +2761,11 @@ fn implementation_series(ctx: &Ctx, s: &Series, variants: &[Variant], out: &mut 
 
 /// A journey one side cannot run (SPEC §9.10 parity gap): listed with the side and why, never run on
 /// either side and never counted as better or worse.
-fn gap_series(s: &Series, variants: &[Variant]) -> Value {
-    let (role, why) = s.gap.clone().unwrap_or(("head", String::new()));
-    let side = variants.iter().find(|v| v.role == role);
-    let name = side.map_or(role.to_string(), |v| v.name.clone());
+fn gap_series(s: &Series, variants: &[Variant], describe: &Value) -> Value {
+    let (role, why, missing) = s.gap.clone().unwrap_or(("head", String::new(), None));
+    // A `--check` of every target lists the target itself (no sides).
+    let side = variants.iter().find(|v| v.role == role && v.target.is_some());
+    let name = side.map_or_else(|| describe["targets"][&s.target]["name"].as_str().unwrap_or(&s.target).to_string(), |v| v.name.clone());
     let r = Refusal::new(ValidatorId::ParityGap, format!("{name} cannot run {}: {why}", s.case)).fix("give that target the journey (or drop it from both)");
     let mut primary = json!({ "metric": s.primary, "verdict": format!("refused (ParityGap): {}", r.summary), "verdict_kind": VerdictKind::Refused, "decided": false });
     primary["refusal"] = json!(r);
@@ -2676,7 +2773,8 @@ fn gap_series(s: &Series, variants: &[Variant]) -> Value {
     json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "gap",
         "targets": { "base": b, "head": h }, "hero": s.hero, "primary": primary, "decided": false, "pairs": 0, "launches": 0,
-        "gap": { "side": role, "name": name, "missing": Value::Null, "reason": why },
+        "gap": { "side": role, "name": name, "missing": missing, "reason": why },
+        "journey": s.journey(), "side_name": name,
     })
 }
 
@@ -3005,7 +3103,15 @@ fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec
 /// case's over it, and the strobe.json of the target's own project (`cwd`) as `ctx.config` while `f`
 /// runs. A series of builds runs as it is, with its target's project.
 fn as_side<T>(ctx: &mut Ctx, s: &Series, v: &Variant, f: impl FnOnce(&mut Ctx, &Series) -> Result<T>) -> Result<T> {
-    let side = v.target.as_deref().filter(|t| *t != s.target).map(|t| Series { target: t.to_string(), expect: merged_expect(&ctx.describe["targets"][t], &s.case_expect), ..s.clone() });
+    // Its `expect` and a launch's `until` through that target's adapter (`@name`).
+    let side = match v.target.as_deref().filter(|t| *t != s.target) {
+        Some(t) => {
+            let def = &ctx.describe["targets"][t];
+            let launch = journey::side_launch(&ctx.describe["cases"][&s.case]["launch"], &def["ui"], t)?;
+            Some(Series { target: t.to_string(), expect: journey::side_expect(def, &s.case_expect, t)?, launch, ..s.clone() })
+        }
+        None => None,
+    };
     let s = side.as_ref().unwrap_or(s);
     let saved = ctx.projects.get(&s.target).map(|(_, c)| c.clone()).map(|c| std::mem::replace(&mut ctx.config, c));
     let r = f(ctx, s);
@@ -3571,8 +3677,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let canvas = declared.iter().any(|m| m.starts_with("canvas."));
     // Against a native implementation (SPEC §9.10) a timed block measures the page from outside, as
     // the other side is: no trace, frames from the OS's present events, runs and phases stamped on
-    // the host clock. The engine's own counters are read at run boundaries, kept per side.
-    let outside = s.cross_engine && x.measures_time() && !x.counters;
+    // the host clock, input from the OS. The engine's own counters are read at run boundaries, kept
+    // per side. A `--check` checks it the same way.
+    let outside = s.cross_engine && !x.counters && matches!(set, Set::Lean | Set::Timing) && x.pixels.is_none();
+    // The block's OS present capture, which the OS input's waits read live.
+    let presents_rc: crate::driver::os::Presents = Default::default();
     let url = if app { String::new() } else { variant_url(v, &target)? };
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
@@ -3643,11 +3752,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // No trace to carry runs, phases and frames: measured from outside (against a native
         // implementation), or a page whose engine has none for strobe (Firefox).
         let traceless = outside || page.cdp().is_none();
-        // Frames from the OS's presents: from outside, or headed in such an engine. Headed in such an
-        // engine, `interaction.*` too (a default secondary), from the page's own changes
-        // (`CHANGES_SCRIPT`, in every document from its start); from outside a run takes no input.
+        // Frames from the OS's presents: from outside, or headed in such an engine. Then `interaction.*`
+        // too (a default secondary), from the page's own changes (`CHANGES_SCRIPT`, in every document
+        // from its start). From outside the input is the OS's (`os::OsInput`), in Chromium; another
+        // engine's page takes none in its runs there yet.
         let os_frames_on = outside || (traceless && !headless && !x.counters && set != Set::Memory);
-        let changes = os_frames_on && !outside;
+        let os_input = outside && page.cdp().is_some();
+        let changes = os_frames_on;
         if changes {
             page.add_init_script(CHANGES_SCRIPT)?;
             page.eval(CHANGES_SCRIPT)?;
@@ -3729,14 +3840,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 "driver" => {
                     let call = a["call"].as_str().unwrap_or("");
                     let args = a["args"].as_array().cloned().unwrap_or_default();
-                    // From outside, the other side gets OS input or none: a run's DevTools input would
-                    // reach this side by another path (SPEC §9.10). OS input to pages comes with journeys.
-                    if outside && hooks.in_run() && matches!(call, "click" | "type" | "press" | "scroll" | "wheel" | "drag" | "down" | "up" | "hover" | "move") {
+                    hooks.op(call, &args);
+                    // From outside a Chromium page gets the OS's input (`os::OsInput`); another engine's
+                    // would get its driver's, where the other side gets the OS's (SPEC §9.10).
+                    if outside && !os_input && hooks.in_run() && crate::driver::os::INPUT.contains(&call) {
                         return Err(Refusal::new(
                             ValidatorId::InputMismatch,
-                            format!("page.{call}() in a run of a page measured against a native implementation: it would reach the page through DevTools, the other side through the OS"),
+                            format!("page.{call}() in a run of a {engine} page measured against a native implementation: strobe gives that engine no OS input yet, and the other side gets the OS's"),
                         )
-                        .fix("keep input out of runs (setup and reset may use it) until OS input to pages lands; or compare two pages")
+                        .fix("keep input out of runs (setup and reset may use it), or measure the page in Chromium")
                         .into());
                     }
                     if call == "goto" && hooks.in_run() {
@@ -3861,6 +3973,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             validity::window_visible(&page)?;
             front_page(s, &browser)?;
         }
+        // From outside, every input of the block (setup's and reset's too) comes from the OS, as the
+        // native side's does: set up once the window shows and is in front.
+        if os_input {
+            let _ = driver.os.set(crate::driver::os::OsInput::attach(&page, browser.pids(), presents_rc.clone())?);
+        }
         lap("checks");
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         hooks.check_fixture();
@@ -3868,6 +3985,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // context) draws no frame the canvas hook sees: canvas.* refused, never 0. Read on the page the
         // runs start from, after setup.
         let no_webgpu = canvas && page.eval("typeof GPUCanvasContext === 'undefined'")?.as_bool() == Some(true);
+        if let Some(os) = driver.os.get() {
+            os.delivered(&page)?;
+        }
+        // `expect.same` (SPEC §9.10): read after setup, each run and each reset, outside the runs.
+        let same = journey::Same::new(s, &target)?;
+        let read_same = |when| same.read(when, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)));
+        if same.on() {
+            read_same(journey::When::Setup)?;
+        }
         let start = shown::page(ctx, s, v, pair, "start", &page);
         shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
         lap("setup");
@@ -3931,10 +4057,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // What reached the screen comes from the OS's present events of the browser's processes (§7.2),
         // as for a native app (`os_frames_on`). The capture follows the browser's windows (macOS and X11
         // stream them by window).
+        // The OS input's waits read it live (`presents_rc`).
         let presents = os_frames_on.then(|| {
             probe::present::PresentCapture::start().map(|mut c| {
                 c.track(&browser.pids());
-                c
+                *presents_rc.borrow_mut() = Some(c);
             })
         });
         let run_counts: RefCell<Vec<BTreeMap<String, f64>>> = RefCell::new(Vec::new());
@@ -3952,7 +4079,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let mut run_once = |key: &str| -> Result<Run> {
             let began = Instant::now();
             // As a native app is before each run (`front_page`).
-            if cfg!(target_os = "macos") && s.sides.is_some() {
+            if cfg!(target_os = "macos") && (s.sides.is_some() || s.cross_engine) {
                 host::raise_windows(&browser.pids());
             }
             hooks.begin(key);
@@ -3997,6 +4124,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 harvested.borrow_mut().clear();
             }
             let docs = page.documents();
+            driver.reads.set(0);
+            if let Some(os) = driver.os.get() {
+                os.set_pids(browser.pids());
+                os.take_log();
+            }
             // From outside the run is strobe's own span on the host clock, as a native app's: no page
             // mark, and no wait for the page's next frame.
             if !traceless || gecko_on {
@@ -4011,6 +4143,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             ctx.runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
                 .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
+            let reads = driver.reads.get() as f64;
             if !outside {
                 driver.dispatch("frame", &[])?;
             }
@@ -4018,7 +4151,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             cost.end();
             let (procs_end, cyc1, tsc1, cpu1) = read();
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &procs_end.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
-            let input = crate::driver::input_pacing(&driver.drags.take());
+            // OS input's log: its inputs for latency, its drags for `input.rate`.
+            let sent = driver.os.get().map(|os| os.take_log());
+            let input = crate::driver::input_pacing(&sent.as_ref().map_or_else(|| driver.drags.take(), |l| l.drags.clone()));
             let c1 = counters();
             if !traceless || gecko_on {
                 driver.mark(&format!("{key}:end"))?;
@@ -4038,7 +4173,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if changes {
                 let mut seen = harvested.take();
                 seen.extend(page_changes(&page));
-                run_inputs.borrow_mut().push((driver.inputs.take(), seen));
+                let inputs = sent.as_ref().map_or_else(|| driver.inputs.take(), crate::driver::os::OsInput::sent);
+                run_inputs.borrow_mut().push((inputs, seen));
             }
             if page.documents() != docs {
                 loaded_document.set(true);
@@ -4046,13 +4182,23 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if let Some(n) = &net {
                 n.borrow_mut().drain(Some(index));
             }
+            // Whether the OS input reached the page, read after the run.
+            if let Some(os) = driver.os.get() {
+                os.delivered(&page)?;
+            }
             // A key or button the run left held would be down in the next one: let go, outside its span.
             driver.release_all()?;
+            if same.on() {
+                read_same(journey::When::Run)?;
+            }
             if s.reset {
                 ctx.runner
                     .call("reset", json!({ "case": s.case }), run_timeout, &serve)
                     .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
                 driver.release_all()?;
+                if same.on() {
+                    read_same(journey::When::Reset)?;
+                }
             }
             let wall = (t1 - t0) as f64;
             let cpu = match (tsc0, tsc1) {
@@ -4074,7 +4220,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             });
             let counted = probe::wakes::counted(&k0, &k1);
             let work = cpu * wall / 1e6 / 100.0;
-            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], work, parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted })
+            Ok(Run { ms: wall / 1e6, cpu, task: c1[0] + carry[0] - c0[0], work, parts, roles, t0, t1, total: began.elapsed().as_secs_f64() * 1e3, input, counted, reads })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -4199,7 +4345,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let heap_mb = page.cdp().and_then(|p| p.send("Runtime.getHeapUsage", json!({})).ok()).and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
         let dom_nodes = driver.nodes().ok();
         // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
-        let presents = presents.map(|r| r.and_then(|c| c.stop()));
+        let presents = presents.map(|r| r.and_then(|_| presents_rc.borrow_mut().take().ok_or_else(|| Error::msg("the present capture ended early"))).and_then(|c| c.stop()));
         let dir = match (&draft, keep) {
             (Some(d), _) => d.dir().to_path_buf(),
             (None, true) => draft.insert(store::claim_recording(&id)?).dir().to_path_buf(),
@@ -4326,6 +4472,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // The same CPU as time per run, as a native or script target's: what an implementation
         // comparison compares on both sides.
         extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
+        extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads)).collect());
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
         let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
@@ -4380,14 +4527,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if let Some(p) = presents {
                 let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
                 os_presents = os_frames(ctx, s, v, p, &browser.pids(), &spans, run_inputs_kept.get(first..).unwrap_or_default(), &mut values, &mut os_refused);
-            }
-            if outside {
-                // No input in the runs reached the page from the OS yet: input latency from outside is phase 2.
-                for m in declared.iter().filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
-                    os_refused.entry(m.to_string()).or_insert_with(|| {
-                        Refusal::new(ValidatorId::NoPresentSource, format!("{m}: the page is measured from outside here (against a native implementation), and OS input to a page is not built yet"))
-                    });
-                }
             }
         }
         if canvas {
@@ -4530,6 +4669,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             client: content,
             browser: Some(seen),
             directions: BTreeMap::new(),
+            same: same.take(),
+            ops: journey::ops(&run_counts.iter().skip(first).collect::<Vec<_>>()),
         })
     })();
     lapped.set(Instant::now());
@@ -4548,10 +4689,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 /// §13.6): strobe makes its app the active one (once nobody has used the Mac for a minute) and refuses
 /// `WindowHidden` when other apps' windows cover it or it is not the active app, which a bench waits
 /// out as for a native block. A key window can cost several times an inactive one, so both sides run
-/// in that one state. Elsewhere, and for builds of one target, nothing.
+/// in that one state (and a `--check` of a file whose pages get OS input, which needs the window in
+/// front). Elsewhere, and for builds of one target, nothing.
 fn front_page(s: &Series, browser: &WebBrowser) -> Result<()> {
     #[cfg(target_os = "macos")]
-    if s.sides.is_some() {
+    if s.sides.is_some() || s.cross_engine {
         use crate::target::native::{COVERED, NOT_ACTIVE};
         let pids = browser.pids();
         host::raise_windows(&pids);
@@ -4948,13 +5090,19 @@ fn merged_expect(target: &Value, case: &Value) -> Value {
     expect
 }
 
-/// Why a side cannot run a case: the case runs only on other targets, or says it is `unsupported` there.
-fn side_gap(c: &Value, target: &str) -> Option<String> {
+/// Why a side cannot run a case, and the adapter entry it lacks when that is why: the case says it is
+/// `unsupported` there, its hooks, `expect` or `until` name an `@name` the target's `ui` lacks (or it
+/// gives other targets their own run and this one none: the runner's `gaps`), or it runs only on
+/// other targets.
+fn side_gap(c: &Value, target: &str) -> Option<(String, Option<String>)> {
     if let Some(why) = c["unsupported"][target].as_str() {
-        return Some(why.to_string());
+        return Some((why.to_string(), None));
+    }
+    if let Some(g) = c["gaps"][target].as_object() {
+        return Some((g.get("reason").and_then(Value::as_str).unwrap_or("").to_string(), g.get("missing").and_then(Value::as_str).filter(|m| m.starts_with('@')).map(str::to_string)));
     }
     let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
-    on.filter(|on| !on.contains(&target)).map(|on| format!("the case runs only on {}", on.join(", ")))
+    on.filter(|on| !on.contains(&target)).map(|on| (format!("the case runs only on {}", on.join(", ")), None))
 }
 
 /// The series: case × target × params, or in an implementation comparison (`sides`: the base's and the
@@ -5000,9 +5148,17 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
     }
     let mut out = Vec::new();
     let targets = describe["targets"].as_object().cloned().unwrap_or_default();
+    // `--check` of every target of a file whose targets run on different engines checks each page the
+    // way an implementation comparison measures it: from outside, with OS input (SPEC §9.10).
+    let check = args.has("check") && sides.is_none() && only_target.is_none();
+    let engines: std::collections::BTreeSet<&str> = targets.values().map(|t| engine(t["kind"].as_str().unwrap_or(""))).collect();
     for (case, c) in describe["cases"].as_object().cloned().unwrap_or_default() {
         if filter.is_some_and(|f| !case_matches(f, &case)) {
             continue;
+        }
+        // Steps per target prove nothing reaches the same place without reads that show it.
+        if c["adapted"].is_string() && !c["expect"]["same"].as_array().is_some_and(|a| !a.is_empty()) {
+            return Err(Error::usage(format!("{case}: run gives each target its own steps, so the case needs expect.same: elements both sides must read the same after setup and after each run")));
         }
         // A case may name the targets it runs on; by default it runs on every target.
         let on: Option<Vec<&str>> = c["targets"].as_array().map(|a| a.iter().filter_map(Value::as_str).collect());
@@ -5013,27 +5169,38 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
         };
         for target in &names {
             // `--target`: target names as `--filter` takes cases (comma-separated, globs with *).
-            let excluded = on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) || c["unsupported"][target].is_string();
-            if sides.is_none() && (only_target.is_some_and(|t| !case_matches(t, target)) || excluded) {
+            let excluded = on.as_ref().is_some_and(|on| !on.contains(&target.as_str())) || c["unsupported"][target].is_string() || c["gaps"][target].is_object();
+            // The parity matrix lists a target the journey has no adapter for, or is unsupported on.
+            let listed = check && excluded && on.as_ref().is_none_or(|on| on.contains(&target.as_str()));
+            if sides.is_none() && (only_target.is_some_and(|t| !case_matches(t, target)) || excluded) && !listed {
                 continue;
             }
             // A side that cannot run the journey: a parity gap, shown and never run on either side.
-            let gap = sides.and_then(|(base, head)| side_gap(&c, base).map(|w| ("base", w)).or_else(|| side_gap(&c, head).map(|w| ("head", w))));
+            let gap = match sides {
+                Some((base, head)) => side_gap(&c, base).map(|(w, m)| ("base", w, m)).or_else(|| side_gap(&c, head).map(|(w, m)| ("head", w, m))),
+                None if listed => side_gap(&c, target).map(|(w, m)| ("head", w, m)),
+                None => None,
+            };
             let primary = args.get("primary").map(str::to_string).unwrap_or_else(|| c["primary"].as_str().unwrap_or("frames.presented.p95").to_string());
             // The case's margins, then `--noworse` over them (a bare margin is the primary's).
             let mut noworse = margins(&c["noworse"], &primary).map_err(|e| Error::usage(format!("{case}: noworse: {e}")))?;
             if let Some(flag) = args.get("noworse") {
                 noworse.extend(margins(&json!(flag), &primary).map_err(|e| Error::usage(format!("--noworse: {e}")))?);
             }
-            let expect = merged_expect(&targets[target], &c["expect"]);
+            // A gap's own selectors may name what its target lacks: nothing of it runs.
+            let (expect, launch) = match &gap {
+                Some(_) => (merged_expect(&targets[target], &c["expect"]), c["launch"].clone()),
+                None => (journey::side_expect(&targets[target], &c["expect"], target)?, journey::side_launch(&c["launch"], &targets[target]["ui"], target)?),
+            };
             for p in &combos {
                 out.push(Series {
                     expect: expect.clone(),
                     case_expect: c["expect"].clone(),
                     sides: sides.map(|(b, h)| (b.to_string(), h.to_string())),
                     gap: gap.clone(),
+                    adapted: c["adapted"].as_str().map(str::to_string),
                     hero: c["hero"] == true,
-                    cross_engine: sides.is_some_and(|(b, h)| engine(targets[b]["kind"].as_str().unwrap_or("")) != engine(targets[h]["kind"].as_str().unwrap_or(""))),
+                    cross_engine: sides.is_some_and(|(b, h)| engine(targets[b]["kind"].as_str().unwrap_or("")) != engine(targets[h]["kind"].as_str().unwrap_or(""))) || (check && engines.len() > 1),
                     case: case.clone(),
                     target: target.clone(),
                     params: p.clone(),
@@ -5042,7 +5209,7 @@ fn expand(describe: &Value, args: &Args, sides: Option<(&str, &str)>, only: Opti
                     metrics: c["metrics"].as_array().map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect()).unwrap_or_default(),
                     reset: c["reset"].as_bool().unwrap_or(false),
                     reset_check: c["resetCheck"] != false,
-                    launch: c["launch"].clone(),
+                    launch: launch.clone(),
                     timeout: c["timeout"].as_u64(),
                     gpu_cache: c["gpuCache"].as_str().map(str::to_string),
                 });

@@ -65,6 +65,8 @@ mod imp {
         pointer: Cell<Option<(f64, f64, Target)>>,
         pressed: Cell<Option<(Button, isize)>>,
         pacer: crate::driver::Pacer,
+        /// Reads of the app's tree since the last `take_reads` (`driver.reads`).
+        reads: Cell<u64>,
     }
 
     impl Session {
@@ -80,7 +82,27 @@ mod imp {
                 pointer: Cell::new(None),
                 pressed: Cell::new(None),
                 pacer: crate::driver::Pacer::default(),
+                reads: Cell::new(0),
             })
+        }
+
+        /// The reads of the app's tree since the last call (`driver.reads`).
+        pub fn take_reads(&self) -> u64 {
+            self.reads.replace(0)
+        }
+
+        /// The value (else the name) of the element `sel` matches, waiting up to `t` for it, with its
+        /// whitespace collapsed (`expect.same`); None when it never showed.
+        pub fn text(&self, sel: &Value, t: Duration) -> Result<Option<String>> {
+            match self.find(&parse_sel(sel)?, None, t) {
+                Ok((tree, i)) => {
+                    let n = &tree.nodes[i];
+                    let v = n.value.as_deref().filter(|v| !v.trim().is_empty()).unwrap_or(&n.name);
+                    Ok(Some(v.split_whitespace().collect::<Vec<_>>().join(" ")))
+                }
+                Err(e) if e.code == 124 => Ok(None),
+                Err(e) => Err(e),
+            }
         }
 
         /// The button flag a move carries while a button is held (Windows' `MK_*`; other OSes track it).
@@ -230,7 +252,7 @@ mod imp {
                 if Instant::now() >= deadline {
                     let secs = timeout.as_secs_f64();
                     let why = if let Some(n) = sel.index_misses(&tree) {
-                        format!("only {n} visible element{} matched in {secs:.1} s, and index={} needs at least {}", if n == 1 { "" } else { "s" }, sel.index(), sel.index() + 1)
+                        format!("only {n} visible element{} matched in {secs:.1} s, and index={} needs at least {}", if n == 1 { "" } else { "s" }, sel.index(), sel.needed())
                     } else if let Some(miss) = sel.text_misses(&tree) {
                         format!("{miss} in {secs:.1} s")
                     } else if tree.nodes.len() <= tree.windows.len() {

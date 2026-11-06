@@ -5,8 +5,10 @@
  * shadow roots; on a native app an element key or key path, `"nav-history"`, `"slider/knob"`), then filters:
  * `role=<role>` (ARIA's role names), `text=<text>` (a substring of its text, label or value; `text==<text>` all of
  * it, trimmed; quotes hold spaces: `text="Copy session"`), `index=<n>` (that match, 0-based in tree order, among
- * identical ones: six check boxes all named "checkbutton") and a `:focus` suffix. `'role=heading text=="General"'`,
- * `".row text=Draft index=1"`. The object form says the same, its `selector` in the string grammar.
+ * identical ones: six check boxes all named "checkbutton"; negative counts from the end, `index=-1` the last) and a
+ * `:focus` suffix. `'role=heading text=="General"'`, `".row text=Draft index=1"`. The object form says the same, its
+ * `selector` in the string grammar. In an implementation comparison `@name` (optionally with filters after it,
+ * `"@row index=-1"`) is the running target's {@link Side.ui} entry.
  */
 export type Selector = string | { selector?: string; role?: string; text?: string; exact?: boolean; index?: number; focus?: boolean }
 
@@ -98,6 +100,11 @@ export interface Page {
 
 export interface Context<P> {
   page: Page
+  /**
+   * The running target's adapter ({@link Side.ui}): a selector string, or a step called with this context
+   * (`await ctx.ui.openSession()`). A name this target's `ui` lacks is a parity gap (`ParityGap`).
+   */
+  ui: Record<string, any>
   /** The case this block runs: a block always belongs to one case. */
   case: string
   /** Marks a named span inside a run; every metric can be sliced by it, and `phase.<name>` is its wall time. */
@@ -284,14 +291,27 @@ export interface Expect {
   url?: string | RegExp
   /** Elements that must be visible: accessibility selectors for a native app, CSS selectors for a page. */
   visible?: Element | Element[]
+  /**
+   * Implementation comparisons: elements (usually `@name`s) whose text or value (trimmed, whitespace collapsed) must
+   * read the same on both sides after setup, after each run and after each reset; read outside the runs. A pair
+   * whose sides read differently is refused `NotEquivalent`. Required with a per-target `run`.
+   */
+  same?: Element[]
 }
+
+/** A hook per target of an implementation comparison, by target name: for journeys whose steps differ entirely. */
+export type PerTarget<P> = Record<string, (ctx: Context<P>) => unknown>
 
 /** A case of runs inside an open target: measured `run`, unmeasured `reset`. */
 export interface RunCase<P> extends CaseBase {
-  /** Measured. */
-  run(ctx: Context<P>): unknown
-  /** Puts the app back between runs. Never measured. */
-  reset?(ctx: Context<P>): unknown
+  /**
+   * Measured. In an implementation comparison, `{ <target>: (ctx) => … }` gives each target its own steps
+   * (`adapted: "steps"`); the case then needs `expect.same`, which shows the two step lists reach the same place.
+   * A target with no entry is a parity gap.
+   */
+  run: ((ctx: Context<P>) => unknown) | PerTarget<P>
+  /** Puts the app back between runs. Never measured. Per target like `run`. */
+  reset?: ((ctx: Context<P>) => unknown) | PerTarget<P>
   /** Milliseconds a run or reset may take before it fails the block (setup gets at least this too). Default 60000. */
   timeout?: number
   launch?: never
@@ -339,6 +359,13 @@ export interface Side {
   name?: string
   /** A folder (relative to the bench file) whose strobe.json gives this target's `build` and app profiles: another repository's implementation. Its default variant is that project. (A `command` target's `cwd` is where its command runs.) */
   cwd?: string
+  /**
+   * The adapter: what a journey's `@name`s mean on this target. A selector string (CSS on a page, a key path or
+   * `role=… text=…` on a native app), or a step `(ctx) => …` for where the steps differ (`ctx.ui.openSession()`).
+   * A case that names an entry this target lacks (in its hooks, `expect` or `until`) is a parity gap: listed, never
+   * run on either side.
+   */
+  ui?: Record<string, string | ((ctx: Context<any>) => unknown)>
 }
 
 /** Options of app and exe targets (Electron apps by profile or path). */
@@ -508,7 +535,7 @@ export interface Bench<Params extends Record<string, ParamValues>> {
  * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
  */
 export function web<P = any>(opts: { url?: FirstPage<P> } & PageOptions & Hooks<P> & Side = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless }
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless, ui: opts.ui }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */

@@ -572,9 +572,12 @@ Fewer than 6 pairs never gets a verdict.
   - Each target has a `name` (what every report calls it); `cwd: "../other-repo"` takes that repo's strobe.json for its builds and app profiles.
   - Both talk to one `fixture("<server> --port {port}", { seed })`: strobe starts it per block outside both apps; pass `{fixture.url}` in the targets' `args`, `env` or `files`.
   - Pick a primary both sides measure the same way: `cpu.work`, `run.duration`, `launch.ready`, `memory.app.private`; `main.work` or `ui.cpu` against another engine exits 2 (`NotComparable`).
-  - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case (a parity gap: listed, never run).
+  - Give each target a `ui` adapter for what differs: `ui: { timeline: ".scroll-view", openSession: ({ page }) => page.click("@row") }`; journeys say `page.scroll("@timeline", …)`, `await ctx.ui.openSession()`, `until: "@timeline"`, `"@row index=-1"` (the last).
+  - A journey one side cannot run: `unsupported: { rewrite: "why" }` on the case, or just an `@name` its `ui` lacks (a parity gap: listed with the missing name, never run).
+  - `expect: { same: ["@topRow"] }`: both sides must read it the same after setup, each run and each reset, or the series is refused `NotEquivalent`. Steps that differ entirely: `run: { original: fn, rewrite: fn }` (needs `expect.same`).
+  - Same input on both sides: a page against a native app gets OS input like the native side; `page.act` on one side and `click` on the other, or other call counts, is `InputMismatch`. Keep waits in runs on `until: "frame"`/`"idle"` (`driver.reads`, `ObserverCost`).
   - Give the app under test its own bundle id (macOS) through its build's own config overrides, so strobe may launch it beside your installed copy (`LiveChannel`).
-  - `--noworse 5%` asks "no worse anywhere"; `--check --head <target>` runs one side's cases once.
+  - `--check` runs every target's cases once and prints the parity matrix (ok, gap, what `expect.same` read, why journeys differ); `--check --head <target>` one side's; `--noworse 5%` asks "no worse anywhere".
   - Where each spends its time: `--why always` profiles each side once with its own engine's tools.
   - Read each side alone (`query <rec> threads`, `hotspots --by package`); `query a..b` across implementations is refused (`NotComparable`).
   - `report experiment <exp> --open`: both sides in two columns; a shared scale only where both come from one source.

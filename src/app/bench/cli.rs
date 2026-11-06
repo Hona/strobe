@@ -405,5 +405,6 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         client: None,
         browser: None,
         directions,
+        ..Block::default()
     })
 }

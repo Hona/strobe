@@ -109,12 +109,13 @@ pub struct Selector {
     exact: bool,
     focus: bool,
     text: Option<String>,
-    index: usize,
+    /// The match it means, in tree order: from 0, or from the end (-1 the last).
+    index: i64,
     pub source: String,
 }
 
 /// The selector grammar, for errors.
-const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav-history\", \"slider/knob\"; CSS on a page), then role=<role>, text=<text> (a substring; text==<text> the whole text; quoted to hold spaces, text=\"Copy session\"), index=<n>, and an optional :focus suffix; or { selector, role, text, exact, index, focus }";
+const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav-history\", \"slider/knob\"; CSS on a page), then role=<role>, text=<text> (a substring; text==<text> the whole text; quoted to hold spaces, text=\"Copy session\"), index=<n> (from 0; -1 the last), and an optional :focus suffix; or { selector, role, text, exact, index, focus }";
 
 /// Splits a selector string at whitespace outside quotes, brackets and parentheses. A quote opens a
 /// quoted value only at a value's start (after `=`, `(`, `[` or a space), so `text=don't` is one
@@ -211,7 +212,7 @@ impl Selector {
                     exact = whole.is_some();
                     text = Some(unquote(whole.unwrap_or(x)));
                 }
-                Some(("index", n)) if index.is_none() => index = Some(n.parse::<usize>().map_err(|_| bad(format!("index={n} is not a whole number")))?),
+                Some(("index", n)) if index.is_none() => index = Some(n.parse::<i64>().map_err(|_| bad(format!("index={n} is not a whole number")))?),
                 Some((k @ ("role" | "text" | "index"), _)) => return Err(bad(format!("{k} given twice"))),
                 Some(("nth", _)) => return Err(bad("nth= is index= here".into())),
                 Some((k, _)) => return Err(bad(format!("{k}= is no filter"))),
@@ -226,8 +227,8 @@ impl Selector {
                 text = Some(text.map_or(Ok(x.to_string()), |_| Err(twice("text")))?);
             }
             if let Some(n) = o.get("index") {
-                let n = n.as_u64().ok_or_else(|| bad(format!("index {n} is not a whole number")))?;
-                index = Some(index.map_or(Ok(n as usize), |_| Err(twice("index")))?);
+                let n = n.as_i64().ok_or_else(|| bad(format!("index {n} is not a whole number")))?;
+                index = Some(index.map_or(Ok(n), |_| Err(twice("index")))?);
             }
             exact |= o.get("exact") == Some(&Value::Bool(true));
             focus |= o.get("focus") == Some(&Value::Bool(true));
@@ -260,15 +261,20 @@ impl Selector {
         json!({ "css": css, "role": self.role, "text": self.text, "exact": self.exact, "index": self.index, "focus": self.focus })
     }
 
-    /// The match `index=` takes, from 0.
-    pub fn index(&self) -> usize {
+    /// The match `index=` takes: from 0, or from the end (-1 the last).
+    pub fn index(&self) -> i64 {
         self.index
+    }
+
+    /// How many visible matches `index=` needs: 3 for `index=2` and for `index=-3`.
+    pub fn needed(&self) -> usize {
+        if self.index < 0 { self.index.unsigned_abs() as usize } else { self.index as usize + 1 }
     }
 
     /// When only `index` missed (fewer visible matches than it needs): how many there are.
     pub fn index_misses(&self, t: &Tree) -> Option<usize> {
         let n = t.find(&Selector { index: 0, ..self.clone() }).len();
-        (self.index > 0 && n > 0 && n <= self.index).then_some(n)
+        (self.index != 0 && n > 0 && n < self.needed()).then_some(n)
     }
 
     /// When the selector carries a text filter and only that missed: what the visible elements it
@@ -406,9 +412,12 @@ impl Tree {
         (x1 - x0 >= 1.0 && y1 - y0 >= 1.0).then_some([x0, y0, x1 - x0, y1 - y0])
     }
 
-    /// Visible matches in tree order, from the selector's `index` on (the first is the one it means).
+    /// Visible matches in tree order, from the selector's `index` on (the first is the one it means;
+    /// a negative index counts from the last).
     pub fn find(&self, sel: &Selector) -> Vec<usize> {
-        (0..self.nodes.len()).filter(|&i| sel.matches(self, i) && self.visible_rect(i).is_some()).skip(sel.index).collect()
+        let all: Vec<usize> = (0..self.nodes.len()).filter(|&i| sel.matches(self, i) && self.visible_rect(i).is_some()).collect();
+        let skip = if sel.index < 0 { all.len() as i64 + sel.index } else { sel.index };
+        if skip < 0 { Vec::new() } else { all.into_iter().skip(skip as usize).collect() }
     }
 
     /// The node's key path: the ids of it and its keyed ancestors, root first.

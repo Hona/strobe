@@ -104,6 +104,8 @@ struct Run {
     changes: Vec<u64>,
     /// Elements in the app's windows at the run's end, when strobe drives it (`StateDrift`).
     elements: Option<usize>,
+    /// Reads of the app's tree inside the run (`driver.reads`), when strobe drives it.
+    reads: Option<f64>,
     t0: u64,
     t1: u64,
     total: f64,
@@ -272,6 +274,7 @@ fn runs(
                     std::thread::sleep(Duration::from_millis(ms as u64));
                     return Ok(Value::Bool(call == "wait"));
                 }
+                hooks.op(call, &args);
                 let session = drive.get().map_err(|e| Error { message: format!("page.{call}(): {}", e.message), ..e })?;
                 session.dispatch(call, &args, &presents, pixels.as_deref())
             }
@@ -308,6 +311,12 @@ fn runs(
     super::super::record::app_gone(n, "before the runs", |_| last())?;
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
     hooks.check_fixture();
+    // `expect.same` (SPEC §9.10): read through the session after setup, each run and each reset.
+    let same = super::journey::Same::new(s, target)?;
+    let read_same = |when| same.read(when, &|sel| drive.get()?.text(sel, Duration::from_secs(2)));
+    if same.on() && !windowless {
+        read_same(super::journey::When::Setup)?;
+    }
     lap("setup", steps);
     // What the window shows before the runs: its titles and pixels, and its tree only when setup
     // already drove the app (reading it now would connect strobe to the app for the runs).
@@ -377,6 +386,7 @@ fn runs(
         if let Some(se) = drive.session.get() {
             se.set_pids(&pids);
             se.take_log();
+            se.take_reads();
         }
         hooks.begin(&format!("run:{i}"));
         // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
@@ -401,9 +411,13 @@ fn runs(
         hooks.end();
         let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
         log.marks.extend(hooks.take_marks());
+        let reads = drive.session.get().map(|se| se.take_reads() as f64);
         let elements = drive.session.get().and_then(|se| se.count_elements().ok());
         let ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), elements, t0, t1, total: 0.0 });
+        runs.push(Run { ms, cpu: cpu_ms(c0, c1, ms), span: wakes::span(&snap0, &snap1), counts: hooks.counts(), log, changes: Vec::new(), elements, reads, t0, t1, total: 0.0 });
+        if same.on() {
+            read_same(super::journey::When::Run)?;
+        }
         // A key or button the run left held would be down in the next one.
         if let Some(se) = drive.session.get() {
             se.release_all();
@@ -414,6 +428,9 @@ fn runs(
                 .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
             if let Some(se) = drive.session.get() {
                 se.release_all();
+            }
+            if same.on() {
+                read_same(super::journey::When::Reset)?;
             }
         }
         runs[i].total = began.elapsed().as_secs_f64() * 1e3;
@@ -535,6 +552,10 @@ fn runs(
     // The bench file's `ctx.count`, and `phase.<name>` from strobe's own marks.
     let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice())).collect();
     extra.extend(super::block::per_run_hooks(s, &key, &hooked));
+    // strobe's own reads of the app's tree inside the runs (`ObserverCost`).
+    if measured.iter().any(|r| r.reads.is_some()) {
+        extra.insert("driver.reads".into(), per_run(&|r| r.reads.unwrap_or(0.0)));
+    }
     // Drags: the moves strobe posted, beside the frames the app drew.
     if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
         extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
@@ -811,6 +832,8 @@ fn runs(
         // content size to compare there.
         client: n.window.as_ref().filter(|_| !cfg!(target_os = "macos")).map(client_of),
         directions: BTreeMap::new(),
+        same: same.take(),
+        ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
         ..Block::default()
     })
 }

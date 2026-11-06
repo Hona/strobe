@@ -2,6 +2,7 @@
 //! marks.
 
 pub mod native;
+pub mod os;
 
 use crate::model::{Error, Result};
 use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
@@ -111,8 +112,10 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     const bare = q.css == null && q.role == null && q.text != null
     const all = bare ? holders(q.text, q.exact) : query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
     const found = all.filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact))
+    // A negative index counts from the last match (-1): the walk goes backwards and stops there too.
     let left = q.index ?? 0
     if (q.text == null) {
+      if (left < 0) { for (let i = found.length - 1; i >= 0; i--) if (visible(found[i]) && ++left === 0) return found[i]; return null }
       for (const el of found) if (visible(el) && left-- === 0) return el
       return null
     }
@@ -127,7 +130,7 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     const shown = [...new Set(bare ? found.map(lift).filter(Boolean) : found.filter(visible))]
     const outer = new Set()
     for (const el of shown) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
-    return shown.filter((el) => !outer.has(el))[left] ?? null
+    return shown.filter((el) => !outer.has(el)).at(left) ?? null
   }
   s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
   s.box = (q) => {
@@ -256,6 +259,12 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     for (const e of events) document.addEventListener(e, yes, true)
     const t = setTimeout(() => done(false), timeout)
   })
+  // What `expect.same` compares: a field's value, else the element's text; null when it never showed.
+  s.text = (q, timeout) => s.waitFor(q, timeout, "").then(() => {
+    const el = s.find(q)
+    const v = !el ? null : /^(input|textarea|select)$/.test(el.localName) ? el.value : (el.innerText ?? el.textContent)
+    return v == null ? null : String(v).trim().replace(/\s+/g, " ")
+  }, () => null)
   s.frame = () => new Promise((r) => raf(() => raf(() => r(true))))
   s.nodes = () => document.getElementsByTagName("*").length
   return s
@@ -311,6 +320,14 @@ pub fn element_box(page: &Page, sel: &Selector, timeout: Duration) -> Result<Opt
     );
     let v = helped(page, &expr, timeout)?;
     Ok(v.as_str().and_then(|s| serde_json::from_str(s).ok()))
+}
+
+/// The text or value of the element `sel` matches (`__strobe.text`), waiting up to `timeout` for it;
+/// None when it never showed.
+pub fn text(page: &Page, sel: &Value, timeout: Duration) -> Result<Option<String>> {
+    let sel = Selector::parse(sel, Dialect::Page)?;
+    let v = helped(page, &format!("__strobe.text({}, {})", sel.page_spec(), timeout.as_millis()), timeout + Duration::from_secs(5))?;
+    Ok(v.as_str().map(str::to_string))
 }
 
 /// A selector argument with a call's `{ text, exact }` options added (`waitFor(sel, { text })`).
@@ -409,6 +426,10 @@ pub struct Driver {
     /// scroll: a page without the browser's own input latencies (Firefox) joins them to the frames
     /// that showed them.
     pub inputs: RefCell<Vec<(u64, bool)>>,
+    /// A page measured from outside against a native implementation: its input goes through the OS.
+    pub os: std::cell::OnceCell<os::OsInput>,
+    /// Reads of the page through the probe (a wait, finding an element): `driver.reads` per run.
+    pub reads: Cell<u64>,
 }
 
 impl Driver {
@@ -426,6 +447,8 @@ impl Driver {
             pacer: Pacer::default(),
             drags: RefCell::new(Vec::new()),
             inputs: RefCell::new(Vec::new()),
+            os: std::cell::OnceCell::new(),
+            reads: Cell::new(0),
         }
     }
 
@@ -579,11 +602,13 @@ impl Driver {
     }
 
     fn call(&self, expr: &str) -> Result<Value> {
+        self.reads.set(self.reads.get() + 1);
         helped(&self.page, expr, Duration::from_secs(60))
     }
 
     /// A helper call that waits in the page for up to `timeout`: the in-page timeout fires first and names what it waited for.
     fn wait(&self, expr: &str, timeout: Duration) -> Result<Value> {
+        self.reads.set(self.reads.get() + 1);
         // A wait ends with the document it runs in: CDP reports a reload or navigation as a collected promise or
         // a destroyed context, which says nothing about what happened to the page.
         helped(&self.page, expr, timeout + Duration::from_secs(10)).map_err(|e| {
@@ -614,6 +639,10 @@ impl Driver {
 
     /// Lets go of every key and mouse button `down` (or a drag) left held, so the next run starts with none.
     pub fn release_all(&self) -> Result<()> {
+        if let Some(os) = self.os.get() {
+            os.release_all();
+            return Ok(());
+        }
         let (mask, _) = self.buttons.get();
         for b in [Button::Left, Button::Right, Button::Middle] {
             if mask & cdp_button(b).1 != 0 {
@@ -650,6 +679,9 @@ impl Driver {
         let opts = |i: usize| args.get(i).cloned().unwrap_or(Value::Null);
         // A selector as the bench gave it: a string, or `{ selector, role, text, exact, index, focus }`.
         let sel = |i: usize| args.get(i).cloned().unwrap_or(Value::String(String::new()));
+        if let Some(os) = self.os.get().filter(|_| os::INPUT.contains(&call)) {
+            return self.os_dispatch(os, call, args);
+        }
         match call {
             "goto" => {
                 let to = s(0);

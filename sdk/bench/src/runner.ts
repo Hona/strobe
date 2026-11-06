@@ -19,7 +19,72 @@ const file = path.resolve(process.argv[2] ?? "")
 const spec = (await import(pathToFileURL(file).href)).default
 if (!spec || typeof spec !== "object" || !spec.cases) throw new Error(`${file} must default-export bench({ targets, cases })`)
 for (const [name, c] of Object.entries(spec.cases) as [string, any][])
-  if (typeof c.run !== "function" && !c.launch) throw new Error(`case ${name} needs run(ctx) or launch: { until }`)
+  if (typeof c.run !== "function" && !(c.run && typeof c.run === "object") && !c.launch) throw new Error(`case ${name} needs run(ctx), run: { <target>: (ctx) => … }, or launch: { until }`)
+
+// A target's adapter (`ui`): `@name` in a selector is its entry there, and `ctx.ui.<name>` its
+// selector or its step bound to the hook's context (SPEC §9.10).
+const ui = (target: string): Record<string, any> => spec.targets?.[target]?.ui ?? {}
+const names = new Set(Object.values(spec.targets ?? {}).flatMap((t: any) => Object.keys(t?.ui ?? {})))
+
+class ParityGap extends Error {
+  refusal: object
+  constructor(target: string, what: string) {
+    const summary = `${spec.targets?.[target]?.name ?? target} has no ${what}`
+    super(`ParityGap: ${summary}`)
+    this.refusal = { validator: "ParityGap", summary, fix: `give ${target}'s ui ${what}, or mark the case unsupported there` }
+  }
+}
+
+// `@name` (optionally followed by filters, `@row index=-1`) as the running side's selector.
+function alias(sel: unknown): unknown {
+  if (sel && typeof sel === "object" && !Array.isArray(sel) && typeof (sel as any).selector === "string")
+    return { ...(sel as object), selector: alias((sel as any).selector) }
+  if (typeof sel !== "string" || !sel.startsWith("@")) return sel
+  const [, name, rest] = sel.match(/^@([A-Za-z_$][\w$]*)\s*(.*)$/s) ?? []
+  if (!name) return sel
+  const entry = ui(state.target)[name]
+  if (entry === undefined) throw new ParityGap(state.target, `@${name}`)
+  if (typeof entry !== "string") throw new Error(`@${name} is a step of ${state.target}'s ui, not a selector: call ctx.ui.${name}()`)
+  return rest ? `${entry} ${rest}` : entry
+}
+
+// A call's options with their selectors (`until`, `selector`, `at`) resolved.
+const opts = (o: any) => {
+  if (!o || typeof o !== "object") return o
+  const out = { ...o }
+  for (const k of ["until", "selector", "at"]) if (k in out && !Array.isArray(out[k])) out[k] = alias(out[k])
+  return out
+}
+
+// The `@name`s and `ui.<name>`s a function's source names (only names some target's ui has: typed
+// text such as "@mention" is no adapter entry).
+function named(source: string): string[] {
+  const out = new Set<string>()
+  for (const m of source.matchAll(/["'`]@([A-Za-z_$][\w$]*)/g)) if (names.has(m[1])) out.add(m[1])
+  for (const m of source.matchAll(/\bui\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([A-Za-z_$][\w$]*)["'`]\s*\])/g)) if (names.has(m[1] ?? m[2])) out.add(m[1] ?? m[2])
+  return [...out]
+}
+
+// A hook of a case on a target: one function, or the target's entry of a per-target map.
+const hookFor = (h: any, target: string) => (typeof h === "function" ? h : h && typeof h === "object" ? h[target] : undefined)
+
+// What a target lacks to run a case, found before anything runs (a journey is never half run): the
+// adapter entries its hooks, `expect` and `until` name, through the steps they call, or its own run.
+function gapOf(c: any, target: string): { missing: string; reason: string } | undefined {
+  if (c.run && typeof c.run === "object" && typeof c.run[target] !== "function") return { missing: "run", reason: `the case gives no run for ${target}` }
+  const sources = [spec.setup, hookFor(c.run, target), hookFor(c.reset, target)].filter((f) => typeof f === "function").map(String)
+  sources.push(JSON.stringify(plain(c.expect ?? null)), JSON.stringify(plain(c.launch?.until ?? null)))
+  const own = ui(target)
+  const seen = new Set<string>()
+  const todo = sources.flatMap(named)
+  while (todo.length) {
+    const n = todo.pop()!
+    if (seen.has(n)) continue
+    seen.add(n)
+    if (!(n in own)) return { missing: `@${n}`, reason: `no @${n} in ${target}'s ui` }
+    if (typeof own[n] === "function") todo.push(...named(String(own[n])))
+  }
+}
 
 let seq = 0
 const pending = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>()
@@ -31,28 +96,29 @@ const request = (op: string, args: object) =>
   })
 const driver = (call: string, ...args: unknown[]) => request("driver", { call, args })
 
+// Every selector, and every option that holds one, goes through the side's adapter before strobe sees it.
 const page = {
-  goto: (url: string, o = {}) => driver("goto", url, o),
-  click: (selector: unknown, o = {}) => driver("click", selector, o),
-  hover: (selector: unknown, o = {}) => driver("hover", selector, o),
-  move: (x: number, y: number, o = {}) => driver("move", x, y, o),
-  type: (selector: unknown, text: string, o = {}) => driver("type", selector, text, o),
-  press: (key: string, o = {}) => driver("press", key, o),
-  down: (key: string, o = {}) => driver("down", key, o),
+  goto: (url: string, o = {}) => driver("goto", url, opts(o)),
+  click: (selector: unknown, o = {}) => driver("click", alias(selector), opts(o)),
+  hover: (selector: unknown, o = {}) => driver("hover", alias(selector), opts(o)),
+  move: (x: number, y: number, o = {}) => driver("move", x, y, opts(o)),
+  type: (selector: unknown, text: string, o = {}) => driver("type", alias(selector), text, opts(o)),
+  press: (key: string, o = {}) => driver("press", key, opts(o)),
+  down: (key: string, o = {}) => driver("down", key, opts(o)),
   // A path function is sampled every 4 ms of the drag's duration; strobe moves along the samples.
   drag: (selector: unknown, path: [number, number][] | ((t: number) => [number, number]), o: { duration?: number } = {}) => {
-    if (typeof path !== "function") return driver("drag", selector, path, o)
+    if (typeof path !== "function") return driver("drag", alias(selector), path, opts(o))
     const n = Math.max(2, Math.ceil((o.duration ?? 1000) / 4) + 1)
-    return driver("drag", selector, Array.from({ length: n }, (_, i) => path(i / (n - 1))), o)
+    return driver("drag", alias(selector), Array.from({ length: n }, (_, i) => path(i / (n - 1))), opts(o))
   },
-  up: (key: string, o = {}) => driver("up", key, o),
+  up: (key: string, o = {}) => driver("up", key, opts(o)),
   snapshot: (name: string) => driver("snapshot", name),
-  scroll: (selector: unknown, delta: object, o = {}) => driver("scroll", selector, delta, o),
-  wheel: (selector: unknown, delta: object, o = {}) => driver("wheel", selector, delta, o),
-  window: (action: string, o = {}) => driver("window", action, o),
-  act: (selector: unknown, action: string, o = {}) => driver("act", selector, action, o),
-  query: (selector: unknown, o = {}) => driver("query", selector, o),
-  waitFor: (selector: unknown, o = {}) => driver("waitFor", selector, o),
+  scroll: (selector: unknown, delta: object, o = {}) => driver("scroll", alias(selector), delta, opts(o)),
+  wheel: (selector: unknown, delta: object, o = {}) => driver("wheel", alias(selector), delta, opts(o)),
+  window: (action: string, o = {}) => driver("window", action, opts(o)),
+  act: (selector: unknown, action: string, o = {}) => driver("act", alias(selector), action, opts(o)),
+  query: (selector: unknown, o = {}) => driver("query", alias(selector), opts(o)),
+  waitFor: (selector: unknown, o = {}) => driver("waitFor", alias(selector), opts(o)),
   idle: (o = {}) => driver("idle", o),
   wait: (ms: number) => driver("wait", ms),
   eval: (fn: Function, ...args: unknown[]) => driver("eval", fn.toString(), ...args),
@@ -77,8 +143,21 @@ const state: {
   relay: any
 } = { case: "", params: {}, target: "", variant: "base", url: "", root: "", home: null, env: null, exe: null, playwright: null, prepared: undefined, mocks: [], session: null, fixture: null, engine: "chromium", relay: null }
 
-const context = () => ({
+// `ctx.ui.<name>`: the side's selector, or its step called with this context; a name it lacks is a parity gap.
+const uiOf = (ctx: () => object) =>
+  new Proxy({}, {
+    get(_, name) {
+      if (typeof name !== "string") return undefined
+      const entry = ui(state.target)[name]
+      if (entry === undefined) throw new ParityGap(state.target, `@${name}`)
+      return typeof entry === "function" ? (...args: unknown[]) => entry(ctx(), ...args) : entry
+    },
+    has: (_, name) => typeof name === "string" && name in ui(state.target),
+  })
+
+const context = (): any => ({
   page,
+  ui: uiOf(context),
   case: state.case,
   params: state.params,
   target: state.target,
@@ -150,7 +229,14 @@ function describe() {
   const targets = Object.fromEntries(
     Object.entries(spec.targets ?? {}).map(([name, t]: [string, any]) => [
       name,
-      { ...plain(t), url: typeof t.url === "function" ? "/" : t.url, prepare: !!t.prepare || typeof t.url === "function", teardown: !!t.teardown },
+      // `ui`: selectors as strings, steps as `{ step: true }` (strobe resolves `@name` in `expect` and `until`).
+      {
+        ...plain(t),
+        url: typeof t.url === "function" ? "/" : t.url,
+        prepare: !!t.prepare || typeof t.url === "function",
+        teardown: !!t.teardown,
+        ui: Object.fromEntries(Object.entries(t.ui ?? {}).map(([k, v]) => [k, typeof v === "function" ? { step: true } : v])),
+      },
     ]),
   )
   const cases = Object.fromEntries(
@@ -160,6 +246,8 @@ function describe() {
         primary: c.primary ?? (c.launch ? "launch.ready" : undefined),
         metrics: c.metrics ?? [],
         reset: !!c.reset,
+        adapted: c.run && typeof c.run === "object" ? "steps" : null,
+        gaps: Object.fromEntries(Object.keys(spec.targets ?? {}).flatMap((t) => { const g = gapOf(c, t); return g ? [[t, g]] : [] })),
         resetCheck: c.resetCheck !== false,
         targets: c.targets,
         timeout: c.timeout,
@@ -354,13 +442,16 @@ async function handle(op: string, args: any) {
     case "setup":
       await spec.setup?.(context())
       return true
-    case "run":
-      await spec.cases[args.case].run(context())
+    case "run": {
+      const run = hookFor(spec.cases[args.case].run, state.target)
+      if (!run) throw new ParityGap(state.target, `run for ${args.case}`)
+      await run(context())
       return true
+    }
     case "reset": {
-      const c = spec.cases[args.case]
-      if (!c.reset) return false
-      await c.reset(context())
+      const reset = hookFor(spec.cases[args.case].reset, state.target)
+      if (!reset) return false
+      await reset(context())
       return true
     }
     case "close": {

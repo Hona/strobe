@@ -134,6 +134,13 @@ impl<'a> Hooks<'a> {
         }
     }
 
+    /// An input call of the bench file's run (`journey::op_count`), counted per run for `InputMismatch`.
+    pub(super) fn op(&self, call: &str, args: &[Value]) {
+        if let Some(n) = super::journey::op_count(call, args).filter(|_| self.in_run()) {
+            self.add(&BTreeMap::from([(format!("{}{call}", super::journey::OP), n)]));
+        }
+    }
+
     /// Counts from another source of the run (a page's counter global).
     pub(super) fn add(&self, from: &BTreeMap<String, f64>) {
         let mut c = self.counts.borrow_mut();

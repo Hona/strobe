@@ -1879,9 +1879,11 @@ export default bench({
   takes accessibility selectors for a native app and CSS selectors for a page; a block on another
   screen is refused `WrongScreen`, §10.1, and without it strobe still records what each block
   showed, §10.2), and for implementation comparisons `unsupported` (`{ <target>: "<why>" }`: a parity
-  gap) and `hero` (lead the report with this journey), §9.10.
+  gap), `hero` (lead the report with this journey), `expect.same` (elements both sides must read the
+  same) and `run`/`reset` per target (`{ <target>: fn }`), §9.10. Targets take `ui` there (their
+  adapter: `@name` → a selector or a step).
 
-**`ctx`:** `page`, `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
+**`ctx`:** `page`, `ui` (the running target's adapter, §9.10), `phase(name, fn)` (its wall time is `phase.<name>`, §7.3), `count(name, n?)` (§8.4), `call(name, ...args)` (script
 targets), `waitForLine(match, { in, timeout })` (native targets: the first line matching a string or
 RegExp that the app writes after the call, from its output, which strobe pipes only for a target
 with `output: true` (a pipe makes a C runtime buffer stdout: the app must flush each line; without
@@ -1963,7 +1965,9 @@ handed to the page's helper or matched against the accessibility tree: a base, t
   does not hide its element). A text with no base or role is looked for in the page's text nodes, not
   in every element's whole text, so there it matches text within one text node.
 - `index=<n>`: that match, 0-based in tree order, among identical ones (six check boxes all named
-  "checkbutton"); `nth=` says to use `index=`.
+  "checkbutton"); a negative index counts from the end (`index=-1` the last match, `-2` the one
+  before); `nth=` says to use `index=`. A page's probe walks backwards for a negative index and stops at
+  its match, as it does forwards.
 - a `:focus` suffix on the last filter or key, or alone: the focused element. A page's CSS keeps its own
   `:focus` (`textarea, input:focus`), and one inside quotes is text.
 
@@ -2257,8 +2261,9 @@ A side of an experiment is a target at a variant. In an A/B both sides share the
 and differ in build; in an **implementation comparison** each side is a target of its own (a rewrite:
 an Electron app against a native one, one toolkit against another), and both run the same cases
 (**journeys**) in alternating A B / B A pairs. Blocks, pairs, looks, verdicts, `noworse`, Holm, the
-validators and the ledger work unchanged on the pair. Phase 1 (as built): sides, fixtures,
-comparability, outside-in pages; journeys with input, adapters and `expect.same` come next.
+validators and the ledger work unchanged on the pair. As built: sides, fixtures, comparability,
+outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMismatch`,
+`NotEquivalent`, `driver.reads` and the `--check` parity matrix (phase 2).
 
 - **Sides.** `--base <target>[=<variant>] --head <target>[=<variant>]`: a value whose name before `=`
   is a target of the bench file picks that target, and `=<variant>` its build (any variant §9.5 takes:
@@ -2278,11 +2283,61 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
   variant is that project, built there with no harness copied into it. Without `cwd` a side's default
   variant is the bench file's project. (A `command` target's `cwd` keeps its meaning: where its
   command runs.)
-- **Parity gaps.** A case whose `targets` leave out a side's target, or whose `unsupported` names it
-  (`unsupported: { rewrite: "no find in session yet" }`), is a parity gap: the series is listed with the
-  side and why, its primary refused `ParityGap`, nothing runs on either side (half a journey measures
-  other work), and it never counts as better or worse. A bench with gaps exits 0; `--require-parity`
-  (for CI that guards a finished port) or `--require-verdict` makes any gap exit 4.
+- **Adapters** (`ui` on a target): what a journey's `@name`s mean on that target. An entry is a
+  selector string (CSS on a page, a key path or `role=… text=…` on a native app) or a step
+  `(ctx) => …` for where the steps differ. `@name` anywhere a selector goes (a call's selector,
+  `until`, `selector`, `at`, `expect`, a launch's `until`), optionally followed by filters
+  (`@row index=-1`), is the running side's entry; the runner resolves a hook's before it sends the call,
+  so strobe's driver never sees an alias, and strobe resolves the file's own (`expect`, `until`) per
+  side. `ctx.ui.<name>` is the entry: its selector, or its step called with the hook's context
+  (`await ctx.ui.openSession()`). A case may also give each target its own hooks
+  (`run: { electron: fn, rune: fn }`, `reset` likewise): the series is `adapted: "steps"`, and the case
+  must declare `expect.same` (a usage error, exit 2, without it), since nothing else shows that the
+  two step lists reach the same place.
+- **Parity gaps.** A case whose `targets` leave out a side's target, whose `unsupported` names it
+  (`unsupported: { rewrite: "no find in session yet" }`), that gives other targets their own `run` and
+  this one none, or whose hooks, `expect` or `until` name an `@name` (or `ui.<name>`) another target's
+  `ui` has and this one's lacks (followed through the steps it calls) is a parity gap: the series is
+  listed with the side, why and the missing entry (`gap.missing`: `@find`), its primary refused
+  `ParityGap`, nothing runs on either side (half a journey measures other work), and it never counts
+  as better or worse. The runner finds the names in the hooks' source before anything runs; a name
+  built at run time that a side lacks throws `ParityGap` at its first use, and the series becomes a gap
+  with its blocks discarded. A bench with gaps exits 0; `--require-parity` (for CI that guards a
+  finished port) or `--require-verdict` makes any gap exit 4.
+- **The same journey** (`expect.same`: elements, usually `@name`s): each block reads their text (a
+  field's value, else the element's text; a native element's value, else its name), trimmed with
+  whitespace collapsed, after setup, after each run and after each reset, between runs and outside
+  every CPU window, waiting up to 2 s for each (one that never shows reads `(no element)`). A pair
+  whose sides read differently at any of those points (the values read after its runs, and after its
+  resets, as sets, since the sides' warmup runs differ in number) refuses the series `NotEquivalent`
+  at that pair: every comparison refused, no more pairs. `equivalence [{ selector, base, head, ok,
+  pairs }]` per series gives what the last pair read at the end of the journey. Reading a native
+  side after setup connects strobe's accessibility client before the runs, as any driven case does.
+- **The same input** (`InputMismatch`): each block keeps its measured runs' input calls (`ops`: each
+  call's median count per run, a typed character each). A pair is refused when one side acts through
+  accessibility actions (`page.act`) where the other gives pointer or key input, when the calls differ
+  by over 5% of the larger side's (not for `adapted: "steps"`, whose steps differ by design), or
+  when the drags' `input.rate` differs by over 5% (a driver that starved on one side looks like a slow
+  app). A page against a native side gets OS input (below); another engine's page there takes no
+  input in its runs yet (`InputMismatch`).
+- **The same latency samples** (`NotEquivalent` for `interaction.*`, `scroll.latency.*`): both sides
+  take samples by one rule (§7.4: an input at rest, the app's model changing within a second, a
+  present within a second); a side whose blocks gave under 0.8 or over 1.25 times the other's samples
+  (`interaction.n`, `scroll.n`, medians) timed other inputs, and those metrics are refused.
+- **What driving costs** (`driver.reads`, `ObserverCost`): strobe reads each side through what it
+  offers, a page's DOM through its probe and a native app's accessibility tree, and a read inside a run
+  costs the app work a person's use would not (a lazy provider builds and updates its tree once a
+  client reads it). Every block counts strobe's reads inside each measured run (`driver.reads`: the
+  page probe's calls, a tree's snapshots), `fairness.observer.reads_per_run` gives each side's, and
+  `ObserverCost` (§10.2) warns when a side's runs read over twice a second, or one side over 4 times as
+  often as the other (above half a read a second). Waits on `until: "frame"` or `"idle"` read nothing.
+- **`--check` parity matrix.** `--check` of a file whose cases run on two or more targets prints, after
+  the cases, one row per journey: each target's outcome (`ok` with its primary, `FAIL` with the
+  validator, or `gap  no @find`) and the `expect.same` reads where two or more ran, or why their
+  journeys differ (`NotEquivalent`, `InputMismatch`, compared with the first target that ran it). A
+  differing journey fails the check (exit 1); a gap is listed, and exits 4 with `--require-parity`.
+  A file whose targets run on different engines checks its pages from outside with OS input, as a
+  timed block does.
 - **Comparability** (`MetricDef.across`, §7.1). Between sides of one engine (two pages, two native
   apps) every metric compares. Between engines (Chromium, native, script: `web`, `url`, `app`, `exe`
   and `command` are Chromium), a `per_side` metric is one engine's own (`main.*`, `layout.*`, `js.*`,
@@ -2342,10 +2397,28 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
   macOS and Linux as for native apps), and `cpu.work` over the browser's process set (now on every
   page block: CPU time per run). `Performance.getMetrics` and the JS heap are still read at run
   boundaries (per side), outside the CPU window, which brackets the run alone (in every page block),
-  and warmup waits for the processes' CPU to hold steady. Input latency from outside needs OS input
-  to a page, which is not built yet: a declared `interaction.*` or `scroll.latency.*` is refused
-  there, and a run that sends the page input through DevTools (`click`, `type`, `press`, `scroll`,
-  `wheel`, `drag`, `down`, `up`, `hover`, `move`) is refused `InputMismatch` (setup and reset may).
+  and warmup waits for the processes' CPU to hold steady. Every input of such a block (setup's and
+  reset's too) is the OS's, as the native side's is (`driver::os`, Chromium pages): posted window
+  messages on Windows, Quartz events on macOS, XTest on X11, through the native driver's posters, never
+  DevTools. Elements are found through the page probe, and a page point goes to the screen by a map
+  strobe measures before setup: it posts two pointer moves inside the window and reads where trusted
+  `pointermove`s landed in the page, which also proves posted input reaches it; none within a second,
+  or points that do not map by one scale, refuse the block `InputMismatch`. The calls behave as the
+  native driver's: a click parks the cursor, presses, waits for the page to rest and releases; `type`
+  clicks into a field without focus, then presses a key per character; `scroll` sends one wheel step
+  per refresh at `speed` (default 3000 px/s, the native default); `drag` moves once per refresh; the
+  window the OS hit-tests must be the browser's (`WindowHidden` otherwise), and a locked session refuses
+  `SessionLocked`. Between runs strobe checks that what it posted arrived: keys, button presses or
+  wheel turns posted since the last check that reached the page as no trusted event refuse the block
+  `InputMismatch` (a navigation in between leaves it to the next check). Input latency then follows
+  the native rule (§7.4) with the page's own changes (`CHANGES_SCRIPT`: DOM mutations, input and
+  scroll events) in place of an accessibility tree's, and `until: "frame"` waits for the browser's next
+  frame on the screen from the OS's presents. Windows: whether posted messages reach a Chromium window
+  is checked by that probe on each block (not yet on a real unlocked desktop). macOS: keys posted to
+  the browser's process reach the page with their modifiers (a page's own `Meta+2` handler runs), but
+  a chord the browser handles as a menu key equivalent (Cmd+A's select all, Cmd+C) does nothing
+  (checked on air: the page saw `Meta+a`, nothing was selected): a journey's reset that needs one
+  uses an `eval` on the page side.
 - **macOS.** A page or Electron side's window is brought to the front (as a native block's, after a
   minute without input) and must be the active app and uncovered at the start and end of the runs
   (`WindowHidden`, which a bench waits out), so both sides run as the key window.
@@ -2371,12 +2444,15 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
   worse, unclear, gaps, better_alone, worse_alone, family, all_no_worse }` (the journeys as one
   family, §9.3; the text output's `family` line), each primary's `p_repeated` and `holm_decided`
   (its better or worse verdict confirmed across the family), and per series `hero` (the case's
-  `hero: true`), `targets`, `target_kinds`, `adapted`,
-  `equivalence`, `per_side`, and for a gap `gap { side, name, missing, reason }`. Roles stay `base`
-  and `head`; the ledger's identity is `<target>=<build>` per side.
+  `hero: true`), `targets`, `target_kinds`, `adapted` (`steps` or null),
+  `equivalence`, `per_side`, and for a gap `gap { side, name, missing, reason }`; each block's `same`
+  (by name: `{ setup, run[], reset[] }`) and `ops` (call → median per run). `fairness.input` is `os`
+  when a native side or a page from outside is driven through the OS, `devtools` for two pages. Roles
+  stay `base` and `head`; the ledger's identity is `<target>=<build>` per side.
 - **Checked** (phase 1): vps (Linux VM) and adais (Windows, locked) with a windowless planted-work
   app as two targets and a copy of it as the fixture; air (macOS) with two copies of a native app.
-  Numbers in §24.2.
+  Phase 2: air with a native app against its page twin and OpenCode's Electron window. Numbers in
+  §24.2.
 
 ## 10. Validity
 
@@ -2398,8 +2474,9 @@ comparability, outside-in pages; journeys with input, adapters and `expect.same`
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block) |
 | `FixtureMismatch` | a block's target held no TCP connection to the bench file's fixture at any run's start or end, or one of its processes runs the fixture's executable (it started its own server), §9.10 |
 | `NotComparable` | a metric one engine has (`across: per_side`) between sides on different engines: a primary is a usage error before anything builds (exit 2), a declared secondary a refused row (§9.10). Also a question with no answer between two implementations: `query a..b` of their recordings, or a base..head view of `query <exp>` (exit 2, §11.1). At exit 2 it stays typed: the error carries the validator (`--json` and MCP give `validator: "NotComparable"`), so nothing reads its message |
-| `InputMismatch` | a run of a page measured from outside against a native implementation sends input through DevTools, where the other side would get OS input or none (§9.10) |
-| `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`): the series' primary, nothing run; the bench still exits 0 |
+| `InputMismatch` | the sides of an implementation comparison got other input (§9.10): one acted through accessibility actions where the other got pointer or key input, their runs' input calls differ by over 5% (not with steps per target), or their drags' `input.rate` does (the series, from that pair); OS input posted to a page measured from outside did not reach it (the block); a run of a page from outside in an engine strobe gives no OS input sends input |
+| `NotEquivalent` | the sides of an implementation comparison did not do the same journey (§9.10): an `expect.same` element read differently after setup, a run or a reset (the series, from that pair); or their latency samples (`interaction.n`, `scroll.n`) are under 0.8 or over 1.25 times each other (refuses `interaction.*` or `scroll.latency.*`) |
+| `ParityGap` | a journey one side of an implementation comparison cannot run (its `targets` or `unsupported`, a `run` per target without its own, an `@name` its `ui` lacks): the series' primary, nothing run; the bench still exits 0 |
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore history-search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
@@ -2462,7 +2539,10 @@ second on a 165 Hz display, so it draws as fast as it can and its CPU and GPU nu
 said for every series, declared frame metrics or not, with the session and display state; native
 `record` and `record pid:` keep it as `unpaced` and `query summary` prints it) · `GpuCacheGrowing`
 (a variant's GPU shader caches still grew in its third warm-up block, §13.2) · `ScreenChanged`
-(base and head ended their runs on different screens, or some blocks of one variant did: below).
+(base and head ended their runs on different screens, or some blocks of one variant did: below) ·
+`ObserverCost` (an implementation comparison: strobe read a side's page or accessibility tree inside
+its runs over twice a second, or one side over 4 times as often as the other above half a read a
+second, `driver.reads`, §9.10: each read costs that app work the other may not do).
 
 **What was on screen.** Every block of a windowed native target, a page or an Electron app reads
 what it showed before its warmup runs and after its measured runs (a launch: once it was ready),
@@ -4917,9 +4997,8 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   flags not in `cli::FLAGS` (the dead `--perfetto` and `--pin-runner` went), and MCP schemas take
   their types from that table (§17).
 - Implementation comparisons, phase 1 (§9.10): sides, per-target projects, fixtures, comparability,
-  pages from outside, parity gaps. Not built yet: journeys with input (OS input to pages, `ui`
-  adapters and `@name`, `expect.same`, `InputMismatch`, `NotEquivalent`, `driver.reads`,
-  `ObserverCost`), per-side attribution, tracking (the scoreboard, its card and PR block came after:
+  pages from outside, parity gaps. Phase 2 (see the entry after this one) added journeys with input.
+  Not built yet: per-side attribution, tracking (the scoreboard, its card and PR block came after:
   see the entry above). Checked
   with a windowless app that spins `--work` ms every 25 ms and asks the fixture (a copy of it) once a
   tick, 1 s runs, 8 pairs each: vps (Linux VM) A/A through two targets `+0.2% [−0.3 … +0.7]` no worse
@@ -4934,6 +5013,27 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   `underpowered`; idle `cpu.work` A/A underpowered (1.3 ms a run); a viewport or `gpuCache` on one
   side only refuses `VariantMismatch` before anything builds. `memory.app.pss` on vps 0.56 MB beside
   `memory.app.private` 0.50 MB for the one-process app.
+- Implementation comparisons, phase 2 (§9.10): `ui` adapters (`@name` resolved by the runner for
+  hooks, by strobe for `expect` and `until`; `ctx.ui`; steps), runs per target (`adapted: "steps"`,
+  `expect.same` required), parity gaps from a scan of the hooks' source (`gaps` in the runner's
+  description) and from a name missing at run time, `expect.same` reads and `NotEquivalent`, input
+  calls per run (`ops`) and `InputMismatch`, latency sample parity, `driver.reads` and `ObserverCost`,
+  OS input to Chromium pages measured from outside (`driver::os`, behind the engine seam's Chromium
+  arm: Firefox pages from outside still take no input in their runs), the `--check` parity matrix, and
+  `index=-1`. Checked on air (macOS 27, shared with other agents' benches; untimed or 2-pair smoke
+  runs, no verdicts) with the Cocoa dev app (`scripts/dev/cocoa-app.swift`) against a page twin of it
+  in Chrome, both through `ui` adapters: the `--check` matrix listed a gap (`no @find`), the same
+  `@echo` on both, `InputMismatch` for a step that acts on one side and clicks on the other, and
+  `NotEquivalent` for another seed (`@echo` read `"echo:"` against `"echo: zzz"` after setup). OS input
+  reached the page: clicks (`interaction.p95` 44.7 ms), typing (39.5 ms page, 75.1 ms Cocoa), scrolls
+  (`scroll.latency.p95` 52.3 ms), drags (`input.rate` 59.9/s against the native side's 59.8/s once the
+  page's drags paced on the unrounded refresh; 62.4/s before, 4% apart); and typing into OpenCode's
+  Electron window (60.8 ms). Timed pairs: the act-against-click journey refused at pair 1, `type`'s
+  equivalence table `@echo` ok over 2 pairs with 18 latency samples a block on both sides and
+  `driver.reads` 4 a run on each. The key check first raced the page (a run without `until` posted a
+  key strobe checked before the page took it): it now waits up to a second. Windows is not checked on
+  a desktop yet (adais locked): its posted messages reach a Chromium window or the block refuses. Linux
+  (XTest) is clippy-clean, not run on a display.
 - Process sets (§13.2): a launched target's metrics, wakes, windows, present events, native stacks
   (`probe::stacks::Targets`: `probe::suspend` and `probe::perf` read the set again as they sample,
   `probe::sample` once at the start, and the helper's kernel profile gets the set from the client

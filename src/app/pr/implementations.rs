@@ -298,7 +298,8 @@ impl<'a> Doc<'a> {
         if outs.iter().all(|o| *o == Out::Refused) {
             return "Not measured".into();
         }
-        let need = self.series.iter().filter_map(|s| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000)).max();
+        // Only a count past the pairs already run: "~6 pairs" after 8 reads as a contradiction.
+        let need = self.series.iter().filter_map(|s| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000 && *n > s["pairs"].as_u64().unwrap_or(0))).max();
         need.map(|n| format!("Not decided yet: needs ~{n} pairs")).unwrap_or_else(|| "Not decided yet".into())
     }
 

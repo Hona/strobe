@@ -197,7 +197,8 @@ pub(super) fn build(r: &Value) -> Forest {
     } else if series.iter().filter(|s| !family::gap(s)).all(|s| primary_out(s, false) == Out::Same) {
         (format!("No measurable difference from {bn}"), format!("every compared journey within its bound in {}", pr_pairs(&series)))
     } else {
-        let need = series.iter().filter_map(|s| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000)).max();
+        // Only a count past the pairs already run: "~6 pairs" after 8 reads as a contradiction.
+        let need = series.iter().filter_map(|s| s["primary"]["needed_pairs"].as_u64().filter(|n| *n <= 1000 && *n > s["pairs"].as_u64().unwrap_or(0))).max();
         ("Not decided yet".into(), need.map(|n| format!("needs ~{n} pairs")).unwrap_or_default())
     };
     // Under a calm heading, the first undecided journey's pairs (else the first compared one's).

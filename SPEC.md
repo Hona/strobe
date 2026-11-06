@@ -5453,6 +5453,15 @@ started before the navigation), sampled allocations (the profiler's `jsallocatio
 attribution through the Web Inspector (waits for the WebKit drivers to land). Not checked: headed
 Firefox attribution on Windows (locked).
 
+Sampling interval kept (2026-11-07, 8.3 "Interval kept" and Firefox, §19). Until then the Windows
+Gecko interval was 1 ms for every Firefox and every view printed the interval asked (`samples at
+1000 µs`, `at 200 µs`) while the samples were 2 ms or 0.52 ms apart. `--check --why always` of a page
+whose click spins named functions, headless (smoke runs, not timed): adais (Windows 11, locked)
+Firefox 159.0.1 `sampled every 2.0 ms (asked 1 ms)`, Firefox Nightly 162.0a1 0.52 ms (asked 0.5 ms),
+Chromium 0.52 ms (asked 0.2 ms); vps (Debian 13 VM) Firefox 159.0.1 0.20 ms (asked 0.2 ms), Chromium
+0.27 ms (asked 0.2 ms). `record --probes attribution` says the same in its summary (adais: Chromium
+0.54 ms, Firefox 159 2.0 ms). Not run on air (offline): macOS keeps 200 µs, the code there unchanged.
+
 Firefox launch cases and where input aims (2026-11-06, 9.6 "Pages in each engine" and "Where input
 aims", 10.1 `OutOfView`, `ClockUnsynced`). A page's launch case runs in Firefox: a fresh browser and
 profile per launch, the observer a BiDi preload script that answers over a `script.message` channel,

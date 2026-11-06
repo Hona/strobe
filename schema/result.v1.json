@@ -165,7 +165,8 @@
         "NoMetric",
         "NoWaits",
         "NotEquivalent",
-        "Untimed"
+        "Untimed",
+        "OutOfView"
       ]
     },
     "verdictKind": {

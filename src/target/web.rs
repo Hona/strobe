@@ -279,6 +279,16 @@ impl WebPage {
         }
     }
 
+    /// Starts a navigation and returns once the browser took it, without waiting for the document: a
+    /// launch case times the load itself. WebKit's Classic navigation returns only after the load.
+    pub fn start_navigation(&self, url: &str) -> Result<()> {
+        match self {
+            WebPage::Chromium(p) => p.send("Page.navigate", json!({ "url": url })).map(|_| ()),
+            WebPage::Firefox(p) => p.bidi.send("browsingContext.navigate", json!({ "context": p.context, "url": url, "wait": "none" })).map(|_| ()),
+            WebPage::Webkit(_) => Err(Error::msg("internal: a WebKit page cannot start a navigation without waiting for its load")),
+        }
+    }
+
     /// A script every document runs before its own (WebKit, which has no preload: once strobe first
     /// touches the document, after its own).
     pub fn add_init_script(&self, source: &str) -> Result<()> {

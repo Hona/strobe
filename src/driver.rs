@@ -4,7 +4,7 @@
 pub mod native;
 pub mod os;
 
-use crate::model::{Error, Result};
+use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::present::frames::Sent;
 use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
 use crate::target::a11y::{Dialect, Selector};
@@ -167,12 +167,45 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     return shown.filter((el) => !outer.has(el)).at(left) ?? null
   }
   s.focused = (q) => { const el = s.find(q); return !!el && (el.contains(document.activeElement) || el.matches(":focus-within")) }
+  // The part of an element a person could see, in viewport CSS pixels: its box clipped by the viewport (without its
+  // scroll bars) and by every ancestor that clips its overflow. An absolutely positioned element is clipped only from
+  // its containing block up, a fixed one only by the viewport unless a transform, filter or containment holds it. The
+  // root and body clip as the viewport does. `by`: the ancestor that left none of it, if one did.
+  const shownPart = (el) => {
+    const r = el.getBoundingClientRect()
+    const root = document.compatMode === "BackCompat" && document.body ? document.body : document.documentElement
+    let x0 = Math.max(r.left, 0), y0 = Math.max(r.top, 0)
+    let x1 = Math.min(r.right, root?.clientWidth || innerWidth), y1 = Math.min(r.bottom, root?.clientHeight || innerHeight)
+    let pos = getComputedStyle(el).position, by = null
+    for (let p = up(el); p && p !== document.body && p !== document.documentElement; p = up(p)) {
+      const cs = getComputedStyle(p)
+      const holder = cs.transform !== "none" || cs.filter !== "none" || cs.perspective !== "none" || /paint|layout|strict|content/.test(cs.contain)
+      if (pos === "fixed" ? !holder : pos === "absolute" ? cs.position === "static" && !holder : false) continue
+      pos = cs.position
+      if (cs.overflowX === "visible" && cs.overflowY === "visible") continue
+      const b = p.getBoundingClientRect(), left = b.left + p.clientLeft, top = b.top + p.clientTop
+      x0 = Math.max(x0, left); y0 = Math.max(y0, top); x1 = Math.min(x1, left + p.clientWidth); y1 = Math.min(y1, top + p.clientHeight)
+      if (!by && (x1 - x0 < 1 || y1 - y0 < 1)) by = p
+    }
+    return x1 - x0 >= 1 && y1 - y0 >= 1 ? { x: (x0 + x1) / 2, y: (y0 + y1) / 2 } : { by }
+  }
+  // Where input aims at an element: the centre of its visible part (a box taller than the viewport, a long editor,
+  // is aimed at the middle of what shows of it, never at its own centre off the screen), scrolled into view at once
+  // when none of it shows. Without a visible part even then: no point, and why.
   s.box = (q) => {
     const el = s.find(q)
     if (!el) return null
-    let r = el.getBoundingClientRect()
-    if (r.bottom < 0 || r.top > innerHeight || r.right < 0 || r.left > innerWidth) { el.scrollIntoView({ block: "nearest", inline: "nearest" }); r = el.getBoundingClientRect() }
-    return { x: r.left + Math.min(r.width, innerWidth) / 2, y: r.top + Math.min(r.height, innerHeight) / 2, w: r.width, h: r.height }
+    let part = shownPart(el)
+    if (part.x == null) {
+      // At once: a page's `scroll-behavior: smooth` would leave the box where the scroll began.
+      try { el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" }) } catch { el.scrollIntoView({ block: "nearest", inline: "nearest" }) }
+      part = shownPart(el)
+    }
+    const r = el.getBoundingClientRect()
+    const box = { w: r.width, h: r.height }
+    if (part.x != null) return { ...box, x: part.x, y: part.y }
+    const at = Math.round(r.width) + "x" + Math.round(r.height) + " at (" + Math.round(r.left) + ", " + Math.round(r.top) + ")"
+    return { ...box, x: null, y: null, hidden: "its box (" + at + ") shows nowhere in the " + innerWidth + "x" + innerHeight + " viewport even scrolled into view" + (part.by ? ": " + name(part.by) + " clips it away" : "") }
   }
   // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
   // `:focus` selector would otherwise never resolve.
@@ -982,7 +1015,14 @@ impl Driver {
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
-        Ok((b["x"].as_f64().unwrap_or(0.0), b["y"].as_f64().unwrap_or(0.0), b["focused"] == true))
+        // The same rule in every engine: the centre of the element's visible part (`__strobe.box`), never a point
+        // outside the viewport, where an input lands on nothing (or a WebDriver browser refuses it).
+        match (b["x"].as_f64(), b["y"].as_f64()) {
+            (Some(x), Some(y)) => Ok((x, y, b["focused"] == true)),
+            _ => Err(Refusal::new(ValidatorId::OutOfView, format!("{}: {}, so input there would land beside it", sel.source, b["hidden"].as_str().unwrap_or("no part of it shows")))
+                .fix("aim at what a person would click: an element with a part on the screen (a person could not reach this one either)")
+                .into()),
+        }
     }
 
     fn until(&self, opts: &Value) -> Result<Value> {

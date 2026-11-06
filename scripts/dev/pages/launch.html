@@ -1,0 +1,24 @@
+<!doctype html>
+<!-- A cold first visit for web launch cases: a mark, a frame holding the until selector (which must not end
+the launch), then the selector itself after about 150 ms of script work and a timer. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>launch</title>
+  </head>
+  <body>
+    <iframe srcdoc="<main id='ready'>a frame's own element</main>"></iframe>
+    <script>
+      performance.mark("booted")
+      const until = performance.now() + 150
+      while (performance.now() < until) {}
+      setTimeout(() => {
+        const main = document.createElement("main")
+        main.id = "ready"
+        main.textContent = "ready"
+        document.body.append(main)
+        performance.mark("shown")
+      }, 50)
+    </script>
+  </body>
+</html>

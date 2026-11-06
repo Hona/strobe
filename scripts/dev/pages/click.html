@@ -1,0 +1,37 @@
+<!doctype html>
+<!-- Where input aims: a composer taller than the viewport whose top shows (its centre is far below the window),
+an element below the fold, one half off the right edge, and one an `overflow: clip` box leaves nothing of. An
+element is marked data-clicked only when a click lands on it. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <title>click</title>
+    <style>
+      html { scroll-behavior: smooth; }
+      body { margin: 0; font: 13px/18px system-ui, sans-serif; }
+      header { height: 600px; background: #eee; }
+      #composer { display: block; width: 100%; height: 3000px; border: 1px solid #888; box-sizing: border-box; }
+      #wide { position: relative; left: 60vw; width: 90vw; height: 80px; background: #cde; }
+      #below { height: 80px; background: #dec; }
+      #box { overflow: clip; height: 40px; width: 200px; position: relative; }
+      #clipped { position: absolute; top: 60px; height: 40px; width: 200px; background: #edc; }
+    </style>
+  </head>
+  <body>
+    <header></header>
+    <div id="composer" contenteditable="true"></div>
+    <div id="wide">wide</div>
+    <div style="height: 1500px"></div>
+    <div id="below">below the fold</div>
+    <div id="box"><div id="clipped">clipped</div></div>
+    <div style="height: 400px"></div>
+    <script>
+      document.addEventListener("click", (e) => {
+        for (const id of ["composer", "wide", "below", "clipped"]) {
+          const el = document.getElementById(id)
+          if (el.contains(e.target)) el.dataset.clicked = String(Number(el.dataset.clicked ?? 0) + 1)
+        }
+      })
+    </script>
+  </body>
+</html>

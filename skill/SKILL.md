@@ -61,7 +61,8 @@ strobe bench <file.bench.ts> --head <variant>
   - `alloc`, `heap`, `leaks` and `style` refuse `EngineUnsupported` on a Firefox recording.
   - Leak runs (`--probes memory`) read about:memory after every run: page JS memory and DOM growth,
     no suspects (no heap snapshots).
-  - No launch cases in Firefox yet. `ctx.mock` and `ctx.addInitScript` work; `ctx.playwright` throws.
+  - Launch cases run (fresh profile each launch, `until` seen from the document's first script); no attribution
+    block for them yet. WebKit refuses launch cases. `ctx.mock` and `ctx.addInitScript` work; `ctx.playwright` throws.
   - A case whose primary Firefox cannot measure is listed `refused` with the closest primary it has; the other cases still run.
 - `--headless`: page targets headless, timed too; runs through a lock. Frame, latency, scroll, canvas and GPU-use metrics refuse `Headless`; `input.rate` stays. Pages only (an app or native target is a usage error).
 
@@ -287,6 +288,8 @@ export default bench({
 - `type`: one key event per character; `delay` ms between.
 - `press`: `"F9"`, `"PageUp"`, `"Control++"`, `"ControlOrMeta+Shift+P"`: one key table on every target.
 - `click(sel, { button, modifiers, count })`.
+  - Aims at the centre of the part of the element that shows (scrolled into view first if none does), in every engine and on native apps; a box taller than the window is clicked where it shows.
+  - Nothing of it shows even in view (an `overflow: clip` box): refused `OutOfView`, naming the clipping ancestor.
 - `down(key)`/`up(key)`: hold a key across calls: a game's `w`, a held `Shift`.
   - `"Mouse"`, `"MouseRight"`, `"MouseMiddle"` hold a button, `{ at: sel | [x, y] }`, and `move` then drags.
 - `drag(sel, path, { duration })`: press, move along keyframes `[[dx, dy], …]` or `t => [dx, dy]`, one move per display frame without waiting for each to be handled, release.

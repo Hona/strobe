@@ -1712,11 +1712,11 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
     let mut attribution = Value::Null;
-    let profiled_engine = !matches!(target["kind"].as_str(), Some("web" | "url")) || engine_of(&target) != WebEngine::Webkit;
-    if passed && ctx.args.get("why") == Some("always") && !profiled_engine {
-        ctx.warnings.push(validity::info("Attribution", format!("{}: {} pages have no profilers in strobe yet: no attribution block (profile it in Chromium)", s.label(), engine_of(&target))));
+    let unprofiled = no_profiler(&target, s.launch.is_object()).filter(|_| matches!(target["kind"].as_str(), Some("web" | "url")));
+    if let (true, Some(no)) = (passed && ctx.args.get("why") == Some("always"), &unprofiled) {
+        ctx.warnings.push(validity::info("Attribution", format!("{}: {no}: no attribution block (profile it in Chromium)", s.label())));
     }
-    if passed && ctx.args.get("why") == Some("always") && profiled_engine {
+    if passed && ctx.args.get("why") == Some("always") && unprofiled.is_none() {
         progress(format!("  attribution block ({}; not timed)", why_text(&target)));
         let v = &variants[0];
         // Warmed and run as in a bench (`--runs`, default 5): `--check`'s single cold run would start no
@@ -2607,7 +2607,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // Each side is profiled with its own engine's tools: an implementation comparison's two may differ,
     // and a side strobe has no profiler for gets no block while the other still gets its own.
     let side_targets: Vec<Value> = variants.iter().map(|v| ctx.describe["targets"][v.target_of(s)].clone()).collect();
-    let unprofiled: Vec<(usize, String)> = side_targets.iter().enumerate().filter_map(|(i, t)| Some((i, no_profiler(t)?))).collect();
+    let unprofiled: Vec<(usize, String)> = side_targets.iter().enumerate().filter_map(|(i, t)| Some((i, no_profiler(t, s.launch.is_object())?))).collect();
     let why = match ctx.args.get("why").unwrap_or(if ctx.args.get("probes") == Some("timing") { "never" } else { "auto" }) {
         _ if halted.is_some() => false,
         // A command ends inside each run: there is nothing to profile it with.
@@ -2888,13 +2888,15 @@ fn tail_state(x: &Exec, mut b: Block) -> Block {
     b
 }
 
-/// Why strobe has no attribution block for this target: a command ends inside each run, and only
-/// Chromium's DevTools and Firefox's own profiler profile a page; a WebKit page has none in strobe.
-/// None when its own engine's tools profile it.
-fn no_profiler(target: &Value) -> Option<String> {
-    match target["kind"].as_str() {
-        Some("cli") => Some("a command ends inside each run: there is nothing to profile it with".into()),
-        Some("web" | "url") if engine_of(target) == WebEngine::Webkit => Some(format!("{} pages have no profilers in strobe yet", engine_of(target))),
+/// Why strobe has no attribution block for this target (`launch`: of a launch case): a command ends
+/// inside each run, and only Chromium's DevTools and Firefox's own profiler profile a page; a WebKit
+/// page has none in strobe, and Firefox's profile names the page by strobe's run marks, which no
+/// document carries from a launch's navigation. None when its own engine's tools profile it.
+fn no_profiler(target: &Value, launch: bool) -> Option<String> {
+    match (target["kind"].as_str(), engine_of(target)) {
+        (Some("cli"), _) => Some("a command ends inside each run: there is nothing to profile it with".into()),
+        (Some("web" | "url"), WebEngine::Webkit) => Some(format!("{} pages have no profilers in strobe yet", engine_of(target))),
+        (Some("web" | "url"), WebEngine::Firefox) if launch => Some("a Firefox page's launch has no profile in strobe yet".into()),
         _ => None,
     }
 }
@@ -5815,10 +5817,12 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
             "attribute or leak-check the page in Chromium or Firefox (--engine firefox)",
         ));
     }
-    Ok(if engine != WebEngine::Chromium && s.launch.is_object() {
+    // A launch is timed by an observer in every document from its first script: Chromium's DevTools and
+    // Firefox's preload scripts put it there; WebDriver Classic has no preload script.
+    Ok(if engine == WebEngine::Webkit && s.launch.is_object() {
         Some(
-            Refusal::new(ValidatorId::EngineUnsupported, format!("{on}launch cases time a launch through Chromium's DevTools; {engine} launch cases are not built yet"))
-                .fix("measure the launch in Chromium, or time the load in a run case (phase around page.goto)"),
+            Refusal::new(ValidatorId::EngineUnsupported, format!("{on}a {engine} page has no preload script over WebDriver Classic, so nothing of strobe's sees a launch's document from its start"))
+                .fix("measure the launch in Chromium or Firefox, or time the load in a run case (phase around page.goto)"),
         )
     } else if let Some(r) = validity::engine_refusal(engine, &s.primary) {
         Some(Refusal { summary: format!("{on}{}", r.summary), ..r })

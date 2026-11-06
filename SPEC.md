@@ -518,7 +518,7 @@ error (narrow it with `--target`). `webkit` refuses on Windows for good (`Engine
 browser runs there for people), and with `--headless` on macOS (Safari has no headless mode); on Linux
 `--headless` picks WPE WebKit, headed WebKitGTK (§13.1). A primary the engine cannot measure
 refuses its series before anything builds (`EngineUnsupported`, with the closest metric it can), as does
-a launch case in another engine than Chromium; `--probes attribution|memory` on a WebKit page refuses
+a launch case on WebKit (no preload script); `--probes attribution|memory` on a WebKit page refuses
 the run. Declared secondaries the engine cannot measure are refused per block.
 **Refused series:** a series refused before anything builds (one case's Chromium-only primary in a
 file run on Firefox) is listed, never run, and the rest of the file runs: `--check` prints `refused
@@ -2119,15 +2119,29 @@ Selectors cross shadow roots with `>>>` (`[data-component=file] >>> [data-line="
 `waitFor` observe every shadow root in the page, including ones attached later, so what a component
 renders into one (a diff or code viewer) counts as a change.
 
+**Where input aims** (every engine, one rule in the page probe, `__strobe.box`): at the centre of the
+element's visible part, in viewport CSS pixels, as on native apps (13.7). The visible part is its box
+clipped by the viewport without its scroll bars and by every ancestor that clips its overflow (an
+absolutely positioned element only from its containing block up, a fixed one only by the viewport
+unless a transform, filter or containment holds it; the root and body clip as the viewport). An
+element of which nothing shows is first scrolled into view at once (`behavior: "instant"`: a page's
+smooth scrolling would leave the box where the scroll began), nearest edge. A box taller or wider than
+the viewport (a long editor) is aimed at the middle of what shows of it: aiming at its own centre had
+sent a click far outside the window (Firefox refused it: `Move target (720, 1105) is out of bounds of
+viewport dimensions (1440, 900)`; Chromium dispatched it to nothing). When nothing of the element shows
+even scrolled into view (an `overflow: clip` box, a sliver under a pixel), the call refuses
+`OutOfView`, naming the ancestor that clips it away. Clicks, hovers, drags, scrolls, wheels, `down`'s
+`at` and the click that focuses for `type` and `press` all aim this way.
+
 **`page` driver** (strobe's own, over CDP or the bridge, so it works on Stable):
 
 | Call | Does |
 |---|---|
 | `goto(url, opts?)` | navigate and wait for load; a relative path resolves against the page |
-| `click(selector, opts?)` | `Input.dispatchMouseEvent` at the element's centre; `opts.button` (`left`, `right`, `middle`), `opts.modifiers` (`["Shift"]`, `["ControlOrMeta"]`) held around it, and `opts.count` 2 or 3 for a double or triple click (each press carries its count), on pages and native apps alike. A native click holds the button about 60 ms on every OS, as a person does |
-| `hover(selector, opts?)` | the pointer moves to the element's centre, no click: reveals hover-only controls |
+| `click(selector, opts?)` | `Input.dispatchMouseEvent` at the centre of the element's visible part (below); `opts.button` (`left`, `right`, `middle`), `opts.modifiers` (`["Shift"]`, `["ControlOrMeta"]`) held around it, and `opts.count` 2 or 3 for a double or triple click (each press carries its count), on pages and native apps alike. A native click holds the button about 60 ms on every OS, as a person does |
+| `hover(selector, opts?)` | the pointer moves to the centre of the element's visible part, no click: reveals hover-only controls |
 | `move(x, y, opts?)` | the pointer moves to a viewport point: parks it away from anything that reacts to hover (an app that prefetches what the pointer rests on); while `down` holds a mouse button it drags (the move carries the button, and a native app gets it in the window the button went down in, as pointer capture does) |
-| `drag(selector, path, opts?)` | presses at the element's centre (where the pointer is with `""`), moves along `path` and releases (`opts.button`: `left`, `right`, `middle`). `path` is offsets `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps): keyframes spread evenly over `opts.duration` (ms, default 1000), straight between them, or a function of `t` from 0 to 1, which the runner samples every 4 ms (`t => [40 * Math.sin(t * 12 * Math.PI), 0]` wiggles). One move per display frame, paced on strobe's clock: the period is the median of ten of the page's own animation frames (a native app: its display's refresh), and each move goes out at its deadline without waiting for the last one's reply. strobe sleeps toward a deadline only as long as its timers have proved they wake in time and spins the rest. Each driver keeps its own record of how late its sleeps woke: the lead it spins grows to the latest wake, shrinks by an eighth with each wake in time and a sixteenth with each frame it spun whole, and never passes one frame, so one late wake no longer makes every later drag of a long-lived process (the daemon) spin. Under a launchd job whose timers macOS coalesces (`TimerCoalescing`, §10.2) a 16 ms sleep woke 20 to 60 ms late and the moves came in bursts (`input.gap.p95` 66 to 75 ms at 59 moves a second; 16.7 ms spinning). The path starts at offset `[0, 0]`, put first when it does not: keyframes `[[300, 0], [300, 300], [0, 0]]` had pressed 300 px off the element. `page.move` awaits `Input.dispatchMouseEvent`'s reply, which comes once the renderer handled the event, so on a slow main thread a drag of awaited moves sent input at the renderer's rate, and dropped frames partly meant "no new input came". A native app's moves are posted (no reply to wait for). A button `down` already holds stays held. `input.rate` (moves sent per second over the drags' time) and `input.gap.p95` (the 95th percentile gap between consecutive moves) sit beside the frame metrics, so input that starved (a busy machine, strobe at background priority) is visible instead of passing for dropped frames |
+| `drag(selector, path, opts?)` | presses at the centre of the element's visible part (where the pointer is with `""`), moves along `path` and releases (`opts.button`: `left`, `right`, `middle`). `path` is offsets `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps): keyframes spread evenly over `opts.duration` (ms, default 1000), straight between them, or a function of `t` from 0 to 1, which the runner samples every 4 ms (`t => [40 * Math.sin(t * 12 * Math.PI), 0]` wiggles). One move per display frame, paced on strobe's clock: the period is the median of ten of the page's own animation frames (a native app: its display's refresh), and each move goes out at its deadline without waiting for the last one's reply. strobe sleeps toward a deadline only as long as its timers have proved they wake in time and spins the rest. Each driver keeps its own record of how late its sleeps woke: the lead it spins grows to the latest wake, shrinks by an eighth with each wake in time and a sixteenth with each frame it spun whole, and never passes one frame, so one late wake no longer makes every later drag of a long-lived process (the daemon) spin. Under a launchd job whose timers macOS coalesces (`TimerCoalescing`, §10.2) a 16 ms sleep woke 20 to 60 ms late and the moves came in bursts (`input.gap.p95` 66 to 75 ms at 59 moves a second; 16.7 ms spinning). The path starts at offset `[0, 0]`, put first when it does not: keyframes `[[300, 0], [300, 300], [0, 0]]` had pressed 300 px off the element. `page.move` awaits `Input.dispatchMouseEvent`'s reply, which comes once the renderer handled the event, so on a slow main thread a drag of awaited moves sent input at the renderer's rate, and dropped frames partly meant "no new input came". A native app's moves are posted (no reply to wait for). A button `down` already holds stays held. `input.rate` (moves sent per second over the drags' time) and `input.gap.p95` (the 95th percentile gap between consecutive moves) sit beside the frame metrics, so input that starved (a busy machine, strobe at background priority) is visible instead of passing for dropped frames |
 | `type(selector, text, opts?)` | clicks the element unless focus is already inside it (`""`: types where focus is), then one `Input.dispatchKeyEvent` down/up per character (`opts.delay` ms apart), so every keystroke is an interaction |
 | `press(key, opts?)` | `Input.dispatchKeyEvent`; Playwright's key names (`Enter`, `F9`, `PageUp`, `Delete`, `Insert`, `+`) and chords (`Control+a`, `Control++`, `ControlOrMeta+Shift+P`); `opts.selector` sends it to that element (clicked into focus first, as `type` does). Keys come from one table for every target (`keys::dom`: the page's `key` and `code`, the Windows virtual key that is also its `keyCode`, the text it types): a named key is that key, and only a single character types text (`F9` had typed the text "F9"). On a page a chord's modifiers mark the key's events, as CDP takes them, rather than going down as keys of their own, so a chord is one interaction. Shift types what a US keyboard's key types with it (`Shift+a` is `A`, `Shift+1` is `!`) on a page and on macOS, where the character is set on the event (it had typed `a`); Windows and X11 make it from the key state |
 | `down(key, opts?)`, `up(key, opts?)` | one key held across other calls until its `up` (a game's `w`); a held `Shift`, `Control`, `Alt` or `Meta` marks the key events sent while it is down. No auto-repeat: Chromium's input sends none. A mouse button: `Mouse` (left), `MouseRight`, `MouseMiddle`, pressed where the pointer is, or first at `opts.at` (a selector, or `[x, y]` in the viewport or the main window's client area); `move` then drags until `up`. A block that ends with a button held releases it |
@@ -2220,6 +2234,24 @@ discarded first, so the OS has read the build from disk before any timed launch.
   `waitForDebuggerOnStart`, so each page pauses until strobe's observer is in it, then runs. A page
   that loaded before strobe could attach (a browser opens its first page at startup) gets the
   observer late; that is still valid unless `until` already shows, which refuses the launch.
+  The observer runs in a page's top document only: an element in a frame never ends a launch.
+- **Pages in each engine:** a `web` or `url` launch is a fresh browser with a fresh profile (no HTTP
+  cache, storage, service worker or browser shader cache from an earlier visit; the GPU driver's own
+  shader cache is the OS user's and stays), timed from strobe's navigation command on the host's wall
+  clock to the observer's `performance.timeOrigin + performance.now()` when `until` showed. Chromium:
+  as above, over DevTools. Firefox: the observer is a BiDi preload script (`script.addPreloadScript`)
+  in every top-level browsing context, in every document from its first script, added before strobe
+  navigates (`browsingContext.navigate`, `wait: "none"`), and it answers over a BiDi channel
+  (`script.message`): nothing polls the page, and no document can load before it. `prepare` gets
+  `ctx.addInitScript` and `ctx.mock` (through strobe, 9.6) in both. The page's time must fall between
+  strobe's send and when strobe heard of it, give or take 2 ms (Firefox coarsens the page's clock to
+  1 ms), or the launch refuses `ClockUnsynced`. `launch.painted` and `launch.settled` are refused for a
+  page in every engine alike (`NoPresentSource`, or `Headless`): its launch is timed in the page, and
+  strobe reads no window pixels for it; a paint time the page reports about itself is not when its
+  frame reached the screen, so none stands in. A Firefox launch has no
+  attribution block yet (its profile names the page by strobe's run marks, which no document carries
+  from the navigation). WebKit (WebDriver Classic) has no preload script: its launch cases refuse
+  `EngineUnsupported`.
 - **Window conditions** (`until: { window: "visible" | "painted" | "settled" }`): an app, exe or
   command target's launch may end on its window, as a native app's does: the window's 16x16
   pixels and its process set's CPU cycles every 30 ms (`native::watch`, the same reads for both
@@ -2742,7 +2774,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `RunIncomplete` | a run threw, timed out, or its `until` never resolved. A hook that threw because a validator refused one of its driver calls (a click on a covered window) is that validator's refusal, named for the hook (`WindowHidden: open run: another window covers …`), so a bench waits it out as it waits out that validator anywhere. A native app that exited is refused, never measured as a gone process: after the `block` hook or setup with nothing of its process set left, or its process exiting during a run (its CPU leaves the set's sum with it), in every native block, windowless ones included, and in `record` of a native app; the refusal gives the exit code and, with `output: true`, the app's last five output lines (`the app exited (code 2) before run 1 …; its last output: …`) |
 | `ResetIncomplete` | a run started from a different state than the first run did. strobe reads what a run starts from before every run and once after the last run and its reset (where a next run would start, so a one-run `--check` is checked too), between runs only, and compares each with the first it read: by control, the value of every shown, enabled, writable editable control (text fields, search and combo boxes, spin buttons, sliders, editing hosts; a secure field by its length) and the state of every check box, radio button and switch. Nothing else: labels, counters and clocks change by themselves; screens (headings, dialogs) are `WrongScreen`'s and `ScreenChanged`'s; focus moves with every click. The first start is read until it holds still: every 200 ms until every control has held its value (or its absence) for 1.2 s since it last changed, for at least 1.2 s and at most 4 s (on a native app after a lazy provider has built its tree past its placeholder answer, as `look` waits), so a tree still filling in, a toggle whose state the app has not read yet, or a page still loading is not what the runs are held to. When that read is before run 1 (nothing a run left behind can be running yet), a control whose value changed by itself in two different intervals (a level meter, a 1 Hz clock in a field: 1.2 s holds two of its ticks) is live and never compared; one change is hydration or a debounced update, read on until it holds and compared, and one that only appears was filling in and is compared. A start first read later (a timed native block whose case opens its session in a run; strobe does not connect to an app before that, since connecting changes its work) marks nothing live. The settling runs before anything of the run is listed or timed. A refusal names apart the controls whose value changed ("the reset did not restore …"), those that were not there at the first start ("still loading then, or left open by the run": its fix says to wait in setup until the screen has loaded, or to have the reset close what the run opened) and those that went; any of them refuses. A later start that differs is read again at each change the target announces (and at least every 250 ms) for up to a second; a read that fails then counts as differing. Native apps are read through the session the case drives them with (an untimed block opens it before run 1 when the case drives the app only from its runs; a timed block without one compares the starts it can read, from the first); pages through the page probe (`__strobe.state`: ARIA roles, editing hosts and shadow roots count as native controls do). Attribution, leak and pixel blocks are not checked, nor a case with `resetCheck: false` (runs that build on each other on purpose). Example: a reset that pressed Control+A on macOS (line start there) selected nothing, so every run appended its text again: `run 2 started from a different state than run 1 did: the reset did not restore search "cache key" (was "")` |
 | `NotOnThisOs` | a declared metric this OS gives strobe no way to read for another process (refuses that metric, with the OS's reason): the §13.6 matrix |
-| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes, launch cases, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
+| `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes and a launch's attribution block, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also launch cases (no preload script), `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
 | `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
 | `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
@@ -2752,7 +2784,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
 | `NoDisplayForBudget` | a budget metric is requested without a real display |
 | `TailTooShort` | a percentile lacks its minimum n (refuses that metric only) |
-| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6) |
+| `ClockUnsynced` | sources cannot be aligned within 1 ms (§6); a page launch whose own time for `until` falls outside strobe's span from its navigation command to hearing of it, by over 2 ms (9.6) |
 | `LiveChannel` | an app profile would launch the user's own running app, or a macOS app whose data lives in the user's Library (§13.2); a WebKit page whose Safari (or Safari Technology Preview) already runs (§13.1) |
 | `NoPhase`, `NoInput` | a declared `phase.<name>` no measured run entered; `input.*` with no drag in the runs (refuse that metric) |
 | `NoSpan` | a declared `span.<name>` no measured run's page measured, or a target with no page (§7.3) |
@@ -2760,6 +2792,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `NoWaits` | `query <rec> waits` on a capture without off-CPU waits: not asked for (`--probes waits`), macOS, Linux without CAP_PERFMON or tracefs, Windows without this build's deep helper (11.1) |
 | `Untimed` | a run total strobe cannot take a `ctx.untimed` stretch out of, in a block whose measured runs used one: `gpu.process.3d`, `energy.cpu`, `cpu.instructions`, `cpu.idle_wakes`, `net.*`, `canvas.*`, `js.heap.retained` (refuses that metric; §9.6) |
 | `NoCounter` | `energy.cpu`, `cpu.instructions` or `cpu.idle_wakes` where the OS does not count it per process, strobe may not read it, or a run counted only part of the processes (§7.5) |
+| `OutOfView` | a page input's element (a click, hover, drag, scroll, wheel or `down` at it, the click that focuses for `type` or `press`) shows no part in the viewport even scrolled into view: an ancestor clips it away (`overflow: clip`), or what shows is under a pixel. Input aimed there would land beside it; the message names the clipping ancestor (9.6 "Where input aims") |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -3559,9 +3592,12 @@ profilers, heap snapshots, the census, Playwright) asks for the Chromium side an
   (`series.browser`).
 - Attribution blocks and `record --probes attribution` run Firefox's Gecko profiler (its CPU samples,
   reflow, style and GC markers) and about:memory (8.3, 8.6); leak runs read about:memory after every
-  run (8.6). Not yet: launch cases (refused `EngineUnsupported`: their timing is built on Chromium's
-  DevTools, so the profiler's startup mode, `MOZ_PROFILER_STARTUP`, has nothing to attribute yet),
+  run (8.6). Not yet: a launch case's attribution block (no attribution block: the profile names the
+  page's process by strobe's run marks, which no document carries from the navigation's start),
   `span.*`, allocation samples, heap snapshots.
+- Launch cases (9.6): a fresh Firefox and profile per launch; the observer is a preload script in
+  every top-level browsing context with a BiDi channel back to strobe (`script.message`), added before
+  strobe's `browsingContext.navigate` (`wait: "none"`), whose send starts the launch.
 
 **WebKit** (`target::webkit`, `target::webdriver`): W3C WebDriver Classic over loopback HTTP (std
 `TcpStream`, one connection per command; a driver runs one command of a session at a time). Classic
@@ -3631,7 +3667,8 @@ is the stable path: Safari's BiDi is not usable yet.
   not seen), after the page's own scripts. So the page's own first scripts see `navigator.webdriver`
   true. A run that loaded a document (a `goto`, or a click that navigated) refuses `count.*`,
   `canvas.*`, `interaction.*` and `scroll.latency.*` (`EngineUnsupported`: what the new page did first
-  went unseen); keep runs on one page. Launch cases refuse as in Firefox.
+  went unseen); keep runs on one page. Launch cases refuse `EngineUnsupported`: with no preload
+  script, nothing of strobe's sees a launch's document from its start.
 - `eval` is an async script that answers through its callback after a JSON round trip in the page (a
   value WebDriver cannot send never fails the command), so a WebDriver `javascript error` means the
   expression did not compile as one: it runs again as statements through an indirect `eval`.
@@ -5302,9 +5339,31 @@ layouts; `query a..b hotspots` and `layout`, `report recording` and `strobe open
 and markers read back by trace_processor with no import errors) work on Firefox recordings; `alloc`,
 `heap`, `leaks`, `style` and `record --probes memory` refuse `EngineUnsupported` (exit 4).
 
-Not built: Firefox launch cases (and so launch attribution through `MOZ_PROFILER_STARTUP`), sampled
-allocations (the profiler's `jsallocations`), Linux WebKit attribution through the Web Inspector
-(waits for the WebKit drivers to land). Not checked: headed Firefox attribution on Windows (locked).
+Not built: a Firefox launch's attribution block (through `MOZ_PROFILER_STARTUP`, or the profiler
+started before the navigation), sampled allocations (the profiler's `jsallocations`), Linux WebKit
+attribution through the Web Inspector (waits for the WebKit drivers to land). Not checked: headed
+Firefox attribution on Windows (locked).
+
+Firefox launch cases and where input aims (2026-11-06, 9.6 "Pages in each engine" and "Where input
+aims", 10.1 `OutOfView`, `ClockUnsynced`). A page's launch case runs in Firefox: a fresh browser and
+profile per launch, the observer a BiDi preload script that answers over a `script.message` channel,
+timed from strobe's `browsingContext.navigate` send; `ctx.addInitScript` and `ctx.mock` in its
+`prepare`; the until observer now runs in a page's top document only, in Chromium too. WebKit launch
+cases still refuse (no preload script). Input on pages aimed at `r.top + min(r.height, innerHeight) /
+2`: the centre of a box clipped only by its own size, so a box whose top showed low in the window and
+which was taller than the viewport (a long draft in an editor) was aimed below the window: Firefox
+refused the move, Chromium dispatched it to nothing; now the centre of the part the viewport and every
+clipping ancestor leave, scrolled into view at once when nothing shows, else `OutOfView`. Checked with
+`scripts/dev/web.bench.ts` (`--check`, one cold run each; `pages/launch.html` marks and shows its
+`until` after 150 ms of script and a 50 ms timer, with the same id in a frame; `pages/click.html` a
+3000 px composer below a 600 px header under `scroll-behavior: smooth`, an element below the fold,
+one half off the right edge, one an `overflow: clip` box hides): Chromium and Firefox 159 headless on
+adais (Windows 11, locked) and vps (Debian 13), Firefox, Safari and Chromium headed on air (macOS 27,
+AC): every click case passed in every engine, the clipped one refused `OutOfView` naming `div#box`, the
+launch case passed in Chromium and Firefox (`launch.ready` 221-349 ms with `launch.shown`, the page's
+own mark when it showed `#ready`, within 1 ms of it; `launch.init`, the init script's mark, before
+`launch.booted`), `launch.painted` refused `Headless` or `NoPresentSource`, and Safari refused the
+launch case `EngineUnsupported`.
 
 Isolation, viewports, fixtures and launch ends (2026-11-06, issues-1: 9.10, 13.2). An isolated launch on
 macOS sets `CFFIXED_USER_HOME` (Cocoa's home and `NSSearchPath…` folders in the home) and an Electron

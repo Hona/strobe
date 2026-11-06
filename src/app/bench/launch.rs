@@ -131,7 +131,18 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let exe = app.as_ref().map(|a| a.exe.display().to_string());
     // A page's `prepare` mocks its API under the URL strobe opens (`ctx.url`), as in a run case.
     let url = if web { variant_url(v, &target)? } else { String::new() };
-    ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": root, "home": home, "env": env, "exe": exe }), t, &no_page)?;
+    let engine = engine_of(&target);
+    // Firefox profiles a page from strobe's run marks in it (`probe::gecko`), which no document carries from
+    // the navigation's start (`no_profiler` keeps a bench from asking).
+    if web && profile && engine != WebEngine::Chromium {
+        return Err(Refusal::new(ValidatorId::EngineUnsupported, format!("a {engine} page's launch has no attribution block in strobe")).fix("attribute the launch in Chromium").into());
+    }
+    ctx.runner.call(
+        "block",
+        json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": root, "home": home, "env": env, "exe": exe, "engine": engine }),
+        t,
+        &no_page,
+    )?;
     if spec["before"] == true {
         ctx.runner
             .call("before", json!({ "case": s.case }), Duration::from_secs(900), &no_page)
@@ -150,7 +161,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     let mut guard = None;
     // The time stamp counter's rate, from two readings around the launch: cycles to ms.
     let clock = (host::tsc(), Instant::now());
-    let (mut browser, started) = match kind.as_str() {
+    let (mut browser, started): (WebBrowser, Started) = match kind.as_str() {
         "app" | "exe" | "webview" => {
             let app = app.as_ref().ok_or_else(|| Error::msg("internal: an app target without its app"))?;
             let extra = Extra {
@@ -162,21 +173,24 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             };
             let (b, g, st) = electron::launch_with(app, seed.as_deref(), &window, ctx.pin, &extra)?;
             guard = Some(g);
-            (b, st)
+            (b.into(), st)
         }
         "command" => {
             let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a command target runs in a variant's folder (a directory or a git ref)", v.role)))?;
-            command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), !warm, &window, ctx.pin)?
+            let (b, st) = command::launch(&command::Spec::from_target(&target, &root), home.as_deref().unwrap_or(Path::new(".")), !warm, &window, ctx.pin)?;
+            (b.into(), st)
         }
-        _ if web => (chromium::launch(&window, ctx.headless, ctx.pin, &[])?, Started { epoch_ms: 0.0, output: None, main: None }),
+        // A fresh browser and profile per launch: no HTTP cache, storage, service worker or browser
+        // shader cache from an earlier visit.
+        _ if web => (web::launch(engine, &window, headless_of(ctx, s), ctx.pin)?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
     let result = (|| -> Result<Block> {
         // Timed to the window, the pages still start paused for their profilers, with an observer that
         // never resolves.
-        let watch = Watch::start(&browser.cdp, if window_until.is_some() { NO_OBSERVER.to_string() } else { observer(&spec["until"])? }, profile)?;
+        let watch = Observer::start(&browser, if window_until.is_some() { NO_OBSERVER.to_string() } else { observer(&spec["until"])? }, profile)?;
         let stop = Arc::new(AtomicBool::new(false));
-        let (pid, profile_dir) = (browser.pid, browser.profile.clone());
+        let (pid, profile_dir) = (browser.pid(), browser.profile());
         let (tx, samples) = channel();
         // An app's windows stay on top without focus (an occluded window never paints); `screen` also
         // captures their pixels. Timed to the window, each look goes to the wait below too, with the
@@ -200,6 +214,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         // spawn, or from navigation for a web target whose browser was already up.
         let cpu_now = || -> u64 { browser.processes().iter().map(|p| p.cycles).sum() };
         let mut cpu0 = 0;
+        // `ctx.mock` on a page whose engine gives the runner no CDP session: through strobe (`mocks`), for
+        // the whole launch.
+        let mocks = super::mocks::Mocks::default();
         let started_ms = if web {
             let page = browser.page()?;
             // The browser's window takes the viewport before the timed navigation, as a run case's does.
@@ -209,10 +226,16 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             let first = if target["prepare"].as_bool() == Some(true) {
                 // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.
                 let init = |op: &str, a: &Value| match (op, a["source"].as_str()) {
-                    ("init", Some(source)) => page.send("Page.addScriptToEvaluateOnNewDocument", json!({ "source": format!("{source}\n") })).map(|_| Value::Bool(true)),
+                    ("init", Some(source)) => page.add_init_script(&format!("{source}\n")).map(|_| Value::Bool(true)),
+                    ("mock", _) if page.cdp().is_none() => mocks.add(&page, a),
                     _ => no_page(op, a),
                 };
-                let r = ctx.runner.call("prepare", json!({ "endpoint": browser.ws, "target": page.target }), t, &init)?;
+                // Playwright connects over CDP: Chromium only (the runner's `playwright` throws elsewhere).
+                let (endpoint, target_id) = match (browser.cdp(), page.cdp()) {
+                    (Some(b), Some(p)) => (json!(b.ws), json!(p.target)),
+                    _ => (Value::Null, Value::Null),
+                };
+                let r = ctx.runner.call("prepare", json!({ "endpoint": endpoint, "target": target_id, "engine": engine }), t, &init)?;
                 let base = variant_url(v, &target)?;
                 r.get("url").and_then(Value::as_str).map(|u| join_url(origin(&base), u)).unwrap_or(base)
             } else {
@@ -220,8 +243,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             };
             // An attribution launch's page profiler started when the page was attached, before this.
             cpu0 = cpu_now();
+            // From strobe's send on the host's wall clock, the clock the page's `until` time is on.
             let at = epoch_ms();
-            page.send("Page.navigate", json!({ "url": first }))?;
+            page.start_navigation(&first)?;
             at
         } else {
             started.epoch_ms
@@ -250,13 +274,32 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                 };
                 // The app's main page through the session strobe attached at its start (where an
                 // attribution launch's profiler runs).
-                let main = electron::main_page(&browser)?;
-                (ready.at, watch.page(&main.target).unwrap_or(main), ready.cycles)
+                let WebBrowser::Chromium(b) = &browser else { return Err(Error::msg("internal: a window launch of a page")) };
+                let main = electron::main_page(b)?;
+                let page: Page = watch.page(&main.target).unwrap_or(main).into();
+                (ready.at, page, ready.cycles)
             }
             None => match watch.ready(timeout) {
-                Ok((at, page)) => (at, page, cpu_now()),
+                Ok((at, received, page)) => {
+                    let cycles = cpu_now();
+                    // The page's time is on its own clock (`performance.timeOrigin`, which Firefox coarsens to
+                    // 1 ms): it must fall between strobe's send and when strobe heard of it.
+                    if at < started_ms - CLOCK_SLACK_MS || at > received + CLOCK_SLACK_MS {
+                        return Err(Refusal::new(
+                            ValidatorId::ClockUnsynced,
+                            format!(
+                                "{} launch: the page says until showed {:+.1} ms from strobe's navigation, which strobe heard of at {:+.1} ms: the page's clock does not match the host's",
+                                s.case,
+                                at - started_ms,
+                                received - started_ms
+                            ),
+                        )
+                        .into());
+                    }
+                    (at, page, cycles)
+                }
                 Err(e) => {
-                    let shot = watch.any_page().map(|p| snapshot(&p.into(), &ctx.exp, "launch")).unwrap_or_default();
+                    let shot = watch.any_page().map(|p| snapshot(&p, &ctx.exp, "launch")).unwrap_or_default();
                     return Err(Error::refused("RunIncomplete", format!("{} launch: {}{shot}", s.case, e.message), "the until selector never showed"));
                 }
             },
@@ -268,22 +311,24 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             _ => f64::NAN,
         };
         lap("ready", &mut steps);
-        if watch.late.load(Ordering::Relaxed) {
+        if watch.late() {
             return Err(Error::refused(
                 "RunIncomplete",
                 format!("{} launch: the window showed its until selector before strobe could attach, so the launch has no valid end", s.case),
                 "a target strobe reaches only after its first page loads cannot be timed to a selector",
             ));
         }
-        let shown_page: Page = page.clone().into();
+        let shown_page: Page = page.clone();
         validity::window_visible(&shown_page)?;
         // A webview app's launch is not moved or sized: the block records the window it opened.
-        if browser.embedded {
-            ctx.used = Some(crate::target::webview::fit(&browser, &page, None, false)?);
+        if let (WebBrowser::Chromium(b), Page::Chromium(p)) = (&browser, &page)
+            && b.embedded
+        {
+            ctx.used = Some(crate::target::webview::fit(b, p, None, false)?);
         }
         if !ctx.gpu_checked {
-            ctx.gpu = serde_json::to_value(if ctx.headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? })?;
-            ctx.browser_version = browser.version.clone();
+            ctx.gpu = serde_json::to_value(if headless_of(ctx, s) { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? })?;
+            ctx.browser_version = browser.version().to_string();
             ctx.gpu_checked = true;
         }
         // Milestones may land after ready (a service that comes up behind the window), and the screen
@@ -315,7 +360,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         // `admit_window` holds to the other side's and to a viewport the targets ask for.
         let client = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
         // What the result says the launch drew in: the page's own size, not the window asked for.
-        if let Some(c) = client.filter(|_| !browser.embedded) {
+        if let Some(c) = client.filter(|_| !matches!(&browser, WebBrowser::Chromium(b) if b.embedded)) {
             ctx.used = Some(Window { width: c[0].round() as u32, height: c[1].round() as u32, scale: Some(c[2]), ..window.clone() });
         }
         // The launch's processes once it was ready (what its numbers summed), and whether they talk to
@@ -374,7 +419,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         if let (false, Some(r)) = (profile, refused.get(&s.primary)) {
             return Err(r.clone().fix("pick a primary a launch case measures").into());
         }
-        let recording = if profile { Some(save_profiles(ctx, s, v, &page, &started, &values)?) } else { None };
+        let recording = match (profile, page.cdp()) {
+            (true, Some(p)) => Some(save_profiles(ctx, s, v, p, &started, &values)?),
+            (true, None) => return Err(Error::msg("internal: an attribution launch of a page without DevTools")),
+            (false, _) => None,
+        };
         // What the launch ended on, once its values and profiles are taken.
         let end = shown::page(ctx, s, v, pair, "end", &shown_page);
         shown::expect(&s.expect, &end, "when the launch was ready", true, &|sel| shown::page_shows(&shown_page, sel))?;
@@ -414,7 +463,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     })();
     // The app closes first, then the bench file's teardown runs while the home still exists (it may
     // stop a service whose registration is in there), then a fresh home goes; a warm one stays.
-    let home = browser.profile.take();
+    // A page's browser removes its own profile as it closes.
+    let home = match &mut browser {
+        WebBrowser::Chromium(b) => b.profile.take(),
+        WebBrowser::Firefox(_) | WebBrowser::Webkit(_) => None,
+    };
     browser.close();
     if let Some(h) = &home {
         isolate::release_home(h);
@@ -670,11 +723,13 @@ const NO_OBSERVER: &str = "window.__strobeLaunch = window.__strobeLaunch || new 
 /// The init script that resolves `window.__strobeLaunch` with the epoch time `until` first showed, and
 /// returns whether it already shows (a late install). `until` is a selector in the one grammar pages
 /// and native apps share (`a11y::Selector`), found by the page probe (`driver::HELPER`) that `expect`,
-/// `waitFor` and `look` use, which goes in first.
+/// `waitFor` and `look` use, which goes in first. Only a page's top document: a frame inside it runs
+/// nothing of strobe's.
 fn observer(until: &Value) -> Result<String> {
     let q = crate::target::a11y::Selector::parse(until, crate::target::a11y::Dialect::Page).map_err(|e| Error::usage(format!("launch.until: {}", e.message)))?.page_spec();
     Ok(format!(
-        r#"{helper}
+        r#"if (window === window.top) {{
+{helper}
 ;(() => {{
   if (window.__strobeLaunch) return false
   const q = {q}
@@ -685,7 +740,8 @@ fn observer(until: &Value) -> Result<String> {
   // runs, so an element inside a shadow root or one that fades in counts when it shows.
   window.__strobe.waitFor(q, 2147483647, "until").then(() => done(performance.timeOrigin + performance.now()))
   return already
-}})()"#,
+}})()
+}}"#,
         helper = crate::driver::HELPER,
     ))
 }
@@ -816,6 +872,121 @@ impl Drop for Watch {
     }
 }
 
+/// How far (ms) a page's own time for `until` may fall outside strobe's span from its navigation to
+/// hearing of it: the page's clock is coarsened (Firefox: 1 ms, with jitter inside it).
+const CLOCK_SLACK_MS: f64 = 2.0;
+
+/// What tells a launch its end: the watch over every page over DevTools (Chromium, an app's pages), or
+/// in Firefox a preload script that answers over a BiDi channel.
+enum Observer {
+    Cdp(Watch),
+    Bidi(Preload),
+}
+
+impl Observer {
+    fn start(browser: &WebBrowser, observer: String, profile: bool) -> Result<Observer> {
+        match browser {
+            WebBrowser::Chromium(b) => Ok(Observer::Cdp(Watch::start(&b.cdp, observer, profile)?)),
+            WebBrowser::Firefox(b) => Ok(Observer::Bidi(Preload::start(b, &observer)?)),
+            WebBrowser::Webkit(_) => Err(Error::msg("internal: a WebKit launch case (WebDriver Classic has no preload script)")),
+        }
+    }
+
+    /// The epoch time `until` first showed, when strobe heard of it (epoch ms), and the page it showed in.
+    fn ready(&self, timeout: Duration) -> Result<(f64, f64, Page)> {
+        match self {
+            Observer::Cdp(w) => w.ready(timeout).map(|(at, page)| (at, epoch_ms(), page.into())),
+            Observer::Bidi(p) => p.ready(timeout),
+        }
+    }
+
+    /// A page by its DevTools target (an app's main page).
+    fn page(&self, target: &str) -> Option<chromium::Page> {
+        match self {
+            Observer::Cdp(w) => w.page(target),
+            Observer::Bidi(_) => None,
+        }
+    }
+
+    fn any_page(&self) -> Option<Page> {
+        match self {
+            Observer::Cdp(w) => w.any_page().map(Page::from),
+            Observer::Bidi(p) => Some(Page::Firefox(p.page.clone())),
+        }
+    }
+
+    /// Whether `until` already showed in a page the observer went into late. A preload script is in every
+    /// document from its first script: never late.
+    fn late(&self) -> bool {
+        match self {
+            Observer::Cdp(w) => w.late.load(Ordering::Relaxed),
+            Observer::Bidi(_) => false,
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            Observer::Cdp(w) => w.stop(),
+            Observer::Bidi(p) => p.stop.store(true, Ordering::Relaxed),
+        }
+    }
+}
+
+/// Firefox's launch observer: a preload script (`script.addPreloadScript`) in every top-level browsing
+/// context and every document from its first script, before strobe navigates, which sends `until`'s time
+/// over a BiDi channel (`script.message`): nothing polls the page.
+struct Preload {
+    /// The browsing context strobe navigates.
+    page: crate::target::firefox::Page,
+    found: Receiver<(f64, f64, String)>,
+    stop: Arc<AtomicBool>,
+}
+
+impl Preload {
+    fn start(b: &crate::target::firefox::Browser, observer: &str) -> Result<Preload> {
+        let events = b.bidi.events();
+        let name = format!("strobe-launch-{}", host::now_ns());
+        b.bidi.send("session.subscribe", json!({ "events": ["script.message"] }))?;
+        // Every top-level context, those the page opens too; a frame's document runs nothing (`observer`).
+        b.bidi.send(
+            "script.addPreloadScript",
+            json!({
+                "functionDeclaration": format!("(strobeLaunched) => {{\n{observer}\n;window.__strobeLaunch?.then((t) => strobeLaunched(t))\n}}"),
+                "arguments": [{ "type": "channel", "value": { "channel": name } }],
+            }),
+        )?;
+        let (tx, found) = channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = stop.clone();
+        std::thread::spawn(move || {
+            while !stop2.load(Ordering::Relaxed) {
+                let Ok(ev) = events.recv_timeout(Duration::from_millis(100)) else { continue };
+                let p = &ev["params"];
+                if ev["method"] != "script.message" || p["channel"] != name.as_str() {
+                    continue;
+                }
+                let received = epoch_ms();
+                if let Some(at) = crate::target::bidi::value(&p["data"]).as_f64() {
+                    let _ = tx.send((at, received, p["source"]["context"].as_str().unwrap_or("").to_string()));
+                    return;
+                }
+            }
+        });
+        Ok(Preload { page: crate::target::firefox::Page { bidi: b.bidi.clone(), context: b.context().to_string() }, found, stop })
+    }
+
+    fn ready(&self, timeout: Duration) -> Result<(f64, f64, Page)> {
+        let (at, received, context) = self.found.recv_timeout(timeout).map_err(|_| Error::timeout(format!("not visible in {} s", timeout.as_secs())))?;
+        Ok((at, received, Page::Firefox(crate::target::firefox::Page { bidi: self.page.bidi.clone(), context })))
+    }
+}
+
+impl Drop for Preload {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// A helper thread's result, or nothing if it does not finish within 5 s: a block never waits on a
 /// stuck OS call (a window that stopped answering), it goes without that thread's readings.
 pub(super) fn joined<T: Default>(h: std::thread::JoinHandle<T>) -> T {
@@ -865,7 +1036,7 @@ pub(super) fn screen_times(samples: &[(f64, Vec<u8>)]) -> Option<(f64, f64)> {
 }
 
 /// The page's `performance.mark` names with their epoch time.
-fn page_marks(page: &chromium::Page) -> Vec<Line> {
+fn page_marks(page: &Page) -> Vec<Line> {
     let expr = r#"JSON.stringify(performance.getEntriesByType("mark").map((m) => [m.name, performance.timeOrigin + m.startTime]))"#;
     page.eval(expr)
         .ok()

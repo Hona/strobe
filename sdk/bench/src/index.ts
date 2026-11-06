@@ -68,7 +68,7 @@ export interface Page {
   /** Lets go of a key or mouse button `down` pressed. */
   up(key: string, opts?: Options & { at?: Element | [number, number] }): Promise<void>
   /**
-   * Presses at `selector`'s centre (where the pointer is with `""`), moves along `path` and releases. `path` is offsets
+   * Presses at the centre of the part of `selector` that shows (where the pointer is with `""`), moves along `path` and releases. `path` is offsets
    * `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps), as keyframes spread evenly over
    * `duration` (ms, default 1000) or a function of `t` from 0 to 1 (a wiggle: `t => [40 * Math.sin(t * 12 * Math.PI), 0]`).
    * One move per display frame, paced on strobe's clock without waiting for the app to handle each; `input.rate` and
@@ -270,7 +270,7 @@ export interface MilestoneUntil {
 }
 
 export interface Launch<P> {
-  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A native target: the screen time of the frame that first showed the element in its accessibility tree (OS present events). Any target with a window of its own may end on a window condition instead, read from its pixels the same way on every kind (two implementations timed alike). */
+  /** The launch is ready when this is visible in any of its windows. The primary is `launch.ready`. A page (Chromium or Firefox; WebKit refuses launch cases): from strobe's navigation, in a fresh profile, until its top document shows it. A native target: the screen time of the frame that first showed the element in its accessibility tree (OS present events). Any target with a window of its own may end on a window condition instead, read from its pixels the same way on every kind (two implementations timed alike). */
   until: Selector | WindowUntil | MilestoneUntil
   /** Named points on the way, each a metric `launch.<name>`. One a case declares must appear in every launch. */
   milestones?: Record<string, Milestone>

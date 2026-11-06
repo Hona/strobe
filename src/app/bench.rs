@@ -1740,7 +1740,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     progress(format!("  {} {}{}", if passed { "pass" } else { "FAIL" }, s.label(), error.as_str().map(|e| format!("  {e}")).unwrap_or_default()));
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
-    let mut attribution = Value::Null;
+    let (mut attribution, mut sampling) = (Value::Null, Value::Null);
     let unprofiled = no_profiler(&target, s.launch.is_object()).filter(|_| matches!(target["kind"].as_str(), Some("web" | "url")));
     if let (true, Some(no)) = (passed && ctx.args.get("why") == Some("always"), &unprofiled) {
         ctx.warnings.push(validity::info("Attribution", format!("{}: {no}: no attribution block (profile it in Chromium)", s.label())));
@@ -1759,6 +1759,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         match attributed {
             Ok(b) => {
                 progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
+                sampling = attribution_sampling(b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok()).as_ref(), &b.variant);
                 attribution = json!(b.recording);
             }
             Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
@@ -1767,7 +1768,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     Ok(json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
-        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "target_kind": target["kind"], "engine": target["engine"],
+        "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
         "log": log, "log_path": ctx.runner.log,
         // For the parity matrix (`journey::matrix`).
@@ -1872,6 +1873,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             }
             if let Some(rec) = s["attribution"].as_str() {
                 text += &format!("      why  {rec} · strobe query {rec} {}\n", why_view(&s["target_kind"]));
+                if let Some(at) = sampled(&s["attribution_sampling"]) {
+                    text += &format!("           JavaScript {at}\n");
+                }
             }
         } else {
             text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
@@ -2631,7 +2635,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     // Attribution: one block per variant with profilers, never timed. By default only when there is a
     // difference to explain; `--why always` keeps them for every series, `--why never` (or
     // `--probes timing`) skips them.
-    let mut recordings = json!({});
+    let (mut recordings, mut sampling) = (json!({}), json!({}));
     let differs = primary_decided && (primary.lo > 0.0 || primary.hi < 0.0);
     // Each side is profiled with its own engine's tools: an implementation comparison's two may differ,
     // and a side strobe has no profiler for gets no block while the other still gets its own.
@@ -2685,7 +2689,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     // files: nothing to map.
                     let who = if ctx.implementations { v.name.as_str() } else { v.role };
                     let script = side_targets[i]["kind"] == "script";
-                    let hot = b.recording.as_deref().filter(|_| !script).and_then(|r| store::resolve(r).ok()).and_then(|d| super::query::hotspots(&d, "function", 1).ok());
+                    let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
+                    sampling[v.role] = attribution_sampling(rec.as_ref(), &b.variant);
+                    let hot = rec.as_ref().filter(|_| !script).and_then(|r| super::query::hotspots_of(r, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
                         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
                         if scripts > 0.0 && mapped / scripts < 0.95 {
@@ -2731,7 +2737,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
-        "blocks": blocks, "warnings": warnings, "attribution": recordings, "timing_recordings": timing_recordings, "shown": shown,
+        "blocks": blocks, "warnings": warnings, "attribution": recordings, "attribution_sampling": sampling, "timing_recordings": timing_recordings, "shown": shown,
         "pass": pass.map(|(b, p)| json!({ "counters": !main_counters, "blocks": b, "pairs": p })),
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     });
@@ -2943,6 +2949,19 @@ fn why_text(target: &Value) -> &'static str {
     } else {
         "CPU and allocation stacks, forced layouts, GC, a heap snapshot"
     }
+}
+
+/// What an attribution recording's JavaScript sampler kept against what it was asked for
+/// (`probe::cpu::Sampling`), said under the block's line: `head JavaScript sampled every 2.0 ms (asked 1 ms)`.
+fn attribution_sampling(rec: Option<&super::query::Rec>, who: &str) -> Value {
+    let Some(s) = rec.and_then(|r| r.sampling()) else { return Value::Null };
+    progress(format!("  {who} JavaScript {}{}", s.text(), if s.coarse() { ": coarser than asked, so a function shorter than one gap shows only by chance" } else { "" }));
+    json!(s)
+}
+
+/// `sampled every 2.0 ms (asked 1 ms)` from a result's `attribution_sampling` entry.
+fn sampled(v: &Value) -> Option<String> {
+    serde_json::from_value::<probe::cpu::Sampling>(v.clone()).ok().map(|s| s.text())
 }
 
 /// The view that explains an attribution recording of a target of this kind.
@@ -7143,6 +7162,10 @@ fn render(r: &Value) -> String {
                 attr["head"].as_str().unwrap_or("rec_…"),
                 why_view(&s["target_kind"])
             );
+        }
+        let at: Vec<String> = ["base", "head"].iter().filter_map(|r| Some(format!("{r} {}", sampled(&s["attribution_sampling"][r])?))).collect();
+        if !at.is_empty() {
+            out += &format!("       JavaScript {}\n", at.join(" · "));
         }
         if let Some(shots) = s["pixels"].as_array().filter(|a| !a.is_empty()) {
             out += "\npixels\n";

@@ -50,16 +50,28 @@ pub struct Profiler<'a> {
     running: bool,
 }
 
-/// The sampling interval (µs): strobe's 200 µs, except on Windows, where Gecko's sampler thread spins
-/// through any interval under 1 ms: every process's sampler then kept a core busy (11 cores for a page's
-/// Firefox on adais against 0.4-1.2 cores at 1 ms; macOS and Linux showed no such cost at 200 µs).
-pub fn interval_us() -> u64 {
-    if cfg!(windows) { 1000 } else { super::cpu::INTERVAL_US }
+/// The first Firefox whose Windows sampler waits on a high-resolution timer (bug 2082760).
+const WINDOWS_TIMER_FROM: u32 = 161;
+
+/// The sampling interval (µs) for a Firefox (`version`: `Firefox 159.0.1`). macOS and Linux: strobe's
+/// 200 µs (their sampler sleeps in `nanosleep` or `usleep`). Windows, through Firefox 160: 1 ms, as
+/// `SamplerThread::SleepMicro` (`platform-win32.cpp`) busy-waits through any interval under 1 ms on
+/// purpose (bug 1349801; bug 1574815), one core per profiled process (10.2 cores for a page's Firefox
+/// 159 on adais at 0.5 ms or 0.2 ms, 0.4 at 1 ms), and its 1 ms is a `Sleep(1)`, every 2 ms in
+/// practice. From 161 it waits on a high-resolution waitable timer: 500 µs, Windows' finest timer
+/// (asked for 0.2 ms, Nightly 162 sampled every 0.54 ms at 0.5-0.8 cores). A version strobe cannot
+/// read is taken as the older.
+pub fn interval_us(version: &str) -> u64 {
+    if !cfg!(windows) {
+        return super::cpu::INTERVAL_US;
+    }
+    let major = version.trim_start_matches("Firefox").trim().split('.').next().and_then(|m| m.parse::<u32>().ok()).unwrap_or(0);
+    if major >= WINDOWS_TIMER_FROM { 500 } else { 1000 }
 }
 
 /// Starts the Gecko profiler at `interval_us` in every process of `browser`.
 pub fn start(browser: &Browser) -> Result<Profiler<'_>> {
-    let interval = interval_us() as f64 / 1000.0;
+    let interval = interval_us(&browser.version) as f64 / 1000.0;
     let bidi = browser.bidi.send("moz:profiler.start", json!({ "entries": ENTRIES, "interval": interval, "features": FEATURES, "threads": THREADS, "activeContext": browser.context() }));
     let control = match bidi {
         Ok(_) => Control::Bidi,
@@ -114,6 +126,8 @@ pub struct Converted {
     pub scripts: BTreeSet<String>,
     /// Samples of the page's threads inside the measured runs.
     pub samples: u64,
+    /// The interval asked and the one the page's main threads were sampled at.
+    pub sampling: Option<super::cpu::Sampling>,
 }
 
 /// One column-named table of the raw profile (`{ schema, data }`).
@@ -357,9 +371,10 @@ fn read_profile(raw: &[u8]) -> Result<Value> {
     Ok(v)
 }
 
-/// The profile's own sampling interval (ns), from its meta.
-fn profile_interval_ns(profile: &Value) -> i64 {
-    profile["meta"]["interval"].as_f64().map_or(interval_us() as i64 * 1000, |ms| (ms * 1e6).round() as i64)
+/// The interval the profiler was asked for (µs), from the profile's meta: Firefox writes the request
+/// there, not what its sampler kept.
+fn asked_us(profile: &Value) -> f64 {
+    profile["meta"]["interval"].as_f64().map_or(super::cpu::INTERVAL_US as f64, |ms| ms * 1000.0)
 }
 
 /// A marker that spans time on a thread (intervals, and start and end pairs), on strobe's clock.
@@ -585,7 +600,21 @@ pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], untimed: &[
         }
     }
     thread_cpu.sort_by(|a, b| b["cpu_ms"].as_f64().unwrap_or(0.0).total_cmp(&a["cpu_ms"].as_f64().unwrap_or(0.0)));
-    let interval_ns = profile_interval_ns(&profile);
+    // What the sampler kept: the median gap between consecutive samples of the page's main threads in
+    // the runs (in the whole profile where the runs hold none), not the interval asked.
+    let gaps = |in_runs: bool| -> Vec<f64> {
+        let mut out = Vec::new();
+        for t in all.iter().filter(|t| page.contains(&t.pid) && t.name == "GeckoMain") {
+            let times: Vec<i64> = t.sample_times().into_iter().flatten().collect();
+            for p in times.windows(2).filter(|p| p[1] - p[0] <= MAX_GAP_NS && (!in_runs || windows.iter().any(|w| p[0] >= w.1 && p[1] <= w.2))) {
+                out.push((p[1] - p[0]) as f64 / 1e3);
+            }
+        }
+        out
+    };
+    let asked = asked_us(&profile);
+    let sampling = super::cpu::Sampling::of(asked, gaps(true)).or_else(|| super::cpu::Sampling::of(asked, gaps(false)));
+    let interval_ns = (sampling.map_or(asked, |s| s.median_us) * 1e3).round() as i64;
     let mut scripts = BTreeSet::new();
     let mut total = 0u64;
     let mut covered = vec![false; windows.len()];
@@ -716,7 +745,8 @@ pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], untimed: &[
     }
     let read = json!({
         "token": token,
-        "interval_us": interval_ns / 1000,
+        "interval_us": asked.round() as u64,
+        "sampling": sampling,
         "format": profile["meta"]["version"],
         "windows": windows.iter().map(|w| json!([w.0, w.1, w.2])).collect::<Vec<_>>(),
         "page_pids": page,
@@ -733,7 +763,7 @@ pub fn convert(raw: &Path, token: &str, runs: &[(String, u64, u64)], untimed: &[
     // Owner-only: a profile holds the page's URLs, function names and marker texts (rule 9).
     host::paths::write_owner_only(&dir.join(PROFILE), &gz.finish()?)?;
     let _ = std::fs::remove_file(raw);
-    Ok(Converted { scripts, samples: total })
+    Ok(Converted { scripts, samples: total, sampling })
 }
 
 /// A recording's Gecko profile for `strobe open`: every sampled thread's samples (waits left out)
@@ -794,7 +824,10 @@ pub fn timeline(dir: &Path) -> Option<Timeline> {
     let profile = read_profile(&raw).ok()?;
     let all = threads(&profile).ok()?;
     let idle = profile["meta"]["categories"].as_array().and_then(|c| c.iter().position(|c| c["name"] == "Idle")).map(|i| i as u64);
-    let interval_ns = profile_interval_ns(&profile);
+    // A thread's last sample weighs the gap its sampler kept (what `convert` read), else the one asked.
+    let read = crate::store::read_json(&dir.join(READ)).ok();
+    let kept = read.as_ref().and_then(|g| g["sampling"]["median_us"].as_f64());
+    let interval_ns = (kept.unwrap_or_else(|| asked_us(&profile)) * 1e3).round() as i64;
     let mut libs = Vec::new();
     let mut todo = vec![&profile];
     while let Some(p) = todo.pop() {
@@ -880,8 +913,7 @@ pub fn timeline(dir: &Path) -> Option<Timeline> {
         }
         out.push(TimelineThread { pid: t.pid, tid: t.tid, name: t.name.to_string(), process: processes.get(&t.pid).cloned().unwrap_or_default(), stacks, samples, markers });
     }
-    let runs = crate::store::read_json(&dir.join(READ))
-        .ok()
+    let runs = read
         .and_then(|g| g["windows"].as_array().cloned())
         .into_iter()
         .flatten()

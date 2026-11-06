@@ -263,8 +263,10 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     if on_screen && (awake.locks() > 0 || host::session_locked()) {
         return Err(validity::locked());
     }
+    let mut sampling = None;
     if set == Set::Attribution {
         let profile = probe::cpu::stop(&page)?;
+        sampling = probe::cpu::Sampling::of_v8(&profile);
         let allocs = probe::alloc::stop(&page)?;
         store::write_json(&dir.join("cpu-0.cpuprofile"), &profile)?;
         store::write_json(&dir.join("alloc-0.heapprofile"), &allocs)?;
@@ -327,7 +329,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         // Rule 3: timing taken with profilers on describes the profiled target, not the target; an
         // app with a debug C runtime is a debug build (`DevBuild`).
         "timing": if set == Set::Attribution { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
-        "created": now_iso(), "valid": true,
+        "created": now_iso(), "valid": true, "sampling": sampling,
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -431,9 +433,11 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     }
     // The profiler ends here whatever happens, before the browser closes.
     let profile = profiler.map(probe::gecko::Profiler::stop).transpose()?;
+    let mut sampling = None;
     if let Some(raw) = profile {
         progress("reading Firefox's profile");
         let got = probe::gecko::convert(&raw, &token, &[("run:0".to_string(), t0, t1)], &[], &dir)?;
+        sampling = got.sampling;
         probe::symbols::store_maps(&page, &got.scripts, &dir, args.get("served").map(std::path::Path::new))?;
     }
     let mut values: BTreeMap<String, f64> = BTreeMap::new();
@@ -497,6 +501,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     if attributed {
         meta["runs"] = json!(1);
         meta["census"] = json!(census);
+        meta["sampling"] = json!(sampling);
     }
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -906,6 +911,11 @@ fn refuse_background(meta: &mut Value, why: Option<String>) {
     meta["background_priority"] = json!(why);
 }
 
+/// `samples  JavaScript sampled every 2.0 ms (asked 1 ms)`, where the recording profiled JavaScript.
+fn sampling_line(meta: &Value) -> String {
+    serde_json::from_value::<probe::cpu::Sampling>(meta["sampling"].clone()).map(|s| format!("samples  JavaScript {}\n", s.text())).unwrap_or_default()
+}
+
 fn background_line(meta: &Value) -> Option<String> {
     meta["background_priority"].as_str().map(|why| format!("frames   refused (BackgroundPriority): the target ran at {why}; frames and input latencies there describe no person's machine (CPU is kept)\n"))
 }
@@ -941,6 +951,7 @@ fn engine_summary(meta: &Value) -> String {
         }
     }
     s += &refused_lines(meta);
+    s += &sampling_line(meta);
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: Firefox's profiler ran during this recording (a sampler in every process walks its threads' stacks), so its CPU and times are not the page's; take them with --probes timing\n";
         s += &format!("next     strobe query {id} hotspots · strobe query {id} layout · strobe query {id} memory · strobe open {id}\n");
@@ -1074,6 +1085,7 @@ fn summary_body(meta: &Value) -> String {
         );
     }
     s += &refused_lines(meta);
+    s += &sampling_line(meta);
     if meta["timing"] == "perturbed" {
         s += "timing   perturbed: profilers ran during this recording, so its times are not the target's; take times with --probes timing\n";
     }

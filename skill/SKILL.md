@@ -58,6 +58,7 @@ strobe bench <file.bench.ts> --head <variant>
   - Attribution blocks run Firefox's profiler: `hotspots` (source-mapped, with the browser's labels:
     `Reflow`, `Styles`, `Minor GC`, DOM calls), `layout` (forced reflows and style flushes by script),
     `gc`, `memory` (about:memory by process, layer, allocator), `insights`, `a..b`, `open`.
+  - Windows samples every 2 ms through Firefox 160 (asked 1 ms: shorter makes every process's sampler spin a core), every 0.5 ms from 161.
   - `alloc`, `heap`, `leaks` and `style` refuse `EngineUnsupported` on a Firefox recording.
   - Leak runs (`--probes memory`) read about:memory after every run: page JS memory and DOM growth,
     no suspects (no heap snapshots).
@@ -541,6 +542,9 @@ Fewer than 6 pairs never gets a verdict.
   - Rerunning until one says "faster" shows; paste the ledger line as it is.
 - **Why is it slow?** `bench … --why always` (or `record --probes attribution`), then on the attribution recording:
   - `query hotspots` (CPU by function, full stacks, original file:line:column through source maps)
+    - Its header (and each attribution block's line) gives the interval the sampler kept, not the one asked: `sampled every 2.0 ms (asked 1 ms)`.
+    - Windows keeps about 0.5 ms at best (Chromium asked 0.2 ms); Firefox 160 and older on Windows 2 ms.
+    - Times hold at any interval (each sample weighs its own gap); a function shorter than one gap shows only by chance.
   - `query layout` (forced layouts by the call that forced them)
   - `query style` (what invalidated style: the class, attribute, pseudo-class or custom property that changed, the nodes, the selector, the script line)
     - attribution blocks trace it for a series declaring `main.style` or `style.count`, or with `--style`

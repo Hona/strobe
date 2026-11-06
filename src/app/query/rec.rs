@@ -3,6 +3,7 @@
 use super::Forced;
 use crate::engine;
 use crate::model::{Error, Result};
+use crate::probe::cpu::Sampling;
 use crate::probe::symbols::{Frame, Symbolizer};
 use crate::store;
 use serde_json::Value;
@@ -30,6 +31,8 @@ pub struct Rec {
     trace: Mutex<BTreeMap<Part, Result<Arc<Rows>>>>,
     /// What strobe read out of a Firefox recording's Gecko profile.
     gecko: OnceLock<Option<Value>>,
+    /// The gaps between consecutive samples of the CPU profiles (µs), read with them.
+    gaps: Mutex<Vec<f64>>,
 }
 
 pub(super) type Rows = Vec<Vec<Option<String>>>;
@@ -120,6 +123,7 @@ impl Rec {
             forced: OnceLock::new(),
             trace: Mutex::new(BTreeMap::new()),
             gecko: OnceLock::new(),
+            gaps: Mutex::new(Vec::new()),
         }
     }
 
@@ -180,10 +184,25 @@ impl Rec {
         !token.is_empty() && source && (!p.attribution_only() || self.meta["probes"] == "attribution")
     }
 
+    /// What strobe read out of a Firefox recording's Gecko profile (`gecko.json`).
+    fn gecko(&self) -> Option<&Value> {
+        self.gecko.get_or_init(|| store::read_json(&self.dir.join(crate::probe::gecko::READ)).ok()).as_ref()
+    }
+
     /// A part's rows from a Firefox recording's Gecko profile.
     fn gecko_rows(&self, p: Part) -> Option<Rows> {
-        let g = self.gecko.get_or_init(|| store::read_json(&self.dir.join(crate::probe::gecko::READ)).ok());
-        serde_json::from_value(g.as_ref()?["parts"].get(format!("{p:?}"))?.clone()).ok()
+        serde_json::from_value(self.gecko()?["parts"].get(format!("{p:?}"))?.clone()).ok()
+    }
+
+    /// The interval the recording's JavaScript sampler was asked for and the one it kept: a Firefox
+    /// recording's as strobe read it from the Gecko profile, else the median gap of its CPU profiles.
+    pub fn sampling(&self) -> Option<Sampling> {
+        if let Some(s) = self.gecko().and_then(|g| serde_json::from_value(g["sampling"].clone()).ok()) {
+            return Some(s);
+        }
+        self.cpu().ok()?;
+        let asked = self.gecko().and_then(|g| g["interval_us"].as_f64()).unwrap_or(crate::probe::cpu::INTERVAL_US as f64);
+        Sampling::of(asked, self.gaps.lock().unwrap_or_else(|e| e.into_inner()).clone())
     }
 
     /// Runs the parts not yet read in one trace_processor pass: one load of the trace for all of them.
@@ -246,6 +265,8 @@ impl Rec {
         for p in profiles {
             let bytes = std::fs::read(&p)?;
             let prof: CpuProfile = parse(&bytes)?;
+            // `timeDeltas[i]`: the gap from sample i − 1 to sample i.
+            self.gaps.lock().unwrap_or_else(|e| e.into_inner()).extend(prof.time_deltas.iter().skip(1).copied());
             // Parsing runs beside other loads; symbolizing shares the recording's source maps.
             let sym = self.sym.lock().unwrap_or_else(|e| e.into_inner());
             let index: HashMap<u64, usize> = prof.nodes.iter().enumerate().map(|(i, n)| (n.id, i)).collect();

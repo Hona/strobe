@@ -1247,8 +1247,11 @@ fn gecko_threads(rec: &Rec, top: usize) -> Result<Output> {
         return Err(Error::usage("this Firefox profile carries no CPU per thread (its samples give CPU in cycles, not time)"));
     }
     let runs = rec.meta["runs"].as_f64().unwrap_or(1.0).max(1.0);
+    // A sample carries its thread's CPU since the one before: the first sample in a run brings up to one
+    // gap of CPU from before it, and the CPU after its last sample goes to no run.
+    let edges = rec.sampling().map(|s| format!(" · {}: each run's CPU is exact to one gap at its edges", s.text())).unwrap_or_default();
     let mut text = format!(
-        "threads by CPU per run · the threads Firefox's profiler sampled (main, compositor, renderer, DOM workers) · {runs:.0} measured run{}\n  cpu/run   process                       thread\n",
+        "threads by CPU per run · the threads Firefox's profiler sampled (main, compositor, renderer, DOM workers) · {runs:.0} measured run{}{edges}\n  cpu/run   process                       thread\n",
         if runs == 1.0 { "" } else { "s" }
     );
     let mut out = Vec::new();
@@ -1263,7 +1266,7 @@ fn gecko_threads(rec: &Rec, top: usize) -> Result<Output> {
     if rows.len() > top {
         text += &format!("  … {} more threads (--top)\n", rows.len() - top);
     }
-    Ok(Output::new(text, json!({ "runs": runs, "threads": out })))
+    Ok(Output::new(text, json!({ "runs": runs, "threads": out, "sampling": rec.sampling() })))
 }
 
 /// Self time per function, file or package from the recording's CPU profiles (attribution only).
@@ -1278,11 +1281,21 @@ pub fn hotspots_of(rec: &Rec, by: &str, top: usize) -> Result<Output> {
         Err(_) if rec.dir.join("deep.json.gz").is_file() => return native_hotspots_of(rec, by, top, None, None),
         Err(e) => return Err(e),
     };
-    // Firefox's profile says its own interval (1 ms on Windows: `probe::gecko::interval_us`).
-    let interval = store::read_json(&rec.dir.join(crate::probe::gecko::READ)).ok().and_then(|g| g["interval_us"].as_u64()).unwrap_or(crate::probe::cpu::INTERVAL_US);
-    let header = format!("hotspots by {by} · self time · {{samples}} samples at {interval} µs{{mapped}}");
+    // The interval the sampler kept, not the one asked: Firefox 160 and older on Windows sample every
+    // 2 ms when asked for 1 ms (`probe::gecko::interval_us`).
+    let sampling = rec.sampling();
+    let at = sampling.map(|s| s.text()).unwrap_or_else(|| "interval unknown".into());
+    let mut header = format!("hotspots by {by} · self time · {{samples}} samples, {at}{{mapped}}");
+    // Each sample weighs the gap it kept, so the times hold; what a coarser sampler loses is the short.
+    if let Some(s) = sampling.filter(|s| s.coarse()) {
+        header += &format!(
+            "\n! the sampler kept {:.1}× the interval asked: every time below is its samples' own gaps, but a function that runs for less than one gap shows only when a sample lands in it (± per row: how sure)",
+            s.median_us / s.asked_us
+        );
+    }
     let mut out = rank(stacks, by, top, &header, |us| fmt::value(us / 1000.0, "ms"));
-    out.json["interval_us"] = json!(interval);
+    out.json["interval_us"] = json!(sampling.map(|s| s.median_us));
+    out.json["sampling"] = json!(sampling);
     out.json["total_ms"] = json!(out.json["total"].as_f64().unwrap_or(0.0) / 1000.0);
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["self_ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);

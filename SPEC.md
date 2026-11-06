@@ -1154,6 +1154,22 @@ by 35–45%, enough that one profiled launch moved against the timed pairs it wa
 Every hotspot row carries its sample count and an interval for its share. Native time stays
 `(program)` unless `deep` resolves it (§12.3).
 
+**Interval kept** (`probe::cpu::Sampling`): a sampler need not keep the interval asked of it, so
+strobe reports the one it kept: the median gap between consecutive samples of the page's main thread
+in the attribution block (V8: `timeDeltas`; Firefox: its main threads' samples inside the measured
+runs). Every attribution block says it beside its line and in the result (`head JavaScript sampled
+every 2.0 ms (asked 1 ms)`; `attribution_sampling` per variant), `record` in `meta.json`
+(`sampling`) and its summary, and `query hotspots` and Firefox's `query threads` in their headers
+(`sampling` in their JSON). Checked on adais (Windows 11, headless, 2026-11-07): Chromium's V8 kept
+0.52 ms when asked for 200 µs (Windows' timers go no finer than about 0.5 ms); Firefox 159 kept
+2.0 ms when asked for 1 ms, Nightly 162 0.52 ms when asked for 0.5 ms. What strobe claims from a
+profile holds at the interval kept: a sample weighs the gap to the next one (as V8 counts it), so a
+function's self time and the sampling interval of a change (`a..b`, Σ Δt²) are the kept gaps', not
+the asked interval's; a thread's last sample weighs the median gap. What a coarser interval loses is
+the short: a function that runs for less than one gap shows only when a sample lands in it. Where the
+kept interval is more than 1.5 times the asked one, the block's line and `query hotspots` say so; the
+`±` beside each row's share (from its sample count) says how sure it is.
+
 **Source maps**: right after the profilers stop, while the target still serves its scripts, strobe
 asks the page to fetch the `sourceMappingURL` (http, an app's custom protocol, or an inline `data:`
 map) of every script the page has run and of every script in the profiles, and stores the maps in
@@ -1199,8 +1215,16 @@ thread GC time per measured run.
 Firefox's own Gecko profiler, started at the steady point with WebDriver BiDi's `moz:profiler.start`
 (the chrome scope's `Services.profiler` where a Firefox lacks the module), with JavaScript, native
 stack walking and CPU use, on each process's main thread, the compositor, WebRender's renderer and DOM
-workers, every 200 µs, and every 1 ms on Windows: there Gecko's sampler thread spins through any
-interval under 1 ms, so every process's sampler kept a core busy (§19). `moz:profiler.stop` saves into
+workers, every 200 µs on macOS and Linux (their samplers sleep in `nanosleep` and `usleep`). On Windows
+the interval follows the Firefox version (`probe::gecko::interval_us`, from the BiDi session's
+`browserVersion`; one strobe cannot read counts as the older): through Firefox 160, 1 ms, because
+`SamplerThread::SleepMicro` (`platform-win32.cpp`) busy-waits through any interval under 1 ms on
+purpose (bug 1349801; open bug 1574815), one core per profiled process (10.2 cores for a page's
+Firefox 159 on adais at 0.5 ms or 0.2 ms, 0.3-0.4 at 1 ms, §19), and its 1 ms is a `Sleep(1)` that
+samples every 2 ms; from Firefox 161, 500 µs, as the sampler waits on a high-resolution waitable timer
+(bug 2082760) and Windows' finest timer is about 0.5 ms (Nightly 162 kept 0.54 ms when asked for
+0.2 ms). Strobe reports the interval kept, not the one asked (Interval kept, above): the profile's
+`meta.interval` says the one asked. `moz:profiler.stop` saves into
 the downloads folder, which `user.js` points at the launch's own profile (never the user's). Every
 process records its start on the host's monotonic clock (`startTimeAsQueryPerformanceCounterValue`,
 `startTimeAsClockMonotonicNanosecondsSinceBoot`, `startTimeAsMachAbsoluteTimeNanoseconds`, read as
@@ -1226,7 +1250,8 @@ owner-only, which the Firefox Profiler opens) and what strobe read from it:
   where only native code ran, `(profiler)` where the profiler captured a marker's stack. A sample
   weighs the time to the next one (as V8 counts it), cut to the run's span and to 50 ms (the sampler
   is late at times: 1 ms at the 99th percentile on a busy adais, up to 30 ms; past that the thread was
-  not being sampled); a thread's last sample weighs one interval. Times are whole µs on a rounded
+  not being sampled); a thread's last sample weighs the median gap of the page's main threads (the
+  interval kept). Times are whole µs on a rounded
   timeline: each sample's weight is the next delta, the last one's a trailing delta (`timeDeltas` is
   one longer than `samples`); where the 50 ms cut a weight, the timeline closes the gap.
 - `gecko.json`: the rows the views read from a trace's SQL, from the page's main threads: `Reflow`
@@ -1239,7 +1264,9 @@ owner-only, which the Firefox Profiler opens) and what strobe read from it:
   none); style, layout and display-list building per run for the summary; `LongTask` markers for
   insights; and every sampled thread's CPU over the measured runs, from the CPU each sample carries
   (`threadCPUDelta`: ns on Windows and Linux, µs on macOS), which `query threads` and `a..b threads`
-  read.
+  read (a sample carries the CPU since the one before, so a run's CPU is exact to one gap at each of
+  its edges, which the view's header says with the interval kept); `interval_us` (the one asked) and
+  `sampling` (asked, kept, and the gaps it is the median of).
 - Not from Firefox: allocation samples (`query alloc`), heap snapshots (`heap`, `leaks`) and style
   invalidation tracking (`style`: Firefox records only each restyle's first cause) refuse
   `EngineUnsupported` (exit 4) with what answers instead; neither views nor reports suggest them, or
@@ -4593,7 +4620,8 @@ recordings/rec_3f9a1c/
   perfetto.pftrace      `strobe open`'s merged trace (§11.4), rebuilt on every open
   gecko-profile.json.gz Firefox: the Gecko profile as Firefox wrote it, owner-only (§8.3)
   gecko.json            Firefox: what strobe read from it: run windows and marks, page threads, each
-                        thread's CPU in the runs, the rows `layout`, `gc`, the summary and insights read
+                        thread's CPU in the runs, the rows `layout`, `gc`, the summary and insights read,
+                        the sampling interval asked and kept
   cpu-g<t>-r<n>.cpuprofile  Firefox: one V8-format profile per page thread and measured run
   memory-<n>.json.gz    Firefox: an about:memory report (`memory-0`, `memory-s0`, `memory-<run>`), owner-only (§8.6)
 ```
@@ -4776,7 +4804,7 @@ headers, 16 MiB body. Results: `content` (text for the model) + `structuredConte
 | reserved-CPU sweep (`--reserve-cpus`, §9.4) | ≤ 5% of one core, on strobe's own CPUs, never the target's (measured per block; Linux on vps 0.16–0.22%) |
 | counters (§7.5) | macOS: one `proc_pid_rusage` per process at each end of a run, nothing in the target; Linux perf events: per context switch in the target (4.4 µs in a VM), so they open only in counter blocks, never in a timing block |
 | off-CPU waits (`--probes waits`, attribution only, §11.1) | none in timing blocks: per context switch in the target (Linux about 7 µs on top of `deep` in a VM), so only a capture that asks takes them |
-| Firefox's profiler (attribution only, §8.3) | the browser's own samplers, in the target's processes: 1 ms on Windows, where any shorter interval makes every process's sampler spin a core (10-11 cores for a page's Firefox on adais at 200 µs or 500 µs, 0.4-0.9 cores at 1 ms, 0.4-1.2 with no profiler); 200 µs on macOS and Linux (air 0.3-0.6 cores and vps 0.1-0.5 at any interval, no profiler alike) |
+| Firefox's profiler (attribution only, §8.3) | the browser's own samplers, in the target's processes: on Windows 1 ms through Firefox 160, where any shorter interval makes every process's sampler busy-wait a core (bug 1349801; 10.2 cores for a page's Firefox 159 on adais at 200 µs or 500 µs, 0.3-0.4 cores at 1 ms, 0.25 with no profiler), and 500 µs from Firefox 161, whose sampler waits on a high-resolution timer (bug 2082760; Nightly 162: 0.65 cores at 500 µs, 0.3 with no profiler); 200 µs on macOS and Linux (air 0.3-0.6 cores and vps 0.1-0.5 at any interval, no profiler alike) |
 | `cli()` targets (§9.6) | nothing in the command; per command run strobe spawns it, reads its output on two threads and, after its exit, the OS's accounting (Linux also scans `/proc` for its process group), on strobe's CPUs |
 | binary (viewer embedded) | ≤ 25 MB |
 | `strobe status` (no calibration) | ≤ 4 s, 3 of them the idle-load sample |

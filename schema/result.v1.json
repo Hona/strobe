@@ -350,6 +350,11 @@
         },
         "warnings": { "type": "array", "items": { "$ref": "#/definitions/warning" } },
         "attribution": { "type": ["object", "string", "null"], "description": "The attribution recording per variant (check: the one recording)." },
+        "attribution_sampling": {
+          "type": ["object", "null"],
+          "description": "The attribution recordings' JavaScript sampler (SPEC 8.3), per variant (check: the one): the interval asked and the median gap it kept between samples of the page's main thread, in µs. Absent in older results.",
+          "properties": { "asked_us": { "type": "number" }, "median_us": { "type": "number" }, "gaps": { "type": "integer" } }
+        },
         "timing_recordings": { "type": "array" },
         "shown": { "type": ["object", "null"], "description": "What was on screen (SPEC 10.2): base and head (each with its first block's thumb_start and thumb_end as data URLs), changed (builds only)." },
         "pixels": { "description": "--pixels: per snapshot, whether base and head drew the same pixels." },

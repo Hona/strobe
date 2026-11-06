@@ -1141,15 +1141,22 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             let pids = n.pids();
             let early = p.live(&pids, lo, Duration::from_secs(2))?;
             let late = p.live(&pids, hi, Duration::from_secs(2))?;
-            if late.next_screen_ns == 0 {
+            let refresh_ns = host::refresh_at(main.rect.0, main.rect.1).map_or(16_666_667, |hz| 1_000_000_000 / hz.max(1) as u64);
+            // Nothing presented after the read that had it: a tree that announces a change just after
+            // the frame that drew it (then the app went idle). The frame is the present that started in
+            // the span, when every present since the span began is within a refresh of it.
+            let drawn_in_span = late.next_screen_ns == 0 && early.next_screen_ns != 0 && early.next_start_ns <= hi && late.last_start_ns.saturating_sub(early.next_start_ns) <= refresh_ns;
+            if drawn_in_span {
+                (n.epoch_ms + (early.next_screen_ns as f64 - n.at_ns as f64) / 1e6, cycles)
+            } else if late.next_screen_ns == 0 {
+                let at = |ns: u64| (ns as f64 - n.at_ns as f64) / 1e6;
+                let last = if late.last_start_ns == 0 { "it never presented".to_string() } else { format!("its last present started at {:.0} ms", at(late.last_start_ns)) };
                 return Err(Error::refused(
                     "RunIncomplete",
-                    format!("{} launch: no frame reached the screen after the element showed", s.case),
+                    format!("{} launch: no frame reached the screen after the element showed (between {:.0} and {:.0} ms after the spawn; {last})", s.case, at(lo), at(hi)),
                     "a window that never presents cannot be timed to an element; use a milestone",
                 ));
-            }
-            let refresh_ns = host::refresh_at(main.rect.0, main.rect.1).map_or(16_666_667, |hz| 1_000_000_000 / hz.max(1) as u64);
-            if early.next_start_ns != late.next_start_ns && late.next_screen_ns.saturating_sub(early.next_screen_ns) > refresh_ns {
+            } else if early.next_start_ns != late.next_start_ns && late.next_screen_ns.saturating_sub(early.next_screen_ns) > refresh_ns {
                 return Err(Error::refused(
                     "RunIncomplete",
                     format!(
@@ -1159,8 +1166,9 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
                     ),
                     "time the launch to an element that appears after the app stops animating, or to { window: \"settled\" }",
                 ));
+            } else {
+                (n.epoch_ms + (late.next_screen_ns as f64 - n.at_ns as f64) / 1e6, cycles)
             }
-            (n.epoch_ms + (late.next_screen_ns as f64 - n.at_ns as f64) / 1e6, cycles)
         } else {
             let mut first_px: Option<Vec<u8>> = None;
             let mut prev_px: Option<Vec<u8>> = None;

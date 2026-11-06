@@ -1944,7 +1944,10 @@ discarded first, so the OS has read the build from disk before any timed launch.
   selector, timed to the screen time of the frame that showed it: it appeared in the accessibility
   tree between the last read that lacked it and the first that had it (strobe reads the tree when
   the window appears and on each change it announces), and its frame is the first present to reach
-  the screen that started after that span began. Refused when the first read already had it, when
+  the screen that started after that span began. A tree that announces a change just after the
+  frame that drew it (AccessKit's macOS tree) leaves no present after the read that had it once the
+  app idles: then the frame is the present that started in the span, when every present since the
+  span began is within a refresh of it. Refused when the first read already had it, when
   frames that reached the screen more than one refresh apart could each have shown it (an animation
   during launch), and without OS present events. Milestones read output and log files (a native
   app has no page marks).

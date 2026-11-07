@@ -5682,7 +5682,7 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         };
         // Firefox's profiler, from the steady point to the end of the runs.
         let mut gecko: Option<probe::gecko::Profiler> = None;
-        // The launch's own time so far: everything before its first case's runs.
+        lap("probes");
         // The cases that ran, each its runs or why it failed (a failure ends the launch), and what a
         // later case's start said about the case before it.
         let mut ran: Vec<Result<PageCase>> = Vec::new();

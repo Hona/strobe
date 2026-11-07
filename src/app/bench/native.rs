@@ -463,6 +463,7 @@ fn runs(
         Some(se) => se.wait_change(changes_seen.get(), t),
         None => std::thread::sleep(t),
     };
+    lap("probes", steps);
     let mut ran: Vec<Result<NativeCase>> = Vec::new();
     let mut notes: Vec<(usize, String)> = Vec::new();
     let mut abort: Option<Error> = None;
@@ -1198,7 +1199,12 @@ fn runs(
     })();
     lap("analyse", steps);
     let mut out: Vec<Result<Block>> = match finished {
-        Ok((blocks, actions)) => return Ok(Launch { cases: blocks.into_iter().chain(failed.map(Err)).collect(), abort, notes, actions, log_at, case_ms }),
+        Ok((mut blocks, actions)) => {
+            for b in blocks.iter_mut().flatten() {
+                b.steps.extend(steps.last().cloned());
+            }
+            return Ok(Launch { cases: blocks.into_iter().chain(failed.map(Err)).collect(), abort, notes, actions, log_at, case_ms });
+        }
         Err(e) => native_cases.iter().map(|_| Err(e.clone())).collect(),
     };
     out.extend(failed.map(Err));

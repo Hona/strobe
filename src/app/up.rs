@@ -2,7 +2,6 @@
 
 use super::{Output, mcp};
 use crate::cli::Args;
-use crate::driver::Driver;
 use crate::host::{self, http, paths};
 use crate::metrics;
 use crate::model::{Error, Result};
@@ -68,9 +67,9 @@ pub fn run(args: &Args) -> Result<Output> {
     s.line("✓", "cpu", format!("{} · {} logical{}", env.cpu, env.logical_cpus, if groups.is_empty() { String::new() } else { format!(" · {}", groups.join(", ")) }));
     let fast = env.power_plan.contains("performance");
     s.line(if fast { "✓" } else { "i" }, "power", if fast { env.power_plan.clone() } else { format!("{} (benches and timed recordings switch to High performance for the run, then back)", env.power_plan) });
-    match chromium::find() {
-        Some(p) => s.line("✓", "browser", p.display().to_string()),
-        None => s.line("✗", "browser", "no Chromium: install Chrome or run bunx playwright install chromium"),
+    match chromium::locate() {
+        Ok(p) => s.line("✓", "browser", p.display().to_string()),
+        Err(e) => s.line("✗", "browser", format!("{}: {}", e.message, e.hint.unwrap_or_default())),
     }
     match crate::target::firefox::find() {
         Some(p) => s.line("✓", "firefox", format!("{} · {}", crate::target::firefox::version_of(&p).unwrap_or_else(|| "Firefox".into()), p.display())),
@@ -459,13 +458,22 @@ fn skill_up(s: &mut Steps) -> Result<()> {
     Ok(())
 }
 
-/// Runs the calibration page and stores the speed baseline (SPEC §10.3).
+/// Runs the calibration page and stores the speed baseline (SPEC §10.3). Where Chromium can show no
+/// frames, only the checks that need no display run: on Linux without a display or on a locked session
+/// it runs headless, and on a software rasterizer (a virtual display such as Xvfb) headed. Those are the
+/// speed check, an idle page's main.busy and a known main-thread load's main.busy; frames, the display's
+/// rate and GPU work go unchecked, and the calibration says so (`headless`, `software_gpu`, `display_hz`
+/// null). A calibration that checked frames is kept apart (`last_display_calibration`), so a headless one
+/// never replaces what headed runs rely on.
 pub fn calibrate(full: bool) -> Result<Value> {
     let port = http::serve_static(vec![("/", "text/html; charset=utf-8", CALIBRATION), ("/index.html", "text/html; charset=utf-8", CALIBRATION)])?;
     let base = format!("http://127.0.0.1:{port}/");
-    let browser = chromium::launch(&Window::default(), false, None, &[])?;
+    let headless = chromium::no_display().map(str::to_string).or_else(|| host::session_locked().then(|| "the session is locked".to_string()));
+    let browser = chromium::launch(&Window::default(), headless.is_some(), None, &[])?;
     let result = (|| -> Result<Value> {
-        validity::software_gpu(browser.gpu()?)?;
+        let gpu = browser.gpu()?;
+        // Why no frame check runs, if one does not.
+        let no_frames = headless.clone().map(|why| format!("headless: {why}")).or_else(|| gpu.software.then(|| format!("{} draws in software", gpu.devices.first().map_or("the GPU", String::as_str))));
         let page = browser.page()?;
         let shown: crate::target::web::WebPage = page.clone().into();
         page.navigate(&format!("{base}?case=idle"), Duration::from_secs(30))?;
@@ -474,50 +482,111 @@ pub fn calibrate(full: bool) -> Result<Value> {
         speeds.sort_by(|a, b| a.total_cmp(b));
         let speed = metrics::median(&speeds);
         let mut checks = Vec::new();
-        let measure = |query: &str, ms: u64| -> Result<BTreeMap<String, f64>> {
+        // A case's block values, and how many animation frames the page ran with the time they took.
+        let measure = |query: &str, ms: u64| -> Result<(BTreeMap<String, f64>, f64, f64)> {
             page.navigate(&format!("{base}?{query}"), Duration::from_secs(30))?;
             let token = format!("cal{}", host::now_ns() % 1_000_000);
-            let driver = Driver::new(page.clone().into(), token.clone());
             let tracing = probe::trace::start(&browser.cdp, Set::Timing)?;
             std::thread::sleep(Duration::from_millis(300));
-            driver.mark("run:0:start")?;
+            // The run's mark and the page's frame count with its clock, in one task: the counted frames
+            // are the window's (`Driver::mark`'s mark, read in the same evaluation).
+            let mark = |edge: &str| {
+                let name = format!("strobe:{token}:run:0:{edge}");
+                page.eval(&format!(r#"performance.mark("{name}"), performance.clearMarks("{name}"), [window.__calibration.frames, performance.now()]"#))
+                    .map(|v| (v[0].as_f64().unwrap_or(f64::NAN), v[1].as_f64().unwrap_or(f64::NAN)))
+            };
+            let f0 = mark("start")?;
             std::thread::sleep(Duration::from_millis(ms));
-            driver.mark("run:0:end")?;
+            let f1 = mark("end")?;
             let file = paths::run().join(format!("{token}.pftrace"));
             tracing.stop(&file)?;
             let data = metrics::read(&file, &token)?;
             let _ = std::fs::remove_file(&file);
-            Ok(metrics::block_values(&data, "run", &BTreeMap::new()))
+            Ok((metrics::block_values(&data, "run", &BTreeMap::new()), f1.0 - f0.0, f1.1 - f0.1))
         };
-        let light = measure("case=busy&ms=2", 2000)?;
-        let vsync = light.get("display.hz").map(|h| 1000.0 / h).unwrap_or(f64::NAN);
-        let light_ok = light.get("frames.dropped.pct").is_some_and(|d| *d < 2.0) && light.get("frames.interval.p50").is_some_and(|i| (i - vsync).abs() / vsync < 0.05);
-        checks.push(json!({ "case": "busy 2 ms", "ok": light_ok, "dropped_pct": light.get("frames.dropped.pct"), "interval_p50": light.get("frames.interval.p50"), "vsync_ms": vsync }));
-        if vsync.is_finite() {
-            let heavy_ms = (vsync * 1.5).round();
-            let heavy = measure(&format!("case=busy&ms={heavy_ms}"), 2000)?;
-            let d = heavy.get("frames.dropped.pct").copied().unwrap_or(f64::NAN);
-            checks.push(json!({ "case": format!("busy {heavy_ms} ms"), "ok": (25.0..75.0).contains(&d), "dropped_pct": d }));
+        let (light, n, elapsed) = measure("case=busy&ms=2", 2000)?;
+        // Known main-thread work: the page spins 2 or 6 ms in each animation frame it runs. A frame's own
+        // work (style, paint, commit) comes on top and differs by machine, so the check is the
+        // difference: main.busy per frame must grow by the 4 ms of script, within 20%.
+        let per_frame = |v: &BTreeMap<String, f64>, n: f64, elapsed: f64| v.get("main.busy").map_or(f64::NAN, |b| b / 100.0 * elapsed / n);
+        let (more, n6, elapsed6) = measure("case=busy&ms=6", 2000)?;
+        let (at2, at6) = (per_frame(&light, n, elapsed), per_frame(&more, n6, elapsed6));
+        let work_ok = n > 10.0 && n6 > 10.0 && ((at6 - at2) / 4.0 - 1.0).abs() <= 0.2;
+        checks.push(json!({ "case": "busy 2 and 6 ms: main thread", "ok": work_ok, "main_ms_per_frame": [at2, at6], "frames": [n, n6] }));
+        let mut hz: Option<f64> = None;
+        if no_frames.is_none() {
+            let vsync = light.get("display.hz").map(|h| 1000.0 / h).unwrap_or(f64::NAN);
+            hz = light.get("display.hz").copied().filter(|h| h.is_finite());
+            let light_ok = light.get("frames.dropped.pct").is_some_and(|d| *d < 2.0) && light.get("frames.interval.p50").is_some_and(|i| (i - vsync).abs() / vsync < 0.05);
+            checks.push(json!({ "case": "busy 2 ms", "ok": light_ok, "dropped_pct": light.get("frames.dropped.pct"), "interval_p50": light.get("frames.interval.p50"), "vsync_ms": vsync }));
+            if vsync.is_finite() {
+                let heavy_ms = (vsync * 1.5).round();
+                let (heavy, _, _) = measure(&format!("case=busy&ms={heavy_ms}"), 2000)?;
+                let d = heavy.get("frames.dropped.pct").copied().unwrap_or(f64::NAN);
+                checks.push(json!({ "case": format!("busy {heavy_ms} ms"), "ok": (25.0..75.0).contains(&d), "dropped_pct": d }));
+            }
         }
-        let idle = measure("case=idle", 1500)?;
+        let (idle, _, _) = measure("case=idle", 1500)?;
         let idle_ok = idle.get("main.busy").is_none_or(|b| *b < 5.0);
         checks.push(json!({ "case": "idle", "ok": idle_ok, "main_busy": idle.get("main.busy") }));
-        if full {
-            let gpu = measure("case=gpu", 2000)?;
+        if full && no_frames.is_none() {
+            let (gpu, _, _) = measure("case=gpu", 2000)?;
             checks.push(json!({ "case": "gpu", "ok": true, "frames": gpu.get("frames.n"), "dropped_pct": gpu.get("frames.dropped.pct") }));
         }
         let ok = checks.iter().all(|c| c["ok"].as_bool() == Some(true));
-        let hz = light.get("display.hz").copied().unwrap_or(f64::NAN);
-        let summary = format!("speed check {speed:.1} ms · display {hz:.0} Hz · {}/{} cases within tolerance", checks.iter().filter(|c| c["ok"].as_bool() == Some(true)).count(), checks.len());
-        Ok(json!({ "at": super::record::now_iso(), "speed_ms": speed, "display_hz": hz, "checks": checks, "ok": ok, "summary": summary }))
+        let passed = checks.iter().filter(|c| c["ok"].as_bool() == Some(true)).count();
+        let shown = match &no_frames {
+            Some(why) => format!("{why}: frame, display and GPU checks skipped"),
+            None => hz.map_or("display rate unread".to_string(), |h| format!("display {h:.0} Hz")),
+        };
+        let summary = format!("speed check {speed:.1} ms · {shown} · {passed}/{} cases within tolerance", checks.len());
+        Ok(json!({
+            "at": super::record::now_iso(), "speed_ms": speed, "display_hz": hz, "checks": checks, "ok": ok, "summary": summary,
+            "headless": headless.is_some(), "software_gpu": gpu.software, "gpu": gpu.devices.first(), "frames_skipped": no_frames,
+        }))
     })();
     browser.close();
     let cal = result?;
     let state_path = paths::state_dir().join("state.json");
     let mut state: Value = std::fs::read_to_string(&state_path).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(json!({}));
+    // One from before `frames_skipped` checked frames when it ran: it stays the display calibration.
+    let previous = state["last_calibration"].take();
+    if previous.is_object() && previous.get("frames_skipped").is_none() && !state["last_display_calibration"].is_object() {
+        state["last_display_calibration"] = previous;
+    }
     state["last_calibration"] = cal.clone();
+    if cal["frames_skipped"].is_null() {
+        state["last_display_calibration"] = cal.clone();
+    }
     paths::write_atomic(&state_path, &serde_json::to_vec_pretty(&state)?)?;
     Ok(cal)
+}
+
+/// `StaleCalibration` for a run, headless or headed (SPEC §10.3): none yet, a failed one, one older
+/// than a week, or for a headed run, a device calibrated only where frames could not be checked
+/// (headless or a software GPU). A headless run takes a headless calibration as it is.
+pub fn calibration_warning(headless: bool) -> Option<validity::Warning> {
+    let state: Value = std::fs::read_to_string(paths::state_dir().join("state.json")).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
+    let last = state.get("last_calibration").filter(|c| c.is_object());
+    // A calibration from before `frames_skipped` checked frames when it passed.
+    let display = state.get("last_display_calibration").filter(|c| c.is_object()).or(last.filter(|c| c.get("headless").is_none()));
+    let Some(c) = (if headless { last } else { display }) else {
+        return Some(match last {
+            None => validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)"),
+            Some(l) => validity::info(
+                "StaleCalibration",
+                format!(
+                    "this device was calibrated only where frames could not be checked ({}): run strobe status --calibrate on an unlocked display with a GPU for the frame checks a headed run relies on",
+                    l["frames_skipped"].as_str().unwrap_or("headless")
+                ),
+            ),
+        });
+    };
+    if c["ok"] == false {
+        return Some(validity::warn("StaleCalibration", "the last calibration failed: strobe could not recover its known costs here (run strobe status --calibrate)"));
+    }
+    let week_ago = super::record::iso(super::record::now_secs().saturating_sub(7 * 86_400));
+    c["at"].as_str().filter(|at| *at < week_ago.as_str()).map(|at| validity::info("StaleCalibration", format!("calibrated {at} (more than 7 days ago; strobe up recalibrates)")))
 }
 
 pub fn leave(args: &Args) -> Result<Output> {

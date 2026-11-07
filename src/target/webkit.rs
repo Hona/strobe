@@ -48,7 +48,10 @@ pub struct Install {
 }
 
 /// The browser for a page: on macOS Safari Technology Preview when installed (its own app, never the
-/// Safari a person browses with), else Safari; on Linux WPE's MiniBrowser headless, WebKitGTK's headed.
+/// Safari a person browses with), else Safari; on Linux WebKitGTK's MiniBrowser headed. Headless,
+/// WebKitGTK's on the session's display when there is one, typically a virtual one (`xvfb-run`): GTK has
+/// no headless backend, so its window opens there, and what it draws is refused as a headless page's;
+/// else WPE's MiniBrowser (Ubuntu 24.04 packages no WPE WebDriver).
 pub fn find(headless: bool) -> Option<Install> {
     if cfg!(target_os = "macos") {
         let preview = PathBuf::from("/Applications/Safari Technology Preview.app/Contents/MacOS");
@@ -61,10 +64,27 @@ pub fn find(headless: bool) -> Option<Install> {
     if !cfg!(target_os = "linux") {
         return None;
     }
-    let (flavor, driver, prefixes): (Flavor, &str, &[&str]) = if headless { (Flavor::Wpe, "WPEWebDriver", &["wpe-webkit-"]) } else { (Flavor::Gtk, "WebKitWebDriver", &["webkitgtk-", "webkit2gtk-"]) };
-    let driver = host::find_exe(driver, &[])?;
-    let browser = minibrowser(prefixes)?;
-    Some(Install { flavor, driver, browser })
+    let wpe = || Some(Install { flavor: Flavor::Wpe, driver: host::find_exe("WPEWebDriver", &[])?, browser: minibrowser(&["wpe-webkit-"])? });
+    let gtk = || Some(Install { flavor: Flavor::Gtk, driver: host::find_exe("WebKitWebDriver", &[])?, browser: minibrowser(&["webkitgtk-", "webkit2gtk-"])? });
+    // Headless, WebKitGTK on a display first: WPE's headless view is a touch device to its pages, which a
+    // desktop page target refuses (`DeviceMismatch`).
+    if headless { gtk().filter(|_| super::chromium::no_display().is_none()).or_else(wpe) } else { gtk() }
+}
+
+/// Why no headless WebKit page runs here, and what would run one.
+fn no_headless() -> Error {
+    let gtk = host::find_exe("WebKitWebDriver", &[]).is_some() && minibrowser(&["webkitgtk-", "webkit2gtk-"]).is_some();
+    let what = if gtk {
+        "a headless WebKit page runs WebKitGTK on a display (GTK has none of its own), and this session has none"
+    } else {
+        "no WebKitGTK WebDriver (WebKitWebDriver and WebKitGTK's MiniBrowser) for a headless WebKit page"
+    };
+    // Not WPE: its headless view is a touch device to its pages, which a desktop page target refuses.
+    Error::msg(what).hint(if gtk {
+        "run it on a virtual display (xvfb-run -a strobe …; frames and GPU use are refused there), or measure the page in Chromium or Firefox"
+    } else {
+        "install webkit2gtk-driver (Debian, Ubuntu) or webkitgtk6.0 / webkit2gtk4.1 (Fedora, Arch) and run on a virtual display (xvfb-run -a strobe …), or measure the page in Chromium or Firefox"
+    })
 }
 
 /// A distribution's MiniBrowser for these library folder prefixes (`/usr/lib/<triplet>/webkitgtk-6.0`,
@@ -119,11 +139,15 @@ pub fn describe() -> String {
     match (find(false), find(true)) {
         (None, None) if cfg!(windows) => "none: no WebKit browser runs on Windows for people (--engine webkit refuses)".into(),
         (None, None) if cfg!(target_os = "macos") => "none (only for --engine webkit: Safari or Safari Technology Preview)".into(),
-        (None, None) => "none (only for --engine webkit: install webkit2gtk-driver for headed pages, wpewebkit-webdriver for headless ones)".into(),
+        (None, None) => {
+            "none (only for --engine webkit: install webkit2gtk-driver; headless pages run it on a virtual display, xvfb-run)".into()
+        }
         (a, b) => {
+            let gtk_headless = b.as_ref().is_some_and(|i| i.flavor == Flavor::Gtk);
             let mut found: Vec<Install> = [a, b].into_iter().flatten().collect();
             found.dedup_by(|x, y| x.browser == y.browser);
-            found.iter().map(|i| format!("{} · {}", bundle_version(i).unwrap_or_else(|| i.flavor.name().into()), i.browser.display())).collect::<Vec<_>>().join("; ")
+            let text = found.iter().map(|i| format!("{} · {}", bundle_version(i).unwrap_or_else(|| i.flavor.name().into()), i.browser.display())).collect::<Vec<_>>().join("; ");
+            if cfg!(target_os = "linux") && !gtk_headless { format!("{text} (headless pages run WebKitGTK on a display: a virtual one, xvfb-run)") } else { text }
         }
     }
 }
@@ -268,20 +292,21 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         if cfg!(target_os = "macos") {
             Error::msg("no Safari found (/Applications/Safari.app)").hint("Safari ships with macOS; Safari Technology Preview: brew install --cask safari-technology-preview")
         } else if headless {
-            Error::msg("no WPE WebKit WebDriver found (WPEWebDriver and WPE's MiniBrowser)")
-                .hint("install wpewebkit-webdriver (Debian, Ubuntu) or wpewebkit (Fedora, Arch), or run headed (WebKitGTK) with a display")
+            no_headless()
         } else {
             Error::msg("no WebKitGTK WebDriver found (WebKitWebDriver and WebKitGTK's MiniBrowser)")
                 .hint("install webkit2gtk-driver (Debian, Ubuntu) or webkitgtk6.0 / webkit2gtk4.1 (Fedora, Arch)")
         }
     })?;
-    if install.flavor == Flavor::Gtk && std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return Err(Refusal::new(ValidatorId::NoPresentSource, "a headed WebKitGTK page needs a display, and this session has none (no DISPLAY or WAYLAND_DISPLAY)")
-            // Not WPE headless: its pages see no pointer at all, which a desktop page target refuses
-            // (`DeviceMismatch`).
+    if install.flavor == Flavor::Gtk && !headless && let Some(why) = super::chromium::no_display() {
+        // Not WPE headless: its pages see no pointer at all, which a desktop page target refuses
+        // (`DeviceMismatch`).
+        return Err(Refusal::new(ValidatorId::NoPresentSource, format!("a headed WebKitGTK page needs a display, and {why}"))
             .fix("run on a desktop session or under a virtual X server (xvfb-run -a strobe ...), or measure the page in Chromium or Firefox")
             .into());
     }
+    // Headless in WebKitGTK (a display, and WPE's pages see a touch device): its window opens on that display.
+    let windowed = install.flavor != Flavor::Wpe;
     let mut started = Started::new(&install.browser);
     // Safari's web content processes are shared by its windows: a session in a Safari a person runs
     // would run beside their tabs, in their Safari.
@@ -337,9 +362,10 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
             }
             cmd.env("XDG_RUNTIME_DIR", text(h.join("run")))
                 .env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={}", h.join("run").join("no-bus").display()))
-                .env("NO_AT_BRIDGE", "1")
-                .env_remove("DISPLAY")
-                .env_remove("WAYLAND_DISPLAY");
+                .env("NO_AT_BRIDGE", "1");
+            if !windowed {
+                cmd.env_remove("DISPLAY").env_remove("WAYLAND_DISPLAY");
+            }
         }
     }
     let child = match host::spawn_owned(&mut cmd, cpus, 0, home.as_deref()) {
@@ -405,7 +431,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     // safaridriver takes no null, "no limit", for it).
     session.send("POST", "/timeouts", Some(&json!({ "script": 86_400_000, "pageLoad": 3_600_000 })), Duration::from_secs(10))?;
     let version = format!("{} {}", install.flavor.name(), caps["browserVersion"].as_str().unwrap_or(""));
-    if !headless {
+    if windowed {
         session.set_window_rect(w.x, w.y, w.width, w.height)?;
     }
     let gpu = read_gpu(&session)?;
@@ -413,7 +439,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     // macOS lets strobe (nobody used the Mac for a minute). A Safari window behind other apps may not
     // answer them: the block waits, as for any window that is not the active one.
     session.send("POST", "/url", Some(&json!({ "url": "about:blank" })), Duration::from_secs(30))?;
-    if !headless {
+    if windowed {
         let set: Vec<u32> = host::process_set(pid, home.as_deref()).iter().map(|p| p.pid).filter(|&p| p != driver_pid).collect();
         host::raise_windows(&set);
     }

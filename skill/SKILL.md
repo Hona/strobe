@@ -20,7 +20,7 @@ strobe status [--calibrate]
 ### `strobe record`
 
 ```text
-strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--served <dir>]
+strobe record <target> [--probes timing|attribution|memory] [--for 10s] [--headless] [--emulate mobile|touch] [--served <dir>]
 strobe record https://… --engine firefox [--probes timing|attribution] [--headless] [--for 10s]
 strobe record --bench <file.bench.ts>#<case> [--head <variant>]
 strobe record pid:<n>|proc:<name> [--probes timing|deep|waits] [--for 10s]
@@ -526,10 +526,14 @@ Fewer than 6 pairs never gets a verdict.
 
 - Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 - No display (locked, a server)? `--headless` runs page cases (check or timed) with frame and latency metrics refused.
+  - Headed on Linux without `DISPLAY`/`WAYLAND_DISPLAY` refuses at once (`NoPresentSource`). `strobe up` calibrates headless there (frame checks skipped).
+  - On a software GPU (Xvfb, a VM): CPU metrics stay, frame and GPU metrics are refused (`SoftwareGpu`); a primary among them refuses the series.
+  - Headless `record` adds `produced`: frames the renderer made off its own clock, never shown. Never a frame rate or latency.
 - Page targets are desktops, headless too: strobe gives the page a fine pointer that hovers and turns touch off (`(hover: hover)`, `(pointer: fine)`, no touch points, no `ontouchstart`, touch screens included), so a site never takes its touch paths in a desktop bench. Checked before `setup`; a page that sees otherwise is refused `DeviceMismatch` (WPE headless on Linux: use `xvfb-run -a` with WebKitGTK, or Chromium/Firefox). No `STROBE_BROWSER` wrapper with hover/pointer `--blink-settings` is needed (strobe's replaces a wrapper's).
   - App pages (Electron, webviews) keep the machine's input; the result's `input` says what they saw (`desktop`, `hybrid`, `touch`, `none`). A page against an app whose pages saw different input is refused `VariantMismatch`.
+- Chromium: `STROBE_BROWSER`, else Chrome/Chromium/Edge, else Playwright's (`PLAYWRIGHT_BROWSERS_PATH` or its cache; Chrome for Testing included).
 - Comparing engines? `cpu.work` is the one primary both have; a Firefox page's main-thread split does not exist.
-- WebKit pages: `--engine webkit` (macOS: Safari Technology Preview, else Safari, headed only; Linux: WebKitGTK headed, WPE with `--headless`; never on Windows).
+- WebKit pages: `--engine webkit` (macOS: Safari Technology Preview, else Safari, headed only; Linux: WebKitGTK headed; `--headless` runs WebKitGTK on the session's display, so use `xvfb-run` on a server (WPE's headless pages see a touch device: refused); never on Windows).
   - Exit 3 "remote automation is off": a person runs `safaridriver --enable` once (admin password).
   - `LiveChannel`: that Safari is running; quit it or install Safari Technology Preview.
   - Refused there (`EngineUnsupported`): `main.*`, `net.*`, `input.rate`, `ctx.mock`, clicks in WPE headless (it drops pointer input; keys and scrolling work), and `count.*`, `canvas.*`, `interaction.*` of a run that loads a page (no preload in WebDriver Classic: keep runs on one page).

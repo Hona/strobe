@@ -1550,16 +1550,7 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(vm) = &env.virtual_machine {
         ctx.warnings.push(validity::warn("VirtualMachine", format!("running in a virtual machine ({vm}): its timings move with the host's load; prefer bare metal")));
     }
-    match validity::calibration() {
-        None => ctx.warnings.push(validity::info("StaleCalibration", "no calibration on this device yet: the Throttled check has no baseline (run strobe up)")),
-        Some(c) if c["ok"] == false => {
-            ctx.warnings.push(validity::warn("StaleCalibration", "the last calibration failed: strobe could not recover its known costs here (run strobe status --calibrate)"))
-        }
-        Some(c) if c["at"].as_str().is_some_and(|at| at < super::record::iso(super::record::now_secs().saturating_sub(7 * 86_400)).as_str()) => {
-            ctx.warnings.push(validity::info("StaleCalibration", format!("calibrated {} (more than 7 days ago; strobe up recalibrates)", c["at"].as_str().unwrap_or(""))))
-        }
-        Some(_) => {}
-    }
+    ctx.warnings.extend(super::up::calibration_warning(ctx.headless));
     preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
@@ -4074,12 +4065,7 @@ fn needs_screen(ctx: &Ctx, s: &Series, x: &Exec) -> Option<String> {
     }
 }
 
-/// GPU use (engine time, compiles), as opposed to GPU memory (`gpu.vram`, `gpu.shared`): what the app
-/// allocated is the same whether or not a compositor shows it, but the work a GPU does for a screen
-/// nobody sees is not.
-fn gpu_use(metric: &str) -> bool {
-    metric.starts_with("gpu.") && metric != "gpu.vram" && metric != "gpu.shared"
-}
+pub(crate) use crate::validity::{display_metric, gpu_use};
 
 /// Records a block's lock state. On a locked screen the compositor draws nothing, so GPU use there
 /// describes no person's screen: its values go, and a series that declares one shows it refused. GPU
@@ -4095,18 +4081,11 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
     b
 }
 
-/// What only a display shows (`Headless` refuses it of a headless page): frames, input-to-screen
-/// latencies, scrolling, canvas frames, the display's rate and a launch's pixels. Not strobe's own input
-/// pacing (`input.*`), which needs no display.
-pub(crate) fn display_metric(m: &str) -> bool {
-    ["frames.", "interaction.", "scroll.", "canvas.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
-}
-
-/// Frames on screen and input latencies: what background priority makes meaningless (SPEC §10.1
+/// Frames on screen (or produced headless) and input latencies: what background priority makes meaningless (SPEC §10.1
 /// `BackgroundPriority`). At background QoS a drag read 83-91% dropped frames that dropped 0.4% at
 /// normal priority.
 pub(crate) fn foreground_metric(m: &str) -> bool {
-    ["frames.", "interaction.", "scroll.", "canvas.", "input.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+    ["frames.", "interaction.", "scroll.", "canvas.", "input.", "display.", "produced."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
 }
 
 /// A kept recording's values and refusals as the block ended with them: the block wrote its

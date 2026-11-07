@@ -24,6 +24,9 @@ fn bench_case(args: &Args, file: &str, case: &str) -> Result<Output> {
     if args.has("gpu-cache") {
         return Err(Error::usage("--gpu-cache is for a native app's record; with --bench the bench target's gpuCache decides (set it in the bench file)"));
     }
+    if args.get("emulate").is_some() {
+        return Err(Error::usage("--emulate is for a page's record; with --bench the bench target decides what its page emulates"));
+    }
     let mut b = Args::parse(vec!["bench".into(), file.into(), "--head".into(), args.get("head").unwrap_or(".").into(), "--check".into(), "--why".into(), "always".into()])?;
     b.set("filter", case);
     // Recordings of one executable share its GPU caches, as `record` does.
@@ -131,7 +134,11 @@ pub fn run(args: &Args) -> Result<Output> {
         None => target,
     };
     // An engine this OS cannot run refuses before anything changes (the power plan below).
-    if let Some(e) = args.get("engine").map(WebEngine::parse).transpose()?.and_then(|e| crate::target::web::refusal(e, args.has("headless"))) {
+    let emulation = parse_emulation(args)?;
+    if let Some(e) = args.get("engine").map(WebEngine::parse).transpose()?.and_then(|e| crate::target::web::refusal_as(e, args.has("headless"), &emulation)) {
+        return Err(e);
+    }
+    if let Some(e) = phone_refusal(&emulation, args.has("headless")) {
         return Err(e);
     }
     // A timed recording runs on the fastest power plan, as a bench does (SPEC §9.4); attribution,
@@ -190,11 +197,16 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     if !attach && app.is_none() && !target.starts_with("http://") && !target.starts_with("https://") && !target.starts_with("file://") {
         return Err(Error::usage(format!("unsupported target {target}: use https://…, a local page.html, app:<id>, exe:<path>, cdp:<port> or file:<trace>")));
     }
+    let emulation = parse_emulation(args)?;
+    if (attach || app.is_some()) && args.get("emulate").is_some() {
+        return Err(Error::usage("--emulate makes a page strobe launches a phone or a touch screen (https://…, page.html); an attached endpoint or an app is what it is"));
+    }
+    let window = emulated_window(&emulation, args.has("headless"));
     // `--engine`: a page in another browser engine; Chromium (the default) records below.
     match args.get("engine").map(WebEngine::parse).transpose()? {
         Some(_) if attach || app.is_some() => return Err(Error::usage("--engine picks the browser strobe launches for a page (https://…, page.html); an attached endpoint or app is the browser it is")),
         Some(WebEngine::Chromium) | None => {}
-        Some(engine) => return engine_page(args, engine, &target, set, for_ms),
+        Some(engine) => return engine_page(args, engine, &target, set, for_ms, &emulation),
     }
     let mut guard = None;
     let browser = if attach {
@@ -206,9 +218,11 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         guard = Some(g);
         b
     } else {
-        chromium::launch(&Window::default(), args.has("headless"), None, &[])?
+        chromium::launch_as(&window, args.has("headless"), None, &[], &emulation)?
     };
-    let gpu = browser.gpu().and_then(validity::software_gpu);
+    // A software rasterizer refuses what it drew, metric by metric, below (`SoftwareGpu`); headless, what
+    // reached no display goes anyway (`Headless`).
+    let gpu = browser.gpu();
     let debug = app.as_ref().and_then(|a| host::debug_runtime(&a.exe));
     let page = if app.is_some() { electron::main_page(&browser)? } else { browser.page()? };
     if let Some(g) = &guard {
@@ -216,13 +230,22 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         // The app loads itself; give it time to settle before recording.
         std::thread::sleep(Duration::from_secs(3));
     } else if !attach {
-        progress(format!("loading {target}"));
+        // Touch and the user agent before anything loads; a phone's viewport once the window is its size.
+        page.emulate(&emulation)?;
+        if emulation.mobile {
+            // Headless (a phone is never headed here, `phone_refusal`): where the browser keeps a minimum
+            // window anyway (Chromium and Edge on Windows, 492 wide), the phone's metrics give the page its
+            // size once the window is as near it as it goes.
+            browser.fit_viewport(&page, PHONE.0, PHONE.1, None)?;
+            page.emulate_viewport(&emulation, PHONE, window.scale)?;
+        }
+        progress(format!("loading {target}{}", emulated_text(&meta_emulate(&emulation)).map(|t| format!(" as {t}")).unwrap_or_default()));
         page.navigate(&target, Duration::from_secs(60))?;
     }
-    // A page strobe launched sees a desktop's input (`DeviceMismatch`); an app's page or an attached
+    // A page strobe launched sees its emulation's input (`DeviceMismatch`); an app's page or an attached
     // browser the machine's, as it saw it.
     let input = if app.is_none() && !attach {
-        Some(validity::desktop_input(&page.clone().into())?)
+        Some(validity::emulated_input(&page.clone().into(), &emulation)?)
     } else {
         let seen = validity::InputSeen::read(&page.clone().into()).ok().map(|s| s.class());
         if seen == Some(validity::InputClass::None) {
@@ -246,7 +269,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone().into(), token.clone());
     if set == Set::Memory {
-        let meta = memory(&page, &browser, &dir, &id, &target, for_ms, input)?;
+        let meta = memory(&page, &browser, &dir, &id, &target, for_ms, json!({ "input": input, "headless": !on_screen, "emulate": meta_emulate(&emulation) }))?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
             return Err(validity::locked());
         }
@@ -337,8 +360,14 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     if let Some(v) = os.as_ref().and_then(|o| o.vram_dedicated_mb) {
         values.insert("gpu.vram".into(), v);
     }
+    let drawn = drawn_state(&gpu, !on_screen, &mut values, &mut refused);
+    // Headless, the renderer still produced frames off a clock of its own: their count and cost, kept
+    // apart from what reached a display.
+    let produced = if on_screen { None } else { Some(metrics::produced::kept(&metrics::produced::values(&metrics::produced::read(&dir.join("trace.pftrace"), &token)?, "run"), gpu.software)) };
     // The trace's mark times are its own clock; the OS window is the same span on QPC (§6).
     let os_frames = match os_frames {
+        Some(_) if !on_screen => json!({ "refused": "Headless: the page ran headless, so nothing it drew reached a display" }),
+        Some(_) if gpu.software => json!({ "refused": format!("SoftwareGpu: {}", drawn.as_deref().unwrap_or("a software adapter drew the page")) }),
         Some(Ok(p)) => {
             let run = crate::probe::present::frames::from_presents(&p.presents, &tree, t0, t1);
             let display = host::main_window(&tree).and_then(|w| host::display_of(w.hwnd));
@@ -357,11 +386,94 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         // app with a debug C runtime is a debug build (`DevBuild`).
         "timing": if set == Set::Attribution || video.is_some() { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
         "created": now_iso(), "valid": true, "sampling": sampling, "video": video,
+        "headless": !on_screen, "frames_refused": drawn, "produced": produced, "emulate": meta_emulate(&emulation),
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
     draft.keep();
     Ok(Output::new(summary_text(&meta), meta))
+}
+
+/// `--emulate mobile|touch`: what a page strobe launches emulates (a desktop without it).
+fn parse_emulation(args: &Args) -> Result<chromium::Emulation> {
+    Ok(match args.get("emulate") {
+        None => chromium::Emulation::default(),
+        Some("mobile") => chromium::Emulation { mobile: true, touch: true, user_agent: None },
+        Some("touch") => chromium::Emulation { touch: true, ..Default::default() },
+        Some(other) => return Err(Error::usage(format!("--emulate is mobile or touch, not {other} (a page is a desktop without it)"))),
+    })
+}
+
+/// The viewport an emulated phone shows (CSS pixels), at `PHONE_SCALE` headless.
+const PHONE: (u32, u32) = (390, 844);
+const PHONE_SCALE: f64 = 3.0;
+
+/// `DisplayTooSmall` for a headed phone: its 390-pixel viewport is narrower than a desktop browser's
+/// smallest window (500 in Chromium on Linux, 492 on Windows, read after the fit), so the page would be
+/// wider than the phone; headless, no window shows.
+fn phone_refusal(emulation: &chromium::Emulation, headless: bool) -> Option<Error> {
+    (emulation.mobile && !headless).then(|| {
+        crate::model::Refusal::new(
+            crate::model::ValidatorId::DisplayTooSmall,
+            format!("an emulated phone's viewport is {}×{}, narrower than a desktop browser's smallest window (500 pixels in Chromium on Linux, 492 on Windows)", PHONE.0, PHONE.1),
+        )
+        .fix("record the phone headless (--headless), which has no window to keep wide")
+        .into()
+    })
+}
+
+/// The window a page launches in: a phone's for `--emulate mobile` (at its scale headless; headed, the
+/// display's own), else strobe's default.
+fn emulated_window(emulation: &chromium::Emulation, headless: bool) -> Window {
+    if !emulation.mobile {
+        return Window::default();
+    }
+    Window { width: PHONE.0, height: PHONE.1, scale: headless.then_some(PHONE_SCALE), ..Window::default() }
+}
+
+/// What a recording keeps of its emulation (`emulate`): none for a desktop.
+fn meta_emulate(emulation: &chromium::Emulation) -> Value {
+    if emulation.touches() { json!(emulation.kind()) } else { Value::Null }
+}
+
+/// `emulated mobile (Android UA, touch)` or `emulated touch`, for a recording that emulated one.
+fn emulated_text(emulate: &Value) -> Option<String> {
+    match emulate.as_str()? {
+        "mobile" => Some("emulated mobile (Android UA, touch)".into()),
+        other => Some(format!("emulated {other}")),
+    }
+}
+
+/// What reached no display (`Headless`) or a software rasterizer drew (`SoftwareGpu`, per metric) leaves
+/// a recording's values: frames, input-to-screen latencies, scrolling, the display's rate and GPU use,
+/// with GPU memory too when no GPU held it. They show refused; CPU, main-thread work and memory stay.
+/// Returns why, for the summary, when anything went. Only catalog metrics are listed refused; the
+/// helper values beside them (`frames.split.n`, …) just go.
+fn drawn_state(gpu: &crate::target::chromium::Gpu, headless: bool, values: &mut BTreeMap<String, f64>, refused: &mut serde_json::Map<String, Value>) -> Option<String> {
+    let (gone, why): (Vec<(String, String)>, String) = if headless {
+        let drawn = |m: &str| validity::display_metric(m) || validity::gpu_use(m) || (gpu.software && matches!(m, "gpu.vram" | "gpu.shared"));
+        let gone = values.keys().filter(|m| drawn(m)).map(|m| (m.clone(), format!("Headless: {m}: the page ran headless, so nothing it drew reached a display"))).collect();
+        (gone, "Headless: the page ran headless, so nothing it drew reached a display".to_string())
+    } else {
+        let names: Vec<String> = values.keys().cloned().collect();
+        // No primary: a recording keeps whatever the rasterizer leaves meaning to.
+        let r = validity::software_refusals(gpu, false, None, names.iter().map(String::as_str)).unwrap_or_default();
+        if r.is_empty() {
+            return None;
+        }
+        let why = format!(
+            "SoftwareGpu: {} draws in software; the browser's CPU (cpu.*) includes the rasterization a GPU would do, so compare it only on this setup",
+            gpu.devices.first().map_or("the adapter", String::as_str)
+        );
+        (r.into_iter().map(|(m, refusal)| (m, refusal.message())).collect(), why)
+    };
+    for (m, text) in &gone {
+        values.remove(m);
+        if crate::model::metric(m).is_some() {
+            refused.insert(m.clone(), json!(text));
+        }
+    }
+    Some(why)
 }
 
 /// `app` with its GPU shader cache store: `--gpu-cache` (else the profile's `gpuCache`; default warm)
@@ -382,7 +494,7 @@ fn with_gpu_store(args: &Args, app: &isolate::App) -> Result<isolate::App> {
 /// the DOM's size, and headed, the OS's presents of its processes (`frames.*`, SPEC §7.2).
 /// `--probes attribution` adds Firefox's own profiler (CPU samples, style, layout and GC markers) and
 /// about:memory (`probe::gecko`); a memory recording follows heap snapshots, which Firefox gives none of.
-fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u64) -> Result<Output> {
+fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u64, emulation: &chromium::Emulation) -> Result<Output> {
     // Attribution and memory need the engine's own profiler and census: Firefox's are built, a WebKit
     // page's are not (an attribution recording without them would hold no data).
     if let (WebEngine::Chromium | WebEngine::Webkit, Set::Attribution | Set::Memory) = (engine, set) {
@@ -413,12 +525,16 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     if let Some(why) = &patched {
         progress(format!("! PatchedBrowser  {why}"));
     }
-    let browser = web::launch(engine, &Window::default(), headless, None)?;
-    let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
+    let window = emulated_window(emulation, headless);
+    let browser = web::launch_as(engine, &window, headless, None, emulation)?;
+    // A software rasterizer refuses what it drew, metric by metric, below (`SoftwareGpu`).
+    let gpu = browser.gpu()?;
     let page = browser.page()?;
-    progress(format!("loading {target} in {}", browser.version()));
+    // Firefox took the phone at launch: its headless window is the phone's viewport.
+    page.emulate(emulation)?;
+    progress(format!("loading {target} in {}{}", browser.version(), emulated_text(&meta_emulate(emulation)).map(|t| format!(" as {t}")).unwrap_or_default()));
     page.navigate(target, Duration::from_secs(60))?;
-    let input = validity::desktop_input(&page)?;
+    let input = validity::emulated_input(&page, emulation)?;
     let qos = host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid())));
     validity::window_visible(&page)?;
     if !headless && host::session_locked() {
@@ -528,12 +644,17 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         Some(Err(e)) => json!({ "refused": e.message }),
         None => json!({ "refused": "Headless: the page ran headless, so nothing it drew reached a display" }),
     };
+    // Headless already kept nothing drawn; headed on a software rasterizer, what it drew goes now.
+    let os_frames = match (!headless).then(|| drawn_state(&gpu, false, &mut values, &mut refused)).flatten() {
+        Some(why) => json!({ "refused": why }),
+        None => os_frames,
+    };
     let version = browser.version().to_string();
     browser.own()?;
     browser.close();
     let attributed = set == Set::Attribution;
     let mut meta = json!({
-        "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "input": input, "headless": headless,
+        "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "input": input, "headless": headless, "emulate": meta_emulate(emulation),
         "browser": version, "gpu": gpu, "env": host::env(), "values": values, "refused": refused, "os": os, "os_frames": os_frames, "phases": [],
         // Rule 3: timing taken with the profiler on describes the profiled page.
         "timing": if attributed || video.is_some() { "perturbed" } else { "clean" }, "created": now_iso(), "valid": true, "patched_browser": patched, "video": video,
@@ -896,7 +1017,8 @@ fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout:
 /// start, the middle and the end (S0, S1, S2), no trace (SPEC §8.6). Objects allocated between S0 and
 /// S1 that are still alive in S2 are the leak suspects. Each census comes before its snapshot, which
 /// raises the memory of the process it serializes; OS memory is reported from the first census only.
-fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::Path, id: &str, target: &str, for_ms: u64, input: Option<validity::InputClass>) -> Result<Value> {
+/// `page_state` is how the page ran (`input`, `headless`, `emulate`), kept in the meta as it is.
+fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::Path, id: &str, target: &str, for_ms: u64, page_state: Value) -> Result<Value> {
     page.send("HeapProfiler.enable", json!({}))?;
     let started = std::time::Instant::now();
     progress(format!("recording {id} for {}: a heap snapshot at the start, middle and end", fmt::ms_duration(for_ms)));
@@ -934,12 +1056,15 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
     values.insert("memory.app.private", at(0, "private_bytes") / (1024.0 * 1024.0));
     values.insert("leak.suspects.retained", leaks["retained_size"].as_f64().unwrap_or(0.0) / (1024.0 * 1024.0));
     let values: BTreeMap<&str, f64> = values.into_iter().filter(|(_, v)| v.is_finite()).collect();
-    let meta = json!({
+    let mut meta = json!({
         "id": id, "kind": "record", "target": target, "probes": "memory", "token": "", "duration_ms": for_ms,
-        "browser": browser.version, "input": input, "env": host::env(), "values": values, "census": census,
+        "browser": browser.version, "env": host::env(), "values": values, "census": census,
         "leaks": { "count": leaks["count"], "self_size": leaks["self_size"], "retained_size": leaks["retained_size"], "classes_total": leaks["classes_total"] },
         "created": now_iso(), "valid": true,
     });
+    for (k, v) in page_state.as_object().into_iter().flatten() {
+        meta[k] = v.clone();
+    }
     store::write_json(&dir.join("meta.json"), &meta)?;
     Ok(meta)
 }
@@ -948,7 +1073,7 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
 /// frame or input-latency values; its summary says why.
 fn refuse_background(meta: &mut Value, why: Option<String>) {
     let Some(why) = why else { return };
-    for path in ["/values", "/os_frames/values"] {
+    for path in ["/values", "/os_frames/values", "/produced/values"] {
         if let Some(o) = meta.pointer_mut(path).and_then(Value::as_object_mut) {
             o.retain(|k, _| !super::bench::foreground_metric(k));
         }
@@ -971,11 +1096,12 @@ fn engine_summary(meta: &Value) -> String {
     let get = |k: &str| v.get(k).and_then(Value::as_f64).unwrap_or(f64::NAN);
     let id = meta["id"].as_str().unwrap_or("");
     let mut s = format!(
-        "{id} · {} · {} · {}{} · {}\n",
+        "{id} · {} · {} · {}{}{} · {}\n",
         meta["target"].as_str().unwrap_or(""),
         fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
         meta["browser"].as_str().unwrap_or(""),
         if meta["headless"] == true { " · headless" } else { "" },
+        emulated_text(&meta["emulate"]).map(|t| format!(" · {t}")).unwrap_or_default(),
         meta["probes"].as_str().unwrap_or("timing")
     );
     s += &format!("cpu      {} of one core (cpu.app.total) · {} in the window (cpu.work), all processes\n", fmt::value(get("cpu.app.total"), "%"), fmt::value(get("cpu.work"), "ms"));
@@ -1101,14 +1227,21 @@ fn summary_body(meta: &Value) -> String {
         return engine_summary(meta);
     }
     let mut s = format!(
-        "{} · {} · {} · {}\n",
+        "{} · {} · {} · {}{}{}\n",
         meta["id"].as_str().unwrap_or(""),
         meta["target"].as_str().unwrap_or(""),
         fmt::ms_duration(meta["duration_ms"].as_u64().unwrap_or(0)),
-        meta["probes"].as_str().unwrap_or("")
+        meta["probes"].as_str().unwrap_or(""),
+        if meta["headless"] == true { " · headless" } else { "" },
+        emulated_text(&meta["emulate"]).map(|t| format!(" · {t}")).unwrap_or_default()
     );
     if let Some(line) = background_line(meta) {
         s += &line;
+    } else if let Some(why) = meta["frames_refused"].as_str() {
+        s += &format!("frames   refused ({why})\n");
+        if let Some(line) = metrics::produced::line(&meta["produced"]) {
+            s += &line;
+        }
     } else {
         s += &format!(
             "frames   {} presented · {} of vsyncs dropped · display {}\n",

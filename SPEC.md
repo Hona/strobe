@@ -371,9 +371,13 @@ engine, attachable targets (running apps and their bridge state, CDP endpoints f
 
 ```
 strobe record <target> [--probes <set|list>] [--for <duration> | --bench <file>#<case>]
-                       [--ring <duration>] [--pin] [--name <text>] [--video] [--json]
+                       [--ring <duration>] [--pin] [--name <text>] [--video] [--headless]
+                       [--emulate mobile|touch] [--json]
 ```
 
+- `--emulate mobile|touch` launches a page as a phone or a desktop with a touch screen (13.1 "Emulated
+  phones and touch screens"); without it a page is a desktop. Not with `--bench` (the bench target
+  says what its page emulates), an attached browser or an app.
 - `--video` films the recording (§8.8): the window's screen (headed) or a Chromium page's renderer
   (headless), its `timing` `perturbed`; with `--bench`, the check run's own recording holds it.
 
@@ -766,6 +770,32 @@ counter, `canvas.*` the canvas frame hook (§8.4), `gpu.compile` the trace's Daw
 - **Budget**: the refresh interval of the display the window is on (§13.1). No display, no
   budget metrics (`NoDisplayForBudget`).
 - `requestAnimationFrame` gaps, when wanted, are a separate metric named `raf.gap.*`.
+- **Headless frame production** (`metrics::produced`, Chromium): with no display, the compositor still
+  begins frames off a clock of its own (no vsync, no screen: 60 a second on vps, 129 a second in Edge
+  headless on adais, so its count is never a rate) and submits them to the display
+  compositor, which draws them where nobody sees. The trace keeps one `PipelineReporter` per frame as
+  headed (checked on vps, Chromium 151 headless on SwiftShader: 180 frames in 3 s, stages
+  `BeginImplFrameToSendBeginMainFrame` … `EndActivateToSubmitCompositorFrame`, then
+  `SubmitCompositorFrameToPresentationCompositorFrame` with Viz's `DirectRenderer::DrawFrame` and a
+  `Swap` to no screen). `produced.frames` is the frames a run produced (one per sequence) and
+  `produced.frame.p50`/`.p95` each frame's production time, from its first report's begin to the end of
+  the renderer's submit stage (`EndActivateToSubmitCompositorFrame`, or
+  `EndActivateToSubmitUpdateDisplayTree`) in its main report: a FORKED report is the compositor's part
+  submitted while the main thread's was pending, and stands for the frame only when there is no other
+  (then the last of them). The span holds the main thread's work, the commit, tile raster
+  (`EndCommitToActivation`), activation and the waits between them, the wait for the next begin of the
+  compositor's clock included when the main thread's part misses its frame (a page spinning 2 ms a
+  frame read p50 2.5 ms in one run and 16.9 ms, one interval of its 60 a second, in another on a loaded
+  2-vCPU VM; one stalling 30 ms every 4th frame, p95 31.3 ms), never the display compositor's draw after
+  the submit (`StartDrawToSwapStart`). Its spread is the machine's as much as the page's: compare it in
+  pairs, never as a level. With `produced.n`. Never a refresh rate, late or dropped
+  frames, pacing, presentation or latency: nothing was presented, and the clock is Chromium's own.
+  Labelled "headless, never shown" wherever it shows ("headless, software raster, never shown" on a
+  software adapter, whose raster is in it); compared only between builds on one machine in one mode. A
+  `produced.*` metric is a foreground one: background priority refuses it (`BackgroundPriority`). Its
+  own family, outside `frames.*`, so nothing that reads frames on screen (`Headless`, the PR block's
+  late frames) ever takes it for them. A headless `record` keeps it under `produced` in its meta and its
+  summary; benches take it with their wiring.
 - **Pages in another engine** (Firefox, WebKit, headed): the browser reports no frames of its own to
   strobe, so a page's frames are the OS's presents of its processes, exactly as a native app's (below and
   §7.4): Windows gives intervals and drops, macOS and Linux X11 counts only. `frames.presented.p*`
@@ -3075,13 +3105,13 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 
 | ID | Refuses when |
 |---|---|
-| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP and the Microsoft Basic Render Driver, llvmpipe, lavapipe, softpipe: `validity::is_software_gpu`) and a frame or GPU metric is requested; a native app: its GPU work ran on such an adapter |
+| `SoftwareGpu` | the target renders on a software adapter (SwiftShader, WARP and the Microsoft Basic Render Driver, llvmpipe, lavapipe, softpipe: `validity::is_software_gpu`) and a frame or GPU metric is requested; a native app: its GPU work ran on such an adapter. Per metric for a headed page (a virtual display such as Xvfb, a machine without a GPU): what reached a display and every `gpu.*` metric (`validity::software_drawn`) leave its values and show refused, a primary among them refuses the block, and CPU, main-thread work, memory and milestones stay, with a warning that the browser's CPU metrics include the rasterization a GPU would do (compare them only with runs on the same setup). Headless, `Headless` refuses what reached no display instead (`software_refusals`: `record` now; a bench's blocks once its wiring calls it) |
 | `DevBuild` | a dev or unminified build is measured for timing (Vite client, Solid dev build, `NODE_ENV` not `production`; a native app whose executable imports a debug C runtime, such as `ucrtbased.dll`) |
 | `DebuggerAttached` | a debugger, DevTools or a non-timing probe is attached during a timing block |
 | `WindowHidden` | the window is minimized, hidden, occluded or `visibilityState` is not `visible`; a native app's main window hidden, minimized or cloaked at the start or end of the runs, or another window over the point strobe would click (the OS hit-tests elsewhere). On macOS the app must also be the active app (strobe makes it so in every block); while someone uses the Mac the block does not refuse but waits, holding nothing, until a minute passes without input, then activates the app and runs it again; a block whose app lost the front while nobody used the Mac (another app opened a window or took focus by itself) is discarded and runs again, up to 5 times |
 | `WrongScreen` | a block's window or page is not on the screen its case's (or target's) `expect` names (§9.6): a title, a dialog or heading, an address, or selectors that must be visible, read before the runs and after them (never inside one). A first-run dialog over the pane the case meant fails the block instead of timing it. Before a native app's runs, only titles are checked unless setup already drove the app: reading its tree there would connect strobe to it for the runs |
 | `UnpacedSpin` | a native app presented more frames in a run than the display refreshed, plus ten: its frame metrics are refused |
-| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric); every frame and latency metric of a block when the OS's present events lost the way to the screen of any present of the target's processes in its measured runs (Windows: a DirectComposition surface's, as Firefox's WebRender presents; counted with none, its frames would read short or 0) |
+| `NoPresentSource` | a presented-frame or input-latency metric of a native app with no presentation times, or no input that reacted (refuses that metric); every frame and latency metric of a block when the OS's present events lost the way to the screen of any present of the target's processes in its measured runs (Windows: a DirectComposition surface's, as Firefox's WebRender presents; counted with none, its frames would read short or 0); a headed page on Linux with neither `DISPLAY` nor `WAYLAND_DISPLAY`, refused before anything builds (`web::refusal`: a bench's series, a record) and again at the launch |
 | `AmbiguousInteraction` | over half of a block's inputs were sent while the target was drawing (a present begun before the input began or reached the screen in the 2 refreshes before it: an animation, a caret, a press's look still settling after 300 ms), so the next frame may not be their reaction (refuses `interaction.*` or `scroll.latency.*`, §7.4); or the block's runs typed in a burst (`type(…, { burst: true })`: each key before the last one showed), in any engine or app, which refuses `interaction.*` with a fix naming the totals that measure burst typing (`cpu.work`, `main.work`, `ui.cpu`, `run.duration`, a phase) |
 | `PatternInput` | `interaction.*` of runs whose only inputs were accessibility actions, which skip hit testing and pointer handling |
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
@@ -3147,7 +3177,7 @@ writes it as `Refusal`s). Schema: `schema/result.v1.json`.
 keep`, on battery, or no faster plan to switch to) · `Battery` · `VirtualMachine` · `BackgroundPriority`
 (strobe or the target runs at background priority: the frame and input-latency metrics are refused, §10.1,
 and the CPU metrics kept say to compare them only at the same priority) · `TimerCoalescing` (macOS: strobe's 5 ms sleeps wake over 5 ms late, median of 7: it runs in a launchd job of ProcessType Standard or Background, such as a remote shell's daemon whose plist sets none, and macOS coalesces the timers of everything in it, the target included: 20 to 60 ms late from a 16 ms sleep on air against 1 to 4 ms under ProcessType Interactive, and no thread QoS, `PRIO_DARWIN_ROLE`, `taskpolicy` tier or `NSProcessInfo` activity strobe may set changed it. The target's timer-driven work fires late and it wakes less than an app started from a terminal; `status` shows it on a `timers` line) · `CursorNotParked` (a native block's OS cursor could not be moved onto the pointer's points, so hover tracking saw it elsewhere) · `Unattributed` (macOS: a launched app bundle did not become its own responsible process, so its XPC services are missing from its CPU, memory, wakes and GPU, §13.2; said in a native block's experiment and in a native `record`) · `Unsampled` (macOS native stacks: processes of the target `/usr/bin/sample` gave no stacks of, such as a system XPC service macOS will not let it examine, or past the 16 it samples, root first; `query hotspots` names them, since their CPU is in no row)
-· `Outliers` · `CensusContaminated` · `StaleCalibration` (older than 7 days or failed) · `DisplayOff`
+· `Outliers` · `CensusContaminated` · `StaleCalibration` (none, older than 7 days or failed; a headed run on a device calibrated only where frames could not be checked, 10.3) · `DisplayOff`
 (pairs ran with the console display off, §10.5) · `CrossAdapterScanout` (a native app draws on one GPU
 while another drives its window's display: each frame crosses between adapters) · `OverheadBudget`
 (the present session's consumer over 0.5% of a core) · `PresentsLost` · `VariantChanged` (a folder
@@ -3220,7 +3250,7 @@ the bridge, inside an Electron window.
 
 | Case | Truth | Must recover |
 |---|---|---|
-| busy | exactly B ms of JS per frame | frame cost and `main.script.self` within max(0.2 ms, 3%) |
+| busy | exactly B ms of JS per frame (2, then 6) | `main.busy` per frame grows by the 4 ms within 20%; headed on a GPU also under 2% of vsyncs dropped at 2 ms with frame intervals within 5% of the refresh, and 25–75% dropped at 1.5 refreshes of JS |
 | alloc | exactly M MB of short-lived objects per run | `alloc.bytes` within 2% |
 | layout | exactly K forced layouts per frame | the invalidation count, exact |
 | timers | exactly N timers per second | timer count, exact |
@@ -3230,7 +3260,22 @@ the bridge, inside an Electron window.
 
 `up` runs busy, alloc and idle. `status --calibrate` runs all. The last result is kept in
 `state.json` (`last_calibration`), including the speed baseline the `Throttled` check compares
-against: the median time of the fixed speed-check workload on this device.
+against: the median time of the fixed speed-check workload on this device. Busy also checks the main
+thread: the page counts the animation frames it ran, each with exactly 2 ms of script, then 6 ms, and
+`main.busy` per frame must grow by those 4 ms within 20% (a frame's own style, paint and commit come on
+top, and differ by machine). The run's start and end marks and the page's frame count with its clock
+are read in one evaluation each, so the frames counted are the window's.
+
+Where Chromium shows no frames, calibration runs the checks that need no display and skips the rest:
+on Linux without `DISPLAY` or `WAYLAND_DISPLAY`, and on a locked session, it runs headless; on a
+software adapter (a virtual display such as Xvfb) headed. The speed check, the idle page's `main.busy`
+and busy's main-thread checks run; the frame checks, the display's rate and the GPU case do not. The
+result says so (`headless`, `software_gpu`, `frames_skipped` with the reason, `display_hz` null). A
+calibration that checked frames is also kept as `last_display_calibration`, so a headless one never
+replaces it. `StaleCalibration` (10.2) reads the one the run relies on: a headless run its last
+calibration, whatever kind; a headed run the last one that checked frames, and when there is none, an
+info naming why the device's calibration skipped them and asking for `strobe status --calibrate` on an
+unlocked display with a GPU.
 
 ### 10.4 A/A
 
@@ -3859,7 +3904,23 @@ resolve to native symbols; the residue stays visible as `unresolved`.
 ### 13.1 Chromium
 
 - Headed by default, real GPU. Headless only for metrics that need no display or GPU.
-- `SoftwareGpu` checks `SystemInfo.getInfo` before measuring.
+- The browser: `STROBE_BROWSER` (a path that is no file fails, naming it, never falls through to
+  another browser), else Chrome, Chromium and Edge where they install (Linux also
+  `/usr/bin/google-chrome-stable` and `/opt/google/chrome/chrome`), else Playwright's full builds, newest
+  revision first and never its headless shell: Chrome for Testing (`chrome-linux64/chrome`,
+  `chrome-mac-{arm64,x64}/Google Chrome for Testing.app`, `chrome-win64\chrome.exe`) and the older
+  layouts (`chrome-linux/chrome`, `chrome-mac/Chromium.app`, `chrome-win\chrome.exe`), under
+  `PLAYWRIGHT_BROWSERS_PATH` or Playwright's own default (`$XDG_CACHE_HOME` or `~/.cache`,
+  `~/Library/Caches`, `%LOCALAPPDATA%`, then `ms-playwright`; `PLAYWRIGHT_BROWSERS_PATH=0` keeps them
+  in a project's `node_modules`, which `STROBE_BROWSER` names). `status` and `up` say where strobe looked.
+- Headed on Linux needs a display: without `DISPLAY` or `WAYLAND_DISPLAY` the launch refuses
+  `NoPresentSource` before anything starts (fix: `--headless`, or a virtual display through
+  `xvfb-run`, where frame and GPU metrics are refused as software rendering). Chromium and Firefox write
+  their stderr into the profile (`stderr.log`): a browser that exits before its debugging port opens,
+  with nothing else of its launch running, fails at once with its exit code and last lines, never after
+  the 30 s wait for the port (Edge's launcher exits 0 once it hands the window to a process it started,
+  which carries on).
+- `SoftwareGpu` checks `SystemInfo.getInfo` before measuring, per metric (10.1).
 - Fixed window size and scale per run, placed on a chosen display; the display's refresh rate
   is read from the OS for that window.
 - Isolated profile per launch.
@@ -3906,6 +3967,45 @@ resolve to native symbols; the residue stays visible as `unresolved`.
   on a machine without a mouse). Two sides whose pages saw different classes (a page target against an
   app on a touch-screen laptop) are refused `VariantMismatch`: a series never claims `desktop` unless
   every page in it saw one.
+- **Emulated phones and touch screens** (`chromium::Emulation`; `record --emulate mobile|touch` and the
+  MCP record tool's `emulate`, a bench target's `emulate` with its wiring; "device" stays the machine
+  strobe runs on): a desktop with a touch screen (`touch`) or a phone (`mobile`, touch implied); a
+  page is a desktop without it. A recording keeps `emulate` (none for a desktop, an attached browser or
+  an app) beside `input`, the class its page was seen to have, and its summary says "emulated mobile
+  (Android UA, touch)" or "emulated touch". A phone's window is 390×844 CSS pixels, at scale 3
+  headless: a desktop browser keeps its window some 500 pixels wide at least (Chromium under Xvfb read
+  500×844 after the fit, Edge on Windows 492), so `record` refuses a headed phone `DisplayTooSmall`
+  before anything launches (fix: `--headless`), and `WebPage::check_viewport` refuses any headed
+  emulated viewport the window did not reach. Headless, nothing is shown: where the browser still keeps
+  a minimum window (Edge headless on Windows kept 492×844), the phone's metrics override below gives
+  the page its 390 width. Chromium takes the input devices at launch (`launch_as`), in the one combined
+  `--blink-settings` (the emulation's values replace the desktop's, never beside them): touch, a fine
+  pointer that hovers first and a coarse one too (`availablePointerTypes=6`, `availableHoverTypes=3`)
+  with `maxTouchPoints=5` and `--touch-events=enabled`; a phone, a coarse pointer that does not hover
+  and nothing else (`primaryPointerType=2,availablePointerTypes=2,primaryHoverType=1,
+  availableHoverTypes=1`). DevTools' touch emulation makes the primary pointer coarse and stops it
+  hovering (checked on Chromium 151: a touch screen under it matched neither `(hover: hover)` nor
+  `(pointer: fine)`), so only a phone gets it. Each page then takes the rest before anything sizes or
+  loads it (`Page::emulate`): a phone gets 5 touch points (`Emulation.setTouchEmulationEnabled`), a
+  mouse's clicks as taps (`setEmitTouchEventsForMouse`, `mobile`) and Chrome for Android's reduced user
+  agent of the browser's own major version (`Mozilla/5.0 (Linux; Android 10; K) … Chrome/<major>.0.0.0
+  Mobile Safari/537.36`) with its client hints (the browser's own brands, `Android`, `mobile: true`); a
+  target's own `userAgent` replaces the string and sends no platform hints it did not name. Only after
+  the window is fitted to the viewport does a phone get `setDeviceMetricsOverride` with `mobile: true`
+  at that same size and scale (`emulate_viewport`): the viewport meta tag, overlay scrollbars and text
+  autosizing, never a size the window does not have. Before the fit it would lay the blank page out
+  980 wide, which the fit reads as the window's. A page with no viewport meta tag then lays out 980
+  CSS pixels wide, as on a phone. Firefox takes all of it in its profile (`launch_as`):
+  `ui.primaryPointerCapabilities`/`ui.allPointerCapabilities` 1 (coarse) for a phone, 6 and 7 for touch,
+  `dom.w3c_touch_events.enabled`, `dom.maxtouchpoints.testing.value` 5, a phone's
+  `dom.meta-viewport.enabled`, `dom.w3c_touch_events.legacy_apis.enabled` (the `ontouch*` handlers sites
+  test for, as Firefox for Android has them) and Firefox for Android's user agent of the same major
+  version (`general.useragent.override`). WebKit has no setting for any of it over WebDriver Classic: an
+  emulation refuses `EngineUnsupported` before anything builds (`web::refusal_as`, said before WPE's
+  desktop refusal). Checked as desktop input is, in the same classes (`validity::emulated_input`,
+  `DeviceMismatch`): a phone's page must read `touch` (a coarse pointer, no fine one) with no hover,
+  touch points, `ontouchstart` and a mobile user agent (or the target's); a touch screen's `hybrid` with
+  its primary pointer fine and hovering and touch points. That class is the page's `input`.
 
 **Other engines.** A page target runs in one engine (`model::WebEngine`): Chromium over CDP (the
 default), Firefox over WebDriver BiDi, WebKit over WebDriver Classic (refused `EngineUnsupported` on
@@ -4032,17 +4132,25 @@ is the stable path: Safari's BiDi is not usable yet.
     window `scale` refuses (`EngineUnsupported`). Headed, the window is kept on top (macOS: the active
     app, once nobody has used the Mac for a minute, as for native apps).
 - Linux: WebKitGTK's MiniBrowser through `WebKitWebDriver` (headed; it needs `DISPLAY` or
-  `WAYLAND_DISPLAY`, else `NoPresentSource`), or with `--headless` WPE WebKit's MiniBrowser through
-  `WPEWebDriver` (`--automation --headless --size=<w>x<h>`: WPE's headless view cannot be resized
-  through WebDriver, so the launch sizes it). The MiniBrowser is the distribution's
-  (`/usr/lib/<triplet>/webkitgtk-6.0`, `webkit2gtk-4.1`, `wpe-webkit-2.0`, `/usr/libexec/…`), passed as
-  `webkitgtk:browserOptions` / `wpe:browserOptions` `binary` (Debian: `webkit2gtk-driver`,
-  `wpewebkit-webdriver`). A private home per launch (`HOME`, `XDG_{CONFIG,DATA,CACHE,STATE}_HOME`),
+  `WAYLAND_DISPLAY`, else `NoPresentSource`). With `--headless`, WebKitGTK's MiniBrowser on the
+  session's display when there is one, typically a virtual one (`xvfb-run`): GTK has no headless
+  backend (GDK's are X11, Wayland, Broadway, Windows and macOS), so its window opens there and the page
+  counts as headless (`Headless` refuses what it drew); its pages see the X server's pointer. Without a
+  display, WPE WebKit's MiniBrowser through `WPEWebDriver` (`--automation --headless --size=<w>x<h>`:
+  WPE's headless view cannot be resized through WebDriver, so the launch sizes it), whose pages see a
+  touch device: a headless WebKit page that would run there is refused `DeviceMismatch` before anything
+  builds (`web::refusal`, beside Safari's headless refusal; the fix is WebKitGTK under `xvfb-run -a`, or
+  Chromium or Firefox; Ubuntu 24.04 packages no WPE WebDriver at all); with neither, the error names
+  `xvfb-run`. The MiniBrowser is the
+  distribution's (`/usr/lib/<triplet>/webkitgtk-6.0`, `webkit2gtk-4.1`, `wpe-webkit-2.0`,
+  `/usr/libexec/…`), passed as `webkitgtk:browserOptions` / `wpe:browserOptions` `binary` (Debian:
+  `webkit2gtk-driver`; Debian 13 and later `wpewebkit-webdriver`, its MiniBrowser in
+  `libwpewebkit-2.0-1`; Fedora and Arch `wpewebkit`). A private home per launch (`HOME`, `XDG_{CONFIG,DATA,CACHE,STATE}_HOME`),
   stamped as every launch; audio goes to GStreamer's fake sink (`GST_PLUGIN_FEATURE_RANK=
   fakeaudiosink:MAX`: media and Web Audio keep their clock, nothing plays) and GSettings to memory
   (`GSETTINGS_BACKEND=memory`: nothing reaches the user's dconf). Headless, the browser also gets a
   private `XDG_RUNTIME_DIR`, a session bus address that leads nowhere, no `DISPLAY` or `WAYLAND_DISPLAY`
-  and `NO_AT_BRIDGE=1`, so GDBus never autolaunches a bus through X11 onto the user's session: a
+  (WPE; WebKitGTK keeps the display its window opens on) and `NO_AT_BRIDGE=1`, so GDBus never autolaunches a bus through X11 onto the user's session: a
   headless page talks to no desktop, and a server's session bus with desktop portals that never start
   held WPE's first load for 75 s (three activation timeouts; 0.1 s without the bus, checked on
   Debian 13). The process set (and the OS sampler's) is the MiniBrowser's tree (its web, network and GPU
@@ -5966,6 +6074,34 @@ experiment (`... headless → ... headless desktop input`) and none against this
 run's env line read `Chrome/156 · desktop input · headless (no display)`. Not run: a real touch screen,
 WebKitGTK under `xvfb-run` (refused `SoftwareGpu` on vps before its input was read), headed pages on
 adais (locked), a page against an app on a machine where they disagree (`VariantMismatch`).
+
+GPU-less Linux (2026-11-07, vps: Debian 13, 2 vCPUs, no display, no GPU, Playwright 1.62.1's browsers in
+a scratch `PLAYWRIGHT_BROWSERS_PATH`, the system's Chromium hidden; other builds loaded the VM). Before:
+no Chromium found (Playwright's `chrome-linux64`); `STROBE_BROWSER` naming a missing file fell through to
+another browser; headed Chromium and Firefox without a display waited 30 s for a port; `status
+--calibrate` timed out without a display and refused `SoftwareGpu` under Xvfb; `record --headless`
+refused `SoftwareGpu`; headless WebKit without WPE named a package Ubuntu does not have. After: the
+default cache's `chromium-1223/chrome-linux64/chrome` and `PLAYWRIGHT_BROWSERS_PATH`'s 1234 are found
+(`look` loads the page); a missing `STROBE_BROWSER` exits 1 naming it; headed Chromium, Firefox and
+WebKitGTK refuse `NoPresentSource` at once; calibration runs headless in 7 s (headless, frames
+skipped) and under Xvfb (llvmpipe, frames skipped); `record --headless` keeps CPU and main-thread values
+with frames and GPU refused `Headless` and `produced` 180 frames in 3 s (for a page spinning 2 ms a
+frame, p50 16.9 ms and p95 17.0 ms begin to submit in one run, its main thread's part submitting at
+the compositor's next begin, and p50 2.5 ms, p95 2.9 ms in a later one, while other builds loaded the VM). A page stalling 30 ms every 4th frame had 228
+sequences with both reports: main 18.5 ms on average (32.2 at most) against the FORKED one's 4.2 ms,
+which the first build took (p50 0.3 ms); from the main report, p50 17.0 ms and p95 31.3 ms. Headed under Xvfb the same values with frames and GPU refused `SoftwareGpu`; headless WebKit
+without WPE runs WebKitGTK under `xvfb-run` (frames refused `Headless`) and, without a display, names
+`xvfb-run`; with WPE installed and no display it is refused `DeviceMismatch` up front. Calibration's
+main-thread check read 2.8 and 7.0 ms a frame (2 and 6 ms of script) headless, 3.1 and 7.0 under Xvfb
+(2.4 and 6.3 with the mark and the frame count read together).
+Emulation (`record --emulate`): Chromium 151 headless and Firefox 159 headless read `desktop`, `hybrid`
+(touch) and `touch` (mobile, Android user agent) as asked, touch under Xvfb too; Edge headless on adais
+(locked) the same, its 492-wide minimum window given the phone's 390 by the metrics override; a headed
+phone refuses `DisplayTooSmall` (Chromium under Xvfb read 500×844 after the fit); WebKit refuses an
+emulation `EngineUnsupported` before WPE's desktop refusal. DevTools' touch emulation
+made a touch screen's pointer coarse (refused before the Blink settings replaced it), and Firefox showed
+no `ontouchstart` for a phone until `dom.w3c_touch_events.legacy_apis.enabled`. Edge's launcher exits 0
+once it hands its window over: the fast exit check waits while anything of the launch still runs.
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

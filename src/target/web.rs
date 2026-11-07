@@ -2,7 +2,7 @@
 //! WebDriver BiDi or WebKit over WebDriver Classic. Callers drive them through these enums; engine-only
 //! work (a trace, the Performance domain) asks for the Chromium side and is refused elsewhere.
 
-use super::chromium::{self, Gpu, Window};
+use super::chromium::{self, Emulation, Gpu, Window};
 use super::{firefox, webkit};
 use crate::host;
 use crate::model::{Error, Refusal, Result, ValidatorId, WebEngine};
@@ -37,8 +37,16 @@ impl From<chromium::Page> for WebPage {
 
 /// Why a page of `engine` cannot run here at all, known before anything builds: WebKit on Windows has
 /// no browser a person runs (Safari is macOS only, Playwright's WebKit build is a test shell), and
-/// Safari has no headless mode.
+/// Safari has no headless mode; a headed page on Linux with no display has no window to open.
 pub fn refusal(engine: WebEngine, headless: bool) -> Option<Error> {
+    if !headless && cfg!(target_os = "linux") && let Some(why) = chromium::no_display() {
+        let (name, fix) = match engine {
+            WebEngine::Chromium => ("Chromium", "run it headless (--headless), or give it a virtual display (xvfb-run -a strobe …), where frame and GPU metrics are refused as software rendering"),
+            WebEngine::Firefox => ("Firefox", "run it headless (--headless), or give it a virtual display (xvfb-run -a strobe …), where frame and GPU metrics are refused as software rendering"),
+            WebEngine::Webkit => ("WebKitGTK", "run on a desktop session or under a virtual X server (xvfb-run -a strobe ...), or measure the page in Chromium or Firefox"),
+        };
+        return Some(Refusal::new(ValidatorId::NoPresentSource, format!("a headed {name} page needs a display, and {why}")).fix(fix).into());
+    }
     let r = match engine {
         WebEngine::Webkit if cfg!(windows) => Refusal::new(
             ValidatorId::EngineUnsupported,
@@ -49,6 +57,13 @@ pub fn refusal(engine: WebEngine, headless: bool) -> Option<Error> {
             Refusal::new(ValidatorId::EngineUnsupported, "Safari has no headless mode: a WebKit page on macOS runs headed, in an unlocked session")
                 .fix("drop --headless (and the target's headless) for --engine webkit")
         }
+        // Without a display a headless WebKit page would run in WPE, whose headless view is a touch device
+        // to its pages ((hover: none), a coarse pointer, no fine one): every desktop block would refuse.
+        WebEngine::Webkit if headless && webkit::find(true).is_some_and(|i| i.flavor == webkit::Flavor::Wpe) => Refusal::new(
+            ValidatorId::DeviceMismatch,
+            "a headless WebKit page here runs in WPE WebKit (no display for WebKitGTK), whose headless view is a touch device to its pages, not a desktop",
+        )
+        .fix("run WebKitGTK on a virtual display (xvfb-run -a strobe … --headless), or measure the page in Chromium or Firefox"),
         _ => return None,
     };
     Some(r.into())
@@ -202,12 +217,33 @@ pub fn known_room(engine: WebEngine, scale: Option<f64>) -> Option<(String, Room
 
 /// Launches a fresh browser of `engine` with an isolated profile. `cpus` pins it and its children.
 pub fn launch(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>) -> Result<WebBrowser> {
-    if let Some(e) = refusal(engine, headless) {
+    launch_as(engine, window, headless, cpus, &Emulation::default())
+}
+
+/// `refusal` for a page that emulates `emulation`, known before anything builds: WebKit has no setting for
+/// any of it over WebDriver Classic (`EngineUnsupported`, said before WPE's desktop refusal, which is
+/// not the reason then).
+pub fn refusal_as(engine: WebEngine, headless: bool, emulation: &Emulation) -> Option<Error> {
+    if engine == WebEngine::Webkit && *emulation != Emulation::default() {
+        return Some(
+            Refusal::new(ValidatorId::EngineUnsupported, format!("an emulated {} page in WebKit: WebDriver Classic has no setting for the input devices, touch points or user agent a page sees", emulation.kind()))
+                .fix("emulate the phone or touch screen in Chromium or Firefox, or measure the page as a desktop in WebKit")
+                .into(),
+        );
+    }
+    refusal(engine, headless)
+}
+
+/// `launch` as `emulation` (SPEC 13.1 "Emulated phones and touch screens"): Chromium takes its input
+/// devices at launch and the rest per page (`WebPage::emulate`, then `emulate_viewport` once sized),
+/// Firefox all of it in its profile; WebKit refuses (`refusal_as`).
+pub fn launch_as(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation) -> Result<WebBrowser> {
+    if let Some(e) = refusal_as(engine, headless, emulation) {
         return Err(e);
     }
     Ok(match engine {
-        WebEngine::Chromium => WebBrowser::Chromium(chromium::launch(window, headless, cpus, &[])?),
-        WebEngine::Firefox => WebBrowser::Firefox(firefox::launch(window, headless, cpus)?),
+        WebEngine::Chromium => WebBrowser::Chromium(chromium::launch_as(window, headless, cpus, &[], emulation)?),
+        WebEngine::Firefox => WebBrowser::Firefox(firefox::launch_as(window, headless, cpus, emulation)?),
         WebEngine::Webkit => WebBrowser::Webkit(webkit::launch(window, headless, cpus)?),
     })
 }
@@ -428,6 +464,38 @@ impl WebPage {
             WebPage::Firefox(p) => p.eval_timeout(expression, timeout),
             WebPage::Webkit(p) => p.eval_timeout(expression, timeout),
         }
+    }
+
+    /// The part of `emulation` a page takes after the launch, before anything sizes or loads it (Chromium:
+    /// `chromium::Page::emulate`). Firefox took all of it at launch; WebKit a desktop only.
+    pub fn emulate(&self, emulation: &Emulation) -> Result<()> {
+        match self {
+            WebPage::Chromium(p) => p.emulate(emulation),
+            WebPage::Firefox(_) | WebPage::Webkit(_) => Ok(()),
+        }
+    }
+
+    /// The part a page takes once its window shows the declared `viewport` (`fit_viewport` first): a
+    /// phone's viewport flag in Chromium (`chromium::Page::emulate_viewport`).
+    pub fn emulate_viewport(&self, emulation: &Emulation, viewport: (u32, u32), scale: Option<f64>) -> Result<()> {
+        match self {
+            WebPage::Chromium(p) => p.emulate_viewport(emulation, viewport, scale),
+            WebPage::Firefox(_) | WebPage::Webkit(_) => Ok(()),
+        }
+    }
+
+    /// `DisplayTooSmall` when the page is not the `viewport` it was fitted to: a desktop browser keeps its
+    /// window some 500 pixels wide at least (492 for Chromium and Edge on Windows), so a headed phone of
+    /// 390 cannot be one.
+    pub fn check_viewport(&self, viewport: (u32, u32)) -> Result<()> {
+        let v = self.eval("[innerWidth, innerHeight]")?;
+        let got = (v[0].as_u64().unwrap_or(0), v[1].as_u64().unwrap_or(0));
+        if got == (viewport.0 as u64, viewport.1 as u64) {
+            return Ok(());
+        }
+        Err(Refusal::new(ValidatorId::DisplayTooSmall, format!("the page is {}×{}, not the {}×{} viewport it was fitted to: a desktop browser's window has a minimum size", got.0, got.1, viewport.0, viewport.1))
+            .fix("run a phone headless (--headless), which has no window to keep wide")
+            .into())
     }
 
     /// Navigates and waits for the load event.

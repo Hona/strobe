@@ -22,14 +22,71 @@ pub fn info(id: &str, text: impl Into<String>) -> Warning {
     Warning { id: id.into(), level: "info".into(), text: text.into() }
 }
 
-/// `SoftwareGpu` on what the browser said it draws with (`browser.gpu()`).
+/// What only a display shows (`Headless` refuses it of a headless page): frames, input-to-screen
+/// latencies, scrolling, canvas frames, the display's rate and a launch's pixels. Not strobe's own input
+/// pacing (`input.*`), which needs no display.
+pub fn display_metric(m: &str) -> bool {
+    ["frames.", "interaction.", "scroll.", "canvas.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+}
+
+/// GPU use (engine time, compiles), as opposed to GPU memory (`gpu.vram`, `gpu.shared`): what the app
+/// allocated is the same whether or not a compositor shows it, but the work a GPU does for a screen
+/// nobody sees is not.
+pub fn gpu_use(metric: &str) -> bool {
+    metric.starts_with("gpu.") && metric != "gpu.vram" && metric != "gpu.shared"
+}
+
+/// What a software rasterizer leaves without meaning (`SoftwareGpu`, per metric): what reached a display
+/// and every GPU metric, its memory too (a software adapter holds none of its own). CPU, main-thread work,
+/// memory, counters and milestones stay, with the rasterizer's work in the CPU of the processes it runs in.
+pub fn software_drawn(m: &str) -> bool {
+    display_metric(m) || m.starts_with("gpu.")
+}
+
+fn software_text(gpu: &Gpu) -> String {
+    format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing)
+}
+
+/// `SoftwareGpu` for a whole target, where every metric it gives is drawn (a native app's frames).
 pub fn software_gpu(gpu: Gpu) -> Result<Gpu> {
     if gpu.software {
-        return Err(Refusal::new(ValidatorId::SoftwareGpu, format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing))
+        return Err(Refusal::new(ValidatorId::SoftwareGpu, software_text(&gpu))
             .fix("run headed on a machine with a GPU; frame and GPU metrics from software rendering describe no real device")
             .into());
     }
     Ok(gpu)
+}
+
+/// `SoftwareGpu` per metric (SPEC §10.1), for a headed page drawn by a software rasterizer (a virtual
+/// display, a machine without a GPU): a `primary` that is drawn (`software_drawn`) refuses the block;
+/// otherwise each of `declared` that is drawn comes back refused, for the caller to take its value out
+/// of the block and list it refused. Nothing on a hardware adapter, and nothing headless, where `Headless`
+/// refuses what reached no display.
+pub fn software_refusals<'a>(gpu: &Gpu, headless: bool, primary: Option<&str>, declared: impl IntoIterator<Item = &'a str>) -> Result<Vec<(String, Refusal)>> {
+    if !gpu.software || headless {
+        return Ok(Vec::new());
+    }
+    if let Some(p) = primary.filter(|p| software_drawn(p)) {
+        return Err(Refusal::new(ValidatorId::SoftwareGpu, format!("{p}, the primary, is drawn: {}", software_text(gpu)))
+            .fix("run headed on a machine with a GPU, or compare a CPU metric (main.work, cpu.work); frame and GPU metrics from software rendering describe no real device")
+            .into());
+    }
+    Ok(declared
+        .into_iter()
+        .filter(|m| software_drawn(m))
+        .map(|m| (m.to_string(), Refusal::new(ValidatorId::SoftwareGpu, format!("{m}: {}", software_text(gpu))).fix("run headed on a machine with a GPU for frame and GPU metrics")))
+        .collect())
+}
+
+/// What a headed run on a software rasterizer says once: its CPU metrics hold the rasterizer's work.
+pub fn software_warning(gpu: &Gpu) -> Warning {
+    warn(
+        "SoftwareGpu",
+        format!(
+            "{}: frame and GPU metrics are refused, and the browser's CPU metrics (cpu.*) include the rasterization a GPU would do; compare them only with runs on this same setup",
+            software_text(gpu)
+        ),
+    )
 }
 
 /// `SoftwareGpu`'s one test, by adapter or renderer name: a software rasterizer (Microsoft Basic
@@ -154,6 +211,63 @@ pub fn desktop_input(page: &Page) -> Result<InputClass> {
         WebEngine::Webkit => "WebKit has no setting for the input devices a page sees: measure it headed on a machine with a mouse and no touch screen, or the page in Chromium or Firefox",
     };
     Err(Refusal::new(ValidatorId::DeviceMismatch, format!("a desktop page target's page sees {} input, not a desktop's", class.name())).detail(format!("the page sees {}", seen.text())).fix(fix).into())
+}
+
+/// `DeviceMismatch` for any emulation (`chromium::Emulation`), in the same input classes: a desktop as
+/// `desktop_input`; a touch screen reads `hybrid` with its primary pointer fine and hovering and touch
+/// points; a phone reads `touch` (a coarse pointer, no fine one) with no hover, touch points and the
+/// touch event API, and a mobile user agent (or the one the target names). Read before anything is
+/// measured; returns the class the page saw.
+pub fn emulated_input(page: &Page, emulation: &crate::target::chromium::Emulation) -> Result<InputClass> {
+    if !emulation.touches() {
+        let class = desktop_input(page)?;
+        if emulation.user_agent.is_none() {
+            return Ok(class);
+        }
+    }
+    let seen = InputSeen::read(page)?;
+    let class = seen.class();
+    let want = if emulation.mobile {
+        InputClass::Touch
+    } else if emulation.touch {
+        InputClass::Hybrid
+    } else {
+        InputClass::Desktop
+    };
+    let mut wrong = Vec::new();
+    if class != want {
+        wrong.push(format!("it sees {} input, not {}", class.name(), want.name()));
+    }
+    if emulation.mobile && seen.hover {
+        wrong.push("(hover: hover) matches".to_string());
+    }
+    if emulation.mobile && !seen.touch_api {
+        wrong.push("there is no touch event API ('ontouchstart' in window is false)".to_string());
+    }
+    if emulation.touch && !emulation.mobile && !(seen.hover && seen.fine) {
+        wrong.push("its primary pointer is not a fine one that hovers".to_string());
+    }
+    if emulation.touches() && seen.touch_points.is_none_or(|n| n < 1.0) {
+        wrong.push("navigator.maxTouchPoints is 0".to_string());
+    }
+    let agent = page.eval("navigator.userAgent")?.as_str().unwrap_or("").to_string();
+    match &emulation.user_agent {
+        Some(want) if agent != *want => wrong.push(format!("the user agent is {agent:?}, not the target's")),
+        None if emulation.mobile && !agent.contains("Mobile") => wrong.push(format!("the user agent is a desktop's ({agent:?})")),
+        _ => {}
+    }
+    if wrong.is_empty() {
+        return Ok(class);
+    }
+    let fix = match page.engine() {
+        WebEngine::Chromium => "strobe launches Chromium with the emulation's pointer (--blink-settings) and emulates its touch points and user agent over DevTools: a STROBE_BROWSER wrapper that rewrites strobe's arguments can drop them; run with strobe's arguments as they are",
+        WebEngine::Firefox => "strobe sets the emulation in the Firefox profile (ui.*PointerCapabilities, dom.w3c_touch_events.enabled, dom.maxtouchpoints.testing.value, general.useragent.override): a Firefox that ignores them is not one strobe supports for it; emulate it in Chromium",
+        WebEngine::Webkit => "WebKit has no setting for the input devices or user agent a page sees: emulate it in Chromium or Firefox",
+    };
+    Err(Refusal::new(ValidatorId::DeviceMismatch, format!("a page target emulating {} does not see one: {}", emulation.kind(), wrong.join(", ")))
+        .detail(format!("the page sees {}", seen.text()))
+        .fix(fix)
+        .into())
 }
 
 /// The fixed speed-check workload; returns its time in ms (median of 3).

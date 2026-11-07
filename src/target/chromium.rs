@@ -66,10 +66,42 @@ pub struct Page {
 }
 
 pub fn find() -> Option<PathBuf> {
-    if let Some(p) = std::env::var_os("STROBE_BROWSER").map(PathBuf::from).filter(|p| p.is_file()) {
-        return Some(p);
+    locate().ok()
+}
+
+/// The Chromium strobe launches: `STROBE_BROWSER` when set (a path that is no file fails, naming it,
+/// rather than falling through to another browser), else the first of `candidates` installed.
+pub fn locate() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("STROBE_BROWSER").filter(|p| !p.is_empty()).map(PathBuf::from) {
+        if p.is_file() {
+            return Ok(p);
+        }
+        let example = if cfg!(windows) {
+            r"…\ms-playwright\chromium-<rev>\chrome-win64\chrome.exe"
+        } else if cfg!(target_os = "macos") {
+            "…/ms-playwright/chromium-<rev>/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing"
+        } else {
+            "…/ms-playwright/chromium-<rev>/chrome-linux64/chrome"
+        };
+        return Err(Error::msg(format!("STROBE_BROWSER names {}, which is not a file", p.display()))
+            .hint(format!("point STROBE_BROWSER at the browser's executable (Playwright's: {example}), or unset it to let strobe find one")));
     }
+    let c = candidates();
+    if let Some(p) = c.iter().find(|p| p.is_file()) {
+        return Ok(p.clone());
+    }
+    let pw = playwright_root().map(|r| format!(" and Playwright's builds in {}", r.display())).unwrap_or_default();
+    Err(Error::msg("no Chromium found").hint(format!(
+        "install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER to a Chromium executable (strobe looked at {} places{pw})",
+        c.len()
+    )))
+}
+
+/// Where Chrome, Chromium, Edge and Playwright's full Chromium builds install, in the order strobe
+/// takes them.
+fn candidates() -> Vec<PathBuf> {
     let mut c: Vec<PathBuf> = Vec::new();
+    let pw = playwright_root();
     if cfg!(windows) {
         for base in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
             if let Some(b) = std::env::var_os(base).map(PathBuf::from) {
@@ -77,9 +109,8 @@ pub fn find() -> Option<PathBuf> {
                 c.push(b.join(r"Chromium\Application\chrome.exe"));
             }
         }
-        if let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) {
-            c.extend(playwright_chromium(&local.join("ms-playwright"), r"chrome-win64\chrome.exe"));
-            c.extend(playwright_chromium(&local.join("ms-playwright"), r"chrome-win\chrome.exe"));
+        if let Some(root) = &pw {
+            c.extend(playwright_chromium(root, &[r"chrome-win64\chrome.exe", r"chrome-win\chrome.exe"]));
         }
         for base in ["ProgramFiles(x86)", "ProgramFiles"] {
             if let Some(b) = std::env::var_os(base).map(PathBuf::from) {
@@ -89,30 +120,66 @@ pub fn find() -> Option<PathBuf> {
     } else if cfg!(target_os = "macos") {
         c.push("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome".into());
         c.push("/Applications/Chromium.app/Contents/MacOS/Chromium".into());
-        c.extend(playwright_chromium(&host::home().join("Library/Caches/ms-playwright"), "chrome-mac/Chromium.app/Contents/MacOS/Chromium"));
+        if let Some(root) = &pw {
+            // Chrome for Testing (Playwright's builds now), then its older Chromium builds.
+            c.extend(playwright_chromium(
+                root,
+                &[
+                    "chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                    "chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing",
+                    "chrome-mac/Chromium.app/Contents/MacOS/Chromium",
+                ],
+            ));
+        }
         c.push("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge".into());
     } else {
-        for p in ["/usr/bin/google-chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"] {
+        for p in ["/usr/bin/google-chrome", "/usr/bin/google-chrome-stable", "/opt/google/chrome/chrome", "/usr/bin/chromium", "/usr/bin/chromium-browser", "/snap/bin/chromium"] {
             c.push(p.into());
         }
-        c.extend(playwright_chromium(&host::home().join(".cache/ms-playwright"), "chrome-linux/chrome"));
+        if let Some(root) = &pw {
+            // Chrome for Testing on x64 (`chrome-linux64`), Playwright's own build on ARM64 and before.
+            c.extend(playwright_chromium(root, &["chrome-linux64/chrome", "chrome-linux/chrome"]));
+        }
+        c.push("/usr/bin/microsoft-edge".into());
     }
-    c.into_iter().find(|p| p.is_file())
+    c
 }
 
-/// Playwright's full Chromium builds, newest first (never the headless shell).
-fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
+/// Playwright's browsers folder as Playwright picks it: `PLAYWRIGHT_BROWSERS_PATH`, else the user's
+/// cache (`$XDG_CACHE_HOME` or `~/.cache` on Linux, `~/Library/Caches` on macOS, `%LOCALAPPDATA%` on
+/// Windows) and `ms-playwright`. `PLAYWRIGHT_BROWSERS_PATH=0` keeps them inside a project's
+/// `node_modules`, which strobe cannot know: STROBE_BROWSER names one there.
+fn playwright_root() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os("PLAYWRIGHT_BROWSERS_PATH").filter(|p| !p.is_empty()) {
+        return (p != "0").then(|| PathBuf::from(p));
+    }
+    let cache = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)?
+    } else if cfg!(target_os = "macos") {
+        host::home().join("Library/Caches")
+    } else {
+        std::env::var_os("XDG_CACHE_HOME").filter(|p| !p.is_empty()).map(PathBuf::from).unwrap_or_else(|| host::home().join(".cache"))
+    };
+    Some(cache.join("ms-playwright"))
+}
+
+/// Playwright's full Chromium builds, finished installs first, newest first, each by the first of `rels`
+/// it has (never the headless shell, `chromium_headless_shell-<rev>`).
+fn playwright_chromium(root: &Path, rels: &[&str]) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(root) else { return Vec::new() };
-    let mut dirs: Vec<(u32, PathBuf)> = rd
+    // A revision Playwright finished installing (its `INSTALLATION_COMPLETE` marker) before one it is
+    // still unpacking or gave up on.
+    let mut dirs: Vec<(bool, u32, PathBuf)> = rd
         .flatten()
         .filter_map(|e| {
             let name = e.file_name().to_string_lossy().to_string();
             let rev = name.strip_prefix("chromium-")?.parse().ok()?;
-            Some((rev, e.path().join(rel)))
+            let dir = e.path();
+            Some((dir.join("INSTALLATION_COMPLETE").is_file(), rev, rels.iter().map(|r| dir.join(r)).find(|p| p.is_file()).unwrap_or_else(|| dir.join(rels[0]))))
         })
         .collect();
-    dirs.sort_by_key(|d| std::cmp::Reverse(d.0));
-    dirs.into_iter().map(|d| d.1).collect()
+    dirs.sort_by_key(|d| std::cmp::Reverse((d.0, d.1)));
+    dirs.into_iter().map(|d| d.2).collect()
 }
 
 /// A desktop's input devices whatever the machine has (`validity::desktop_input`): a fine pointer that
@@ -125,10 +192,110 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
 /// is ignored), so `launch` passes one, these after any of the caller's; it replaces one a
 /// `STROBE_BROWSER` wrapper puts first.
 const DESKTOP_INPUT: &str = "primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2,maxTouchPoints=0";
+/// A desktop with a touch screen too: the fine pointer that hovers comes first, and a coarse one that
+/// does not hover is also there (`POINTER_TYPE_COARSE` 1 << 1, `HOVER_TYPE_NONE` 1 << 0), with its touch
+/// points. Not DevTools' touch emulation, which makes the primary pointer coarse, as on a phone.
+const TOUCH_INPUT: &str = "primaryPointerType=4,availablePointerTypes=6,primaryHoverType=2,availableHoverTypes=3,maxTouchPoints=5";
+/// A phone's: a coarse pointer that does not hover, and nothing else.
+const MOBILE_INPUT: &str = "primaryPointerType=2,availablePointerTypes=2,primaryHoverType=1,availableHoverTypes=1,maxTouchPoints=5";
+
+/// The touch points an emulated phone or touch screen reports (`navigator.maxTouchPoints`), as real ones do.
+pub const TOUCH_POINTS: u32 = 5;
+
+/// What a page target emulates (`--emulate`, SPEC 13.1 "Emulated phones and touch screens"): a desktop
+/// (none: a fine pointer that hovers, no touch points), a desktop with a touch screen too (`touch`), or a
+/// phone (`mobile`: touch only, the page's viewport meta tag honoured, and a mobile user agent of this
+/// browser's own version unless `user_agent` names one).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Emulation {
+    pub mobile: bool,
+    pub touch: bool,
+    pub user_agent: Option<String>,
+}
+
+impl Emulation {
+    /// Touch points: a phone has them, and a touch screen.
+    pub fn touches(&self) -> bool {
+        self.mobile || self.touch
+    }
+
+    /// What it is in a label: `mobile`, `touch` or `desktop`.
+    pub fn kind(&self) -> &'static str {
+        if self.mobile {
+            "mobile"
+        } else if self.touch {
+            "touch"
+        } else {
+            "desktop"
+        }
+    }
+
+    fn blink_settings(&self) -> &'static str {
+        if self.mobile {
+            MOBILE_INPUT
+        } else if self.touch {
+            TOUCH_INPUT
+        } else {
+            DESKTOP_INPUT
+        }
+    }
+}
+
+/// Android Chrome's user agent for a desktop one's (`…Chrome/151.0.0.0…`): the reduced form Chrome sends
+/// on every Android phone (`Android 10; K`), of the same major version.
+pub fn mobile_user_agent(desktop: &str) -> String {
+    let major = desktop.split("Chrome/").nth(1).and_then(|v| v.split('.').next()).filter(|v| !v.is_empty()).unwrap_or("0");
+    format!("Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Mobile Safari/537.36")
+}
+
+/// Why a headed browser cannot open a window here: Linux with neither an X11 nor a Wayland display.
+pub fn no_display() -> Option<&'static str> {
+    let set = |k: &str| std::env::var_os(k).is_some_and(|v| !v.is_empty());
+    (cfg!(target_os = "linux") && !set("DISPLAY") && !set("WAYLAND_DISPLAY")).then_some("this session has no display (neither DISPLAY nor WAYLAND_DISPLAY is set)")
+}
+
+/// `NoPresentSource` for a headed page with no display to open its window on.
+pub fn headed_refusal(browser: &str) -> Option<Error> {
+    let why = no_display()?;
+    Some(
+        crate::model::Refusal::new(crate::model::ValidatorId::NoPresentSource, format!("a headed {browser} page needs a display, and {why}"))
+            .fix("run it headless (--headless), or give it a virtual display (xvfb-run -a strobe …), where frame and GPU metrics are refused as software rendering")
+            .into(),
+    )
+}
+
+/// The exit code of a launch whose browser is gone: the launched process exited and nothing else of the
+/// launch runs (Edge's launcher exits 0 once it hands the window to a process it started, which carries
+/// on with the profile).
+/// A launcher that failed (a non-zero exit) is gone at once, whatever it left.
+pub fn launch_gone(child: Option<&mut Owned>, profile: &Path) -> Option<i32> {
+    let c = child?;
+    let (code, pid) = (c.exited()?, c.pid());
+    (code != 0 || host::process_set(pid, Some(profile)).iter().all(|p| p.pid == pid)).then_some(code)
+}
+
+/// The last lines a browser that exited printed on stderr (`<profile>/stderr.log`), for the error.
+pub fn last_words(log: &Path) -> String {
+    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let lines: Vec<&str> = text.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+    if lines.is_empty() {
+        return String::new();
+    }
+    format!(": {}", lines[lines.len().saturating_sub(3)..].join(" · "))
+}
 
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
-    let exe = find().ok_or_else(|| Error::msg("no Chromium found").hint("install Chrome or Edge, run `bunx playwright install chromium`, or set STROBE_BROWSER"))?;
+    launch_as(window, headless, cpus, extra, &Emulation::default())
+}
+
+/// `launch` as `emulation`: its input devices from the start (`--blink-settings`); each page then takes the
+/// rest of it from `Page::emulate`.
+pub fn launch_as(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String], emulation: &Emulation) -> Result<Browser> {
+    let exe = locate()?;
+    if !headless && let Some(e) = headed_refusal("Chromium") {
+        return Err(e);
+    }
     let profile = host::paths::run().join(format!("profile-{}-{}", std::process::id(), host::now_ns()));
     std::fs::create_dir_all(&profile)?;
     let mut args: Vec<String> = vec![
@@ -159,7 +326,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         format!("--window-size={},{}", window.width, window.height),
     ];
     if let Some(s) = window.scale {
-        args.push(format!("--force-device-scale-factor={s}"));
+        args.push(format!("--force-emulation-scale-factor={s}"));
     }
     if headless {
         args.push("--headless=new".into());
@@ -170,13 +337,18 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         args.push("--no-sandbox".into());
     }
     let (blink, rest): (Vec<&String>, Vec<&String>) = extra.iter().partition(|a| a.starts_with("--blink-settings="));
-    let settings: Vec<&str> = blink.iter().filter_map(|a| a.strip_prefix("--blink-settings=")).chain([DESKTOP_INPUT]).collect();
+    let settings: Vec<&str> = blink.iter().filter_map(|a| a.strip_prefix("--blink-settings=")).chain([emulation.blink_settings()]).collect();
     args.extend(rest.into_iter().cloned());
     args.push(format!("--blink-settings={}", settings.join(",")));
-    args.push("--touch-events=disabled".into());
+    // The touch event API (`ontouchstart`) where the emulation has touch: a phone's also comes with
+    // DevTools' touch emulation (`Page::emulate`).
+    args.push(format!("--touch-events={}", if emulation.touches() { "enabled" } else { "disabled" }));
     args.push("about:blank".into());
     let mut cmd = Command::new(&exe);
-    cmd.args(&args).envs(super::isolate::launch_env(&profile)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // Its stderr goes to the profile: a browser that exits before its debugging port opens says why there.
+    let log = profile.join("stderr.log");
+    let stderr = std::fs::File::create(&log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
+    cmd.args(&args).envs(super::isolate::launch_env(&profile)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(stderr);
     let child = match host::spawn_owned(&mut cmd, cpus, 0, Some(&profile)) {
         Ok(c) => c,
         Err(e) => {
@@ -187,7 +359,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     };
     let pid = child.pid();
     // A launch that fails from here ends the browser and its profile.
-    let launching = super::isolate::Launching::new(child, Some(profile.clone()), true);
+    let mut launching = super::isolate::Launching::new(child, Some(profile.clone()), true);
     let port_file = profile.join("DevToolsActivePort");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     let text = loop {
@@ -196,8 +368,11 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         {
             break t;
         }
+        if let Some(code) = launch_gone(launching.child.as_mut(), &profile) {
+            return Err(Error::msg(format!("{} exited ({code}) before it opened its debugging port{}", exe.display(), last_words(&log))));
+        }
         if std::time::Instant::now() > deadline {
-            return Err(Error::unreachable("Chromium did not open its debugging port in 30 s"));
+            return Err(Error::unreachable(format!("Chromium did not open its debugging port in 30 s{}", last_words(&log))));
         }
         std::thread::sleep(Duration::from_millis(25));
     };
@@ -379,6 +554,9 @@ impl Browser {
     /// Closes the browser as a person would (`Browser.close`, up to 5 s for it to exit), then ends
     /// what is left and removes the profile (an attached browser is only asked to close).
     pub fn close(mut self) {
+        // A launcher that already exited handed the window to a process it started (Edge): that one is
+        // the browser to wait for.
+        let handed_over = self.as_person && self.child.as_mut().is_some_and(|c| c.exited().is_some());
         // A webview's app closes as a person closes it (its windows), with a short grace; `Browser.close`
         // would end only its browser and leave the app waited on.
         let grace = if self.embedded {
@@ -387,11 +565,17 @@ impl Browser {
             let _ = self.cdp.send_timeout("Browser.close", json!({}), None, Duration::from_secs(5));
             5
         };
-        if let Some(c) = self.child.as_mut() {
-            let deadline = std::time::Instant::now() + Duration::from_secs(grace);
-            while std::time::Instant::now() < deadline && c.exited().is_none() {
-                std::thread::sleep(Duration::from_millis(50));
+        let deadline = std::time::Instant::now() + Duration::from_secs(grace);
+        while std::time::Instant::now() < deadline {
+            let gone = match (self.child.as_mut(), self.profile.as_deref()) {
+                (Some(c), Some(p)) if handed_over => launch_gone(Some(c), p).is_some(),
+                (Some(c), _) => c.exited().is_some(),
+                (None, _) => true,
+            };
+            if gone {
+                break;
             }
+            std::thread::sleep(Duration::from_millis(50));
         }
         self.end(true);
     }
@@ -445,6 +629,40 @@ impl Page {
             return Err(Error::msg(format!("page: {}", text.lines().next().unwrap_or(text))));
         }
         Ok(r["result"]["value"].clone())
+    }
+
+    /// What a page takes of `emulation` before anything sizes or loads it (the launch gave it the input
+    /// devices): for a phone, touch points and touch events and a mouse's clicks as taps, and the mobile
+    /// user agent with Chrome for Android's client hints (a target's own `user_agent` replaces the string
+    /// and sends no hints of a platform it did not name). The phone's viewport flag waits for
+    /// `emulate_viewport`, once the window is sized.
+    pub fn emulate(&self, emulation: &Emulation) -> Result<()> {
+        if emulation.mobile {
+            // A phone's touch points; this also makes its primary pointer coarse (a touch screen's come
+            // from the launch's Blink settings instead).
+            self.send("Emulation.setTouchEmulationEnabled", json!({ "enabled": true, "maxTouchPoints": TOUCH_POINTS }))?;
+            self.send("Emulation.setEmitTouchEventsForMouse", json!({ "enabled": true, "configuration": "mobile" }))?;
+        }
+        if let Some(agent) = &emulation.user_agent {
+            self.send("Emulation.setUserAgentOverride", json!({ "userAgent": agent }))?;
+        } else if emulation.mobile {
+            let own = self.eval("[navigator.userAgent, navigator.userAgentData ? navigator.userAgentData.brands : []]")?;
+            // Client hints as Chrome on Android sends them, with this browser's own brands.
+            let metadata = json!({ "brands": own[1], "platform": "Android", "platformVersion": "10.0.0", "architecture": "", "model": "K", "mobile": true });
+            self.send("Emulation.setUserAgentOverride", json!({ "userAgent": mobile_user_agent(own[0].as_str().unwrap_or("")), "platform": "Linux armv81", "userAgentMetadata": metadata }))?;
+        }
+        Ok(())
+    }
+
+    /// A phone's viewport flag once the window shows `viewport` CSS pixels (after the fit, never before:
+    /// over a blank page the flag lays it out 980 wide, which the fit would read as the window's): the
+    /// viewport meta tag, overlay scrollbars and text autosizing, at that same size and scale. Never a size
+    /// the window does not have.
+    pub fn emulate_viewport(&self, emulation: &Emulation, viewport: (u32, u32), scale: Option<f64>) -> Result<()> {
+        if emulation.mobile {
+            self.send("Emulation.setDeviceMetricsOverride", json!({ "width": viewport.0, "height": viewport.1, "deviceScaleFactor": scale.unwrap_or(0.0), "mobile": true }))?;
+        }
+        Ok(())
     }
 
     pub fn navigate(&self, url: &str, timeout: Duration) -> Result<()> {

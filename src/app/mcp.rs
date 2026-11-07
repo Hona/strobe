@@ -54,6 +54,10 @@ const TOOLS: &[Tool] = &[
             ("app", "exe:<path>: the strobe.json app profile it borrows"),
             ("headless", "draw off screen: attribution data stays meaningful, frame metrics do not"),
             (
+                "emulate",
+                "a page strobe launches as mobile (a phone: 390x844, coarse pointer, no hover, touch, the browser's Android user agent; scale 3 headless) or touch (a desktop with a touch screen); a desktop without it; Chromium and Firefox",
+            ),
+            (
                 "engine",
                 "a page's browser engine: chromium (default) or firefox (CPU, GPU, memory and OS frames, no trace; probes attribution runs Firefox's own profiler and about:memory; probes memory refuses)",
             ),

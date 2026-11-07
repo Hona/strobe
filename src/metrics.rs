@@ -6,6 +6,8 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
+pub mod produced;
+
 /// A run's span with the stretches the bench file left out of it (`ctx.untimed`, SPEC §9.6), on
 /// one clock (the host's, or a trace's): its timed totals, frames and inputs cover the rest.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]

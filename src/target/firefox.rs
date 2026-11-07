@@ -2,7 +2,7 @@
 //! §13.1): the browser's own remote agent, no geckodriver.
 
 use super::bidi::{self, Bidi};
-use super::chromium::{Gpu, Window};
+use super::chromium::{Emulation, Gpu, Window};
 use crate::host;
 use crate::host::spawn::Owned;
 use crate::model::{Error, Result};
@@ -167,7 +167,43 @@ pub fn version_of(exe: &Path) -> Option<String> {
 /// Launches a fresh Firefox in an isolated profile and opens its BiDi session. `cpus`, when set, is the
 /// affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Browser> {
+    launch_as(window, headless, cpus, &Emulation::default())
+}
+
+/// What an `emulation` other than a desktop sets in the profile, over `USER_JS`'s desktop input (LookAndFeel's
+/// PointerCapabilities bits: Coarse 1, Fine 2, Hover 4). A phone: a coarse pointer that does not hover,
+/// touch events, touch points, the page's viewport meta tag honoured (as Firefox for Android does) and
+/// Firefox for Android's user agent of this version; a touch screen adds a coarse pointer and touch points
+/// to the desktop's.
+fn emulation_prefs(emulation: &Emulation, exe: &Path) -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = Vec::new();
+    let mut set = |k: &str, v: String| p.push((k.to_string(), v));
+    if emulation.touches() {
+        let (primary, all) = if emulation.mobile { ("1", "1") } else { ("6", "7") };
+        set("ui.primaryPointerCapabilities", primary.into());
+        set("ui.allPointerCapabilities", all.into());
+        set("dom.w3c_touch_events.enabled", "1".into());
+        set("dom.maxtouchpoints.testing.value", super::chromium::TOUCH_POINTS.to_string());
+    }
+    if emulation.mobile {
+        set("dom.meta-viewport.enabled", "true".into());
+        // The `ontouch*` handlers on window and document that sites test for touch, as Firefox for Android has them.
+        set("dom.w3c_touch_events.legacy_apis.enabled", "true".into());
+    }
+    let major = version_of(exe).and_then(|v| v.trim_start_matches("Firefox ").split('.').next().map(str::to_string)).unwrap_or_else(|| "0".into());
+    let agent = emulation.user_agent.clone().or_else(|| emulation.mobile.then(|| format!("Mozilla/5.0 (Android 10; Mobile; rv:{major}.0) Gecko/{major}.0 Firefox/{major}.0")));
+    if let Some(a) = agent {
+        set("general.useragent.override", serde_json::to_string(&a).unwrap_or_default());
+    }
+    p
+}
+
+/// `launch` as `emulation` (`emulation_prefs`), set in the profile before Firefox starts.
+pub fn launch_as(window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation) -> Result<Browser> {
     let exe = find().ok_or_else(|| Error::msg("no Firefox found").hint("install Firefox from mozilla.org (winget install Mozilla.Firefox, brew install --cask firefox, or the distribution's package), or set STROBE_FIREFOX"))?;
+    if !headless && let Some(e) = super::chromium::headed_refusal("Firefox") {
+        return Err(e);
+    }
     let name = format!("profile-{}-{}", std::process::id(), host::now_ns());
     let profile = if snap(&exe) { snap_profiles().join(name) } else { host::paths::run().join(name) };
     // The user's alone: the profile names the BiDi port and allows chrome-scope scripts on it, which any
@@ -176,7 +212,9 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         host::paths::owner_only_dir(root);
     }
     host::paths::owner_only_dir(&profile);
-    let mut prefs: Vec<(String, String)> = USER_JS.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    let over = emulation_prefs(emulation, &exe);
+    let mut prefs: Vec<(String, String)> = USER_JS.iter().filter(|(k, _)| !over.iter().any(|o| o.0 == *k)).map(|(k, v)| (k.to_string(), v.to_string())).collect();
+    prefs.extend(over);
     if let Some(s) = window.scale {
         prefs.push(("layout.css.devPixelsPerPx".into(), format!("\"{s}\"")));
     }
@@ -207,6 +245,9 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     }
     args.push("about:blank".into());
     let mut cmd = Command::new(&exe);
+    // Its stderr goes to the profile: a browser that exits before its BiDi port opens says why there.
+    let log = profile.join("stderr.log");
+    let stderr = std::fs::File::create(&log).map(Stdio::from).unwrap_or_else(|_| Stdio::null());
     cmd.args(&args)
         .envs(super::isolate::launch_env(&profile))
         // Chrome-scope reads only (process roles, the compositor): nothing a page can reach.
@@ -216,7 +257,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         .env("MOZ_HEADLESS_HEIGHT", window.height.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(stderr);
     let child = match host::spawn_owned(&mut cmd, cpus, 0, Some(&profile)) {
         Ok(c) => c,
         Err(e) => {
@@ -226,7 +267,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         }
     };
     let pid = child.pid();
-    let launching = super::isolate::Launching::new(child, Some(profile.clone()), true);
+    let mut launching = super::isolate::Launching::new(child, Some(profile.clone()), true);
     // Firefox writes its BiDi server's address into the profile once it listens.
     let port_file = profile.join("WebDriverBiDiServer.json");
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
@@ -234,8 +275,11 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         if let Some(p) = std::fs::read_to_string(&port_file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()).and_then(|v| v["ws_port"].as_u64()) {
             break p;
         }
+        if let Some(code) = super::chromium::launch_gone(launching.child.as_mut(), &profile) {
+            return Err(Error::msg(format!("{} exited ({code}) before it opened its WebDriver BiDi port{}", exe.display(), super::chromium::last_words(&log))));
+        }
         if std::time::Instant::now() > deadline {
-            return Err(Error::unreachable("Firefox did not open its WebDriver BiDi port in 30 s"));
+            return Err(Error::unreachable(format!("Firefox did not open its WebDriver BiDi port in 30 s{}", super::chromium::last_words(&log))));
         }
         std::thread::sleep(Duration::from_millis(25));
     };

@@ -17,7 +17,12 @@ pub fn run(args: &Args) -> Result<Output> {
     let env = host::env();
     let topo = host::topology();
     let busy = host::system_busy(if args.has("fast") { 300 } else { 3000 });
-    let browser = chromium::find();
+    let located = chromium::locate();
+    let browser = located.as_ref().ok().cloned();
+    let browser_text = match &located {
+        Ok(p) => p.display().to_string(),
+        Err(e) => format!("none: {}{}", e.message, e.hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default()),
+    };
     // Optional: page targets run in Firefox only when a bench or record asks for it (`--engine firefox`).
     let firefox = crate::target::firefox::find();
     let firefox_text = firefox.as_ref().map(|p| {
@@ -53,8 +58,8 @@ pub fn run(args: &Args) -> Result<Output> {
     if locked {
         problems.push("the session is locked (benches wait for an unlock)".into());
     }
-    if browser.is_none() {
-        problems.push("no Chromium found (install Chrome or run bunx playwright install chromium)".into());
+    if let Err(e) = &located {
+        problems.push(format!("{}{}", e.message, e.hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default()));
     }
     if bun.is_none() {
         problems.push("no Bun (bench files need it: https://bun.sh)".into());
@@ -119,7 +124,7 @@ pub fn run(args: &Args) -> Result<Output> {
         t += &format!("  ! timers     {why}: its waits and the app's timers fire late, and the app's wakes are not a terminal's (run strobe from a terminal, or give that job ProcessType Interactive in its launchd plist)\n");
     }
     t += &format!("  {} screen     {}\n", mark(!locked), if locked { "locked: benches wait for an unlock" } else { "unlocked" });
-    t += &format!("  {} browser    {}\n", mark(browser.is_some()), browser.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
+    t += &format!("  {} browser    {browser_text}\n", mark(browser.is_some()));
     t += &format!("  {} firefox    {}\n", if firefox.is_some() { "✓" } else { "i" }, firefox_text.as_deref().unwrap_or("none (only for --engine firefox)"));
     t += &format!("  {} webkit     {}\n", if webkit { "✓" } else { "i" }, webkit_text);
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
@@ -128,8 +133,20 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} engine     trace_processor {}{}\n", mark(engine::installed()), engine::VERSION, if engine::installed() { "" } else { " (not downloaded)" });
     t += &format!(
         "  {} calibrate  {}\n",
-        mark(!calibration.is_null()),
-        calibration.get("speed_ms").and_then(Value::as_f64).map(|s| format!("speed check {s:.1} ms · {}", calibration["at"].as_str().unwrap_or(""))).unwrap_or_else(|| "never".into())
+        mark(!calibration.is_null() && calibration["ok"] != false),
+        calibration
+            .get("speed_ms")
+            .and_then(Value::as_f64)
+            .map(|s| format!(
+                "speed check {s:.1} ms · {}{}{}",
+                calibration["at"].as_str().unwrap_or(""),
+                {
+                    let failed: Vec<&str> = calibration["checks"].as_array().into_iter().flatten().filter(|c| c["ok"] == false).filter_map(|c| c["case"].as_str()).collect();
+                    if failed.is_empty() { String::new() } else { format!(" · outside tolerance: {}", failed.join(", ")) }
+                },
+                calibration["frames_skipped"].as_str().filter(|_| !state["last_display_calibration"].is_object()).map(|why| format!(" · frames unchecked ({why}): headed runs want one on a display with a GPU")).unwrap_or_default()
+            ))
+            .unwrap_or_else(|| "never".into())
     );
     t += &format!(
         "  {} daemon     {}\n",

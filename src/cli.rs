@@ -32,6 +32,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("headless", Switch, "record bench plan track"),
     ("engine", Value, "record bench plan track"),
     ("served", Value, "record"),
+    ("emulate", Value, "record"),
     ("style", Switch, "record bench"),
     ("native", Switch, "record query"),
     ("app", Value, "record look"),
@@ -325,7 +326,7 @@ Usage: strobe <command> [flags]
 
 Use
   status                          environment, validity preflight, recent recordings and experiments
-  record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--served <dir>] [--style]
+  record <target> [--for 10s] [--probes timing|attribution|memory] [--headless] [--emulate mobile|touch] [--served <dir>] [--style]
                                   record a target; prints a handle (rec_…); exe:<path> --native for a native app
                                   (a native app: --gpu-cache warm|cold, its GPU shader caches from earlier recordings of it)
                                   (--video: also film it, timing perturbed: the window's screen, or a headless page's renderer)

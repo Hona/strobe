@@ -125,7 +125,7 @@ pub fn dev_build(page: &Page) -> Result<()> {
 }
 
 /// What a page reads of its input devices: the hover and pointer media queries, touch points and the
-/// touch event API.
+/// touch event API; and in the same read, whether it matches `(prefers-reduced-motion: reduce)`.
 pub struct InputSeen {
     hover: bool,
     fine: bool,
@@ -133,15 +133,16 @@ pub struct InputSeen {
     any_coarse: bool,
     touch_api: bool,
     touch_points: Option<f64>,
+    pub reduced_motion: bool,
 }
 
-const INPUT_SCRIPT: &str = "[matchMedia('(hover: hover)').matches, matchMedia('(pointer: fine)').matches, matchMedia('(any-pointer: fine)').matches, matchMedia('(any-pointer: coarse)').matches, 'ontouchstart' in window, navigator.maxTouchPoints]";
+const INPUT_SCRIPT: &str = "[matchMedia('(hover: hover)').matches, matchMedia('(pointer: fine)').matches, matchMedia('(any-pointer: fine)').matches, matchMedia('(any-pointer: coarse)').matches, 'ontouchstart' in window, navigator.maxTouchPoints, matchMedia('(prefers-reduced-motion: reduce)').matches]";
 
 impl InputSeen {
     pub fn read(page: &Page) -> Result<InputSeen> {
         let v = page.eval(INPUT_SCRIPT)?;
         let b = |i: usize| v[i].as_bool() == Some(true);
-        Ok(InputSeen { hover: b(0), fine: b(1), any_fine: b(2), any_coarse: b(3), touch_api: b(4), touch_points: v[5].as_f64() })
+        Ok(InputSeen { hover: b(0), fine: b(1), any_fine: b(2), any_coarse: b(3), touch_api: b(4), touch_points: v[5].as_f64(), reduced_motion: b(6) })
     }
 
     /// A desktop: a fine pointer that hovers, nothing coarse, no touch. No pointer at all: `None`. A
@@ -195,8 +196,7 @@ impl InputClass {
 /// reports (hover: none) and no pointer, a touch-screen laptop touch points, and the page takes its touch
 /// paths: another workload than people's desktops run. strobe sets that input at launch where the engine
 /// has a setting for it (Chromium, Firefox); this reads what the page sees, before anything is measured.
-pub fn desktop_input(page: &Page) -> Result<InputClass> {
-    let seen = InputSeen::read(page)?;
+fn desktop_input(page: &Page, seen: &InputSeen) -> Result<InputClass> {
     let class = seen.class();
     if class == InputClass::Desktop {
         return Ok(class);
@@ -217,15 +217,16 @@ pub fn desktop_input(page: &Page) -> Result<InputClass> {
 /// `desktop_input`; a touch screen reads `hybrid` with its primary pointer fine and hovering and touch
 /// points; a phone reads `touch` (a coarse pointer, no fine one) with no hover, touch points and the
 /// touch event API, and a mobile user agent (or the one the target names). Read before anything is
-/// measured; returns the class the page saw.
-pub fn emulated_input(page: &Page, emulation: &crate::target::chromium::Emulation) -> Result<InputClass> {
+/// measured; returns the class the page saw and whether it matched `(prefers-reduced-motion: reduce)`
+/// (the same read).
+pub fn emulated_input(page: &Page, emulation: &crate::target::chromium::Emulation) -> Result<(InputClass, bool)> {
+    let seen = InputSeen::read(page)?;
     if !emulation.touches() {
-        let class = desktop_input(page)?;
+        let class = desktop_input(page, &seen)?;
         if emulation.user_agent.is_none() {
-            return Ok(class);
+            return Ok((class, seen.reduced_motion));
         }
     }
-    let seen = InputSeen::read(page)?;
     let class = seen.class();
     let want = if emulation.mobile {
         InputClass::Touch
@@ -257,7 +258,7 @@ pub fn emulated_input(page: &Page, emulation: &crate::target::chromium::Emulatio
         _ => {}
     }
     if wrong.is_empty() {
-        return Ok(class);
+        return Ok((class, seen.reduced_motion));
     }
     let fix = match page.engine() {
         WebEngine::Chromium => "strobe launches Chromium with the emulation's pointer (--blink-settings) and emulates its touch points and user agent over DevTools: a STROBE_BROWSER wrapper that rewrites strobe's arguments can drop them; run with strobe's arguments as they are",

@@ -3,6 +3,7 @@
 //! work (a trace, the Performance domain) asks for the Chromium side and is refused elsewhere.
 
 use super::chromium::{self, Emulation, Gpu, Window};
+use super::motion::Motion;
 use super::{firefox, webkit};
 use crate::host;
 use crate::model::{Error, Refusal, Result, ValidatorId, WebEngine};
@@ -217,7 +218,7 @@ pub fn known_room(engine: WebEngine, scale: Option<f64>) -> Option<(String, Room
 
 /// Launches a fresh browser of `engine` with an isolated profile. `cpus` pins it and its children.
 pub fn launch(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>) -> Result<WebBrowser> {
-    launch_as(engine, window, headless, cpus, &Emulation::default())
+    launch_as(engine, window, headless, cpus, &Emulation::default(), Motion::System)
 }
 
 /// `refusal` for a page that emulates `emulation`, known before anything builds: WebKit has no setting for
@@ -236,15 +237,19 @@ pub fn refusal_as(engine: WebEngine, headless: bool, emulation: &Emulation) -> O
 
 /// `launch` as `emulation` (SPEC 13.1 "Emulated phones and touch screens"): Chromium takes its input
 /// devices at launch and the rest per page (`WebPage::emulate`, then `emulate_viewport` once sized),
-/// Firefox all of it in its profile; WebKit refuses (`refusal_as`).
-pub fn launch_as(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation) -> Result<WebBrowser> {
+/// Firefox all of it in its profile; WebKit refuses (`refusal_as`). With `motion` reduced, each engine's
+/// own setting for it in this launch alone (`motion`; Safari and WPE refuse it).
+pub fn launch_as(engine: WebEngine, window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation, motion: Motion) -> Result<WebBrowser> {
     if let Some(e) = refusal_as(engine, headless, emulation) {
         return Err(e);
     }
+    if let Some(r) = super::motion::engine_refusal(engine, headless).filter(|_| motion.reduced()) {
+        return Err(r.into());
+    }
     Ok(match engine {
-        WebEngine::Chromium => WebBrowser::Chromium(chromium::launch_as(window, headless, cpus, &[], emulation)?),
-        WebEngine::Firefox => WebBrowser::Firefox(firefox::launch_as(window, headless, cpus, emulation)?),
-        WebEngine::Webkit => WebBrowser::Webkit(webkit::launch(window, headless, cpus)?),
+        WebEngine::Chromium => WebBrowser::Chromium(chromium::launch_as(window, headless, cpus, &motion.chromium_args(), emulation)?),
+        WebEngine::Firefox => WebBrowser::Firefox(firefox::launch_as(window, headless, cpus, emulation, motion)?),
+        WebEngine::Webkit => WebBrowser::Webkit(webkit::launch(window, headless, cpus, motion)?),
     })
 }
 

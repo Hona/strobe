@@ -245,7 +245,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     // A page strobe launched sees its emulation's input (`DeviceMismatch`); an app's page or an attached
     // browser the machine's, as it saw it.
     let input = if app.is_none() && !attach {
-        Some(validity::emulated_input(&page.clone().into(), &emulation)?)
+        Some(validity::emulated_input(&page.clone().into(), &emulation)?.0)
     } else {
         let seen = validity::InputSeen::read(&page.clone().into()).ok().map(|s| s.class());
         if seen == Some(validity::InputClass::None) {
@@ -523,7 +523,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
         progress(format!("! PatchedBrowser  {why}"));
     }
     let window = emulated_window(emulation, headless);
-    let browser = web::launch_as(engine, &window, headless, None, emulation)?;
+    let browser = web::launch_as(engine, &window, headless, None, emulation, crate::target::motion::Motion::System)?;
     // A software rasterizer refuses what it drew, metric by metric, below (`SoftwareGpu`).
     let gpu = browser.gpu()?;
     let page = browser.page()?;
@@ -531,7 +531,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     page.emulate(emulation)?;
     progress(format!("loading {target} in {}{}", browser.version(), emulated_text(&meta_emulate(emulation)).map(|t| format!(" as {t}")).unwrap_or_default()));
     page.navigate(target, Duration::from_secs(60))?;
-    let input = validity::emulated_input(&page, emulation)?;
+    let input = validity::emulated_input(&page, emulation)?.0;
     let qos = host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid())));
     validity::window_visible(&page)?;
     if !headless && host::session_locked() {

@@ -104,7 +104,23 @@
         "args": { "type": "array", "items": { "type": "string" } },
         "window": { "type": "boolean", "description": "false: the app opens no window (a tray app)." },
         "moved": { "type": "array", "items": { "type": "string" }, "description": "The user's folders the profile's env moves into the home (macOS)." },
-        "gpuCache": { "enum": ["warm", "cold"] }
+        "gpuCache": { "enum": ["warm", "cold"] },
+        "motion": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "What makes the app prefer reduced motion, as its owner declares it: a target with motion: \"reduce\" adds it to its launch. Required for a native target with motion (else NotForTarget); an Electron or webview app also gets Chromium's switch. strobe never changes the OS's own setting.",
+          "properties": {
+            "reduce": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "args": { "type": "array", "items": { "type": "string" }, "description": "Arguments after the profile's and the target's; {home} and {port} are filled in." },
+                "env": { "type": "object", "additionalProperties": { "type": "string" }, "description": "Environment after the profile's and the target's." },
+                "files": { "type": "object", "description": "Files in the home, merged over what the seed and the profile wrote: a JSON object key by key at every depth; text replaces." }
+              }
+            }
+          }
+        }
       }
     }
   }

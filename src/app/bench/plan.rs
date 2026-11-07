@@ -55,10 +55,11 @@ pub fn run(args: &Args) -> Result<Output> {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
     // What a bench would refuse before anything builds, the plan refuses (or lists, per series) too.
-    super::check_engines(&mut series, &describe, args, &variants)?;
+    let projects = super::target_projects(&describe)?;
+    super::check_engines(&mut series, &describe, args, &variants, &config, &projects)?;
     super::display_fit(None, &mut series, &describe, args.has("headless"))?;
     if variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2 {
-        super::implementation_preflight(&describe, &series, &variants, &config, &super::target_projects(&describe)?)?;
+        super::implementation_preflight(&describe, &series, &variants, &config, &projects)?;
     }
     let mut plan = estimate(&series, &describe, &file, args, &config, &project, &variants, None);
     let text = text(&file, &variants, &plan, &notes);
@@ -149,8 +150,9 @@ impl History {
         self.results.entry(id.to_string()).or_insert_with(|| store::read_json(&host::paths::experiments().join(id).join("result.json")).ok()).clone()
     }
 
-    /// Up to 5 newest earlier runs of this series (same bench file name, series label and primary).
-    fn same_series(&mut self, file_name: &str, s: &Series) -> Vec<Past> {
+    /// Up to 5 newest earlier runs of this series (same bench file name, series label and primary, and the
+    /// same `motion`: a reduced-motion series is never estimated from an animated one).
+    fn same_series(&mut self, file_name: &str, s: &Series, motion: &Value) -> Vec<Past> {
         let label = s.label();
         let ids: Vec<String> = self
             .index
@@ -165,7 +167,7 @@ impl History {
         let sides = s.sides.as_ref().map(|(b, h)| json!({ "base": b, "head": h }));
         for id in ids {
             let Some(r) = self.result(&id) else { continue };
-            let same = |x: &&Value| x["label"] == label.as_str() && sides.as_ref().is_none_or(|t| x["targets"] == *t);
+            let same = |x: &&Value| x["label"] == label.as_str() && x["motion"] == *motion && sides.as_ref().is_none_or(|t| x["targets"] == *t);
             if let Some(p) = r["series"].as_array().into_iter().flatten().find(same).and_then(|x| past(&id, x)) {
                 out.push(p);
             }
@@ -176,8 +178,9 @@ impl History {
         out
     }
 
-    /// Up to 5 newest series of any bench file whose primary is this metric on this kind of target.
-    fn same_metric(&mut self, metric: &str, kind: &str) -> Vec<Past> {
+    /// Up to 5 newest series of any bench file whose primary is this metric on this kind of target, with
+    /// the same `motion`.
+    fn same_metric(&mut self, metric: &str, kind: &str, motion: &Value) -> Vec<Past> {
         let ids: Vec<String> = self
             .index
             .iter()
@@ -189,7 +192,7 @@ impl History {
         let mut out = Vec::new();
         for id in ids {
             let Some(r) = self.result(&id) else { continue };
-            for x in r["series"].as_array().into_iter().flatten().filter(|x| x["primary"]["metric"] == metric && x["target_kind"] == kind) {
+            for x in r["series"].as_array().into_iter().flatten().filter(|x| x["primary"]["metric"] == metric && x["target_kind"] == kind && x["motion"] == *motion) {
                 if let Some(p) = past(&id, x) {
                     out.push(p);
                 }
@@ -202,8 +205,9 @@ impl History {
     }
 }
 
-/// A `--check` of this series: one cold block with one run, plus the warmup and runs a timed block adds.
-fn check_block(file_name: &str, label: &str, runs: f64) -> Option<(f64, String)> {
+/// A `--check` of this series (with the same `motion`): one cold block with one run, plus the warmup and
+/// runs a timed block adds.
+fn check_block(file_name: &str, label: &str, runs: f64, motion: &Value) -> Option<(f64, String)> {
     for (id, _) in store::list("exp", 40) {
         let path = host::paths::experiments().join(&id).join("result.json");
         if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(u64::MAX) > 2 << 20 {
@@ -213,7 +217,7 @@ fn check_block(file_name: &str, label: &str, runs: f64) -> Option<(f64, String)>
         if r["kind"] != "check" || Path::new(r["file"].as_str().unwrap_or("")).file_name().is_none_or(|f| f.to_string_lossy() != file_name) {
             continue;
         }
-        let Some(s) = r["series"].as_array().into_iter().flatten().find(|s| s["label"] == label && s["passed"] == true) else { continue };
+        let Some(s) = r["series"].as_array().into_iter().flatten().find(|s| s["label"] == label && s["passed"] == true && s["motion"] == *motion) else { continue };
         let one = s["values"]["run.duration"].as_f64().unwrap_or(0.0);
         return Some((s["elapsed_ms"].as_f64()? + (runs + 1.0) * one, id));
     }
@@ -246,11 +250,13 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
         let target = &describe["targets"][&s.target];
         let kind = target["kind"].as_str().unwrap_or("");
         let def = model::metric(&s.primary);
-        let same = history.same_series(&file_name, s);
+        // Its motion (both sides of an implementation comparison ask for the same).
+        let motion = &describe["targets"][s.sides.as_ref().map_or(&s.target, |(b, _)| b)]["motion"];
+        let same = history.same_series(&file_name, s, motion);
         // The spread from this series when it ran 4 pairs or more here, else from other series of its metric.
         let from_series = same.iter().map(|p| p.d.len()).sum::<usize>() >= 4;
         let spread_from = if from_series { "series" } else { "metric" };
-        let metric_pool = if from_series { Vec::new() } else { history.same_metric(&s.primary, kind) };
+        let metric_pool = if from_series { Vec::new() } else { history.same_metric(&s.primary, kind, motion) };
         let pool: Vec<&Past> = if from_series { same.iter().collect() } else { metric_pool.iter().collect() };
         // The spread of one pair's difference, from each experiment's differences around its own median.
         let centred: Vec<f64> = pool
@@ -277,7 +283,7 @@ pub(super) fn estimate(series: &[Series], describe: &Value, file: &Path, args: &
         // A block's time comes only from this series: another case's blocks say nothing about this one's.
         let (block_ms, block_source) = match same.first() {
             Some(_) => (same.iter().map(|p| p.block_ms).sum::<f64>() / same.len() as f64, format!("mean of {} earlier", same.len())),
-            None => match check_block(&file_name, &s.label(), runs) {
+            None => match check_block(&file_name, &s.label(), runs, motion) {
                 Some((ms, id)) => (ms, format!("from the --check {id} plus warmup and {runs} runs; rough: a check's block is a cold launch")),
                 None => (GUESS_BLOCK_MS, "a guess: no earlier run of this case here".to_string()),
             },

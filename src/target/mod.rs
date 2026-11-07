@@ -8,6 +8,7 @@ pub mod command;
 pub mod electron;
 pub mod firefox;
 pub mod isolate;
+pub mod motion;
 pub mod native;
 pub mod web;
 pub mod webdriver;

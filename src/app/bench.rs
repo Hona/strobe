@@ -13,6 +13,7 @@ use crate::runner::Runner;
 use crate::stats::{self, Comparison};
 use crate::store;
 use crate::target::chromium::{self, Window};
+use crate::target::motion::{self, Motion};
 use crate::target::web::{self, WebBrowser, WebPage as Page};
 use crate::target::{electron, isolate};
 use crate::validity::{self, Warning};
@@ -532,6 +533,10 @@ struct Block {
     /// desktop's; an app's page (Electron, a webview, a command's browser), the machine's as it saw them.
     #[serde(skip_serializing_if = "Option::is_none")]
     input: Option<validity::InputClass>,
+    /// Whether the block's page matched `(prefers-reduced-motion: reduce)`, read with its input
+    /// devices (`validity::InputSeen`): a target's `motion` or the OS's own setting (`admit_motion`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reduced_motion: Option<bool>,
 }
 
 /// What a page block's browser was (`Block::browser`): read once per target and headless mode, since
@@ -719,6 +724,27 @@ fn admit_input(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()> 
         ));
     }
     ctx.inputs.insert(format!("{}\n{}", s.label(), v.role), mine);
+    Ok(())
+}
+
+/// `VariantMismatch` when base's and head's pages saw other motion (`Block.reduced_motion`): one took
+/// its reduced-motion path and the other its animations (an app's page that keeps the OS's setting
+/// against a page target with `motion`, or the other way round), two workloads. A native side has no page
+/// to read: its motion is the target's declaration.
+fn admit_motion(ctx: &mut Ctx, s: &Series, v: &Variant, b: &Block) -> Result<()> {
+    let Some(mine) = b.reduced_motion else { return Ok(()) };
+    let other = if v.role == "base" { "head" } else { "base" };
+    let said = |r: bool| if r { "matched (prefers-reduced-motion: reduce)" } else { "did not match (prefers-reduced-motion: reduce)" };
+    if let Some(theirs) = ctx.motions.get(&format!("{}\n{other}", s.label())).copied()
+        && theirs != mine
+    {
+        return Err(Error::refused(
+            "VariantMismatch",
+            format!("{}'s page {}, the other side's {}", v.name, said(mine), said(theirs)),
+            "give both targets the same motion (motion: \"reduce\" on both, or on neither on an OS that does not reduce motion)",
+        ));
+    }
+    ctx.motions.insert(format!("{}\n{}", s.label(), v.role), mine);
     Ok(())
 }
 
@@ -1042,6 +1068,8 @@ struct Ctx<'a> {
     windows: BTreeMap<String, ([f64; 3], bool)>,
     /// Per series and side, the input devices its first page block saw (`admit_input`).
     inputs: BTreeMap<String, validity::InputClass>,
+    /// Per series and side, whether its first page block matched reduced motion (`admit_motion`).
+    motions: BTreeMap<String, bool>,
     /// The sides whose first launch has run: a later launch notes what appears in the user's
     /// Documents or Desktop (`folder_notes`) instead of stopping (SPEC §13.2).
     folders_first: std::collections::BTreeSet<String>,
@@ -1497,6 +1525,7 @@ pub fn run(args: &Args) -> Result<Output> {
         fixture_running: None,
         windows: BTreeMap::new(),
         inputs: BTreeMap::new(),
+        motions: BTreeMap::new(),
         folders_first: Default::default(),
         folder_notes: Default::default(),
         runner_pin,
@@ -1528,7 +1557,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     ctx.projects = target_projects(&ctx.describe)?;
     ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
-    check_engines(&mut series, &ctx.describe, args, &variants)?;
+    check_engines(&mut series, &ctx.describe, args, &variants, &config, &ctx.projects)?;
     // A series the display cannot show refuses before anything counts it (journeys, the Holm family).
     let (describe, headless) = (ctx.describe.clone(), ctx.headless);
     display_fit(Some(&mut ctx), &mut series, &describe, headless)?;
@@ -1565,6 +1594,25 @@ pub fn run(args: &Args) -> Result<Output> {
     if env.on_battery {
         ctx.warnings.push(validity::warn("Battery", "on battery: clocks may drop mid-run; plug in"));
     }
+    // The OS reduces motion, and a series asked for nothing: its pages and apps follow the OS (a native
+    // app may not), so it measures their reduced-motion paths, as no person with animations on sees them.
+    if env.reduced_motion == Some(true) {
+        let ambient: Vec<String> = series
+            .iter()
+            .filter(|s| s.refused.is_none() && s.gap.is_none())
+            .filter(|s| std::iter::once(&s.target).chain(s.sides.iter().flat_map(|(b, h)| [b, h])).any(|t| ctx.describe["targets"][t]["motion"].is_null()))
+            .map(|s| s.label())
+            .collect();
+        if !ambient.is_empty() {
+            ctx.warnings.push(validity::warn(
+                "ReducedMotion",
+                format!(
+                    "the OS reduces motion (its own setting, which strobe never changes) and {} ask for none: their pages and apps follow the OS and take their reduced-motion paths, and a native side may not; turn the OS's setting off to measure animations, or give the targets motion: \"reduce\" to measure reduced motion on purpose",
+                    ambient.join(", ")
+                ),
+            ));
+        }
+    }
     if let Some(why) = ctx.qos.clone() {
         // Frames and input latencies at background priority describe no person's machine: refused
         // (before anything builds when a primary is one). CPU metrics stay, with this warning.
@@ -1591,6 +1639,22 @@ pub fn run(args: &Args) -> Result<Output> {
     let headed = series.iter().filter(|s| s.refused.is_none() && s.gap.is_none()).any(|s| !headless_of(&ctx, s) && !series_windowless(&ctx, s));
     ctx.warnings.extend(super::up::calibration_warning(!headed));
     preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
+    // A native app's reduced motion is what its profile declares: no page to read it back from.
+    let natives: Vec<String> = series
+        .iter()
+        .filter(|s| s.gap.is_none() && s.refused.is_none())
+        .flat_map(|s| std::iter::once(&s.target).chain(s.sides.iter().flat_map(|(b, h)| [b, h])))
+        .filter(|t| ctx.describe["targets"][*t]["kind"] == "native" && ctx.describe["targets"][*t]["motion"] == "reduce")
+        .map(|t| profile_of(&ctx.describe["targets"][t]).unwrap_or(t).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for id in natives {
+        ctx.warnings.push(validity::info(
+            "MotionContract",
+            format!("reduced motion in native app {id} is the contract its app profile declares (apps.{id}.motion.reduce: its args, env and files): no page tells strobe whether the app follows it"),
+        ));
+    }
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
     let compares = !check && !leak_run && variants.len() == 2;
@@ -1621,6 +1685,16 @@ pub fn run(args: &Args) -> Result<Output> {
         if !pages.is_empty() {
             ident["engines"] = json!(pages);
         }
+        // Reduced motion is another workload: the targets that asked for it (none: the OS's own setting).
+        let reduced: BTreeMap<String, Value> = series
+            .iter()
+            .flat_map(|s| std::iter::once(&s.target).chain(s.sides.iter().flat_map(|(b, h)| [b, h])))
+            .filter(|t| ctx.describe["targets"][*t]["motion"] == "reduce")
+            .map(|t| (t.clone(), json!("reduce")))
+            .collect();
+        ident["motion"] = json!(reduced);
+        // And what the targets without it followed: the OS's own setting.
+        ident["os_reduced_motion"] = json!(env.reduced_motion);
         ident["seed"] = json!(seed);
     }
     let ledger_at = super::record::now_iso();
@@ -2059,8 +2133,13 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
                 "pass  {}  {value}  {secs:.1} s{}{}{}{}\n",
                 s["label"].as_str().unwrap_or(""),
                 s["engine"].as_str().filter(|e| *e != "chromium").map(|e| format!(" · {e}")).unwrap_or_default(),
-                // An emulated device's window says what it was (`390×844 @3x · emulated mobile`).
-                s["window"].as_str().filter(|_| !s["emulate"].is_null()).map(|w| format!(" · {w}")).unwrap_or_default(),
+                // An emulated device's window says what it was (`390×844 @3x · emulated mobile`), and
+                // reduced motion (`1400×900 · reduced motion`).
+                match s["window"].as_str().filter(|_| !s["emulate"].is_null() || !s["motion"].is_null()) {
+                    Some(w) => format!(" · {w}"),
+                    None if s["motion"] == "reduce" => format!(" · {}", motion::LABEL),
+                    None => String::new(),
+                },
                 if s["headless"] == true { " · headless" } else { "" },
                 if s["session_locked"] == true { " · session locked" } else { "" }
             );
@@ -4119,6 +4198,7 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let b = b?;
     admit_window(ctx, s, v, &b)?;
     admit_input(ctx, s, v, &b)?;
+    admit_motion(ctx, s, v, &b)?;
     Ok(b)
 }
 
@@ -4411,6 +4491,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     }
     window.scale = target["scale"].as_f64();
     let emulation = if app { chromium::Emulation::default() } else { emulation_of(&target, &s.target)? };
+    let reduce = Motion::of(&target, &s.target)?;
     phone_window(&mut window, &target, &emulation, headless);
     ctx.used = Some(window.clone());
     // As before a native block's speed check: a timed block launches once the target's CPUs are quiet
@@ -4441,7 +4522,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         guard = Some(g);
         b.into()
     } else {
-        web::launch_as(engine, &window, headless, ctx.pin, &emulation)?
+        web::launch_as(engine, &window, headless, ctx.pin, &emulation, reduce)?
     };
     let steps = RefCell::new(vec![("quiet".to_string(), quiet_ms), ("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
     ctx.target_qos = host::background_qos(Some(browser.pid()));
@@ -4484,6 +4565,13 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // `check_viewport`; after the override a page without a viewport tag lays out 980 wide).
         if !app {
             page.emulate(&emulation)?;
+        }
+        // A command's app was started by its command: only DevTools' media emulation reaches its page.
+        if reduce.reduced()
+            && kind == "command"
+            && let Some(p) = page.cdp()
+        {
+            motion::emulate(p)?;
         }
         if !app && (viewport || emulation.mobile) {
             browser.fit_viewport(&page, window.width, window.height, headless)?;
@@ -4812,7 +4900,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         init_docs.set(page.documents());
         lap("load");
         validity::dev_build(&page)?;
-        let input = if app { observed_input(ctx, s, &page) } else { Some(validity::emulated_input(&page, &emulation)?) };
+        let page_seen = if app { observed_input(ctx, s, &page) } else { Some(validity::emulated_input(&page, &emulation)?) };
+        let (input, reduced_motion) = (page_seen.map(|s| s.0), page_seen.map(|s| s.1));
+        if reduce.reduced() {
+            motion::require(reduced_motion == Some(true), motion_how(kind, engine))?;
+        }
         let mut during = Some(Foreign::start(&browser));
         let speed = validity::speed_check(&page)?;
         // The calibration is Chromium's: another engine's JS speed is compared with its own reference
@@ -5688,6 +5780,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             same: same.take(range.clone()),
             ops: journey::ops(&run_counts.get(range.clone()).unwrap_or_default().iter().collect::<Vec<_>>()),
             input,
+            reduced_motion,
         })
     })();
     lapped.set(Instant::now());
@@ -5958,12 +6051,11 @@ fn side_gpu_cache(s: &Series, describe: &Value, name: &str, config: &Value, proj
 /// the target's profile (`app(id)`, or `exe(path, { app })`) with another build.
 fn variant_app(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
     // The target's own `args`, `env` and `files` over the profile's.
-    let extra = |a: isolate::App| {
-        let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
-        let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
-        a.with_extra(&args, &env).with_files(&target["files"].as_object().cloned().unwrap_or_default())
-    };
-    variant_profile(v, target, config).map(extra)
+    let args: Vec<String> = target["args"].as_array().into_iter().flatten().filter_map(|a| a.as_str().map(str::to_string)).collect();
+    let env: Vec<(String, String)> = target["env"].as_object().into_iter().flatten().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect();
+    let app = variant_profile(v, target, config)?.with_extra(&args, &env).with_files(&target["files"].as_object().cloned().unwrap_or_default());
+    // Reduced motion through the app's Chromium (Electron, WebView2), and its profile's declaration.
+    if Motion::of(target, "")?.reduced() { app.with_reduced_motion(true) } else { Ok(app) }
 }
 
 fn variant_profile(v: &Variant, target: &Value, config: &Value) -> Result<isolate::App> {
@@ -6076,7 +6168,7 @@ fn check_pair<'a>(describe: &Value, args: &'a Args, project: &Path) -> Result<Op
 
 /// What an implementation comparison refuses before anything builds (SPEC §9.10): a primary that is
 /// one engine's own (`NotComparable`, exit 2), and sides set up unlike each other (`VariantMismatch`):
-/// another viewport or scale, another GPU shader cache mode.
+/// another viewport or scale, emulated device, motion or GPU shader cache mode.
 fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Variant], config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> Result<()> {
     let (Some(b), Some(h)) = (variants[0].target.as_deref(), variants.get(1).and_then(|v| v.target.as_deref())) else { return Ok(()) };
     let (tb, th) = (&describe["targets"][b], &describe["targets"][h]);
@@ -6119,7 +6211,7 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
         Error::refused(
             "VariantMismatch",
             format!("{} and {} {what}", variants[0].name, variants[1].name),
-            "give both targets the same window and GPU cache setup: an implementation comparison varies the app, not its window or caches",
+            "give both targets the same window, device, motion and GPU cache setup: an implementation comparison varies the app, not its window, settings or caches",
         )
     };
     match (size(tb), size(th)) {
@@ -6136,6 +6228,12 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
     if tb["emulate"] != th["emulate"] {
         let device = |t: &Value| t["emulate"].as_str().map_or("a desktop".to_string(), |e| format!("emulated {e}"));
         return Err(mismatch(format!("emulate different devices ({} and {})", device(tb), device(th))));
+    }
+    // Reduced motion against the OS's own setting is two workloads (the app skips its animations).
+    let (mb, mh) = (Motion::of(tb, b)?, Motion::of(th, h)?);
+    if mb != mh {
+        let said = |m: Motion| if m.reduced() { motion::LABEL } else { "the OS's own motion setting" };
+        return Err(mismatch(format!("ask for different motion ({} and {})", said(mb), said(mh))));
     }
     for s in series.iter().filter(|s| s.gap.is_none()) {
         let (cb, ch) = (side_gpu_cache(s, describe, b, config, projects), side_gpu_cache(s, describe, h, config, projects));
@@ -6371,6 +6469,16 @@ fn emulation_of(target: &Value, name: &str) -> Result<chromium::Emulation> {
     })
 }
 
+/// How a block asked a target's page for reduced motion, for the refusal when the page does not match.
+fn motion_how(kind: &str, engine: WebEngine) -> &'static str {
+    match kind {
+        "app" | "exe" => "Chromium's --force-prefers-reduced-motion on the app's command line",
+        "webview" => "--force-prefers-reduced-motion in the webview's additional browser arguments",
+        "command" => "DevTools' Emulation.setEmulatedMedia on the attached page",
+        _ => motion::how(engine),
+    }
+}
+
 /// `EngineUnsupported` for a pointer input on an emulated phone's page: strobe's driver sends mouse
 /// events, and a phone is driven by touch, which strobe does not send yet, so a case that clicks, taps,
 /// hovers, drags or scrolls there would measure a mouse on a phone. Keys (`press`, `type` without a
@@ -6405,7 +6513,7 @@ fn phone_window(window: &mut Window, target: &Value, emulation: &chromium::Emula
 }
 
 /// `390×844 @3x · emulated mobile`: the window a series' pages drew in (its blocks' content area, else the
-/// window it asked for) with its scale and emulation, for its result (`window`) and every report; none for
+/// window it asked for) with its scale, emulation and reduced motion, for its result (`window`) and every report; none for
 /// a series with no window.
 fn series_window(ctx: &Ctx, s: &Series, blocks: &[Block]) -> Value {
     if series_windowless(ctx, s) || s.sides.is_some() {
@@ -6432,17 +6540,21 @@ fn series_window(ctx: &Ctx, s: &Series, blocks: &[Block]) -> Value {
     let round = |x: f64| format!("{x:.2}").trim_end_matches('0').trim_end_matches('.').to_string();
     let scale = if (size[2] - 1.0).abs() > 0.005 { format!(" @{}x", round(size[2])) } else { String::new() };
     let emulated = target["emulate"].as_str().map(|e| format!(" · emulated {e}")).unwrap_or_default();
-    json!(format!("{}×{}{scale}{emulated}", size[0], size[1]))
+    let reduced = if target["motion"] == "reduce" { format!(" · {}", motion::LABEL) } else { String::new() };
+    json!(format!("{}×{}{scale}{emulated}{reduced}", size[0], size[1]))
 }
 
 /// What every report reads of a series' own setup, beside its verdicts: the window it drew in
-/// (`series_window`), whether it has none, what its page emulated, and a `url()` target's address (the
+/// (`series_window`), whether it has none, what its page emulated, its `motion`, and a `url()` target's address (the
 /// page both sides load whatever the variant, so reports name it, not a build).
 fn series_setup(ctx: &Ctx, s: &Series, window: Value, out: &mut Value) {
     let target = &ctx.describe["targets"][&s.target];
     out["windowless"] = json!(series_windowless(ctx, s));
     out["window"] = window;
     out["emulate"] = target["emulate"].clone();
+    // Both sides of an implementation comparison ask for the same (`implementation_preflight`).
+    let side = s.sides.as_ref().map_or(&s.target, |(b, _)| b);
+    out["motion"] = ctx.describe["targets"][side]["motion"].clone();
     if target["kind"] == "url" && s.sides.is_none() {
         out["href"] = target["href"].clone();
     }
@@ -6455,16 +6567,18 @@ fn headless_of(ctx: &Ctx, s: &Series) -> bool {
 
 /// What an app's page (Electron, a webview, a command's browser) sees of its input devices: the
 /// machine's, which strobe does not set (it does not launch that browser), recorded as seen. A page that
-/// sees no pointer at all warns once (`NoPointer`): the app runs as on a machine without a mouse.
-fn observed_input(ctx: &mut Ctx, s: &Series, page: &Page) -> Option<validity::InputClass> {
-    let class = validity::InputSeen::read(page).ok()?.class();
+/// sees no pointer at all warns once (`NoPointer`): the app runs as on a machine without a mouse. With
+/// it, whether the page matched `(prefers-reduced-motion: reduce)` (the same read).
+fn observed_input(ctx: &mut Ctx, s: &Series, page: &Page) -> Option<(validity::InputClass, bool)> {
+    let seen = validity::InputSeen::read(page).ok()?;
+    let class = seen.class();
     if class == validity::InputClass::None && !ctx.warnings.iter().any(|w| w.id == "NoPointer") {
         ctx.warnings.push(validity::warn(
             "NoPointer",
             format!("{}: the app's page sees no pointer ((hover: none), neither a fine nor a coarse one), as on a machine without a mouse, and runs its touch or no-hover paths; measure it on a machine with a mouse", s.label()),
         ));
     }
-    Some(class)
+    Some((class, seen.reduced_motion))
 }
 
 /// The input devices a series' pages saw (`Block.input`): the one class every block with a page saw
@@ -6489,6 +6603,16 @@ fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
     let page = |t: &Value| matches!(t["kind"].as_str(), Some("web" | "url"));
     let Some(targets) = describe["targets"].as_object_mut() else { return Ok(()) };
     for (name, t) in targets.iter() {
+        // What a target writes into its home stays there (checked again before each write).
+        for rel in t["files"].as_object().into_iter().flatten().map(|(k, _)| k) {
+            isolate::check_home_rel(rel, &format!("target {name}: files"))?;
+        }
+        if !t["motion"].is_null() {
+            if let Some(kind @ ("script" | "cli")) = t["kind"].as_str() {
+                return Err(Error::usage(format!("target {name}: motion is for targets that show something (web, url, app, exe, command, native, webview); this is a {kind} target")));
+            }
+            Motion::of(t, name)?;
+        }
         if !t["emulate"].is_null() {
             if !page(t) {
                 return Err(Error::usage(format!("target {name}: emulate is for page targets (web, url): an app's page sees the machine's own input; this is a {} target", t["kind"].as_str().unwrap_or("?"))));
@@ -6532,7 +6656,7 @@ fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
 /// it is listed and the rest runs; when that leaves nothing to run, the first refusal is the run's.
 /// Declared secondaries are refused per block instead. Two builds that run one fixed target alike
 /// (`same_target`) refuse that series too.
-fn check_engines(series: &mut [Series], describe: &Value, args: &Args, variants: &[Variant]) -> Result<()> {
+fn check_engines(series: &mut [Series], describe: &Value, args: &Args, variants: &[Variant], config: &Value, projects: &BTreeMap<String, (PathBuf, Value)>) -> Result<()> {
     // Every target a series runs on: an implementation comparison's both sides. A parity gap never runs.
     for s in series.iter_mut().filter(|s| s.gap.is_none()) {
         let names: Vec<String> = match &s.sides {
@@ -6542,6 +6666,9 @@ fn check_engines(series: &mut [Series], describe: &Value, args: &Args, variants:
         for name in names {
             if s.refused.is_none() {
                 s.refused = target_refusal(s, &name, describe, args)?;
+            }
+            if s.refused.is_none() {
+                s.refused = motion_contract(s, &name, describe, variants, projects.get(&name).map_or(config, |(_, c)| c));
             }
         }
         if s.refused.is_none() && s.sides.is_none() && !args.has("aa") {
@@ -6554,6 +6681,26 @@ fn check_engines(series: &mut [Series], describe: &Value, args: &Args, variants:
         return Err(if refused.len() > 1 { r.detail(format!("and every other series too ({} in all)", refused.len())) } else { r }.into());
     }
     Ok(())
+}
+
+/// `NotForTarget` for a native target asking for reduced motion whose app profile (its own, or an
+/// `app:<id>` variant's) declares no `motion.reduce`, or that has no profile (`native(path)`): strobe knows
+/// no setting of a native app's own. The series alone; a profile that does not resolve is `preflight`'s.
+fn motion_contract(s: &Series, name: &str, describe: &Value, variants: &[Variant], config: &Value) -> Option<Refusal> {
+    let t = &describe["targets"][name];
+    if t["kind"] != "native" || t["motion"] != "reduce" {
+        return None;
+    }
+    let apps = variants.iter().filter(|v| v.target_of(s) == name).filter_map(|v| if let Kind::App(id) = &v.kind { Some(id.as_str()) } else { None });
+    let ids: Vec<&str> = profile_of(t).into_iter().chain(apps).collect();
+    let missing = if ids.is_empty() {
+        Some(Path::new(t["path"].as_str().unwrap_or("")).file_stem().map(|n| n.to_string_lossy().to_string()).unwrap_or_default())
+    } else {
+        ids.into_iter().find(|id| isolate::app(id, config).is_ok_and(|a| !a.declares_motion())).map(str::to_string)
+    };
+    let r = isolate::no_motion_contract(&missing?);
+    let on = if s.sides.is_some() { format!("{}: ", t["name"].as_str().unwrap_or(name)) } else { String::new() };
+    Some(Refusal { summary: format!("{on}{}", r.summary), ..r })
 }
 
 /// Before the first block (SPEC 9.10 "Declared viewport"): each headed page target's viewport against
@@ -6698,6 +6845,15 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
     if args.has("headless") && !page {
         return Err(Error::usage(format!("{}: --headless runs pages in a headless browser; {} is a {} target, which opens its own window", s.label(), name, t["kind"].as_str().unwrap_or("?"))));
     }
+    let reduce = Motion::of(t, name)?;
+    // A command's app reaches strobe once it printed its endpoint: what it drew before is not reduced.
+    if reduce.reduced() && t["kind"] == "command" && s.launch.is_object() {
+        let on = if s.sides.is_some() { format!("{}: ", t["name"].as_str().unwrap_or(name)) } else { String::new() };
+        return Ok(Some(
+            Refusal::new(ValidatorId::NotForTarget, format!("{on}a command's app takes reduced motion only from DevTools once strobe attaches to it, after its launch drew"))
+                .fix("time work after the launch in a run case, or have the command start the app with --force-prefers-reduced-motion and drop the target's motion"),
+        ));
+    }
     if !page {
         return Ok(None);
     }
@@ -6715,6 +6871,10 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
         if let Some(r) = why.and_then(|e| e.refusal) {
             return Ok(Some(Refusal { summary: format!("{on}{}", r.summary), ..*r }));
         }
+    }
+    // Reduced motion in a WebKit with no setting of its own for it (Safari, WPE), before WPE's own refusal.
+    if let Some(r) = motion::engine_refusal(engine, headless).filter(|_| reduce.reduced()) {
+        return Ok(Some(Refusal { summary: format!("{on}{}", r.summary), ..r }));
     }
     if let Some(e) = web::refusal(engine, headless) {
         return Err(e);
@@ -7748,7 +7908,7 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     let mut out = format!("strobe bench {file} · {} · head {head} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""));
     let input = s["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default();
     let window = s["window"].as_str().map(|w| format!("window {w}")).unwrap_or_default();
-    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), &input, &window, if s["headless"] == true { "headless (no display)" } else { "" }]);
+    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), &input, &window, motion_note(s, &window), if s["headless"] == true { "headless (no display)" } else { "" }]);
     if !engine.is_empty() {
         out += &format!("env    {engine}\n");
     }
@@ -7782,6 +7942,12 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     }
     out += &warnings_text(s["warnings"].as_array().into_iter().flatten());
     out + "\n"
+}
+
+/// `reduced motion` for a series whose target asked for it, unless its window's label already says so
+/// (a series with no window of its own: windowless, or two implementations).
+fn motion_note(s: &Value, window: &str) -> &'static str {
+    if s["motion"] == "reduce" && !window.contains(motion::LABEL) { motion::LABEL } else { "" }
 }
 
 /// `\nwarnings\n! Id  text` lines, or nothing.
@@ -7854,7 +8020,7 @@ fn render(r: &Value) -> String {
         };
         let browser = s["browser"].as_str().or(r["browser"].as_str()).unwrap_or("");
         let input = s["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default();
-        let display = fmt::fields([browser, &input, gpu, &window, &refresh]);
+        let display = fmt::fields([browser, &input, gpu, &window, motion_note(&s, &window), &refresh]);
         if !display.is_empty() {
             out += &format!("       {display}\n");
         }

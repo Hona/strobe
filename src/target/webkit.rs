@@ -275,8 +275,9 @@ fn free_port() -> Result<u16> {
     Ok(std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?.port())
 }
 
-/// Launches a fresh WebKit browser through its WebDriver server and opens one session.
-pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Browser> {
+/// Launches a fresh WebKit browser through its WebDriver server and opens one session. With `motion`
+/// reduced, WebKitGTK's isolated config folder turns GTK's animations off (`motion::gtk_settings`).
+pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, motion: super::motion::Motion) -> Result<Browser> {
     let unsupported = |what: &str, fix: &str| -> Error { Refusal::new(ValidatorId::EngineUnsupported, what.to_string()).fix(fix).into() };
     if cfg!(target_os = "macos") && headless {
         return Err(unsupported("Safari has no headless mode: a WebKit page on macOS runs headed, in an unlocked session", "drop --headless (and the target's headless)"));
@@ -337,6 +338,9 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
     if let Some(h) = &home {
         for d in ["config", "data", "cache", "state", "run"] {
             std::fs::create_dir_all(h.join(d))?;
+        }
+        if motion.reduced() && install.flavor == Flavor::Gtk {
+            super::motion::gtk_settings(&h.join("config"))?;
         }
         let text = |p: PathBuf| p.display().to_string();
         cmd.env("HOME", text(h.clone()))

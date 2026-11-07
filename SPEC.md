@@ -2241,7 +2241,9 @@ export default bench({
   reports call it as a side) and `cwd` (another project's strobe.json for it), §9.10.
   `fixture(command, opts)` at the top level starts a process per block that both sides talk to
   (§9.10). `web()` and `url()` also take `engine` (`"chromium"`, the default, `"firefox"`,
-  `"webkit"`: §13.1, `--engine` above) and `headless` (§5.6).
+  `"webkit"`: §13.1, `--engine` above) and `headless` (§5.6). Every target but `script()` and `cli()`
+  takes `motion: "reduce"`: the page or app prefers reduced motion in strobe's launch alone, checked
+  with `matchMedia` on a page and declared by its app profile for a native app (§13.1 "Reduced motion").
 - `prepare(ctx)`: per block, before the first page load. `ctx.addInitScript(script, arg?)` and
   `ctx.mock(pattern, handler)` (below) work in every engine and are how a bench file sets up a page:
   a script before the page's own (a frame counter, seeded storage) and network mocks. The only place
@@ -3017,7 +3019,8 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
     used), connected {base, head}, cpu_ms_per_run {base, head} }`.
 - **Same conditions** (`VariantMismatch`, §10.1, implementation rules): build command, env, engine
   and GPU backend are the implementation and may differ. Before anything builds: the targets'
-  declared `viewport` (more than 2 device-independent pixels apart, or only one sets it), `scale`, and
+  declared `viewport` (more than 2 device-independent pixels apart, or only one sets it), `scale`,
+  `emulate`, `motion` (§13.1 "Reduced motion"), and
   `gpuCache` (the case's, else the target's, else its app profile's from the target's own project);
   `strobe plan` refuses the same. Each side's app profile and guards are checked before anything
   builds against its own project's strobe.json, as a single target's are. After each block: what the app drew in or its scale against the
@@ -3206,7 +3209,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `SessionLocked` | the session showed the lock screen during a recording (polled every 500 ms). `bench` never refuses for it: a series that needs a presenting window waits for an unlock and redoes the block, deleting what the locked block wrote. Bench and record keep the display on and the machine awake while they run. See §10.5 for series that run through a lock |
 | `ConcurrentBench` | never refuses since benches take turns: one device slot, which a bench takes for a block (`--check`, attribution and launch blocks too) and keeps for its next block until it builds, waits for an unlock, or another bench queues (then it hands the slot over after the block), so two blocks never run at once and a bench waiting for a person blocks no other. A `--check` keeps the slot from one of its short untimed blocks to the next (its builds and waits still hand it over). Benches queue for it in the order they asked; one that just ran asks again behind those waiting. Each running bench registers what it does (`<run>/benches/<pid>-<exp>.json`, with `daemon: true` when the daemon runs it), and `strobe status` lists them: running a block, queued behind whom, waiting for an unlock, preparing. Time queued is waiting, not run time. A wait has no deadline: once a minute it prints how long it has waited and what ends it (the holder's pid releasing the slot or exiting; stop it if it is stuck). A registration or old `bench.lock` whose pid is gone or no longer a strobe is dropped |
 | `VariantMismatch` | variants differ in build command, env, flags or window setup; native apps that draw with a different GPU backend, adapter or scale. Implementation comparisons (§9.10): the sides' declared viewport, scale or `gpuCache` differ (before anything builds), or their windows' client areas (over 2 DIP) or scales, or native sides' adapters (after a block), or
-what their pages emulate (`emulate`, before anything builds); builds of a target that runs a fixed
+what their pages emulate (`emulate`, before anything builds), or the motion they ask for (`motion`, §13.1 "Reduced motion", before anything builds); builds of a target that runs a fixed
 thing (a `url()`'s address, a fixed executable or an app profile's, §9.5), refused per series before
 anything builds; any run case's block (a `--check`, one target's) whose window is off its target's declared viewport by over 2 DIP (a macOS native window by its frame), or that the app or the screen clamps (named) |
 | `FixtureMismatch` | a block's target held no TCP connection the bench file's fixture answered at any run's start or end, or one of its processes served the fixture's port itself or runs the fixture's executable or a copy of it (it started its own server), §9.10 |
@@ -4145,6 +4148,51 @@ resolve to native symbols; the residue stays visible as `unresolved`.
   `DeviceMismatch`): a phone's page must read `touch` (a coarse pointer, no fine one) with no hover,
   touch points, `ontouchstart` and a mobile user agent (or the target's); a touch screen's `hybrid` with
   its primary pointer fine and hovering and touch points. That class is the page's `input`.
+- **Reduced motion** (`target::motion`; a target's `motion: "reduce"` on web, url, app, exe, command,
+  native and webview targets; on a script or cli target, or with any other value, a usage error): the
+  page or app prefers reduced motion (`prefers-reduced-motion: reduce`) in strobe's launch alone. strobe
+  never changes the OS's own setting, which is every app's and the person's (rule 10); a target without
+  `motion` follows that setting, read only into `env.reduced_motion` (`host::motion`: Windows
+  `SPI_GETCLIENTAREAANIMATION` off; macOS `ReduceMotionEnabled` of `com.apple.Accessibility`, readable
+  without Full Disk Access, else `reduceMotion` of `com.apple.universalaccess` when that holds a value,
+  through CFPreferences after a synchronize, without AppKit; Linux the settings portal's
+  `org.freedesktop.appearance reduced-motion` (1), else its `org.gnome.desktop.interface
+  enable-animations` (false), else GTK 3's `settings.ini`; null when unknown, never a guessed false).
+  When it is true, a run whose series omit `motion` warns `ReducedMotion` (their pages and apps take
+  their reduced-motion paths; a native side may not), the ledger's identity keeps it
+  (`os_reduced_motion`) and a tracked series without `motion` keeps it in its fingerprint. How each target asks: Chromium
+  pages `--force-prefers-reduced-motion` after strobe's other switches; Electron apps the same switch on
+  the app's command line; WebView2 apps the switch in the webview's additional browser arguments after
+  the profile's; a `command` target's attached page DevTools' `Emulation.setEmulatedMedia` (for that
+  page and session; a command's launch case is refused `NotForTarget` before anything builds: its app
+  drew before strobe attached); Firefox `ui.prefersReducedMotion` 1 in the profile's `user.js`;
+  WebKitGTK `gtk-enable-animations=0` in `gtk-3.0` and `gtk-4.0` `settings.ini` of its isolated
+  `XDG_CONFIG_HOME`, GSettings in memory (a session whose settings daemon answers GTK instead fails the
+  check below). Safari (only the OS's Reduce motion) and WPE's headless view (no GTK settings) refuse
+  the series `EngineUnsupported` before anything builds. Every page block reads
+  `matchMedia('(prefers-reduced-motion: reduce)').matches` in the same evaluation as its input devices
+  (`validity::InputSeen`, no extra round trip), before setup, and a launch case's page before its timed
+  load (an app's, timed from its spawn with the switch on its command line, once it is ready); the block
+  keeps it (`reduced_motion`). With `motion`, a page that does not match refuses the block
+  `EngineUnsupported`, never measured as reduced. Base and head pages that read differently (an app's
+  page following the OS against a page target with `motion`) are refused `VariantMismatch` after the
+  block (`admit_motion`, beside `admit_input`). A native app has no setting strobe knows: it takes what
+  its app profile declares, `apps.<id>.motion.reduce { args, env, files }` in strobe.json (args and env
+  after the profile's and the target's, `{home}` and `{port}` filled in; each file merged over what the
+  seed and the profile wrote: a JSON object, comments and trailing commas allowed, merged key by key at
+  every depth so the app's other settings stay, text written as is; a file there that is no JSON object
+  is a usage error naming it, never replaced). A native target with `motion` and no declaration (or a
+  `native(path)` with no profile) refuses that series alone `NotForTarget` before anything builds
+  (`check_engines`; `strobe plan` lists it the same), with the declaration to add; with one, the run
+  notes `MotionContract`: no page tells strobe whether the app follows it. An Electron or webview
+  profile's declaration is added beside Chromium's switch. An implementation comparison whose sides ask
+  for different motion is refused `VariantMismatch` before anything builds. `strobe plan` estimates a
+  series only from earlier series and checks with the same `motion`. A series' `motion` is in its result, the rerun ledger's
+  identity (`identity.motion`, the targets that asked) and a tracked series' fingerprint (`motion`, or
+  `os_reduced_motion` for a series without it on an OS that reduces motion); its `window` reads
+  `1400×900 · reduced motion` (a series with no window of its own says `reduced motion` beside it), a
+  PR's machine line and an implementation comparison's fairness line say "reduced motion" (or "OS
+  reduces motion"), and so does `strobe history`'s fingerprint line.
 
 **Other engines.** A page target runs in one engine (`model::WebEngine`): Chromium over CDP (the
 default), Firefox over WebDriver BiDi, WebKit over WebDriver Classic (refused `EngineUnsupported` on
@@ -4522,7 +4570,15 @@ What one app needs beyond that is its **app profile**, in the consumer's strobe.
   string that is exactly `{port}` becomes a number) shape the copy; `args` are extra command-line
   arguments. `window: false`: the app opens no window (a tray app); `record app:<id>` waits for none.
   `moved`: the user's folders the profile's `env` moves into the home (macOS Library rule, below).
-  `kind`: `electron` (the default), `webview` (§13.8) or `native` (§13.7).
+  `kind`: `electron` (the default), `webview` (§13.8) or `native` (§13.7). `motion.reduce { args, env,
+  files }`: what makes the app prefer reduced motion, as its owner declares it, added to a launch whose
+  target asks for `motion: "reduce"` (its files merged over the home's; required for a native target,
+  §13.1 "Reduced motion"). Every place a profile or a target writes in a home (`files`, `dirs`,
+  `motion.reduce.files`) is a non-empty relative path of plain names (no root, drive, `..` or `.`, no
+  `~`, `%VAR%` or `${VAR}`: a home's paths are never expanded), checked when the profile is read
+  (`strobe config` says so too) and again before each write; a write never goes through a link on the
+  way (a warm home may hold one an app made), and a shared seed file at that place is unlinked first so
+  the write never reaches the shared copy (rule 10).
 - **Seeds** (`home` seed folders, copied into each fresh home): a file of 64 MB or more (a model) is
   shared, not copied. strobe keeps one read-only copy per seed version in `<state>/seeds` and
   hard-links it into each home, so a launch writes nothing that size again: a fresh copy per block
@@ -6272,6 +6328,28 @@ until the driver sends touches: a follow-up), and `--pin auto` on a one-L3 machi
 cores (synthetic shapes only, as in package B). Review round: a phone launch case on adais (headless)
 reads `launch.ready` 29.7 ms with touch input, where the launch had run as a desktop; a click case on
 the phone is refused `EngineUnsupported` at the click, not after a 60 s hang.
+
+Reduced motion (`motion: "reduce"`, §13.1, `scripts/dev/motion.bench.ts` with a page whose CSS animation
+stops under `(prefers-reduced-motion: reduce)`): checked with `--check` on adais (Windows, headless,
+session locked) and vps (Linux, headless; WebKitGTK headed under `xvfb-run -a`). Chromium, Firefox and
+WebKitGTK pages matched the query before setup and before a launch's timed load and showed the static
+path (`animationName` none), while the same page without `motion` kept its animation in each engine;
+the series' window read `1400×813 · reduced motion`. WPE (headless with no display) and Safari (air, on
+AC power) refused the series `EngineUnsupported` before anything launched. A native app (the dev
+bench's fake app, windowless) with a declared `motion.reduce` got the argument, the variable and its
+settings file merged over the seeded one (the seed's other key kept), on adais and vps; a native target
+without a declaration and two implementations asking for different motion refused before anything
+built (`VariantMismatch`), and the native one refuses that series alone in `strobe plan` too
+(`NotForTarget`, the rest planned). A seeded settings file with a comment and a trailing comma took the
+contract's key with its other key kept; a seeded file that is no JSON refused the block with its path.
+A target file `/tmp/…`, `C:/Windows/Temp/…`, `../…` or `~/…`, and a profile's `%APPDATA%/…`, were
+refused before anything was written (`strobe config` names the profile's), and nothing appeared outside
+the home. `env.reduced_motion` read false on adais (animation effects on) and air
+(`com.apple.Accessibility ReduceMotionEnabled` 0, with no `universalaccess` key) and null on vps (no
+session bus, no GTK settings file). Not checked: an Electron or WebView2 app's switch and a `command()`
+target's media emulation (headed: they wait for an unlock on adais), a headed WebKitGTK under a
+desktop's settings daemon, the `ReducedMotion` warning and `admit_motion` (they need an OS that reduces
+motion, which strobe never sets), and a link in a warm home (code path only).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

@@ -89,6 +89,9 @@ pub fn launch_with(app: &App, seed: Option<&Path>, window: &Window, cpus: Option
         args.push(format!("--inspect-brk={port}"));
     }
     args.push("--remote-debugging-port=0".into());
+    if app.reduce_motion {
+        args.push(super::motion::SWITCH.into());
+    }
     // Chromium's key for the app's own encrypted data (Electron's safeStorage, cookies) lives in the
     // user's keychain (macOS) or keyring (Linux), which no home redirects: the copy uses a key of its
     // own instead, and never reads or adds an entry of the user's (nor asks the person to allow it).

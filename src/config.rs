@@ -156,6 +156,8 @@ use Shape::{Bool, Enum, Keys, List, Named, Object, PerOs, Percent, Req, Str, Str
 const OSES: &[&str] = &["windows", "macos", "linux"];
 const BUILD_OS: Shape = Keys(&[("command", Str), ("cwd", Str), ("output", PerOs), ("env", StrMap)]);
 const GUARD: Shape = Keys(&[("file", Req(&Str)), ("pid", Str), ("url", Str), ("os", Enum(OSES))]);
+/// `apps.<id>.motion`: what the app's owner declares makes it prefer reduced motion (SPEC 13.1).
+const MOTION: Shape = Keys(&[("reduce", Keys(&[("args", Strings), ("env", StrMap), ("files", Object)]))]);
 const APP: Shape = Keys(&[
     ("exe", PerOs),
     ("extends", Str),
@@ -170,6 +172,7 @@ const APP: Shape = Keys(&[
     ("window", Bool),
     ("moved", Strings),
     ("gpuCache", Enum(&["warm", "cold"])),
+    ("motion", MOTION),
 ]);
 const TOP: Shape = Keys(&[
     ("$schema", Str),

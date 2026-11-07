@@ -123,6 +123,13 @@ fn fingerprint_text(s: &Series) -> String {
         f["browser"].as_str().unwrap_or("").to_string(),
         if f["headless"] == true { "headless".to_string() } else { String::new() },
         f["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default(),
+        if f["motion"] == "reduce" {
+            crate::target::motion::LABEL.to_string()
+        } else if f["os_reduced_motion"] == true {
+            "OS reduces motion".to_string()
+        } else {
+            String::new()
+        },
     ])
 }
 

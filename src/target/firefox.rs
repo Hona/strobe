@@ -167,7 +167,7 @@ pub fn version_of(exe: &Path) -> Option<String> {
 /// Launches a fresh Firefox in an isolated profile and opens its BiDi session. `cpus`, when set, is the
 /// affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Browser> {
-    launch_as(window, headless, cpus, &Emulation::default())
+    launch_as(window, headless, cpus, &Emulation::default(), super::motion::Motion::System)
 }
 
 /// What an `emulation` other than a desktop sets in the profile, over `USER_JS`'s desktop input (LookAndFeel's
@@ -198,8 +198,9 @@ fn emulation_prefs(emulation: &Emulation, exe: &Path) -> Vec<(String, String)> {
     p
 }
 
-/// `launch` as `emulation` (`emulation_prefs`), set in the profile before Firefox starts.
-pub fn launch_as(window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation) -> Result<Browser> {
+/// `launch` as `emulation` (`emulation_prefs`) and with `motion` (`motion::FIREFOX_PREF`), set in the
+/// profile before Firefox starts.
+pub fn launch_as(window: &Window, headless: bool, cpus: Option<u64>, emulation: &Emulation, motion: super::motion::Motion) -> Result<Browser> {
     let exe = find().ok_or_else(|| Error::msg("no Firefox found").hint("install Firefox from mozilla.org (winget install Mozilla.Firefox, brew install --cask firefox, or the distribution's package), or set STROBE_FIREFOX"))?;
     if !headless && let Some(e) = super::chromium::headed_refusal("Firefox") {
         return Err(e);
@@ -215,6 +216,10 @@ pub fn launch_as(window: &Window, headless: bool, cpus: Option<u64>, emulation: 
     let over = emulation_prefs(emulation, &exe);
     let mut prefs: Vec<(String, String)> = USER_JS.iter().filter(|(k, _)| !over.iter().any(|o| o.0 == *k)).map(|(k, v)| (k.to_string(), v.to_string())).collect();
     prefs.extend(over);
+    if motion.reduced() {
+        let (k, v) = super::motion::FIREFOX_PREF;
+        prefs.push((k.into(), v.into()));
+    }
     if let Some(s) = window.scale {
         prefs.push(("layout.css.devPixelsPerPx".into(), format!("\"{s}\"")));
     }

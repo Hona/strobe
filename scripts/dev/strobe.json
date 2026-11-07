@@ -8,7 +8,8 @@
   "apps": {
     "fake": {
       "kind": "native",
-      "exe": { "windows": "fake-app.exe", "macos": "fake-app", "linux": "fake-app" }
+      "exe": { "windows": "fake-app.exe", "macos": "fake-app", "linux": "fake-app" },
+      "motion": { "reduce": { "args": ["--reduce-motion"], "env": { "MOTION": "reduce" }, "files": { "settings.json": { "motion": "reduce" } } } }
     }
   }
 }

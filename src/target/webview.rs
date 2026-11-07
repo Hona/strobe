@@ -185,7 +185,8 @@ fn webview2_env(app: &App, home: &Home) -> Result<(Vec<(String, String)>, PathBu
     if own.contains("--remote-debugging-") {
         return Err(Error::usage(format!("app profile \"{}\": {ARGS} already names a debugging port ({own}): strobe opens its own", app.id)));
     }
-    let args = std::iter::once(own.as_str()).chain(STROBE_ARGS.iter().copied()).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(" ");
+    let motion = if app.reduce_motion { super::motion::SWITCH } else { "" };
+    let args = std::iter::once(own.as_str()).chain(STROBE_ARGS.iter().copied()).chain([motion]).filter(|a| !a.is_empty()).collect::<Vec<_>>().join(" ");
     Ok((vec![(DATA.into(), data.display().to_string()), (ARGS.into(), args)], data))
 }
 

@@ -53,6 +53,17 @@ fn seed_fingerprint(r: &Value, fingerprint: &mut Value) {
     }
 }
 
+/// A series' motion in its fingerprint: reduced motion is another workload (the app skips its
+/// animations), and so is a target that follows an OS whose own setting reduces it. Only when either
+/// is so, so every other series keeps its history.
+fn motion_fingerprint(r: &Value, s: &Value, fingerprint: &mut Value) {
+    if !s["motion"].is_null() {
+        fingerprint["motion"] = s["motion"].clone();
+    } else if r["env"]["reduced_motion"] == true {
+        fingerprint["os_reduced_motion"] = json!(true);
+    }
+}
+
 /// Blocks per point unless `--blocks`: the fewest whose interval reaches 95% (a signed-rank interval
 /// of 6 values covers 96.9%).
 const BLOCKS: usize = 6;
@@ -321,6 +332,7 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
                 fingerprint["emulate"] = s["emulate"].clone();
             }
         }
+        motion_fingerprint(r, s, &mut fingerprint);
         seed_fingerprint(r, &mut fingerprint);
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });
         let id = history::series_id(&family, &fingerprint);

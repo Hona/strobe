@@ -341,6 +341,7 @@ pub(super) fn point(args: &Args, sides: &Sides, file: &Path, root: &Path, commit
         if !s["input"].is_null() {
             fingerprint["input"] = s["input"].clone();
         }
+        super::motion_fingerprint(r, s, &mut fingerprint);
         super::seed_fingerprint(r, &mut fingerprint);
         let fam = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric, "base_target": sides.base_target, "head_target": sides.head_target });
         let id = history::series_id(&fam, &fingerprint);

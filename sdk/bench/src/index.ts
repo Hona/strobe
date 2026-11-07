@@ -450,6 +450,8 @@ export interface AppOptions {
   env?: Record<string, string>
   /** Files written into the home before the launch, over the profile's (JSON or text; placeholders as in `args`; a string that is exactly `{fixture.port}` or `{fixture.pid}` becomes a number). */
   files?: Record<string, unknown>
+  /** {@link Motion}: Chromium's `--force-prefers-reduced-motion` on the app's command line, and its profile's `motion.reduce` when it declares one. */
+  motion?: Motion
 }
 
 /**
@@ -475,10 +477,23 @@ export interface PageOptions {
    * it (EngineUnsupported). Checked before anything is measured (DeviceMismatch).
    */
   emulate?: Emulate
+  /** {@link Motion}: Chromium's `--force-prefers-reduced-motion`, Firefox's `ui.prefersReducedMotion` or WebKitGTK's GTK setting, in this launch only. Safari and WPE refuse it (EngineUnsupported). */
+  motion?: Motion
 }
 
 /** What a page target emulates (`PageOptions.emulate`). */
 export type Emulate = "mobile" | "touch"
+
+/**
+ * `"reduce"`: the app or page prefers reduced motion (`prefers-reduced-motion: reduce`), set in strobe's
+ * launch alone, never through the OS's own setting. Without it the target follows the OS's setting,
+ * which result.json records as `env.reduced_motion`. A page is read with `matchMedia` before setup (and
+ * before a launch's timed load) and refused EngineUnsupported when it does not match. A native app takes
+ * what its app profile declares (`apps.<id>.motion.reduce` in strobe.json: `args`, `env`, `files`),
+ * which no page reads back; without a declaration it is refused NotForTarget. Both sides of an
+ * implementation comparison must ask for the same (VariantMismatch).
+ */
+export type Motion = "reduce"
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
 export type GpuCache = "warm" | "cold"
@@ -504,6 +519,13 @@ export interface CommandOptions {
   /** Run once per variant before its first block, in its folder. */
   build?: string
   viewport?: Viewport
+  /**
+   * {@link Motion}: DevTools' media emulation on the attached page (strobe starts no browser to give a switch). Launch
+   * cases refuse it (NotForTarget): the app drew before strobe attached. An app that reads `matchMedia` once at startup
+   * keeps what it read then: reload it in `setup` (`page.goto` to its own address), or have the command start it with
+   * `--force-prefers-reduced-motion` and drop `motion`.
+   */
+  motion?: Motion
 }
 
 export interface ScriptOptions {
@@ -568,6 +590,8 @@ export interface NativeOptions {
    * default, as a pipe changes how a C runtime buffers stdout: an app whose output a case waits on must flush each line.
    */
   output?: boolean
+  /** {@link Motion}: what the app profile declares (`apps.<id>.motion.reduce`); refused NotForTarget without one. */
+  motion?: Motion
 }
 
 export interface WebviewOptions {
@@ -579,6 +603,8 @@ export interface WebviewOptions {
   gpuCache?: GpuCache
   /** What every block of this target must show (a case's `expect` adds to it). */
   expect?: Expect
+  /** {@link Motion}: `--force-prefers-reduced-motion` in the webview's browser arguments, and the profile's `motion.reduce` when it declares one. */
+  motion?: Motion
 }
 
 /** A parameter's values: all run, or `run` by default and `more` with `--params all`. */
@@ -614,7 +640,7 @@ export interface Bench<Params extends Record<string, ParamValues>> {
  * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
  */
 export function web<P = any>(opts: { url?: FirstPage<P> } & PageOptions & Hooks<P> & Side = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless, emulate: opts.emulate, ui: opts.ui }
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless, emulate: opts.emulate, motion: opts.motion, ui: opts.ui }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */

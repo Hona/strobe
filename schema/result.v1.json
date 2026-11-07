@@ -16,7 +16,13 @@
     "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
     "passed": { "type": "boolean", "description": "check: every case passed." },
     "parity": { "type": ["string", "null"], "description": "check of several targets: the parity matrix, as the text output prints it." },
-    "env": { "type": "object", "description": "The device: OS, CPU, GPU, displays, power, strobe's build." },
+    "env": {
+      "type": "object",
+      "description": "The device: OS, CPU, GPU, displays, power, strobe's build.",
+      "properties": {
+        "reduced_motion": { "type": ["boolean", "null"], "description": "The OS's own reduce-motion setting, read and never changed (Windows animation effects off, macOS Reduce motion, the Linux desktop's enable-animations off): what a target without motion follows. Null when unknown. When true, part of a tracked series' fingerprint for series without motion." }
+      }
+    },
     "browser": { "type": ["string", "null"], "description": "The first page target's browser version (each series has its own: series.browser)." },
     "gpu": { "type": ["object", "null"], "description": "The first page target's browser GPU: devices, compositing, software." },
     "window": { "type": ["object", "null"], "description": "The window's place and size: x, y, width, height." },
@@ -315,7 +321,8 @@
         "input": { "enum": ["desktop", "hybrid", "touch", "none", null], "description": "The input devices the series' pages saw (each block keeps its own). desktop: a fine pointer that hovers, nothing coarse, no touch, which a page target sees unless it emulates a device, headless too (checked before setup: DeviceMismatch); a page target with emulate: \"mobile\" sees touch and one with emulate: \"touch\" hybrid, checked the same way; an app's page (Electron, a webview, a command's browser) sees the machine's: hybrid (a fine pointer with touch beside it), touch (no fine pointer), none (no pointer at all). Sides that saw different ones are refused (VariantMismatch). Part of a page series' tracked fingerprint. Null without a page, and in results from before strobe recorded it." },
         "browser": { "type": ["string", "null"], "description": "The browser versions this series' blocks ran (`a / b` when the sides of an implementation comparison ran two); part of a tracked series' fingerprint." },
         "emulate": { "enum": ["mobile", "touch", null], "description": "What the series' page target emulates (its `emulate`): a phone or a touch screen; null for a desktop. Part of a tracked series' fingerprint." },
-        "window": { "type": ["string", "null"], "description": "The window the series drew in, as reports print it: `1400×900`, `390×844 @3x · emulated mobile` (its blocks' content area, else the window it asked for). Null without a window, for a series refused before it ran, and in an implementation comparison (see fairness.window)." },
+        "motion": { "enum": ["reduce", null], "description": "The series' target's `motion`: reduce (the page or app prefers reduced motion, set in strobe's launch alone; a page was checked with matchMedia before setup, a native app took its profile's declared motion.reduce); null: the OS's own setting (env.reduced_motion). Part of a tracked series' fingerprint and the rerun ledger's identity." },
+        "window": { "type": ["string", "null"], "description": "The window the series drew in, as reports print it: `1400×900`, `390×844 @3x · emulated mobile`, `1400×900 · reduced motion` (its blocks' content area, else the window it asked for). Null without a window, for a series refused before it ran, and in an implementation comparison (see fairness.window)." },
         "windowless": { "type": "boolean", "description": "Every target the series runs opens no window (a script, a command line, an app with window: false)." },
         "href": { "type": "string", "description": "A url() target's address: the page both sides load whatever their build (a series of builds of one is refused VariantMismatch before anything builds)." },
         "overhead": { "$ref": "#/definitions/overhead" },
@@ -358,7 +365,8 @@
               "recording": { "type": ["string", "null"] },
               "locked": { "type": "boolean" },
               "overhead": { "$ref": "#/definitions/overhead" },
-              "directions": { "type": "object", "additionalProperties": { "enum": ["lower", "higher"] }, "description": "cli() targets: the direction each metric.<name> is better in, as the command's lines said." }
+              "directions": { "type": "object", "additionalProperties": { "enum": ["lower", "higher"] }, "description": "cli() targets: the direction each metric.<name> is better in, as the command's lines said." },
+              "reduced_motion": { "type": "boolean", "description": "Page blocks: whether the page matched (prefers-reduced-motion: reduce), read with its input devices before setup. Sides that read differently are refused VariantMismatch. Absent without a page and in older results." }
             }
           }
         },

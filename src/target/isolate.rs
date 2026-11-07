@@ -78,6 +78,23 @@ pub struct App {
     /// Set: something appearing in the user's Documents or Desktop while this launch runs is noted
     /// here for the experiment (a bench's later launches of a side); unset, it stops the launch.
     pub folder_notes: Option<Notes>,
+    /// The profile's `motion.reduce`: what makes this app prefer reduced motion, as its owner declares it.
+    motion_contract: Option<MotionContract>,
+    /// The launch asks for reduced motion (`with_reduced_motion`): Electron and WebView2 launches add
+    /// Chromium's switch (`motion::SWITCH`).
+    pub reduce_motion: bool,
+    /// Files merged over what the home holds once its seed and the profile's files are in place (JSON
+    /// objects key by key, deeply; anything else replaced): the motion contract's.
+    merged_files: Vec<(String, Value)>,
+}
+
+/// An app profile's `motion.reduce` (strobe.json): the arguments, environment and files that make
+/// the app prefer reduced motion in a launch.
+#[derive(Clone, Debug, Default)]
+struct MotionContract {
+    args: Vec<String>,
+    env: Vec<(String, String)>,
+    files: Vec<(String, Value)>,
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +147,41 @@ impl App {
     fn unsets(&self, key: &str) -> bool {
         env_unset(&self.unset, key)
     }
+
+    /// This launch prefers reduced motion (SPEC 13.1 "Reduced motion"): the profile's declared
+    /// `motion.reduce` (its args and env after the target's, its files merged over the home's), and for
+    /// an app strobe reaches through Chromium (`chromium`: Electron, WebView2) Chromium's own switch. A
+    /// native target's app has only its declaration: without one it is refused `NotForTarget`.
+    pub fn with_reduced_motion(mut self, chromium: bool) -> Result<App> {
+        match self.motion_contract.clone() {
+            Some(c) => {
+                self.args.extend(c.args);
+                self.env.extend(c.env);
+                self.merged_files.extend(c.files);
+            }
+            None if !chromium => return Err(no_motion_contract(&self.id).into()),
+            None => {}
+        }
+        self.reduce_motion = chromium;
+        Ok(self)
+    }
+
+    /// The profile declares `motion.reduce`.
+    pub fn declares_motion(&self) -> bool {
+        self.motion_contract.is_some()
+    }
+}
+
+/// `NotForTarget` for reduced motion in a native app whose profile declares none: strobe knows no
+/// setting of a native app's own, and never changes the OS's (rule 10).
+pub fn no_motion_contract(id: &str) -> crate::model::Refusal {
+    crate::model::Refusal::new(
+        crate::model::ValidatorId::NotForTarget,
+        format!("reduced motion in native app {id}: a native app has no setting strobe knows to ask for it, and its app profile declares none (apps.{id}.motion.reduce)"),
+    )
+    .fix(format!(
+        "declare in strobe.json what makes the app prefer reduced motion: \"apps\": {{ \"{id}\": {{ \"motion\": {{ \"reduce\": {{ \"args\": [...], \"env\": {{...}}, \"files\": {{...}} }} }} }} }} (a native(path) target gets a profile and native(\"{id}\")), or drop the target's motion"
+    ))
 }
 
 /// This OS's key in a per-OS value (`exe`, a build's `output`).
@@ -216,6 +268,19 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
     let moved = moved.iter().map(|m| expand(m).map_err(|e| Error::usage(format!("app profile \"{id}\" moved: {}", e.message)))).collect::<Result<Vec<_>>>()?;
     let kind = p["kind"].as_str().unwrap_or("electron");
     let kind = AppKind::parse(kind).ok_or_else(|| Error::usage(format!("app profile \"{id}\": kind is {}, not {kind}", AppKind::NAMES.join(", "))))?;
+    // Every place the profile writes in a home stays inside it (SPEC rule 10), said by `strobe config` too.
+    let keys = |v: &Value| v.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>()).unwrap_or_default();
+    for (what, rels) in [("files", keys(&p["files"])), ("motion.reduce.files", keys(&p["motion"]["reduce"]["files"])), ("dirs", strings("dirs"))] {
+        for rel in rels {
+            check_home_rel(&rel, &format!("app profile \"{id}\": {what}"))?;
+        }
+    }
+    let reduce = &p["motion"]["reduce"];
+    let motion_contract = reduce.is_object().then(|| MotionContract {
+        args: reduce["args"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+        env: reduce["env"].as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.as_str().unwrap_or("").to_string())).collect()).unwrap_or_default(),
+        files: reduce["files"].as_object().map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect()).unwrap_or_default(),
+    });
     Ok(App {
         id: id.to_string(),
         exe,
@@ -232,6 +297,9 @@ pub fn app(id: &str, config: &Value) -> Result<App> {
         gpu_cache_mode: p["gpuCache"].as_str().map(str::to_string),
         gpu_cache: None,
         folder_notes: None,
+        motion_contract,
+        reduce_motion: false,
+        merged_files: Vec::new(),
     })
 }
 
@@ -546,21 +614,65 @@ fn unshare(home: &Path) {
     let Ok(text) = std::fs::read_to_string(home.join(".strobe-shared")) else { return };
     for line in text.lines() {
         let Some((link, cache)) = line.split_once('\t') else { continue };
-        let link = Path::new(link);
-        if std::fs::remove_file(link).is_ok() || !link.exists() {
-            continue;
-        }
-        let set = |ro: bool| {
-            if let Ok(m) = std::fs::metadata(cache) {
-                let mut p = m.permissions();
-                p.set_readonly(ro);
-                let _ = std::fs::set_permissions(cache, p);
-            }
-        };
-        set(false);
-        let _ = std::fs::remove_file(link);
-        set(true);
+        unlink_shared(Path::new(link), Path::new(cache));
     }
+}
+
+/// Removes one link to a shared seed file, never the cached copy's content or its read-only mark.
+fn unlink_shared(link: &Path, cache: &Path) {
+    if std::fs::remove_file(link).is_ok() || !link.exists() {
+        return;
+    }
+    let set = |ro: bool| {
+        if let Ok(m) = std::fs::metadata(cache) {
+            let mut p = m.permissions();
+            p.set_readonly(ro);
+            let _ = std::fs::set_permissions(cache, p);
+        }
+    };
+    set(false);
+    let _ = std::fs::remove_file(link);
+    set(true);
+}
+
+/// Fails unless `rel` names a place inside a home (SPEC rule 10): a non-empty relative path of plain
+/// names, with no root, drive, `..` or `.`, and no `~`, `%VAR%` or `${VAR}` left unexpanded (a home's
+/// paths are never expanded). `what` says where it came from (`app profile "x": files`).
+pub fn check_home_rel(rel: &str, what: &str) -> Result<()> {
+    let var = |s: &str| {
+        let mut parts = s.split('%');
+        parts.next();
+        let mut inside = parts.collect::<Vec<_>>();
+        inside.pop();
+        inside.iter().any(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_alphanumeric() || "_()".contains(c)))
+    };
+    let plain = !rel.is_empty() && Path::new(rel).components().all(|c| matches!(c, std::path::Component::Normal(_)));
+    if plain && !rel.starts_with('~') && !rel.contains("${") && !var(rel) {
+        return Ok(());
+    }
+    Err(Error::usage(format!("{what} \"{rel}\" is not a path inside the launch's private home"))
+        .hint("name it relative to the home with plain folder names (\"config/settings.json\"): no leading / or drive, no .., no ~ or environment variables; strobe writes only inside the home"))
+}
+
+/// `rel` (`check_home_rel`) inside `home`, ready to write: no folder on the way that is a link out of
+/// the home (an app may have left one in a warm home), the file itself no link, and a shared seed file
+/// at that place unlinked first (after `read`, which gets what it held) so a write never reaches the
+/// shared copy.
+fn home_path(home: &Path, rel: &str, what: &str, shared: &[Shared], read: bool) -> Result<(PathBuf, Option<String>)> {
+    check_home_rel(rel, what)?;
+    let path = home.join(rel);
+    let mut at = home.to_path_buf();
+    for c in Path::new(rel).components() {
+        at.push(c);
+        if std::fs::symlink_metadata(&at).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Error::usage(format!("{what} \"{rel}\": {} is a link, which could lead out of the launch's private home", at.display())).hint("seed real folders and files, not links"));
+        }
+    }
+    let held = if read { std::fs::read_to_string(&path).ok() } else { None };
+    if let Some(s) = shared.iter().find(|s| s.link == path) {
+        unlink_shared(&s.link, &s.cache);
+    }
+    Ok((path, held))
 }
 
 /// A new private home folder; nothing is in it yet.
@@ -985,7 +1097,7 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
         }
     }
     for d in &app.dirs {
-        std::fs::create_dir_all(home.join(d))?;
+        std::fs::create_dir_all(home_path(&home, d, &format!("app {}: dirs", app.id), &[], false)?.0)?;
     }
     let mut shared = Vec::new();
     if let Some(s) = seed.filter(|_| fresh) {
@@ -1013,13 +1125,42 @@ pub fn prepare_home(app: &App, seed: Option<&Path>, home: Option<PathBuf>) -> Re
     std::fs::write(home.join(".strobe-port"), port.to_string())?;
     let fill = |s: &str| s.replace("{home}", &home.display().to_string()).replace("{port}", &port.to_string());
     for (rel, content) in &app.files {
-        let path = home.join(rel);
+        let (path, _) = home_path(&home, rel, &format!("app {}: files", app.id), &shared, false)?;
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
         let text = match content {
             Value::String(s) => fill(s),
             v => fill_json(v, &fill, port).to_string(),
+        };
+        std::fs::write(path, text)?;
+    }
+    // Over the seed's and the profile's files: a JSON object merged into the JSON object a file holds
+    // (the app's other settings stay; comments and trailing commas are read, not kept), text written as
+    // is. A file there that holds no JSON object fails: replacing it would drop the app's settings.
+    for (rel, content) in &app.merged_files {
+        let what = format!("app {}: motion.reduce.files", app.id);
+        let (path, held) = home_path(&home, rel, &what, &shared, true)?;
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let filled = match content {
+            Value::String(s) => Value::String(fill(s)),
+            v => fill_json(v, &fill, port),
+        };
+        let text = match (&filled, held) {
+            (Value::String(s), _) => s.clone(),
+            (Value::Object(_), Some(held)) => match serde_json::from_str::<Value>(&crate::jsonc::strip(&held)) {
+                Ok(mut held) if held.is_object() => {
+                    merge_json(&mut held, &filled);
+                    serde_json::to_string_pretty(&held)?
+                }
+                _ => {
+                    return Err(Error::usage(format!("{what} \"{rel}\": the file the home holds there ({}) is not a JSON object to merge into", path.display()))
+                        .hint("seed that file as a JSON object (comments allowed), or give the whole file as text in motion.reduce.files"));
+                }
+            },
+            (v, _) => serde_json::to_string_pretty(v)?,
         };
         std::fs::write(path, text)?;
     }
@@ -1099,6 +1240,23 @@ fn fill_json(v: &Value, fill: &dyn Fn(&str) -> String, port: u16) -> Value {
         Value::Array(a) => Value::Array(a.iter().map(|x| fill_json(x, fill, port)).collect()),
         Value::Object(m) => Value::Object(m.iter().map(|(k, x)| (k.clone(), fill_json(x, fill, port))).collect()),
         other => other.clone(),
+    }
+}
+
+/// `over` merged into `into`: objects key by key at every depth, any other value replaced.
+fn merge_json(into: &mut Value, over: &Value) {
+    match (into, over) {
+        (Value::Object(a), Value::Object(b)) => {
+            for (k, v) in b {
+                match a.get_mut(k) {
+                    Some(held) => merge_json(held, v),
+                    None => {
+                        a.insert(k.clone(), v.clone());
+                    }
+                }
+            }
+        }
+        (into, over) => *into = over.clone(),
     }
 }
 

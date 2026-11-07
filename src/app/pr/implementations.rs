@@ -199,6 +199,15 @@ pub fn fairness(r: &Value, series: &[&Value], names: (&str, &str)) -> (Vec<Strin
         window,
         if r["fixture"].is_object() { "same server and data".into() } else { String::new() },
         if r["fairness"]["input"] == "os" { "OS input to both".into() } else { String::new() },
+        // Both asked for reduced motion (`implementation_preflight` refused sides that differ), or both
+        // followed an OS that reduces it.
+        if series.iter().any(|s| s["motion"] == "reduce") {
+            "reduced motion on both".into()
+        } else if r["env"]["reduced_motion"] == true {
+            "OS reduces motion".into()
+        } else {
+            String::new()
+        },
     ];
     (first, vec![cpu_scope(r, names), pairs_span(series)])
 }

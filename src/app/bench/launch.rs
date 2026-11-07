@@ -159,6 +159,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
     }
     // A page that emulates a phone or a touch screen launches as one (SPEC 13.1), as a run case's does.
     let emulation = if web { emulation_of(&target, &s.target)? } else { chromium::Emulation::default() };
+    let reduce = Motion::of(&target, &s.target)?;
     phone_window(&mut window, &target, &emulation, headless_of(ctx, s));
     ctx.used = Some(window.clone());
     // An attribution launch reads no pixels, unless they are what ends it.
@@ -188,7 +189,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         // A fresh browser and profile per launch: no HTTP cache, storage, service worker or browser
         // shader cache from an earlier visit.
-        _ if web => (web::launch_as(engine, &window, headless_of(ctx, s), ctx.pin, &emulation)?, Started { epoch_ms: 0.0, output: None, main: None }),
+        _ if web => (web::launch_as(engine, &window, headless_of(ctx, s), ctx.pin, &emulation, reduce)?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
     // A launched target inherits strobe's priority, or sets its own (`BackgroundPriority`).
@@ -242,7 +243,11 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                 }
                 page.emulate_viewport(&emulation, (window.width, window.height), window.scale)?;
             }
-            validity::emulated_input(&page, &emulation)?;
+            let (_, blank_reduced) = validity::emulated_input(&page, &emulation)?;
+            // Reduced motion holds in the browser before the timed load, as its input devices do.
+            if reduce.reduced() {
+                motion::require(blank_reduced, motion_how(&kind, engine))?;
+            }
             let first = if target["prepare"].as_bool() == Some(true) {
                 // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.
                 let init = |op: &str, a: &Value| match (op, a["source"].as_str()) {
@@ -350,7 +355,13 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         if !profile {
             validity::dev_build(&shown_page)?;
         }
-        let input = if web { Some(validity::emulated_input(&shown_page, &emulation)?) } else { observed_input(ctx, s, &shown_page) };
+        let page_seen = if web { Some(validity::emulated_input(&shown_page, &emulation)?) } else { observed_input(ctx, s, &shown_page) };
+        let (input, reduced_motion) = (page_seen.map(|s| s.0), page_seen.map(|s| s.1));
+        // An app's launch is timed from its spawn, with the switch on its command line from the start:
+        // its page is read once it is ready, and a launch that did not reduce motion is refused.
+        if reduce.reduced() {
+            motion::require(reduced_motion == Some(true), motion_how(&kind, engine))?;
+        }
         let headless = headless_of(ctx, s);
         let seen = browser_seen(ctx, s, v, headless, !profile, &browser)?;
         // Milestones may land after ready (a service that comes up behind the window), and the screen
@@ -491,6 +502,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             browser: Some(seen),
             directions: BTreeMap::new(),
             input,
+            reduced_motion,
             ..Block::default()
         })
     })();

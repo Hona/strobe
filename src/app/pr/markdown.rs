@@ -1061,7 +1061,7 @@ impl<'a> Doc<'a> {
         t + &self.recorded()
     }
 
-    /// The machine in one line: OS, CPU, GPU, power plan, browser, display, pinning.
+    /// The machine in one line: OS, CPU, GPU, power plan, browser, motion, display, pinning.
     pub(super) fn machine(&self) -> String {
         let r = self.r;
         let mut hw = vec![r["env"]["os"].as_str().unwrap_or("").to_string(), short_cpu(r["env"]["cpu"].as_str().unwrap_or(""))];
@@ -1071,6 +1071,12 @@ impl<'a> Doc<'a> {
         hw.push(browsers.first().copied().or(r["browser"].as_str()).unwrap_or("").replace('/', " "));
         if self.headless() {
             hw.push("headless browser (no display)".into());
+        }
+        // Reduced motion: asked of the targets, or the OS's own setting that every target followed.
+        if self.series.iter().any(|s| s["motion"] == "reduce") {
+            hw.push(crate::target::motion::LABEL.into());
+        } else if r["env"]["reduced_motion"] == true {
+            hw.push("OS reduces motion".into());
         }
         if self.drew_frames() {
             hw.push(r["refresh_hz"].as_f64().map(|x| format!("{x:.0} Hz display")).unwrap_or_default());

@@ -109,6 +109,24 @@ fn attempt(line: &Value, current: &Value, later: bool) -> Value {
             changed.push(format!("{t}: {} → {}", show(ea.get(t)), show(eb.get(t))));
         }
     }
+    // The targets that asked for reduced motion (`identity.motion`); one from before strobe recorded it
+    // says nothing about it.
+    if let (Some(a), Some(b)) = (then["motion"].as_object(), now["motion"].as_object()) {
+        let mut targets: Vec<&String> = a.keys().chain(b.keys()).collect();
+        targets.sort();
+        targets.dedup();
+        let show = |m: Option<&Value>| if m.is_some() { "reduced motion" } else { "the OS's motion" };
+        for t in targets.into_iter().filter(|t| a.get(*t) != b.get(*t)) {
+            changed.push(format!("{t}: {} → {}", show(a.get(t)), show(b.get(t))));
+        }
+    }
+    // The OS's own reduce-motion setting, which targets without `motion` follow (known on both sides).
+    if let (Some(a), Some(b)) = (then["os_reduced_motion"].as_bool(), now["os_reduced_motion"].as_bool())
+        && a != b
+    {
+        let show = |r: bool| if r { "on" } else { "off" };
+        changed.push(format!("the OS's reduce motion {} → {}", show(a), show(b)));
+    }
     // Another seed is another workload only where a hook used it (`ctx.random()`, `ctx.seed`): either
     // attempt's `used_random`, and while this one runs (not known yet) the other's.
     if then.get("seed").is_some() && now.get("seed").is_some() && then["seed"] != now["seed"] && (then["used_random"] == true || now["used_random"] == true) {

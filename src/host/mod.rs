@@ -5,6 +5,7 @@ pub mod build;
 pub mod git;
 pub mod http;
 pub mod ios;
+pub mod motion;
 pub mod paths;
 pub mod power;
 pub mod reserve;
@@ -896,6 +897,8 @@ pub struct Env {
     pub on_battery: bool,
     /// The hypervisor, when this is a virtual machine.
     pub virtual_machine: Option<String>,
+    /// The OS's own "reduce motion" setting (`motion::reduced_motion`), read only; None when unknown.
+    pub reduced_motion: Option<bool>,
     pub strobe: String,
 }
 
@@ -938,7 +941,8 @@ pub fn env() -> Env {
     let virtual_machine = win::virtual_machine();
     #[cfg(not(windows))]
     let virtual_machine = os::virtual_machine();
-    Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, virtual_machine, strobe: env!("CARGO_PKG_VERSION").to_string() }
+    let reduced_motion = motion::reduced_motion();
+    Env { os, cpu, logical_cpus: topo.logical, l3_groups: topo.groups, power_plan, on_battery, virtual_machine, reduced_motion, strobe: env!("CARGO_PKG_VERSION").to_string() }
 }
 
 /// Share of all CPUs busy over `ms`, 0..1.

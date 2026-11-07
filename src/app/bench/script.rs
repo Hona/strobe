@@ -226,6 +226,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         lapped = Instant::now();
         let mut runs: Vec<ScriptRun> = Vec::new();
+        let mut ends: Vec<Option<(f64, Option<u64>)>> = Vec::new();
         // Steady once two runs cost the same CPU (SPEC §9.2).
         let mut warmup = super::block::Warmup::new(s, x);
         let perf = x.counters.then(probe::wakes::Perf::new);
@@ -259,6 +260,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
                 _ => f64::NAN,
             };
             let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
+            // The host's memory as the run left it, before its reset (SPEC §9.6), where this run may be
+            // the last measured one.
+            ends.push(warmup.may_end(runs.len()).then(|| {
+                let tree = host::process_tree(pid);
+                (tree.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&tree.iter().map(|p| p.pid).collect::<Vec<_>>()))
+            }));
             runs.push((timed.ns() as f64 / 1e6, used, hooks.counts(), retained, hooks.take_marks(), counted, timed));
             if s.reset {
                 ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
@@ -290,11 +297,12 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         if warmup.unsteady() {
             values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
         }
-        let private_mb = host::process_tree(pid).iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+        // Never a reading from after the reset in its place: no value.
+        let (private_mb, pss) = range.end.checked_sub(1).and_then(|i| ends.get(i).copied().flatten()).unwrap_or((0.0, None));
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);
         }
-        if let Some(b) = host::pss_bytes(&host::tree_pids(pid)) {
+        if let Some(b) = pss {
             values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
         }
         let _ = ctx.runner.call("close", json!({}), t, &serve);

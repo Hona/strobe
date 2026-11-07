@@ -190,6 +190,13 @@ pub fn process_trees(roots: &super::PickRoots) -> Vec<ProcTimes> {
         .collect()
 }
 
+/// The pids of `process_trees`, from the stat lines alone: no process's memory or name read.
+pub fn tree_pids_of(roots: &super::PickRoots) -> Vec<u32> {
+    let all = all_stats();
+    let roots = roots(&all.iter().map(|s| (s.pid, s.ppid, s.start)).collect::<Vec<_>>());
+    tree_of(&all, &roots).into_iter().map(|i| all[i].pid).collect()
+}
+
 pub fn tree_pids(root: u32) -> Vec<u32> {
     let all = all_stats();
     tree_of(&all, &[root]).into_iter().map(|i| all[i].pid).collect()
@@ -329,6 +336,28 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
             out.resize(cpu + 1, 0);
         }
         out[cpu] = (v.get(3).copied().unwrap_or(0) + v.get(4).copied().unwrap_or(0)) * 1_000_000_000 / tck();
+    }
+    !out.is_empty()
+}
+
+/// Hypervisor steal so far per logical CPU in ns (`/proc/stat`'s eighth field, in 10 ms ticks): time
+/// the guest's CPU was ready while the hypervisor ran something else. Zero on bare metal, and on a
+/// hypervisor that does not report it.
+pub fn steal_ns(out: &mut Vec<u64>) -> bool {
+    out.clear();
+    let Some(text) = read("/proc/stat") else { return false };
+    for line in text.lines() {
+        let Some(rest) = line.strip_prefix("cpu") else { break };
+        if !rest.starts_with(|c: char| c.is_ascii_digit()) {
+            continue;
+        }
+        let mut f = rest.split_whitespace();
+        let Some(Ok(cpu)) = f.next().map(str::parse::<usize>) else { continue };
+        let Some(steal) = f.nth(7).and_then(|x| x.parse::<u64>().ok()) else { continue };
+        if out.len() <= cpu {
+            out.resize(cpu + 1, 0);
+        }
+        out[cpu] = steal * 1_000_000_000 / tck();
     }
     !out.is_empty()
 }

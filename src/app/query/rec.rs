@@ -266,7 +266,7 @@ impl Rec {
     fn load_cpu(&self) -> Result<Stacks> {
         let profiles = files(&self.dir, "cpuprofile")?;
         if profiles.is_empty() {
-            return Err(Error::usage("this recording has no CPU profile; record with --probes attribution"));
+            return Err(super::no_profile(&self.meta, "CPU profile", "hotspots"));
         }
         let mut out = Stacks::default();
         for p in profiles {
@@ -314,7 +314,7 @@ impl Rec {
         super::firefox_gap(self, super::Gap::Alloc)?;
         let profiles = files(&self.dir, "heapprofile")?;
         if profiles.is_empty() {
-            return Err(Error::usage("this recording has no allocation profile; record with --probes attribution"));
+            return Err(super::no_profile(&self.meta, "allocation profile", "alloc"));
         }
         let mut out = Stacks::default();
         for p in profiles {

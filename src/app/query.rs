@@ -57,6 +57,30 @@ pub fn run(args: &Args) -> Result<Output> {
                     a.pos[0] = recs.remove(0);
                     return run(&a);
                 }
+                // `--blocks N` compares nothing: its attribution recordings are head's alone (`--why
+                // always`), one per series, and one answers for the experiment.
+                let series = result["series"].as_array().cloned().unwrap_or_default();
+                // Beside series refused before they ran, or not run (the bench stopped).
+                let aside = |s: &Value| s["kind"] == "refused" || s["not_run"] == true;
+                if series.iter().any(|s| s["kind"] == "blocks") && series.iter().all(|s| s["kind"] == "blocks" || aside(s)) {
+                    let heads: Vec<String> = series.iter().filter_map(|s| s["attribution"]["head"].as_str().map(str::to_string)).collect();
+                    let id = result["id"].as_str().unwrap_or("this experiment");
+                    return match heads.as_slice() {
+                        [one] => {
+                            let mut a = args.clone();
+                            a.pos[0] = one.clone();
+                            run(&a)
+                        }
+                        [] => {
+                            let timed: Vec<&str> = series.iter().flat_map(|s| s["timing_recordings"].as_array().into_iter().flatten()).filter_map(|t| t["recording"].as_str()).collect();
+                            let others = if timed.is_empty() { String::new() } else { format!("; its timed blocks' recordings (no profile): strobe query <rec> {other} with one of {}", timed.join(", ")) };
+                            Err(Error::usage(format!(
+                                "{id} kept no attribution recording: a timed block runs no profiler (it would weigh on its times), and bench --blocks N --why always adds one attribution block of head per series{others}"
+                            )))
+                        }
+                        _ => Err(Error::usage(format!("{id} kept one attribution recording per series: strobe query <rec> {other} with one of {}", heads.join(", ")))),
+                    };
+                }
                 // A view of two recordings answers for the experiment: each series' base..head.
                 if diff::VIEWS.contains(&other) {
                     return diff::experiment(&result, other, args, top);
@@ -1322,7 +1346,7 @@ pub fn native_hotspots(dir: &Path, by: &str, top: usize, thread: Option<&str>, p
 
 pub fn native_hotspots_of(rec: &Rec, by: &str, top: usize, thread: Option<&str>, phase: Option<&str>) -> Result<Output> {
     let dir = rec.dir.as_path();
-    let missing = || Error::usage("this recording has no native samples; record with --probes deep");
+    let missing = || if rec.meta["kind"] == "block" && rec.meta["probes"] != "attribution" { no_profile(&rec.meta, "native samples", "hotspots") } else { Error::usage("this recording has no native samples; record with --probes deep") };
     // A thread or phase selects samples: symbolized for that question alone; all samples are shared.
     let filtered;
     let n: &NativeStacks = if thread.is_some() || phase.is_some() {
@@ -1435,7 +1459,7 @@ pub struct Forced {
 
 fn forced(rec: &Rec) -> Result<&Forced> {
     cached(rec.forced.get_or_init(|| {
-        attribution_meta(&rec.meta)?;
+        attribution_meta(&rec.meta, "layout")?;
         let rows = rec.part(Part::Layout)?;
         let measured = measured_runs(&rec.meta, &rows);
         let sym = rec.sym.lock().unwrap_or_else(|e| e.into_inner());
@@ -1544,7 +1568,7 @@ pub struct Invalidation {
 
 fn invalidation(rec: &Rec) -> Result<Invalidation> {
     firefox_gap(rec, Gap::Style)?;
-    attribution_meta(&rec.meta)?;
+    attribution_meta(&rec.meta, "style")?;
     let rows = rec.part(Part::Style)?;
     let measured = measured_runs(&rec.meta, &rows);
     let sym = rec.sym.lock().unwrap_or_else(|e| e.into_inner());
@@ -1707,7 +1731,7 @@ pub fn run_phases(rec: &Rec) -> Option<(String, Value)> {
 /// Garbage collection in the measured runs: collections, the main-thread pause they cost (incremental
 /// marking steps included) and the work they did on helper threads, from attribution traces.
 pub fn gc(rec: &Rec) -> Result<Output> {
-    attribution_meta(&rec.meta)?;
+    attribution_meta(&rec.meta, "gc")?;
     let rows = rec.part(Part::Gc)?;
     let measured = measured_runs(&rec.meta, &rows);
     #[derive(Default, Clone, Copy)]
@@ -1783,11 +1807,27 @@ pub fn gc(rec: &Rec) -> Result<Output> {
     Ok(Output::new(text, json!({ "values": values, "runs": per_run })))
 }
 
-fn attribution_meta(meta: &Value) -> Result<()> {
+fn attribution_meta(meta: &Value, view: &str) -> Result<()> {
     if meta["probes"] != "attribution" {
-        return Err(Error::usage("this view needs an attribution recording (stacks and GC phases); record with --probes attribution"));
+        return Err(no_profile(meta, "attribution stacks or GC phases (this view needs an attribution recording)", view));
     }
     Ok(())
+}
+
+/// A recording without the profile a view reads (`what`), and where one is: a bench's timed block
+/// never runs a profiler (it would weigh on the times the block measures), its experiment's
+/// attribution blocks do (`--why always`, or a series whose primary differs); anything else is
+/// recorded again with `--probes attribution`.
+pub(crate) fn no_profile(meta: &Value, what: &str, view: &str) -> Error {
+    match meta["experiment"].as_str().filter(|_| meta["kind"] == "block" && meta["probes"] != "attribution") {
+        Some(exp) => {
+            let read = if diff::VIEWS.contains(&view) { format!("strobe query {exp} {view} reads the experiment's") } else { format!("strobe query {exp} names the experiment's") };
+            Error::usage(format!(
+                "this recording has no {what}: it is a timed block of {exp}, and a timed block runs no profiler (it would weigh on the times it measures); attribution blocks have them: {read}, and bench --why always runs them (one per side, or one of head with --check or --blocks N)"
+            ))
+        }
+        None => Error::usage(format!("this recording has no {what}; record with --probes attribution")),
+    }
 }
 
 /// The window keys of the measured runs, from a result whose window rows (`_w`) have only their key

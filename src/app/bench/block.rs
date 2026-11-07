@@ -54,6 +54,19 @@ impl Warmup {
         self.measured().contains(&i)
     }
 
+    /// Whether run `i` may turn out to be the last measured one. Once warmup is over, the last of the
+    /// measured runs. Before (`after` decides only then): an untimed block measures its first run, so
+    /// that run with one measured run; a timing block keeps the steady pair (`first` is the run before
+    /// the steady one), so the run now or the one before the next ends the measured runs only with one
+    /// or two of them; every other block measures from the run after the steady point.
+    pub(super) fn may_end(&self, i: usize) -> bool {
+        match self.first {
+            Some(f) => i + 1 == f + self.measured,
+            None if self.untimed => self.measured == 1,
+            None => self.keeps_pair && self.measured <= 2,
+        }
+    }
+
     /// The first measured run, once warmup is over.
     pub(super) fn first(&self) -> Option<usize> {
         self.first

@@ -388,7 +388,7 @@ impl Sampler {
 fn run(root: u32, home: Option<std::path::PathBuf>, interval: Duration, stop: mpsc::Receiver<()>, ready: mpsc::Sender<()>) -> Samples {
     let (k0, tsc0, ns0) = (host::thread_cycles(), host::tsc(), host::now_ns());
     // Sorted, without strobe itself (`host::process_set`).
-    let set = || -> Vec<u32> { if root == 0 { Vec::new() } else { host::process_set(root, home.as_deref()).into_iter().map(|p| p.pid).collect() } };
+    let set = || -> Vec<u32> { if root == 0 { Vec::new() } else { host::process_set_pids(root, home.as_deref()) } };
     // The first read of the set reads every process's stamp once (cached by pid and start time), so
     // it does not set the refresh; later reads do.
     let mut pids = set();

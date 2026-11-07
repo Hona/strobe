@@ -290,6 +290,55 @@ pub fn throttled(ms: f64, baseline: Option<f64>) -> Result<Option<f64>> {
     Ok(Some(ratio))
 }
 
+/// Hypervisor steal over a stretch (a speed check): the share of the CPUs' time the hypervisor gave to
+/// something else while the guest wanted them, which a guest sees as neither its own work nor idle.
+/// Linux only; elsewhere none is read and a slow check with no process named says "system work".
+pub struct Steal {
+    at: Option<(Vec<u64>, std::time::Instant)>,
+}
+
+impl Steal {
+    pub fn start() -> Steal {
+        let mut v = Vec::new();
+        Steal { at: host::steal_ns(&mut v).then(|| (v, std::time::Instant::now())) }
+    }
+
+    /// Steal since `start` as % of the time of `cpus` (all when `None`), their mean; None where the OS
+    /// does not report it.
+    pub fn pct(&self, cpus: Option<u64>) -> Option<f64> {
+        let (a, t0) = self.at.as_ref()?;
+        let mut b = Vec::new();
+        let span = t0.elapsed().as_nanos() as f64;
+        (host::steal_ns(&mut b) && b.len() == a.len() && span > 0.0).then_some(())?;
+        let per: Vec<f64> =
+            a.iter().zip(&b).enumerate().filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1)).map(|(_, (x, y))| (100.0 * y.saturating_sub(*x) as f64 / span).min(100.0)).collect();
+        (!per.is_empty()).then(|| per.iter().sum::<f64>() / per.len() as f64)
+    }
+}
+
+/// Steal from which it is named as a cause (% of the CPUs' time): `/proc/stat` counts in 10 ms ticks,
+/// and a tick of it in a check of a second or two is noise.
+const STEAL_CAUSE_PCT: f64 = 0.5;
+
+/// The busiest processes during a check (% of a core), and the hypervisor's steal (% of the target's
+/// CPUs' time, where the OS reports it) as a cause from `STEAL_CAUSE_PCT`. With no process named: the
+/// steal, else the OS's own work, saying a steal that read under it.
+pub fn named_work(who: &[(String, f64)], steal: Option<f64>) -> String {
+    let stolen = steal.filter(|s| *s >= STEAL_CAUSE_PCT).map(|s| format!("hypervisor steal {s:.0}% of those CPUs during the check"));
+    if who.is_empty() {
+        return match (stolen, steal) {
+            (Some(s), _) => format!("none named ({s})"),
+            (None, Some(s)) => format!("none named (system work; {s:.0}% hypervisor steal)"),
+            (None, None) => "none named (system work)".to_string(),
+        };
+    }
+    let list = who.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
+    match stolen {
+        Some(s) => format!("{list}; {s}"),
+        None => list,
+    }
+}
+
 /// The native speed check (`Throttled` for targets with no page to run the JS check in): a fixed
 /// integer workload on a strobe thread on `cpus` (the target's CPUs), median of 3, in ms. strobe's own
 /// mask (the runner's CPUs) is widened to them for the check and comes back after it.
@@ -375,17 +424,25 @@ struct Try {
     ms: f64,
     foreign_pct: f64,
     others: Vec<(String, f64)>,
+    /// Hypervisor steal on the target's CPUs meanwhile (% of their time; Linux guests).
+    steal: Option<f64>,
 }
 
 fn timed_check(cpus: Option<u64>) -> Try {
     let me = std::process::id();
-    let (p0, c0, t0) = (host::all_processes(), idle_now(), host::tsc());
+    // The process lists outside the span the idle counters cover, strobe's own CPU just inside it:
+    // what is left of the CPUs' busy time is other work, the check's own core never assumed whole.
+    let p0 = host::all_processes();
+    let stolen = Steal::start();
+    let (c0, t0, own0) = (idle_now(), host::tsc(), host::process_cycles(me));
     let started = std::time::Instant::now();
     let ms = native_speed(cpus);
     let wall_ms = started.elapsed().as_secs_f64() * 1e3;
-    let (p1, c1, t1) = (host::all_processes(), idle_now(), host::tsc());
-    let foreign_pct = match (c0, c1, t0, t1) {
-        (Some(a), Some(b), Some(x), Some(y)) if y > x && a.len() == b.len() => {
+    let (own1, c1, t1) = (host::process_cycles(me), idle_now(), host::tsc());
+    let steal = stolen.pct(cpus);
+    let p1 = host::all_processes();
+    let foreign_pct = match (c0, c1, t0, t1, own0, own1) {
+        (Some(a), Some(b), Some(x), Some(y), Some(o0), Some(o1)) if y > x && a.len() == b.len() => {
             let span = (y - x) as f64;
             let busy: f64 = a
                 .iter()
@@ -394,7 +451,7 @@ fn timed_check(cpus: Option<u64>) -> Try {
                 .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
                 .map(|(_, (i0, i1))| (100.0 * (1.0 - i1.saturating_sub(*i0) as f64 / span)).clamp(0.0, 100.0))
                 .sum();
-            (busy - 100.0).max(0.0)
+            (busy - 100.0 * o1.saturating_sub(o0) as f64 / span).max(0.0)
         }
         _ => 0.0,
     };
@@ -410,7 +467,7 @@ fn timed_check(cpus: Option<u64>) -> Try {
         .collect();
     others.sort_by(|a, b| b.1.total_cmp(&a.1));
     others.truncate(3);
-    Try { ms, foreign_pct, others }
+    Try { ms, foreign_pct, others, steal }
 }
 
 fn idle_now() -> Option<Vec<u64>> {
@@ -462,7 +519,7 @@ pub fn native_speed_checked(cpus: Option<u64>) -> Result<Option<f64>> {
     if let (Some(ratio), Some(r)) = (ratio, reference)
         && ratio > 1.5
     {
-        let who = |t: &Try| if t.others.is_empty() { "nothing outside strobe".to_string() } else { t.others.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ") };
+        let who = |t: &Try| named_work(&t.others, t.steal);
         if last.foreign_pct > FOREIGN_PCT {
             return Err(Refusal::new(
                 ValidatorId::Background,

@@ -600,7 +600,18 @@ it (rule 1): a block's refusal, `TailTooShort` when a block had too few of a per
 `NoPhase` when a measured run never entered its phase; and one build's analysers run on its blocks
 (`HighVariance`, `MultimodalDistribution`, `NotSteady`, `Background`, `StateDrift`, `DisplayOff`).
 A refused primary gives `track` no point. `report` draws nothing for it (no comparison to show): its
-blocks are in its `result.json`.
+blocks are in its `result.json`. Its timed blocks run no profiler (rule 3); `--blocks N --why always`
+then runs one attribution block per series on `--head`, as `--check --why always` does (warmed, then
+`--runs` measured runs), kept as the series' `attribution.head` and printed (`why    attribution
+block: head rec_…`). `--why auto` runs none (nothing compared, so nothing to explain); a `--why` value other than
+`auto`, `always` or `never`, and a `cli()` case with `--why always` in a check or `--blocks N`, are
+usage errors before any series runs. A stop, or an unlock wait that ran out, during that attribution
+block ends the bench as in a comparison. `query <exp> <view>` of a `--blocks` run (beside series
+refused before they ran or not run) answers from its one attribution recording, lists them when
+there are several, and with none says
+that timed blocks keep no profile and names `--why always`; `query <rec> hotspots` (and `alloc`,
+`layout`, `style`, `gc`) of a bench's timed block says the same, naming its experiment, where
+other recordings still say `record --probes attribution`.
 `--base <target>[=<variant>] --head <target>[=<variant>]` (or `target:<name>…`) names two targets of
 the bench file: an implementation comparison (§9.10).
 `--head` alone is an error that suggests `--base`, `--blocks` or `--check`. `--runs` is the measured runs per
@@ -1489,7 +1500,17 @@ or less often so the re-read stays under 0.2% of a core (the first read, which r
 process's stamp once, does not set the pace). A process without a stamp is read again only while it
 is under 2 s old by its own start time (§13.2): read again for 2 s after strobe first saw it, every
 process that ran before the first scan was read again at the next one, which had made the sampler 1.0%
-of a core instead of 0.17% in a 5 s block on adais. Budget: 0.5% of one core, and the sampler measures its
+of a core instead of 0.17% in a 5 s block on adais. The re-read takes the set's pids from the
+processes' stat lines alone (Linux: no `smaps_rollup`, no executable link), and Linux reads GPU
+statistics only when a device has a render node (`renderD*`): a display-only device (a VM's
+bochs-drm or hyperv_drm framebuffer, simpledrm) runs no process's GPU work, and listing every target
+process's file descriptors each second for its DRM files was most of the cost there. On vps
+(KVM, 2 vCPUs, a headless page's 9-17 s blocks) the sampler read 0.57-0.65% of a core: the set's
+re-read 0.21-0.26% (about 20 ms each, almost all of it the browser processes' `smaps_rollup` it
+never used), the DRM file scan of the display-only device 0.19-0.23%, `/proc/stat` each tick 0.08%,
+strobe's own readings 0.05%; hypervisor steal over those blocks was 0 (`/proc/stat`), so none of it
+was steal billed to the thread (KVM's steal clock keeps steal out of a thread's CPU time anyway).
+With both changes the same blocks read 0.31-0.36%. Budget: 0.5% of one core, and the sampler measures its
 own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers read OS APIs directly and never
 spawn processes (§13.6). On macOS the per-process GPU reader keeps the accelerators and the set's
 GPU clients open between ticks (each client's owner is read once, every client is listed again each
@@ -1604,7 +1625,8 @@ address space, which holds its memory lock for a moment; never inside a timed ru
 `memory.app.host` is given only when every process of the tree was read (a process strobe cannot open
 is listed, never counted as 0). macOS gives another process's regions only to a debugger (its task
 port), so there is no reading there; `memory.app.private` is the physical footprint, GPU allocations
-included. Readings are taken after the runs of every native bench block and after `record exe:`,
+included. Readings are taken at the end of the last measured run of every native bench block
+(before its reset, §9.6) and after `record exe:`,
 `record app:` and `record pid:` windows, stored in `memory.json`; `query <rec> memory` shows a reading
 by process (default) or by part (`--by layer`), `--at <i>` picks one, `a..b memory` diffs two by part.
 
@@ -2690,7 +2712,8 @@ experiment's `script.log`.
   during the run is not in the tree any more). Warmup and pairs work as for pages.
 - **Memory:** `js.heap.retained` is the heap after a full collection (`Bun.gc(true)`, Node's
   `gc()` under `--expose-gc`) after a run minus before it, read outside the run's span: what each
-  run keeps alive. `memory.app.private` is the host tree's private bytes after the runs.
+  run keeps alive. `memory.app.private` is the host tree's private bytes at the end of the last
+  measured run, before its reset (§9.6).
 - **Attribution:** the process starts with `--cpu-prof` (200 µs, 400 µs on Windows: §8.3) and `--heap-prof`; the profiles
   cover the whole process and name the harness's and the variant's own source files, so nothing
   needs a source map.
@@ -2800,6 +2823,25 @@ sequenceDiagram
 - At every run start strobe reads the DOM node count (a native app's: the elements in its
   accessibility tree at each run's end, when strobe drives it); a count that drifts across runs means
   `reset` is missing (`StateDrift`).
+- Point-in-time readings describe what a measured run left, never what its reset left: each one is
+  taken after the run's span closed and before its `reset`, outside the timed span. A page's
+  `dom.nodes` and `js.heap.used` are read at the end of every run and are the median over the
+  measured runs (a load case that resets to `about:blank` reads the loaded page, not the blank
+  one); no collection is forced for them. `memory.app.private`, `memory.app.pss` and a native app's
+  memory reading (`memory.app.host`, `query memory`) are those of the last measured run, read at the
+  end of each run that may turn out to be it: the last measured one, and before the steady point
+  only where a warmup run can become it (an untimed block's first run with one measured run; a
+  timing block, which keeps the steady pair, with one or two measured runs; never an attribution or
+  leak block, which measure from the run after the steady point). Where none was read (a block that
+  ended oddly), the metric has no value: never a reading from after the reset in its place. A
+  Chromium attribution block defers its last run's reset: it runs right after the census and the
+  heap snapshot (taken once the trace stops), so they describe what the runs left, and before the
+  end screen is read, so the screen check, the servers and a `url()` target are reset as in any
+  other block. A leak run (§8.6) reads between its runs, after each reset, as before: what a reset
+  does not release is what it looks for (its `memory.app.*` stays the reading after its runs); a
+  Firefox attribution block's about:memory census stays the one before its measured runs (the state
+  they start from). What the page showed after the runs (`shown`'s end) is read after the last
+  reset in every block: a check of the screen, compared like for like.
 
 `@hona/strobe-playwright` keeps existing Playwright benchmarks usable: inside a Playwright test,
 `strobe.record(page, fn)` records one block. Those recordings support every view, but not
@@ -3223,8 +3265,8 @@ anything builds; any run case's block (a `--check`, one target's) whose window i
 | `EngineUnsupported` | a target, metric, probe set, hook or case kind needs a browser engine strobe does not drive on it: a webview target on Linux (WebKitGTK) or macOS (WKWebView), refused before anything launches with the fix `kind: "native"` (§13.8); and a page's engine that gives strobe no way to measure it (Firefox: `main.*`, `layout.count`, `style.count`, `layout.shift`, `gpu.compile`, `js.heap.*`, `span.*`, `frames.presented.p*`, attribution and memory probes and a launch's attribution block, `ctx.playwright`; `canvas.*` on a page without WebGPU; WebKit also launch cases (no preload script), `net.*`, `input.rate`, `input.gap.p95`, `ctx.mock`, a window `scale`, pointer input where the browser drops it (WPE's headless view), pointer input on a page that emulates a phone (strobe sends no touches yet, §13.1), and `count.*`, `canvas.*`, `interaction.*`, `scroll.latency.*` of a run that loaded a document, a `page.goto` after `ctx.addInitScript`), or an engine strobe cannot run here (`webkit` on Windows for good, Safari `--headless`, a window `scale` on WebKit): a primary refuses its series before anything builds, with the closest metric the engine has, and the rest of the file runs (§5.6 "Refused series"); a declared secondary is refused per block, and an undeclared one (a default secondary, a descriptive row) is left out of the block's values |
 | `Headless` | a frame, input-latency, scrolling, canvas or GPU-use metric of a page that runs headless (`--headless`, a target's `headless`): a primary refuses its series before anything builds (§5.6 "Refused series"); a secondary is refused per block; a run of a headless page measured from outside that sends input (no window for the OS's input) |
 | `NotForTarget` | a declared metric this kind of target or case has none of (a browser engine's on a native app, a run's on a launch case, the UI thread's on a windowless app, `cpu.foreign` with `--pin none`): refuses that metric |
-| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled` |
-| `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends |
+| `Throttled` | the block-start speed check (a fixed JS workload in the page) runs more than 1.5× slower than this device's calibration: emulated throttling, thermal throttling, power saving or battery mode. Native targets have no page: strobe runs a fixed integer workload on the target's CPUs before the launch, once those CPUs are quiet (two 100 ms looks under 5% mean busy and no CPU over 25%, up to 10 s: the last block's app may still be freeing its memory and GPU objects), and compares it with this device's reference for that CPU mask: the median of its last 20 passing checks there (`<state>/native-speed.json`, per mask; the first check sets it). A slow check is tried again: up to 3 slow tries on quiet CPUs, and for up to 2 minutes while other processes keep the target's CPUs over 25% of a core busy during the check. Slow while other work was busy there is `Background` (naming the busiest processes), not `Throttled`. A page's slow check runs once more after the CPUs settle (the same quiet wait, up to 10 s, then 2 s): a burst passes (the page's own work just after its load, a neighbour on a VM's host, a process that just ended) while throttling lasts, so a second slow check refuses the block (`Background` or `Throttled`, by the other work during it, saying it was slow twice and quoting the first) and a fast one lets the runs go on. Such a block is accepted only if one more check, right after its measured runs (no wait), is at speed too: then a `Throttled` note (info) quotes the first; slow again refuses the block as above, quoting the first. It never goes on silently. The busiest processes named are every process but the browser's and strobe's own, strobe's tree included and marked `the bench's` (the runner, the servers it started: their work counts as other work on the target's CPUs, and once went unnamed as "system work"). strobe reads the processes before the idle counters at the check's start and after them at its end, so its own reading is outside the span (read inside it, it showed as a quarter of a core of other work on vps). On Linux the other work carries the idle counters' resolution (`±N%`: `/proc/stat` counts idle in 10 ms ticks, so over a check of tens of ms each CPU's reading is off by up to a tick). A Linux guest reads the hypervisor's steal over the check on the target's CPUs (`/proc/stat`'s steal, their mean) and names it as a cause from 0.5% of those CPUs' time (`none named (hypervisor steal 37% of those CPUs during the check)`, and after the named processes when there are some); under that, `none named (system work; 0% hypervisor steal)`; bare metal and other OSes say `none named (system work)`. The native check reads the process lists outside the idle counters' span and takes strobe's own CPU over the span out of the busy time, rather than assuming its check thread used one whole core (with a single target CPU, other work could then never read above 0) |
+| `Background` (refusing) | the native speed check stayed slow for 2 minutes while other processes kept the target's CPUs busy (an antivirus scanning new files, an update, a build): the message names the busiest. A bench block waits it out first, holding nothing (a minute, then until the CPUs are quiet, and the check again), up to 15 times, about an hour: on a shared machine another agent's build ends. Blocks that run through a locked session (a headless page, a windowless app) wait the same way: they once ended the bench at the first busy check |
 | `BackgroundPriority` | the target runs at background priority, inherited from strobe or its own: macOS `taskpolicy -b` (`PRIO_DARWIN_PROCESS`), Windows' idle priority class, efficiency mode (EcoQoS) or background mode (very low memory priority), Linux `SCHED_IDLE` or nice 19. The OS keeps it on efficiency cores, at low clocks or behind other work: a drag in an Electron app read 83–91% dropped frames under `taskpolicy -b` against 0.4% at normal priority. Refuses frame and input-latency metrics (`frames.*`, `interaction.*`, `scroll.*`, `canvas.*`, `input.*`, `launch.painted`, `launch.settled`): a primary among them refuses the bench before anything builds (strobe's own priority) or at the block (the target's), a secondary shows refused, and `record` prints `frames refused`. CPU, memory and counters stay, with a warning to compare them only with runs at the same priority. Attribution and memory blocks are untimed and keep running. `record pid:` measures a process as its user runs it and is not checked |
 | `PresentsUnmatched` | over 5% of the inputs strobe sent a native app (those after which its accessibility tree changed) showed no frame within a second while the present session lost no events (refuses `interaction.*`, §7.4) |
 | `OverheadBudget` (refusing) | the OS present session's consumer used over 2% of a core (budget 0.5%, §19; over the budget only warns): its frames describe a disturbed run |
@@ -6827,6 +6869,25 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
   phone itself (toybox `flock` held by an open shell stream; the kernel frees it when the stream
   closes), so another computer's strobe is refused `ConcurrentBench` naming that host. Checked on
   Android 15 emulators (x86_64 WHPX on adais, arm64 HVF on air); no real phone yet.
+- **A web team's report on a GPU-less Linux VM (2026-11-07)**, checked on vps (KVM, 2 vCPUs) with a
+  site's headless bench, 0.16.0 against this build:
+  - Point-in-time readings before the reset (§9.6): a load case that resets to `about:blank` read
+    `dom.nodes` 3 and `js.heap.used` 0.57 MB (the blank page); now 1,415 and 5-7 MB, in `--blocks`
+    and `--check` alike. A script target that holds 200 MB per run and frees it in its reset read
+    `memory.app.private` 206 MB, now 406 MB.
+  - `--blocks N --why always` (§5.6) made no attribution block, and `query <rec> hotspots` on a timed
+    block told the user to record with `--probes attribution`; now one block of head per series,
+    and the hint names the experiment and `--why always`.
+  - The speed check (§10.1): under a 30% CPU quota during the first check, 0.16.0 refused the block
+    `Background: … busiest processes on the machine: none named (system work)` and ended the bench;
+    a headless block never waited out `Background`. The other work it saw was strobe's own reading
+    of every process inside the check's span (a quarter of a core) and 10 ms idle ticks over a check
+    of tens of ms. Now the check runs again after the CPUs settle and once more after the runs, the
+    bench's own processes are named, strobe's reading sits outside the span, and headless blocks wait
+    out `Background`. Steal read 0 throughout on vps.
+  - The OS sampler (§8.5) read 0.57-0.65% of a core against its 0.5% budget: the set's re-read
+    reading every browser process's `smaps_rollup` it never used, and a scan of every browser file
+    descriptor each second for DRM files on a display-only device. Now 0.31-0.36%.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

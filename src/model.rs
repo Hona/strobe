@@ -768,7 +768,7 @@ pub const METRICS: &[MetricDef] = &[
         words: AMOUNT,
         min_n: 0,
         across: Across::Care(CARE_PRIVATE),
-        about: "private bytes of every target process after the measured runs (Windows: the commit charge, which includes commit held for the processes' GPU allocations; macOS: the physical footprint)",
+        about: "private bytes of every target process at the end of the last measured run, before its reset (Windows: the commit charge, which includes commit held for the processes' GPU allocations; macOS: the physical footprint)",
     },
     MetricDef {
         name: "memory.app.host",
@@ -778,7 +778,7 @@ pub const METRICS: &[MetricDef] = &[
         words: AMOUNT,
         min_n: 0,
         across: Across::Care(CARE_HOST),
-        about: "native targets: memory the processes allocated in their own address space after the measured runs (heap, stacks, anonymous memory), without GPU memory mapped into them or held for them (Windows, Linux)",
+        about: "native targets: memory the processes allocated in their own address space at the end of the last measured run, before its reset (heap, stacks, anonymous memory), without GPU memory mapped into them or held for them (Windows, Linux)",
     },
     MetricDef {
         name: "memory.app.pss",
@@ -788,7 +788,7 @@ pub const METRICS: &[MetricDef] = &[
         words: AMOUNT,
         min_n: 0,
         across: Across::Compared,
-        about: "Linux: the proportional set size of every target process after the measured runs (each page shared by n processes counts 1/n), summed: memory an app's processes share counts once",
+        about: "Linux: the proportional set size of every target process at the end of the last measured run, before its reset (each page shared by n processes counts 1/n), summed: memory an app's processes share counts once",
     },
     MetricDef {
         name: "cpu.fixture",
@@ -848,9 +848,9 @@ pub const METRICS: &[MetricDef] = &[
         words: AMOUNT,
         min_n: 0,
         across: Across::PerSide,
-        about: "renderer JS heap in use after the measured runs",
+        about: "renderer JS heap in use at the end of each measured run, before its reset (median over the runs)",
     },
-    MetricDef { name: "dom.nodes", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "DOM nodes after the measured runs" },
+    MetricDef { name: "dom.nodes", unit: "count", better: Better::Lower, kind: Kind::Timed, words: COUNT, min_n: 0, across: Across::PerSide, about: "DOM nodes at the end of each measured run, before its reset (median over the runs)" },
     MetricDef {
         name: "js.heap.growth",
         unit: "MB/min",

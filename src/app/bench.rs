@@ -448,6 +448,22 @@ struct Run {
     counted: probe::wakes::Counted,
     /// strobe's reads of the page inside the run and their time (ms): `driver.reads`, `driver.read_ms`.
     reads: (u64, f64),
+    /// What the run left, read after its span and before its reset (`RunEnd`).
+    end: RunEnd,
+}
+
+/// The point-in-time state a run left (SPEC §9.6): read once its span closed and before its reset,
+/// so a reset that leaves the page (`goto("about:blank")`) is never what they describe.
+#[derive(Clone, Debug, Default)]
+struct RunEnd {
+    /// The renderer's JS heap in use (MB; Chromium).
+    heap_mb: Option<f64>,
+    /// DOM nodes in the page.
+    nodes: Option<u64>,
+    /// Private bytes of the browser's processes (MB), read where the run may be the last measured one.
+    private_mb: Option<f64>,
+    /// Their proportional set size (bytes; Linux), read with `private_mb`.
+    pss: Option<u64>,
 }
 
 /// A browser's process roles (`WebBrowser::process_roles`) and the metric each one's CPU goes to.
@@ -1731,6 +1747,18 @@ pub fn run(args: &Args) -> Result<Output> {
     let mut not_run: Vec<String> = Vec::new();
     // Series `--max-time` left no time to start.
     let mut out_of_time: Vec<String> = Vec::new();
+    // `--why`, said before any series runs: a `cli()` case has no attribution recording (SPEC §9.6),
+    // and a check or `--blocks N` profiles only with `always`.
+    let why = args.get("why").unwrap_or("auto");
+    if !matches!(why, "auto" | "always" | "never") {
+        return Err(Error::usage(format!("--why: auto, always or never, not {why}")));
+    }
+    if why == "always"
+        && matches!(mode, Mode::Check | Mode::Blocks(_))
+        && let Some(s) = series.iter().find(|s| s.gap.is_none() && s.refused.is_none() && ctx.describe["targets"][&s.target]["kind"] == "cli")
+    {
+        return Err(Error::usage(format!("{}: a cli() case has no attribution recording: its commands end inside each run (profile a long-running command with strobe record pid:<n> --probes deep)", s.case)));
+    }
     for (i, s) in series.iter().enumerate() {
         if halted.is_none() && stop_requested() {
             halted = Some(stop_error());
@@ -1947,12 +1975,8 @@ pub fn run(args: &Args) -> Result<Output> {
 /// `--check`: one block on head with one run, no warmup and no statistics. A failing case is reported
 /// with what timed out and its screenshot, and the next case runs.
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
+    // A `cli()` case with `--why always` was refused before the series ran (`run`).
     let target = ctx.describe["targets"][&s.target].clone();
-    // `record --bench` (`--check --why always`) of a command: nothing profiles a process that ends
-    // inside each run (SPEC §9.6).
-    if target["kind"] == "cli" && ctx.args.get("why") == Some("always") {
-        return Err(Error::usage(format!("{}: a cli() case has no attribution recording: its commands end inside each run (profile a long-running command with strobe record pid:<n> --probes deep)", s.case)));
-    }
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     prepare_all(ctx, s, variants, config)?;
@@ -2017,35 +2041,14 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     }
     // `--why always` profiles the case on head too: one attribution block, warmed like a bench's, for finding
     // where a single build spends its time before there is anything to compare.
-    let (mut attribution, mut sampling) = (Value::Null, Value::Null);
-    let unprofiled = no_profiler(&target, s.launch.is_object()).filter(|_| matches!(target["kind"].as_str(), Some("web" | "url")));
-    if let (true, Some(no)) = (passed && ctx.args.get("why") == Some("always"), &unprofiled) {
-        ctx.warnings.push(validity::info("Attribution", format!("{}: {no}: no attribution block (profile it in Chromium)", s.label())));
-    }
-    if passed && ctx.args.get("why") == Some("always") && unprofiled.is_none() {
-        progress(format!("  attribution block ({}; not timed)", why_text(&target)));
-        let v = &variants[0];
+    let (attribution, sampling) = if passed && ctx.args.get("why") == Some("always") {
         // Warmed and run as in a bench (`--runs`, default 5): `--check`'s single cold run would start no
         // profiler, and one measured run is too few to read per-run numbers from.
         let runs = ctx.args.num("runs")?.unwrap_or(5.0).max(1.0) as usize;
-        let attributed = if s.launch.is_object() {
-            in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| as_side(ctx, s, v, |ctx, s| launch::attribution(ctx, s, v)))
-        } else {
-            block_on_screen(ctx, s, v, usize::MAX, &Exec::timed(Set::Attribution, runs, true))
-        };
-        match attributed {
-            Ok(b) => {
-                progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
-                let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
-                sampling = json!(attribution_sampling(rec.as_ref(), &b.variant, &mut ctx.warnings));
-                if target["kind"] != "script" && !is_native(&target) {
-                    observer_profile(rec.as_ref(), &s.label(), &mut ctx.warnings);
-                }
-                attribution = json!(b.recording);
-            }
-            Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
-        }
-    }
+        head_attribution(ctx, s, &variants[0], runs)?
+    } else {
+        (Value::Null, Value::Null)
+    };
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
     let mut out = json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
@@ -2058,6 +2061,41 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     });
     series_setup(ctx, s, window, &mut out);
     Ok(out)
+}
+
+/// One build's attribution block (`--why always` of a `--check` or of `--blocks N`): warmed like a
+/// bench's, `runs` measured runs with the target's profilers, never timed. Returns its recording and
+/// the interval its sampler kept; a target strobe has no profiler for, or a block that failed, is
+/// said in the warnings and gives none. A stop, or an unlock wait that ran out, ends the bench as in
+/// the pairs: its error is returned.
+fn head_attribution(ctx: &mut Ctx, s: &Series, v: &Variant, runs: usize) -> Result<(Value, Value)> {
+    let target = ctx.describe["targets"][&s.target].clone();
+    if let Some(no) = no_profiler(&target, s.launch.is_object()).filter(|_| matches!(target["kind"].as_str(), Some("web" | "url"))) {
+        ctx.warnings.push(validity::info("Attribution", format!("{}: {no}: no attribution block (profile it in Chromium)", s.label())));
+        return Ok((Value::Null, Value::Null));
+    }
+    progress(format!("  attribution block ({}; not timed)", why_text(&target)));
+    let attributed = if s.launch.is_object() {
+        in_slot(ctx, &format!("{} {} attribution", s.label(), v.role), |ctx| as_side(ctx, s, v, |ctx, s| launch::attribution(ctx, s, v)))
+    } else {
+        block_on_screen(ctx, s, v, usize::MAX, &Exec::timed(Set::Attribution, runs, true))
+    };
+    match attributed {
+        Ok(b) => {
+            progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
+            let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
+            let sampling = json!(attribution_sampling(rec.as_ref(), &b.variant, &mut ctx.warnings));
+            if target["kind"] != "script" && !is_native(&target) {
+                observer_profile(rec.as_ref(), &s.label(), &mut ctx.warnings);
+            }
+            Ok((json!(b.recording), sampling))
+        }
+        Err(e) if e.code == 130 || e.code == 124 || stop_requested() => Err(if e.code == 124 { e } else { stop_error() }),
+        Err(e) => {
+            ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message)));
+            Ok((Value::Null, Value::Null))
+        }
+    }
 }
 
 /// `seeded`: the experiment's seed, and whether a hook used it.
@@ -2416,6 +2454,8 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
+    // Checked before the series ran (`run`).
+    let why = ctx.args.get("why").unwrap_or("auto").to_string();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     prepare_all(ctx, s, variants, config)?;
@@ -2476,6 +2516,22 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     if let Some(h) = halted.as_ref().filter(|_| blocks.is_empty()) {
         return Ok(json!({ "label": s.label(), "case": s.case, "not_run": true, "halt": { "code": h.code, "message": h.message } }));
     }
+    // `--why always`: one attribution block of head after its timed blocks, as a `--check`'s
+    // (`head_attribution`). Nothing is compared, so `auto` has no difference to explain.
+    let (mut attribution, mut attribution_sampling) = (json!({}), Value::Null);
+    if halted.is_none() && why == "always" {
+        let runs = ctx.runs;
+        match head_attribution(ctx, s, &variants[0], runs) {
+            Ok((rec, sampling)) if rec.is_string() => {
+                attribution["head"] = rec;
+                attribution_sampling = json!({ "head": sampling });
+            }
+            Ok(_) => {}
+            Err(e) => halted = Some(e),
+        }
+    } else if halted.is_none() && why == "auto" {
+        progress("  no attribution block: --blocks compares nothing, so there is no difference to explain (--why always profiles head once)");
+    }
     // The primary, refused as a paired comparison would refuse it (rule 1): a block refused it, a
     // percentile's tail is too short, or no measured run entered its phase.
     let mut primary = json!({ "metric": s.primary });
@@ -2512,7 +2568,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         "warmup_blocks": warmup_blocks, "warmup_ms": warmup_ms,
         "steps": mean_steps(&blocks), "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3 - (ctx.waited_ms - waited_before), "waited_ms": ctx.waited_ms - waited_before,
         "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
-        "blocks": blocks, "warnings": warnings, "attribution": {}, "timing_recordings": timing_recordings, "shown": shown,
+        "blocks": blocks, "warnings": warnings, "attribution": attribution, "attribution_sampling": attribution_sampling, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
     });
     series_setup(ctx, s, window, &mut out);
@@ -3732,9 +3788,29 @@ fn growth(ys: &[f64], n: usize, bound: f64, show: &dyn Fn(f64) -> String) -> Val
     json!({ "slope": slope, "lo": lo, "hi": hi, "bound": bound, "first_half": first, "second_half": second, "verdict": verdict, "verdict_kind": kind, "decided": kind.decided() })
 }
 
-/// What `Foreign::stop` read: other work on the target's CPUs (% of one core, None when unreadable) and
-/// the busiest processes on the machine.
-type OtherWork = (Option<f64>, Vec<(String, f64)>);
+/// What `Foreign::stop` read over a speed check.
+#[derive(Clone, Debug, Default)]
+struct OtherWork {
+    /// Other work on the target's CPUs (% of one core; None when unreadable).
+    foreign: Option<f64>,
+    /// The busiest processes on the machine but the browser's, as % of one core.
+    busiest: Vec<(String, f64)>,
+    /// The hypervisor's steal on those CPUs (% of their time; Linux guests, `validity::Steal`).
+    steal: Option<f64>,
+    /// How far `foreign` can be off from the idle counters' resolution alone (% of one core; Linux).
+    resolution: Option<f64>,
+}
+
+impl OtherWork {
+    /// `51% of a core (±40%: …)`, or why it is unknown.
+    fn on_cpus(&self) -> String {
+        match (self.foreign, self.resolution) {
+            (Some(f), Some(r)) => format!("{f:.0}% of a core (±{r:.0}%: Linux counts idle time in 10 ms ticks)"),
+            (Some(f), None) => format!("{f:.0}% of a core"),
+            (None, _) => "could not be read".to_string(),
+        }
+    }
+}
 
 /// Other work on the target's CPUs over a span (a page's speed check), as `validity`'s native check
 /// measures it: their busy time from idle cycles, less the target browser's own CPU, and the busiest
@@ -3744,13 +3820,20 @@ struct Foreign {
     tsc: Option<u64>,
     browser: u64,
     procs: (u64, Vec<host::ProcInfo>),
+    steal: validity::Steal,
 }
 
 impl Foreign {
+    /// The process readings come first and the idle counters last, and `stop` reads them the other way
+    /// round: strobe's own reading of every process is outside the span (on vps it read as a quarter of
+    /// a core of other work).
     fn start(browser: &WebBrowser) -> Foreign {
+        let procs = (host::now_ns(), host::all_processes());
+        let cycles = browser.processes().iter().map(|p| p.cycles).sum();
         let mut idle = Vec::new();
+        let steal = validity::Steal::start();
         host::idle_cycles(&mut idle);
-        Foreign { idle, tsc: host::tsc(), browser: browser.processes().iter().map(|p| p.cycles).sum(), procs: (host::now_ns(), host::all_processes()) }
+        Foreign { idle, tsc: host::tsc(), browser: cycles, procs, steal }
     }
 
     /// Other work on `cpus` (all when unpinned) as % of one core (None: the idle counters or the time
@@ -3760,8 +3843,10 @@ impl Foreign {
     fn stop(self, cpus: Option<u64>, browser: &WebBrowser) -> OtherWork {
         let mut idle = Vec::new();
         let ok = host::idle_cycles(&mut idle);
+        let tsc = host::tsc();
+        let steal = self.steal.pct(cpus);
         let theirs = browser.processes();
-        let (tsc, now) = (host::tsc(), (host::now_ns(), host::all_processes()));
+        let now = (host::now_ns(), host::all_processes());
         let own = theirs.iter().map(|p| p.cycles).sum::<u64>();
         let span = match (self.tsc, tsc) {
             (Some(a), Some(b)) if b > a => Some((b - a) as f64),
@@ -3769,13 +3854,21 @@ impl Foreign {
         };
         let busiest = match span {
             Some(span) => {
-                let skip: std::collections::BTreeSet<u32> = host::tree_pids(std::process::id()).into_iter().chain(theirs.iter().map(|p| p.pid)).collect();
+                // strobe's own tree beyond the browser (the runner, the servers it started) is named
+                // too, as the bench's: its work counts as other work on the target's CPUs. strobe's own
+                // process is not: between the two readings it is mostly reading the processes.
+                let me = std::process::id();
+                let ours: std::collections::BTreeSet<u32> = host::tree_pids(me).into_iter().collect();
+                let skip: std::collections::BTreeSet<u32> = std::iter::once(me).chain(theirs.iter().map(|p| p.pid)).collect();
                 let before: BTreeMap<u32, u64> = self.procs.1.iter().map(|p| (p.pid, p.cycles)).collect();
                 let mut out: Vec<(String, f64)> = now
                     .1
                     .iter()
                     .filter(|p| p.pid != 0 && !skip.contains(&p.pid))
-                    .map(|p| (format!("{} ({})", p.name, p.pid), 100.0 * p.cycles.saturating_sub(before.get(&p.pid).copied().unwrap_or(0)) as f64 / span))
+                    .map(|p| {
+                        let whose = if ours.contains(&p.pid) { ", the bench's" } else { "" };
+                        (format!("{} ({}{whose})", p.name, p.pid), 100.0 * p.cycles.saturating_sub(before.get(&p.pid).copied().unwrap_or(0)) as f64 / span)
+                    })
                     .filter(|(_, pct)| *pct >= 5.0)
                     .collect();
                 out.sort_by(|x, y| y.1.total_cmp(&x.1));
@@ -3784,18 +3877,33 @@ impl Foreign {
             }
             None => busiest_others(&self.procs, &now),
         };
+        let counted = |c: &usize| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1);
         let foreign = span.filter(|_| ok && idle.len() == self.idle.len()).map(|span| {
-            let busy: f64 = self
-                .idle
-                .iter()
-                .zip(&idle)
-                .enumerate()
-                .filter(|(c, _)| cpus.is_none_or(|m| *c < 64 && m >> c & 1 == 1))
-                .map(|(_, (a, b))| (100.0 * (1.0 - b.saturating_sub(*a) as f64 / span)).clamp(0.0, 100.0))
-                .sum();
+            let busy: f64 = self.idle.iter().zip(&idle).enumerate().filter(|(c, _)| counted(c)).map(|(_, (a, b))| (100.0 * (1.0 - b.saturating_sub(*a) as f64 / span)).clamp(0.0, 100.0)).sum();
             (busy - 100.0 * own.saturating_sub(self.browser) as f64 / span).max(0.0)
         });
-        (foreign, busiest)
+        // Linux counts idle time in 10 ms ticks (`/proc/stat`): over a check of tens of ms each CPU's
+        // reading is off by up to a tick.
+        let resolution = span.filter(|_| cfg!(target_os = "linux") && foreign.is_some()).map(|span| 100.0 * (0..idle.len()).filter(counted).count() as f64 * host::IDLE_TICK_NS as f64 / span);
+        OtherWork { foreign, busiest, steal, resolution }
+    }
+}
+
+/// A slow page speed check's refusal: `Background` while other work kept the target's CPUs busy (the
+/// browser's own processes not counted), which the bench waits out as for a native block; otherwise
+/// the check's own (`Throttled`), with the other work named so a reader can tell. `again` says what
+/// earlier checks of the block saw.
+fn slow_check(e: Error, other: &OtherWork, again: &str) -> Error {
+    let named = validity::named_work(&other.busiest, other.steal);
+    match other.foreign {
+        Some(f) if f >= BACKGROUND_PCT => Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {} busy ({})", other.on_cpus(), e.message))
+            .detail(format!("busiest processes on the machine (% of a core): {named}{again}"))
+            .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
+            .into(),
+        _ => match e.refusal {
+            Some(r) => (*r).detail(format!("other work on the target's CPUs meanwhile: {}; busiest processes on the machine (% of a core): {named}{again}", other.on_cpus())).into(),
+            None => e,
+        },
     }
 }
 
@@ -3899,6 +4007,7 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     let behind = |r: &Result<Block>| r.as_ref().err().is_some_and(|e| matches!(e.hidden(), Some(Hidden::Covered | Hidden::NotActive)));
     // A series that needs no presenting window runs through a lock, in one lock state per block.
     let mut retries = 0;
+    let mut busy_waits = 0;
     // A series that may run locked but met a hidden window on an unlocked screen (a `--check` or
     // `record --bench` of a windowed native case): it waits and retries as on-screen blocks do.
     let mut hidden_unlocked = false;
@@ -3908,6 +4017,12 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let display = host::display_state();
             let r = slotted_block(ctx, s, v, pair, x);
             if retry_launch(ctx, s, v, &r, &mut retries)? {
+                continue;
+            }
+            // As an on-screen block's below: a headless page runs here, and a busy machine ended its bench.
+            if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
+                busy_waits += 1;
+                wait_out_background(ctx, s, v, &r)?;
                 continue;
             }
             let end = host::session_locked();
@@ -3932,7 +4047,6 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
     }
     let mut woken = false;
-    let mut busy_waits = 0;
     let mut hidden_retries = 0;
     loop {
         host::wake_display();
@@ -3997,14 +4111,7 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // machine it ends. Wait for it, holding nothing, and run the block again; an hour of it refuses.
         if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
             busy_waits += 1;
-            let who = r.as_ref().err().and_then(|e| e.refusal.as_ref()).and_then(|f| f.detail.clone()).unwrap_or_default();
-            progress(format!("  waiting: other work keeps the CPUs busy ({who}); strobe runs the {} block again once it ends", v.role));
-            release_machine(ctx);
-            ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
-            let waiting = Instant::now();
-            nap(Duration::from_secs(60))?;
-            crate::validity::wait_quiet(None, Duration::from_secs(60));
-            ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+            wait_out_background(ctx, s, v, &r)?;
             continue;
         }
         if ctx.awake.locks() == before && !host::session_locked() {
@@ -4022,6 +4129,21 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
     }
+}
+
+/// Other work (a build, an update) kept the CPUs busy through the speed check (`Background`): on a
+/// shared machine it ends. Waits for it, holding nothing (a minute, then until the CPUs are quiet),
+/// before the block runs again; `BUSY_WAITS` of them (about an hour) refuse.
+fn wait_out_background(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>) -> Result<()> {
+    let who = r.as_ref().err().and_then(|e| e.refusal.as_ref()).and_then(|f| f.detail.clone()).unwrap_or_default();
+    progress(format!("  waiting: other work keeps the CPUs busy ({who}); strobe runs the {} block again once it ends", v.role));
+    release_machine(ctx);
+    ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
+    let waiting = Instant::now();
+    nap(Duration::from_secs(60))?;
+    crate::validity::wait_quiet(None, Duration::from_secs(60));
+    ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+    Ok(())
 }
 
 /// Whether to run a block again after a launch that failed for a passing reason (`transient`): up to
@@ -4905,45 +5027,45 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         if reduce.reduced() {
             motion::require(reduced_motion == Some(true), motion_how(kind, engine))?;
         }
-        let mut during = Some(Foreign::start(&browser));
-        let speed = validity::speed_check(&page)?;
-        // The calibration is Chromium's: another engine's JS speed is compared with its own reference
-        // only, which a check under other work never joins.
-        let mut loaded: Option<OtherWork> = None;
-        let checked = match engine {
-            WebEngine::Chromium => validity::throttled(speed, ctx.baseline),
-            WebEngine::Firefox | WebEngine::Webkit => {
-                let f = during.take().map(|d| d.stop(ctx.pin, &browser)).unwrap_or_default();
-                // Only a check known to have run without other work joins the engine's reference.
-                let keep = f.0.is_some_and(|x| x < BACKGROUND_PCT);
-                loaded = Some(f);
-                validity::engine_throttled(engine, ctx.pin, speed, keep)
-            }
+        let (pin, baseline) = (ctx.pin, ctx.baseline);
+        // One speed check and the other work meanwhile. The calibration is Chromium's: another engine's
+        // JS speed is compared with its own reference only, which a check under other work never joins.
+        let check = || -> Result<(Result<Option<f64>>, OtherWork)> {
+            let during = Foreign::start(&browser);
+            let speed = validity::speed_check(&page)?;
+            Ok(match engine {
+                WebEngine::Chromium => {
+                    let checked = validity::throttled(speed, baseline);
+                    let other = if checked.is_err() { during.stop(pin, &browser) } else { OtherWork::default() };
+                    (checked, other)
+                }
+                WebEngine::Firefox | WebEngine::Webkit => {
+                    let f = during.stop(pin, &browser);
+                    // Only a check known to have run without other work joins the engine's reference.
+                    let keep = f.foreign.is_some_and(|x| x < BACKGROUND_PCT);
+                    (validity::engine_throttled(engine, pin, speed, keep), f)
+                }
+            })
         };
+        let (mut checked, mut other) = check()?;
+        // A slow check runs once more after the CPUs settle: a burst passes (the page's own work just
+        // after its load, a neighbour on a VM's host, a process that just ended), while throttling
+        // (power, heat, a power plan) lasts. A second slow check refuses the block (`Background`, which
+        // the bench waits out, or `Throttled`); a fast one lets it go on, and the first is said
+        // (`Throttled`, info): never silently.
+        let mut first_slow: Option<String> = None;
+        if let Err(e) = &checked {
+            let first = format!("{}; other work on the target's CPUs {}; busiest processes on the machine: {}", e.message, other.on_cpus(), validity::named_work(&other.busiest, other.steal));
+            progress(format!("  the {side} speed check ran slow ({}): it runs once more after the CPUs settle", e.message));
+            validity::wait_quiet(pin, Duration::from_secs(10));
+            std::thread::sleep(Duration::from_secs(2));
+            (checked, other) = check()?;
+            first_slow = Some(first);
+        }
         let ratio = match checked {
-            // A slow check while other work kept the target's CPUs busy (the browser's own processes
-            // not counted) is that work's doing, as for a native block: `Background`, which the bench
-            // waits out, not `Throttled`.
             Err(e) => {
-                let (foreign, busiest) = loaded.or_else(|| during.map(|d| d.stop(ctx.pin, &browser))).unwrap_or_default();
-                let who = busiest.iter().map(|(n, p)| format!("{n} {p:.0}%")).collect::<Vec<_>>().join(", ");
-                return Err(match foreign {
-                    Some(f) if f >= BACKGROUND_PCT => {
-                        Refusal::new(ValidatorId::Background, format!("the speed check ran slow while other work kept the target's CPUs {f:.0}% of a core busy ({})", e.message))
-                            .detail(format!("busiest processes on the machine (% of a core): {}", if who.is_empty() { "none named (system work)" } else { &who }))
-                            .fix("let that work finish (an antivirus scanning new files, an update, a build), or exclude it from the bench's CPUs")
-                            .into()
-                    }
-                    // Too little other work to be the cause (or none readable), but named, so a reader can tell.
-                    _ => match e.refusal {
-                        Some(r) => {
-                            let on_cpus = foreign.map_or("could not be read".to_string(), |f| format!("{f:.0}% of a core"));
-                            let busiest = if who.is_empty() { "nothing outside strobe".to_string() } else { format!("busiest processes on the machine (% of a core): {who}") };
-                            (*r).detail(format!("other work on the target's CPUs meanwhile: {on_cpus}; {busiest}")).into()
-                        }
-                        None => e,
-                    },
-                });
+                let again = first_slow.as_ref().map(|f| format!("; slow twice, the second time after the CPUs settled (the first: {f})")).unwrap_or_default();
+                return Err(slow_check(e, &other, &again));
             }
             Ok(r) => r,
         };
@@ -5076,8 +5198,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 
         let run_timeout = s.run_timeout();
         let perf = x.counters.then(probe::wakes::Perf::new);
-        // `profile`: a measured run of a Chromium attribution block; `last`: the last of them.
-        let mut run_once = |key: &str, profile: bool, last: bool| -> Result<Run> {
+        // An attribution block's last reset, run after its census and heap snapshot.
+        let deferred = Cell::new(false);
+        // `profile`: a measured run of a Chromium attribution block; `last`: the last of them; `memory`:
+        // read the processes' memory at its end (it may be the last measured run).
+        let mut run_once = |key: &str, profile: bool, last: bool, memory: bool| -> Result<Run> {
             let began = Instant::now();
             // As a native app is before each run (`front_page`).
             if cfg!(target_os = "macos") && (s.sides.is_some() || s.cross_engine) {
@@ -5240,7 +5365,20 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if same.on() {
                 read_same(journey::When::Run)?;
             }
-            if s.reset {
+            // What the run left, before the reset can leave the page: the page's own counts every run,
+            // the processes' memory only where this run may be the last measured one (`may_end`).
+            let procs = if memory { browser.processes() } else { Vec::new() };
+            let end = RunEnd {
+                heap_mb: page.cdp().and_then(|p| p.send("Runtime.getHeapUsage", json!({})).ok()).and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0)),
+                nodes: driver.nodes().ok(),
+                private_mb: memory.then(|| procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0)),
+                pss: memory.then(|| host::pss_bytes(&procs.iter().map(|p| p.pid).collect::<Vec<_>>())).flatten(),
+            };
+            // An attribution block's last run keeps what it left for the census and the heap snapshot
+            // after the runs (taken once the trace stops): its reset runs after them (`deferred`).
+            if s.reset && last {
+                deferred.set(true);
+            } else if s.reset {
                 if let Some(os) = driver.os.get() {
                     os.begin(&page)?;
                 }
@@ -5285,7 +5423,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let counted = probe::wakes::counted(&k0, &k1);
             let work = cpu * wall / 1e6 / 100.0;
             let task = c1[0] + carry[0] - c0[0] - gap.1[0];
-            Ok(Run { ms: wall / 1e6, cpu, cpu_whole, task, work, parts, roles, t0, t1, timed, total: began.elapsed().as_secs_f64() * 1e3, input, counted, reads })
+            Ok(Run { ms: wall / 1e6, cpu, cpu_whole, task, work, parts, roles, t0, t1, timed, total: began.elapsed().as_secs_f64() * 1e3, input, counted, reads, end })
         };
         // Warm until two consecutive runs do the same main-thread work (within 5%); both of them count
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
@@ -5311,7 +5449,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // view of the recording counts it.
             let unmeasured = warmup.first().is_some() && i >= warmup.measured().end;
             let key = if unmeasured { format!("warm:{i}") } else { format!("run:{i}") };
-            runs.push(run_once(&key, profile, profile && i + 1 == warmup.measured().end)?);
+            runs.push(run_once(&key, profile, profile && i + 1 == warmup.measured().end, set != Set::Memory && warmup.may_end(i))?);
             if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N. Firefox
                 // takes about:memory's after its own GC and CC, and no heap snapshot.
@@ -5359,6 +5497,17 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
         }
         starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
+        // A block whose first speed check ran slow is accepted only if the check holds at speed right
+        // after its measured runs too (no wait): a slowdown that came back over the runs refuses it.
+        if let Some(first) = &first_slow {
+            match check()? {
+                (Err(e), other) => return Err(slow_check(e, &other, &format!("; right after the measured runs, after a first slow check ({first}) and a second at speed once the CPUs settled"))),
+                (Ok(_), _) => ctx.warnings.push(validity::info(
+                    "Throttled",
+                    format!("{} · {side} block: the first speed check ran slow ({first}); the second, after the CPUs settled, and a third right after the measured runs ran at speed, so the block went on", s.label()),
+                )),
+            }
+        }
         let mut stopped = video.take().map(super::video::Recorder::stop);
         let unsteady = warmup.unsteady();
         let first = warmup.first().unwrap_or(0);
@@ -5407,13 +5556,20 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             front_page(s, &browser)?;
         }
         browser.own()?;
-        let private_mb = browser.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
-        let pss = host::pss_bytes(&browser.processes().iter().map(|p| p.pid).collect::<Vec<_>>());
+        // The processes' memory as the last measured run left it, before its reset; a leak run's after
+        // its runs (it reads between them, after each reset).
+        let (private_mb, pss) = match measured.last().and_then(|r| r.end.private_mb.map(|m| (m, r.end.pss))) {
+            Some(read) => read,
+            None if set == Set::Memory => {
+                let procs = browser.processes();
+                (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&procs.iter().map(|p| p.pid).collect::<Vec<_>>()))
+            }
+            // Never a reading from after the reset in its place: no value.
+            None => (0.0, None),
+        };
         // What the page had to draw in: its viewport in CSS pixels (device-independent at zoom 1) and
         // its scale, compared with the other side's content area (`admit_window`).
         let content = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
-        let heap_mb = page.cdp().and_then(|p| p.send("Runtime.getHeapUsage", json!({})).ok()).and_then(|h| h["usedSize"].as_f64()).map(|b| b / (1024.0 * 1024.0));
-        let dom_nodes = driver.nodes().ok();
         // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
         let presents = presents.map(|r| r.and_then(|_| presents_rc.borrow_mut().take().ok_or_else(|| Error::msg("the present capture ended early"))).and_then(|c| c.stop()));
         let dir = match (&draft, keep) {
@@ -5481,6 +5637,24 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             lap("heap");
         }
+        // The attribution block's last reset, deferred past its census and heap snapshot, so the end
+        // screen, the servers and the page are where every other block leaves them.
+        if deferred.get() {
+            if let Some(os) = driver.os.get() {
+                os.begin(&page)?;
+            }
+            ctx.runner
+                .call("reset", json!({ "case": s.case }), run_timeout, &serve)
+                .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
+            driver.release_all()?;
+            if let Some(os) = driver.os.get() {
+                os.delivered(&page)?;
+                os.placed(&page, "reset")?;
+            }
+            if same.on() {
+                read_same(journey::When::Reset)?;
+            }
+        }
         // What the page showed after the runs, once the trace and profilers have stopped.
         let end = shown::page(ctx, s, v, pair, "end", &page);
         shown::expect(&s.expect, &end, "after the runs", true, &|sel| shown::page_shows(&page, sel))?;
@@ -5547,6 +5721,14 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
         extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.0 as f64)).collect());
         extra.insert("driver.read_ms".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.1)).collect());
+        // The page as each measured run left it (`RunEnd`), the median over the runs.
+        let heap: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.heap_mb?))).collect();
+        let dom: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.nodes? as f64))).collect();
+        for (metric, per_run) in [("js.heap.used", heap), ("dom.nodes", dom)] {
+            if !per_run.is_empty() {
+                extra.insert(metric.to_string(), per_run);
+            }
+        }
         let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
         let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
         extra.extend(counts);
@@ -5627,12 +5809,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         }
         if let Some(v) = vram {
             values.insert("gpu.vram".into(), v);
-        }
-        if let Some(h) = heap_mb {
-            values.insert("js.heap.used".into(), h);
-        }
-        if let Some(n) = dom_nodes {
-            values.insert("dom.nodes".into(), n as f64);
         }
         if !foreign.is_empty() {
             values.insert("cpu.foreign".into(), metrics::median(&foreign));
@@ -7941,6 +8117,12 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
         out += "  ! some blocks ran on a locked screen and the rest unlocked: their values do not compare\n";
     }
     out += &warnings_text(s["warnings"].as_array().into_iter().flatten());
+    if let Some(rec) = s["attribution"]["head"].as_str() {
+        out += &format!("\nwhy    attribution block: head {rec}\n       strobe query {rec} {}\n", why_view(&s["target_kind"]));
+        if let Some(at) = sampled(&s["attribution_sampling"]["head"]) {
+            out += &format!("       JavaScript {at}\n");
+        }
+    }
     out + "\n"
 }
 

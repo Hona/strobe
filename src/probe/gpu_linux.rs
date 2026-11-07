@@ -101,9 +101,34 @@ pub struct Kmt {
     pub unreadable: Vec<u32>,
 }
 
+/// The cards (`luid`s, as `adapters` names them) whose device also has a render node
+/// (`/sys/class/drm/renderD*`), matched by the device's canonical path: only those run a process's
+/// GPU work. A display-only device (a virtual machine's framebuffer such as bochs-drm or hyperv_drm,
+/// simpledrm) has a card and no render node, and prints no engine time; vgem has a render node and
+/// no GPU behind it.
+fn rendering_cards() -> Vec<u64> {
+    let entries: Vec<(String, std::path::PathBuf)> = std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_string_lossy().to_string(), std::fs::canonicalize(e.path().join("device")).ok()?)))
+        .collect();
+    let driver = |dev: &std::path::Path| std::fs::read_link(dev.join("driver")).ok().and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string())).unwrap_or_default();
+    let renders: Vec<&std::path::PathBuf> = entries.iter().filter(|(n, d)| n.starts_with("renderD") && driver(d) != "vgem").map(|(_, d)| d).collect();
+    entries
+        .iter()
+        .filter(|(n, d)| n.starts_with("card") && !n.contains('-') && renders.contains(&d))
+        .filter_map(|(_, d)| d.file_name().map(|f| pci_id(&f.to_string_lossy())))
+        .collect()
+}
+
 impl Kmt {
+    /// None without a device that renders: nothing to read, and listing every process's file
+    /// descriptors each second for DRM files cost the OS sampler about 0.2% of a core on vps, whose
+    /// only device is a display-only one.
     pub fn new(adapters: &[Adapter], names: &mut Vec<String>) -> Option<Kmt> {
-        if adapters.is_empty() {
+        let rendering = rendering_cards();
+        if !adapters.iter().any(|a| rendering.contains(&a.luid)) {
             return None;
         }
         let mut map = HashMap::new();

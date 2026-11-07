@@ -571,6 +571,29 @@ pub fn idle_cycles(out: &mut Vec<u64>) -> bool {
     }
 }
 
+/// The resolution of Linux's idle counters (`/proc/stat` counts in `USER_HZ` ticks, 100 a second):
+/// a CPU's idle time over a short span is off by up to one.
+pub const IDLE_TICK_NS: u64 = 10_000_000;
+
+/// Hypervisor steal so far per logical CPU, in ns: a Linux guest reads it (`/proc/stat`); false on
+/// bare metal and on other OSes, where a hypervisor's time away shows as nothing a guest can read.
+pub fn steal_ns(out: &mut Vec<u64>) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        static GUEST: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*GUEST.get_or_init(|| linux::virtual_machine().is_some()) {
+            out.clear();
+            return false;
+        }
+        linux::steal_ns(out)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        out.clear();
+        false
+    }
+}
+
 /// A clock in the unit of `ProcInfo::cycles`. Windows: the performance counter times the kernel's
 /// cycle factor, or the time stamp counter where the kernel charges raw TSC cycles (x64); None where
 /// its cycles are not time (`cycles_refused`, `cycle_clock`). ns elsewhere.
@@ -671,6 +694,31 @@ pub fn process_set(root: u32, home: Option<&Path>) -> Vec<ProcTimes> {
     set.retain(|p| p.pid != me || root == me);
     set.sort_by_key(|p| p.pid);
     set
+}
+
+/// The pids of `process_set`, sorted, for a reader that needs no more (the OS sampler's re-read of a
+/// target's set). On Linux it reads only the stat lines: `process_set` also reads each process's
+/// `smaps_rollup` for its private memory, which for a browser's dozen processes cost the sampler
+/// about 20 ms a re-read on vps.
+pub fn process_set_pids(root: u32, home: Option<&Path>) -> Vec<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let roots = |list: &[(u32, u32, u64)]| -> Vec<u32> {
+            let more = match home {
+                Some(h) => spawn::pids_in(list, h).into_iter().chain(spawn::group_pids(h)).collect(),
+                None => Vec::new(),
+            };
+            std::iter::once(root).chain(more).filter(|&r| r != 0).collect()
+        };
+        let me = std::process::id();
+        let mut set: Vec<u32> = linux::tree_pids_of(&roots).into_iter().filter(|&p| p != me || root == me).collect();
+        set.sort_unstable();
+        set
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        process_set(root, home).into_iter().map(|p| p.pid).collect()
+    }
 }
 
 /// One group of logical CPUs that shares an L3 cache (a CCD on Ryzen).

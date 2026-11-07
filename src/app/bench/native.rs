@@ -124,6 +124,10 @@ struct Run {
     t0: u64,
     t1: u64,
     total: f64,
+    /// The processes' memory as the run left it, before its reset (SPEC §9.6): private bytes (MB),
+    /// PSS (bytes) and what holds it. Read for a run that may be the last measured one
+    /// (`Warmup::may_end`), never in a leak run (which reads between its runs).
+    end: Option<(f64, Option<u64>, memory::Reading)>,
 }
 
 /// `Unattributed` (macOS, SPEC §13.2): a launch of an app bundle that did not become its own
@@ -526,6 +530,7 @@ fn runs(
             t0,
             t1,
             total: 0.0,
+            end: None,
         });
         // The last measured input's change: an app may announce it after the run's `until` (a read).
         if let Some(se) = drive.session.get() {
@@ -541,6 +546,12 @@ fn runs(
         // A key or button the run left held would be down in the next one.
         if let Some(se) = drive.session.get() {
             se.release_all();
+        }
+        // What the run left, before the reset can release it.
+        if !leak && warmup.may_end(i) {
+            let procs = n.processes();
+            let private_mb = procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+            runs[i].end = Some((private_mb, host::pss_bytes(&n.pids()), memory::Reading::take(&procs, "at the end of the last measured run, before its reset")));
         }
         if s.reset {
             ctx.runner
@@ -801,17 +812,25 @@ fn runs(
             );
         }
     }
-    let private_mb = n.processes().iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
-    if private_mb > 0.0 {
-        values.insert("memory.app.private".into(), private_mb);
+    // The memory the last measured run left, read before its reset (a leak run reads it between its
+    // runs): private bytes, PSS and what holds them (host, GPU, files, images).
+    // Never a reading from after the reset in its place: no value.
+    let end = match measured.last().and_then(|r| r.end.clone()) {
+        Some((m, p, r)) => (m, p, Some(r)),
+        None if leak => {
+            let procs = n.processes();
+            (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&n.pids()), None)
+        }
+        None => (0.0, None, None),
+    };
+    if end.0 > 0.0 {
+        values.insert("memory.app.private".into(), end.0);
     }
-    if let Some(b) = host::pss_bytes(&n.pids()) {
+    if let Some(b) = end.1 {
         values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
     }
-    // What holds that memory (host, GPU, files, images), read after the runs; a leak run read it
-    // between them.
-    if !leak {
-        readings.push(memory::Reading::take(&n.processes(), "after the runs"));
+    if let Some(r) = end.2 {
+        readings.push(r);
     }
     if let Some(r) = readings.last() {
         values.extend(r.values().into_iter().map(|(k, x)| (k.to_string(), x)));

@@ -324,6 +324,7 @@ export default bench({
 ### Case lifecycle
 
 - `reset` puts state back between runs and is never measured.
+  - What a run leaves is read before its reset: `dom.nodes` and `js.heap.used` at the end of each run (median), `memory.app.*` at the end of the last measured one. A load case that resets to `about:blank` reports the loaded page.
 - Waits inside a run that are not the journey: `await ctx.untimed(() => page.idle())` between two clicks.
   - Its time, the target's CPU in it (`cpu.*`, `ui.*`, `io.*`, `main.*`), its frames, counts and inputs sent in it leave the run's numbers.
   - An input just before it still counts: its frame may come during the wait.
@@ -432,7 +433,11 @@ export default bench({
 - Several benches on one device take turns per block: one waiting for an unlock or building holds nothing, so locked-session series of another bench run meanwhile.
   - `strobe status` lists every bench and what it waits for.
 - `Throttled` means the speed check stayed slow on quiet CPUs.
+  - A page's slow check runs once more after the CPUs settle; a second slow one refuses. A fast one lets the runs go on, and one more check right after them must be at speed too (then a `Throttled` note; slow refuses).
+  - The busiest processes include the bench's own (`the bench's`: the runner, the servers strobe started). With none named, a Linux VM names the hypervisor's steal from 0.5% (`hypervisor steal 37% of those CPUs during the check`); otherwise `system work`.
+  - On Linux the other work during a short check carries `±N%`: idle time is counted in 10 ms ticks.
 - `Background` (refusing) names the process that kept the target's CPUs busy (an antivirus scanning new files, an update).
+  - A bench waits it out (headless pages and windowless apps too) before it refuses.
 
 ### Builds and launches
 
@@ -551,6 +556,7 @@ Fewer than 6 pairs never gets a verdict.
   - `LiveChannel`: that Safari is running; quit it or install Safari Technology Preview.
   - Refused there (`EngineUnsupported`): `main.*`, `net.*`, `input.rate`, `ctx.mock`, clicks in WPE headless (it drops pointer input; keys and scrolling work), and `count.*`, `canvas.*`, `interaction.*` of a run that loads a page (no preload in WebDriver Classic: keep runs on one page).
 - `--blocks N` times one build alone (what `track` records).
+  - `--why always` adds one attribution block of head per series after its timed blocks; `strobe query <exp> hotspots` reads it (a timed block's recording has no profile).
 
 ### `strobe.json`
 

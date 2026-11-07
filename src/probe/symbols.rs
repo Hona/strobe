@@ -1,12 +1,16 @@
 //! Original names and locations for profile frames, from the page's own source maps (SPEC §8.3).
 //!
 //! A production bundle profiles as minified names in hashed chunks (`go` in `file-oSEU8O4T.js`). Right
-//! after an attribution block's profilers stop, while the target still serves its scripts, strobe asks
-//! the page to fetch each profiled script's source map (so it works for http and for an Electron app's
-//! custom protocol alike) and stores the maps in the recording (`maps/index.json` and gzip files). Any
-//! view can then turn any frame (CPU samples, allocation sites, layout stacks) into its original name,
-//! the absolute file on disk, line and column. Complete over short: displays may abbreviate, records
-//! do not.
+//! after an attribution block's profilers stop, while the target still serves its scripts, strobe reads
+//! each profiled script and its source map itself: an http(s) or file script from its server (the map
+//! from the served folder on disk when strobe serves it and the script there is the one served), so the
+//! page's own address (about:blank after a reset) never matters; a script on an app's custom protocol
+//! through the page. It stores the maps in the recording (`maps/index.json` and gzip files). Any view
+//! can then turn any frame (CPU samples, allocation sites, layout stacks) into its original name, the
+//! absolute file on disk, line and column. Complete over short: displays may abbreviate, records do
+//! not.
+
+mod fetch;
 
 use crate::model::Result;
 use crate::target::web::WebPage;
@@ -37,38 +41,69 @@ pub fn urls(profile: &Value, out: &mut BTreeSet<String>) {
 /// Saves the source maps of every script the page has run, and of `scripts` (profile URLs), into
 /// `dir/maps/`, with each script's function ranges: a stack frame that is a call site (layout and style
 /// stacks in the trace) is then named after the function containing it, not the identifier at the
-/// call. `served` is the folder the page's http origin serves (a web build's output); with it, original
-/// sources resolve to files on disk. Returns how many maps were stored.
+/// call. `served` is the folder the page's http origin serves (a web build's output); with it, a map
+/// the server keeps to itself is read there, and original sources resolve to files on disk. Returns how
+/// many maps were stored.
 pub fn store_maps(page: &WebPage, scripts: &BTreeSet<String>, dir: &Path, served: Option<&Path>) -> Result<usize> {
-    let maps = dir.join("maps");
-    std::fs::create_dir_all(&maps)?;
-    // V8's own function ranges per script (UTF-16 offsets), without starting anything that would change
-    // how the page runs. Firefox's frames carry their function's start, so they need none.
-    let coverage = match page.cdp() {
-        Some(p) => {
-            p.send("Profiler.enable", json!({}))?;
-            p.send_timeout("Profiler.getBestEffortCoverage", json!({}), Duration::from_secs(60)).unwrap_or(Value::Null)
-        }
-        None => Value::Null,
-    };
-    let mut ranges: BTreeMap<String, Vec<(i64, i64, String)>> = BTreeMap::new();
-    for s in coverage["result"].as_array().into_iter().flatten() {
-        let Some(url) = s["url"].as_str().filter(|u| !u.is_empty()) else { continue };
-        let fns = ranges.entry(url.to_string()).or_default();
-        for f in s["functions"].as_array().into_iter().flatten() {
-            let r = &f["ranges"][0];
-            if let (Some(a), Some(b)) = (r["startOffset"].as_i64(), r["endOffset"].as_i64()) {
-                fns.push((a, b, f["functionName"].as_str().unwrap_or("").to_string()));
+    store_maps_with(page, scripts, Ranges::take(page)?, dir, served)
+}
+
+/// V8's own function ranges per script (UTF-16 offsets, minified names), read without starting anything
+/// that would change how the page runs. Only the scripts the page holds when they are read: a block reads
+/// them before a reset leaves the page (about:blank holds none). Firefox's frames carry their function's
+/// start, so a Firefox page has none.
+#[derive(Default)]
+pub struct Ranges(BTreeMap<String, Vec<(i64, i64, String)>>);
+
+impl Ranges {
+    pub fn take(page: &WebPage) -> Result<Ranges> {
+        let Some(p) = page.cdp() else { return Ok(Ranges::default()) };
+        p.send("Profiler.enable", json!({}))?;
+        let coverage = p.send_timeout("Profiler.getBestEffortCoverage", json!({}), Duration::from_secs(60)).unwrap_or(Value::Null);
+        let mut ranges = Ranges::default();
+        for s in coverage["result"].as_array().into_iter().flatten() {
+            let Some(url) = s["url"].as_str().filter(|u| !u.is_empty()) else { continue };
+            let fns = ranges.0.entry(url.to_string()).or_default();
+            for f in s["functions"].as_array().into_iter().flatten() {
+                let r = &f["ranges"][0];
+                if let (Some(a), Some(b)) = (r["startOffset"].as_i64(), r["endOffset"].as_i64()) {
+                    fns.push((a, b, f["functionName"].as_str().unwrap_or("").to_string()));
+                }
             }
         }
+        Ok(ranges)
     }
-    let all: BTreeSet<String> = scripts.iter().cloned().chain(ranges.keys().filter(|u| !u.starts_with("chrome") && !u.starts_with("devtools")).cloned()).collect();
+
+    /// Another reading's ranges too (each document of a block that loads pages holds its own scripts).
+    pub fn merge(&mut self, other: Ranges) {
+        for (url, fns) in other.0 {
+            self.0.entry(url).or_default().extend(fns);
+        }
+    }
+}
+
+/// `store_maps` with function ranges read earlier (`Ranges::take`, before the page left its scripts).
+pub fn store_maps_with(page: &WebPage, scripts: &BTreeSet<String>, ranges: Ranges, dir: &Path, served: Option<&Path>) -> Result<usize> {
+    let maps = dir.join("maps");
+    std::fs::create_dir_all(&maps)?;
+    let mut ranges = ranges.0;
+    // Scripts by address only: a script named by its `sourceURL` alone (strobe's own `strobe-driver.js`) has
+    // no address to read it from.
+    let all: BTreeSet<String> = scripts.iter().chain(ranges.keys()).filter(|u| u.contains(':') && !u.starts_with("chrome") && !u.starts_with("devtools")).cloned().collect();
     let mut index = Map::new();
     let all: Vec<&String> = all.iter().collect();
-    // The page fetches 16 scripts and their maps at a time: one round trip per batch, not per script.
-    let fetched: Vec<(usize, &String, Fetched)> =
-        all.chunks(16).enumerate().flat_map(|(b, urls)| fetch_maps(page, urls).into_iter().enumerate().filter_map(move |(j, f)| Some((b * 16 + j, f?)))).map(|(i, f)| (i, all[i], f)).collect();
-    for (i, url, fetched) in fetched {
+    // strobe reads an http(s) or file script itself, so the page's own address never matters; a custom
+    // protocol's (an app's), and one its server refused strobe, through the page, which fetches 16 scripts
+    // and their maps at a time: one round trip per batch, not per script.
+    let mut read: Vec<Option<Option<Fetched>>> = fetch::read_maps(&all, served, file_page(page));
+    let through_page: Vec<usize> = (0..all.len()).filter(|i| read[*i].is_none()).collect();
+    for batch in through_page.chunks(16) {
+        let urls: Vec<&String> = batch.iter().map(|i| all[*i]).collect();
+        for (i, f) in batch.iter().zip(fetch_maps(page, &urls)) {
+            read[*i] = Some(f);
+        }
+    }
+    for (i, (url, fetched)) in all.iter().copied().zip(read).enumerate().filter_map(|(i, (u, f))| Some((i, (u, f.flatten()?)))) {
         let file = format!("maps/{i}.map.gz");
         write_gz(&dir.join(&file), fetched.text.as_bytes())?;
         let mut fns = ranges.remove(url).unwrap_or_default();
@@ -77,13 +112,38 @@ pub fn store_maps(page: &WebPage, scripts: &BTreeSet<String>, dir: &Path, served
         let scopes = format!("maps/{i}.scopes.json.gz");
         let body = json!({ "lines": fetched.lines, "functions": fns.iter().map(|(a, b, n)| json!([a, b, n])).collect::<Vec<_>>() });
         write_gz(&dir.join(&scopes), body.to_string().as_bytes())?;
-        // The map's folder on disk: its URL path under the served folder (http origins only).
-        let map_dir = served.zip(url_path(&fetched.url)).map(|(root, p)| root.join(p.trim_start_matches('/'))).and_then(|p| p.parent().map(|d| d.display().to_string()));
+        // The map's folder on disk: its URL path under the served folder (http origins only); an inline
+        // map's is its script's. Without Windows' verbatim prefix (`\\?\`, `\\?\UNC\`), which a canonical
+        // root carries: files show as a person types them.
+        let at = if fetched.url.starts_with("data:") { url.as_str() } else { fetched.url.as_str() };
+        let map_dir = served.zip(url_path(at)).map(|(root, p)| root.join(p.trim_start_matches('/'))).and_then(|p| p.parent().map(|d| plain_path(&d.display().to_string())));
         index.insert(url.clone(), json!({ "map": file, "map_url": fetched.url, "map_dir": map_dir, "scopes": scopes }));
     }
     let n = index.len();
     crate::store::write_json(&maps.join("index.json"), &Value::Object(index))?;
     Ok(n)
+}
+
+/// A Windows path without its verbatim prefix: `\\?\C:\x` → `C:\x`, `\\?\UNC\host\share` → `\\host\share`.
+fn plain_path(p: &str) -> String {
+    match p.strip_prefix(r"\\?\") {
+        Some(r) if r.get(..4).is_some_and(|u| u.eq_ignore_ascii_case(r"UNC\")) => format!(r"\\{}", &r[4..]),
+        Some(r) if r.as_bytes().get(1) == Some(&b':') => r.to_string(),
+        _ => p.to_string(),
+    }
+}
+
+/// Whether the page itself was a file (its history, where the engine keeps one for strobe, else its
+/// address now): only then may strobe read its file scripts. A page on the web names any file it likes in
+/// a `sourceURL`.
+fn file_page(page: &WebPage) -> bool {
+    let file = |u: &str| u.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("file:"));
+    if let Some(p) = page.cdp()
+        && let Ok(h) = p.send("Page.getNavigationHistory", json!({}))
+    {
+        return h["entries"].as_array().into_iter().flatten().any(|e| e["url"].as_str().is_some_and(file));
+    }
+    page.eval("location.href").ok().and_then(|v| v.as_str().map(file)).unwrap_or(false)
 }
 
 fn write_gz(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -112,7 +172,8 @@ fn fetch_maps(page: &WebPage, urls: &[&String]) -> Vec<Option<Fetched>> {
     // Without the comment, a hidden map (STROBE_SOURCEMAP=hidden) sits beside its script as <script>.map.
     const href = m ? new URL(m[1], u).href : u.split(/[?#]/)[0] + '.map'
     const r = await fetch(href)
-    if (!r.ok || (!m && !/^\s*\{{/.test(await r.clone().text()))) return null
+    // A map is a JSON object, never another body (an app's index page for an unknown path).
+    if (!r.ok || !/^\uFEFF?\s*\{{/.test(await r.clone().text())) return null
     const lines = [0]
     for (let i = s.indexOf('\n'); i >= 0; i = s.indexOf('\n', i + 1)) lines.push(i + 1)
     return {{ url: href, text: await r.text(), lines }}

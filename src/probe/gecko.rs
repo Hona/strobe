@@ -217,7 +217,10 @@ fn classify(location: &str) -> Kind {
     if line < 0 {
         return Kind::Label("(evaluated script)".into());
     }
-    Kind::Js { name: name.to_string(), url: url.to_string(), line, column }
+    // strobe's page probe, which Firefox loads as a module named `…#strobe-driver.js` (`driver::install`):
+    // named as Chromium names it, so every view keeps it apart from the page's own scripts.
+    let probe = url.strip_suffix(crate::driver::SOURCE_URL).is_some_and(|u| u.ends_with('#'));
+    Kind::Js { name: name.to_string(), url: if probe { crate::driver::SOURCE_URL.to_string() } else { url.to_string() }, line, column }
 }
 
 /// A label with every URL in it cut to its path (`Reflow http://127.0.0.1:51234/app?x` → `Reflow

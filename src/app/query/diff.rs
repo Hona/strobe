@@ -268,17 +268,14 @@ struct Portable {
 
 impl Portable {
     fn ids(&mut self, stacks: &Stacks) -> Vec<u32> {
-        stacks
-            .frames
-            .iter()
-            .map(|f| {
-                let key = (f.name.clone(), portable_file(f));
-                *self.at.entry(key.clone()).or_insert_with(|| {
-                    self.frames.push(key);
-                    (self.frames.len() - 1) as u32
-                })
-            })
-            .collect()
+        stacks.frames.iter().map(|f| self.key((f.name.clone(), portable_file(f)))).collect()
+    }
+
+    fn key(&mut self, key: (String, String)) -> u32 {
+        *self.at.entry(key.clone()).or_insert_with(|| {
+            self.frames.push(key);
+            (self.frames.len() - 1) as u32
+        })
     }
 }
 
@@ -338,8 +335,12 @@ fn weighted(sides: [Side; 2], kind: Kind, by: &str) -> Weighted {
                 continue;
             }
             let per = wt.w * kind.scale() / runs[s];
+            // strobe's page driver at work: its own rows, as `rank` gives them.
+            let driven = super::Driven::of(&wt.stack, &side.stacks.frames);
             let (name, at) = match by {
+                "function" if driven == Some(super::Driven::Native) => (f.name.clone(), super::VIA_DRIVER.to_string()),
                 "function" => (f.name.clone(), portable_file(f)),
+                _ if driven.is_some() => (driven.map_or("", super::Driven::label).to_string(), String::new()),
                 "file" if !f.file.is_empty() || !f.url.is_empty() => (portable_file(f), String::new()),
                 _ => (super::row_key(f, by, &mut packages), String::new()),
             };
@@ -491,7 +492,9 @@ pub fn series_insights(base: &Rec, head: &Rec, plan_runs: Option<u64>) -> Result
         let floor = if kind == Kind::Alloc { 64.0 * 1024.0 } else { 1.0 };
         // A CPU profile's pseudo-frames, `(program)` and `(garbage collector)`, name no function to change.
         let pseudo = |r: &Row| kind == Kind::Cpu && r.at == "(native)" && r.name.starts_with('(');
-        for row in d.rows.iter().filter(|r| r.delta().abs() >= floor && !d.noise(r) && !pseudo(r)).take(3) {
+        // strobe's page driver moved, not the app: never a mover.
+        let driver = |r: &Row| r.at == super::VIA_DRIVER || r.at.ends_with(crate::driver::SOURCE_URL);
+        for row in d.rows.iter().filter(|r| r.delta().abs() >= floor && !d.noise(r) && !pseudo(r) && !driver(r)).take(3) {
             let at = row.at.rsplit('/').next().unwrap_or("");
             let line = format!("{}: {} {at} {} → {} per run ({})", kind.what(), row.name, kind.show(row.v[0]), kind.show(row.v[1]), kind.signed(row.delta()));
             text += &format!("i {line}\n");
@@ -559,10 +562,14 @@ fn tree<const N: usize>(sides: [Side; N], kind: Kind) -> Value {
                 continue;
             }
             let per = wt.w * kind.scale() / runs[s];
+            // The browser's own work that strobe's driver called is a node of its own, apart from the app's.
+            let via = (super::Driven::of(&wt.stack, &side.stacks.frames) == Some(super::Driven::Native))
+                .then(|| wt.stack.last().map(|&i| portable.key((side.stacks.frames[i as usize].name.clone(), super::VIA_DRIVER.to_string()))))
+                .flatten();
             let mut at = 0;
             nodes[0].v[s] += per;
-            for &i in &wt.stack {
-                let f = ids[i as usize];
+            for (j, &i) in wt.stack.iter().enumerate() {
+                let f = if j + 1 == wt.stack.len() { via.unwrap_or(ids[i as usize]) } else { ids[i as usize] };
                 at = match nodes[at].kids.get(&f) {
                     Some(&k) => k,
                     None => {

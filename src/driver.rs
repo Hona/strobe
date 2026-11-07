@@ -86,11 +86,15 @@ impl Typing {
 /// frame pacer does) and so delay the driver's waits on its own schedule.
 pub const NATIVE_RAF: &str = "window.__strobeRaf ??= window.requestAnimationFrame.bind(window)";
 
+/// The probe's script as a profile names it (`HELPER`'s `sourceURL`).
+pub const SOURCE_URL: &str = "strobe-driver.js";
+
 /// Installed lazily in the page (it disappears on navigation): the one DOM probe every page reader uses (the
 /// driver's selectors and waits, `look`, a block's screen and `expect`), so they agree on what is visible, what a
-/// selector matches and what the headings are. Observers only: nothing polls, except a check per frame while a CSS
-/// animation or transition runs, since those change what is visible without a mutation. Its work during a run (a
-/// wait's checks) is the bench's own and shows in a profile under `strobe-driver.js`, its source URL.
+/// selector matches and what the headings are. Observers only: nothing polls, except a wait's check per frame while
+/// an element it matches is there but hidden and a CSS animation or transition runs, since those change what is
+/// visible without a mutation. Its work during a run (a wait's checks) is the bench's own and shows in a profile
+/// under `strobe-driver.js`, its source URL (`query hotspots` names it `(strobe driver)`).
 pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   const s = {}
   const raf = window.__strobeRaf ?? window.requestAnimationFrame.bind(window)
@@ -194,11 +198,15 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   // its filters, the cheap ones first. With a text, only the innermost visible matches count: every ancestor's text
   // holds it too, and a hidden descendant's (an icon's title, a screen-reader label) must not hide the element. It
   // runs on the page's main thread inside a run whenever a wait checks, so without a text it stops at the match it
-  // needs and measures the layout of no element past it.
-  s.find = (q) => {
+  // needs and measures the layout of no element past it. `{ el, near }`: the element (or null), and whether any
+  // element matched in the DOM, shown or not (only then can one show without a mutation).
+  const pick = (q) => {
     const bare = q.css == null && q.role == null && q.text != null
     const all = bare ? holders(q.text, q.exact) : query(document, (q.css ?? "*").split(">>>").map((p) => p.trim()))
     const found = all.filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact))
+    return { el: found.length ? shownOf(q, found, bare) : null, near: found.length > 0 }
+  }
+  const shownOf = (q, found, bare) => {
     // A negative index counts from the last match (-1): the walk goes backwards and stops there too.
     let left = q.index ?? 0
     if (q.text == null) {
@@ -305,42 +313,56 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     }
     return { ...box, scrolled, x: null, y: null, covered: name(cover) }
   }
-  // Re-checked on every DOM change and every focus change: focus moves without a mutation, so a
-  // `:focus` selector would otherwise never resolve.
   // The page's time in strobe's element lookups (`driver.read_ms`): what a read costs its main thread,
   // never the time a wait spends waiting for the page.
   s.spent = 0
-  const lookup = s.find
-  s.find = (q) => { const t = performance.now(); try { return lookup(q) } finally { s.spent += performance.now() - t } }
-  // The element, once it shows (`waitFor` without the element).
+  const timed = (q) => { const t = performance.now(); try { return pick(q) } finally { s.spent += performance.now() - t } }
+  s.find = (q) => timed(q).el
+  const caf = window.cancelAnimationFrame.bind(window)
+  // The element, once it shows (`waitFor` without the element). Checked at once, then at most once a frame after a
+  // change that could show it: the DOM, focus (it moves without a mutation, so a `:focus` selector would otherwise
+  // never resolve), an animation or transition starting or ending, a scroll, a resize. The check runs after the
+  // frame has rendered (a task posted from its animation callback), so the boxes it reads are the ones the frame
+  // laid out and it forces no layout of the page's own; a page that draws no frames (hidden) is checked 50 ms after
+  // the change instead. While an element it matches is there but hidden and an animation or transition runs, it
+  // checks each frame: a fade in (opacity from 0) shows an element on a frame, not on a mutation.
   s.waitEl = (q, timeout, label) => new Promise((resolve, reject) => {
-    const now = s.find(q)
-    if (now) return resolve(now)
-    let done = false
+    const first = timed(q)
+    if (first.el) return resolve(first.el)
+    let done = false, queued = false, frame = 0, late = 0
+    const port = new MessageChannel()
     const check = () => {
-      if (done) return
-      const el = s.find(q)
-      if (el) { stop(); clearTimeout(t); resolve(el) }
+      if (done || !queued) return
+      queued = false
+      caf(frame)
+      clearTimeout(late)
+      const r = timed(q)
+      if (r.el) { stop(); resolve(r.el) }
+      else if (r.near && document.getAnimations().some((a) => a.playState === "running" || a.playState === "pending")) soon()
     }
-    // A fade in (opacity from 0) makes an element visible on a frame, not on a mutation: while any animation or
-    // transition runs, check each frame.
-    let ticking = false
-    const tick = () => {
-      check()
-      if (!done && document.getAnimations().some((a) => a.playState === "running")) raf(tick)
-      else ticking = false
+    port.port1.onmessage = check
+    const soon = () => {
+      if (done || queued) return
+      queued = true
+      frame = raf(() => port.port2.postMessage(0))
+      late = setTimeout(check, 50)
     }
-    const animating = () => { if (!ticking && !done) { ticking = true; raf(tick) } }
-    const unwatch = observe(() => { check(); animating() }, { subtree: true, childList: true, attributes: true, characterData: q.text != null })
-    const events = ["focusin", "focusout", "animationstart", "transitionrun"]
-    for (const e of events) document.addEventListener(e, e.startsWith("focus") ? check : animating, true)
+    const unwatch = observe(soon, { subtree: true, childList: true, attributes: true, characterData: q.text != null })
+    const events = ["focusin", "focusout", "animationstart", "animationend", "transitionrun", "transitionend", "scroll"]
+    for (const e of events) document.addEventListener(e, soon, true)
+    window.addEventListener("resize", soon)
     const stop = () => {
       done = true
+      caf(frame)
+      clearTimeout(late)
+      clearTimeout(t)
       unwatch()
-      for (const e of events) document.removeEventListener(e, e.startsWith("focus") ? check : animating, true)
+      for (const e of events) document.removeEventListener(e, soon, true)
+      window.removeEventListener("resize", soon)
+      port.port1.close()
     }
-    animating()
     const t = setTimeout(() => { stop(); reject(new Error("timed out waiting for " + label)) }, timeout)
+    if (first.near) soon()
   })
   s.waitFor = (q, timeout, label) => s.waitEl(q, timeout, label).then(() => true)
   // What a person sees at the top of the page: its title and address, its open dialogs (by their heading), then
@@ -468,6 +490,29 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
 })(), true
 //# sourceURL=strobe-driver.js"#;
 
+/// Firefox's profiles name the script of code its WebDriver evaluates after the document (whatever its
+/// `sourceURL` says, and an `eval` inside after the document too), so there the probe goes in as a module
+/// whose address ends in `#strobe-driver.js` (`probe::gecko` names it the probe's). A page whose policy
+/// refuses that module gets the probe as other engines do.
+const FIREFOX_INSTALL: &str = r##"(async () => {
+  if (window.__strobe) return true
+  const u = URL.createObjectURL(new Blob([SOURCE], { type: "text/javascript" }))
+  try { await import(u + "#" + NAME) } finally { URL.revokeObjectURL(u) }
+  return !!window.__strobe
+})()"##;
+
+/// Installs the probe in the page's document.
+fn install(page: &Page, timeout: Duration) -> Result<()> {
+    if let Page::Firefox(_) = page {
+        // The name first: the probe's own text may hold either word.
+        let module = FIREFOX_INSTALL.replace("NAME", &json!(SOURCE_URL).to_string()).replace("SOURCE", &json!(HELPER).to_string());
+        if page.eval_timeout(&module, timeout).is_ok_and(|v| v == true) {
+            return Ok(());
+        }
+    }
+    page.eval_timeout(HELPER, timeout).map(drop)
+}
+
 /// Evaluates a helper call (`__strobe.…`), installing the helper first only when this document lacks
 /// it (a navigation drops it). Page calls run inside measured runs: sending the whole helper with
 /// each one made the page parse it on its main thread every call.
@@ -475,7 +520,7 @@ fn helped(page: &Page, expr: &str, timeout: Duration) -> Result<Value> {
     match page.eval_timeout(expr, timeout) {
         // V8 and SpiderMonkey say "is not defined", JavaScriptCore "Can't find variable".
         Err(e) if e.message.contains("__strobe is not defined") || e.message.contains("Can't find variable: __strobe") => {
-            page.eval_timeout(HELPER, timeout)?;
+            install(page, timeout)?;
             page.eval_timeout(expr, timeout)
         }
         r => r,
@@ -634,6 +679,10 @@ pub struct Driver {
     /// strobe's looks at the page through the probe since the last `take_reads` (an input's aim, an
     /// `until` or `waitFor` selector; never `idle` or `frame`): `driver.reads`.
     reads: Cell<u64>,
+    /// The last address of a document of the page's own that strobe saw (at each `goto`, before it
+    /// navigates, and between runs): a relative `goto` from a page without one (about:blank after a
+    /// reset, a data: or blob: URL) resolves against it.
+    base: RefCell<Option<String>>,
 }
 
 impl Driver {
@@ -656,14 +705,53 @@ impl Driver {
             refresh: Cell::new(Duration::from_micros(16_667)),
             os: std::cell::OnceCell::new(),
             reads: Cell::new(0),
+            base: RefCell::new(None),
         }
     }
 
+    /// Keeps `at` (the page's location) as the base when it is a document's own hierarchical address.
+    fn saw(&self, at: &str) {
+        let lower = at.to_ascii_lowercase();
+        if lower.contains("://") && !["about:", "data:", "blob:", "javascript:"].iter().any(|s| lower.starts_with(s)) {
+            *self.base.borrow_mut() = Some(at.to_string());
+        }
+    }
+
+    /// Where `goto(to)` goes: the page's location is read first (and kept as the base when it is the
+    /// page's own), so an absolute `to` (about:blank in a reset) leaves the base behind. A relative `to`
+    /// resolves as a link on the page would; from a page without an address of its own, against the base.
+    fn goto_url(&self, to: &str) -> Result<String> {
+        let absolute = to.contains("://") || ["about:", "data:", "blob:", "javascript:"].iter().any(|s| to.get(..s.len()).is_some_and(|p| p.eq_ignore_ascii_case(s)));
+        let at = self.page.eval("location.href");
+        if absolute {
+            if let Ok(at) = at.as_ref().map(|v| v.as_str().unwrap_or("")) {
+                self.saw(at);
+            }
+            return Ok(to.to_string());
+        }
+        let at = at?.as_str().unwrap_or("").to_string();
+        self.saw(&at);
+        let Some(base) = self.base.borrow().clone() else {
+            return Err(Error::usage(format!(
+                "page.goto({to:?}): a relative address on {at} (location.href), which has none to resolve it against, and strobe has seen no address of the page's own yet"
+            ))
+            .hint("give goto an absolute URL: page.goto(new URL(path, ctx.url).href), where ctx.url is the address strobe opened"));
+        };
+        let v = self.page.eval(&format!("(() => {{ try {{ return new URL({}, {}).href }} catch {{ return null }} }})()", json!(to), json!(base)))?;
+        v.as_str()
+            .map(str::to_string)
+            .ok_or_else(|| Error::usage(format!("page.goto({to:?}): no address relative to {base} (the page is at {at})")).hint("give goto an absolute URL: page.goto(new URL(path, ctx.url).href)"))
+    }
+
     /// The reads of the page since the last call, and the page's time in them (ms, its main thread's
-    /// lookups, from the probe): `driver.reads`, `driver.read_ms`. Read between runs, never inside one.
+    /// lookups, from the probe): `driver.reads`, `driver.read_ms`. Read between runs, never inside one;
+    /// the page's location then is kept as the base too.
     pub fn take_reads(&self) -> (u64, f64) {
-        let ms = self.page.eval("(() => { const s = window.__strobe; if (!s) return 0; const v = s.spent ?? 0; s.spent = 0; return v })()").ok().and_then(|v| v.as_f64()).unwrap_or(0.0);
-        (self.reads.replace(0), ms)
+        let v = self.page.eval("(() => { const s = window.__strobe, v = s?.spent ?? 0; if (s) s.spent = 0; return [v, location.href] })()").unwrap_or(Value::Null);
+        if let Some(at) = v[1].as_str() {
+            self.saw(at);
+        }
+        (self.reads.replace(0), v[0].as_f64().unwrap_or(0.0))
     }
 
     /// A look at the page that `driver.reads` counts.
@@ -970,9 +1058,7 @@ impl Driver {
         match call {
             "goto" => {
                 let to = s(0);
-                // Relative paths resolve against the page, like a link would.
-                let url =
-                    if to.contains("://") || to.starts_with("about:") { to } else { self.page.eval(&format!("new URL({}, location.href).href", json!(to)))?.as_str().unwrap_or_default().to_string() };
+                let url = self.goto_url(&to)?;
                 self.page.navigate(&url, self.timeout(&opts(1)))?;
                 self.until(&opts(1))
             }

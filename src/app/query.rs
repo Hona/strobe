@@ -1425,6 +1425,8 @@ pub fn alloc(rec: &Rec, by: &str, top: usize) -> Result<Output> {
 pub struct Forced {
     pub stacks: Stacks,
     totals: [[(u64, f64); 2]; 2],
+    /// [layout, style] that strobe's driver forced (a wait's check reading a box), apart from `totals`.
+    driver: [(u64, f64); 2],
     pub runs: usize,
     runs_text: String,
     /// Call sites located at their function's start: Firefox gave no running line for them.
@@ -1440,6 +1442,7 @@ fn forced(rec: &Rec) -> Result<&Forced> {
         let mut sites: BTreeMap<TraceFrame, u32> = BTreeMap::new();
         let mut stacks = Stacks::default();
         let mut totals = [[(0u64, 0.0f64); 2]; 2];
+        let mut driver = [(0u64, 0.0f64); 2];
         let mut outer_end: BTreeMap<String, i64> = BTreeMap::new();
         let mut at_start = 0u64;
         for row in rows.iter().filter(|r| r.get(1).is_some_and(Option::is_some)) {
@@ -1457,9 +1460,12 @@ fn forced(rec: &Rec) -> Result<&Forced> {
             let stack = trace_stack(&cell(5));
             at_start += stack.first().is_some_and(|f| f.4 > 0 && (f.1, f.2) == (f.4, f.5)) as u64;
             let kind = usize::from(cell(1) == "UpdateLayoutTree");
+            // strobe's driver forced it (a wait's check read a box): never the app's.
+            let by_driver = stack.iter().find(|f| !f.0.is_empty()).is_some_and(|f| f.0 == crate::driver::SOURCE_URL);
             let lifecycle = usize::from(stack.is_empty());
-            totals[lifecycle][kind].0 += 1;
-            totals[lifecycle][kind].1 += dur as f64 / 1e6;
+            let into = if by_driver { &mut driver[kind] } else { &mut totals[lifecycle][kind] };
+            into.0 += 1;
+            into.1 += dur as f64 / 1e6;
             if stack.is_empty() {
                 continue;
             }
@@ -1479,7 +1485,7 @@ fn forced(rec: &Rec) -> Result<&Forced> {
             // Traced, not sampled: each forced layout is counted, with no sampling variance.
             stacks.weights.push(Weight { stack: ids, w: dur as f64 / 1e3, n: 1, var: 0.0 });
         }
-        Ok(Forced { stacks, totals, runs: measured.len(), runs_text: runs_text(measured.len(), &rows), at_start })
+        Ok(Forced { stacks, totals, driver, runs: measured.len(), runs_text: runs_text(measured.len(), &rows), at_start })
     }))
 }
 
@@ -1503,6 +1509,10 @@ pub fn layout(rec: &Rec, top: usize) -> Result<Output> {
     out.json["runs"] = json!(f.runs);
     out.json["forced"] = json!({ "layout": summary(f.totals[0][0]), "style": summary(f.totals[0][1]) });
     out.json["lifecycle"] = json!({ "layout": summary(f.totals[1][0]), "style": summary(f.totals[1][1]) });
+    out.json["driver"] = json!({ "layout": summary(f.driver[0]), "style": summary(f.driver[1]) });
+    if f.driver.iter().any(|d| d.0 > 0) {
+        out.text += &format!("i strobe's driver forced layout {} · style {} (its waits' checks; not in the counts above, its rows say {DRIVER})\n", per_run(f.driver[0]), per_run(f.driver[1]));
+    }
     for r in out.json["rows"].as_array_mut().into_iter().flatten() {
         r["ms"] = json!(r["weight"].as_f64().unwrap_or(0.0) / 1000.0);
     }
@@ -1836,6 +1846,37 @@ fn trace_stack(raw: &str) -> Vec<TraceFrame> {
     frames.into_values().collect()
 }
 
+/// `(strobe driver)`: what strobe's page driver did in the page (a wait's checks), and the browser's own
+/// work it called (a layout its checks measured), apart from the app's.
+pub(crate) const DRIVER: &str = "(strobe driver)";
+/// The browser's own work (a layout, a DOM call) that strobe's page driver called.
+pub(crate) const VIA_DRIVER: &str = "(native, via strobe driver)";
+
+/// What strobe's page driver had to do with a stack (root first): its leaf is the driver's script, or
+/// the browser's own code that the driver's script called (the nearest frame with a script is the
+/// driver's). None: the app's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Driven {
+    Js,
+    Native,
+}
+
+impl Driven {
+    pub(crate) fn of(stack: &[u32], frames: &[Frame]) -> Option<Driven> {
+        let leaf = &frames[*stack.last()? as usize];
+        let nearest = stack.iter().rev().map(|&i| &frames[i as usize]).find(|f| !f.url.is_empty())?;
+        (nearest.url == crate::driver::SOURCE_URL).then_some(if leaf.url.is_empty() { Driven::Native } else { Driven::Js })
+    }
+
+    /// Its row by file or package.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Driven::Js => DRIVER,
+            Driven::Native => VIA_DRIVER,
+        }
+    }
+}
+
 /// The row a leaf frame counts toward by function (its name), file or package.
 fn row_key(f: &Frame, by: &str, packages: &mut BTreeMap<String, String>) -> String {
     match by {
@@ -1866,17 +1907,23 @@ fn rank(stacks: &Stacks, by: &str, top: usize, header: &str, show: impl Fn(f64) 
     let mut lines: BTreeMap<(String, String), BTreeMap<i64, f64>> = BTreeMap::new();
     for Weight { stack, w, n: hits, .. } in &stacks.weights {
         let Some(f) = stack.last().map(|&i| frame(i)) else { continue };
-        if f.mapped {
+        // strobe's page driver at work: its own rows, never a share of the app's scripts.
+        let driven = Driven::of(stack, &stacks.frames);
+        if f.mapped && driven.is_none() {
             mapped += hits;
         }
-        if !f.url.is_empty() {
+        if !f.url.is_empty() && driven.is_none() {
             scripts += hits;
         }
-        let key = row_key(f, by, &mut packages);
+        let key = match driven {
+            Some(d) if by != "function" => d.label().to_string(),
+            _ => row_key(f, by, &mut packages),
+        };
         // A native frame is located at the sampled line: its function's row is the function in its
         // file, and the lines it spent the time on are kept beside it.
         let native = f.package.is_some() && f.line > 0;
         let detail = match by {
+            "function" if driven == Some(Driven::Native) => VIA_DRIVER.to_string(),
             "function" if native => f.file.clone(),
             "function" => f.location(),
             _ => String::new(),

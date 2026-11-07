@@ -6520,6 +6520,25 @@ window's part, 2×108, not the compact 2×96. A 1000×640 page maximized in a ru
 `DisplayTooSmall` before building on vps. Not run: Windows (adais's session is locked; built and
 linted), Safari, a `page.window` second ask past the work area (a window manager that does not clamp).
 
+Many cases per launch (`--check --batch N`, §5.6; 2026-11-07): `run_chunk` (pages), `native::chunk`
+and `script::chunk` run a launch's cases in order, `Launch` carries each case's block or failure,
+and `on_screen` and the slot, fixture and per-block states work on launches (one case is a launch of
+one). `scripts/dev/batch.bench.ts` (40 cases on one headless page: 33 clean ones, two whose reset takes
+back nothing, one that leaves another heading, one that loads `chrome://crash`, one that throws, one
+with `resetCheck: false`) ran 36 passes and the same 4 failures with and without `--batch 10`: on
+adais 155 s against 727 s, on vps 51 s against 144 s. `dirty-check` and `dirty-type` failed
+`ResetIncomplete` naming their own runs, `crash` ended its launch and the next case ran fresh,
+`heading-next` did not run after `heading-left` (its note says why) and passed in a fresh launch, and
+`builds-on` ended its launch. The summary's saving (3.1 min on adais, 66 s on vps) counts only each
+launch's own time, so it is below the wall time saved. `scripts/dev/batch-more.bench.ts` (a script
+host and a windowless native app) passed on adais and vps, its `exits` case failing alone ("the
+process host exited (code 3)"); a file whose setup throws stopped after three launches (exit 1); with
+`--video` one film per launch held a `case` marker per case. On an app's real bench files: its home
+page file (two cases × two params) took 33 s with `--batch 5` against 67 s, two launches (one per
+params value), and its navigation file, whose `prepare` reads `ctx.case`, was refused with exit 2.
+Clippy `-D warnings` clean on Windows, macOS (air) and Linux (vps). Not run: a windowed native app and
+a headed page in a batch (adais's session is locked).
+
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,
 macOS window placement and pixels (they need Accessibility and Screen Recording).

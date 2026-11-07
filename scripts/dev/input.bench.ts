@@ -4,7 +4,7 @@
 // count.touchapi 'ontouchstart' in window. A desktop page target matches the first three and none of the rest,
 // headless too, or strobe refuses the block (DeviceMismatch) before setup. Run with --check, --engine
 // chromium|firefox|webkit, with and without --headless.
-// `--filter "app input"` (Linux, a Chromium at /usr/bin/chromium): the same page in a browser a command starts,
+// `--filter "app input" --head .` (a Chromium at DEV_CHROMIUM, default /usr/bin/chromium): the same page in a browser a command starts,
 // as an app's page: it keeps the machine's input, which the result's `input` records (`none` on a machine
 // without a mouse, with a NoPointer warning).
 import { bench, command, url } from "@hona/strobe"
@@ -29,7 +29,7 @@ const counts = {
 export default bench({
   targets: {
     desktop: url(page),
-    browser: command(`/usr/bin/chromium --headless=new --no-sandbox --remote-debugging-port={port} --user-data-dir={home}/chromium ${page}`),
+    browser: command(`"${process.env.DEV_CHROMIUM ?? "/usr/bin/chromium"}" --headless=new --no-sandbox --remote-debugging-port={port} --user-data-dir={home}/chromium ${page}`),
   },
   async setup({ page }: any) {
     matched = []

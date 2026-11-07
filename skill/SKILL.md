@@ -289,7 +289,7 @@ export default bench({
 
 ### `page`
 
-- `goto`: relative paths resolve against the page.
+- `goto`: relative paths resolve against the page; after a reset to about:blank, against the page's first address.
 - `click`, `hover`, `move(x, y)`.
 - `type`: one key event per character; `delay` ms between.
   - Paced: each key waits until the last one's frame is on the screen and the target rests (one 300 ms budget a key; OS presents where strobe follows them, else the page's own frames), so each is an `interaction.*` sample; a key sent before an earlier key's frame showed is none. Once the target never rests (an animation), the rest of the call goes `delay` apart.
@@ -423,6 +423,8 @@ export default bench({
   - Windows: a CPU set; Linux: each thread's affinity.
   - Processes started during the block follow within 200 ms.
   - `--reserve-cpus off` opts out, `on` does it for `--check` too.
+  - `--pin auto` (the default) picks the target's CPUs: the V-Cache CCD; equal CCDs: the first; a hybrid CPU: its fastest cores; otherwise all but the last 1-2 whole cores, which strobe and the runner get. Fewer than 4 cores, more than 64 CPUs, or macOS: unpinned, and the plan line names the `--pin` list that would pin anyway.
+  - A virtual machine with one L3 and 4 or more cores now pins and reserves under `--pin auto`: no explicit CPU list needed.
   - Elevated processes stay (named in the `ReservedCpus` note, which goes in the PR footer).
   - macOS has no affinity.
 - Several benches on one device take turns per block: one waiting for an unlock or building holds nothing, so locked-session series of another bench run meanwhile.
@@ -524,11 +526,15 @@ export default bench({
 
 Fewer than 6 pairs never gets a verdict.
 
-- Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
+- Validate a new file with `--check` first: each case once, pass or fail with a screenshot. A case with a reset runs once more after it (unmeasured), so a run that cannot start from what the reset leaves fails the check.
+- `NotSteady` says whether the work grew (add a reset, or fix what the reset leaves behind) or only swung from run to run (pin CPUs, quiet the machine, more work per run).
+- A `url()` target loads its address whatever the build: `--base <ref> --head .` on one is refused `VariantMismatch` before anything builds (compare `--base url:<a> --head url:<b>`).
+- `--max-time` gives each series an equal share of the time left when it starts (checked from its first look), so the first cannot spend the rest's.
 - No display (locked, a server)? `--headless` runs page cases (check or timed) with frame and latency metrics refused.
   - Headed on Linux without `DISPLAY`/`WAYLAND_DISPLAY` refuses at once (`NoPresentSource`). `strobe up` calibrates headless there (frame checks skipped).
   - On a software GPU (Xvfb, a VM): CPU metrics stay, frame and GPU metrics are refused (`SoftwareGpu`); a primary among them refuses the series.
-  - Headless `record` adds `produced`: frames the renderer made off its own clock, never shown. Never a frame rate or latency.
+  - Headless, what frames cost the page is `main.paint` (prepaint and paint on the main thread, ms per run) beside `main.style` and `main.layout`. There is no headless frame-time metric: a headless compositor's clock is not a display's.
+- Emulate a device on a page target: `web({ emulate: "mobile" })` (a 390×844 phone at scale 3, headless only, Android user agent, touch) or `"touch"` (a desktop with a touch screen), as `record --emulate`. Checked before `setup` (`DeviceMismatch`); WebKit refuses it; the series' window line says `390×844 @3x · emulated mobile`. Load and launch cases work on a phone; clicks, taps, hovers, drags and scrolls there are refused `EngineUnsupported` (strobe sends no touch input yet), and so are `type`/`press` with an element to click into.
 - Page targets are desktops, headless too: strobe gives the page a fine pointer that hovers and turns touch off (`(hover: hover)`, `(pointer: fine)`, no touch points, no `ontouchstart`, touch screens included), so a site never takes its touch paths in a desktop bench. Checked before `setup`; a page that sees otherwise is refused `DeviceMismatch` (WPE headless on Linux: use `xvfb-run -a` with WebKitGTK, or Chromium/Firefox). No `STROBE_BROWSER` wrapper with hover/pointer `--blink-settings` is needed (strobe's replaces a wrapper's).
   - App pages (Electron, webviews) keep the machine's input; the result's `input` says what they saw (`desktop`, `hybrid`, `touch`, `none`). A page against an app whose pages saw different input is refused `VariantMismatch`.
 - Chromium: `STROBE_BROWSER`, else Chrome/Chromium/Edge, else Playwright's (`PLAYWRIGHT_BROWSERS_PATH` or its cache; Chrome for Testing included).
@@ -546,6 +552,8 @@ Fewer than 6 pairs never gets a verdict.
   - `apps` profiles for Electron, webview and native apps (`kind: "webview" | "native"`, `exe` per OS, `env`, `unset`, `dirs`, `files`, `guard` for the user's own state, `protocols`, `extends`)
 - Strobe itself knows no product.
 - If an isolated launch disturbs the user's state, strobe stops: add what leaked to the profile.
+- The nearest strobe.json upward from the bench file wins (a package's own in a monorepo, else the repository's).
+  - `build.cwd` and `serve.cwd` resolve against the variant's checkout root (the repository root, as a git ref's worktree is), never the folder you named: `--head .` from a subfolder builds the same as from the root.
 - strobe.json takes `//` comments and trailing commas.
 - A key strobe does not read or a value of the wrong type fails (exit 2) with its line and the key it meant.
   - A problem in a profile of your own `<state>/strobe.json` fails only the launch that uses it.
@@ -568,6 +576,8 @@ Fewer than 6 pairs never gets a verdict.
     - Its header (and each attribution block's line, `query <rec> summary`, result `attribution_sampling`) gives the interval the sampler kept, not the one asked: `sampled every 2.0 ms (asked 1 ms: 2.0× coarser)`.
     - Windows keeps about 0.5 ms at best (Chromium asks 0.4 ms there); Firefox 160 and older on Windows 2 ms.
     - Times hold at any interval (each sample weighs its own gap); a function shorter than one gap shows only by chance.
+    - `(strobe driver)` and `(native, via strobe driver)` are strobe's own waits and the layouts they forced, never the app's; over 2% of an attribution block's samples (or a timed block's reads over 2% of a run or 8 a run) warns `ObserverCost`.
+    - A load case's profile covers each measured run whole, its navigation included, never the reset.
   - `query layout` (forced layouts by the call that forced them)
   - `query style` (what invalidated style: the class, attribute, pseudo-class or custom property that changed, the nodes, the selector, the script line)
     - attribution blocks trace it for a series declaring `main.style` or `style.count`, or with `--style`
@@ -578,7 +588,7 @@ Fewer than 6 pairs never gets a verdict.
     - Rows by the size of their change per run, with the stacks it concentrated in.
     - `~` marks a change inside its sampling interval (one launch per side: not a verdict).
     - The HTML report's diff flame shows the same as a call tree.
-  - `main.script`, `main.layout` and `main.style` in the bench result say where main-thread time went, with intervals.
+  - `main.script`, `main.layout`, `main.style` and `main.paint` in the bench result say where main-thread time went, with intervals.
 - **What stands out?** `query <rec or exp> insights`: forced layout, GC pressure, long tasks, work while idle, detached DOM, background load, unresolved time.
   - For an experiment, the biggest base/head movers, each with the command that shows it.
 - **Where is the memory?** `query <rec> memory` (per process; `--by layer` or `--by allocator` for Chromium's own accounting).

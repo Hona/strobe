@@ -412,7 +412,7 @@ fn runs(
     let mut runs: Vec<Run> = Vec::new();
     // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
     // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
-    let mut warmup = super::block::Warmup::new(x);
+    let mut warmup = super::block::Warmup::new(s, x);
     let perf = x.counters.then(wakes::Perf::new);
     let leak = set == Set::Memory;
     let mut readings: Vec<memory::Reading> = Vec::new();
@@ -573,7 +573,8 @@ fn runs(
     for r in &mut runs {
         r.changes = changes.iter().filter(|c| c.0 >= r.t0 && c.0 <= r.window_end).map(|&(at, feedback)| frames::notified(at, feedback)).collect();
     }
-    let (strobe_pct, runner_pct) = cost.share(first);
+    let range = first..warmup.measured().end.clamp(first, runs.len());
+    let (strobe_pct, runner_pct) = cost.share(range.clone());
     let samples = sampler.stop();
     let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
     let presents = presents.borrow_mut().take().map(|c| c.stop());
@@ -592,7 +593,7 @@ fn runs(
         }
         None => None,
     };
-    let measured = &runs[first..];
+    let measured = &runs[range.clone()];
     let key = |j: usize| format!("run:{}", first + j);
     let per_run = |f: &dyn Fn(&Run) -> f64| -> BTreeMap<String, f64> { measured.iter().enumerate().map(|(j, r)| (key(j), f(r))).filter(|(_, x)| x.is_finite()).collect() };
     let gpu_runs: Vec<probe::os::Summary> = measured.iter().map(|r| samples.window(r.t0, r.t1)).collect();
@@ -826,7 +827,7 @@ fn runs(
         values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
     }
     if unsteady {
-        values.insert("warmup.unsteady".into(), 1.0);
+        values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
     }
     // A metric no run gave a number for (an empty per-run map's median) is missing, not a value.
     values.retain(|_, x| x.is_finite());
@@ -887,7 +888,7 @@ fn runs(
         // The video: every run on its time (warmup ones too), the inputs strobe posted, the phases.
         let video = match stopped.take() {
             Some(Ok(st)) => {
-                let filmed: Vec<crate::app::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, i >= first)).collect();
+                let filmed: Vec<crate::app::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, range.contains(&i))).collect();
                 let sent: Vec<crate::app::video::Sent> = runs
                     .iter()
                     .flat_map(|r| &r.log.inputs)
@@ -972,7 +973,7 @@ fn runs(
         client: n.window.as_ref().map(client_of),
         frame: cfg!(target_os = "macos"),
         directions: BTreeMap::new(),
-        same: same.take(first),
+        same: same.take(range.clone()),
         ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
         ..Block::default()
     })
@@ -1542,7 +1543,7 @@ pub(super) fn launch_once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, p
             shown,
             refused,
             process_set: Some(programs(&procs)),
-            same: same.take(0),
+            same: same.take(0..1),
             client: opened.as_ref().map(client_of),
             frame: opened.is_some() && cfg!(target_os = "macos"),
             ..Block::default()

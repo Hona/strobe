@@ -336,11 +336,16 @@ Use
                                   any process from outside: OS present events (frames), CPU, GPU; deep: native stacks
                                   (--os-frames on a Chromium record adds the OS present events beside its trace)
   bench <file.bench.ts> --head <variant> [--base <variant> | --aa | --check | --blocks N] [--filter <cases>] [--pairs auto|N]
-        [--why auto|always|never] [--trace lean|full] [--power high|keep] [--pin auto|none|ccdN|<cpus>]
+        [--why auto|always|never] [--trace lean|full] [--power high|keep]
         [--params k=v,…|all]           (all: every parameter's `more` values too)
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--video]                      (film untimed: the check run, or one warmed run per side after the timed pairs)
+        [--pin auto|none|ccdN|<cpus>]  (auto: the V-Cache CCD; equal CCDs: the first; a hybrid CPU: its fastest cores;
+                                        otherwise all but the last 1-2 whole cores, which strobe and the runner get;
+                                        fewer than 4 cores, more than 64 CPUs, or macOS: unpinned)
+        [--reserve-cpus auto|on|off]   (keep this user's other processes off the target's CPUs: timed blocks, every
+                                        block, or never)
         [--bisect good..bad]           (the commit that moved the primary; one series)
         [--style]                      (attribution blocks also trace what invalidated style: query <rec> style)
         [--noworse 2% | metric=2%,…]   (non-inferiority: is head at most 2% worse? verdicts no worse, worse, unclear)
@@ -404,7 +409,8 @@ Use
   top [--target <pid>] [--once]   live per-core load by CCD, processes with CPU, GPU, VRAM
   run [--pin auto|none|ccdN|<cpus>] [--reserve-cpus on|off] [--power high|keep] -- <command> [args…]
                                   run your own harness as a bench block runs: the bench slot, the fastest power plan,
-                                  pinned to the target's CPUs with other processes kept off them; it prints its own numbers
+                                  pinned to the target's CPUs with other processes kept off them (--pin as for bench);
+                                  it prints its own numbers
   run --base \"<command>\" --head \"<command>\" [--aa] [--check] [--primary cpu.work] [--metrics metric.<name>,…] [--pairs auto|N]
       [--runs 5] [--noworse 2%] [--pin …] [--reserve-cpus auto|on|off] [--power high|keep] [--require-verdict]
                                   a paired A/B of two commands, as a bench (verdicts, report, PR block): each run starts the

@@ -632,7 +632,9 @@ impl Page {
     }
 
     /// What a page takes of `emulation` before anything sizes or loads it (the launch gave it the input
-    /// devices): for a phone, touch points and touch events and a mouse's clicks as taps, and the mobile
+    /// devices): for a phone, touch points and touch events (never the mouse's clicks as taps: with that
+    /// on, `Input.dispatchMouseEvent` got no reply in headless Chromium, and it adds no media query or
+    /// DOM trait a page reads; strobe's pointer input on a phone is refused until it sends touches), and the mobile
     /// user agent with Chrome for Android's client hints (a target's own `user_agent` replaces the string
     /// and sends no hints of a platform it did not name). The phone's viewport flag waits for
     /// `emulate_viewport`, once the window is sized.
@@ -641,7 +643,6 @@ impl Page {
             // A phone's touch points; this also makes its primary pointer coarse (a touch screen's come
             // from the launch's Blink settings instead).
             self.send("Emulation.setTouchEmulationEnabled", json!({ "enabled": true, "maxTouchPoints": TOUCH_POINTS }))?;
-            self.send("Emulation.setEmitTouchEventsForMouse", json!({ "enabled": true, "configuration": "mobile" }))?;
         }
         if let Some(agent) = &emulation.user_agent {
             self.send("Emulation.setUserAgentOverride", json!({ "userAgent": agent }))?;

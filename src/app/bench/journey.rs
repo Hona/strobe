@@ -135,13 +135,15 @@ impl Same {
         Ok(())
     }
 
-    /// The reads, without those of the `first` warmup runs (and their resets): the sides' warmups
-    /// differ in length, their measured runs do not.
-    pub(super) fn take(&self, first: usize) -> BTreeMap<String, Reads> {
+    /// The reads of the `measured` runs (and their resets): not the warmup runs before them, whose
+    /// number the sides do not share, nor a check's unmeasured run after them.
+    pub(super) fn take(&self, measured: std::ops::Range<usize>) -> BTreeMap<String, Reads> {
         let mut out = std::mem::take(&mut *self.reads.borrow_mut());
         for r in out.values_mut() {
-            r.run.drain(..first.min(r.run.len()));
-            r.reset.drain(..first.min(r.reset.len()));
+            for list in [&mut r.run, &mut r.reset] {
+                list.truncate(measured.end);
+                list.drain(..measured.start.min(list.len()));
+            }
         }
         out
     }
@@ -293,7 +295,7 @@ pub(super) fn latency_skew(blocks: &[Block], names: (&str, &str)) -> Vec<(&'stat
 
 /// strobe's reads of a side's page or tree inside its measured runs: per run, and their share of the
 /// run's wall time (medians over its blocks), from each block's `driver.reads` and `driver.read_ms`.
-fn reads_of(blocks: &[Block], role: &str) -> Option<(f64, f64)> {
+pub(super) fn reads_of(blocks: &[Block], role: &str) -> Option<(f64, f64)> {
     let mine: Vec<&Block> = blocks.iter().filter(|b| b.variant == role).collect();
     let per_run: Vec<f64> = mine.iter().filter_map(|b| b.values.get("driver.reads").copied()).collect();
     let share: Vec<f64> = mine.iter().filter_map(|b| Some(b.values.get("driver.read_ms")? / metrics::median(&b.run_ms).max(1e-3))).collect();

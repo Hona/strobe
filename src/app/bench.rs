@@ -89,6 +89,7 @@ const DESCRIPTIVE: &[&str] = &[
     "main.script",
     "main.layout",
     "main.style",
+    "main.paint",
     "layout.count",
     "style.count",
     "scroll.latency.p95",
@@ -539,26 +540,58 @@ struct Block {
 struct BrowserSeen {
     version: String,
     software: bool,
+    /// Its adapter, for the block's own `SoftwareGpu` refusals (`software_state`).
+    #[serde(skip)]
+    gpu: Option<chromium::Gpu>,
 }
 
-/// What a page block's browser is, read once per target and mode (`ctx.browsers`): one file may run a
-/// headless Chromium target and a headed Firefox one. Headed, a software rasterizer refuses the block
-/// (`SoftwareGpu`); headless refuses nothing (frames and GPU use are refused anyway). The first one read
-/// is the experiment's GPU and browser.
-fn browser_seen(ctx: &mut Ctx, s: &Series, headless: bool, browser: &WebBrowser) -> Result<BrowserSeen> {
-    let key = format!("{}{}", s.target, if headless { ":headless" } else { "" });
-    if let Some(b) = ctx.browsers.get(&key) {
-        return Ok(b.clone());
+/// What a page block's browser is, read once per side's target and mode (`ctx.browsers`): one file may
+/// run a headless Chromium target and a headed Firefox one, and an implementation comparison's sides
+/// two. Headed, a software rasterizer refuses only what it drew (`SoftwareGpu` per metric,
+/// `software_state`): with `timed`, a series whose primary is a frame or GPU metric refuses the block
+/// (an attribution or memory block measures no primary), and the rest say once that their CPU holds
+/// the rasterization. Headless refuses nothing here (frames and GPU use are refused anyway). The first
+/// one read is the experiment's GPU and browser.
+fn browser_seen(ctx: &mut Ctx, s: &Series, v: &Variant, headless: bool, timed: bool, browser: &WebBrowser) -> Result<BrowserSeen> {
+    let key = format!("{}{}", v.target_of(s), if headless { ":headless" } else { "" });
+    let seen = match ctx.browsers.get(&key) {
+        Some(b) => b.clone(),
+        None => {
+            let gpu = browser.gpu()?;
+            if !ctx.gpu_checked {
+                ctx.gpu = serde_json::to_value(&gpu)?;
+                ctx.browser_version = browser.version().to_string();
+                ctx.gpu_checked = true;
+            }
+            let b = BrowserSeen { version: browser.version().to_string(), software: gpu.software, gpu: Some(gpu) };
+            ctx.browsers.insert(key, b.clone());
+            b
+        }
+    };
+    if let Some(gpu) = seen.gpu.as_ref().filter(|g| g.software && !headless) {
+        if timed {
+            validity::software_refusals(gpu, false, Some(&s.primary), [])?;
+        }
+        if !ctx.warnings.iter().any(|w| w.id == "SoftwareGpu") {
+            ctx.warnings.push(validity::software_warning(gpu));
+        }
     }
-    let gpu = if headless { browser.gpu()? } else { validity::software_gpu(browser.gpu()?)? };
-    if !ctx.gpu_checked {
-        ctx.gpu = serde_json::to_value(&gpu)?;
-        ctx.browser_version = browser.version().to_string();
-        ctx.gpu_checked = true;
+    Ok(seen)
+}
+
+/// A headed page block drawn by a software rasterizer (`BrowserSeen::software`): its frame and GPU
+/// values go, declared ones refused `SoftwareGpu` (`validity::software_refusals`); CPU, main-thread work,
+/// memory and milestones stay (`browser_seen` warned that the CPU holds the rasterization).
+fn software_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
+    let Some(gpu) = b.browser.as_ref().filter(|br| br.software && !headless_of(ctx, s)).and_then(|br| br.gpu.clone()) else { return b };
+    b.values.retain(|k, _| !validity::software_drawn(k));
+    b.frames.clear();
+    b.intervals.clear();
+    b.phases.clear();
+    for (m, r) in validity::software_refusals(&gpu, false, None, declared_metrics(s).into_iter().map(String::as_str)).unwrap_or_default() {
+        b.refused.insert(m, r);
     }
-    let b = BrowserSeen { version: browser.version().to_string(), software: gpu.software };
-    ctx.browsers.insert(key, b.clone());
-    Ok(b)
+    b
 }
 
 /// The browsers a series' blocks ran, for its result and track's fingerprint (`a / b` when the sides
@@ -933,6 +966,8 @@ struct Ctx<'a> {
     /// The window the last block actually used (a target's viewport overrides the default).
     used: Option<Window>,
     pin: Option<u64>,
+    /// What `--pin` picked and why (`pinning`): the plan's line, and why an unpinned target reserves nothing.
+    pin_label: String,
     gpu_checked: bool,
     gpu: Value,
     /// Each page target's browser by target and headless mode (`BrowserSeen`), checked at its first block.
@@ -1246,10 +1281,10 @@ impl SelfCost {
         self.runs.borrow_mut().push(run);
     }
 
-    /// strobe's and the runner's share of one core over the runs from `first` on.
-    fn share(&self, first: usize) -> (Option<f64>, Option<f64>) {
+    /// strobe's and the runner's share of one core over the measured runs.
+    fn share(&self, measured: std::ops::Range<usize>) -> (Option<f64>, Option<f64>) {
         let runs = self.runs.borrow();
-        let runs = &runs[first.min(runs.len())..];
+        let runs = &runs[measured.start.min(runs.len())..measured.end.min(runs.len())];
         let span: u64 = runs.iter().map(|r| r.0).sum();
         let part = |f: fn(&RunCost) -> Option<u64>| {
             let used: Option<u64> = runs.iter().map(f).sum();
@@ -1414,6 +1449,7 @@ pub fn run(args: &Args) -> Result<Output> {
         window: Window::default(),
         used: None,
         pin,
+        pin_label: pin_label.clone(),
         gpu_checked: false,
         gpu: Value::Null,
         browsers: BTreeMap::new(),
@@ -1492,7 +1528,7 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     ctx.projects = target_projects(&ctx.describe)?;
     ctx.implementations = variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2;
-    check_engines(&mut series, &ctx.describe, args)?;
+    check_engines(&mut series, &ctx.describe, args, &variants)?;
     // A series the display cannot show refuses before anything counts it (journeys, the Holm family).
     let (describe, headless) = (ctx.describe.clone(), ctx.headless);
     display_fit(Some(&mut ctx), &mut series, &describe, headless)?;
@@ -1550,7 +1586,10 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(vm) = &env.virtual_machine {
         ctx.warnings.push(validity::warn("VirtualMachine", format!("running in a virtual machine ({vm}): its timings move with the host's load; prefer bare metal")));
     }
-    ctx.warnings.extend(super::up::calibration_warning(ctx.headless));
+    // Headed runs rely on a calibration that checked frames on a display; a run whose every series is
+    // headless (a target's own `headless` too) or windowless accepts a headless one.
+    let headed = series.iter().filter(|s| s.refused.is_none() && s.gap.is_none()).any(|s| !headless_of(&ctx, s) && !series_windowless(&ctx, s));
+    ctx.warnings.extend(super::up::calibration_warning(!headed));
     preflight(&series, &ctx.describe, &variants, &config, &ctx.projects, ctx.headless)?;
     // The rerun ledger (SPEC §14.2): the other experiments on these two variants, said before anything
     // builds, so rerunning until one says "faster" shows.
@@ -1566,8 +1605,17 @@ pub fn run(args: &Args) -> Result<Output> {
             .filter(|t| matches!(ctx.describe["targets"][*t]["kind"].as_str(), Some("web" | "url")))
             .map(|t| {
                 let target = &ctx.describe["targets"][t];
-                let input = validity::InputClass::Desktop;
-                (t.clone(), json!({ "engine": engine_of(target), "browser": web::browser_identity(engine_of(target), target["headless"] == true), "headless": target["headless"] == true, "input": input }))
+                // The input its page is held to (`validity::emulated_input`), and what it emulates.
+                let input = match target["emulate"].as_str() {
+                    Some("mobile") => validity::InputClass::Touch,
+                    Some(_) => validity::InputClass::Hybrid,
+                    None => validity::InputClass::Desktop,
+                };
+                let mut page = json!({ "engine": engine_of(target), "browser": web::browser_identity(engine_of(target), target["headless"] == true), "headless": target["headless"] == true, "input": input });
+                if !target["emulate"].is_null() {
+                    page["emulate"] = target["emulate"].clone();
+                }
+                (t.clone(), page)
             })
             .collect();
         if !pages.is_empty() {
@@ -1607,7 +1655,9 @@ pub fn run(args: &Args) -> Result<Output> {
     // series done, the pairs of the one running, and the series it never reached.
     let mut halted: Option<Error> = None;
     let mut not_run: Vec<String> = Vec::new();
-    for s in &series {
+    // Series `--max-time` left no time to start.
+    let mut out_of_time: Vec<String> = Vec::new();
+    for (i, s) in series.iter().enumerate() {
         if halted.is_none() && stop_requested() {
             halted = Some(stop_error());
         }
@@ -1644,7 +1694,15 @@ pub fn run(args: &Args) -> Result<Output> {
             })(),
             Mode::Leak => leak_series(&mut ctx, s, &mut variants, &config),
             Mode::Blocks(n) => blocks_series(&mut ctx, s, &mut variants, &config, n),
-            Mode::Compare => run_series(&mut ctx, s, &mut variants, &config, started, max_time),
+            // `--max-time` ran out: no series starts after it.
+            Mode::Compare if max_time.is_some_and(|t| started.elapsed() > t) => {
+                out_of_time.push(s.label());
+                continue;
+            }
+            Mode::Compare => {
+                let remaining = series[i..].iter().filter(|s| s.gap.is_none() && s.refused.is_none() && !ctx.saved["series"][s.label()]["done"].is_object()).count();
+                run_series(&mut ctx, s, &mut variants, &config, started, max_time, remaining)
+            }
         };
         let out = match r {
             Ok(out) => out,
@@ -1693,6 +1751,10 @@ pub fn run(args: &Args) -> Result<Output> {
     }
     if let Some(t) = &ctx.reserved {
         ctx.warnings.push(validity::info("ReservedCpus", t.text()));
+    }
+    if !out_of_time.is_empty() {
+        all_decided = false;
+        ctx.warnings.push(validity::warn("MaxTime", format!("--max-time ran out before these series started; not run: {}", out_of_time.join(", "))));
     }
     for text in variants.iter().flat_map(|v| v.changed.iter()) {
         ctx.warnings.push(validity::warn("VariantChanged", text.clone()));
@@ -1856,6 +1918,7 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     let overhead = r.as_ref().ok().and_then(|b| b.overhead.clone());
     let (same, ops) = r.as_ref().map(|b| (json!(b.same), json!(b.ops))).unwrap_or_default();
     let input = r.as_ref().map(|b| input_of(std::slice::from_ref(b))).unwrap_or(Value::Null);
+    let window = series_window(ctx, s, r.as_ref().map(std::slice::from_ref).unwrap_or_default());
     let (passed, error, hint, values, refused, locked, recording, screen, shown) = match r {
         Ok(b) => {
             let shown = shown::summarize(std::slice::from_ref(&b), false).0;
@@ -1901,13 +1964,16 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
                 progress(format!("  {} attribution  {}", b.variant, steps_text(&b.steps)));
                 let rec = b.recording.as_deref().and_then(|r| super::query::Rec::resolve(r).ok());
                 sampling = json!(attribution_sampling(rec.as_ref(), &b.variant, &mut ctx.warnings));
+                if target["kind"] != "script" && !is_native(&target) {
+                    observer_profile(rec.as_ref(), &s.label(), &mut ctx.warnings);
+                }
                 attribution = json!(b.recording);
             }
             Err(e) => ctx.warnings.push(validity::warn("Attribution", format!("{} attribution block failed: {}", side_of(ctx, v), e.message))),
         }
     }
     let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
-    Ok(json!({
+    let mut out = json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "check", "until": launch::until_of(&s.launch), "primary": { "metric": s.primary }, "declared": declared,
         "passed": passed, "decided": passed, "error": error, "hint": hint, "values": values, "refused": refused, "session_locked": locked, "headless": headless_of(ctx, s), "input": input, "elapsed_ms": elapsed_ms, "attribution": attribution, "attribution_sampling": sampling, "target_kind": target["kind"], "engine": target["engine"],
         "recording": recording, "screen": screen, "shown": shown, "overhead": overhead, "untimed": untimed_of(&[(values["untimed.n"].as_f64(), values["untimed.ms"].as_f64())]),
@@ -1915,7 +1981,9 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         "log": log, "log_path": ctx.runner.log, "actions": actions,
         // For the parity matrix (`journey::matrix`).
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target), "same": same, "ops": ops, "adapted": s.adapted,
-    }))
+    });
+    series_setup(ctx, s, window, &mut out);
+    Ok(out)
 }
 
 /// `seeded`: the experiment's seed, and whether a hook used it.
@@ -1988,9 +2056,11 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
         if s["passed"] == true {
             text += &format!(
-                "pass  {}  {value}  {secs:.1} s{}{}{}\n",
+                "pass  {}  {value}  {secs:.1} s{}{}{}{}\n",
                 s["label"].as_str().unwrap_or(""),
                 s["engine"].as_str().filter(|e| *e != "chromium").map(|e| format!(" · {e}")).unwrap_or_default(),
+                // An emulated device's window says what it was (`390×844 @3x · emulated mobile`).
+                s["window"].as_str().filter(|_| !s["emulate"].is_null()).map(|w| format!(" · {w}")).unwrap_or_default(),
                 if s["headless"] == true { " · headless" } else { "" },
                 if s["session_locked"] == true { " · session locked" } else { "" }
             );
@@ -2060,7 +2130,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     }
     let ran = series.len() - gaps - before;
     text += &format!(
-        "\n{} of {ran} cases passed{}{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; nothing compared)\n",
+        "\n{} of {ran} cases passed{}{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; a case with a reset runs once more after it, unmeasured; nothing compared)\n",
         ran - failed,
         if refused > 0 { format!(", {refused} where the targets' journeys differ") } else { String::new() },
         if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() },
@@ -2118,12 +2188,15 @@ fn leak_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Val
     }
     let (metric, part) = if leak["head"]["native_host"].is_object() { ("memory.app.host", "native_host") } else { ("js.heap.growth", "js_heap") };
     let head = &leak["head"][part];
-    Ok(json!({
+    let mut out = json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "leak", "engine": ctx.describe["targets"][&s.target]["engine"],
+        "headless": headless_of(ctx, s),
         "primary": { "metric": metric, "verdict": head["verdict"], "verdict_kind": head["verdict_kind"], "decided": head["decided"] },
         "decided": decided, "leak": leak, "runs_per_half": n, "warnings": [], "blocks": [], "attribution": {},
         "elapsed_ms": series_started.elapsed().as_secs_f64() * 1e3,
-    }))
+    });
+    series_setup(ctx, s, series_window(ctx, s, &[]), &mut out);
+    Ok(out)
 }
 
 /// The secondaries a series tests: its declared metrics and the defaults. A script's or native app's CPU
@@ -2339,6 +2412,7 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     // The analysers of one build's blocks: HighVariance, MultimodalDistribution, NotSteady,
     // Background, StateDrift (Drift is a trend of pair differences: none here).
     analyse(s, def, &blocks, &[], false, ["base", "head"], &mut warnings);
+    warnings.extend(observer_reads(&blocks, "head", "head", is_native(&target)));
     let (session, locked, _) = session_of(blocks.iter());
     if session == "mixed" {
         warnings.push(validity::warn("SessionLocked", format!("{locked} of {} blocks ran on a locked screen and the rest unlocked: their values do not compare", blocks.len())));
@@ -2349,9 +2423,10 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
     let (shown, screen_warnings) = shown::summarize(&blocks, false);
     warnings.extend(screen_warnings);
     let timing_recordings: Vec<Value> = blocks.iter().filter_map(|b| b.recording.clone().map(|r| json!({ "variant": b.variant, "pair": b.pair, "recording": r }))).collect();
-    Ok(json!({
+    let window = series_window(ctx, s, &blocks);
+    let mut out = json!({
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": "blocks",
-        "until": launch::until_of(&s.launch), "windowless": series_windowless(ctx, s),
+        "until": launch::until_of(&s.launch),
         "engine": target["engine"], "headless": headless_of(ctx, s), "input": input_of(&blocks), "browser": series_browser(&blocks),
         "primary": primary, "decided": false, "session": session,
         "pairs": 0, "launches": blocks.len(), "stopped": if halted.is_some() { "stopped" } else { "blocks done" },
@@ -2360,10 +2435,14 @@ fn blocks_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &V
         "overhead": mean_overhead(&blocks), "untimed": untimed_of(&blocks.iter().map(|b| (b.values.get("untimed.n").copied(), b.values.get("untimed.ms").copied())).collect::<Vec<_>>()),
         "blocks": blocks, "warnings": warnings, "attribution": {}, "timing_recordings": timing_recordings, "shown": shown,
         "halt": halted.map(|h| json!({ "code": h.code, "message": h.message })),
-    }))
+    });
+    series_setup(ctx, s, window, &mut out);
+    Ok(out)
 }
 
-fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, started: Instant, max_time: Option<Duration>) -> Result<Value> {
+/// `remaining`: the series still to run, this one included (its `--max-time` share).
+#[allow(clippy::too_many_arguments)]
+fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value, started: Instant, max_time: Option<Duration>, remaining: usize) -> Result<Value> {
     let def = model::metric(&s.primary)
         .ok_or_else(|| Error::usage(format!("{}: unknown primary metric {} (known: {})", s.case, s.primary, model::METRICS.iter().map(|m| m.name).collect::<Vec<_>>().join(", "))))?;
     let target = ctx.describe["targets"][&s.target].clone();
@@ -2402,6 +2481,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     };
     progress(format!("\n{}  primary {}{}", s.label(), s.primary, margin.map(|m| format!(" · no worse than {}%?", (m * 1000.0).round() / 10.0)).unwrap_or_default()));
     let series_started = Instant::now();
+    // This series' deadline under `--max-time`: an equal share of the time left among the series still
+    // to run (this one included); a series that ends early leaves its time to the ones after it.
+    let share = max_time.map(|t| series_started + t.saturating_sub(started.elapsed()) / remaining.max(1) as u32);
     let waited_before = ctx.waited_ms;
     // A resumed experiment (`--resume`) starts from the pairs it had finished.
     let saved = &ctx.saved["series"][s.label()];
@@ -2500,7 +2582,8 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             let need = holm_pairs(tested_names(s, script, &blocks, &pairs, bound).len()).max(family(c));
             let eta = eta(ctx, s, &blocks, &pairs, need);
             progress(format!("  pair {n:>2}  for the secondaries (the primary was decided: {}) · {eta}", c.verdict));
-            if n >= need {
+            // `--max-time` ends the secondaries' pairs too: the primary keeps its verdict.
+            if n >= need || max_time.is_some_and(|t| started.elapsed() > t) || share.is_some_and(|d| Instant::now() > d) {
                 stopped = "primary decided".into();
                 break;
             }
@@ -2576,7 +2659,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             stopped = "more pairs cannot decide it".into();
             break;
         }
-        if max_time.is_some_and(|t| started.elapsed() > t) {
+        // `--max-time`: the experiment's deadline, and from the first look this series' share of what
+        // was left when it began, so the first series cannot spend the others' time.
+        if max_time.is_some_and(|t| started.elapsed() > t) || (n >= min_pairs && share.is_some_and(|d| Instant::now() > d)) {
             stopped = "max time".into();
             break;
         }
@@ -2776,6 +2861,10 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
             }
         }
         warnings.extend(journey::observer_cost(&blocks, names));
+    } else {
+        for (role, who) in ["base", "head"].into_iter().zip(names) {
+            warnings.extend(observer_reads(&blocks, role, who, is_native(&target)));
+        }
     }
     if session == "mixed" {
         let why = Refusal::new(ValidatorId::SessionLocked, format!("{locked_pairs} of {} pairs ran on a locked screen, the rest unlocked", pairs.len()));
@@ -2859,6 +2948,9 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
                     if let Some(sm) = attribution_sampling(rec.as_ref(), who, &mut warnings) {
                         sampling.insert(v.role.to_string(), json!(sm));
                     }
+                    if !script && !is_native(&side_targets[i]) {
+                        observer_profile(rec.as_ref(), who, &mut warnings);
+                    }
                     let hot = rec.as_ref().filter(|_| !script).and_then(|r| super::query::hotspots_of(r, "function", 1).ok());
                     if let Some(h) = hot.map(|o| o.json) {
                         let (scripts, mapped) = (h["script_samples"].as_f64().unwrap_or(0.0), h["mapped_samples"].as_f64().unwrap_or(0.0));
@@ -2939,10 +3031,11 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     if pixels.as_array().is_some_and(|a| a.iter().any(|p| p["state"] != "same")) {
         warnings.push(validity::warn("PixelsDiffer", "base and head drew different pixels at a snapshot: see pixels"));
     }
+    let window = series_window(ctx, s, &blocks);
     let mut out = json!({
         "pixels": pixels,
         "label": s.label(), "case": s.case, "target": s.target, "target_kind": target["kind"], "params": s.params, "kind": if s.launch.is_object() { "launch" } else { "runs" },
-        "until": launch::until_of(&s.launch), "windowless": series_windowless(ctx, s),
+        "until": launch::until_of(&s.launch),
         "engine": target["engine"], "headless": headless_of(ctx, s), "browser": series_browser(&blocks),
         "primary": primary, "decided": primary_decided, "session": session, "secondaries": secondaries, "descriptive": descriptive, "holm_pairs": holm,
         "pairs": pairs.len(), "launches": blocks.len(), "stopped": stopped, "bound": bound, "noworse": s.noworse,
@@ -2955,6 +3048,7 @@ fn run_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Valu
     });
     out["video"] = if videos.as_object().is_some_and(|o| !o.is_empty()) { videos } else { Value::Null };
     out["input"] = input_of(&blocks);
+    series_setup(ctx, s, window, &mut out);
     if ctx.implementations {
         implementation_series(ctx, s, variants, &mut out);
     }
@@ -3180,6 +3274,49 @@ fn attribution_sampling(rec: Option<&super::query::Rec>, who: &str, warnings: &m
     Some(s)
 }
 
+/// `ObserverCost` for one side (SPEC §10.2), in every bench: its timed blocks' reads of the page or tree
+/// inside the measured runs (`driver.reads`, `driver.read_ms`) over 2% of a run's wall time; for a
+/// native app read through its accessibility tree (`a11y`), whose provider works for each read, also
+/// over 8 a run. An implementation comparison also weighs the sides against each other
+/// (`journey::observer_cost`).
+fn observer_reads(blocks: &[Block], role: &str, who: &str, a11y: bool) -> Option<Warning> {
+    let (reads, share) = journey::reads_of(blocks, role)?;
+    let why = if share > 0.02 {
+        "reading took over 2% of a run, time the page or app spent answering strobe"
+    } else if a11y && reads > 8.0 {
+        "over 8 reads a run of the app's accessibility tree: each costs its provider work a person's use does not (wait on until: \"frame\" or \"idle\", which read nothing)"
+    } else {
+        return None;
+    };
+    Some(validity::warn("ObserverCost", format!("strobe read {who} {reads:.1} times a run ({:.1}% of its wall time) inside the measured runs: {why}", 100.0 * share)))
+}
+
+/// `ObserverCost` from a page's attribution recording: its profile's samples in strobe's page driver,
+/// its own script (`(strobe driver)`) and the browser's work it called (`(native, via strobe driver)`,
+/// the layouts its checks forced), over 2% of the main thread's active time (every sample but
+/// `(idle)`), when that time is at least 2 ms a run; said with where it went.
+fn observer_profile(rec: Option<&super::query::Rec>, who: &str, warnings: &mut Vec<Warning>) {
+    let Some(rec) = rec else { return };
+    let Some(h) = super::query::hotspots_of(rec, "package", usize::MAX).ok().map(|o| o.json) else { return };
+    let rows: Vec<(&str, f64)> = h["rows"].as_array().into_iter().flatten().map(|r| (r["name"].as_str().unwrap_or(""), r["weight"].as_f64().unwrap_or(0.0))).collect();
+    let active: f64 = rows.iter().filter(|r| r.0 != "(idle)").map(|r| r.1).sum();
+    let mine: Vec<&(&str, f64)> = rows.iter().filter(|r| matches!(r.0, super::query::DRIVER | super::query::VIA_DRIVER)).collect();
+    let driven: f64 = mine.iter().map(|r| r.1).sum();
+    let runs = rec.meta["runs"].as_f64().unwrap_or(1.0).max(1.0);
+    // µs: under 2 ms of work a run, a share of it says nothing.
+    if active / runs < 2_000.0 || driven / active <= 0.02 {
+        return;
+    }
+    let parts = mine.iter().map(|(n, w)| format!("{n} {}", fmt::value(w / 1000.0, "ms"))).collect::<Vec<_>>().join(", ");
+    warnings.push(validity::warn(
+        "ObserverCost",
+        format!(
+            "{who}: strobe's page driver took {:.1}% of the attribution block's active main-thread time ({parts}): waits whose checks run often or force layout cost the page work a person's use does not; wait on until: \"frame\" or \"idle\", or for an element that appears once",
+            100.0 * driven / active
+        ),
+    ));
+}
+
 /// `sampled every 2.0 ms (asked 1 ms)` from a result's `attribution_sampling` entry.
 fn sampled(v: &Value) -> Option<String> {
     serde_json::from_value::<probe::cpu::Sampling>(v.clone()).ok().map(|s| s.text())
@@ -3300,12 +3437,15 @@ fn refused_series(ctx: &Ctx, s: &Series, r: &Refusal) -> Value {
     let target = &ctx.describe["targets"][&s.target];
     let primary = json!({ "metric": s.primary, "verdict": format!("refused ({}): {}", r.validator, r.summary), "verdict_kind": VerdictKind::Refused, "decided": false, "refusal": r });
     let (b, h) = s.sides.clone().unwrap_or_default();
-    json!({
+    let mut out = json!({
         "label": s.label(), "case": s.case, "target": s.target, "params": s.params, "kind": "refused",
         "targets": { "base": b, "head": h }, "hero": s.hero, "primary": primary, "decided": false, "passed": false, "pairs": 0, "launches": 0,
         "headless": headless_of(ctx, s), "engine": engine_of(target), "target_kind": target["kind"],
         "journey": s.journey(), "side_name": target["name"].as_str().unwrap_or(&s.target),
-    })
+    });
+    // It drew in no window.
+    series_setup(ctx, s, Value::Null, &mut out);
+    out
 }
 
 /// `<validator>: <summary> · fix: <fix>`, for a refusal as result.json keeps it.
@@ -3379,9 +3519,23 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             w.push(validity::warn("MultimodalDistribution", format!("{name}: {} looks multimodal (mValue {m:.1}); check pinning and background load", def.name)));
         }
     }
-    let unsteady = blocks.iter().filter(|b| b.values.contains_key("warmup.unsteady")).count();
-    if unsteady > 0 {
-        w.push(validity::warn("NotSteady", format!("{unsteady} block(s) never did the same work twice in {MAX_WARMUP} warmup runs: the case's state grows across runs; add a reset")));
+    // Why a block never got steady: its work grew run after run (`warmup.unsteady` 2: state the runs
+    // leave behind), or swung back and forth (1: noise, not state).
+    let unsteady = |grew: bool| blocks.iter().filter(|b| b.values.get("warmup.unsteady").is_some_and(|u| (*u >= 2.0) == grew)).count();
+    let (grew, swung) = (unsteady(true), unsteady(false));
+    if grew > 0 {
+        let why = if s.reset {
+            "the work still grew run after run despite the case's reset: check what the reset leaves behind (DOM, listeners, caches)"
+        } else {
+            "the work grew run after run: the case's state grows across runs; add a reset"
+        };
+        w.push(validity::warn("NotSteady", format!("{grew} block(s) never did the same work twice in {MAX_WARMUP} warmup runs: {why}")));
+    }
+    if swung > 0 {
+        w.push(validity::warn(
+            "NotSteady",
+            format!("{swung} block(s) never did the same work twice in {MAX_WARMUP} warmup runs: the work swung from run to run without growing (jitter, not state): pin the target's CPUs (--pin), quiet the machine, or give each run more work"),
+        ));
     }
     // On the comparison's own scale: log ratios, or differences for counts and anything that read 0
     // (a ratio of 0 dropped those pairs, and a count's every pair).
@@ -3420,7 +3574,8 @@ fn analyse(s: &Series, def: &MetricDef, blocks: &[Block], pairs: &[(usize, usize
             let first = b.nodes[0] as f64;
             let last = *b.nodes.last().unwrap_or(&0) as f64;
             if first > 0.0 && (last - first) / first > 0.05 && b.nodes.windows(2).all(|x| x[1] >= x[0]) {
-                w.push(validity::warn("StateDrift", format!("DOM nodes grew {:.0} → {:.0} across runs in a {} block: add a reset to the case", first, last, b.variant)));
+                let fix = if s.reset { "despite the case's reset: check what the reset leaves behind (DOM, listeners, caches)" } else { "add a reset to the case" };
+                w.push(validity::warn("StateDrift", format!("DOM nodes grew {:.0} → {:.0} across runs in a {} block: {fix}", first, last, b.variant)));
                 break;
             }
         }
@@ -3879,7 +4034,7 @@ fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).map(|b| tail_state(x, b)).inspect(|b| restate_recording(ctx, s, b));
+        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| software_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).map(|b| tail_state(x, b)).inspect(|b| restate_recording(ctx, s, b));
         // A timed or check block that refused its primary refuses the block, as a native one does:
         // pairs of nothing would end `unclear` instead of saying why.
         let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
@@ -3923,10 +4078,15 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
     if !wanted {
         return None;
     }
-    let noted = ctx.warnings.iter().any(|w| w.id == "ReservedCpus");
+    // macOS has no CPU affinity: nothing is pinned or kept off anything, and nothing to say.
+    let noted = cfg!(target_os = "macos") || ctx.warnings.iter().any(|w| w.id == "ReservedCpus");
     let Some(cpus) = ctx.pin else {
         if !noted {
-            ctx.warnings.push(validity::info("ReservedCpus", "other processes were not kept off the target's CPUs: the target is not pinned (--pin none, or no V-Cache CCD for --pin auto)"));
+            let why = match ctx.args.get("pin").unwrap_or("auto") {
+                "auto" => format!("--pin auto left the target {}", ctx.pin_label),
+                _ => "the target is not pinned (--pin none)".to_string(),
+            };
+            ctx.warnings.push(validity::info("ReservedCpus", format!("other processes were not kept off the target's CPUs: {why}")));
         }
         return None;
     };
@@ -4081,11 +4241,11 @@ fn session_state(s: &Series, mut b: Block, locked: bool) -> Block {
     b
 }
 
-/// Frames on screen (or produced headless) and input latencies: what background priority makes meaningless (SPEC §10.1
+/// Frames on screen and input latencies: what background priority makes meaningless (SPEC §10.1
 /// `BackgroundPriority`). At background QoS a drag read 83-91% dropped frames that dropped 0.4% at
 /// normal priority.
 pub(crate) fn foreground_metric(m: &str) -> bool {
-    ["frames.", "interaction.", "scroll.", "canvas.", "input.", "display.", "produced."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
+    ["frames.", "interaction.", "scroll.", "canvas.", "input.", "display."].iter().any(|p| m.starts_with(p)) || m == "launch.painted" || m == "launch.settled"
 }
 
 /// A kept recording's values and refusals as the block ended with them: the block wrote its
@@ -4098,6 +4258,17 @@ fn restate_recording(ctx: &Ctx, s: &Series, b: &Block) {
     meta["refused"] = refusal_map(&b.refused);
     if headless_of(ctx, s) {
         meta["headless"] = json!(true);
+    }
+    // Why the recording's frames are gone, as a `record` says it (`query summary`).
+    let why = if headless_of(ctx, s) {
+        Some("Headless: the page ran headless, so nothing it drew reached a display".to_string())
+    } else if b.browser.as_ref().is_some_and(|br| br.software) {
+        Some("SoftwareGpu: a software adapter drew the page; the browser's CPU includes the rasterization a GPU would do".to_string())
+    } else {
+        b.refused.iter().find(|(k, r)| display_metric(k) && r.validator == ValidatorId::BackgroundPriority).map(|(_, r)| r.message())
+    };
+    if let Some(why) = why {
+        meta["frames_refused"] = json!(why);
     }
     let _ = store::write_json(&dir.join("meta.json"), &meta);
 }
@@ -4114,6 +4285,10 @@ fn headless_state(ctx: &Ctx, s: &Series, mut b: Block) -> Block {
     let software = b.browser.as_ref().is_some_and(|br| br.software);
     let drawn = |m: &str| display_metric(m) || gpu_use(m) || (software && matches!(m, "gpu.vram" | "gpu.shared"));
     b.values.retain(|k, _| !drawn(k));
+    // The frames' own lists too: a report must not read late frames or pacing from them.
+    b.frames.clear();
+    b.intervals.clear();
+    b.phases.clear();
     for m in declared_metrics(s).into_iter().filter(|m| drawn(m)) {
         b.refused.insert(m.clone(), Refusal::new(ValidatorId::Headless, format!("{m}: the page ran headless, so nothing it drew reached a display")));
     }
@@ -4191,6 +4366,9 @@ fn priority_state(ctx: &mut Ctx, s: &Series, x: &Exec, mut b: Block) -> Result<B
         return Err(background_refusal(&why, &format!("the primary {}", s.primary)));
     }
     b.values.retain(|k, _| !foreground_metric(k));
+    b.frames.clear();
+    b.intervals.clear();
+    b.phases.clear();
     for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| foreground_metric(m)) {
         b.refused.insert(m.clone(), Refusal::new(ValidatorId::BackgroundPriority, format!("the target ran at {why}")));
     }
@@ -4225,12 +4403,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     // How the block's notes name its side (`side_of`), read before the runs' closures borrow ctx.
     let side = side_of(ctx, v).to_string();
     let url = if app { String::new() } else { variant_url(v, &target)? };
+    let fixed_page = kind == "url" && !matches!(v.kind, Kind::Url(_));
     let mut window = ctx.window.clone();
     if let Some(vp) = target.get("viewport").filter(|v| v.is_object()) {
         window.width = vp["width"].as_u64().unwrap_or(1400) as u32;
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
     window.scale = target["scale"].as_f64();
+    let emulation = if app { chromium::Emulation::default() } else { emulation_of(&target, &s.target)? };
+    phone_window(&mut window, &target, &emulation, headless);
     ctx.used = Some(window.clone());
     // As before a native block's speed check: a timed block launches once the target's CPUs are quiet
     // (the last block's browser still frees its memory and GPU objects there), waiting at most 10 s.
@@ -4260,7 +4441,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         guard = Some(g);
         b.into()
     } else {
-        web::launch(engine, &window, headless, ctx.pin)?
+        web::launch_as(engine, &window, headless, ctx.pin, &emulation)?
     };
     let steps = RefCell::new(vec![("quiet".to_string(), quiet_ms), ("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)]);
     ctx.target_qos = host::background_qos(Some(browser.pid()));
@@ -4270,7 +4451,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         lapped.set(Instant::now());
     };
     let result = (|| -> Result<Block> {
-        let seen = browser_seen(ctx, s, headless, &browser)?;
+        let seen = browser_seen(ctx, s, v, headless, !matches!(set, Set::Attribution | Set::Memory), &browser)?;
         let page: Page = match (&browser, app) {
             (WebBrowser::Chromium(b), true) => electron::main_page(b)?.into(),
             (WebBrowser::Chromium(_), false) | (WebBrowser::Firefox(_) | WebBrowser::Webkit(_), _) => browser.page()?,
@@ -4298,8 +4479,20 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             g.check("after the app opened its window")?;
         }
         let viewport = target.get("viewport").is_some_and(Value::is_object);
-        if !app && viewport {
+        // An emulated device's touch and user agent before anything sizes or loads the page; a phone's
+        // viewport once the window is its size (headed, the window must have reached it:
+        // `check_viewport`; after the override a page without a viewport tag lays out 980 wide).
+        if !app {
+            page.emulate(&emulation)?;
+        }
+        if !app && (viewport || emulation.mobile) {
             browser.fit_viewport(&page, window.width, window.height, headless)?;
+        }
+        if emulation.mobile {
+            if !headless {
+                page.check_viewport((window.width, window.height))?;
+            }
+            page.emulate_viewport(&emulation, (window.width, window.height), window.scale)?;
         }
         // An app's window (a webview's, an Electron app's) is placed like a native app's and sized to
         // a viewport (DevTools resizes no app window: the OS does). The block records the page's own
@@ -4361,10 +4554,45 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 canvas_docs.borrow_mut().push(times);
             }
         };
-        // An attribution block's profiles, one pair per document: a page load ends the V8 profilers with
-        // their document, so each `goto` (in a run or a reset) closes a segment and starts the next.
+        // A Chromium attribution block's profiles, one CPU and allocation pair per measured run, each over
+        // exactly the run (never its reset): both profilers go on through the run's navigations in one
+        // renderer. `profiling` while one is on; the scripts' function ranges, read after the last
+        // measured run and before each `goto` inside a profiled run (`probe::symbols::Ranges`).
         let profiling = Cell::new(false);
-        let segments: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
+        let profiles: RefCell<Vec<(Value, Value)>> = RefCell::new(Vec::new());
+        let ranges: RefCell<probe::symbols::Ranges> = RefCell::new(Default::default());
+        let isolate = || page.cdp().and_then(|p| p.send("Runtime.getIsolateId", json!({})).ok()).and_then(|v| v["id"].as_str().map(str::to_string));
+        // The renderer the profilers run in (its isolate): a navigation that moved the page to another
+        // (a cross-site one under site isolation) left them with the first, so the profile would miss it.
+        let renderer: RefCell<Option<String>> = RefCell::new(None);
+        // Profiling paused for a `ctx.untimed` stretch inside a profiled run.
+        let paused = Cell::new(false);
+        let same_renderer = || -> Result<()> {
+            let now = isolate();
+            if renderer.borrow().is_some() && now == *renderer.borrow() {
+                return Ok(());
+            }
+            Err(Refusal::new(
+                ValidatorId::RunIncomplete,
+                "the page moved to another renderer process during a profiled run (a cross-site navigation), or strobe could not read which one it is in, and the profilers stay with the first: the profile would not cover the run",
+            )
+            .fix("profile a run that stays on one site (load the first page in setup), or attribute the other site's page from its own case")
+            .into())
+        };
+        let profile_start = || -> Result<()> {
+            *renderer.borrow_mut() = isolate();
+            same_renderer()?;
+            probe::cpu::start(cp()?)?;
+            probe::alloc::start(cp()?)?;
+            profiling.set(true);
+            Ok(())
+        };
+        let profile_stop = || -> Result<()> {
+            profiling.set(false);
+            same_renderer()?;
+            profiles.borrow_mut().push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
+            Ok(())
+        };
         let mocks = mocks::Mocks::default();
         // An init script in an engine without preload scripts (WebKit): it ran after the first document's
         // own scripts, which strobe counts (`init_docs`, after the block's first load). A document loaded
@@ -4417,6 +4645,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if start {
                 cost.pause();
             }
+            // The profilers leave the stretch out: stopped at its start (with the scripts' ranges, as the
+            // stretch may leave the page), started again in the page's renderer at its end.
+            if start && profiling.get() {
+                profile_stop()?;
+                ranges.borrow_mut().merge(probe::symbols::Ranges::take(&page)?);
+                paused.set(true);
+            }
+            if !start && paused.take() {
+                profile_start()?;
+            }
             if !traceless {
                 driver.mark(&hooks.untimed_mark(n, start))?;
             }
@@ -4461,6 +4699,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                             Refusal { summary: format!("page.{call}() in a run of a {engine} page measured from outside: {}, and the other side gets the OS's", r.summary), ..r.clone() }.into()
                         );
                     }
+                    if emulation.mobile
+                        && let Some(r) = phone_pointer(call, &args)
+                    {
+                        return Err(r.into());
+                    }
                     if call == "goto" && hooks.in_run() {
                         let before = counters();
                         let mut c = carried.borrow_mut();
@@ -4475,19 +4718,21 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                             harvested.borrow_mut().extend(page_changes(&page));
                         }
                     }
-                    let segment = call == "goto" && profiling.get();
-                    if segment {
-                        segments.borrow_mut().push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
+                    // The profilers go on through a navigation; the scripts of the document it leaves
+                    // go with it, so their function ranges are read first, and the page must still be in
+                    // the profilers' renderer after it (A → B → A would drop B's samples unseen).
+                    let profiled_goto = call == "goto" && profiling.get();
+                    if profiled_goto {
+                        ranges.borrow_mut().merge(probe::symbols::Ranges::take(&page)?);
                     }
                     let (started, sent0) = (host::now_ns(), driver.inputs.borrow().len());
                     let r = driver.dispatch(call, &args);
+                    if profiled_goto && r.is_ok() {
+                        same_renderer()?;
+                    }
                     if let Some(v) = video.borrow().as_ref() {
                         v.note(call, &args, started);
                         video_sent.borrow_mut().extend(driver.inputs.borrow().iter().skip(sent0).map(|s| super::video::Sent { t_ns: s.t_ns, press_ns: s.press }));
-                    }
-                    if segment {
-                        probe::cpu::start(cp()?)?;
-                        probe::alloc::start(cp()?)?;
                     }
                     late_check()?;
                     r
@@ -4567,7 +4812,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         init_docs.set(page.documents());
         lap("load");
         validity::dev_build(&page)?;
-        let input = if app { observed_input(ctx, s, &page) } else { Some(validity::desktop_input(&page)?) };
+        let input = if app { observed_input(ctx, s, &page) } else { Some(validity::emulated_input(&page, &emulation)?) };
         let mut during = Some(Foreign::start(&browser));
         let speed = validity::speed_check(&page)?;
         // The calibration is Chromium's: another engine's JS speed is compared with its own reference
@@ -4739,7 +4984,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 
         let run_timeout = s.run_timeout();
         let perf = x.counters.then(probe::wakes::Perf::new);
-        let mut run_once = |key: &str| -> Result<Run> {
+        // `profile`: a measured run of a Chromium attribution block; `last`: the last of them.
+        let mut run_once = |key: &str, profile: bool, last: bool| -> Result<Run> {
             let began = Instant::now();
             // As a native app is before each run (`front_page`).
             if cfg!(target_os = "macos") && (s.sides.is_some() || s.cross_engine) {
@@ -4800,6 +5046,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let listed = probe::wakes::wall_us();
             let (at0, cyc0, tsc0, _) = read();
             let k0 = probe::wakes::Counters::take(listed, &at0.keys().map(|k| k.0).collect::<Vec<_>>(), perf.as_ref());
+            if profile {
+                profile_start()?;
+            }
             // strobe's own cost over the run.
             cost.start();
             let t0 = host::now_ns();
@@ -4813,6 +5062,15 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
             let t1 = host::now_ns();
             cost.end();
+            // A run that ended inside an untimed stretch left its profilers stopped already.
+            paused.set(false);
+            if profiling.get() {
+                profile_stop()?;
+            }
+            // The page's scripts' function ranges, before the reset can leave the page.
+            if profile && (last || s.reset) {
+                ranges.borrow_mut().merge(probe::symbols::Ranges::take(&page)?);
+            }
             let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
             let (at1, cyc1, tsc1, cpu1) = read();
             let k1 = probe::wakes::Counters::take(probe::wakes::wall_us(), &at1.keys().map(|k| k.0).collect::<Vec<_>>(), perf.as_ref());
@@ -4943,9 +5201,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // blocks start their profiler at the steady point, so they measure the runs after it.
         let mut runs: Vec<Run> = Vec::new();
         let mut nodes_all = Vec::new();
-        let mut warmup = block::Warmup::new(x);
+        let mut warmup = block::Warmup::new(s, x);
         let mut starts = shown::Starts::new(s, x);
         let read_start = || shown::page_start(&page);
+        let profiled = set == Set::Attribution && !gecko_on;
         let wait_start = |t: Duration| {
             let _ = crate::driver::wait_change(&page, t);
         };
@@ -4955,7 +5214,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
             starts.check(i + 1, false, &read_start, &wait_start)?;
-            runs.push(run_once(&format!("run:{i}"))?);
+            let profile = profiled && warmup.measures(i);
+            // A check's run after its reset is never measured: the trace names it a warmup run, so no
+            // view of the recording counts it.
+            let unmeasured = warmup.first().is_some() && i >= warmup.measured().end;
+            let key = if unmeasured { format!("warm:{i}") } else { format!("run:{i}") };
+            runs.push(run_once(&key, profile, profile && i + 1 == warmup.measured().end)?);
             if let Some(f) = warmup.first() {
                 // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N. Firefox
                 // takes about:memory's after its own GC and CC, and no heap snapshot.
@@ -4991,10 +5255,6 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                         Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", side, e.message))),
                     }
                     gecko = Some(probe::gecko::start(b)?);
-                } else if set == Set::Attribution {
-                    probe::cpu::start(cp()?)?;
-                    probe::alloc::start(cp()?)?;
-                    profiling.set(true);
                 }
                 if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
                     census.push(probe::gecko::census(b, &page, &dir.join("memory-s0.json.gz"), "after warmup, before the leak run's runs (S0)")?);
@@ -5016,7 +5276,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         steps.borrow_mut().push(("warmup".into(), warm_ms));
         steps.borrow_mut().push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
         lapped.set(Instant::now());
-        let measured = &runs[first..];
+        // A check's run after its reset is not measured (`Warmup::measured`).
+        let range = first..warmup.measured().end.clamp(first, runs.len());
+        let measured = &runs[range.clone()];
         let key = |j: usize| format!("run:{}", first + j);
         let run_ms: Vec<f64> = measured.iter().map(|r| r.ms).collect();
         let walls: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.ms)).collect();
@@ -5024,9 +5286,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let busy: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite() && r.ms > 0.0).map(|(j, r)| (key(j), 100.0 * r.task / r.ms)).collect();
         let work: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite()).map(|(j, r)| (key(j), r.task)).collect();
         let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
-        let nodes = nodes_all[first.min(nodes_all.len())..].to_vec();
+        let nodes = nodes_all.get(range.clone()).unwrap_or_default().to_vec();
         let warm = runs[..first].to_vec();
-        let (strobe_pct, runner_pct) = cost.share(first);
+        let (strobe_pct, runner_pct) = cost.share(range.clone());
         let samples = sampler.stop();
         let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
         let procs1 = (host::now_ns(), host::all_processes());
@@ -5082,12 +5344,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
             probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
             lap("maps");
-        } else if set == Set::Attribution {
-            profiling.set(false);
-            let mut segments = segments.take();
-            segments.push((probe::cpu::stop(cp()?)?, probe::alloc::stop(cp()?)?));
-            sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, segments.iter().flat_map(|(p, _)| probe::cpu::gaps(p)).collect());
-            for (k, (profile, allocs)) in segments.iter().enumerate() {
+        } else if profiled {
+            let profiles = profiles.take();
+            sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, profiles.iter().flat_map(|(p, _)| probe::cpu::gaps(p)).collect());
+            for (k, (profile, allocs)) in profiles.iter().enumerate() {
                 store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
                 store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
             }
@@ -5097,11 +5357,11 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
             let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
             let mut scripts = std::collections::BTreeSet::new();
-            for (profile, allocs) in &segments {
+            for (profile, allocs) in &profiles {
                 probe::symbols::urls(profile, &mut scripts);
                 probe::symbols::urls(allocs, &mut scripts);
             }
-            probe::symbols::store_maps(&page, &scripts, &dir, served.as_deref())?;
+            probe::symbols::store_maps_with(&page, &scripts, ranges.take(), &dir, served.as_deref())?;
             lap("maps");
         }
         let trace = dir.join("trace.pftrace");
@@ -5138,7 +5398,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side, e.message)));
         }
         let mut data = if set == Set::Memory || x.counters || traceless { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
-        data.warm_below(first);
+        data.measured_only(range.clone());
         lap("analyse");
         let mut extra = BTreeMap::new();
         let run_counts = run_counts.into_inner();
@@ -5230,7 +5490,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let run_canvas = run_canvas.into_inner();
         let mut canvas_gaps: Vec<f64> = Vec::new();
         if canvas {
-            let measured_canvas = &run_canvas[first.min(run_canvas.len())..];
+            let measured_canvas = run_canvas.get(range.clone()).unwrap_or_default();
             extra.insert("canvas.frames".to_string(), measured_canvas.iter().enumerate().map(|(j, docs)| (key(j), docs.iter().map(Vec::len).sum::<usize>() as f64)).collect());
             for doc in measured_canvas.iter().flatten() {
                 canvas_gaps.extend(doc.windows(2).map(|w| w[1] - w[0]));
@@ -5248,7 +5508,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             values.remove("frames.n");
             if let Some(p) = presents {
                 let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
-                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(first..).unwrap_or_default(), &mut values, &mut os_refused);
+                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(range.clone()).unwrap_or_default(), &mut values, &mut os_refused);
             }
         }
         if canvas {
@@ -5265,7 +5525,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             values.insert("main.busy.cdp".into(), busy_cdp);
         }
         if unsteady {
-            values.insert("warmup.unsteady".into(), 1.0);
+            values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
         }
         if private_mb > 0.0 {
             values.insert("memory.app.private".into(), private_mb);
@@ -5339,7 +5599,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // The video: every run on its time (warmup ones too), the inputs and, without a trace, the phases.
             let video = match stopped.take() {
                 Some(Ok(st)) => {
-                    let filmed: Vec<super::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, i >= first)).collect();
+                    let filmed: Vec<super::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, range.contains(&i))).collect();
                     let marks: Vec<(String, u64)> = if traceless { run_marks.iter().flatten().cloned().collect() } else { video_marks.take() };
                     st.keep(&dir, &filmed, &video_sent.take(), &marks)
                         .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: the video was not kept: {}", s.label(), e.message))))
@@ -5352,7 +5612,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 None => None,
             };
             let mut meta = json!({
-                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+                // A `url()` target loads its address whatever the variant: no build of it ran.
+                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role,
+                "variant_label": if fixed_page { url.clone() } else { v.label.clone() }, "variant_git": if fixed_page { Value::Null } else { variant_git(v) },
                 "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "input": input, "background": background, "screen": screen,
                 // Rule 3: a block with profilers, a census or a video describes the profiled (filmed) page.
@@ -5423,8 +5685,8 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             frame: false,
             browser: Some(seen),
             directions: BTreeMap::new(),
-            same: same.take(first),
-            ops: journey::ops(&run_counts.iter().skip(first).collect::<Vec<_>>()),
+            same: same.take(range.clone()),
+            ops: journey::ops(&run_counts.get(range.clone()).unwrap_or_default().iter().collect::<Vec<_>>()),
             input,
         })
     })();
@@ -5870,6 +6132,11 @@ fn implementation_preflight(describe: &Value, series: &[Series], variants: &[Var
     if tb["scale"].as_f64() != th["scale"].as_f64() {
         return Err(mismatch(format!("ask for different scales ({} and {})", tb["scale"], th["scale"])));
     }
+    // A phone or a touch screen against a desktop is two workloads (the page takes its touch paths).
+    if tb["emulate"] != th["emulate"] {
+        let device = |t: &Value| t["emulate"].as_str().map_or("a desktop".to_string(), |e| format!("emulated {e}"));
+        return Err(mismatch(format!("emulate different devices ({} and {})", device(tb), device(th))));
+    }
     for s in series.iter().filter(|s| s.gap.is_none()) {
         let (cb, ch) = (side_gpu_cache(s, describe, b, config, projects), side_gpu_cache(s, describe, h, config, projects));
         if cb != ch {
@@ -6093,6 +6360,94 @@ fn engine_of(target: &Value) -> WebEngine {
     target["engine"].as_str().and_then(|e| WebEngine::parse(e).ok()).unwrap_or_default()
 }
 
+/// What a page target emulates (its `emulate`, SPEC 13.1 "Emulated phones and touch screens"): a phone
+/// (`mobile`) or a touch screen (`touch`); a desktop without it.
+fn emulation_of(target: &Value, name: &str) -> Result<chromium::Emulation> {
+    Ok(match target["emulate"].as_str() {
+        None if target["emulate"].is_null() => chromium::Emulation::default(),
+        Some("mobile") => chromium::Emulation { mobile: true, touch: true, user_agent: None },
+        Some("touch") => chromium::Emulation { touch: true, ..Default::default() },
+        _ => return Err(Error::usage(format!("target {name}: emulate is \"mobile\" or \"touch\", not {} (a page is a desktop without it)", target["emulate"]))),
+    })
+}
+
+/// `EngineUnsupported` for a pointer input on an emulated phone's page: strobe's driver sends mouse
+/// events, and a phone is driven by touch, which strobe does not send yet, so a case that clicks, taps,
+/// hovers, drags or scrolls there would measure a mouse on a phone. Keys (`press`, `type` without a
+/// selector to click into) and loads work. None for any other call.
+fn phone_pointer(call: &str, args: &[Value]) -> Option<Refusal> {
+    let has_selector = |v: Option<&Value>| v.is_some_and(|v| !(v.is_null() || v.as_str() == Some("")));
+    let pointer = match call {
+        "click" | "tap" | "hover" | "move" | "down" | "up" | "drag" | "scroll" | "wheel" => true,
+        // Both focus their element with a click unless it already has focus.
+        "type" => has_selector(args.first()),
+        "press" => has_selector(args.get(1).map(|o| &o["selector"])),
+        _ => false,
+    };
+    pointer.then(|| {
+        Refusal::new(ValidatorId::EngineUnsupported, format!("page.{call} on a page that emulates a phone: strobe sends mouse input, and touch input isn't built yet; load cases (and keys with no element to click into) work"))
+            .fix("time the phone's load, or its keys with page.press/type and no selector; measure the pointer case on a desktop target")
+    })
+}
+
+/// The window an emulated phone's page shows when its target declares none: the phone's viewport, at
+/// its scale headless (a headed phone is refused before anything runs, `record::phone_refusal`).
+fn phone_window(window: &mut Window, target: &Value, emulation: &chromium::Emulation, headless: bool) {
+    if !emulation.mobile {
+        return;
+    }
+    if !target["viewport"].is_object() {
+        (window.width, window.height) = super::record::PHONE;
+    }
+    if window.scale.is_none() && headless {
+        window.scale = Some(super::record::PHONE_SCALE);
+    }
+}
+
+/// `390×844 @3x · emulated mobile`: the window a series' pages drew in (its blocks' content area, else the
+/// window it asked for) with its scale and emulation, for its result (`window`) and every report; none for
+/// a series with no window.
+fn series_window(ctx: &Ctx, s: &Series, blocks: &[Block]) -> Value {
+    if series_windowless(ctx, s) || s.sides.is_some() {
+        return Value::Null;
+    }
+    let target = &ctx.describe["targets"][&s.target];
+    // An emulated phone is its device's size: a page without a viewport tag lays out wider on it.
+    let mobile = target["emulate"] == "mobile";
+    let size = match blocks.iter().find_map(|b| b.client).filter(|_| !mobile) {
+        Some(c) => [c[0], c[1], c[2]],
+        None => {
+            let mut w = ctx.window.clone();
+            if let Some(vp) = target["viewport"].as_object() {
+                w.width = vp.get("width").and_then(Value::as_u64).unwrap_or(1400) as u32;
+                w.height = vp.get("height").and_then(Value::as_u64).unwrap_or(900) as u32;
+            }
+            w.scale = target["scale"].as_f64();
+            if let Ok(e) = emulation_of(target, &s.target) {
+                phone_window(&mut w, target, &e, headless_of(ctx, s));
+            }
+            [w.width as f64, w.height as f64, w.scale.unwrap_or(1.0)]
+        }
+    };
+    let round = |x: f64| format!("{x:.2}").trim_end_matches('0').trim_end_matches('.').to_string();
+    let scale = if (size[2] - 1.0).abs() > 0.005 { format!(" @{}x", round(size[2])) } else { String::new() };
+    let emulated = target["emulate"].as_str().map(|e| format!(" · emulated {e}")).unwrap_or_default();
+    json!(format!("{}×{}{scale}{emulated}", size[0], size[1]))
+}
+
+/// What every report reads of a series' own setup, beside its verdicts: the window it drew in
+/// (`series_window`), whether it has none, what its page emulated, and a `url()` target's address (the
+/// page both sides load whatever the variant, so reports name it, not a build).
+fn series_setup(ctx: &Ctx, s: &Series, window: Value, out: &mut Value) {
+    let target = &ctx.describe["targets"][&s.target];
+    out["windowless"] = json!(series_windowless(ctx, s));
+    out["window"] = window;
+    out["emulate"] = target["emulate"].clone();
+    if target["kind"] == "url" && s.sides.is_none() {
+        out["href"] = target["href"].clone();
+    }
+}
+
 /// Whether a series' page runs headless: `--headless`, or its target's `headless`.
 fn headless_of(ctx: &Ctx, s: &Series) -> bool {
     ctx.headless || ctx.describe["targets"][&s.target]["headless"] == true
@@ -6134,6 +6489,12 @@ fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
     let page = |t: &Value| matches!(t["kind"].as_str(), Some("web" | "url"));
     let Some(targets) = describe["targets"].as_object_mut() else { return Ok(()) };
     for (name, t) in targets.iter() {
+        if !t["emulate"].is_null() {
+            if !page(t) {
+                return Err(Error::usage(format!("target {name}: emulate is for page targets (web, url): an app's page sees the machine's own input; this is a {} target", t["kind"].as_str().unwrap_or("?"))));
+            }
+            emulation_of(t, name)?;
+        }
         if let Some(e) = t["engine"].as_str() {
             if !page(t) {
                 return Err(Error::usage(format!("target {name}: engine is for page targets (web, url); this is a {} target", t["kind"].as_str().unwrap_or("?"))));
@@ -6169,8 +6530,9 @@ fn apply_engines(describe: &mut Value, args: &Args) -> Result<()> {
 /// engine cannot measure (`EngineUnsupported`, with the closest one it can), a headless page cannot show
 /// (`Headless`), or a launch case in an engine without one refuses that series alone (`Series::refused`):
 /// it is listed and the rest runs; when that leaves nothing to run, the first refusal is the run's.
-/// Declared secondaries are refused per block instead.
-fn check_engines(series: &mut [Series], describe: &Value, args: &Args) -> Result<()> {
+/// Declared secondaries are refused per block instead. Two builds that run one fixed target alike
+/// (`same_target`) refuse that series too.
+fn check_engines(series: &mut [Series], describe: &Value, args: &Args, variants: &[Variant]) -> Result<()> {
     // Every target a series runs on: an implementation comparison's both sides. A parity gap never runs.
     for s in series.iter_mut().filter(|s| s.gap.is_none()) {
         let names: Vec<String> = match &s.sides {
@@ -6181,6 +6543,9 @@ fn check_engines(series: &mut [Series], describe: &Value, args: &Args) -> Result
             if s.refused.is_none() {
                 s.refused = target_refusal(s, &name, describe, args)?;
             }
+        }
+        if s.refused.is_none() && s.sides.is_none() && !args.has("aa") {
+            s.refused = same_target(&describe["targets"][&s.target], variants);
         }
     }
     let refused: Vec<(String, &Refusal)> = series.iter().filter_map(|s| Some((s.label(), s.refused.as_ref()?))).collect();
@@ -6283,6 +6648,45 @@ fn fit_answer(ctx: Option<&mut Ctx>, engine: WebEngine, scale: Option<f64>, aske
     }
 }
 
+/// `VariantMismatch` before anything builds: base and head would run the same thing, so the comparison
+/// would be an A/A by accident. Builds (a folder, a git ref) of a target that names what it runs itself
+/// (a `url()`'s address, an `exe()`'s or a `native(path)`'s executable, an app profile's); two folders
+/// of one checkout (each is that checkout's root, `resolve_variant`); or two `url:`, `exe:` or `app:`
+/// variants (or one beside such a target) that name the same page, executable or app. Not for `--aa`,
+/// an A/A on purpose.
+fn same_target(target: &Value, variants: &[Variant]) -> Option<Refusal> {
+    let [b, h] = variants else { return None };
+    let kind = target["kind"].as_str()?;
+    let fixed = |key: &str| target[key].as_str().unwrap_or("?").to_string();
+    // What a side runs, when nothing it builds decides it.
+    let runs = |v: &Variant| -> Option<String> {
+        match (&v.kind, kind) {
+            (Kind::Url(href), "url") => Some(format!("the page at {href}")),
+            (Kind::Url(href), "web") => Some(format!("the page at {}", join_url(href, target["url"].as_str().unwrap_or("/")))),
+            (Kind::Exe(p), _) => Some(format!("the executable {}", p.display())),
+            (Kind::App(id), _) => Some(format!("app {id}'s installed executable")),
+            (Kind::Dir | Kind::Git(_), "url") => Some(format!("the page at {}", fixed("href"))),
+            (Kind::Dir | Kind::Git(_), "exe") => Some(format!("the executable {}", fixed("path"))),
+            (Kind::Dir | Kind::Git(_), "native" | "webview") if target["path"].is_string() => Some(format!("the executable {}", fixed("path"))),
+            (Kind::Dir | Kind::Git(_), "app") => Some(format!("app {}'s installed executable", fixed("id"))),
+            _ => None,
+        }
+    };
+    let what = match (&b.kind, &h.kind, runs(b), runs(h)) {
+        (Kind::Dir, Kind::Dir, _, _) if b.root.is_some() && b.root == h.root => {
+            let root = b.root.as_deref().map(|r| r.display().to_string()).unwrap_or_default();
+            format!("both name the checkout at {}, whose root a folder variant stands for", root.trim_start_matches(r"\\?\"))
+        }
+        (_, _, Some(x), Some(y)) if x == y => format!("this target runs {x} on both sides, whatever is built"),
+        _ => return None,
+    };
+    Some(
+        Refusal::new(ValidatorId::VariantMismatch, format!("base ({}) and head ({}) would run the same thing: {what}", b.label, h.label)).fix(
+            "name what each side runs (--base url:<href> --head url:<href>, exe:<path>, app:<id>, two checkouts or git refs), give the target something strobe builds or serves (web() with build and serve, native(appId) with a build), or --aa for an A/A on purpose",
+        ),
+    )
+}
+
 /// `check_engines` for one target of a series: a usage error or whole-run refusal, else the series' own
 /// refusal (its summary without the series' label, which every listing prints beside it).
 fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Result<Option<Refusal>> {
@@ -6303,7 +6707,16 @@ fn target_refusal(s: &Series, name: &str, describe: &Value, args: &Args) -> Resu
     let engine = engine_of(t);
     // On one side of an implementation comparison, the side named.
     let on = if s.sides.is_some() { format!("{} ({engine}): ", t["name"].as_str().unwrap_or(name)) } else { String::new() };
-    if let Some(e) = web::refusal(engine, t["headless"] == true || args.has("headless")) {
+    let headless = t["headless"] == true || args.has("headless");
+    // An emulated device: none in WebKit; a phone only headless, narrower than a desktop browser's window.
+    let emulation = emulation_of(t, name)?;
+    if emulation.touches() {
+        let why = web::refusal_as(engine, true, &emulation).or_else(|| super::record::phone_refusal(&emulation, headless));
+        if let Some(r) = why.and_then(|e| e.refusal) {
+            return Ok(Some(Refusal { summary: format!("{on}{}", r.summary), ..*r }));
+        }
+    }
+    if let Some(e) = web::refusal(engine, headless) {
         return Err(e);
     }
     if engine == WebEngine::Webkit && t["scale"].is_number() {
@@ -6689,7 +7102,10 @@ fn resolve_variant(role: &'static str, spec: &str, project: &Path, config: &Valu
     } else {
         let p = if Path::new(spec).is_absolute() { PathBuf::from(spec) } else { std::env::current_dir()?.join(spec) };
         if p.is_dir() {
-            let root = std::fs::canonicalize(&p)?;
+            // A folder in a checkout is that checkout, as a git ref's worktree is: strobe.json's
+            // `build.cwd` and `serve.cwd` resolve against its root, whichever folder of it was named.
+            let named = std::fs::canonicalize(&p)?;
+            let root = git::toplevel(&named).and_then(|t| std::fs::canonicalize(t).ok()).unwrap_or(named);
             let sha = git::out(&root, &["rev-parse", "--short=10", "HEAD"]).unwrap_or_default();
             let dirty = git::out(&root, &["status", "--porcelain", "--untracked-files=no"]).is_some_and(|s| !s.is_empty());
             let name = root.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
@@ -7226,14 +7642,11 @@ pub(crate) fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>,
     let pick = |g: &host::CacheGroup, i: usize| (Some(g.mask), Some(all & !g.mask), format!("CCD{i} ({} MB L3, {} CPUs) · runner on the other CPUs", g.l3_mb, g.cpus));
     match spec {
         "none" => Ok((None, None, "unpinned".into())),
-        "auto" => match topo.vcache() {
-            Some(g) => {
-                let i = topo.groups.iter().position(|x| x.mask == g.mask).unwrap_or(0);
-                let (a, b, l) = pick(g, i);
-                Ok((a, b, format!("{l} · V-Cache")))
-            }
-            None => Ok((None, None, "unpinned (no V-Cache CCD)".into())),
-        },
+        // SPEC §9.4 `--pin auto`: within the CPUs strobe may use, by the machine's caches and cores.
+        "auto" => {
+            let p = topo.auto_pin();
+            Ok((p.target, p.reserved, p.reason))
+        }
         s if s.starts_with("ccd") => {
             let i: usize = s[3..].parse().map_err(|_| Error::usage("--pin ccd0|ccd1|…"))?;
             let g = topo.groups.get(i).ok_or_else(|| Error::usage(format!("no {s}: this CPU has {} L3 groups", topo.groups.len())))?;
@@ -7330,9 +7743,12 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     let unit = def.map_or("", |d| d.unit);
     let values: Vec<f64> = s["blocks"].as_array().into_iter().flatten().filter_map(|b| b["values"][metric].as_f64()).filter(|v| v.is_finite()).collect();
     let blocks = s["blocks"].as_array().map_or(0, Vec::len);
-    let mut out = format!("strobe bench {file} · {} · head {} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""), r["variants"][0]["label"].as_str().unwrap_or(""));
+    // A `url()` target's address, not the build, whose code it never loads.
+    let head = s["href"].as_str().filter(|_| r["variants"][0]["kind"] != "url").or(r["variants"][0]["label"].as_str()).unwrap_or("");
+    let mut out = format!("strobe bench {file} · {} · head {head} · {blocks} blocks, nothing compared\n", s["label"].as_str().unwrap_or(""));
     let input = s["input"].as_str().map(|i| format!("{i} input")).unwrap_or_default();
-    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), &input, if s["headless"] == true { "headless (no display)" } else { "" }]);
+    let window = s["window"].as_str().map(|w| format!("window {w}")).unwrap_or_default();
+    let engine = fmt::fields([s["browser"].as_str().unwrap_or(""), &input, &window, if s["headless"] == true { "headless (no display)" } else { "" }]);
     if !engine.is_empty() {
         out += &format!("env    {engine}\n");
     }
@@ -7364,14 +7780,14 @@ fn blocks_text(r: &Value, s: &Value, file: &str) -> String {
     if s["session"] == "mixed" {
         out += "  ! some blocks ran on a locked screen and the rest unlocked: their values do not compare\n";
     }
-    let warns: Vec<&Value> = r["warnings"].as_array().into_iter().flatten().chain(s["warnings"].as_array().into_iter().flatten()).collect();
-    if !warns.is_empty() {
-        out += "\nwarnings\n";
-        for w in warns {
-            out += &format!("{} {:<24}{}\n", if w["level"] == "warn" { "!" } else { "i" }, w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
-        }
-    }
+    out += &warnings_text(s["warnings"].as_array().into_iter().flatten());
     out + "\n"
+}
+
+/// `\nwarnings\n! Id  text` lines, or nothing.
+fn warnings_text<'a>(warns: impl Iterator<Item = &'a Value>) -> String {
+    let lines: String = warns.map(|w| format!("{} {:<24}{}\n", if w["level"] == "warn" { "!" } else { "i" }, w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""))).collect();
+    if lines.is_empty() { lines } else { format!("\nwarnings\n{lines}") }
 }
 
 fn render(r: &Value) -> String {
@@ -7402,6 +7818,9 @@ fn render(r: &Value) -> String {
         }
         if sides {
             out += &format!("strobe bench {file} · {}   {bn} ({})   vs   {hn} ({})\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
+        } else if let Some(href) = s["href"].as_str().filter(|_| base["kind"] != "url" && head["kind"] != "url") {
+            // A `url()` target loads its address whatever the build: the builds are not what ran.
+            out += &format!("strobe bench {file} · {}   {href} on both sides\n", s["label"].as_str().unwrap_or(""));
         } else {
             out += &format!("strobe bench {file} · {}   base {}   head {}\n", s["label"].as_str().unwrap_or(""), base["label"].as_str().unwrap_or(""), head["label"].as_str().unwrap_or(""));
         }
@@ -7420,7 +7839,8 @@ fn render(r: &Value) -> String {
                 _ => String::new(),
             }
         } else {
-            fmt::size(&r["window"])
+            // The series' own window (results from before it: the experiment's last one).
+            s["window"].as_str().map_or_else(|| fmt::size(&r["window"]), str::to_string)
         };
         let window = Some(size).filter(|s| !s.is_empty() && !windowless).map(|s| format!("window {s}")).unwrap_or_default();
         // A headless page drew to no display: no refresh, no visibility to claim.
@@ -7535,13 +7955,8 @@ fn render(r: &Value) -> String {
         if s["pairs"].as_u64().unwrap_or(0) < holm && s["decided"].as_bool() == Some(true) {
             out += &format!("  secondaries can only clear Holm from {holm} pairs: add --pairs {holm} for their verdicts\n");
         }
-        let warns: Vec<Value> = r["warnings"].as_array().cloned().unwrap_or_default().into_iter().chain(s["warnings"].as_array().cloned().unwrap_or_default()).collect();
-        if !warns.is_empty() {
-            out += "\nwarnings\n";
-            for w in warns {
-                out += &format!("{} {:<24}{}\n", if w["level"] == "warn" { "!" } else { "i" }, w["id"].as_str().unwrap_or(""), w["text"].as_str().unwrap_or(""));
-            }
-        }
+        // The series' own warnings; the experiment's are said once, after every series.
+        out += &warnings_text(s["warnings"].as_array().into_iter().flatten());
         let attr = &s["attribution"];
         if sides && (attr["base"].is_string() || attr["head"].is_string()) {
             // Each implementation on its own, with its own kind's view: two share no code to diff.
@@ -7583,6 +7998,10 @@ fn render(r: &Value) -> String {
                 out += &pixel_line(p);
             }
         }
+        out += "\n";
+    }
+    if let Some(w) = r["warnings"].as_array().filter(|w| !w.is_empty()) {
+        out += &warnings_text(w.iter()).replacen("\nwarnings\n", "warnings (the experiment's)\n", 1);
         out += "\n";
     }
     let id = r["id"].as_str().unwrap_or("");

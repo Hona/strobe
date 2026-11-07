@@ -227,7 +227,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         lapped = Instant::now();
         let mut runs: Vec<ScriptRun> = Vec::new();
         // Steady once two runs cost the same CPU (SPEC §9.2).
-        let mut warmup = super::block::Warmup::new(x);
+        let mut warmup = super::block::Warmup::new(s, x);
         let perf = x.counters.then(probe::wakes::Perf::new);
         while warmup.more(runs.len()) {
             let h0 = if heap { heap_mb()? } else { f64::NAN };
@@ -267,9 +267,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
             warmup.after(&runs.iter().map(|r| if r.1.is_finite() { r.1 } else { r.0 }).collect::<Vec<_>>());
         }
         let first = warmup.first().unwrap_or(0);
-        let (strobe_pct, runner_pct) = cost.share(first);
+        let range = first..warmup.measured().end.clamp(first, runs.len());
+        let (strobe_pct, runner_pct) = cost.share(range.clone());
         steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
-        let measured = &runs[first..];
+        let measured = &runs[range.clone()];
         let key = |j: usize| format!("run:{}", first + j);
         let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
         extra.insert("run.duration".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.0)).collect());
@@ -287,7 +288,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         extra.extend(counts);
         let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
         if warmup.unsteady() {
-            values.insert("warmup.unsteady".into(), 1.0);
+            values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
         }
         let private_mb = host::process_tree(pid).iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
         if private_mb > 0.0 {

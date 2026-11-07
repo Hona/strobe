@@ -870,7 +870,7 @@ impl<'a> Doc<'a> {
             }
             let rows = all_rows(s);
             let mut i = 0;
-            for (n, m) in [("All work", "main.work"), ("JavaScript", "main.script"), ("Style", "main.style"), ("Layout", "main.layout"), ("Garbage collection", "main.gc")] {
+            for (n, m) in [("All work", "main.work"), ("JavaScript", "main.script"), ("Style", "main.style"), ("Layout", "main.layout"), ("Paint", "main.paint"), ("Garbage collection", "main.gc")] {
                 if let Some(c) = rows.iter().find(|c| c["metric"] == m) {
                     any_main = true;
                     main += &format!("{}| {n} | {} | {} |\n", self.series_cell(s, i), nb(&value(c, "base")), nb(&value(c, "head")));

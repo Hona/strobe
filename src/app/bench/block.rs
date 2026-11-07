@@ -14,7 +14,8 @@ fn steady(a: f64, b: f64) -> bool {
 /// `Exec::runs` more are measured (a leak run's: twice that). Both steady runs count as measured in a
 /// timing block; an attribution or memory block starts its probes at the steady point and measures
 /// the runs after it, as does a block that never got steady in `MAX_WARMUP` runs. An untimed block
-/// measures its first run.
+/// measures its first run; a `--check` of a case with a reset then runs it once more after the reset
+/// (`again`), unmeasured, so a run that fails from the state the reset leaves fails the check.
 pub(super) struct Warmup {
     /// The first measured run, once decided.
     first: Option<usize>,
@@ -23,18 +24,34 @@ pub(super) struct Warmup {
     /// Whether the two steady runs are measured (timing blocks).
     keeps_pair: bool,
     measured: usize,
+    /// Unmeasured runs after the measured ones: a check's run after its reset.
+    again: usize,
+    /// Unsteady, and the work grew across the runs (`grew`).
+    growth: bool,
 }
 
 impl Warmup {
-    pub(super) fn new(x: &Exec) -> Warmup {
+    pub(super) fn new(s: &Series, x: &Exec) -> Warmup {
         let measured = if x.set == Set::Memory { 2 * x.runs } else { x.runs };
+        // Not a pixels block: its snapshots are the first run's.
+        let again = usize::from(x.untimed && s.reset && x.pixels.is_none());
         // A video block films the one run after the steady point: run 0 is cold, never the filmed one.
-        Warmup { first: None, unsteady: false, untimed: x.untimed, keeps_pair: !matches!(x.set, Set::Attribution | Set::Memory) && !x.video, measured }
+        Warmup { first: None, unsteady: false, untimed: x.untimed, keeps_pair: !matches!(x.set, Set::Attribution | Set::Memory) && !x.video, measured, again, growth: false }
     }
 
     /// Whether another run is due after `ran` runs.
     pub(super) fn more(&self, ran: usize) -> bool {
-        self.first.is_none_or(|f| ran < f + self.measured)
+        self.first.is_none_or(|f| ran < f + self.measured + self.again)
+    }
+
+    /// The measured runs, once warmup is over (before it: none).
+    pub(super) fn measured(&self) -> std::ops::Range<usize> {
+        self.first.map_or(0..0, |f| f..f + self.measured)
+    }
+
+    /// Whether run `i` is a measured one.
+    pub(super) fn measures(&self, i: usize) -> bool {
+        self.measured().contains(&i)
     }
 
     /// The first measured run, once warmup is over.
@@ -62,8 +79,16 @@ impl Warmup {
             return false;
         }
         self.unsteady = !steady;
+        // Unsteady: work that grew run after run (rank correlation over 0.5 and the last run 5% over
+        // the first), or swung back and forth.
+        self.growth = !steady && validity::spearman(work) > 0.5 && work[i] > work[0] * 1.05;
         self.first = Some(if steady && self.keeps_pair { i - 1 } else { i + 1 });
         true
+    }
+
+    /// Never steady because the work grew across the warmup runs, not because it swung (`NotSteady`).
+    pub(super) fn grew(&self) -> bool {
+        self.growth
     }
 }
 

@@ -468,7 +468,17 @@ export interface PageOptions {
   engine?: Engine
   /** Run headless: no display needed (runs through a locked session); frame, input-latency and GPU-use metrics are refused (Headless). */
   headless?: boolean
+  /**
+   * The device the page is on, as `strobe record --emulate`: `"mobile"`, a phone (a 390×844 viewport at scale 3,
+   * headless only; a coarse pointer that does not hover, 5 touch points, the engine's mobile user agent) or
+   * `"touch"`, a desktop with a touch screen. A page is a desktop without it. Chromium and Firefox; WebKit refuses
+   * it (EngineUnsupported). Checked before anything is measured (DeviceMismatch).
+   */
+  emulate?: Emulate
 }
+
+/** What a page target emulates (`PageOptions.emulate`). */
+export type Emulate = "mobile" | "touch"
 
 /** Whether launches find the GPU shader caches earlier launches of the same variant compiled. */
 export type GpuCache = "warm" | "cold"
@@ -604,7 +614,7 @@ export interface Bench<Params extends Record<string, ParamValues>> {
  * driver's own caches are the user's, as for any browser on the machine (SPEC §13.2).
  */
 export function web<P = any>(opts: { url?: FirstPage<P> } & PageOptions & Hooks<P> & Side = {}): Target<P> {
-  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless, ui: opts.ui }
+  return { kind: "web", url: opts.url ?? "/", prepare: opts.prepare, teardown: opts.teardown, viewport: opts.viewport, scale: opts.scale, expect: opts.expect, name: opts.name, cwd: opts.cwd, engine: opts.engine, headless: opts.headless, emulate: opts.emulate, ui: opts.ui }
 }
 
 /** A fixed page; the same for both variants unless a variant is `url:<href>`. */

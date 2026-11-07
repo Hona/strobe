@@ -6,8 +6,6 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::path::Path;
 
-pub mod produced;
-
 /// A run's span with the stretches the bench file left out of it (`ctx.untimed`, SPEC §9.6), on
 /// one clock (the host's, or a trace's): its timed totals, frames and inputs cover the rest.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -211,6 +209,10 @@ pub struct BlockData {
     /// Each run window's `ctx.untimed` stretches (trace clock), by the run's key: what `leave_out_untimed`
     /// took out of it and its phases.
     pub untimed: BTreeMap<String, Vec<(i64, i64)>>,
+    /// Prepaint and paint on the renderer main thread per frame report in each window: (ts, ms), from
+    /// the `SendBeginMainFrameToCommit` stage's breakdown (`main.paint`). Only a report whose main
+    /// thread ran carries it, so a FORKED one adds nothing.
+    pub paint: BTreeMap<String, Vec<(i64, f64)>>,
 }
 
 /// `[a, a + d)` without the stretches `gaps` (sorted), as (start, ns) pieces.
@@ -252,6 +254,7 @@ impl BlockData {
         self.gc.retain(|k, _| run_or_phase(k));
         self.gpu_compile.retain(|k, _| run_or_phase(k));
         self.spans.retain(|k, _| run_or_phase(k));
+        self.paint.retain(|k, _| run_or_phase(k));
         for gaps in self.untimed.values_mut() {
             gaps.sort_unstable();
         }
@@ -270,6 +273,11 @@ impl BlockData {
         for (k, v) in self.shifts.iter_mut() {
             if let Some(gaps) = gaps_of(&self.untimed, k) {
                 v.retain(|s| !inside(&gaps, s.0));
+            }
+        }
+        for (k, v) in self.paint.iter_mut() {
+            if let Some(gaps) = gaps_of(&self.untimed, k) {
+                v.retain(|p| !inside(&gaps, p.0));
             }
         }
         for map in [&mut self.tasks, &mut self.gc, &mut self.gpu_compile] {
@@ -292,13 +300,14 @@ impl BlockData {
         self.untimed.get(run).map_or(0, |gaps| gaps.iter().map(|&(a, b)| (b.min(w.t1) - a.max(w.t0)).max(0)).sum())
     }
 
-    /// Relabels runs before `first` as warmup (`…:run:<i>` → `…:warm:<i>`, phases included): a block
-    /// decides where warmup ended only after the runs, from the work they did.
-    pub fn warm_below(&mut self, first: usize) {
+    /// Relabels the runs outside `measured` as unmeasured (`…:run:<i>` → `…:warm:<i>`, phases included):
+    /// warmup before it, and a check's run after its reset (`block::Warmup`). A block decides where
+    /// warmup ended only after the runs, from the work they did.
+    pub fn measured_only(&mut self, measured: std::ops::Range<usize>) {
         let demote = |key: &str| -> String {
             let Some((head, rest)) = key.split_once(":run:") else { return key.to_string() };
             let index = rest.split(':').next().and_then(|i| i.parse::<usize>().ok());
-            if index.is_some_and(|i| i < first) { format!("{head}:warm:{rest}") } else { key.to_string() }
+            if index.is_some_and(|i| !measured.contains(&i)) { format!("{head}:warm:{rest}") } else { key.to_string() }
         };
         for w in &mut self.windows {
             w.key = demote(&w.key);
@@ -311,6 +320,7 @@ impl BlockData {
         self.gpu_compile = std::mem::take(&mut self.gpu_compile).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.spans = std::mem::take(&mut self.spans).into_iter().map(|(k, v)| (demote(&k), v)).collect();
         self.untimed = std::mem::take(&mut self.untimed).into_iter().map(|(k, v)| (demote(&k), v)).collect();
+        self.paint = std::mem::take(&mut self.paint).into_iter().map(|(k, v)| (demote(&k), v)).collect();
     }
 
     /// `span.<name>` of each run window (ms): the time its spans covered, overlapping ones merged (two
@@ -374,6 +384,10 @@ impl BlockData {
             .collect()
     }
 }
+
+/// The args of a frame report's `SendBeginMainFrameToCommit` stage that split the main thread's frame
+/// work (style, layout, prepaint, paint, …, each in µs).
+const BREAKDOWN: &str = "send_begin_mainframe_to_commit_breakdown";
 
 pub fn read(trace: &Path, token: &str) -> Result<BlockData> {
     let sql = format!(
@@ -442,8 +456,16 @@ select 'span', w.k, s.ts, s.dur, null, s.name
   left join thread_track tt on tt.id = s.track_id left join thread t on t.utid = tt.utid
   join _w w on coalesce(t.upid, extract_arg(tr.dimension_arg_set_id, 'upid')) = w.upid and s.ts >= w.t0 and s.ts + s.dur <= w.t1
   where s.category glob '*blink.user_timing*' and s.dur >= 0 and s.name not glob 'strobe:*'
-    and not (s.dur = 0 and tr.type = 'thread_track_event');
+    and not (s.dur = 0 and tr.type = 'thread_track_event')
+union all
+select 'paint', w.k, c.ts, null, null,
+  coalesce(extract_arg(c.arg_set_id, '{breakdown}.prepaint_us'), 0) + coalesce(extract_arg(c.arg_set_id, '{breakdown}.paint_us'), 0)
+  from slice c join slice s on s.id = c.parent_id join track tr on s.track_id = tr.id
+  join _w w on extract_arg(tr.dimension_arg_set_id, 'upid') = w.upid and c.ts >= w.t0 and c.ts < w.t1
+  where s.name = 'PipelineReporter' and c.name = 'SendBeginMainFrameToCommit'
+    and (extract_arg(c.arg_set_id, '{breakdown}.prepaint_us') is not null or extract_arg(c.arg_set_id, '{breakdown}.paint_us') is not null);
 "#,
+        breakdown = BREAKDOWN,
         cpu = sql_list(&STAGES_RENDERER),
         raster = STAGES_RASTER,
         viz_parent = sql_list(&STAGES_VIZ_PARENT),
@@ -470,6 +492,7 @@ select 'span', w.k, s.ts, s.dur, null, s.name
             "gc" => data.gc.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "gpuc" => data.gpu_compile.entry(key).or_default().push((num(&row[2]), num(&row[3]))),
             "span" => data.spans.entry(key).or_default().push((row[5].clone().unwrap_or_default(), num(&row[2]), num(&row[3]))),
+            "paint" => data.paint.entry(key).or_default().push((num(&row[2]), row[5].as_deref().and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0) / 1e3)),
             _ => {}
         }
     }
@@ -534,6 +557,9 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
         per_run.entry("frames.presented.count").or_default().push(presented.len() as f64);
         per_run.entry("frames.dropped").or_default().push(dropped as f64);
         per_run.entry("frames.partial").or_default().push(v.iter().filter(|s| s.outcome == Outcome::Partial).count() as f64);
+        // Prepaint and paint on the main thread, summed over the run's frame reports: 0 for a run that
+        // painted nothing.
+        per_run.entry("main.paint").or_default().push(data.paint.get(&w.key).map_or(0.0, |p| p.iter().map(|x| x.1).sum()));
         // A lean trace has no RunTask slices: main.busy then comes from the Performance domain.
         if !data.tasks.is_empty() {
             let tasks = data.tasks.get(&w.key).map(Vec::as_slice).unwrap_or(&[]);

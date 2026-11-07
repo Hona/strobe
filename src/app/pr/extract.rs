@@ -479,6 +479,7 @@ pub(super) fn noun(metric: &str) -> String {
         "main.script" => "JavaScript time per run",
         "main.style" => "Style time per run",
         "main.layout" => "Layout time per run",
+        "main.paint" => "Paint time per run",
         "main.gc" => "Garbage collection per run",
         "main.tasks.long" => "Long tasks per run",
         "layout.count" => "Layouts per run",

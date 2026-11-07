@@ -27,9 +27,9 @@
       "additionalProperties": false,
       "properties": {
         "command": { "type": "string" },
-        "cwd": { "type": "string" },
+        "cwd": { "type": "string", "description": "Where the server runs, from the variant's checkout root (not the folder of strobe.json)." },
         "ready": { "type": "string", "description": "A URL that answers once the server is up." },
-        "dir": { "type": "string", "description": "The folder the origin serves, for source maps (else build.output)." }
+        "dir": { "type": "string", "description": "The folder the origin serves, for source maps (else build.output), from the variant's checkout root." }
       }
     },
     "apps": {
@@ -66,8 +66,8 @@
       "type": "object",
       "properties": {
         "command": { "type": "string", "description": "{cache} is a folder shared by every worktree of the repository." },
-        "cwd": { "type": "string" },
-        "output": { "$ref": "#/definitions/perOs" },
+        "cwd": { "type": "string", "description": "Where the build runs, from the variant's checkout root (a git ref's worktree, or the checkout a folder variant is in), not the folder of strobe.json." },
+        "output": { "$ref": "#/definitions/perOs", "description": "What the build writes, from the variant's checkout root." },
         "env": { "type": "object", "additionalProperties": { "type": "string" } }
       }
     },

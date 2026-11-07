@@ -286,7 +286,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     /// One run: its commands, its counts, its phase marks and its span.
     type CliRun = (Vec<Ran>, BTreeMap<String, f64>, Vec<(String, u64)>, metrics::Timed);
     let mut runs: Vec<CliRun> = Vec::new();
-    let mut warmup = super::block::Warmup::new(x);
+    let mut warmup = super::block::Warmup::new(s, x);
     let wall = |r: &[Ran]| -> f64 { r.iter().map(|x| x.wall).sum() };
     let cpu = |r: &[Ran]| sum_of(r, |x| x.usage.cpu_ns.map(|c| c as f64 / 1e6));
     while warmup.more(runs.len()) {
@@ -310,9 +310,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         warmup.after(&runs.iter().map(|r| cpu(&r.0).unwrap_or_else(|| wall(&r.0))).collect::<Vec<_>>());
     }
     let first = warmup.first().unwrap_or(0);
-    let (strobe_pct, runner_pct) = cost.share(first);
+    let range = first..warmup.measured().end.clamp(first, runs.len());
+    let (strobe_pct, runner_pct) = cost.share(range.clone());
     steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
-    let measured = &runs[first..];
+    let measured = &runs[range.clone()];
     let key = |j: usize| format!("run:{}", first + j);
     let per = |f: &dyn Fn(&[Ran]) -> Option<f64>| -> BTreeMap<String, f64> { measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), f(&r.0)?))).collect() };
     let first_why = |f: &dyn Fn(&host::spawn::Usage) -> Option<String>| measured.iter().flat_map(|r| r.0.iter()).find_map(|x| f(&x.usage));
@@ -395,7 +396,7 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
     super::untimed_values(&measured.iter().map(|r| &r.3).collect::<Vec<_>>(), &mut values);
     if warmup.unsteady() {
-        values.insert("warmup.unsteady".into(), 1.0);
+        values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
     }
     for m in declared_metrics(s) {
         if values.contains_key(m) || refused.contains_key(m) || m.starts_with("count.") || m.starts_with("phase.") {

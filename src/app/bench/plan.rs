@@ -55,7 +55,7 @@ pub fn run(args: &Args) -> Result<Output> {
         return Err(Error::usage("no series matches --filter / --target / --params"));
     }
     // What a bench would refuse before anything builds, the plan refuses (or lists, per series) too.
-    super::check_engines(&mut series, &describe, args)?;
+    super::check_engines(&mut series, &describe, args, &variants)?;
     super::display_fit(None, &mut series, &describe, args.has("headless"))?;
     if variants.iter().filter_map(|v| v.target.as_deref()).collect::<std::collections::BTreeSet<_>>().len() == 2 {
         super::implementation_preflight(&describe, &series, &variants, &config, &super::target_projects(&describe)?)?;

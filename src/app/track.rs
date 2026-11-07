@@ -316,6 +316,10 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
             if !s["input"].is_null() {
                 fingerprint["input"] = s["input"].clone();
             }
+            // An emulated phone or touch screen is another device.
+            if !s["emulate"].is_null() {
+                fingerprint["emulate"] = s["emulate"].clone();
+            }
         }
         seed_fingerprint(r, &mut fingerprint);
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });

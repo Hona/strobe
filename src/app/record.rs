@@ -361,9 +361,6 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         values.insert("gpu.vram".into(), v);
     }
     let drawn = drawn_state(&gpu, !on_screen, &mut values, &mut refused);
-    // Headless, the renderer still produced frames off a clock of its own: their count and cost, kept
-    // apart from what reached a display.
-    let produced = if on_screen { None } else { Some(metrics::produced::kept(&metrics::produced::values(&metrics::produced::read(&dir.join("trace.pftrace"), &token)?, "run"), gpu.software)) };
     // The trace's mark times are its own clock; the OS window is the same span on QPC (§6).
     let os_frames = match os_frames {
         Some(_) if !on_screen => json!({ "refused": "Headless: the page ran headless, so nothing it drew reached a display" }),
@@ -386,7 +383,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
         // app with a debug C runtime is a debug build (`DevBuild`).
         "timing": if set == Set::Attribution || video.is_some() { "perturbed" } else if debug.is_some() { "debug build" } else { "clean" }, "debug_runtime": debug,
         "created": now_iso(), "valid": true, "sampling": sampling, "video": video,
-        "headless": !on_screen, "frames_refused": drawn, "produced": produced, "emulate": meta_emulate(&emulation),
+        "headless": !on_screen, "frames_refused": drawn, "emulate": meta_emulate(&emulation),
     });
     refuse_background(&mut meta, qos);
     store::write_json(&dir.join("meta.json"), &meta)?;
@@ -405,13 +402,13 @@ fn parse_emulation(args: &Args) -> Result<chromium::Emulation> {
 }
 
 /// The viewport an emulated phone shows (CSS pixels), at `PHONE_SCALE` headless.
-const PHONE: (u32, u32) = (390, 844);
-const PHONE_SCALE: f64 = 3.0;
+pub(crate) const PHONE: (u32, u32) = (390, 844);
+pub(crate) const PHONE_SCALE: f64 = 3.0;
 
 /// `DisplayTooSmall` for a headed phone: its 390-pixel viewport is narrower than a desktop browser's
 /// smallest window (500 in Chromium on Linux, 492 on Windows, read after the fit), so the page would be
 /// wider than the phone; headless, no window shows.
-fn phone_refusal(emulation: &chromium::Emulation, headless: bool) -> Option<Error> {
+pub(crate) fn phone_refusal(emulation: &chromium::Emulation, headless: bool) -> Option<Error> {
     (emulation.mobile && !headless).then(|| {
         crate::model::Refusal::new(
             crate::model::ValidatorId::DisplayTooSmall,
@@ -1073,7 +1070,7 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
 /// frame or input-latency values; its summary says why.
 fn refuse_background(meta: &mut Value, why: Option<String>) {
     let Some(why) = why else { return };
-    for path in ["/values", "/os_frames/values", "/produced/values"] {
+    for path in ["/values", "/os_frames/values"] {
         if let Some(o) = meta.pointer_mut(path).and_then(Value::as_object_mut) {
             o.retain(|k, _| !super::bench::foreground_metric(k));
         }
@@ -1239,9 +1236,6 @@ fn summary_body(meta: &Value) -> String {
         s += &line;
     } else if let Some(why) = meta["frames_refused"].as_str() {
         s += &format!("frames   refused ({why})\n");
-        if let Some(line) = metrics::produced::line(&meta["produced"]) {
-            s += &line;
-        }
     } else {
         s += &format!(
             "frames   {} presented · {} of vsyncs dropped · display {}\n",
@@ -1262,7 +1256,12 @@ fn summary_body(meta: &Value) -> String {
             fmt::value(get("frames.presented.max"), "ms"),
         );
     }
-    s += &format!("main     {} busy · {} long tasks\n", fmt::value(get("main.busy"), "%"), fmt::value(get("main.tasks.long"), "count"));
+    s += &format!(
+        "main     {} busy · {} long tasks{}\n",
+        fmt::value(get("main.busy"), "%"),
+        fmt::value(get("main.tasks.long"), "count"),
+        if get("main.paint").is_finite() { format!(" · {} prepaint and paint", fmt::value(get("main.paint"), "ms")) } else { String::new() }
+    );
     if get("cpu.app.total").is_finite() {
         s += &format!("cpu      {} of one core, all processes\n", fmt::value(get("cpu.app.total"), "%"));
     }

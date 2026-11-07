@@ -224,6 +224,7 @@ fn short(m: &str) -> (String, Option<(&'static str, &'static str)>) {
         "main.script" => "JavaScript time",
         "main.style" => "style time",
         "main.layout" => "layout time",
+        "main.paint" => "paint time",
         "main.gc" => "garbage collection",
         "main.tasks.long" => return ("long tasks".into(), fewer),
         "layout.count" => return ("layouts".into(), fewer),

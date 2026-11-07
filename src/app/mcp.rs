@@ -106,7 +106,7 @@ const TOOLS: &[Tool] = &[
             ("repeat", "leak run: N runs to the middle snapshot and N more to the last (default 10)"),
             ("seed", "the seed of the bench file's ctx.seed and ctx.random() (a 32-bit unsigned integer): replays a seeded workload; default: drawn, kept in result.json plan.seed and printed"),
             ("bisect", "good..bad: find the commit on the first-parent line that moved the primary (one series)"),
-            ("pin", "auto (V-Cache CCD), none, ccdN, or a CPU list"),
+            ("pin", "auto (the V-Cache CCD; equal CCDs: the first; a hybrid CPU: its fastest cores; otherwise all but the last 1-2 whole cores; fewer than 4 cores, more than 64 CPUs or macOS: unpinned), none, ccdN, or a CPU list"),
             ("power", "high (default: the fastest plan for the run, restored after) or keep"),
             ("reserve-cpus", "auto (default: this user's other processes kept off the target's CPUs during timed blocks, put back after; Windows and Linux), on (every block, check too) or off"),
             ("why", "attribution blocks: auto (default, only when the primary differs), always, never"),

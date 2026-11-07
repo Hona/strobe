@@ -157,6 +157,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         window.width = vp["width"].as_u64().unwrap_or(1400) as u32;
         window.height = vp["height"].as_u64().unwrap_or(900) as u32;
     }
+    // A page that emulates a phone or a touch screen launches as one (SPEC 13.1), as a run case's does.
+    let emulation = if web { emulation_of(&target, &s.target)? } else { chromium::Emulation::default() };
+    phone_window(&mut window, &target, &emulation, headless_of(ctx, s));
     ctx.used = Some(window.clone());
     // An attribution launch reads no pixels, unless they are what ends it.
     let screen = !web && spec["screen"] != false && (!profile || window_until.is_some());
@@ -185,7 +188,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         }
         // A fresh browser and profile per launch: no HTTP cache, storage, service worker or browser
         // shader cache from an earlier visit.
-        _ if web => (web::launch(engine, &window, headless_of(ctx, s), ctx.pin)?, Started { epoch_ms: 0.0, output: None, main: None }),
+        _ if web => (web::launch_as(engine, &window, headless_of(ctx, s), ctx.pin, &emulation)?, Started { epoch_ms: 0.0, output: None, main: None }),
         other => return Err(Error::usage(format!("{}: launch cases need an app, exe, command, web or url target, not {other}", s.case))),
     };
     // A launched target inherits strobe's priority, or sets its own (`BackgroundPriority`).
@@ -224,13 +227,22 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let mocks = super::mocks::Mocks::default();
         let started_ms = if web {
             let page = browser.page()?;
-            // A desktop's input before anything loads (on the blank page): the launch's page runs its code
+            let headless = headless_of(ctx, s);
+            // The emulated device's touch and user agent before anything sizes or loads the page, its
+            // input checked before anything loads (on the blank page): the launch's page runs its code
             // in the timed load. Read again once it is ready.
-            validity::desktop_input(&page)?;
+            page.emulate(&emulation)?;
             // The browser's window takes the viewport before the timed navigation, as a run case's does.
-            if target.get("viewport").is_some_and(Value::is_object) {
-                browser.fit_viewport(&page, window.width, window.height, headless_of(ctx, s))?;
+            if target.get("viewport").is_some_and(Value::is_object) || emulation.mobile {
+                browser.fit_viewport(&page, window.width, window.height, headless)?;
             }
+            if emulation.mobile {
+                if !headless {
+                    page.check_viewport((window.width, window.height))?;
+                }
+                page.emulate_viewport(&emulation, (window.width, window.height), window.scale)?;
+            }
+            validity::emulated_input(&page, &emulation)?;
             let first = if target["prepare"].as_bool() == Some(true) {
                 // `ctx.addInitScript`: in the launch's page before its own scripts, as in a run case.
                 let init = |op: &str, a: &Value| match (op, a["source"].as_str()) {
@@ -338,9 +350,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         if !profile {
             validity::dev_build(&shown_page)?;
         }
-        let input = if web { Some(validity::desktop_input(&shown_page)?) } else { observed_input(ctx, s, &shown_page) };
+        let input = if web { Some(validity::emulated_input(&shown_page, &emulation)?) } else { observed_input(ctx, s, &shown_page) };
         let headless = headless_of(ctx, s);
-        let seen = browser_seen(ctx, s, headless, &browser)?;
+        let seen = browser_seen(ctx, s, v, headless, !profile, &browser)?;
         // Milestones may land after ready (a service that comes up behind the window), and the screen
         // settles after it: lines are collected for 1 s, and up to 3 s while a milestone is missing.
         let mut lines: Vec<Line> = Vec::new();
@@ -452,7 +464,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         same.read(super::journey::When::Setup, &|sel| crate::driver::text(&shown_page, sel, Duration::from_secs(2)))?;
         Ok(Block {
             shown: Some(shown::Shown { start: shown::Screen::default(), end }),
-            same: same.take(0),
+            same: same.take(0..1),
             variant: v.role.to_string(),
             pair,
             values,

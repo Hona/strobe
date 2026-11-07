@@ -43,19 +43,23 @@ pub fn run(args: &Args) -> Result<Output> {
         }
     }
     let build = isolate::build_for_os(&config["build"]);
+    // A variant's builds and server run in its checkout: their `cwd` and `output` are from its root, not
+    // from the folder of strobe.json (SPEC §9.5).
+    let checkout = crate::host::git::toplevel(&root).unwrap_or_else(|| root.clone());
+    let at = |cwd: &serde_json::Value| checkout.join(cwd.as_str().unwrap_or(".")).display().to_string();
     if let Some(cmd) = build["command"].as_str() {
         // An output given per OS that names none for this OS leaves a build here with nothing to launch.
         if build["output"].is_object() && isolate::per_os(&build["output"]).is_none() {
             failed += 1;
             text += &format!("build    {cmd} · output names no path for {}: a variant built here has nothing to launch\n", isolate::os());
         } else {
-            text += &format!("build    {cmd}{}\n", isolate::per_os(&build["output"]).map(|o| format!(" → {o}")).unwrap_or_default());
+            text += &format!("build    {cmd} · in {}{}\n", at(&build["cwd"]), isolate::per_os(&build["output"]).map(|o| format!(" → {}", checkout.join(o).display())).unwrap_or_default());
         }
     }
     if let Some(cmd) = config["serve"]["command"].as_str() {
-        text += &format!("serve    {cmd}\n");
+        text += &format!("serve    {cmd} · in {}\n", at(&config["serve"]["cwd"]));
     }
-    let out = json!({ "project": project, "user": user, "root": root, "apps": apps, "build": build, "serve": config["serve"], "ok": failed == 0 });
+    let out = json!({ "project": project, "user": user, "root": root, "checkout": checkout, "apps": apps, "build": build, "serve": config["serve"], "ok": failed == 0 });
     if failed > 0 {
         return Err(Error::usage(format!("{text}{failed} problem{} for this machine", if failed == 1 { "" } else { "s" })));
     }

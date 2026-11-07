@@ -144,7 +144,12 @@ pub fn run(args: &Args) -> Result<Output> {
                     let failed: Vec<&str> = calibration["checks"].as_array().into_iter().flatten().filter(|c| c["ok"] == false).filter_map(|c| c["case"].as_str()).collect();
                     if failed.is_empty() { String::new() } else { format!(" · outside tolerance: {}", failed.join(", ")) }
                 },
-                calibration["frames_skipped"].as_str().filter(|_| !state["last_display_calibration"].is_object()).map(|why| format!(" · frames unchecked ({why}): headed runs want one on a display with a GPU")).unwrap_or_default()
+                match (calibration["frames_skipped"].as_str(), &state["last_display_calibration"]) {
+                    (Some(why), d) if !d.is_object() => format!(" · frames unchecked ({why}): headed runs want one on a display with a GPU"),
+                    // The headed runs' calibration is the kept display one: a failed one is theirs.
+                    (Some(_), d) if d["ok"] == false => format!(" · the display calibration of {} failed: headed runs want a new one on a display with a GPU", d["at"].as_str().unwrap_or("?")),
+                    _ => String::new(),
+                }
             ))
             .unwrap_or_else(|| "never".into())
     );

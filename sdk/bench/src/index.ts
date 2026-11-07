@@ -88,12 +88,13 @@ export interface Page {
    * A single click is one `interaction.*` sample: from its press when the target changed between the press and the
    * release (it acts on the press: tabs, menus, many native controls; `interaction.n.press` counts them), else from
    * its release. Double and triple clicks are none. Chromium times its press and release events each from its own
-   * trace, two samples.
+   * trace, two samples. On an emulated phone it is a tap (touchstart, 60 ms, touchend; `count` taps 100 ms apart),
+   * the left button only and no `modifiers`.
    */
   click(selector: Element, opts?: ClickOptions): Promise<void>
-  /** Moves the pointer onto `selector` without a click: reveals hover-only controls, or parks the pointer. */
+  /** Moves the pointer onto `selector` without a click: reveals hover-only controls, or parks the pointer. Refused on an emulated phone (DeviceMismatch: a finger does not hover). */
   hover(selector: Element, opts?: Options): Promise<void>
-  /** Moves the pointer to a point in the viewport (CSS pixels), such as away from anything that reacts to hover. */
+  /** Moves the pointer to a point in the viewport (CSS pixels), such as away from anything that reacts to hover. Refused on an emulated phone (DeviceMismatch). */
   move(x: number, y: number, opts?: Options): Promise<void>
   /**
    * Focuses `selector` (clicking it if focus is elsewhere; `""` types where focus is), then sends one key event per character.
@@ -109,7 +110,8 @@ export interface Page {
   /**
    * Presses one key and holds it across other calls until `up`: a game's `"w"`, or `"Shift"` (held modifiers mark later keys).
    * A mouse button: `"Mouse"` (left), `"MouseRight"`, `"MouseMiddle"`, pressed where the pointer is, or first at `opts.at`
-   * (a selector, or `[x, y]` in the viewport); `move` then drags.
+   * (a selector, or `[x, y]` in the viewport); `move` then drags. A mouse button is refused on an emulated phone
+   * (DeviceMismatch): put a finger down, move it and lift it with `drag`.
    */
   down(key: string, opts?: Options & { at?: Element | [number, number] }): Promise<void>
   /** Lets go of a key or mouse button `down` pressed. */
@@ -119,7 +121,10 @@ export interface Page {
    * `[dx, dy]` from the start (CSS pixels; device-independent pixels on native apps), as keyframes spread evenly over
    * `duration` (ms, default 1000) or a function of `t` from 0 to 1 (a wiggle: `t => [40 * Math.sin(t * 12 * Math.PI), 0]`).
    * One move per display frame, paced on strobe's clock without waiting for the app to handle each; `input.rate` and
-   * `input.gap.p95` say how evenly the moves went out. A button `down` already holds stays held.
+   * `input.gap.p95` say how evenly the moves went out. A button `down` already holds stays held. On an emulated
+   * phone a finger goes down on the element, moves and lifts (a selector required: no finger stays down between
+   * calls; `button` left only). Firefox refuses one the browser would pan (EngineUnsupported) unless the page keeps
+   * the touch (touch-action, nothing there scrolls, or it prevents the touch's start or first move).
    */
   drag(selector: Element, path: [number, number][] | ((t: number) => [number, number]), opts?: Options & { duration?: number; button?: "left" | "right" | "middle" }): Promise<void>
   /**
@@ -128,8 +133,14 @@ export interface Page {
    * page, an app's deterministic step), or the two builds differ for reasons of their own.
    */
   snapshot(name: string): Promise<void>
+  /**
+   * Scrolls the element by `by` (and `byX`) CSS pixels at `speed` px/s (default 2000). On an emulated phone a finger
+   * swipes the other way from the element, in swipes that stay inside the viewport, resting before each lift so
+   * the page does not fling; the page scrolls that distance less the browser's touch slop. Chromium only there:
+   * headless Firefox does not pan on touch (EngineUnsupported).
+   */
   scroll(selector: Element, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
-  /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`, with the keys `down` holds (`down("Control")` first: a zoom). */
+  /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`, with the keys `down` holds (`down("Control")` first: a zoom). Refused on an emulated phone (DeviceMismatch): scroll it. */
   wheel(selector: Element, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
   /**
    * Sizes a window through the OS without taking focus, on native apps and headed pages ({@link WindowAction}):
@@ -535,7 +546,9 @@ export interface PageOptions {
    * The device the page is on, as `strobe record --emulate`: `"mobile"`, a phone (a 390×844 viewport at scale 3,
    * headless only; a coarse pointer that does not hover, 5 touch points, the engine's mobile user agent) or
    * `"touch"`, a desktop with a touch screen. A page is a desktop without it. Chromium and Firefox; WebKit refuses
-   * it (EngineUnsupported). Checked before anything is measured (DeviceMismatch).
+   * it (EngineUnsupported). Checked before anything is measured (DeviceMismatch). A phone's page takes touch: `click`
+   * taps, `drag` moves a finger, `scroll` swipes (Chromium), `type` and `press` tap into their element; `hover`, `move`,
+   * `wheel` and a mouse button's `down`/`up` are refused (DeviceMismatch). A touch screen keeps the mouse.
    */
   emulate?: Emulate
   /** {@link Motion}: Chromium's `--force-prefers-reduced-motion`, Firefox's `ui.prefersReducedMotion` or WebKitGTK's GTK setting, in this launch only. Safari and WPE refuse it (EngineUnsupported). */

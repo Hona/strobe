@@ -634,7 +634,7 @@ impl Page {
     /// What a page takes of `emulation` before anything sizes or loads it (the launch gave it the input
     /// devices): for a phone, touch points and touch events (never the mouse's clicks as taps: with that
     /// on, `Input.dispatchMouseEvent` got no reply in headless Chromium, and it adds no media query or
-    /// DOM trait a page reads; strobe's pointer input on a phone is refused until it sends touches), and the mobile
+    /// DOM trait a page reads; strobe sends a phone touches of its own, `driver::touch`), and the mobile
     /// user agent with Chrome for Android's client hints (a target's own `user_agent` replaces the string
     /// and sends no hints of a platform it did not name). The phone's viewport flag waits for
     /// `emulate_viewport`, once the window is sized.

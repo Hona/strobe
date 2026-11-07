@@ -246,7 +246,7 @@ impl Runner {
                     // What the driver said it sent: its send time, a click's press, what it aimed at.
                     let sending = crate::driver::take_sending();
                     a.t_ns = sending.t_ns.unwrap_or(a.t_ns);
-                    (a.press_ns, a.hit, a.measured) = (sending.press_ns, sending.hit, sending.measured);
+                    (a.press_ns, a.hit, a.measured, a.touch) = (sending.press_ns, sending.hit, sending.measured, sending.touch);
                     a.end_ns = host::now_ns();
                     a.outcome = Outcome::of(&served);
                     self.actions.borrow_mut().push(a);

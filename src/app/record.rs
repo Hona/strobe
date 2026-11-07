@@ -238,6 +238,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
             // size once the window is as near it as it goes.
             browser.fit_viewport(&page, PHONE.0, PHONE.1, None)?;
             page.emulate_viewport(&emulation, PHONE, window.scale)?;
+            web::WebPage::from(page.clone()).check_device(PHONE, window.scale, "before it loads")?;
         }
         progress(format!("loading {target}{}", emulated_text(&meta_emulate(&emulation)).map(|t| format!(" as {t}")).unwrap_or_default()));
         page.navigate(&target, Duration::from_secs(60))?;
@@ -527,8 +528,12 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     // A software rasterizer refuses what it drew, metric by metric, below (`SoftwareGpu`).
     let gpu = browser.gpu()?;
     let page = browser.page()?;
-    // Firefox took the phone at launch: its headless window is the phone's viewport.
+    // Firefox took the phone's input at launch; its viewport and device pixels come over BiDi, checked.
     page.emulate(emulation)?;
+    if emulation.mobile {
+        page.emulate_viewport(emulation, PHONE, window.scale)?;
+        page.check_device(PHONE, window.scale, "before it loads")?;
+    }
     progress(format!("loading {target} in {}{}", browser.version(), emulated_text(&meta_emulate(emulation)).map(|t| format!(" as {t}")).unwrap_or_default()));
     page.navigate(target, Duration::from_secs(60))?;
     let input = validity::emulated_input(&page, emulation)?.0;

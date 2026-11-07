@@ -501,10 +501,78 @@ select 'paint', w.k, c.ts, null, null,
     Ok(data)
 }
 
-const DISCRETE: [&str; 8] = ["MOUSE_PRESSED", "MOUSE_RELEASED", "KEY_PRESSED", "KEY_RELEASED", "TOUCH_PRESSED", "TOUCH_RELEASED", "GESTURE_TAP", "GESTURE_TAP_DOWN"];
+const DISCRETE: [&str; 4] = ["MOUSE_PRESSED", "MOUSE_RELEASED", "KEY_PRESSED", "KEY_RELEASED"];
 /// The pointer presses among them (`interaction.n.press`): Chromium times each event to the frame that
 /// showed it, so a click is a press and a release there, each its own sample (SPEC §7.4).
-const PRESSES: [&str; 3] = ["MOUSE_PRESSED", "TOUCH_PRESSED", "GESTURE_TAP_DOWN"];
+const PRESSES: [&str; 1] = ["MOUSE_PRESSED"];
+/// A touch's edges: Chromium reports each as two events at the touch's own time, the touch and the
+/// gesture it starts (a press: touchstart and the tap down; a release: touchend and the tap, which
+/// fires the click), each to the frame that showed it. One sample per edge, as a click's: the later
+/// of the two, when all the edge did had shown.
+const TOUCH_PRESSES: [&str; 2] = ["TOUCH_PRESSED", "GESTURE_TAP_DOWN"];
+const TOUCH_RELEASES: [&str; 2] = ["TOUCH_RELEASED", "GESTURE_TAP"];
+
+/// One touch in a run's `EventLatency` slices: its press edge and its release edge (time and the
+/// latest duration of its events), either outside the run.
+#[derive(Default)]
+struct TouchSeq {
+    press: Option<(i64, i64)>,
+    release: Option<(i64, i64)>,
+}
+
+/// A run's discrete input latencies (ms) and how many are presses, from its `EventLatency` slices
+/// (time, duration, type). Touches are read as sequences in time order: a press event while the touch
+/// is down joins its press edge (the tap down after the touch start), a release event while it has not
+/// pressed again joins its release edge (the tap after the touch end), and a press after a release
+/// starts the next touch, so a double tap is two. Each edge is one sample (`TOUCH_PRESSES`); a touch
+/// that became a scroll (a scroll begins between its press and release, or after its press when its
+/// release is past the run) gives none, as no wheel turn does, and so does a release whose press was
+/// before the run once a scroll went on before it.
+fn discrete_samples(lat: &[(i64, i64, String)]) -> (Vec<f64>, usize) {
+    let mut out: Vec<f64> = Vec::new();
+    let mut presses = 0;
+    let mut events: Vec<&(i64, i64, String)> = lat.iter().collect();
+    // Time order; at one time a press before a release.
+    events.sort_by_key(|e| (e.0, !TOUCH_PRESSES.contains(&e.2.as_str())));
+    let mut touches: Vec<TouchSeq> = Vec::new();
+    for (ts, dur, ty) in events {
+        let ty = ty.as_str();
+        let edge = |e: Option<(i64, i64)>| Some(e.map_or((*ts, *dur), |(t, d)| (t, d.max(*dur))));
+        if DISCRETE.contains(&ty) {
+            out.push(*dur as f64 / 1e6);
+            presses += usize::from(PRESSES.contains(&ty));
+        } else if TOUCH_PRESSES.contains(&ty) {
+            match touches.last_mut() {
+                Some(t) if t.press.is_some() && t.release.is_none() => t.press = edge(t.press),
+                _ => touches.push(TouchSeq { press: edge(None), release: None }),
+            }
+        } else if TOUCH_RELEASES.contains(&ty) {
+            match touches.last_mut() {
+                Some(t) => t.release = edge(t.release),
+                None => touches.push(TouchSeq { press: None, release: edge(None) }),
+            }
+        }
+    }
+    let scroll_begins: Vec<i64> = lat.iter().filter(|l| l.2 == "GESTURE_SCROLL_BEGIN").map(|l| l.0).collect();
+    let scrolling: Vec<i64> = lat.iter().filter(|l| l.2.contains("GESTURE_SCROLL")).map(|l| l.0).collect();
+    for t in touches {
+        let scrolled = match (t.press, t.release) {
+            (Some((p, _)), r) => scroll_begins.iter().any(|s| *s >= p && r.is_none_or(|(r, _)| *s <= r)),
+            (None, Some((r, _))) => scrolling.iter().any(|s| *s <= r),
+            (None, None) => true,
+        };
+        if scrolled {
+            continue;
+        }
+        for (e, press) in [(t.press, true), (t.release, false)] {
+            if let Some((_, d)) = e {
+                out.push(d as f64 / 1e6);
+                presses += usize::from(press);
+            }
+        }
+    }
+    (out, presses)
+}
 
 pub fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
@@ -568,13 +636,13 @@ pub fn block_values(data: &BlockData, prefix: &str, extra: &BTreeMap<String, BTr
             per_run.entry("main.busy").or_default().push(100.0 * busy / span);
             per_run.entry("main.tasks.long").or_default().push(tasks.iter().filter(|t| t.1 > 50_000_000).count() as f64);
         }
-        for (_, dur, ty) in data.latencies.get(&w.key).map(Vec::as_slice).unwrap_or(&[]) {
-            let ms = *dur as f64 / 1e6;
-            if DISCRETE.contains(&ty.as_str()) {
-                discrete.push(ms);
-                presses += usize::from(PRESSES.contains(&ty.as_str()));
-            } else if ty.contains("SCROLL_UPDATE") || ty == "MOUSE_WHEEL" {
-                scroll.push(ms);
+        let lat = data.latencies.get(&w.key).map(Vec::as_slice).unwrap_or(&[]);
+        let (samples, n_press) = discrete_samples(lat);
+        discrete.extend(samples);
+        presses += n_press;
+        for (_, dur, ty) in lat {
+            if ty.contains("SCROLL_UPDATE") || ty == "MOUSE_WHEEL" {
+                scroll.push(*dur as f64 / 1e6);
             }
         }
     }

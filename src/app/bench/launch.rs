@@ -242,6 +242,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
                     page.check_viewport((window.width, window.height))?;
                 }
                 page.emulate_viewport(&emulation, (window.width, window.height), window.scale)?;
+                page.check_device((window.width, window.height), window.scale, "before it loads")?;
             }
             let (_, blank_reduced) = validity::emulated_input(&page, &emulation)?;
             // Reduced motion holds in the browser before the timed load, as its input devices do.

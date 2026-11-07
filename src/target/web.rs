@@ -516,12 +516,57 @@ impl WebPage {
     }
 
     /// The part a page takes once its window shows the declared `viewport` (`fit_viewport` first): a
-    /// phone's viewport flag in Chromium (`chromium::Page::emulate_viewport`).
+    /// phone's viewport flag in Chromium (`chromium::Page::emulate_viewport`), and in Firefox the phone's
+    /// viewport and device pixels (BiDi `browsingContext.setViewport`): its headless window is sized in
+    /// device pixels, which at a scale of 3 left the page some 500×127 CSS pixels.
     pub fn emulate_viewport(&self, emulation: &Emulation, viewport: (u32, u32), scale: Option<f64>) -> Result<()> {
         match self {
             WebPage::Chromium(p) => p.emulate_viewport(emulation, viewport, scale),
+            WebPage::Firefox(p) if emulation.mobile => {
+                let mut params = json!({ "context": p.context, "viewport": { "width": viewport.0, "height": viewport.1 } });
+                if let Some(s) = scale {
+                    params["devicePixelRatio"] = json!(s);
+                }
+                // Headless Firefox took the viewport at once and never answered the command (adais, 10 s):
+                // sent without waiting, then read until the page shows it (at most 2 s; `check_device` judges).
+                p.bidi.post("browsingContext.setViewport", params)?;
+                let until = Instant::now() + Duration::from_secs(2);
+                while Instant::now() < until {
+                    let [w, h, _] = self.device_viewport()?;
+                    if (w - viewport.0 as f64).abs() <= 2.0 && (h - viewport.1 as f64).abs() <= 2.0 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Ok(())
+            }
             WebPage::Firefox(_) | WebPage::Webkit(_) => Ok(()),
         }
+    }
+
+    /// What an emulated phone's page sees of its screen: the visual viewport at its scale (the phone's
+    /// width in CSS pixels, whatever width the page lays out at without a viewport tag) and the device
+    /// pixels per CSS pixel.
+    pub fn device_viewport(&self) -> Result<[f64; 3]> {
+        let v = self.eval("[visualViewport.width * visualViewport.scale, visualViewport.height * visualViewport.scale, devicePixelRatio]")?;
+        Ok(std::array::from_fn(|i| v[i].as_f64().unwrap_or(0.0)))
+    }
+
+    /// `DeviceMismatch` unless an emulated phone's page sees the phone (`device_viewport`): its viewport
+    /// within 2 CSS pixels of `viewport` and its device pixels at `scale` (when one is asked for), read
+    /// before anything loads and again once the first page has. Its series names the phone's size only
+    /// because every block's page was seen to be it.
+    pub fn check_device(&self, viewport: (u32, u32), scale: Option<f64>, when: &str) -> Result<()> {
+        let [w, h, dpr] = self.device_viewport()?;
+        let size_ok = (w - viewport.0 as f64).abs() <= 2.0 && (h - viewport.1 as f64).abs() <= 2.0;
+        let scale_ok = scale.is_none_or(|s| (dpr - s).abs() <= 0.01);
+        if size_ok && scale_ok {
+            return Ok(());
+        }
+        let want = format!("{}×{}{}", viewport.0, viewport.1, scale.map(|s| format!(" at {s}x")).unwrap_or_default());
+        Err(Refusal::new(ValidatorId::DeviceMismatch, format!("the emulated phone's page sees a {w:.0}×{h:.0} viewport at {dpr}x {when}, not the phone's {want}"))
+            .fix("emulate the phone in Chromium, or in a Firefox whose WebDriver BiDi sets a viewport and device pixel ratio (browsingContext.setViewport)")
+            .into())
     }
 
     /// `DisplayTooSmall` when the page is not the `viewport` it was fitted to: a desktop browser keeps its

@@ -154,6 +154,10 @@ pub struct ActionRecord {
     pub selector: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hit: Option<Hit>,
+    /// Its pointer input was a finger's (an emulated phone's page): a click is a tap, a drag a finger
+    /// moved on the glass, a scroll a swipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub touch: bool,
     /// Its other arguments as given (typed text included: views redact it), each string cut at
     /// `ARG_BYTES` and each array at `ARG_ITEMS` (`args_truncated` then says so).
     #[serde(default)]
@@ -227,7 +231,7 @@ impl ActionLog {
         };
         let mut rest = rest;
         let args_truncated = rest.iter_mut().fold(false, |cut, v| bound(v) | cut);
-        Some(ActionRecord { seq: 0, hook, case: None, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, measured: false, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
+        Some(ActionRecord { seq: 0, hook, case: None, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, measured: false, call, selector, hit: None, touch: false, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
     }
 
     /// Each timed run action that ended `ok` gets its latency sample, from the block's per-input outcomes (`each`: by when

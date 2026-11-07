@@ -112,6 +112,9 @@ fn view(title: &str, log: &ActionLog, args: &Args, top: usize) -> (String, Value
         if let Some(c) = &a.case {
             marks += &format!(" · case {c}");
         }
+        if a.touch {
+            marks += " · touch";
+        }
         if let Some(s) = &a.sample {
             marks += &format!(" · sample {}", s.text());
         }

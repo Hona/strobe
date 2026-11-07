@@ -3,6 +3,7 @@
 
 pub mod native;
 pub mod os;
+pub mod touch;
 pub mod window;
 
 use crate::model::{Error, Refusal, Result, ValidatorId};
@@ -29,6 +30,8 @@ pub struct Sending {
     pub measured: bool,
     pub press_ns: Option<u64>,
     pub hit: Option<Hit>,
+    /// The call's pointer input was a finger's (an emulated phone's page), not a mouse's.
+    pub touch: bool,
 }
 
 thread_local! {
@@ -54,6 +57,11 @@ pub(crate) fn sent(t_ns: u64, measured: bool, press: Option<u64>) {
 /// The call's inputs are none a sample may come from after all (keys typed in a burst).
 pub(crate) fn unmeasured() {
     SENDING.with_borrow_mut(|s| s.measured = false);
+}
+
+/// The call's pointer input went out as touch.
+pub(crate) fn touched() {
+    SENDING.with_borrow_mut(|s| s.touch = true);
 }
 
 /// The element the call's input aims at (its first aim).
@@ -368,6 +376,20 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
       for (const [ax, ay] of [[x, y], [x - qx, y - qy], [x + qx, y - qy], [x - qx, y + qy], [x + qx, y + qy]]) if (!reaches(el, ax, ay)) return { ...box, scrolled, x: ax, y: ay }
     }
     return { ...box, scrolled, x: null, y: null, covered: name(cover) }
+  }
+  // Where a finger starts a swipe that scrolls by (dx, dy): on the trailing side of the element's visible part, `edge`
+  // inside it and the viewport (its bottom for a scroll down, where the finger has the most room to travel up), then
+  // stepping toward its centre until a hit test finds the element there; with the viewport's size. No point when none does.
+  s.trail = (q, dx, dy, edge) => {
+    const el = s.find(q), size = [innerWidth, innerHeight]
+    if (!el) return [null, null, ...size]
+    const p = partOf(el), w = p.x1 - p.x0, h = p.y1 - p.y0
+    const at = (d, lo, hi, len, f) => (d > 0 ? hi - edge - f * len : d < 0 ? lo + edge + f * len : (lo + hi) / 2)
+    for (const f of [0, 0.1, 0.2, 0.3, 0.4, 0.5]) {
+      const x = Math.min(Math.max(at(dx, p.x0, p.x1, w, f), edge), size[0] - edge), y = Math.min(Math.max(at(dy, p.y0, p.y1, h, f), edge), size[1] - edge)
+      if (!reaches(el, x, y)) return [x, y, ...size]
+    }
+    return [null, null, ...size]
   }
   // The page's time in strobe's element lookups (`driver.read_ms`): what a read costs its main thread,
   // never the time a wait spends waiting for the page.
@@ -830,6 +852,8 @@ pub struct Driver {
     pub headless: bool,
     /// `page.window` sizing of the browser's window over the block.
     sizer: window::Sizer,
+    /// An emulated phone's page: its pointer input is touch (`touch_input`).
+    touch: std::cell::OnceCell<touch::Touch>,
 }
 
 impl Driver {
@@ -855,6 +879,7 @@ impl Driver {
             base: RefCell::new(None),
             headless: false,
             sizer: window::Sizer::default(),
+            touch: std::cell::OnceCell::new(),
         }
     }
 
@@ -1230,12 +1255,16 @@ impl Driver {
     }
 
     /// Lets go of every key and mouse button `down` (or a drag) left held, so the next run starts with none.
+    /// On a phone, a finger left down lifts, and what strobe touched must have reached the page.
     pub fn release_all(&self) -> Result<()> {
         if let Some(os) = self.os.get() {
             // Where the last move landed after a resize strobe asked for, before the cursor goes back.
             os.look_landed(&self.page)?;
             os.release_all();
             return Ok(());
+        }
+        if let Some(t) = self.touch.get() {
+            self.touch_release(t)?;
         }
         let (mask, _) = self.buttons.get();
         for b in [Button::Left, Button::Right, Button::Middle] {
@@ -1279,12 +1308,22 @@ impl Driver {
         if let Some(os) = self.os.get().filter(|_| os::INPUT.contains(&call)) {
             return self.os_dispatch(os, call, args);
         }
+        if let Some(t) = self.touch.get().filter(|_| touch::takes(call, args)) {
+            return self.touch_dispatch(t, call, args);
+        }
         match call {
             "goto" => {
                 let to = s(0);
                 let url = self.goto_url(&to)?;
+                // What strobe touched in the document it leaves reached it; the next one counts afresh.
+                if let Some(t) = self.touch.get() {
+                    t.delivered(&self.page)?;
+                }
                 sent(crate::host::now_ns(), false, None);
                 self.page.navigate(&url, self.timeout(&opts(1)))?;
+                if let Some(t) = self.touch.get() {
+                    t.rebase(&self.page)?;
+                }
                 self.until(&opts(1))
             }
             "click" => {

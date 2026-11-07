@@ -189,6 +189,9 @@ fn emulation_prefs(emulation: &Emulation, exe: &Path) -> Vec<(String, String)> {
         set("dom.meta-viewport.enabled", "true".into());
         // The `ontouch*` handlers on window and document that sites test for touch, as Firefox for Android has them.
         set("dom.w3c_touch_events.legacy_apis.enabled", "true".into());
+        // A phone's scroll bars overlay the page, as Firefox for Android's do: GTK's classic ones took 12
+        // CSS pixels of a 390×844 phone's viewport on vps (378×832).
+        set("ui.useOverlayScrollbars", "1".into());
     }
     let major = version_of(exe).and_then(|v| v.trim_start_matches("Firefox ").split('.').next().map(str::to_string)).unwrap_or_else(|| "0".into());
     let agent = emulation.user_agent.clone().or_else(|| emulation.mobile.then(|| format!("Mozilla/5.0 (Android 10; Mobile; rv:{major}.0) Gecko/{major}.0 Firefox/{major}.0")));
@@ -482,9 +485,11 @@ impl Page {
         Ok(())
     }
 
-    /// A script every document of the page runs before its own (`script.addPreloadScript`).
+    /// A script every document of the page runs before its own (`script.addPreloadScript`), in a function
+    /// of its own lines: a source whose last line is a comment (a `sourceURL`) would comment out the
+    /// function's closing brace, and the preload would never run.
     pub fn add_init_script(&self, source: &str) -> Result<()> {
-        self.bidi.send("script.addPreloadScript", json!({ "functionDeclaration": format!("() => {{ {source} }}"), "contexts": [self.context] }))?;
+        self.bidi.send("script.addPreloadScript", json!({ "functionDeclaration": format!("() => {{\n{source}\n}}"), "contexts": [self.context] }))?;
         Ok(())
     }
 

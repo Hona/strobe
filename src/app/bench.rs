@@ -4956,6 +4956,7 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                 page.check_viewport((window.width, window.height))?;
             }
             page.emulate_viewport(&emulation, (window.width, window.height), window.scale)?;
+            page.check_device((window.width, window.height), window.scale, "before it loads")?;
         }
         // An app's window (a webview's, an Electron app's) is placed like a native app's and sized to
         // a viewport (DevTools resizes no app window: the OS does). The block records the page's own
@@ -4990,6 +4991,10 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         let mut driver = Driver::new(page.clone(), token.clone());
         driver.pixels = x.pixels.clone();
         driver.headless = headless;
+        // An emulated phone is driven by touch, in every hook (`driver::touch`).
+        if emulation.mobile {
+            driver.touch_input()?;
+        }
         // This run's `count.<name>` values (the bench file's `ctx.count` and the page's counter global)
         // and the run's key, which names its phase marks.
         let hooks = block::Hooks::new(ctx, || browser.processes().iter().map(|p| p.pid).collect());
@@ -5102,7 +5107,8 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                 os.placed(&page, "run")?;
                 os.begin(&page)?;
             }
-            Ok(())
+            // So with an emulated phone's touches: a stretch that loads a page takes its counts along.
+            driver.touch_delivered()
         };
         // A trace's mark goes nearest the stretch's start: the trace's readers cut the run there.
         let edge = |start: bool, n: usize| -> Result<()> {
@@ -5162,11 +5168,6 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                         return Err(
                             Refusal { summary: format!("page.{call}() in a run of a {engine} page measured from outside: {}, and the other side gets the OS's", r.summary), ..r.clone() }.into()
                         );
-                    }
-                    if emulation.mobile
-                        && let Some(r) = phone_pointer(call, &args)
-                    {
-                        return Err(r.into());
                     }
                     if call == "goto" && hooks.in_run() {
                         let before = counters();
@@ -5274,6 +5275,10 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         prepared.set(true);
         if !app {
             page.navigate(&first, Duration::from_secs(60))?;
+            driver.touch_loaded()?;
+            if emulation.mobile {
+                page.check_device((window.width, window.height), window.scale, "once its page loaded")?;
+            }
         }
         init_docs.set(page.documents());
         lap("load");
@@ -5347,8 +5352,14 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         // `page.window` in setup sizes the browser's window: the driver follows its processes from now.
         driver.set_pids(browser.pids());
         // The page's viewport in CSS pixels (device-independent at zoom 1) and its scale, before any
-        // `page.window`.
-        let read_content = || page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
+        // `page.window`. An emulated phone's is its screen (`device_viewport`): a page without a viewport
+        // tag lays out wider than the phone.
+        let read_content = || {
+            if emulation.mobile {
+                return page.device_viewport().ok().map(|[w, h, s]| [w.round(), h.round(), s]);
+            }
+            page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]))
+        };
         let content_before = read_content();
         let setup = ctx.runner.call("setup", json!({}), t, &serve);
         batch::launch_hook_case(ctx, "the bench file's setup")?;
@@ -5367,6 +5378,7 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
             os.delivered(&page)?;
             os.recheck(&page)?;
         }
+        driver.touch_delivered()?;
         // `expect.same` (SPEC §9.10): read after setup (a later case of a batch: before its runs), each run
         // and each reset, outside the runs.
         let first_same = journey::Same::new(s, &ctx.describe["targets"])?;
@@ -7163,25 +7175,6 @@ fn motion_how(kind: &str, engine: WebEngine) -> &'static str {
     }
 }
 
-/// `EngineUnsupported` for a pointer input on an emulated phone's page: strobe's driver sends mouse
-/// events, and a phone is driven by touch, which strobe does not send yet, so a case that clicks, taps,
-/// hovers, drags or scrolls there would measure a mouse on a phone. Keys (`press`, `type` without a
-/// selector to click into) and loads work. None for any other call.
-fn phone_pointer(call: &str, args: &[Value]) -> Option<Refusal> {
-    let has_selector = |v: Option<&Value>| v.is_some_and(|v| !(v.is_null() || v.as_str() == Some("")));
-    let pointer = match call {
-        "click" | "tap" | "hover" | "move" | "down" | "up" | "drag" | "scroll" | "wheel" => true,
-        // Both focus their element with a click unless it already has focus.
-        "type" => has_selector(args.first()),
-        "press" => has_selector(args.get(1).map(|o| &o["selector"])),
-        _ => false,
-    };
-    pointer.then(|| {
-        Refusal::new(ValidatorId::EngineUnsupported, format!("page.{call} on a page that emulates a phone: strobe sends mouse input, and touch input isn't built yet; load cases (and keys with no element to click into) work"))
-            .fix("time the phone's load, or its keys with page.press/type and no selector; measure the pointer case on a desktop target")
-    })
-}
-
 /// The window an emulated phone's page shows when its target declares none: the phone's viewport, at
 /// its scale headless (a headed phone is refused before anything runs, `record::phone_refusal`).
 fn phone_window(window: &mut Window, target: &Value, emulation: &chromium::Emulation, headless: bool) {
@@ -7204,9 +7197,9 @@ fn series_window(ctx: &Ctx, s: &Series, blocks: &[Block]) -> Value {
         return Value::Null;
     }
     let target = &ctx.describe["targets"][&s.target];
-    // An emulated phone is its device's size: a page without a viewport tag lays out wider on it.
-    let mobile = target["emulate"] == "mobile";
-    let size = match blocks.iter().find_map(|b| b.client).filter(|_| !mobile) {
+    // What the blocks' pages were seen to be (an emulated phone's screen, `device_viewport`, which each
+    // block checked before it ran), else the window asked for.
+    let size = match blocks.iter().find_map(|b| b.client) {
         Some(c) => [c[0], c[1], c[2]],
         None => {
             let mut w = ctx.window.clone();

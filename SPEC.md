@@ -551,7 +551,9 @@ on a check of one case answers from that recording (with several, it lists them)
 `prepare` and its `setup`, up to N at a time, so a file of many small cases (a fuzzer's) checks in a
 fraction of the time. Cases share a launch when they run on one target (so one engine, headless
 mode, emulated device and motion) with the same params (a fixture's, a seed folder's and the hooks'
-own), GPU cache and way of measuring (from outside or not), in the file's order; a launch case, a
+own), GPU cache and way of measuring (from outside or not), in the series' order (case names sorted,
+then target and params; not the order the file lists them), up to and including the first with
+`resetCheck: false`; a launch case, a
 `cli()` case and a Linux series that counts instructions in a block of its own each keep a launch of
 their own. Each case runs as alone: run → reset → run → reset when it has a reset (the file's
 `reset`, `bench({ reset })`, when the case has none of its own). After each case strobe checks
@@ -562,9 +564,17 @@ next case of the launch would start, after X's run 2 and its reset, from a diffe
 run 1 did"), its `expect` after the runs (`WrongScreen`), the OS input it was given, the window's
 size (`page.window`), the window's visibility and the browser's own processes. A case that fails ends
 its launch, and the next case gets a fresh one; so does a case with `resetCheck: false` (it passes
-or fails on its own, and no case may start from what it built). A later case whose `expect` does
-not hold on the screen the case before it left is not run there: it runs in a fresh launch, and
-the case before gets the note `batch  after its reset the screen was not what <next> expects …`.
+or fails on its own, and no case may start from what it built). A later case is not run on a screen
+its `expect` does not show, nor on another screen than the launch began on (another title, address
+path or heading, or pixels 20 or more of 64 hash bits apart): it runs in a fresh launch, and the
+case before gets the note `batch  after its reset the screen was not one <next> may start from …`.
+A disturbed guard fails the case after which it was found, and stops the bench. What the start check
+(`ResetIncomplete`) and the screen compare is all a batch holds the cases to: a case can still leave
+behind what neither sees, and the next case then starts from it. Not checked: the page's DOM beyond
+its editable controls, toggles, title, address, headings and pixels; JavaScript globals and the heap;
+event listeners, timers and pending work; `localStorage`, `sessionStorage`, IndexedDB, the Cache API,
+cookies and service workers; the HTTP and GPU caches; a native app's state beyond its tree's editable
+controls and toggles. A file whose cases share such state checks each case alone (no `--batch`).
 A launch that fails before any case ran (its launch, prepare or setup) fails its first case, as
 without `--batch`; three such launches in a row stop the bench (exit 1), as does a disturbed
 guard. `prepare`, a `url` function and `setup` run once for a launch's cases, so a file whose

@@ -88,6 +88,18 @@ impl Screen {
         u64::from_str_radix(self.hash.as_deref()?, 16).ok()
     }
 
+    /// Why this screen is not `from` (a batch's launch start, `--check --batch`): another title, address
+    /// path or heading, or pixels whose hashes are `DIFFERENT_BITS` or more apart. None when it is the same.
+    pub fn drifted(&self, from: &Screen) -> Option<String> {
+        if self.key() != from.key() {
+            return Some(format!("it showed {:?}, the launch began on {:?}", self.label(), from.label()));
+        }
+        match (self.bits(), from.bits()) {
+            (Some(a), Some(b)) if (a ^ b).count_ones() >= DIFFERENT_BITS => Some(format!("its pixels moved from the launch's start ({} of 64 hash bits)", (a ^ b).count_ones())),
+            _ => None,
+        }
+    }
+
     fn is_empty(&self) -> bool {
         self.titles.is_empty() && self.headings.is_empty() && self.url.is_none() && self.hash.is_none()
     }

@@ -208,7 +208,7 @@ pub(super) fn chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x
     if let Err(e) = guard.check("after a block") {
         match &mut result {
             Ok(l) => {
-                l.abort.get_or_insert(e);
+                l.disturbed(e);
             }
             Err(_) => return Err(e),
         }
@@ -412,19 +412,39 @@ fn runs(
     // The window's client area before any `page.window` (`admit_window`).
     let client_before = n.window.as_ref().map(client_of);
     let setup = ctx.runner.call("setup", json!({}), t, &serve);
+    super::batch::launch_hook_case(ctx, "the bench file's setup")?;
     super::super::record::app_gone(n, "before the runs", |_| last())?;
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
-    super::batch::launch_hook_case(ctx, "the bench file's setup")?;
     hooks.check_fixture();
+    // `expect.same` (SPEC §9.10): read through the session after setup (a later case of a batch: before
+    // its runs), each run and each reset. A windowless app shows nothing to read.
+    let first_same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
+    if first_same.on() {
+        first_same.read(super::journey::When::Setup, &|sel| drive.get()?.text(sel, Duration::from_secs(2)))?;
+    }
     lap("setup", steps);
     // What the window shows before the runs: its titles and pixels, and its tree only when setup
     // already drove the app (reading it now would connect strobe to the app for the runs). A later case
     // of a batch starts from what the case before it left (its end).
     let main = n.window.as_ref().map(|w| w.hwnd);
-    let mut start_screen = (!windowless).then(|| {
+    let launch_screen = (!windowless).then(|| {
         let se = drive.session.get().ok_or_else(|| "not read before the runs (the case had not driven the app yet)".to_string());
         shown::native(ctx, s, v, pair, "start", &n.pids(), main, se)
     });
+    let mut start_screen = launch_screen.clone();
+    // The first case's expect, before anything starts for the runs: one block's wrong screen refuses it
+    // here, a batch's first case fails alone (`first_case`).
+    let first_start = match &start_screen {
+        Some(sc) => {
+            let se = drive.session.get();
+            shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))
+        }
+        None => Ok(()),
+    };
+    if !batch {
+        first_start.clone()?;
+    }
+    let mut first_case = Some((first_same, first_start));
     // `--video` (an untimed block): the app's main window from before the first run to after the last.
     if x.video {
         match crate::app::video::Recorder::start(n.window.as_ref(), None, false) {
@@ -463,7 +483,6 @@ fn runs(
         Some(se) => se.wait_change(changes_seen.get(), t),
         None => std::thread::sleep(t),
     };
-    lap("probes", steps);
     let mut ran: Vec<Result<NativeCase>> = Vec::new();
     let mut notes: Vec<(usize, String)> = Vec::new();
     let mut abort: Option<Error> = None;
@@ -479,35 +498,40 @@ fn runs(
         }
         let case_began = Instant::now();
         log_at.push(ctx.runner.log_len());
-        // A later case starts from what the case before it left: on a screen its expect does not show it
-        // is never measured from there, it goes to a fresh launch, and the case before is noted.
+        // A later case starts from what the case before it left: on another screen than the launch began
+        // on, or one its expect does not show, it is never measured from there; it goes to a fresh
+        // launch, and the case before is noted.
         if k > 0
-            && let Some(sc) = &start_screen
+            && let (Some(sc), Some(from)) = (&start_screen, &launch_screen)
         {
             let se = drive.session.get();
-            if let Err(e) = shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5)))) {
-                notes.push((k - 1, super::batch::left_screen(s, &e)));
+            let left = shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5)))).err().map(|e| e.message).or_else(|| sc.drifted(from));
+            if let Some(why) = left {
+                notes.push((k - 1, super::batch::left_screen(s, &why)));
                 break;
             }
         }
         let base = launch_runs;
         let mark = format!("case:{k}:{}", super::batch::mark_name(&s.case));
         let r = (|| -> Result<NativeCase> {
-            let began = Instant::now();
-            // `expect.same` (SPEC §9.10): read through the session before the case's runs, after each run
-            // and each reset. A windowless app shows nothing to read.
-            let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
+            // The first case's runs count from setup's end, as one block's do.
+            let began = if k == 0 { lapped.get() } else { Instant::now() };
+            // `expect.same`: the first case's read after setup (above), a later one's before its runs.
+            let same = match first_case.take() {
+                Some((same, start)) => {
+                    start?;
+                    same
+                }
+                None => {
+                    let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
+                    if same.on() {
+                        same.read(super::journey::When::Setup, &|sel| drive.get()?.text(sel, Duration::from_secs(2)))?;
+                    }
+                    same
+                }
+            };
             let read_same = |when| same.read(when, &|sel| drive.get()?.text(sel, Duration::from_secs(2)));
-            if same.on() {
-                read_same(super::journey::When::Setup)?;
-            }
             let start = start_screen.clone();
-            if k == 0
-                && let Some(sc) = &start
-            {
-                let se = drive.session.get();
-                shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
-            }
             starts.case(s, x, batch.then_some(base));
             if batch {
                 case_marks.push((format!("{mark}:start"), host::now_ns()));
@@ -685,12 +709,14 @@ fn runs(
                 if c.end.is_some() {
                     start_screen = c.end.clone();
                 }
-                ran.push(Ok(c));
-                // The user's own state, after each case of a batch: a disturbed one stops the bench.
+                // The user's own state, after each case of a batch: a disturbed one fails the case and stops
+                // the bench.
                 if batch && let Err(e) = guard.check(&format!("after {}", s.label())) {
+                    ran.push(Err(e.clone()));
                     abort = Some(e);
                     break;
                 }
+                ran.push(Ok(c));
                 // Runs that build on each other on purpose (`resetCheck: false`) leave a state no later case
                 // may start from: the launch ends with it.
                 if !s.reset_check {

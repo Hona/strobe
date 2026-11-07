@@ -106,9 +106,10 @@ pub(super) fn mark_name(case: &str) -> String {
     case.chars().map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '-' }).collect()
 }
 
-/// The note on a case after which the next one's start showed another screen than it expects.
-pub(super) fn left_screen(next: &Series, e: &Error) -> String {
-    format!("after its reset the screen was not what {} expects before its runs ({}), so {} ran in a fresh launch", next.case, e.message, next.case)
+/// The note on a case after which the screen was not one the next case may start from (`why`: another
+/// screen than the launch began on, or not what the next case expects).
+pub(super) fn left_screen(next: &Series, why: &str) -> String {
+    format!("after its reset the screen was not one {} may start from ({why}), so {} ran in a fresh launch", next.case, next.case)
 }
 
 /// The page still answers after a case of a batch: one its case crashed or hung fails that case.
@@ -125,7 +126,7 @@ pub(super) fn meta<'a>(cases: impl Iterator<Item = (&'a Series, std::ops::Range<
     json!(
         cases
             .enumerate()
-            .map(|(i, (s, runs, b))| json!({ "seq": i + 1, "case": s.case, "label": s.label(), "params": s.params, "runs": runs.map(|r| format!("run:{r}")).collect::<Vec<_>>(), "values": b.values, "refused": refusal_map(&b.refused) }))
+            .map(|(i, (s, runs, b))| json!({ "seq": i + 1, "case": s.case, "label": s.label(), "params": s.params, "primary": s.primary, "runs": runs.map(|r| format!("run:{r}")).collect::<Vec<_>>(), "values": b.values, "refused": refusal_map(&b.refused) }))
             .collect::<Vec<_>>()
     )
 }
@@ -138,10 +139,14 @@ pub(super) fn series(ctx: &mut Ctx, b: &mut Batching, all: &[Series], i: usize, 
         return Ok(out);
     }
     let Some(k) = key(ctx, &all[i]) else { return check_series(ctx, &all[i], variants, config) };
-    let chunk: Vec<usize> = (i..all.len())
-        .filter(|j| !b.done.contains_key(j) && !ctx.saved["series"][all[*j].label()]["done"].is_object() && key(ctx, &all[*j]).as_deref() == Some(k.as_str()))
-        .take(b.size)
-        .collect();
+    // A case whose runs build on each other (`resetCheck: false`) ends its launch: the chunk ends with it.
+    let mut chunk: Vec<usize> = Vec::new();
+    for j in (i..all.len()).filter(|j| !b.done.contains_key(j) && !ctx.saved["series"][all[*j].label()]["done"].is_object() && key(ctx, &all[*j]).as_deref() == Some(k.as_str())) {
+        chunk.push(j);
+        if chunk.len() == b.size || !all[j].reset_check {
+            break;
+        }
+    }
     let cases: Vec<Series> = chunk.iter().map(|j| all[*j].clone()).collect();
     let s = &cases[0];
     release_machine(ctx);
@@ -180,9 +185,8 @@ pub(super) fn series(ctx: &mut Ctx, b: &mut Batching, all: &[Series], i: usize, 
             return Ok(out);
         }
     };
-    if launch.cases.iter().any(Result::is_ok) || launch.cases.len() > 1 {
-        b.failures = 0;
-    }
+    // The launch, its prepare and its setup went through.
+    b.failures = 0;
     let actions = launch.actions.unwrap_or_else(|| ctx.runner.take_actions());
     // What the launch took besides its cases (their runs, resets and the checks after them): its start,
     // prepare and setup, reading its trace, its recording and its close, which a launch per case pays

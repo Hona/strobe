@@ -544,6 +544,8 @@ Fewer than 6 pairs never gets a verdict.
   - `bench({ reset })` is the reset of every case without its own: put the page back there.
   - A `prepare`, `url` or `setup` that reads `ctx.case` refuses the batch: set up per case in its `run`.
   - Later cases run warm (`· launch 3.2`); the summary says the time saved. `--check` only: a verdict needs a fresh launch per block.
+  - Cases run in case-name order, not the file's. Not checked between cases: other DOM, JS globals, listeners, timers,
+    storage (local, session, IndexedDB, Cache API, cookies, service workers) and HTTP caches. Cases that share those: no `--batch`.
 - `NotSteady` says whether the work grew (add a reset, or fix what the reset leaves behind) or only swung from run to run (pin CPUs, quiet the machine, more work per run).
 - A `url()` target loads its address whatever the build: `--base <ref> --head .` on one is refused `VariantMismatch` before anything builds (compare `--base url:<a> --head url:<b>`).
 - `--max-time` gives each series an equal share of the time left when it starts (checked from its first look), so the first cannot spend the rest's.

@@ -1131,10 +1131,36 @@ fn engine_summary(meta: &Value) -> String {
 
 pub fn summary_text(meta: &Value) -> String {
     let mut s = summary_body(meta);
+    s += &batch_lines(meta);
     s += &context_lines(meta);
     if meta["video"].is_object() {
         s += &super::video::line(meta["id"].as_str().unwrap_or(""), &meta["video"]);
         s += "timing   perturbed: a video was taken during this recording (its capture and encoder share the machine)\n";
+    }
+    s
+}
+
+/// A batch's recording (`--check --batch`, SPEC §5.6): one launch of several cases, each with its
+/// measured runs, its primary and the time and CPU of its runs, and what it refused.
+fn batch_lines(meta: &Value) -> String {
+    let Some(cases) = meta["batch"].as_array().filter(|a| !a.is_empty()) else { return String::new() };
+    let mut s = format!("cases    {} in this launch (--check --batch), in the order they ran:\n", cases.len());
+    for c in cases {
+        let v = &c["values"];
+        let primary = c["primary"].as_str().unwrap_or("");
+        let shown: Vec<String> = std::iter::once(primary)
+            .chain(["run.duration", "cpu.work"])
+            .filter(|m| !m.is_empty())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter_map(|m| v[m].as_f64().map(|x| format!("{m} {}", fmt::value(x, crate::model::metric(m).map_or("", |d| d.unit)))))
+            .collect();
+        let runs: Vec<&str> = c["runs"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        s += &format!("  {:>2}  {}  {}  {}\n", c["seq"], c["label"].as_str().unwrap_or(""), runs.join(" "), shown.join(" · "));
+        let refused: Vec<&String> = c["refused"].as_object().map(|o| o.keys().collect()).unwrap_or_default();
+        if !refused.is_empty() {
+            s += &format!("      refused {}\n", refused.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", "));
+        }
     }
     s
 }

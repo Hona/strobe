@@ -190,6 +190,7 @@ impl Runner {
         if op == "block" {
             self.actions.borrow_mut().clear(self.seed);
             self.runs = 0;
+            self.read_case = false;
         }
         let hook = Hook::of_op(op);
         if hook == Some(Hook::Run) {

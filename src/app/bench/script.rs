@@ -229,8 +229,9 @@ pub(super) fn chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x
         let root_text = root.display().to_string();
         ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root_text }), t, &serve)?;
         let lapped = Instant::now();
-        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+        let setup = ctx.runner.call("setup", json!({}), t, &serve);
         super::batch::launch_hook_case(ctx, "the bench file's setup")?;
+        setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
         hooks.check_fixture();
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
         let perf = x.counters.then(probe::wakes::Perf::new);

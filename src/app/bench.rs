@@ -1923,13 +1923,14 @@ pub fn run(args: &Args) -> Result<Output> {
         }
     }
     if let Some(h) = halted.as_ref().filter(|_| check || pixels_only) {
-        ctx.warnings.push(validity::warn("Stopped", format!("{}; not run: {}", h.message, not_run.join(", "))));
+        let rest = if not_run.is_empty() { String::new() } else { format!("; not run: {}", not_run.join(", ")) };
+        ctx.warnings.push(validity::warn("Stopped", format!("{}{rest}", h.message)));
     }
     if check {
         let mut series_out = series_out;
         let matrix = journey::matrix(&mut series_out);
         let batched = batching.as_ref().map_or(Value::Null, batch::Batching::summary);
-        let mut out = check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"), (seed, used_random), batched)?;
+        let mut out = check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"), (seed, used_random), batched, halted.is_some())?;
         // A check that stopped (a stop, the user's state disturbed, launches that kept failing) ends with
         // that error's code.
         if let Some(h) = &halted {
@@ -2172,7 +2173,7 @@ fn head_attribution(ctx: &mut Ctx, s: &Series, v: &Variant, runs: usize) -> Resu
 
 /// `seeded`: the experiment's seed, and whether a hook used it.
 #[allow(clippy::too_many_arguments)]
-fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool, seeded: (u32, bool), batched: Value) -> Result<Output> {
+fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool, seeded: (u32, bool), batched: Value, halted: bool) -> Result<Output> {
     // A gap is listed, not failed; journeys whose sides differ (`journey_refusal`) fail.
     let gaps = series.iter().filter(|s| s["kind"] == "gap").count();
     // Refused before it ran (`check_engines`): listed, not failed, as a gap is; the rest of the file ran.
@@ -2349,7 +2350,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     text += &format!("\n{exp}\n");
     let result = json!({
         "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "plan": { "seed": seeded.0, "used_random": seeded.1 },
-        "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "batch": batched, "text": text,
+        "series": series, "warnings": warnings, "passed": failed == 0 && !halted, "parity": matrix, "batch": batched, "text": text,
     });
     store::write_json(&dir.join("result.json"), &result)?;
     let mut out = Output::new(text, result);
@@ -4095,6 +4096,15 @@ impl Launch {
         Launch { cases: vec![r], ..Launch::default() }
     }
 
+    /// The profile's guard found the user's state disturbed after the launch: its last case, which ran
+    /// after the guard last held, fails with it (unless it failed already), and the bench stops.
+    fn disturbed(&mut self, e: Error) {
+        if let Some(c) = self.cases.last_mut().filter(|c| c.is_ok()) {
+            *c = Err(e.clone());
+        }
+        self.abort.get_or_insert(e);
+    }
+
     /// What decides whether the launch runs again: its abort, else its first failed case.
     fn failure(&self) -> Option<&Error> {
         self.abort.as_ref().or_else(|| self.cases.iter().find_map(|c| c.as_ref().err()))
@@ -4196,12 +4206,14 @@ fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
             let display = host::display_state();
             let r = slotted(ctx, cases, v, pair, x);
             if retry_launch(ctx, s, v, failure_of(&r), &mut retries)? {
+                discard(&r);
                 continue;
             }
             // As an on-screen block's below: a headless page runs here, and a busy machine ended its bench.
             if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
                 busy_waits += 1;
                 wait_out_background(ctx, s, v, failure_of(&r))?;
+                discard(&r);
                 continue;
             }
             let end = host::session_locked();
@@ -4256,11 +4268,13 @@ fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         let before = ctx.awake.locks();
         let r = slotted(ctx, cases, v, pair, x);
         if retry_launch(ctx, s, v, failure_of(&r), &mut retries)? {
+            discard(&r);
             continue;
         }
         if !woken && refused_by(&r) == Some(ValidatorId::WindowHidden) {
             progress(format!("  the {} window was hidden (a display off on idle?): waking the display and running the block again", v.role));
             woken = true;
+            discard(&r);
             continue;
         }
         // macOS: someone is using the Mac, so strobe did not take their focus to uncover the window.
@@ -4274,6 +4288,7 @@ fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                 nap(Duration::from_secs(5))?;
             }
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
+            discard(&r);
             continue;
         }
         // macOS, nobody at the Mac: another app came forward during the block (one that opens a window
@@ -4282,6 +4297,7 @@ fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
             hidden_retries += 1;
             progress(format!("  another app came in front of the {} app during the block: discarded, it runs again ({hidden_retries} of {HIDDEN_RETRIES})", v.role));
             nap(Duration::from_secs(5))?;
+            discard(&r);
             continue;
         }
         // Other work (a build, an update) kept the CPUs busy through the speed check: on a shared
@@ -4289,6 +4305,7 @@ fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
             busy_waits += 1;
             wait_out_background(ctx, s, v, failure_of(&r))?;
+            discard(&r);
             continue;
         }
         if ctx.awake.locks() == before && !host::session_locked() {
@@ -5244,9 +5261,10 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
             };
             let r = ctx
                 .runner
-                .call("prepare", json!({ "endpoint": endpoint, "target": target_id, "engine": engine }), t, &serve)
-                .map_err(|e| crate::runner::incomplete("prepare", "prepare", e, "", "fix the target's prepare in the bench file"))?;
+                .call("prepare", json!({ "endpoint": endpoint, "target": target_id, "engine": engine }), t, &serve);
+            // A batch's prepare that read `ctx.case` is refused whether or not it went on to fail.
             batch::launch_hook_case(ctx, "the target's prepare")?;
+            let r = r.map_err(|e| crate::runner::incomplete("prepare", "prepare", e, "", "fix the target's prepare in the bench file"))?;
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 first = join_url(origin(&url), u);
             }
@@ -5331,8 +5349,9 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         // `page.window`.
         let read_content = || page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
         let content_before = read_content();
-        ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        let setup = ctx.runner.call("setup", json!({}), t, &serve);
         batch::launch_hook_case(ctx, "the bench file's setup")?;
+        setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         if late_init.get() && !ctx.warnings.iter().any(|w| w.id == "InitScript") {
             ctx.warnings.push(validity::info("InitScript", format!("{}: {engine} has no preload script: ctx.addInitScript ran after the first document's own scripts; a block that loads another document is refused", s.label())));
         }
@@ -5347,9 +5366,22 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
             os.delivered(&page)?;
             os.recheck(&page)?;
         }
-        // What the page shows once set up: the first case's start. A later case of a batch starts from
-        // what the case before it left (its end).
-        let mut start_screen = shown::page(ctx, s, v, pair, "start", &page);
+        // `expect.same` (SPEC §9.10): read after setup (a later case of a batch: before its runs), each run
+        // and each reset, outside the runs.
+        let first_same = journey::Same::new(s, &ctx.describe["targets"])?;
+        if first_same.on() {
+            first_same.read(journey::When::Setup, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)))?;
+        }
+        // What the page shows once set up: the first case's start, held to its expect before anything is
+        // started for the runs. A later case of a batch starts from what the case before it left (its end).
+        let launch_screen = shown::page(ctx, s, v, pair, "start", &page);
+        let mut start_screen = launch_screen.clone();
+        // One block's wrong screen refuses it here; a batch's first case fails alone (`first_start`).
+        let first_start = shown::expect(&s.expect, &start_screen, "before the runs", true, &|sel| shown::page_shows(&page, sel));
+        if !batch {
+            first_start.clone()?;
+        }
+        let mut first_case = Some((first_same, first_start));
         lap("setup");
         // `--video` (an untimed block): from before the first run to after the last.
         if x.video {
@@ -5682,7 +5714,8 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
         };
         // Firefox's profiler, from the steady point to the end of the runs.
         let mut gecko: Option<probe::gecko::Profiler> = None;
-        lap("probes");
+        // The launch's steps before its cases' runs; the rest (maps, trace, heap, analyse) come after them.
+        let pre = steps.borrow().len();
         // The cases that ran, each its runs or why it failed (a failure ends the launch), and what a
         // later case's start said about the case before it.
         let mut ran: Vec<Result<PageCase>> = Vec::new();
@@ -5699,28 +5732,37 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                 break;
             }
             let case_began = Instant::now();
-            // A later case starts from what the case before it left: on a screen its expect does not
-            // show it is never measured from there, it goes to a fresh launch, and the case before is noted.
-            if k > 0
-                && let Err(e) = shown::expect(&s.expect, &start_screen, "before the runs", true, &|sel| shown::page_shows(&page, sel))
-            {
-                notes.push((k - 1, batch::left_screen(s, &e)));
-                break;
+            // A later case starts from what the case before it left: on another screen than the launch
+            // started on, or one its expect does not show, it is never measured from there; it goes to a
+            // fresh launch, and the case before is noted.
+            if k > 0 {
+                let left = shown::expect(&s.expect, &start_screen, "before the runs", true, &|sel| shown::page_shows(&page, sel)).err().map(|e| e.message).or_else(|| start_screen.drifted(&launch_screen));
+                if let Some(why) = left {
+                    notes.push((k - 1, batch::left_screen(s, &why)));
+                    break;
+                }
             }
             log_at.push(ctx.runner.log_len());
             let base = launch_runs;
             let r = (|| -> Result<PageCase> {
-                let began = Instant::now();
-                // `expect.same` (SPEC §9.10): read before the case's runs, after each run and each reset,
-                // outside the runs.
-                let same = journey::Same::new(s, &ctx.describe["targets"])?;
-                if same.on() {
-                    same.read(journey::When::Setup, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)))?;
-                }
+                // The first case's runs count from setup's end, as one block's do.
+                let began = if k == 0 { lapped.get() } else { Instant::now() };
+                // `expect.same` (SPEC §9.10): read before the case's runs (the first case's after setup,
+                // above), after each run and each reset, outside the runs.
+                let same = match first_case.take() {
+                    Some((same, start)) => {
+                        start?;
+                        same
+                    }
+                    None => {
+                        let same = journey::Same::new(s, &ctx.describe["targets"])?;
+                        if same.on() {
+                            same.read(journey::When::Setup, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)))?;
+                        }
+                        same
+                    }
+                };
                 let start = start_screen.clone();
-                if k == 0 {
-                    shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
-                }
                 starts.case(s, x, batch.then_some(base));
                 loaded_document.set(false);
                 let burst0 = burst_keys.get();
@@ -5813,10 +5855,17 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                         front_page(s, &browser)?;
                     }
                     browser.own()?;
-                    if let Some(first) = &first_slow
-                        && let (Err(e), other) = check()?
-                    {
-                        return Err(slow_check(e, &other, &format!("; right after {}'s runs, after a first slow check ({first}) and a second at speed once the CPUs settled", s.case)));
+                    if let Some(first) = &first_slow {
+                        match check()? {
+                            (Err(e), other) => {
+                                return Err(slow_check(e, &other, &format!("; right after {}'s runs, after a first slow check ({first}) and a second at speed once the CPUs settled", s.case)));
+                            }
+                            (Ok(_), _) if !ctx.warnings.iter().any(|w| w.id == "Throttled" && w.text.starts_with(&format!("{} ·", cases[0].label()))) => ctx.warnings.push(validity::info(
+                                "Throttled",
+                                format!("{} · {side} launch: the first speed check ran slow ({first}); the second, after the CPUs settled, and one after each case's runs ran at speed, so the launch went on", cases[0].label()),
+                            )),
+                            _ => {}
+                        }
                     }
                 }
                 // A batch reads the case's end now, before the next case changes it; one case reads it once
@@ -5841,15 +5890,17 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                     if let Some(e) = &c.end {
                         start_screen = e.clone();
                     }
-                    ran.push(Ok(c));
-                    // The user's own state, after each case of a batch: a disturbed one stops the bench.
+                    // The user's own state, after each case of a batch: a disturbed one fails the case and
+                    // stops the bench.
                     if batch
                         && let Some(g) = &guard
                         && let Err(e) = g.check(&format!("after {}", s.label()))
                     {
+                        ran.push(Err(e.clone()));
                         abort = Some(e);
                         break;
                     }
+                    ran.push(Ok(c));
                     // Runs that build on each other on purpose (`resetCheck: false`) leave a state no later
                     // case may start from: the launch ends with it.
                     if !s.reset_check {
@@ -6284,8 +6335,10 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
                     }
                     os_presents = case_presents;
                 }
-                let mut steps = steps.borrow().clone();
-                steps.extend(c.steps.iter().cloned());
+                // The launch's steps before the runs, the case's warmup and runs, then the launch's after them.
+                let launch_steps = steps.borrow();
+                let steps: Vec<(String, f64)> = launch_steps[..pre].iter().chain(&c.steps).chain(&launch_steps[pre..]).cloned().collect();
+                drop(launch_steps);
                 blocks.push(Block {
                     variant: v.role.to_string(),
                     pair,
@@ -6417,7 +6470,7 @@ fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec
     {
         match &mut result {
             Ok(l) => {
-                l.abort.get_or_insert(e);
+                l.disturbed(e);
             }
             Err(_) => return Err(e),
         }

@@ -46,6 +46,12 @@ pub fn experiment(result: &Value, args: &Args, top: usize) -> Result<Output> {
             if let Ok(dir) = store::resolve(&rec)
                 && let Some(log) = ActionLog::read(&dir.join(store::actions::FILE))?
             {
+                // A batch's launch shares its recording among its cases (`--check --batch`): each case's
+                // own actions, and the first's also the launch's prepare and setup.
+                let log = match (s["batch_seq"].as_u64(), s["case"].as_str()) {
+                    (Some(seq), Some(case)) if Some(rec.as_str()) == s["recording"].as_str() => log.of_case(case, seq == 1),
+                    _ => log,
+                };
                 found.push((format!("{label}{target} · {rec} ({what})"), log));
             }
         }

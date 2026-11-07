@@ -602,6 +602,10 @@ impl Builder {
                 None => a.call.clone(),
             };
             let mut args: Vec<(String, Value)> = vec![("seq".into(), json!(a.seq)), ("hook".into(), json!(a.hook.name()))];
+            // A batch's launch runs several cases (`--check --batch`).
+            if let Some(c) = &a.case {
+                args.push(("case".into(), json!(c)));
+            }
             if let Some(r) = a.run {
                 args.push(("run".into(), json!(r)));
             }

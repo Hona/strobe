@@ -272,12 +272,14 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
                 .hint("install wpewebkit-webdriver (Debian, Ubuntu) or wpewebkit (Fedora, Arch), or run headed (WebKitGTK) with a display")
         } else {
             Error::msg("no WebKitGTK WebDriver found (WebKitWebDriver and WebKitGTK's MiniBrowser)")
-                .hint("install webkit2gtk-driver (Debian, Ubuntu) or webkitgtk6.0 / webkit2gtk4.1 (Fedora, Arch), or run --headless (WPE)")
+                .hint("install webkit2gtk-driver (Debian, Ubuntu) or webkitgtk6.0 / webkit2gtk4.1 (Fedora, Arch)")
         }
     })?;
     if install.flavor == Flavor::Gtk && std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
         return Err(Refusal::new(ValidatorId::NoPresentSource, "a headed WebKitGTK page needs a display, and this session has none (no DISPLAY or WAYLAND_DISPLAY)")
-            .fix("run --headless (WPE WebKit) or on a desktop session")
+            // Not WPE headless: its pages see no pointer at all, which a desktop page target refuses
+            // (`DeviceMismatch`).
+            .fix("run on a desktop session, under a virtual X server (xvfb-run -a strobe ...: frame and present metrics are refused there), or measure the page in Chromium or Firefox")
             .into());
     }
     let mut started = Started::new(&install.browser);

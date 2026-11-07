@@ -3116,7 +3116,7 @@ outside-in pages (phase 1); adapters, `expect.same`, OS input to pages, `InputMi
 | `OutOfView` | a page input's element (a click, hover, drag, scroll, wheel or `down` at it, the click that focuses for `type` or `press`) shows no part in the viewport even scrolled into view: an ancestor clips it away (`overflow: clip`), or what shows is under a pixel. Input aimed there would land beside it; the message names the clipping ancestor (9.6 "Where input aims") |
 | `Covered` | a page input's element shows, but another element is where strobe would aim at every point it tries (its centre, its line boxes, then scrolled to the middle of the viewport, the centre and the centres of its visible part's quarters): a click there would reach that instead, as for a person. The message names the covering element; not transient (an overlay that stays). A native app's covered window is `WindowHidden` (9.6 "Where input aims") |
 | `DisplayTooSmall` | a headed page's declared viewport is larger than this display shows of a page in that browser: its work area (less the menu bar and Dock, the taskbar, panels) less the browser window's own part. Named with the most it can be, the work area and the window's part; checked right after the engine checks, before the first block (and by `strobe plan` from what strobe kept), refusing that series alone, and again when a block fits its window. Not transient: the device, not the variant (9.10 "Declared viewport") |
-| `DeviceMismatch` | a page target's page does not see the input devices its target is for (13.1 "Desktop input is checked"): a desktop page target's page, read once loaded and before `setup`, does not match `(hover: hover)`, `(pointer: fine)` or `(any-pointer: fine)`, or has `navigator.maxTouchPoints` above 0. Its own id, not `VariantMismatch` (two sides set up unlike each other) or `InputMismatch` (two sides got other input calls): it holds for one page alone. The detail lists what the page saw; the fix names the engine's setting (Chromium's `--blink-settings`, Firefox's pointer capabilities, none in WebKit) |
+| `DeviceMismatch` | a page target's page does not see the input devices its target is for (13.1 "Desktop input is checked"): a desktop page target's page, read once loaded and before `setup`, does not match `(hover: hover)`, `(pointer: fine)` or `(any-pointer: fine)`, matches `(any-pointer: coarse)`, has `ontouchstart` or `navigator.maxTouchPoints` above 0 (strobe turns touch off in Chromium and Firefox, so a touch screen passes there). Its own id, not `VariantMismatch` (two sides set up unlike each other, which also refuses sides whose pages saw different input) or `InputMismatch` (two sides got other input calls): it holds for one page alone. The detail lists what the page saw; the fix names the engine's settings (Chromium's `--blink-settings` and `--touch-events`, Firefox's pointer capabilities and touch preferences, none in WebKit) |
 
 Validators are one type in the code (`model::ValidatorId`, these ids), and a refusal is data:
 `Refusal { validator, summary, detail, fix, hidden }`. A refused run's error carries it (exit 4;
@@ -3873,25 +3873,39 @@ resolve to native symbols; the residue stays visible as `unresolved`.
   measurement of that mode is a measurement of strobe. `--disable-blink-features=AutomationControlled` did it until 0.14 and put a dismissable
   "unsupported command-line flag" bar over every headed page (47 points in Edge on macOS, which a
   click could close mid-run, resizing the page).
-- A desktop's input devices, headless too (`--blink-settings=primaryPointerType=4,availablePointerTypes=4,
-  primaryHoverType=2,availableHoverTypes=2`: Blink's `ui::PointerType` fine and `ui::HoverType` hover
-  bits, ui/base/pointer/pointer_device.h). Chromium reports the machine's own: on a machine without a
-  mouse (a server, a VM, headless or not) the page matched `(hover: none)` and neither a fine nor a
-  coarse pointer, and a site took its touch paths (in-view preloading, video autoplay) in a desktop
-  bench, which changed a real fix's result from -5.4% to -12%. DevTools' media emulation has no hover
-  or pointer feature. Chromium keeps only the last `--blink-settings` before the page's URL and ignores
-  one after it (checked on Chromium 156: the first of two around the URL wins, the second of two before
-  it): any other Blink setting strobe passes joins this one, and it replaces one a `STROBE_BROWSER`
-  wrapper puts before strobe's arguments (such a wrapper's hover and pointer settings are no longer
-  needed; its other Blink settings are dropped).
+- A desktop's input devices, headless too, whatever the machine has (`--blink-settings=primaryPointerType=4,
+  availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2,maxTouchPoints=0` and
+  `--touch-events=disabled`): Blink's `ui::PointerType` fine and `ui::HoverType` hover bits
+  (ui/base/pointer/pointer_device.h), Blink's `maxTouchPoints` setting (settings.json5, behind
+  `navigator.maxTouchPoints`) and `switches::kTouchEventFeatureDetection` (content_switches.cc: no
+  `ontouchstart`). Chromium reports the machine's own: on a machine without a mouse (a server, a VM,
+  headless or not) the page matched `(hover: none)` and neither a fine nor a coarse pointer, and a site
+  took its touch paths (in-view preloading, video autoplay) in a desktop bench, which changed a real fix's
+  result from -5.4% to -12%; a touch-screen laptop adds touch points, a coarse pointer and the touch event
+  API, which strobe turns off for a desktop target rather than refuse the machine. DevTools' media
+  emulation has no hover or pointer feature. Each setting was checked by forcing its opposite on vps
+  (Chromium 156): `maxTouchPoints=5` gave 5 touch points, `--touch-events=enabled` `ontouchstart`, and the
+  desktop values took them back. Chromium keeps only the last `--blink-settings` before the page's URL and
+  ignores one after it (the first of two around the URL won, the second of two before it), so `launch`
+  passes one: any `--blink-settings` its caller passes, then the desktop's (which win). It replaces one a
+  `STROBE_BROWSER` wrapper puts before strobe's arguments (such a wrapper's hover and pointer settings are
+  no longer needed; its other Blink settings are dropped).
 - **Desktop input is checked** (`DeviceMismatch`, every engine): a page target's page, once loaded and
-  before `setup` (a launch case's after its timed load, a record's before it records), must match
-  `(hover: hover)`, `(pointer: fine)` and `(any-pointer: fine)` with `navigator.maxTouchPoints` 0, or
-  the block is refused with what the page saw. A series and its blocks say `input: "desktop"` (the
-  result's `input`, the env line's "desktop input"), which is part of a tracked series' fingerprint
-  and the rerun ledger's identity: a series from before is another history. A machine with a touch
-  screen reports touch points and is refused (no engine setting removes them yet). Apps (Electron, a
-  webview, a command's browser) run with the machine's own input: strobe does not launch their browser.
+  before `setup` (a launch case's on the blank page before its timed navigation and again once ready, a
+  record's before it records), must match `(hover: hover)`, `(pointer: fine)` and `(any-pointer: fine)`,
+  not `(any-pointer: coarse)`, with no `ontouchstart` and `navigator.maxTouchPoints` 0, or the block is
+  refused with what the page saw. What a page sees is one class (`validity::InputClass`): `desktop`;
+  `none` (no pointer at all); `touch` (a coarse pointer or touch points, no fine pointer); `hybrid` (a
+  fine pointer with touch beside it). Each block keeps its page's (`input`), a series the one its blocks
+  saw (the result's `input`, the env line's "desktop input"), a recording's meta too. A page series'
+  `input` is part of its tracked fingerprint and the rerun ledger's identity (both sides' targets in an
+  implementation comparison): a series from before is another history.
+- An app's page (Electron, a webview, a command's browser, a `cdp:` browser `record` attaches to) keeps the
+  machine's input: strobe does not launch that browser. It reads and records the class the page saw (a
+  block's, a launch's once ready, a recording's), and warns `NoPointer` when it sees none (the app runs as
+  on a machine without a mouse). Two sides whose pages saw different classes (a page target against an
+  app on a touch-screen laptop) are refused `VariantMismatch`: a series never claims `desktop` unless
+  every page in it saw one.
 
 **Other engines.** A page target runs in one engine (`model::WebEngine`): Chromium over CDP (the
 default), Firefox over WebDriver BiDi, WebKit over WebDriver Classic (refused `EngineUnsupported` on
@@ -3922,7 +3936,9 @@ profilers, heap snapshots, the census, Playwright) asks for the Chromium side an
   folder is the profile's own `downloads` (where `moz:profiler.stop` saves); it sets a desktop's input
   devices, headless too (`ui.primaryPointerCapabilities` and `ui.allPointerCapabilities` 6: LookAndFeel's
   PointerCapabilities Fine 2 | Hover 4; headless Firefox on Linux otherwise matched `(hover: none)` and no
-  pointer, as Chromium did); everything else that shapes how a page runs stays Firefox's default. `remote.prefs.recommended` is off: the remote agent
+  pointer, as Chromium did) and no touch (`dom.maxtouchpoints.testing.value` 0, used for
+  `navigator.maxTouchPoints` in content processes when 0 or more, and `dom.w3c_touch_events.enabled` 0,
+  the touch event API off; both in StaticPrefList.yaml); everything else that shapes how a page runs stays Firefox's default. `remote.prefs.recommended` is off: the remote agent
   would otherwise apply its test preferences (no process priority manager, no hang monitor, focus test
   mode, no window occlusion tracking), which a person's Firefox does not run with (checked in
   `RecommendedPreferences.sys.mjs`). `MOZ_REMOTE_ALLOW_SYSTEM_ACCESS=1` lets strobe read the chrome scope
@@ -4063,7 +4079,9 @@ is the stable path: Safari's BiDi is not usable yet.
   apps refuses `WindowHidden` (the block waits until nobody has used the Mac for a minute).
 - Desktop input: WebKit has no setting for the input devices a page sees, so a page sees the machine's.
   WPE's headless view (2.48, vps) matches `(hover: none)` and no pointer: every WPE headless page block
-  is refused `DeviceMismatch`. Safari and WebKitGTK headed report the machine's mouse or trackpad.
+  is refused `DeviceMismatch`, so a headed WebKitGTK page without a display is told to run under
+  `xvfb-run -a` (its virtual pointer is a mouse) or in Chromium or Firefox, not `--headless`. Safari
+  headed reports the machine's mouse or trackpad.
 - Known differences from a person's browser, where the engine gives no switch: the page's own first
   scripts see `navigator.webdriver` true (no preload), and Safari plays the page's sound (no mute).
 - Frames and interaction as Firefox's (OS presents; macOS ScreenCaptureKit needs Screen Recording);

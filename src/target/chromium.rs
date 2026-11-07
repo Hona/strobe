@@ -119,9 +119,12 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
 /// hovers, in Blink's `ui::PointerType` and `ui::HoverType` bits (ui/base/pointer/pointer_device.h:
 /// `POINTER_TYPE_FINE` 1 << 2, `HOVER_TYPE_HOVER` 1 << 1). Without it a machine with no mouse (a server, a
 /// VM) has its pages match (hover: none) and no pointer. DevTools' media emulation has no hover or pointer.
-/// Chromium keeps only the last `--blink-settings` before the page's URL (one after it is ignored): any
-/// other Blink setting strobe passes joins this list, and it replaces one a `STROBE_BROWSER` wrapper puts first.
-const DESKTOP_INPUT: &str = "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2";
+/// No touch either, as on a desktop without a touch screen: `maxTouchPoints` 0 (Blink's setting behind
+/// `navigator.maxTouchPoints`) and `--touch-events=disabled` (`switches::kTouchEventFeatureDetection`:
+/// no `ontouchstart`). Chromium keeps only the last `--blink-settings` before the page's URL (one after it
+/// is ignored), so `launch` passes one, these after any of the caller's; it replaces one a
+/// `STROBE_BROWSER` wrapper puts first.
+const DESKTOP_INPUT: &str = "primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2,maxTouchPoints=0";
 
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.
 pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[String]) -> Result<Browser> {
@@ -154,7 +157,6 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
         "--disable-search-engine-choice-screen".into(),
         format!("--window-position={},{}", window.x, window.y),
         format!("--window-size={},{}", window.width, window.height),
-        DESKTOP_INPUT.into(),
     ];
     if let Some(s) = window.scale {
         args.push(format!("--force-device-scale-factor={s}"));
@@ -167,7 +169,11 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>, extra: &[Strin
     if unsafe { libc::geteuid() } == 0 {
         args.push("--no-sandbox".into());
     }
-    args.extend(extra.iter().cloned());
+    let (blink, rest): (Vec<&String>, Vec<&String>) = extra.iter().partition(|a| a.starts_with("--blink-settings="));
+    let settings: Vec<&str> = blink.iter().filter_map(|a| a.strip_prefix("--blink-settings=")).chain([DESKTOP_INPUT]).collect();
+    args.extend(rest.into_iter().cloned());
+    args.push(format!("--blink-settings={}", settings.join(",")));
+    args.push("--touch-events=disabled".into());
     args.push("about:blank".into());
     let mut cmd = Command::new(&exe);
     cmd.args(&args).envs(super::isolate::launch_env(&profile)).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());

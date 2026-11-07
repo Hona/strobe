@@ -224,6 +224,9 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         let mocks = super::mocks::Mocks::default();
         let started_ms = if web {
             let page = browser.page()?;
+            // A desktop's input before anything loads (on the blank page): the launch's page runs its code
+            // in the timed load. Read again once it is ready.
+            validity::desktop_input(&page)?;
             // The browser's window takes the viewport before the timed navigation, as a run case's does.
             if target.get("viewport").is_some_and(Value::is_object) {
                 browser.fit_viewport(&page, window.width, window.height, headless_of(ctx, s))?;
@@ -335,9 +338,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
         if !profile {
             validity::dev_build(&shown_page)?;
         }
-        if web {
-            validity::desktop_input(&shown_page)?;
-        }
+        let input = if web { Some(validity::desktop_input(&shown_page)?) } else { observed_input(ctx, s, &shown_page) };
         let headless = headless_of(ctx, s);
         let seen = browser_seen(ctx, s, headless, &browser)?;
         // Milestones may land after ready (a service that comes up behind the window), and the screen
@@ -439,7 +440,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             return Err(r.clone().fix("pick a primary a launch case measures").into());
         }
         let recording = match (profile, page.cdp()) {
-            (true, Some(p)) => Some(save_profiles(ctx, s, v, p, &started, &values)?),
+            (true, Some(p)) => Some(save_profiles(ctx, s, v, p, &started, &values, input)?),
             (true, None) => return Err(Error::msg("internal: an attribution launch of a page without DevTools")),
             (false, _) => None,
         };
@@ -477,6 +478,7 @@ fn once(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, key: &str, profile:
             client,
             browser: Some(seen),
             directions: BTreeMap::new(),
+            input,
             ..Block::default()
         })
     })();
@@ -1188,7 +1190,7 @@ fn node_timing(port: u16) -> Result<Vec<(String, f64)>> {
 
 /// The attribution launch's profiles as a recording: the page's (`cpu-0`) and the main process's
 /// (`cpu-main`), both from their first statement.
-fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, started: &Started, values: &BTreeMap<String, f64>) -> Result<String> {
+fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, started: &Started, values: &BTreeMap<String, f64>, input: Option<validity::InputClass>) -> Result<String> {
     let (id, draft) = store::new_recording()?;
     let dir = draft.dir().to_path_buf();
     let renderer = probe::cpu::stop(page)?;
@@ -1207,7 +1209,7 @@ fn save_profiles(ctx: &Ctx, s: &Series, v: &Variant, page: &chromium::Page, star
         &dir.join("meta.json"),
         &json!({
             "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
-            "probes": "attribution", "runs": 1, "values": values, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
+            "probes": "attribution", "runs": 1, "values": values, "input": input, "created": super::super::record::now_iso(), "valid": true, "env": host::env(),
             "launch": true, "note": "a launch from the first statement: the page's profile and, for app targets, the main process's (cpu-main)",
             // The page's sampler (SPEC §8.3), not the main process's.
             "sampling": probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, probe::cpu::gaps(&renderer)),

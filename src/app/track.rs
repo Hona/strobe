@@ -312,10 +312,10 @@ fn point(args: &Args, file: &Path, root: &Path, commit: &str, blocks: usize, sta
             fingerprint["engine"] = s["engine"].clone();
             fingerprint["browser"] = s["browser"].clone();
             fingerprint["headless"] = s["headless"].clone();
-        }
-        // The input devices its pages saw: a series from before strobe set a desktop's is another history.
-        if !s["input"].is_null() {
-            fingerprint["input"] = s["input"].clone();
+            // The input devices its page saw: a series from before strobe set a desktop's is another history.
+            if !s["input"].is_null() {
+                fingerprint["input"] = s["input"].clone();
+            }
         }
         seed_fingerprint(r, &mut fingerprint);
         let family = json!({ "device": statics["device"], "repo": repo, "file": file_rel, "label": label, "metric": metric });

@@ -77,6 +77,10 @@ const USER_JS: &[(&str, &str)] = &[
     // mouse (a server, a VM) otherwise has its pages match (hover: none) and no pointer.
     ("ui.primaryPointerCapabilities", "6"),
     ("ui.allPointerCapabilities", "6"),
+    // And no touch, as on a desktop without a touch screen (StaticPrefList.yaml): 0 touch points in
+    // content processes, and the touch event API off (0 disabled, 2 autodetect, the default but on macOS).
+    ("dom.maxtouchpoints.testing.value", "0"),
+    ("dom.w3c_touch_events.enabled", "0"),
 ];
 
 /// A Firefox strobe launched, with its one BiDi session. Dropped without `close`, it still ends

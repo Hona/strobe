@@ -67,32 +67,93 @@ pub fn dev_build(page: &Page) -> Result<()> {
     Ok(())
 }
 
-/// What a desktop page target's page sees of its input devices (`input` in a series and its block).
-pub const DESKTOP_INPUT: &str = "desktop";
+/// What a page reads of its input devices: the hover and pointer media queries, touch points and the
+/// touch event API.
+pub struct InputSeen {
+    hover: bool,
+    fine: bool,
+    any_fine: bool,
+    any_coarse: bool,
+    touch_api: bool,
+    touch_points: Option<f64>,
+}
+
+const INPUT_SCRIPT: &str = "[matchMedia('(hover: hover)').matches, matchMedia('(pointer: fine)').matches, matchMedia('(any-pointer: fine)').matches, matchMedia('(any-pointer: coarse)').matches, 'ontouchstart' in window, navigator.maxTouchPoints]";
+
+impl InputSeen {
+    pub fn read(page: &Page) -> Result<InputSeen> {
+        let v = page.eval(INPUT_SCRIPT)?;
+        let b = |i: usize| v[i].as_bool() == Some(true);
+        Ok(InputSeen { hover: b(0), fine: b(1), any_fine: b(2), any_coarse: b(3), touch_api: b(4), touch_points: v[5].as_f64() })
+    }
+
+    /// A desktop: a fine pointer that hovers, nothing coarse, no touch. No pointer at all: `None`. A
+    /// coarse pointer or touch points without a fine pointer: `Touch`. Anything else, a fine pointer with
+    /// touch beside it (a touch-screen laptop): `Hybrid`.
+    pub fn class(&self) -> InputClass {
+        let touch = self.touch_points.is_none_or(|n| n > 0.0);
+        if self.hover && self.fine && self.any_fine && !self.any_coarse && !self.touch_api && !touch {
+            InputClass::Desktop
+        } else if !self.any_fine && !self.any_coarse && !touch {
+            InputClass::None
+        } else if !self.any_fine {
+            InputClass::Touch
+        } else {
+            InputClass::Hybrid
+        }
+    }
+
+    fn text(&self) -> String {
+        let points = self.touch_points.map_or("unknown".to_string(), |n| n.to_string());
+        format!(
+            "(hover: hover) {}, (pointer: fine) {}, (any-pointer: fine) {}, (any-pointer: coarse) {}, ontouchstart {}, navigator.maxTouchPoints {points}",
+            self.hover, self.fine, self.any_fine, self.any_coarse, self.touch_api
+        )
+    }
+}
+
+/// The input devices a page sees (`input` in a series, its blocks and recordings, SPEC 13.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InputClass {
+    Desktop,
+    Hybrid,
+    Touch,
+    None,
+}
+
+impl InputClass {
+    pub fn name(self) -> &'static str {
+        match self {
+            InputClass::Desktop => "desktop",
+            InputClass::Hybrid => "hybrid",
+            InputClass::Touch => "touch",
+            InputClass::None => "none",
+        }
+    }
+}
 
 /// `DeviceMismatch` (SPEC 10.1): a desktop page target sees a desktop's input, a fine pointer that
-/// hovers and no touch points, headless too. A machine without a mouse (a server, a VM) reports
-/// (hover: none) and no pointer, and the page takes its touch paths: another workload than people's
-/// desktops run. strobe sets that input at launch where the engine has a setting for it (Chromium,
-/// Firefox); this reads what the page sees, before anything is measured.
-pub fn desktop_input(page: &Page) -> Result<()> {
-    let v = page.eval("[matchMedia('(hover: hover)').matches, matchMedia('(pointer: fine)').matches, matchMedia('(any-pointer: fine)').matches, navigator.maxTouchPoints]")?;
-    let queries = ["(hover: hover)", "(pointer: fine)", "(any-pointer: fine)"];
-    let touch = v[3].as_f64();
-    let mut wrong: Vec<String> = queries.iter().enumerate().filter(|(i, _)| v[*i].as_bool() != Some(true)).map(|(_, q)| format!("{q} does not match")).collect();
-    if touch != Some(0.0) {
-        wrong.push(format!("navigator.maxTouchPoints is {}", v[3]));
+/// hovers, nothing coarse and no touch, headless too. A machine without a mouse (a server, a VM)
+/// reports (hover: none) and no pointer, a touch-screen laptop touch points, and the page takes its touch
+/// paths: another workload than people's desktops run. strobe sets that input at launch where the engine
+/// has a setting for it (Chromium, Firefox); this reads what the page sees, before anything is measured.
+pub fn desktop_input(page: &Page) -> Result<InputClass> {
+    let seen = InputSeen::read(page)?;
+    let class = seen.class();
+    if class == InputClass::Desktop {
+        return Ok(class);
     }
-    if wrong.is_empty() {
-        return Ok(());
-    }
-    let seen = queries.iter().enumerate().map(|(i, q)| format!("{q} {}", v[i])).chain([format!("navigator.maxTouchPoints {}", v[3])]).collect::<Vec<_>>().join(", ");
     let fix = match page.engine() {
-        WebEngine::Chromium => "strobe launches Chromium with a fine pointer that hovers (--blink-settings): a touch screen adds touch points, and a STROBE_BROWSER wrapper that rewrites strobe's arguments can drop them; measure on a machine without a touch screen, with strobe's arguments as they are",
-        WebEngine::Firefox => "strobe sets Firefox's ui.primaryPointerCapabilities and ui.allPointerCapabilities to a fine pointer that hovers: a touch screen adds touch points; measure on a machine without one",
+        WebEngine::Chromium => {
+            "strobe launches Chromium with a fine pointer that hovers and no touch (--blink-settings, --touch-events=disabled): a STROBE_BROWSER wrapper that rewrites strobe's arguments can drop them; run with strobe's arguments as they are"
+        }
+        WebEngine::Firefox => {
+            "strobe sets Firefox's ui.*PointerCapabilities, dom.maxtouchpoints.testing.value and dom.w3c_touch_events.enabled to a fine pointer that hovers and no touch: a STROBE_FIREFOX build or wrapper that changes the profile's preferences undoes them"
+        }
         WebEngine::Webkit => "WebKit has no setting for the input devices a page sees: measure it headed on a machine with a mouse and no touch screen, or the page in Chromium or Firefox",
     };
-    Err(Refusal::new(ValidatorId::DeviceMismatch, format!("a desktop page target's page does not see a desktop's input: {}", wrong.join(", "))).detail(format!("the page sees {seen}")).fix(fix).into())
+    Err(Refusal::new(ValidatorId::DeviceMismatch, format!("a desktop page target's page sees {} input, not a desktop's", class.name())).detail(format!("the page sees {}", seen.text())).fix(fix).into())
 }
 
 /// The fixed speed-check workload; returns its time in ms (median of 3).

@@ -218,8 +218,18 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     } else if !attach {
         progress(format!("loading {target}"));
         page.navigate(&target, Duration::from_secs(60))?;
-        validity::desktop_input(&page.clone().into())?;
     }
+    // A page strobe launched sees a desktop's input (`DeviceMismatch`); an app's page or an attached
+    // browser the machine's, as it saw it.
+    let input = if app.is_none() && !attach {
+        Some(validity::desktop_input(&page.clone().into())?)
+    } else {
+        let seen = validity::InputSeen::read(&page.clone().into()).ok().map(|s| s.class());
+        if seen == Some(validity::InputClass::None) {
+            progress("! NoPointer  the page sees no pointer ((hover: none), neither a fine nor a coarse one), as on a machine without a mouse: it runs its touch or no-hover paths");
+        }
+        seen
+    };
     let gpu = gpu?;
     // A launched target inherits strobe's priority; an attached one runs as its user left it.
     let qos = if attach { None } else { host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid))) };
@@ -236,7 +246,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     let token = id.trim_start_matches("rec_").to_string();
     let driver = Driver::new(page.clone().into(), token.clone());
     if set == Set::Memory {
-        let meta = memory(&page, &browser, &dir, &id, &target, for_ms)?;
+        let meta = memory(&page, &browser, &dir, &id, &target, for_ms, input)?;
         if on_screen && (awake.locks() > 0 || host::session_locked()) {
             return Err(validity::locked());
         }
@@ -341,7 +351,7 @@ fn recorded(args: &Args, target: String) -> Result<Output> {
     };
     let mut meta = json!({
         "id": id, "kind": "record", "target": target, "probes": set, "token": token, "duration_ms": for_ms,
-        "browser": version, "gpu": gpu, "env": host::env(), "trace_bytes": bytes, "values": values, "refused": refused, "os": os, "os_frames": os_frames,
+        "browser": version, "gpu": gpu, "input": input, "env": host::env(), "trace_bytes": bytes, "values": values, "refused": refused, "os": os, "os_frames": os_frames,
         "phases": metrics::phase_frames(&data).keys().collect::<Vec<_>>(),
         // Rule 3: timing taken with profilers on describes the profiled target, not the target; an
         // app with a debug C runtime is a debug build (`DevBuild`).
@@ -408,7 +418,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     let page = browser.page()?;
     progress(format!("loading {target} in {}", browser.version()));
     page.navigate(target, Duration::from_secs(60))?;
-    validity::desktop_input(&page)?;
+    let input = validity::desktop_input(&page)?;
     let qos = host::background_qos(None).or_else(|| host::background_qos(Some(browser.pid())));
     validity::window_visible(&page)?;
     if !headless && host::session_locked() {
@@ -523,7 +533,7 @@ fn engine_page(args: &Args, engine: WebEngine, target: &str, set: Set, for_ms: u
     browser.close();
     let attributed = set == Set::Attribution;
     let mut meta = json!({
-        "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "headless": headless,
+        "id": id, "kind": "record", "target": target, "probes": set, "token": if attributed { token.as_str() } else { "" }, "duration_ms": for_ms, "engine": engine, "input": input, "headless": headless,
         "browser": version, "gpu": gpu, "env": host::env(), "values": values, "refused": refused, "os": os, "os_frames": os_frames, "phases": [],
         // Rule 3: timing taken with the profiler on describes the profiled page.
         "timing": if attributed || video.is_some() { "perturbed" } else { "clean" }, "created": now_iso(), "valid": true, "patched_browser": patched, "video": video,
@@ -886,7 +896,7 @@ fn wait_line(n: &crate::target::native::Native, re: &regex_lite::Regex, timeout:
 /// start, the middle and the end (S0, S1, S2), no trace (SPEC §8.6). Objects allocated between S0 and
 /// S1 that are still alive in S2 are the leak suspects. Each census comes before its snapshot, which
 /// raises the memory of the process it serializes; OS memory is reported from the first census only.
-fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::Path, id: &str, target: &str, for_ms: u64) -> Result<Value> {
+fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::Path, id: &str, target: &str, for_ms: u64, input: Option<validity::InputClass>) -> Result<Value> {
     page.send("HeapProfiler.enable", json!({}))?;
     let started = std::time::Instant::now();
     progress(format!("recording {id} for {}: a heap snapshot at the start, middle and end", fmt::ms_duration(for_ms)));
@@ -926,7 +936,7 @@ fn memory(page: &chromium::Page, browser: &chromium::Browser, dir: &std::path::P
     let values: BTreeMap<&str, f64> = values.into_iter().filter(|(_, v)| v.is_finite()).collect();
     let meta = json!({
         "id": id, "kind": "record", "target": target, "probes": "memory", "token": "", "duration_ms": for_ms,
-        "browser": browser.version, "env": host::env(), "values": values, "census": census,
+        "browser": browser.version, "input": input, "env": host::env(), "values": values, "census": census,
         "leaks": { "count": leaks["count"], "self_size": leaks["self_size"], "retained_size": leaks["retained_size"], "classes_total": leaks["classes_total"] },
         "created": now_iso(), "valid": true,
     });

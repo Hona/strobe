@@ -105,7 +105,7 @@ const hookFor = (h: any, target: string) => (typeof h === "function" ? h : h && 
 function gapOf(c: any, target: string): { missing: string; reason: string } | undefined {
   if (c.run && typeof c.run === "object" && typeof c.run[target] !== "function") return { missing: "run", reason: `the case gives no run for ${target}` }
   // A launch case runs no setup; its `before` hook runs before the launch.
-  const sources = [c.launch ? c.launch.before : spec.setup, hookFor(c.run, target), hookFor(c.reset, target)].filter((f) => typeof f === "function").map(String)
+  const sources = [c.launch ? c.launch.before : spec.setup, hookFor(c.run, target), c.launch ? undefined : hookFor(c.reset ?? spec.reset, target)].filter((f) => typeof f === "function").map(String)
   sources.push(JSON.stringify(plain(c.expect ?? null)), JSON.stringify(plain(c.launch?.until ?? null)))
   const own = ui(target)
   const seen = new Set<string>()
@@ -218,6 +218,23 @@ function canonical(value: unknown): string {
 // The hook about to run starts its stream (`ctx.random()`) over.
 const stream = (hook: string) => void (state.stream = mulberry32(mix(state.caseSeed, hook)))
 
+// A batch (`--check --batch`) runs several cases in one launch: a run or reset of another case than the
+// last one's switches the hooks' case and seed to it.
+function forCase(name: string) {
+  if (!name || name === state.case) return
+  state.case = name
+  state.caseSeed = mix(state.seed, `${name}\n${canonical(state.params)}`)
+}
+
+// A launch hook (prepare, a `url` function, setup) runs once for every case of a batch's launch: reading
+// `ctx.case` there is said (`read_case`), and strobe refuses the batch.
+let launchHook = false
+let readCase = false
+const caseOf = () => {
+  if (launchHook) readCase = true
+  return state.case
+}
+
 // `ctx.seed` and `ctx.random()` on a hook's context. A getter, so only reading it counts as using it
 // (never copy a context with spread syntax: that reads every getter).
 const seeded = <T extends object>(ctx: T): T =>
@@ -253,7 +270,9 @@ const uiOf = (ctx: () => object) =>
 const context = (): any => seeded({
   page,
   ui: uiOf(context),
-  case: state.case,
+  get case() {
+    return caseOf()
+  },
   params: state.params,
   target: state.target,
   variant: state.variant,
@@ -313,7 +332,9 @@ function addInitScript(script: string | Function, arg?: unknown) {
 // Playwright connects over CDP, which only Chromium speaks: on another engine reading it throws, typed
 // as strobe's EngineUnsupported refusal, so the bench names the cause instead of a null page failing later.
 const prepareContext = () => seeded({
-  case: state.case,
+  get case() {
+    return caseOf()
+  },
   params: state.params,
   target: state.target,
   variant: state.variant,
@@ -364,10 +385,11 @@ function describe() {
       {
         primary: c.primary ?? (c.launch ? "launch.ready" : undefined),
         metrics: c.metrics ?? [],
-        reset: !!c.reset,
+        // A run case without a reset of its own takes the file's (`bench({ reset })`).
+        reset: !c.launch && !!(c.reset ?? spec.reset),
         adapted: c.run && typeof c.run === "object" ? "steps" : null,
         gaps: Object.fromEntries(Object.keys(spec.targets ?? {}).flatMap((t) => { const g = gapOf(c, t); return g ? [[t, g]] : [] })),
-        typos: [...new Set([spec.setup, c.launch?.before, c.run, c.reset].flatMap((h) => (typeof h === "function" ? [h] : h && typeof h === "object" ? Object.values(h) : [])).flatMap((f: any) => typos(String(f))))],
+        typos: [...new Set([spec.setup, c.launch?.before, c.run, c.reset ?? (c.launch ? undefined : spec.reset)].flatMap((h) => (typeof h === "function" ? [h] : h && typeof h === "object" ? Object.values(h) : [])).flatMap((f: any) => typos(String(f))))],
         resetCheck: c.resetCheck !== false,
         targets: c.targets,
         timeout: c.timeout,
@@ -595,23 +617,37 @@ async function handle(op: string, args: any) {
       return true
     case "prepare": {
       const target = spec.targets[state.target]
-      if (target?.prepare) {
-        state.devtools = args.endpoint ? { endpoint: args.endpoint, target: args.target } : null
-        if (args.endpoint) state.playwright = await playwright(args.endpoint, args.target)
-        stream("prepare")
-        state.prepared = await target.prepare(prepareContext())
+      launchHook = true
+      try {
+        if (target?.prepare) {
+          state.devtools = args.endpoint ? { endpoint: args.endpoint, target: args.target } : null
+          if (args.endpoint) state.playwright = await playwright(args.endpoint, args.target)
+          stream("prepare")
+          state.prepared = await target.prepare(prepareContext())
+        }
+        // A `url` function names the first page from what `prepare` returned, so the block loads one page.
+        if (typeof target?.url === "function") stream("url")
+        const url =
+          typeof target?.url === "function"
+            ? await target.url(seeded({ get case() { return caseOf() }, prepared: state.prepared, params: state.params }))
+            : undefined
+        return { url }
+      } finally {
+        launchHook = false
       }
-      // A `url` function names the first page from what `prepare` returned, so the block loads one page.
-      if (typeof target?.url === "function") stream("url")
-      const url = typeof target?.url === "function" ? await target.url(seeded({ case: state.case, prepared: state.prepared, params: state.params })) : undefined
-      return { url }
     }
     case "setup":
       stream("setup")
-      // Not spread: that would read `ctx.seed`.
-      await spec.setup?.(Object.assign(context(), { addInitScript }))
+      launchHook = true
+      try {
+        // Not spread: that would read `ctx.seed`.
+        await spec.setup?.(Object.assign(context(), { addInitScript }))
+      } finally {
+        launchHook = false
+      }
       return true
     case "run": {
+      forCase(args.case)
       const run = hookFor(spec.cases[args.case].run, state.target)
       if (!run) throw new ParityGap(state.target, `run for ${args.case}`)
       stream("run")
@@ -619,7 +655,9 @@ async function handle(op: string, args: any) {
       return true
     }
     case "reset": {
-      const reset = hookFor(spec.cases[args.case].reset, state.target)
+      forCase(args.case)
+      const c = spec.cases[args.case]
+      const reset = hookFor(c.reset ?? (c.launch ? undefined : spec.reset), state.target)
       if (!reset) return false
       stream("reset")
       await reset(context())
@@ -663,7 +701,12 @@ createInterface({ input: socket }).on("line", (line) => {
     return
   }
   // `used_random`: some hook so far read `ctx.seed` or called `ctx.random()` (the ledger's rule, SPEC §14.2).
-  const used = () => (state.usedRandom ? { used_random: true } : {})
+  // `read_case`: a launch hook read `ctx.case` in this call (said once).
+  const used = () => {
+    const out = { ...(state.usedRandom ? { used_random: true } : {}), ...(readCase ? { read_case: true } : {}) }
+    readCase = false
+    return out
+  }
   handle(message.op, message.args ?? {}).then(
     (ok) => write({ id: message.id, ok: ok ?? null, ...used() }),
     (error) =>

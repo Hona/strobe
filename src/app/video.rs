@@ -167,6 +167,12 @@ impl Stopped {
                 let end = marks.iter().find(|(k, _)| k.split(":phase:").nth(1).and_then(|r| r.strip_suffix(":end")) == Some(name) && k.split(":phase:").next() == key.split(":phase:").next());
                 markers.push(json!({ "t_s": at(*t), "press_s": Value::Null, "end_s": end.map(|e| at(e.1)), "kind": "phase", "label": name, "reaction_s": Value::Null }));
             }
+            // A batch's case (`case:<i>:<name>:start|end`): one launch filmed for several cases.
+            if let Some(case) = key.strip_prefix("case:").and_then(|r| r.strip_suffix(":start")) {
+                let end = marks.iter().find(|(k, _)| k.strip_prefix("case:").and_then(|r| r.strip_suffix(":end")) == Some(case));
+                let label = case.split_once(':').map_or(case, |(_, name)| name);
+                markers.push(json!({ "t_s": at(*t), "press_s": Value::Null, "end_s": end.map(|e| at(e.1)), "kind": "case", "label": label, "reaction_s": Value::Null }));
+            }
         }
         markers.sort_by(|a, b| a["t_s"].as_f64().unwrap_or(0.0).total_cmp(&b["t_s"].as_f64().unwrap_or(0.0)));
         let runs: Vec<Value> = runs.iter().map(|(k, a, b, measured)| json!({ "run": k, "start_s": at(*a), "end_s": at(*b), "measured": measured })).collect();

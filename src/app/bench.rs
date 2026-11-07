@@ -25,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+mod batch;
 mod block;
 mod cli;
 mod fixture;
@@ -1092,6 +1093,8 @@ struct Ctx<'a> {
     folder_notes: isolate::Notes,
     /// The CPUs the target is not pinned to (the runner's): a fixture runs there.
     runner_pin: Option<u64>,
+    /// `--check --batch N`: up to N run cases per launch (`batch`).
+    batch: Option<usize>,
 }
 
 /// Every block's reservation, merged for the experiment's context.
@@ -1406,6 +1409,35 @@ pub fn run(args: &Args) -> Result<Output> {
             return Err(Error::usage(format!("--video: {why}: drop one of them")));
         }
     }
+    // `--batch N`: many cases per launch, in `--check` only (SPEC §5.6). In timed blocks the fresh launch
+    // is what a verdict is made of, and a profile, a leak run or a pixel comparison is one case's block.
+    let batch = match args.get("batch") {
+        None => None,
+        Some(n) => {
+            let why = if !args.has("check") {
+                Some("it runs many cases in one launch, which only --check may: a timed block is one fresh launch per case")
+            } else if args.get("why") == Some("always") {
+                Some("--why always profiles each case in a block of its own")
+            } else if args.has("pixels") || args.has("pixels-only") {
+                Some("--pixels compares each case's snapshots from a launch of its own")
+            } else if args.get("probes") == Some("memory") {
+                Some("--probes memory is a leak run of one case per launch")
+            } else if args.has("blocks") || args.has("aa") {
+                Some("--blocks and --aa time fresh launches")
+            } else if args.get("base").is_some() {
+                Some("--base runs an implementation comparison's check, one launch per case and side")
+            } else {
+                None
+            };
+            if let Some(why) = why {
+                return Err(Error::usage(format!("--batch: {why}: drop one of them")));
+            }
+            match args.num("batch")? {
+                Some(b) if b.is_finite() && b >= 1.0 && b.fract() == 0.0 => Some(b as usize),
+                _ => return Err(Error::usage(format!("--batch: a whole number of cases per launch from 1, not {}", n))),
+            }
+        }
+    };
     if args.has("plan") {
         return plan::run(args);
     }
@@ -1545,7 +1577,9 @@ pub fn run(args: &Args) -> Result<Output> {
         folders_first: Default::default(),
         folder_notes: Default::default(),
         runner_pin,
+        batch,
     };
+    ctx.runner.batch(batch.is_some());
     // What `--resume` needs from another folder: the bench file and directory variants as full paths.
     ctx.saved["args"]["pos"] = json!([file]);
     for k in ["head", "base"] {
@@ -1759,9 +1793,17 @@ pub fn run(args: &Args) -> Result<Output> {
     {
         return Err(Error::usage(format!("{}: a cli() case has no attribution recording: its commands end inside each run (profile a long-running command with strobe record pid:<n> --probes deep)", s.case)));
     }
+    let mut batching = batch.map(batch::Batching::new);
     for (i, s) in series.iter().enumerate() {
         if halted.is_none() && stop_requested() {
             halted = Some(stop_error());
+        }
+        // A series a batch's launch already ran is done, a stop since or not.
+        if let Some(out) = batching.as_mut().and_then(|b| b.take(i)) {
+            checkpoint(&mut ctx, &s.label(), json!({ "done": out }));
+            all_decided &= out["decided"].as_bool().unwrap_or(false);
+            series_out.push(out);
+            continue;
         }
         if halted.is_some() {
             not_run.push(s.label());
@@ -1786,7 +1828,16 @@ pub fn run(args: &Args) -> Result<Output> {
             continue;
         }
         let r = match mode {
-            Mode::Check => check_series(&mut ctx, s, &mut variants, &config),
+            Mode::Check => match batching.as_mut() {
+                Some(b) => {
+                    let r = batch::series(&mut ctx, b, &series, i, &mut variants, &config);
+                    if let Some(e) = b.halt.take() {
+                        halted = Some(e);
+                    }
+                    r
+                }
+                None => check_series(&mut ctx, s, &mut variants, &config),
+            },
             Mode::Pixels => (|| -> Result<Value> {
                 release_machine(&mut ctx);
                 ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
@@ -1877,7 +1928,14 @@ pub fn run(args: &Args) -> Result<Output> {
     if check {
         let mut series_out = series_out;
         let matrix = journey::matrix(&mut series_out);
-        return check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"), (seed, used_random));
+        let batched = batching.as_ref().map_or(Value::Null, batch::Batching::summary);
+        let mut out = check_output(&exp, &dir, &file, series_out, ctx.warnings, matrix, args.has("require-parity"), (seed, used_random), batched)?;
+        // A check that stopped (a stop, the user's state disturbed, launches that kept failing) ends with
+        // that error's code.
+        if let Some(h) = &halted {
+            out.code = h.code;
+        }
+        return Ok(out);
     }
     if pixels_only {
         let mut text = String::new();
@@ -1976,7 +2034,6 @@ pub fn run(args: &Args) -> Result<Output> {
 /// with what timed out and its screenshot, and the next case runs.
 fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Value) -> Result<Value> {
     // A `cli()` case with `--why always` was refused before the series ran (`run`).
-    let target = ctx.describe["targets"][&s.target].clone();
     release_machine(ctx);
     ctx.reg.set("preparing", format!("{}: builds and servers", s.label()));
     prepare_all(ctx, s, variants, config)?;
@@ -2002,17 +2059,33 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
         Ok(b)
     });
     let elapsed_ms = started.elapsed().as_secs_f64() * 1e3;
+    let log = runner_log(ctx, log_from, None);
+    let sent = ctx.runner.take_actions();
+    check_case(ctx, s, variants, r, elapsed_ms, log, sent, film)
+}
+
+/// What the bench file's hooks printed from byte `from` of runner.log (to `to`): console.log and error.
+fn runner_log(ctx: &Ctx, from: u64, to: Option<u64>) -> Vec<String> {
+    std::fs::read(&ctx.runner.log)
+        .ok()
+        .and_then(|b| {
+            let end = to.map_or(b.len(), |t| (t as usize).min(b.len()));
+            b.get(from as usize..end).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect())
+        })
+        .unwrap_or_default()
+}
+
+/// A `--check` case's result from its block (or why it failed), its time, what its hooks printed and
+/// the actions they sent (`sent`, written beside the result when no recording keeps them).
+#[allow(clippy::too_many_arguments)]
+fn check_case(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], r: Result<Block>, elapsed_ms: f64, log: Vec<String>, sent: store::actions::ActionLog, film: bool) -> Result<Value> {
+    let target = ctx.describe["targets"][&s.target].clone();
     // An adapter entry the target lacks, met as the case ran: a gap in the matrix, not a failure.
     if let Err(e) = &r
         && e.validator() == Some(ValidatorId::ParityGap)
     {
         return Ok(runtime_gap(ctx, s, variants, 0, e, &[]));
     }
-    // What the bench file's hooks printed during this case (console.log/error go to runner.log).
-    let log: Vec<String> = std::fs::read(&ctx.runner.log)
-        .ok()
-        .and_then(|b| b.get(log_from as usize..).map(|b| String::from_utf8_lossy(b).lines().map(str::trim_end).filter(|l| !l.trim().is_empty()).map(str::to_string).collect()))
-        .unwrap_or_default();
     let overhead = r.as_ref().ok().and_then(|b| b.overhead.clone());
     let (same, ops) = r.as_ref().map(|b| (json!(b.same), json!(b.ops))).unwrap_or_default();
     let input = r.as_ref().map(|b| input_of(std::slice::from_ref(b))).unwrap_or(Value::Null);
@@ -2028,7 +2101,6 @@ fn check_series(ctx: &mut Ctx, s: &Series, variants: &mut [Variant], config: &Va
     // A case without a recording (it failed, or its kind keeps none: a script, a command, a launch, a
     // page measured from outside) keeps what its hooks sent beside the result. A recording took its own.
     let mut actions = Value::Null;
-    let sent = ctx.runner.take_actions();
     if recording.is_null() && !sent.is_empty() {
         // A journey's label names no target: each side's file is its own.
         let name = if s.sides.is_some() { format!("{} {}", s.label(), s.target) } else { s.label() };
@@ -2100,7 +2172,7 @@ fn head_attribution(ctx: &mut Ctx, s: &Series, v: &Variant, runs: usize) -> Resu
 
 /// `seeded`: the experiment's seed, and whether a hook used it.
 #[allow(clippy::too_many_arguments)]
-fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool, seeded: (u32, bool)) -> Result<Output> {
+fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings: Vec<Warning>, matrix: Option<String>, require_parity: bool, seeded: (u32, bool), batched: Value) -> Result<Output> {
     // A gap is listed, not failed; journeys whose sides differ (`journey_refusal`) fail.
     let gaps = series.iter().filter(|s| s["kind"] == "gap").count();
     // Refused before it ran (`check_engines`): listed, not failed, as a gap is; the rest of the file ran.
@@ -2166,9 +2238,11 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
             .collect::<Vec<_>>()
             .join(" · ");
         let secs = s["elapsed_ms"].as_f64().unwrap_or(0.0) / 1e3;
+        // Which of a batch's launches ran the case, and its place there.
+        let launch = s["batch_id"].as_u64().map(|id| format!(" · launch {id}.{}", s["batch_seq"])).unwrap_or_default();
         if s["passed"] == true {
             text += &format!(
-                "pass  {}  {value}  {secs:.1} s{}{}{}{}\n",
+                "pass  {}  {value}  {secs:.1} s{launch}{}{}{}{}\n",
                 s["label"].as_str().unwrap_or(""),
                 s["engine"].as_str().filter(|e| *e != "chromium").map(|e| format!(" · {e}")).unwrap_or_default(),
                 // An emulated device's window says what it was (`390×844 @3x · emulated mobile`), and
@@ -2216,7 +2290,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
                 }
             }
         } else {
-            text += &format!("FAIL  {}  {secs:.1} s\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
+            text += &format!("FAIL  {}  {secs:.1} s{launch}\n      {}\n", s["label"].as_str().unwrap_or(""), s["error"].as_str().unwrap_or("").replace('\n', "\n      "));
             if let Some(h) = s["hint"].as_str() {
                 text += &format!("      fix: {h}\n");
             }
@@ -2226,6 +2300,9 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         }
         for (why, names) in &reasons {
             text += &format!("      refused  {}: {why}\n", names.join(", "));
+        }
+        if let Some(note) = s["batch_note"].as_str() {
+            text += &format!("      batch  {note}\n");
         }
         if let Some(r) = s["journey_refusal"].as_object() {
             text += &format!("      refused  this journey: {}: {}\n", r.get("validator").and_then(Value::as_str).unwrap_or(""), r.get("summary").and_then(Value::as_str).unwrap_or(""));
@@ -2246,13 +2323,22 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
         text += &format!("\nparity\n{m}");
     }
     let ran = series.len() - gaps - before;
+    // A batch's later cases run in a launch the cases before them warmed.
+    let cold = if batched.is_object() {
+        "one run each, no warmup: a launch's first case runs cold, the others in a page or app the cases before them warmed"
+    } else {
+        "one cold run each, no warmup: values include first-run work such as shader compiles"
+    };
     text += &format!(
-        "\n{} of {ran} cases passed{}{}{} (one cold run each, no warmup: values include first-run work such as shader compiles; a case with a reset runs once more after it, unmeasured; nothing compared)\n",
+        "\n{} of {ran} cases passed{}{}{} ({cold}; a case with a reset runs once more after it, unmeasured; nothing compared)\n",
         ran - failed,
         if refused > 0 { format!(", {refused} where the targets' journeys differ") } else { String::new() },
         if gaps > 0 { format!(", {gaps} parity gap{}", if gaps == 1 { "" } else { "s" }) } else { String::new() },
         if before > 0 { format!(", {before} refused before running") } else { String::new() }
     );
+    if let Some(l) = batch::line(&batched) {
+        text += &l;
+    }
     // A failure of a seeded workload is replayed by its seed.
     if failed > 0 && seeded.1 {
         text += &format!("seed  {0} (the hooks used ctx.random() or ctx.seed): add --seed {0} to replay the same workload\n", seeded.0);
@@ -2263,7 +2349,7 @@ fn check_output(exp: &str, dir: &Path, file: &Path, series: Vec<Value>, warnings
     text += &format!("\n{exp}\n");
     let result = json!({
         "id": exp, "kind": "check", "file": file, "created": super::record::now_iso(), "plan": { "seed": seeded.0, "used_random": seeded.1 },
-        "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "text": text,
+        "series": series, "warnings": warnings, "passed": failed == 0, "parity": matrix, "batch": batched, "text": text,
     });
     store::write_json(&dir.join("result.json"), &result)?;
     let mut out = Output::new(text, result);
@@ -3975,54 +4061,147 @@ const HIDDEN_RETRIES: u32 = 5;
 /// that keeps the CPUs busy (`Background`) for up to about an hour. The block's own checks still refuse
 /// anything else.
 fn block_on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
-    as_side(ctx, s, v, |ctx, s| on_screen(ctx, s, v, pair, x))
+    one(launch_on_screen(ctx, std::slice::from_ref(s), v, pair, x))
+}
+
+/// `block_on_screen` for the cases one launch runs in order (`--check --batch`, SPEC §5.6): a block per
+/// case it ran. Whatever runs a block again (a launch that failed and passes, a lock, a hidden window,
+/// busy CPUs) runs the whole launch again.
+fn launch_on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    as_sides(ctx, cases, v, |ctx, cases| on_screen(ctx, cases, v, pair, x))
+}
+
+/// What one launch did: a block per case it ran, in order (one case, or a chunk of them with `--check
+/// --batch`, SPEC §5.6). A case that failed ended the launch: the cases after it wait for a fresh one.
+#[derive(Default)]
+struct Launch {
+    cases: Vec<Result<Block>>,
+    /// The profile's guard found the user's own state disturbed after a case: the bench stops.
+    abort: Option<Error>,
+    /// What a later case's start said about the case before it (by its place), which then went to a
+    /// fresh launch.
+    notes: Vec<(usize, String)>,
+    /// A batch's action log, which its recording kept: each case's part goes to its result.
+    actions: Option<store::actions::ActionLog>,
+    /// runner.log's length as each case began: what its hooks printed.
+    log_at: Vec<u64>,
+    /// The time each case took in the launch (ms): its runs, resets and the checks after them.
+    case_ms: Vec<f64>,
+}
+
+impl Launch {
+    /// One case's block as a launch of it.
+    fn of(r: Result<Block>) -> Launch {
+        Launch { cases: vec![r], ..Launch::default() }
+    }
+
+    /// What decides whether the launch runs again: its abort, else its first failed case.
+    fn failure(&self) -> Option<&Error> {
+        self.abort.as_ref().or_else(|| self.cases.iter().find_map(|c| c.as_ref().err()))
+    }
+
+    /// The recordings its cases kept (a batch's cases share one).
+    fn recordings(&self) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for id in self.cases.iter().flatten().filter_map(|b| b.recording.clone()) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+}
+
+/// A batch's action log, as its launch's recording kept it (`Launch::actions`).
+type Kept = Option<store::actions::ActionLog>;
+
+/// A launch's failure, or its first failed case's.
+fn failure_of(r: &Result<Launch>) -> Option<&Error> {
+    match r {
+        Err(e) => Some(e),
+        Ok(l) => l.failure(),
+    }
+}
+
+/// One case's launch as its block.
+fn one(r: Result<Launch>) -> Result<Block> {
+    let l = r?;
+    if let Some(e) = l.abort {
+        return Err(e);
+    }
+    l.cases.into_iter().next().unwrap_or_else(|| Err(Error::msg("internal: a launch ran no case")))
 }
 
 /// The series as one side runs it (SPEC §9.10): its own target, that target's `expect` with the
 /// case's over it, and the strobe.json of the target's own project (`cwd`) as `ctx.config` while `f`
 /// runs. A series of builds runs as it is, with its target's project.
 fn as_side<T>(ctx: &mut Ctx, s: &Series, v: &Variant, f: impl FnOnce(&mut Ctx, &Series) -> Result<T>) -> Result<T> {
+    as_sides(ctx, std::slice::from_ref(s), v, |ctx, cases| f(ctx, &cases[0]))
+}
+
+/// `as_side` for the cases of one launch (one target: `batch::key`).
+fn as_sides<T>(ctx: &mut Ctx, cases: &[Series], v: &Variant, f: impl FnOnce(&mut Ctx, &[Series]) -> Result<T>) -> Result<T> {
     // Its `expect` and a launch's `until` through that target's adapter (`@name`).
-    let side = match v.target.as_deref().filter(|t| *t != s.target) {
+    let sided = match v.target.as_deref().filter(|t| *t != cases[0].target) {
         Some(t) => {
             let targets = &ctx.describe["targets"];
-            let launch = journey::side_launch(&ctx.describe["cases"][&s.case]["launch"], targets, t)?;
-            Some(Series { target: t.to_string(), expect: journey::side_expect(targets, &s.case_expect, t)?, launch, ..s.clone() })
+            let mut out = Vec::new();
+            for s in cases {
+                let launch = journey::side_launch(&ctx.describe["cases"][&s.case]["launch"], targets, t)?;
+                out.push(Series { target: t.to_string(), expect: journey::side_expect(targets, &s.case_expect, t)?, launch, ..s.clone() });
+            }
+            Some(out)
         }
         None => None,
     };
-    let s = side.as_ref().unwrap_or(s);
-    let saved = ctx.projects.get(&s.target).map(|(_, c)| c.clone()).map(|c| std::mem::replace(&mut ctx.config, c));
-    let r = f(ctx, s);
+    let cases = sided.as_deref().unwrap_or(cases);
+    let saved = ctx.projects.get(&cases[0].target).map(|(_, c)| c.clone()).map(|c| std::mem::replace(&mut ctx.config, c));
+    let r = f(ctx, cases);
     if let Some(c) = saved {
         ctx.config = c;
     }
     r
 }
 
-fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+/// Each case's block of a launch that ran as `stamp` says (its display's state, its lock state).
+fn stamped(r: Result<Launch>, cases: &[Series], stamp: impl Fn(&Series, Block) -> Block) -> Result<Launch> {
+    r.map(|mut l| {
+        let taken = std::mem::take(&mut l.cases);
+        l.cases = taken.into_iter().zip(cases).map(|(c, s)| c.map(|b| stamp(s, b))).collect();
+        l
+    })
+}
+
+fn on_screen(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
     // The validator that refused the block, if one did.
-    let refused_by = |r: &Result<Block>| r.as_ref().err().and_then(Error::validator);
+    let refused_by = |r: &Result<Launch>| failure_of(r).and_then(Error::validator);
     // macOS: the app's window was covered, or the app not the active one.
-    let behind = |r: &Result<Block>| r.as_ref().err().is_some_and(|e| matches!(e.hidden(), Some(Hidden::Covered | Hidden::NotActive)));
+    let behind = |r: &Result<Launch>| failure_of(r).is_some_and(|e| matches!(e.hidden(), Some(Hidden::Covered | Hidden::NotActive)));
+    // A launch's recordings, discarded when it runs again.
+    let discard = |r: &Result<Launch>| {
+        for dir in r.as_ref().map(Launch::recordings).unwrap_or_default().iter().filter_map(|id| store::resolve(id).ok()) {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    };
     // A series that needs no presenting window runs through a lock, in one lock state per block.
     let mut retries = 0;
     let mut busy_waits = 0;
     // A series that may run locked but met a hidden window on an unlocked screen (a `--check` or
     // `record --bench` of a windowed native case): it waits and retries as on-screen blocks do.
     let mut hidden_unlocked = false;
-    if runs_locked(ctx, s, x) {
+    if cases.iter().all(|s| runs_locked(ctx, s, x)) {
         loop {
             let (start, locks, unlocks) = (host::session_locked(), ctx.awake.locks(), ctx.awake.unlocks());
             let display = host::display_state();
-            let r = slotted_block(ctx, s, v, pair, x);
-            if retry_launch(ctx, s, v, &r, &mut retries)? {
+            let r = slotted(ctx, cases, v, pair, x);
+            if retry_launch(ctx, s, v, failure_of(&r), &mut retries)? {
                 continue;
             }
             // As an on-screen block's below: a headless page runs here, and a busy machine ended its bench.
             if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
                 busy_waits += 1;
-                wait_out_background(ctx, s, v, &r)?;
+                wait_out_background(ctx, s, v, failure_of(&r))?;
                 continue;
             }
             let end = host::session_locked();
@@ -4034,14 +4213,12 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 break;
             }
             if steady && lit {
-                return r.map(|mut b| {
+                return stamped(r, cases, |s, mut b| {
                     b.display = display.map(|d| d.0);
                     session_state(s, b, start)
                 });
             }
-            if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
-                let _ = std::fs::remove_dir_all(dir);
-            }
+            discard(&r);
             let what = if steady { "the display turned off or on" } else { "the session locked or unlocked" };
             progress(format!("  {what} during a {} block: discarded, it runs again", v.role));
         }
@@ -4077,8 +4254,8 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             ctx.waited_ms += waiting.elapsed().as_secs_f64() * 1e3;
         }
         let before = ctx.awake.locks();
-        let r = slotted_block(ctx, s, v, pair, x);
-        if retry_launch(ctx, s, v, &r, &mut retries)? {
+        let r = slotted(ctx, cases, v, pair, x);
+        if retry_launch(ctx, s, v, failure_of(&r), &mut retries)? {
             continue;
         }
         if !woken && refused_by(&r) == Some(ValidatorId::WindowHidden) {
@@ -4111,22 +4288,21 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // machine it ends. Wait for it, holding nothing, and run the block again; an hour of it refuses.
         if busy_waits < BUSY_WAITS && refused_by(&r) == Some(ValidatorId::Background) {
             busy_waits += 1;
-            wait_out_background(ctx, s, v, &r)?;
+            wait_out_background(ctx, s, v, failure_of(&r))?;
             continue;
         }
         if ctx.awake.locks() == before && !host::session_locked() {
             return if hidden_unlocked {
-                r.map(|mut b| {
-                    b.display = host::display_state().map(|d| d.0);
+                let display = host::display_state().map(|d| d.0);
+                stamped(r, cases, |s, mut b| {
+                    b.display = display;
                     session_state(s, b, false)
                 })
             } else {
                 r
             };
         }
-        if let Some(dir) = r.as_ref().ok().and_then(|b| b.recording.as_deref()).and_then(|id| store::resolve(id).ok()) {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        discard(&r);
         progress(format!("  the session locked during a {} block: discarded, it runs again once unlocked", v.role));
     }
 }
@@ -4134,8 +4310,8 @@ fn on_screen(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
 /// Other work (a build, an update) kept the CPUs busy through the speed check (`Background`): on a
 /// shared machine it ends. Waits for it, holding nothing (a minute, then until the CPUs are quiet),
 /// before the block runs again; `BUSY_WAITS` of them (about an hour) refuse.
-fn wait_out_background(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>) -> Result<()> {
-    let who = r.as_ref().err().and_then(|e| e.refusal.as_ref()).and_then(|f| f.detail.clone()).unwrap_or_default();
+fn wait_out_background(ctx: &mut Ctx, s: &Series, v: &Variant, failed: Option<&Error>) -> Result<()> {
+    let who = failed.and_then(|e| e.refusal.as_ref()).and_then(|f| f.detail.clone()).unwrap_or_default();
     progress(format!("  waiting: other work keeps the CPUs busy ({who}); strobe runs the {} block again once it ends", v.role));
     release_machine(ctx);
     ctx.reg.set("waiting", format!("{} {} block: other work keeps the CPUs busy", s.label(), v.role));
@@ -4148,8 +4324,8 @@ fn wait_out_background(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>
 
 /// Whether to run a block again after a launch that failed for a passing reason (`transient`): up to
 /// `LAUNCH_RETRIES` times per block, after the machine has a minute to calm down, holding nothing.
-fn retry_launch(ctx: &mut Ctx, s: &Series, v: &Variant, r: &Result<Block>, retries: &mut u32) -> Result<bool> {
-    let Err(e) = r else { return Ok(false) };
+fn retry_launch(ctx: &mut Ctx, s: &Series, v: &Variant, failed: Option<&Error>, retries: &mut u32) -> Result<bool> {
+    let Some(e) = failed else { return Ok(false) };
     if stop_requested() {
         return Err(stop_error());
     }
@@ -4231,40 +4407,51 @@ fn in_slot<T>(ctx: &mut Ctx, what: &str, f: impl FnOnce(&mut Ctx) -> Result<T>) 
 
 /// One block in the bench slot, with this user's other processes kept off the target's CPUs while it
 /// runs (`--reserve-cpus`, SPEC §9.4).
-fn slotted_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
-    in_slot(ctx, &format!("{} {} block", s.label(), v.role), |ctx| {
+fn slotted(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let what = match cases {
+        [s] => format!("{} {} block", s.label(), v.role),
+        _ => format!("{} {} launch of {} cases", cases[0].label(), v.role, cases.len()),
+    };
+    in_slot(ctx, &what, |ctx| {
         let reserve = reserve_for(ctx, x);
         ctx.target_qos = None;
-        let r = any_block(ctx, s, v, pair, x).and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| software_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).map(|b| tail_state(x, b)).inspect(|b| restate_recording(ctx, s, b));
-        // A timed or check block that refused its primary refuses the block, as a native one does:
-        // pairs of nothing would end `unclear` instead of saying why.
-        let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
-            Some(why) => Err(Refusal {
-                summary: if why.summary.starts_with(&format!("{}:", s.primary)) { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) },
-                fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into()),
-            None => Ok(b),
-        });
-        let r = match reserve.map(host::reserve::Reserve::finish) {
-            Some(report) => {
-                ctx.reserved.get_or_insert_with(ReserveTotal::default).add(&report);
-                r.map(|mut b| {
+        let launch = any_launch(ctx, cases, v, pair, x);
+        let report = reserve.map(host::reserve::Reserve::finish);
+        if let Some(report) = &report {
+            ctx.reserved.get_or_insert_with(ReserveTotal::default).add(report);
+        }
+        let mut launch = launch?;
+        let taken = std::mem::take(&mut launch.cases);
+        for (r, s) in taken.into_iter().zip(cases) {
+            let r = r.and_then(|b| priority_state(ctx, s, x, b)).map(|b| headless_state(ctx, s, b)).map(|b| software_state(ctx, s, b)).map(|b| phase_state(ctx, s, b)).map(|b| counter_state(s, x, b)).map(|b| tail_state(x, b)).inspect(|b| restate_recording(ctx, s, b));
+            // A timed or check block that refused its primary refuses the block, as a native one does:
+            // pairs of nothing would end `unclear` instead of saying why.
+            let r = r.and_then(|b| match b.refused.get(&s.primary).filter(|_| x.set != Set::Attribution && x.set != Set::Memory) {
+                Some(why) => Err(Refusal {
+                    summary: if why.summary.starts_with(&format!("{}:", s.primary)) { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) },
+                    fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into()),
+                None => Ok(b),
+            });
+            let r = match &report {
+                Some(report) => r.map(|mut b| {
                     b.reserve = Some(json!({ "moved": report.moved_total(), "started": report.started, "failed": report.failed.len(), "restored": report.restored, "overhead_pct": report.overhead_pct, "setup_ms": report.setup_ms }));
                     b.overhead.get_or_insert_with(Overhead::default).reserve_pct = Some(report.overhead_pct);
                     b
-                })
+                }),
+                None => r,
+            };
+            // A part of strobe over its §19 budget in a timed block competes with the app it measures:
+            // said once per series and part.
+            let over = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).filter(|_| x.measures_time()).map(Overhead::over).unwrap_or_default();
+            for (part, pct, budget) in over {
+                if ctx.overhead_warned.insert(format!("{}\n{part}", s.label())) {
+                    ctx.warnings
+                        .push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), side_of(ctx, v), pct_of_core(pct))));
+                }
             }
-            None => r,
-        };
-        // A part of strobe over its §19 budget in a timed block competes with the app it measures:
-        // said once per series and part.
-        let over = r.as_ref().ok().and_then(|b| b.overhead.as_ref()).filter(|_| x.measures_time()).map(Overhead::over).unwrap_or_default();
-        for (part, pct, budget) in over {
-            if ctx.overhead_warned.insert(format!("{}\n{part}", s.label())) {
-                ctx.warnings
-                    .push(validity::warn("OverheadBudget", format!("{} · {} block: {part} used {} of a core, over its {budget}% budget (SPEC §19)", s.label(), side_of(ctx, v), pct_of_core(pct))));
-            }
+            launch.cases.push(r);
         }
-        r
+        Ok(launch)
     })
 }
 
@@ -4307,8 +4494,9 @@ fn reserve_for(ctx: &mut Ctx, x: &Exec) -> Option<host::reserve::Reserve> {
 /// `{fixture.port}` and `{fixture.pid}` filled into the target's options and given to the hooks as
 /// `ctx.fixture`, and ended with the block. The block is refused `FixtureMismatch` when the target
 /// never held a connection to it or ran its executable.
-fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
-    let b = fixture_block(ctx, s, v, pair, x);
+fn any_launch(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
+    let b = fixture_launch(ctx, cases, v, pair, x);
     // What appeared in the user's Documents or Desktop during a later launch: a caution, once each.
     let noted: Vec<String> = std::mem::take(&mut *ctx.folder_notes.lock().unwrap_or_else(|e| e.into_inner()));
     for n in noted {
@@ -4317,15 +4505,20 @@ fn any_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             ctx.warnings.push(validity::warn("UserFolders", text));
         }
     }
-    let b = b?;
-    admit_window(ctx, s, v, &b)?;
-    admit_input(ctx, s, v, &b)?;
-    admit_motion(ctx, s, v, &b)?;
-    Ok(b)
+    let mut launch = b?;
+    for (c, s) in launch.cases.iter_mut().zip(cases) {
+        if let Ok(b) = c
+            && let Err(e) = admit_window(ctx, s, v, b).and_then(|_| admit_input(ctx, s, v, b)).and_then(|_| admit_motion(ctx, s, v, b))
+        {
+            *c = Err(e);
+        }
+    }
+    Ok(launch)
 }
 
-fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
-    let Some(spec) = &ctx.fixture else { return kind_block(ctx, s, v, pair, x) };
+fn fixture_launch(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
+    let Some(spec) = &ctx.fixture else { return kind_launch(ctx, cases, v, pair, x) };
     let running = spec.start(&s.params, &store::experiment_dir(&ctx.exp)?.join("fixture.log"), ctx.runner_pin)?;
     // The target this variant runs (its side's, in an implementation comparison).
     let name = v.target_of(s).to_string();
@@ -4333,35 +4526,44 @@ fn fixture_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) 
     ctx.describe["targets"][&name] = running.fill(&unfilled);
     ctx.fixture_running = Some(running.clone());
     let info = json!({ "url": running.url(), "port": running.port, "pid": running.pid, "home": running.home() });
-    let r = ctx.runner.call("fixture", info, Duration::from_secs(10), launch::no_page).and_then(|_| kind_block(ctx, s, v, pair, x));
+    let r = ctx.runner.call("fixture", info, Duration::from_secs(10), launch::no_page).and_then(|_| kind_launch(ctx, cases, v, pair, x));
     ctx.describe["targets"][&name] = unfilled;
     ctx.fixture_running = None;
-    let r = r.and_then(|mut b| {
-        b.fixture_connected = running.verdict(&v.name)?;
-        Ok(b)
+    let r = r.map(|mut l| {
+        let verdict = running.verdict(&v.name);
+        for c in l.cases.iter_mut() {
+            match (&verdict, c.as_mut()) {
+                (Ok(f), Ok(b)) => b.fixture_connected = *f,
+                (Err(e), Ok(_)) => *c = Err(e.clone()),
+                _ => {}
+            }
+        }
+        l
     });
     drop(running);
     r
 }
 
-/// One block of whatever kind the target and case are.
-fn kind_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+/// One launch of whatever kind the target and cases are: run cases of a native app, a script or a page
+/// may share one (`--check --batch`); a launch case or a command line's case is one block each.
+fn kind_launch(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
     // Only a block that keeps its actions logs them (`--check`, `--keep`, attribution and memory
     // blocks): an ordinary timed block reads no clock and copies nothing for them.
     ctx.runner.collect_actions(x.untimed || x.keep || matches!(x.set, Set::Attribution | Set::Memory));
     let native = is_native(&ctx.describe["targets"][&s.target]);
     if ctx.describe["targets"][&s.target]["kind"] == "cli" {
-        cli::block(ctx, s, v, pair, x)
+        Ok(Launch::of(cli::block(ctx, s, v, pair, x)))
     } else if s.launch.is_object() && native {
-        native::launch(ctx, s, v, pair, x)
+        Ok(Launch::of(native::launch(ctx, s, v, pair, x)))
     } else if s.launch.is_object() {
-        launch::block(ctx, s, v, pair, x)
+        Ok(Launch::of(launch::block(ctx, s, v, pair, x)))
     } else if native {
-        native::block(ctx, s, v, pair, x)
+        native::chunk(ctx, cases, v, pair, x)
     } else if ctx.describe["targets"][&s.target]["kind"] == "script" {
-        script::block(ctx, s, v, pair, x)
+        script::chunk(ctx, cases, v, pair, x)
     } else {
-        run_block(ctx, s, v, pair, x)
+        run_chunk(ctx, cases, v, pair, x)
     }
 }
 
@@ -4456,8 +4658,17 @@ pub(crate) fn foreground_metric(m: &str) -> bool {
 fn restate_recording(ctx: &Ctx, s: &Series, b: &Block) {
     let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) else { return };
     let Ok(mut meta) = store::read_json(&dir.join("meta.json")) else { return };
-    meta["values"] = json!(b.values);
-    meta["refused"] = refusal_map(&b.refused);
+    // A batch's recording holds each case's values by its label (`batch::meta`).
+    match meta["batch"].as_array_mut().and_then(|a| a.iter_mut().find(|c| c["label"] == s.label().as_str())) {
+        Some(c) => {
+            c["values"] = json!(b.values);
+            c["refused"] = refusal_map(&b.refused);
+        }
+        None => {
+            meta["values"] = json!(b.values);
+            meta["refused"] = refusal_map(&b.refused);
+        }
+    }
     if headless_of(ctx, s) {
         meta["headless"] = json!(true);
     }
@@ -4563,7 +4774,7 @@ fn background_refusal(why: &str, what: &str) -> Error {
 /// its own) keeps no frame or input-latency values; declared ones show refused, and a primary among
 /// them refuses the block (a check run lists it refused).
 fn priority_state(ctx: &mut Ctx, s: &Series, x: &Exec, mut b: Block) -> Result<Block> {
-    let Some(why) = ctx.target_qos.take().or_else(|| ctx.qos.clone()).filter(|_| !matches!(x.set, Set::Attribution | Set::Memory)) else { return Ok(b) };
+    let Some(why) = ctx.target_qos.clone().or_else(|| ctx.qos.clone()).filter(|_| !matches!(x.set, Set::Attribution | Set::Memory)) else { return Ok(b) };
     if foreground_metric(&s.primary) && !x.untimed {
         return Err(background_refusal(&why, &format!("the primary {}", s.primary)));
     }
@@ -4580,17 +4791,40 @@ fn priority_state(ctx: &mut Ctx, s: &Series, x: &Exec, mut b: Block) -> Result<B
     Ok(b)
 }
 
-fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+/// What one case of a page launch ran (`run_chunk`), kept until the launch's trace is read.
+struct PageCase {
+    /// Its first run's index among the launch's runs: its runs are `run:<base + i>`.
+    base: usize,
+    runs: Vec<Run>,
+    nodes: Vec<u64>,
+    warmup: block::Warmup,
+    same: journey::Same,
+    start: shown::Screen,
+    /// What the page showed after its runs (a batch reads it before the next case; one case after the trace stops).
+    end: Option<shown::Screen>,
+    /// Keys its measured runs typed in a burst.
+    burst: usize,
+    /// WebKit: a run loaded a document, in which strobe's page scripts ran only after the page's own.
+    loaded_document: bool,
+    steps: Vec<(String, f64)>,
+}
+
+/// A page's launch (web, url, app, exe, webview and command targets): the browser or app, its prepare
+/// and setup, then each case's runs, one case or a chunk of them (`--check --batch`, SPEC §5.6).
+fn run_chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
+    let batch = ctx.batch.is_some();
     let (set, keep, n) = (x.set, x.keep, x.runs);
     let target = ctx.describe["targets"][&s.target].clone();
     let kind = target["kind"].as_str().unwrap_or("");
     let app = matches!(kind, "app" | "exe" | "webview" | "command");
     let engine = engine_of(&target);
     let headless = headless_of(ctx, s);
-    // What the series declared beyond the default probes: counters, network counts, layout shift.
-    let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
-    let counted: Vec<String> = declared.iter().filter_map(|m| m.strip_prefix("count.")).map(str::to_string).collect();
-    let nets: Vec<String> = declared.iter().filter(|m| m.starts_with("net.")).map(|m| m.to_string()).collect();
+    // What the cases declared beyond the default probes: counters, network counts, layout shift. One
+    // browser runs every case of a launch, so it is set up for what any of them declared.
+    let declared: Vec<&String> = cases.iter().flat_map(|c| std::iter::once(&c.primary).chain(&c.metrics)).collect();
+    let counting = declared.iter().any(|m| m.starts_with("count."));
+    let nets = declared.iter().any(|m| m.starts_with("net."));
     let shift = declared.iter().any(|m| *m == "layout.shift");
     let gc = declared.iter().any(|m| *m == "main.gc");
     let gpu_compile = declared.iter().any(|m| *m == "gpu.compile");
@@ -4653,7 +4887,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         steps.borrow_mut().push((name.to_string(), lapped.get().elapsed().as_secs_f64() * 1e3));
         lapped.set(Instant::now());
     };
-    let result = (|| -> Result<Block> {
+    let result = (|| -> Result<Launch> {
         let seen = browser_seen(ctx, s, v, headless, !matches!(set, Set::Attribution | Set::Memory), &browser)?;
         let software = seen.software;
         let page: Page = match (&browser, app) {
@@ -4716,7 +4950,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // The driver's frame waits use the browser's own rAF, kept before the page's scripts can replace it.
         page.add_init_script(crate::driver::NATIVE_RAF)?;
         // `count.<name>` metrics: the page counts through a global installed in every document it loads.
-        if !counted.is_empty() {
+        if counting {
             page.add_init_script(COUNT_SCRIPT)?;
             page.eval(COUNT_SCRIPT)?;
         }
@@ -4877,7 +5111,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             if start {
                 reads_before.set((reads_before.get().0 + k, reads_before.get().1 + ms));
             }
-            if !counted.is_empty() {
+            if counting {
                 let now = page_counts();
                 if start {
                     *counted_before.borrow_mut() = now;
@@ -4922,7 +5156,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                         for (sum, v) in c.iter_mut().zip(before) {
                             *sum += v;
                         }
-                        if !counted.is_empty() {
+                        if counting {
                             hooks.add(&page_counts());
                         }
                         take_canvas();
@@ -4994,7 +5228,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 other => Err(Error::msg(format!("unknown runner request {other}"))),
             }
         };
-        let t = s.hook_timeout();
+        let t = cases.iter().map(Series::hook_timeout).max().unwrap_or_default();
         let mut block = json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": url, "root": v.root, "engine": engine });
         if let (Some(b), Some(a)) = (block.as_object_mut(), hook_app.as_object()) {
             b.extend(a.clone());
@@ -5012,6 +5246,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 .runner
                 .call("prepare", json!({ "endpoint": endpoint, "target": target_id, "engine": engine }), t, &serve)
                 .map_err(|e| crate::runner::incomplete("prepare", "prepare", e, "", "fix the target's prepare in the bench file"))?;
+            batch::launch_hook_case(ctx, "the target's prepare")?;
             if let Some(u) = r.get("url").and_then(Value::as_str) {
                 first = join_url(origin(&url), u);
             }
@@ -5097,6 +5332,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let read_content = || page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
         let content_before = read_content();
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
+        batch::launch_hook_case(ctx, "the bench file's setup")?;
         if late_init.get() && !ctx.warnings.iter().any(|w| w.id == "InitScript") {
             ctx.warnings.push(validity::info("InitScript", format!("{}: {engine} has no preload script: ctx.addInitScript ran after the first document's own scripts; a block that loads another document is refused", s.label())));
         }
@@ -5111,14 +5347,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             os.delivered(&page)?;
             os.recheck(&page)?;
         }
-        // `expect.same` (SPEC §9.10): read after setup, each run and each reset, outside the runs.
-        let same = journey::Same::new(s, &ctx.describe["targets"])?;
-        let read_same = |when| same.read(when, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)));
-        if same.on() {
-            read_same(journey::When::Setup)?;
-        }
-        let start = shown::page(ctx, s, v, pair, "start", &page);
-        shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
+        // What the page shows once set up: the first case's start. A later case of a batch starts from
+        // what the case before it left (its end).
+        let mut start_screen = shown::page(ctx, s, v, pair, "start", &page);
         lap("setup");
         // `--video` (an untimed block): from before the first run to after the last.
         if x.video {
@@ -5171,7 +5402,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // `net.*` metrics: requests and bytes per run from the Network domain (Firefox: BiDi's network
         // events), on only for such series.
         let net = match (&browser, &page) {
-            _ if nets.is_empty() => None,
+            _ if !nets => None,
             (WebBrowser::Chromium(b), Page::Chromium(p)) => {
                 let rx = b.cdp.events();
                 p.send("Network.enable", json!({}))?;
@@ -5204,13 +5435,16 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let loaded_document = Cell::new(false);
         let run_inputs: RefCell<Vec<RunInputs>> = RefCell::new(Vec::new());
 
-        let run_timeout = s.run_timeout();
         let perf = x.counters.then(probe::wakes::Perf::new);
         // An attribution block's last reset, run after its census and heap snapshot.
         let deferred = Cell::new(false);
-        // `profile`: a measured run of a Chromium attribution block; `last`: the last of them; `memory`:
-        // read the processes' memory at its end (it may be the last measured run).
-        let mut run_once = |key: &str, profile: bool, last: bool, memory: bool| -> Result<Run> {
+        let exp = ctx.exp.clone();
+        // Run `key` of case `s` (its `expect.same` reads `same`). `profile`: a measured run of a Chromium
+        // attribution block; `last`: the last of them; `memory`: read the processes' memory at its end
+        // (it may be the last measured run).
+        let run_once = |runner: &mut Runner, s: &Series, same: &journey::Same, key: &str, profile: bool, last: bool, memory: bool| -> Result<Run> {
+            let run_timeout = s.run_timeout();
+            let read_same = |when| same.read(when, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)));
             let began = Instant::now();
             // As a native app is before each run (`front_page`).
             if cfg!(target_os = "macos") && (s.sides.is_some() || s.cross_engine) {
@@ -5232,7 +5466,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // domain's counters) stay outside the CPU window, which brackets the run alone: their
             // round trips are not the run's work.
             *carried.borrow_mut() = [0.0; 6];
-            if !counted.is_empty() {
+            if counting {
                 page.eval("globalThis.__strobeCounts = {}, true")?;
             }
             if canvas {
@@ -5277,9 +5511,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // strobe's own cost over the run.
             cost.start();
             let t0 = host::now_ns();
-            ctx.runner
+            runner
                 .call("run", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &ctx.exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
+                .map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, &snapshot(&page, &exp, "run"), "the run threw or timed out; fix the bench file or the app"))?;
             // The page's next frame ends the run (what its last step drew), except after an untimed
             // stretch, whose own frames are none of the run's.
             if !outside && !hooks.ended_untimed() {
@@ -5336,7 +5570,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             cycles_at.extend(e.iter().map(|x| &x.0));
             cycles_at.push(&at1);
             let timed_cycles = |keep: &dyn Fn(u32) -> bool| super::record::cycles_timed(&cycles_at, keep);
-            if !counted.is_empty() {
+            if counting {
                 hooks.add(&page_counts());
             }
             take_canvas();
@@ -5390,9 +5624,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 if let Some(os) = driver.os.get() {
                     os.begin(&page)?;
                 }
-                ctx.runner
+                runner
                     .call("reset", json!({ "case": s.case }), run_timeout, &serve)
-                    .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
+                    .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &exp, "reset"), "fix the case's reset"))?;
                 driver.release_all()?;
                 // A reset's OS input is checked on its own: a click there must not cover a run's lost one.
                 if let Some(os) = driver.os.get() {
@@ -5437,9 +5671,9 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         // as measured (SPEC §9.2). Wall time says nothing here: a fixed-speed scroll or paced typing
         // takes the same time cold or warm, while the work it costs settles over 1–4 runs. Attribution
         // blocks start their profiler at the steady point, so they measure the runs after it.
-        let mut runs: Vec<Run> = Vec::new();
-        let mut nodes_all = Vec::new();
-        let mut warmup = block::Warmup::new(s, x);
+        // Every run of the launch starts from the state its first run started from (`Starts`): a later
+        // case of a batch from what the case before it left, so a reset that takes back too little fails
+        // the case that left it (`ResetIncomplete`) before the next one runs.
         let mut starts = shown::Starts::new(s, x);
         let read_start = || shown::page_start(&page);
         let profiled = set == Set::Attribution && !gecko_on;
@@ -5448,458 +5682,694 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         };
         // Firefox's profiler, from the steady point to the end of the runs.
         let mut gecko: Option<probe::gecko::Profiler> = None;
-        while warmup.more(runs.len()) {
-            let i = runs.len();
-            nodes_all.push(driver.nodes().unwrap_or(0));
-            starts.check(i + 1, false, &read_start, &wait_start)?;
-            driver.window_start(i + 1, false, starts.on())?;
-            let profile = profiled && warmup.measures(i);
-            // A check's run after its reset is never measured: the trace names it a warmup run, so no
-            // view of the recording counts it.
-            let unmeasured = warmup.first().is_some() && i >= warmup.measured().end;
-            let key = if unmeasured { format!("warm:{i}") } else { format!("run:{i}") };
-            runs.push(run_once(&key, profile, profile && i + 1 == warmup.measured().end, set != Set::Memory && warmup.may_end(i))?);
-            if let Some(f) = warmup.first() {
-                // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N. Firefox
-                // takes about:memory's after its own GC and CC, and no heap snapshot.
-                if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
-                    let done = runs.len() - f;
-                    census.push(probe::gecko::census(b, &page, &dir.join(format!("memory-{done}.json.gz")), &format!("after run {done} of the leak run"))?);
-                } else if let Some(dir) = &mem_dir {
-                    let mut c = probe::census::take(cb()?, cp()?);
-                    c["os_after_snapshot"] = json!(true);
-                    let done = runs.len() - f;
-                    if done == 2 * n {
-                        c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s2.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
-                    }
-                    census.push(c);
-                    if done == n {
-                        probe::heap::snapshot(cp()?, &dir.join("heap-s1.heapsnapshot.gz"))?;
-                    }
-                    if done == 2 * n {
-                        probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz"))?;
-                    }
-                }
-                continue;
+        // The launch's own time so far: everything before its first case's runs.
+        // The cases that ran, each its runs or why it failed (a failure ends the launch), and what a
+        // later case's start said about the case before it.
+        let mut ran: Vec<Result<PageCase>> = Vec::new();
+        let mut notes: Vec<(usize, String)> = Vec::new();
+        let mut abort: Option<Error> = None;
+        // The launch's runs so far: a case's runs are numbered after the ones before it.
+        let mut launch_runs = 0usize;
+        // Each case's marks on the host clock, for the video.
+        let case_marks: RefCell<Vec<(String, u64)>> = RefCell::new(Vec::new());
+        let mut log_at: Vec<u64> = Vec::new();
+        let mut case_ms: Vec<f64> = Vec::new();
+        for (k, s) in cases.iter().enumerate() {
+            if k > 0 && stop_requested() {
+                break;
             }
-            // The work that must hold steady is the renderer's main-thread time. `--check` measures the
-            // first run: it asks whether a case works, not what it costs. From outside or in an engine
-            // without that counter, the work is the processes' CPU, as a native app's; where this machine
-            // gives no CPU time (cycles refused), the run's wall time.
-            let work: Vec<f64> = runs.iter().map(|r| if !traceless { r.task } else if r.work.is_finite() { r.work } else { r.ms }).collect();
-            if warmup.after(&work) && !x.untimed {
-                if let (Some(dir), Some(b)) = (&gecko_dir, firefox) {
-                    match probe::gecko::census(b, &page, &dir.join("memory-0.json.gz"), "after warmup, before the profiler started and the measured runs") {
-                        Ok(c) => census.push(c),
-                        Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", side, e.message))),
-                    }
-                    gecko = Some(probe::gecko::start(b)?);
+            let case_began = Instant::now();
+            // A later case starts from what the case before it left: on a screen its expect does not
+            // show it is never measured from there, it goes to a fresh launch, and the case before is noted.
+            if k > 0
+                && let Err(e) = shown::expect(&s.expect, &start_screen, "before the runs", true, &|sel| shown::page_shows(&page, sel))
+            {
+                notes.push((k - 1, batch::left_screen(s, &e)));
+                break;
+            }
+            log_at.push(ctx.runner.log_len());
+            let base = launch_runs;
+            let r = (|| -> Result<PageCase> {
+                let began = Instant::now();
+                // `expect.same` (SPEC §9.10): read before the case's runs, after each run and each reset,
+                // outside the runs.
+                let same = journey::Same::new(s, &ctx.describe["targets"])?;
+                if same.on() {
+                    same.read(journey::When::Setup, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)))?;
                 }
-                if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
-                    census.push(probe::gecko::census(b, &page, &dir.join("memory-s0.json.gz"), "after warmup, before the leak run's runs (S0)")?);
-                } else if let Some(dir) = &mem_dir {
-                    let mut c = probe::census::take(cb()?, cp()?);
-                    c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
-                    census.push(c);
-                    probe::heap::snapshot(cp()?, &dir.join("heap-s0.heapsnapshot.gz"))?;
+                let start = start_screen.clone();
+                if k == 0 {
+                    shown::expect(&s.expect, &start, "before the runs", true, &|sel| shown::page_shows(&page, sel))?;
+                }
+                starts.case(s, x, batch.then_some(base));
+                loaded_document.set(false);
+                let burst0 = burst_keys.get();
+                let mark = format!("case:{k}:{}", batch::mark_name(&s.case));
+                if batch {
+                    if !traceless {
+                        driver.mark(&format!("{mark}:start"))?;
+                    }
+                    case_marks.borrow_mut().push((format!("{mark}:start"), host::now_ns()));
+                }
+                let mut runs: Vec<Run> = Vec::new();
+                let mut nodes = Vec::new();
+                let mut warmup = block::Warmup::new(s, x);
+                while warmup.more(runs.len()) {
+                    let i = runs.len();
+                    // Its place among the launch's runs.
+                    let g = base + i;
+                    nodes.push(driver.nodes().unwrap_or(0));
+                    starts.check(g + 1, false, &read_start, &wait_start)?;
+                    driver.window_start(g + 1, false, starts.on())?;
+                    let profile = profiled && warmup.measures(i);
+                    // A check's run after its reset is never measured: the trace names it a warmup run, so no
+                    // view of the recording counts it.
+                    let unmeasured = warmup.first().is_some() && i >= warmup.measured().end;
+                    let key = if unmeasured { format!("warm:{g}") } else { format!("run:{g}") };
+                    runs.push(run_once(&mut ctx.runner, s, &same, &key, profile, profile && i + 1 == warmup.measured().end, set != Set::Memory && warmup.may_end(i))?);
+                    if let Some(f) = warmup.first() {
+                        // Leak run: a post-GC census after every run; S1 after N runs, S2 after 2 × N. Firefox
+                        // takes about:memory's after its own GC and CC, and no heap snapshot.
+                        if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
+                            let done = runs.len() - f;
+                            census.push(probe::gecko::census(b, &page, &dir.join(format!("memory-{done}.json.gz")), &format!("after run {done} of the leak run"))?);
+                        } else if let Some(dir) = &mem_dir {
+                            let mut c = probe::census::take(cb()?, cp()?);
+                            c["os_after_snapshot"] = json!(true);
+                            let done = runs.len() - f;
+                            if done == 2 * n {
+                                c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s2.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                            }
+                            census.push(c);
+                            if done == n {
+                                probe::heap::snapshot(cp()?, &dir.join("heap-s1.heapsnapshot.gz"))?;
+                            }
+                            if done == 2 * n {
+                                probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz"))?;
+                            }
+                        }
+                        continue;
+                    }
+                    // The work that must hold steady is the renderer's main-thread time. `--check` measures the
+                    // first run: it asks whether a case works, not what it costs. From outside or in an engine
+                    // without that counter, the work is the processes' CPU, as a native app's; where this machine
+                    // gives no CPU time (cycles refused), the run's wall time.
+                    let work: Vec<f64> = runs.iter().map(|r| if !traceless { r.task } else if r.work.is_finite() { r.work } else { r.ms }).collect();
+                    if warmup.after(&work) && !x.untimed {
+                        if let (Some(dir), Some(b)) = (&gecko_dir, firefox) {
+                            match probe::gecko::census(b, &page, &dir.join("memory-0.json.gz"), "after warmup, before the profiler started and the measured runs") {
+                                Ok(c) => census.push(c),
+                                Err(e) => ctx.warnings.push(validity::warn("Census", format!("{} about:memory: {}", side, e.message))),
+                            }
+                            gecko = Some(probe::gecko::start(b)?);
+                        }
+                        if let (Some(dir), Some(b)) = (&mem_dir, firefox) {
+                            census.push(probe::gecko::census(b, &page, &dir.join("memory-s0.json.gz"), "after warmup, before the leak run's runs (S0)")?);
+                        } else if let Some(dir) = &mem_dir {
+                            let mut c = probe::census::take(cb()?, cp()?);
+                            c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-s0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                            census.push(c);
+                            probe::heap::snapshot(cp()?, &dir.join("heap-s0.heapsnapshot.gz"))?;
+                        }
+                    }
+                }
+                // Warmup and measured runs interleave with the steadiness check: split the loop by run.
+                // `+ 0.0`: an empty f64 sum is -0.0, which would print as "-0.0s".
+                let first = warmup.first().unwrap_or(0);
+                let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
+                let steps = vec![("warmup".to_string(), warm_ms), ("runs".to_string(), (began.elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0))];
+                // In a batch the page must still answer after the case: a renderer it crashed or hung fails
+                // the case that did it, not the next one's start check.
+                if batch {
+                    batch::answers(&s.case, page.eval("1"))?;
+                }
+                starts.check(base + runs.len() + 1, true, &read_start, &wait_start)?;
+                driver.window_start(base + runs.len() + 1, true, starts.on())?;
+                // In a batch, what one block checks after its runs is checked after each case: a later case
+                // may take the page down with it, and the cases before it keep what they measured.
+                if batch {
+                    if !hidden_ok {
+                        validity::window_visible(&page)?;
+                        front_page(s, &browser)?;
+                    }
+                    browser.own()?;
+                    if let Some(first) = &first_slow
+                        && let (Err(e), other) = check()?
+                    {
+                        return Err(slow_check(e, &other, &format!("; right after {}'s runs, after a first slow check ({first}) and a second at speed once the CPUs settled", s.case)));
+                    }
+                }
+                // A batch reads the case's end now, before the next case changes it; one case reads it once
+                // the trace and profilers have stopped (below).
+                let end = if batch {
+                    let end = shown::page(ctx, s, v, pair, "end", &page);
+                    shown::expect(&s.expect, &end, "after the runs", true, &|sel| shown::page_shows(&page, sel))?;
+                    if !traceless {
+                        driver.mark(&format!("{mark}:end"))?;
+                    }
+                    case_marks.borrow_mut().push((format!("{mark}:end"), host::now_ns()));
+                    Some(end)
+                } else {
+                    None
+                };
+                Ok(PageCase { base, runs, nodes, warmup, same, start, end, burst: burst_keys.get() - burst0, loaded_document: loaded_document.get(), steps })
+            })();
+            case_ms.push(case_began.elapsed().as_secs_f64() * 1e3);
+            match r {
+                Ok(c) => {
+                    launch_runs = c.base + c.runs.len();
+                    if let Some(e) = &c.end {
+                        start_screen = e.clone();
+                    }
+                    ran.push(Ok(c));
+                    // The user's own state, after each case of a batch: a disturbed one stops the bench.
+                    if batch
+                        && let Some(g) = &guard
+                        && let Err(e) = g.check(&format!("after {}", s.label()))
+                    {
+                        abort = Some(e);
+                        break;
+                    }
+                    // Runs that build on each other on purpose (`resetCheck: false`) leave a state no later
+                    // case may start from: the launch ends with it.
+                    if !s.reset_check {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    ran.push(Err(e));
+                    break;
                 }
             }
         }
-        starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
-        driver.window_start(runs.len() + 1, true, starts.on())?;
-        // A block whose first speed check ran slow is accepted only if the check holds at speed right
-        // after its measured runs too (no wait): a slowdown that came back over the runs refuses it.
-        if let Some(first) = &first_slow {
-            match check()? {
-                (Err(e), other) => return Err(slow_check(e, &other, &format!("; right after the measured runs, after a first slow check ({first}) and a second at speed once the CPUs settled"))),
-                (Ok(_), _) => ctx.warnings.push(validity::info(
-                    "Throttled",
-                    format!("{} · {side} block: the first speed check ran slow ({first}); the second, after the CPUs settled, and a third right after the measured runs ran at speed, so the block went on", s.label()),
-                )),
-            }
-        }
-        let mut stopped = video.take().map(super::video::Recorder::stop);
-        let unsteady = warmup.unsteady();
-        let first = warmup.first().unwrap_or(0);
-        // Warmup and measured runs interleave with the steadiness check: split the loop by run.
-        // `+ 0.0`: an empty f64 sum is -0.0, which would print as "-0.0s".
-        let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
-        steps.borrow_mut().push(("warmup".into(), warm_ms));
-        steps.borrow_mut().push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
         lapped.set(Instant::now());
-        // A check's run after its reset is not measured (`Warmup::measured`).
-        let range = first..warmup.measured().end.clamp(first, runs.len());
-        let measured = &runs[range.clone()];
-        let key = |j: usize| format!("run:{}", first + j);
-        let run_ms: Vec<f64> = measured.iter().map(|r| r.ms).collect();
-        let walls: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.ms)).collect();
-        let cpu: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.cpu)).collect();
-        let busy: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite() && r.ms > 0.0).map(|(j, r)| (key(j), 100.0 * r.task / r.ms)).collect();
-        let work: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite()).map(|(j, r)| (key(j), r.task)).collect();
-        let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
-        let nodes = nodes_all.get(range.clone()).unwrap_or_default().to_vec();
-        let warm = runs[..first].to_vec();
-        let (strobe_pct, runner_pct) = cost.share(range.clone());
-        let samples = sampler.stop();
-        let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
-        let procs1 = (host::now_ns(), host::all_processes());
-        let gpu_runs: Vec<_> = spans.iter().map(|(k, t0, t1)| (k.clone(), samples.window(*t0, *t1))).collect();
-        // Other work on the CPUs the target is pinned to, per run (% of one core): their busy time beyond
-        // the target's own cycles (SPEC §10.2 Background). It shares the target's cores and its L3.
-        let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
-        let foreign: Vec<f64> = gpu_runs
-            .iter()
-            .zip(measured)
-            .filter(|_| !pinned.is_empty())
-            .filter_map(|((_, w), r)| {
-                let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
-                r.cpu_whole.is_finite().then(|| (busy - r.cpu_whole).max(0.0))
-            })
-            .collect();
-        let background = busiest_others(&procs0, &procs1);
-        let screen = screen_state(&procs0, &procs1);
-        let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
-        let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
-        // The window must have stayed visible for the whole block, and the browser strobe's alone.
-        if !hidden_ok {
-            validity::window_visible(&page)?;
-            front_page(s, &browser)?;
-        }
-        browser.own()?;
-        // The processes' memory as the last measured run left it, before its reset; a leak run's after
-        // its runs (it reads between them, after each reset).
-        let (private_mb, pss) = match measured.last().and_then(|r| r.end.private_mb.map(|m| (m, r.end.pss))) {
-            Some(read) => read,
-            None if set == Set::Memory => {
-                let procs = browser.processes();
-                (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&procs.iter().map(|p| p.pid).collect::<Vec<_>>()))
-            }
-            // Never a reading from after the reset in its place: no value.
-            None => (0.0, None),
-        };
-        // What the page had to draw in, compared with the other side's content area (`admit_window`):
-        // as setup began when a `page.window` sized it since (a run, or a reset left out, may leave it
-        // sized), else now.
-        let content = if driver.window_sized() { content_before } else { read_content() };
-        // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
-        let presents = presents.map(|r| r.and_then(|_| presents_rc.borrow_mut().take().ok_or_else(|| Error::msg("the present capture ended early"))).and_then(|c| c.stop()));
-        let dir = match (&draft, keep) {
-            (Some(d), _) => d.dir().to_path_buf(),
-            (None, true) => draft.insert(store::claim_recording(&id)?).dir().to_path_buf(),
-            (None, false) => host::paths::run().join(&id),
-        };
-        std::fs::create_dir_all(&dir)?;
-        let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
-        // The interval the page's sampler kept (SPEC §8.3), kept in the recording's meta.
-        let mut sampling = None;
-        // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
-        // measured run's own span) and its style, layout and GC rows, then the page's source maps.
-        if let Some(g) = gecko.take() {
-            let raw = g.stop()?;
-            let untimed: Vec<(u64, u64)> = measured.iter().flat_map(|r| r.timed.untimed.iter().copied()).collect();
-            let got = probe::gecko::convert(&raw, &token, &spans, &untimed, &dir)?;
-            sampling = got.sampling;
-            let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
-            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
-            probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
-            lap("maps");
-        } else if profiled {
-            let profiles = profiles.take();
-            sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, profiles.iter().flat_map(|(p, _)| probe::cpu::gaps(p)).collect());
-            for (k, (profile, allocs)) in profiles.iter().enumerate() {
-                store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
-                store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
-            }
-            // The page's source maps, kept with the recording while its server still runs, so any view
-            // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
-            // `build.output`) turns original sources into files on disk.
-            let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
-            let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
-            let mut scripts = std::collections::BTreeSet::new();
-            for (profile, allocs) in &profiles {
-                probe::symbols::urls(profile, &mut scripts);
-                probe::symbols::urls(allocs, &mut scripts);
-            }
-            probe::symbols::store_maps_with(&page, &scripts, ranges.take(), &dir, served.as_deref())?;
-            lap("maps");
-        }
-        let trace = dir.join("trace.pftrace");
-        if let Some(tracing) = tracing {
-            tracing.stop(&trace)?;
-            lap("trace");
-        }
-        // `layout.shift`'s explanation: the largest shifts and what moved, named while the page is open.
-        if set == Set::Attribution && shift && page.cdp().is_some() {
-            match probe::shifts::largest(&trace, &token, cp()?, first, 5) {
-                Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
-                Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", side, e.message))),
+        let mut page_cases: Vec<(usize, PageCase)> = Vec::new();
+        let mut failed: Option<Error> = None;
+        for (k, r) in ran.into_iter().enumerate() {
+            match r {
+                Ok(c) => page_cases.push((k, c)),
+                Err(e) => failed = Some(e),
             }
         }
-        // A Firefox block's census came before its profiler; Firefox gives strobe no heap snapshot.
-        if set == Set::Attribution && firefox.is_none() {
-            // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
-            let mut c = probe::census::take(cb()?, cp()?);
-            c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
-            census.push(c);
-            // The live objects after the runs (post-GC), once no trace subscription copies every
-            // snapshot chunk (SPEC §8.6).
-            if let Err(e) = probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz")) {
-                ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", side, e.message)));
-            }
-            lap("heap");
+        // No case passed: the launch closes as a failed block does, its trace and probes dropped.
+        if page_cases.is_empty() {
+            return Ok(Launch { cases: failed.map(|e| vec![Err(e)]).unwrap_or_default(), abort, notes, actions: None, log_at, case_ms });
         }
-        // The attribution block's last reset, deferred past its census and heap snapshot, so the end
-        // screen, the servers and the page are where every other block leaves them.
-        if deferred.get() {
-            if let Some(os) = driver.os.get() {
-                os.begin(&page)?;
-            }
-            ctx.runner
-                .call("reset", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
-            driver.release_all()?;
-            if let Some(os) = driver.os.get() {
-                os.delivered(&page)?;
-                os.placed(&page, "reset")?;
-            }
-            if same.on() {
-                read_same(journey::When::Reset)?;
-            }
-        }
-        // What the page showed after the runs, once the trace and profilers have stopped.
-        let end = shown::page(ctx, s, v, pair, "end", &page);
-        shown::expect(&s.expect, &end, "after the runs", true, &|sel| shown::page_shows(&page, sel))?;
-        if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
-            && !ctx.warnings.iter().any(|w| w.id == "Teardown")
-        {
-            ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side, e.message)));
-        }
-        let mut data = if set == Set::Memory || x.counters || traceless { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
-        data.measured_only(range.clone());
-        lap("analyse");
-        let mut extra = BTreeMap::new();
-        let run_counts = run_counts.into_inner();
-        for name in &counted {
-            extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
-        }
-        let fixture_cpu: BTreeMap<String, f64> = (0..measured.len()).filter_map(|j| Some((key(j), *run_counts.get(first + j)?.get(block::FIXTURE_CPU)?))).collect();
-        if !fixture_cpu.is_empty() {
-            extra.insert("cpu.fixture".to_string(), fixture_cpu);
-        }
-        // `phase.<name>`: the run's phase windows from the trace's marks, or (traceless) strobe's own.
-        let run_marks = run_marks.into_inner();
-        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")) {
-            let per: BTreeMap<String, f64> = (0..measured.len())
-                .filter_map(|j| {
-                    if traceless {
-                        return Some((key(j), phase_ms(run_marks.get(first + j)?, name, &measured.get(j)?.timed))).filter(|(_, ms)| ms.is_finite());
-                    }
-                    let suffix = format!(":run:{}:phase:{name}", first + j);
-                    let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0 - data.untimed_in(w)) as f64 / 1e6).collect();
-                    (!spans.is_empty()).then(|| (key(j), spans.iter().sum()))
-                })
-                .collect();
-            extra.insert(format!("phase.{name}"), per);
-        }
-        // The browser's processes' CPU per run: in every engine, so one primary compares across them.
-        extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.work.is_finite()).map(|(j, r)| (key(j), r.work)).collect());
-        // `span.<name>`: the page's own performance.measure() spans per run, from the trace.
-        for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("span.")) {
-            if let Some(per) = data.span_per_run("run", name) {
-                extra.insert(format!("span.{name}"), per);
-            }
-        }
-        if let Some(n) = net {
-            let mut n = n.into_inner();
-            n.settle();
-            for m in &nets {
-                extra.insert(m.clone(), (0..measured.len()).map(|j| (key(j), n.value(m, first + j))).collect());
-            }
-        }
-        if shift && set != Set::Memory {
-            extra.insert("layout.shift".to_string(), data.shift_per_run("run"));
-        }
-        if gc && set != Set::Memory {
-            extra.insert("main.gc".to_string(), data.gc_per_run("run"));
-        }
-        if gpu_compile && set != Set::Memory {
-            extra.insert("gpu.compile".to_string(), data.gpu_compile_per_run("run"));
-        }
-        extra.insert("run.duration".to_string(), walls);
-        extra.insert("cpu.app.total".to_string(), cpu);
-        // The same CPU as time per run, as a native or script target's: what an implementation
-        // comparison compares on both sides.
-        extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
-        extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.0 as f64)).collect());
-        extra.insert("driver.read_ms".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.1)).collect());
-        // The page as each measured run left it (`RunEnd`), the median over the runs.
-        let heap: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.heap_mb?))).collect();
-        let dom: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.nodes? as f64))).collect();
-        for (metric, per_run) in [("js.heap.used", heap), ("dom.nodes", dom)] {
-            if !per_run.is_empty() {
-                extra.insert(metric.to_string(), per_run);
-            }
-        }
-        let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
-        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
-        extra.extend(counts);
-        // Drags: the input strobe gave, beside the frames it drew (a starved driver shows here).
-        if measured.iter().any(|r| r.input.is_some()) {
-            extra.insert("input.rate".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.0))).collect());
-            extra.insert("input.gap.p95".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.1))).collect());
-        }
-        for (i, (_, metric)) in PROCESS_ROLES.iter().enumerate() {
-            let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.roles[i].is_finite()).map(|(j, r)| (key(j), r.roles[i])).collect();
-            if !per_run.is_empty() {
-                extra.insert(metric.to_string(), per_run);
-            }
-        }
-        if !gpu_3d.is_empty() {
-            extra.insert("gpu.process.3d".to_string(), gpu_3d);
-        }
-        let busy_cdp = metrics::median(&busy.values().copied().collect::<Vec<_>>());
-        if !work.is_empty() {
-            extra.insert("main.work".to_string(), work);
-        }
-        for (i, (metric, _, _)) in WORK_PARTS.iter().enumerate() {
-            let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.parts[i].is_finite()).map(|(j, r)| (key(j), r.parts[i])).collect();
-            if !per_run.is_empty() {
-                extra.insert(metric.to_string(), per_run);
-            }
-        }
-        if set == Set::Lean {
-            extra.insert("main.busy".to_string(), busy);
-        }
-        // canvas.*: frames per run, and gaps between consecutive frames pooled over the measured runs, as
-        // frames.interval pools presented frames. A gap never spans two documents.
-        let run_canvas = run_canvas.into_inner();
-        let mut canvas_gaps: Vec<f64> = Vec::new();
-        if canvas {
-            let measured_canvas = run_canvas.get(range.clone()).unwrap_or_default();
-            extra.insert("canvas.frames".to_string(), measured_canvas.iter().enumerate().map(|(j, docs)| (key(j), docs.iter().map(Vec::len).sum::<usize>() as f64)).collect());
-            for doc in measured_canvas.iter().flatten() {
-                canvas_gaps.extend(doc.windows(2).map(|w| w[1] - w[0]));
-            }
-            canvas_gaps.sort_by(f64::total_cmp);
-        }
-        let mut values = metrics::block_values(&data, "run", &extra);
-        // Traceless, the frames are the OS's presents of the browser's processes (none headless), read
-        // as a native app's are (§7.4) and refused with the reason where this OS cannot tell; headed in
-        // another engine, `interaction.*` joins strobe's inputs to them (from outside a run takes none).
-        let mut os_refused: BTreeMap<String, Refusal> = BTreeMap::new();
-        let mut os_presents = None;
-        let run_inputs_kept = run_inputs.into_inner();
-        if traceless {
-            values.remove("frames.n");
-            if let Some(p) = presents {
-                let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
-                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(range.clone()).unwrap_or_default(), software, &mut values, &mut os_refused);
-            }
-        }
-        if canvas {
-            values.insert("canvas.n".into(), canvas_gaps.len() as f64);
-            if !canvas_gaps.is_empty() {
-                for (name, p) in [("canvas.interval.p50", 0.50), ("canvas.interval.p95", 0.95), ("canvas.interval.p99", 0.99)] {
-                    values.insert(name.into(), metrics::percentile(&canvas_gaps, p));
+        // The cases that passed, as blocks; anything the launch fails from here fails each of them.
+        let finished = (|| -> Result<(Vec<Block>, Kept)> {
+            let s0 = &cases[page_cases[0].0];
+            // A batch checked the page after each case (above): the case that failed may have left none.
+            // A block whose first speed check ran slow is accepted only if the check holds at speed right
+            // after its measured runs too (no wait): a slowdown that came back over the runs refuses it.
+            if let Some(first) = first_slow.as_ref().filter(|_| !batch) {
+                match check()? {
+                    (Err(e), other) => return Err(slow_check(e, &other, &format!("; right after the measured runs, after a first slow check ({first}) and a second at speed once the CPUs settled"))),
+                    (Ok(_), _) => ctx.warnings.push(validity::info(
+                        "Throttled",
+                        format!("{} · {side} block: the first speed check ran slow ({first}); the second, after the CPUs settled, and a third right after the measured runs ran at speed, so the block went on", s0.label()),
+                    )),
                 }
-                values.insert("canvas.interval.max".into(), canvas_gaps.last().copied().unwrap_or(0.0));
             }
-        }
-        if set != Set::Lean && busy_cdp.is_finite() {
-            // The same quantity from the Performance domain, next to the trace's: they must agree.
-            values.insert("main.busy.cdp".into(), busy_cdp);
-        }
-        if unsteady {
-            values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
-        }
-        if private_mb > 0.0 {
-            values.insert("memory.app.private".into(), private_mb);
-        }
-        if let Some(b) = pss {
-            values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
-        }
-        if let Some(v) = vram {
-            values.insert("gpu.vram".into(), v);
-        }
-        if !foreign.is_empty() {
-            values.insert("cpu.foreign".into(), metrics::median(&foreign));
-            values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
-        }
-        let mut refused = uncounted;
-        refuse_not_on_this_os(s, &mut values, &mut refused);
-        block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
-        for (m, r) in os_refused {
-            values.remove(&m);
-            refused.insert(m, r);
-        }
-        for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
-            refused.insert(m.clone(), metrics::split_refusal(m, &values));
-        }
-        // What strobe's page scripts see from a document's start: WebDriver Classic runs them only after the
-        // document's own, so a run that loaded one missed its counter calls, canvas frames and changes.
-        let unseen_start = |m: &str| loaded_document.get() && ["count.", "canvas.", "interaction.", "scroll.latency."].iter().any(|p| m.starts_with(p));
-        for m in declared_metrics(s) {
-            let webgpu = (no_webgpu && m.starts_with("canvas."))
-                .then(|| Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: the page has no WebGPU here (no GPUCanvasContext: {engine} on this OS does not ship it, or the origin is not a secure context)")));
-            let preload = unseen_start(m).then(|| {
-                Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: a run loaded a page, and WebDriver Classic ({engine}) runs strobe's page scripts only after the page's own, so what the new page did first went unseen"))
-                    .fix("keep the run on one page (load it in prepare or reset), or measure it in Chromium or Firefox")
+            let mut stopped = video.take().map(super::video::Recorder::stop);
+            // A check's run after its reset is not measured (`Warmup::measured`): each case's measured runs,
+            // by their index in the case (`local`) and among the launch's runs.
+            let measured_of = |c: &PageCase| {
+                let first = c.warmup.first().unwrap_or(0);
+                let local = first..c.warmup.measured().end.clamp(first, c.runs.len());
+                (local.clone(), c.base + local.start..c.base + local.end)
+            };
+            let samples = sampler.stop();
+            let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
+            let procs1 = (host::now_ns(), host::all_processes());
+            let background = busiest_others(&procs0, &procs1);
+            let screen = screen_state(&procs0, &procs1);
+            // The window must have stayed visible for the whole block, and the browser strobe's alone.
+            if !hidden_ok && !batch {
+                validity::window_visible(&page)?;
+                front_page(s0, &browser)?;
+            }
+            if !batch {
+                browser.own()?;
+            }
+            // What the page had to draw in, compared with the other side's content area (`admit_window`):
+            // as setup began when a `page.window` sized it since (a run, or a reset left out, may leave it
+            // sized), else now; as setup began after a batch's failed case, which may have left no page.
+            let content = if driver.window_sized() || failed.is_some() { content_before } else { read_content() };
+            // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
+            let presents = presents.map(|r| r.and_then(|_| presents_rc.borrow_mut().take().ok_or_else(|| Error::msg("the present capture ended early"))).and_then(|c| c.stop()));
+            let dir = match (&draft, keep) {
+                (Some(d), _) => d.dir().to_path_buf(),
+                (None, true) => draft.insert(store::claim_recording(&id)?).dir().to_path_buf(),
+                (None, false) => host::paths::run().join(&id),
+            };
+            std::fs::create_dir_all(&dir)?;
+            let leak = if set == Set::Memory { Some(leak_analysis(&census, &dir, n)?) } else { None };
+            // The first case's measured runs: what an attribution or memory block (always one case) profiles.
+            let (_, range0) = measured_of(&page_cases[0].1);
+            let first0 = range0.start;
+            let measured0 = &page_cases[0].1.runs[measured_of(&page_cases[0].1).0];
+            let spans0: Vec<(String, u64, u64)> = measured0.iter().enumerate().map(|(j, r)| (format!("run:{}", first0 + j), r.t0, r.t1)).collect();
+            // The interval the page's sampler kept (SPEC §8.3), kept in the recording's meta.
+            let mut sampling = None;
+            // Firefox's profile becomes the recording's CPU profiles (each page thread's samples inside each
+            // measured run's own span) and its style, layout and GC rows, then the page's source maps.
+            if let Some(g) = gecko.take() {
+                let raw = g.stop()?;
+                let untimed: Vec<(u64, u64)> = measured0.iter().flat_map(|r| r.timed.untimed.iter().copied()).collect();
+                let got = probe::gecko::convert(&raw, &token, &spans0, &untimed, &dir)?;
+                sampling = got.sampling;
+                let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
+                let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
+                probe::symbols::store_maps(&page, &got.scripts, &dir, served.as_deref())?;
+                lap("maps");
+            } else if profiled {
+                let profiles = profiles.take();
+                sampling = probe::cpu::Sampling::of(probe::cpu::interval_us() as f64, profiles.iter().flat_map(|(p, _)| probe::cpu::gaps(p)).collect());
+                for (k, (profile, allocs)) in profiles.iter().enumerate() {
+                    store::write_json(&dir.join(format!("cpu-{k}.cpuprofile")), profile)?;
+                    store::write_json(&dir.join(format!("alloc-{k}.heapprofile")), allocs)?;
+                }
+                // The page's source maps, kept with the recording while its server still runs, so any view
+                // can resolve any frame later. The served folder (strobe.json `serve.dir`, else
+                // `build.output`) turns original sources into files on disk.
+                let build = crate::target::isolate::build_for_os(&ctx.config["build"]);
+                let served = v.root.as_ref().zip(ctx.config["serve"]["dir"].as_str().or(crate::target::isolate::per_os(&build["output"]))).map(|(r, d)| r.join(d));
+                let mut scripts = std::collections::BTreeSet::new();
+                for (profile, allocs) in &profiles {
+                    probe::symbols::urls(profile, &mut scripts);
+                    probe::symbols::urls(allocs, &mut scripts);
+                }
+                probe::symbols::store_maps_with(&page, &scripts, ranges.take(), &dir, served.as_deref())?;
+                lap("maps");
+            }
+            let trace = dir.join("trace.pftrace");
+            if let Some(tracing) = tracing {
+                tracing.stop(&trace)?;
+                lap("trace");
+            }
+            // `layout.shift`'s explanation: the largest shifts and what moved, named while the page is open.
+            if set == Set::Attribution && shift && page.cdp().is_some() {
+                match probe::shifts::largest(&trace, &token, cp()?, first0, 5) {
+                    Ok(v) => store::write_json(&dir.join("shifts.json"), &v)?,
+                    Err(e) => ctx.warnings.push(validity::warn("Shifts", format!("{} layout shifts: {}", side, e.message))),
+                }
+            }
+            // A Firefox block's census came before its profiler; Firefox gives strobe no heap snapshot.
+            if set == Set::Attribution && firefox.is_none() {
+                // Memory by process and layer after the runs (`query memory`), before the snapshot raises it.
+                let mut c = probe::census::take(cb()?, cp()?);
+                c["allocators"] = probe::census::allocators(cb()?, &dir.join("memdump-0.pftrace")).unwrap_or_else(|e| json!({ "error": e.message }));
+                census.push(c);
+                // The live objects after the runs (post-GC), once no trace subscription copies every
+                // snapshot chunk (SPEC §8.6).
+                if let Err(e) = probe::heap::snapshot(cp()?, &dir.join("heap-0.heapsnapshot.gz")) {
+                    ctx.warnings.push(validity::warn("HeapSnapshot", format!("{} heap snapshot failed: {}", side, e.message)));
+                }
+                lap("heap");
+            }
+            // The attribution block's last reset, deferred past its census and heap snapshot, so the end
+            // screen, the servers and the page are where every other block leaves them.
+            if deferred.get() {
+                if let Some(os) = driver.os.get() {
+                    os.begin(&page)?;
+                }
+                ctx.runner
+                    .call("reset", json!({ "case": s0.case }), s0.run_timeout(), &serve)
+                    .map_err(|e| crate::runner::incomplete(&format!("{} reset", s0.case), "reset", e, &snapshot(&page, &ctx.exp, "reset"), "fix the case's reset"))?;
+                driver.release_all()?;
+                if let Some(os) = driver.os.get() {
+                    os.delivered(&page)?;
+                    os.placed(&page, "reset")?;
+                }
+                let same = &page_cases[0].1.same;
+                if same.on() {
+                    same.read(journey::When::Reset, &|sel| crate::driver::text(&page, sel, Duration::from_secs(2)))?;
+                }
+            }
+            // What the page showed after the runs, once the trace and profilers have stopped (a batch read
+            // each case's before the next one ran).
+            let mut ends: Vec<shown::Screen> = Vec::new();
+            for (k, c) in &page_cases {
+                let end = match &c.end {
+                    Some(e) => e.clone(),
+                    None => {
+                        let end = shown::page(ctx, &cases[*k], v, pair, "end", &page);
+                        shown::expect(&cases[*k].expect, &end, "after the runs", true, &|sel| shown::page_shows(&page, sel))?;
+                        end
+                    }
+                };
+                ends.push(end);
+            }
+            if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
+                && !ctx.warnings.iter().any(|w| w.id == "Teardown")
+            {
+                ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side, e.message)));
+            }
+            // The launch's trace, read once: each case takes its own measured runs from it.
+            let traced = if set == Set::Memory || x.counters || traceless { metrics::BlockData::default() } else { metrics::read(&trace, &token)? };
+            lap("analyse");
+            let run_counts = run_counts.take();
+            let run_marks = run_marks.take();
+            let run_canvas = run_canvas.take();
+            let run_inputs_kept = run_inputs.take();
+            let net = net.map(|n| {
+                let mut n = n.into_inner();
+                n.settle();
+                n
             });
-            if let Some(r) = validity::engine_refusal(engine, m).or(webgpu).or(preload) {
-                values.remove(m);
-                refused.insert(m.clone(), r);
-            }
-        }
-        if burst_keys.get() > 0 {
-            let line = probe::present::frames::burst_refusal(burst_keys.get());
-            let names: Vec<String> = declared_metrics(s).into_iter().cloned().chain(values.keys().cloned()).filter(|m| m.starts_with("interaction.")).collect();
-            for m in names {
-                values.remove(&m);
-                if let Some(r) = Refusal::from_line(&line) {
+            // Other work on the CPUs the target is pinned to, per run (% of one core): their busy time beyond
+            // the target's own cycles (SPEC §10.2 Background). It shares the target's cores and its L3.
+            let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
+            // The OS's presents, handed from case to case (each reads its own runs' frames from them).
+            let mut presents = presents;
+            let mut os_presents: Option<probe::present::Presents> = None;
+            // A traceless block's frames are its OS presents: each measured run's span, inputs and the page's
+            // changes, which `query <rec> frames` reads.
+            let mut frames_runs = serde_json::Map::new();
+            let mut blocks: Vec<Block> = Vec::new();
+            for ((k, c), end) in page_cases.iter().zip(ends) {
+                let s = &cases[*k];
+                let (local, range) = measured_of(c);
+                let first = range.start;
+                let measured = &c.runs[local.clone()];
+                let key = |j: usize| format!("run:{}", first + j);
+                let declared: Vec<&String> = std::iter::once(&s.primary).chain(&s.metrics).collect();
+                let declares = |m: &str| declared.iter().any(|d| *d == m);
+                let run_ms: Vec<f64> = measured.iter().map(|r| r.ms).collect();
+                let walls: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.ms)).collect();
+                let cpu: BTreeMap<String, f64> = measured.iter().enumerate().map(|(j, r)| (key(j), r.cpu)).collect();
+                let busy: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite() && r.ms > 0.0).map(|(j, r)| (key(j), 100.0 * r.task / r.ms)).collect();
+                let work: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.task.is_finite()).map(|(j, r)| (key(j), r.task)).collect();
+                let spans: Vec<(String, u64, u64)> = measured.iter().enumerate().map(|(j, r)| (key(j), r.t0, r.t1)).collect();
+                let nodes = c.nodes.get(local.clone()).unwrap_or_default().to_vec();
+                let (strobe_pct, runner_pct) = cost.share(range.clone());
+                let gpu_runs: Vec<_> = spans.iter().map(|(k, t0, t1)| (k.clone(), samples.window(*t0, *t1))).collect();
+                let foreign: Vec<f64> = gpu_runs
+                    .iter()
+                    .zip(measured)
+                    .filter(|_| !pinned.is_empty())
+                    .filter_map(|((_, w), r)| {
+                        let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
+                        r.cpu_whole.is_finite().then(|| (busy - r.cpu_whole).max(0.0))
+                    })
+                    .collect();
+                let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().filter_map(|(k, s)| Some((k.clone(), s.gpu_3d_pct?))).collect();
+                let vram = gpu_runs.last().and_then(|(_, s)| s.vram_dedicated_mb);
+                // The processes' memory as the last measured run left it, before its reset; a leak run's after
+                // its runs (it reads between them, after each reset).
+                let (private_mb, pss) = match measured.last().and_then(|r| r.end.private_mb.map(|m| (m, r.end.pss))) {
+                    Some(read) => read,
+                    None if set == Set::Memory => {
+                        let procs = browser.processes();
+                        (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&procs.iter().map(|p| p.pid).collect::<Vec<_>>()))
+                    }
+                    // Never a reading from after the reset in its place: no value.
+                    None => (0.0, None),
+                };
+                let mut data = traced.clone();
+                data.measured_only(range.clone());
+                let mut extra = BTreeMap::new();
+                for name in declared.iter().filter_map(|m| m.strip_prefix("count.")) {
+                    extra.insert(format!("count.{name}"), (0..measured.len()).map(|j| (key(j), run_counts.get(first + j).and_then(|c| c.get(name)).copied().unwrap_or(0.0))).collect());
+                }
+                let fixture_cpu: BTreeMap<String, f64> = (0..measured.len()).filter_map(|j| Some((key(j), *run_counts.get(first + j)?.get(block::FIXTURE_CPU)?))).collect();
+                if !fixture_cpu.is_empty() {
+                    extra.insert("cpu.fixture".to_string(), fixture_cpu);
+                }
+                // `phase.<name>`: the run's phase windows from the trace's marks, or (traceless) strobe's own.
+                for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("phase.")) {
+                    let per: BTreeMap<String, f64> = (0..measured.len())
+                        .filter_map(|j| {
+                            if traceless {
+                                return Some((key(j), phase_ms(run_marks.get(first + j)?, name, &measured.get(j)?.timed))).filter(|(_, ms)| ms.is_finite());
+                            }
+                            let suffix = format!(":run:{}:phase:{name}", first + j);
+                            let spans: Vec<f64> = data.windows.iter().filter(|w| w.key.ends_with(&suffix)).map(|w| (w.t1 - w.t0 - data.untimed_in(w)) as f64 / 1e6).collect();
+                            (!spans.is_empty()).then(|| (key(j), spans.iter().sum()))
+                        })
+                        .collect();
+                    extra.insert(format!("phase.{name}"), per);
+                }
+                // `span.<name>`: the page's own performance.measure() spans per run, from the trace.
+                for name in declared_metrics(s).into_iter().filter_map(|m| m.strip_prefix("span.")) {
+                    if let Some(per) = data.span_per_run("run", name) {
+                        extra.insert(format!("span.{name}"), per);
+                    }
+                }
+                if let Some(n) = &net {
+                    for m in declared.iter().filter(|m| m.starts_with("net.")) {
+                        extra.insert(m.to_string(), (0..measured.len()).map(|j| (key(j), n.value(m, first + j))).collect());
+                    }
+                }
+                if declares("layout.shift") && set != Set::Memory {
+                    extra.insert("layout.shift".to_string(), data.shift_per_run("run"));
+                }
+                if declares("main.gc") && set != Set::Memory {
+                    extra.insert("main.gc".to_string(), data.gc_per_run("run"));
+                }
+                if declares("gpu.compile") && set != Set::Memory {
+                    extra.insert("gpu.compile".to_string(), data.gpu_compile_per_run("run"));
+                }
+                extra.insert("run.duration".to_string(), walls);
+                extra.insert("cpu.app.total".to_string(), cpu);
+                // The same CPU as time per run, as a native or script target's: what an implementation
+                // comparison compares on both sides.
+                extra.insert("cpu.work".to_string(), measured.iter().enumerate().filter(|(_, r)| r.cpu.is_finite()).map(|(j, r)| (key(j), r.cpu * r.ms / 100.0)).collect());
+                extra.insert("driver.reads".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.0 as f64)).collect());
+                extra.insert("driver.read_ms".to_string(), measured.iter().enumerate().map(|(j, r)| (key(j), r.reads.1)).collect());
+                // The page as each measured run left it (`RunEnd`), the median over the runs.
+                let heap: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.heap_mb?))).collect();
+                let dom: BTreeMap<String, f64> = measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.end.nodes? as f64))).collect();
+                for (metric, per_run) in [("js.heap.used", heap), ("dom.nodes", dom)] {
+                    if !per_run.is_empty() {
+                        extra.insert(metric.to_string(), per_run);
+                    }
+                }
+                let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.counted)).collect();
+                let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
+                extra.extend(counts);
+                // Drags: the input strobe gave, beside the frames it drew (a starved driver shows here).
+                if measured.iter().any(|r| r.input.is_some()) {
+                    extra.insert("input.rate".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.0))).collect());
+                    extra.insert("input.gap.p95".to_string(), measured.iter().enumerate().filter_map(|(j, r)| Some((key(j), r.input?.1))).collect());
+                }
+                for (i, (_, metric)) in PROCESS_ROLES.iter().enumerate() {
+                    let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.roles[i].is_finite()).map(|(j, r)| (key(j), r.roles[i])).collect();
+                    if !per_run.is_empty() {
+                        extra.insert(metric.to_string(), per_run);
+                    }
+                }
+                if !gpu_3d.is_empty() {
+                    extra.insert("gpu.process.3d".to_string(), gpu_3d);
+                }
+                let busy_cdp = metrics::median(&busy.values().copied().collect::<Vec<_>>());
+                if !work.is_empty() {
+                    extra.insert("main.work".to_string(), work);
+                }
+                for (i, (metric, _, _)) in WORK_PARTS.iter().enumerate() {
+                    let per_run: BTreeMap<String, f64> = measured.iter().enumerate().filter(|(_, r)| r.parts[i].is_finite()).map(|(j, r)| (key(j), r.parts[i])).collect();
+                    if !per_run.is_empty() {
+                        extra.insert(metric.to_string(), per_run);
+                    }
+                }
+                if set == Set::Lean {
+                    extra.insert("main.busy".to_string(), busy);
+                }
+                // canvas.*: frames per run, and gaps between consecutive frames pooled over the measured runs, as
+                // frames.interval pools presented frames. A gap never spans two documents.
+                let case_canvas = declared.iter().any(|m| m.starts_with("canvas."));
+                let mut canvas_gaps: Vec<f64> = Vec::new();
+                if case_canvas {
+                    let measured_canvas = run_canvas.get(range.clone()).unwrap_or_default();
+                    extra.insert("canvas.frames".to_string(), measured_canvas.iter().enumerate().map(|(j, docs)| (key(j), docs.iter().map(Vec::len).sum::<usize>() as f64)).collect());
+                    for doc in measured_canvas.iter().flatten() {
+                        canvas_gaps.extend(doc.windows(2).map(|w| w[1] - w[0]));
+                    }
+                    canvas_gaps.sort_by(f64::total_cmp);
+                }
+                let mut values = metrics::block_values(&data, "run", &extra);
+                // Traceless, the frames are the OS's presents of the browser's processes (none headless), read
+                // as a native app's are (§7.4) and refused with the reason where this OS cannot tell; headed in
+                // another engine, `interaction.*` joins strobe's inputs to them (from outside a run takes none).
+                let mut os_refused: BTreeMap<String, Refusal> = BTreeMap::new();
+                let mut case_presents = None;
+                if traceless {
+                    values.remove("frames.n");
+                    if let Some(p) = presents.take() {
+                        let again = (page_cases.len() > 1).then(|| p.clone());
+                        let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
+                        case_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(range.clone()).unwrap_or_default(), software, &mut values, &mut os_refused);
+                        presents = again;
+                    }
+                }
+                if case_canvas {
+                    values.insert("canvas.n".into(), canvas_gaps.len() as f64);
+                    if !canvas_gaps.is_empty() {
+                        for (name, p) in [("canvas.interval.p50", 0.50), ("canvas.interval.p95", 0.95), ("canvas.interval.p99", 0.99)] {
+                            values.insert(name.into(), metrics::percentile(&canvas_gaps, p));
+                        }
+                        values.insert("canvas.interval.max".into(), canvas_gaps.last().copied().unwrap_or(0.0));
+                    }
+                }
+                if set != Set::Lean && busy_cdp.is_finite() {
+                    // The same quantity from the Performance domain, next to the trace's: they must agree.
+                    values.insert("main.busy.cdp".into(), busy_cdp);
+                }
+                if c.warmup.unsteady() {
+                    values.insert("warmup.unsteady".into(), if c.warmup.grew() { 2.0 } else { 1.0 });
+                }
+                if private_mb > 0.0 {
+                    values.insert("memory.app.private".into(), private_mb);
+                }
+                if let Some(b) = pss {
+                    values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+                }
+                if let Some(v) = vram {
+                    values.insert("gpu.vram".into(), v);
+                }
+                if !foreign.is_empty() {
+                    values.insert("cpu.foreign".into(), metrics::median(&foreign));
+                    values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
+                }
+                let mut refused = uncounted;
+                refuse_not_on_this_os(s, &mut values, &mut refused);
+                block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
+                for (m, r) in os_refused {
+                    values.remove(&m);
                     refused.insert(m, r);
                 }
+                for m in declared_metrics(s).into_iter().filter(|m| metrics::split_metric(m) && !values.contains_key(*m) && set != Set::Memory && !x.counters) {
+                    refused.insert(m.clone(), metrics::split_refusal(m, &values));
+                }
+                // What strobe's page scripts see from a document's start: WebDriver Classic runs them only after the
+                // document's own, so a run that loaded one missed its counter calls, canvas frames and changes.
+                let unseen_start = |m: &str| c.loaded_document && ["count.", "canvas.", "interaction.", "scroll.latency."].iter().any(|p| m.starts_with(p));
+                for m in declared_metrics(s) {
+                    let webgpu = (no_webgpu && m.starts_with("canvas."))
+                        .then(|| Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: the page has no WebGPU here (no GPUCanvasContext: {engine} on this OS does not ship it, or the origin is not a secure context)")));
+                    let preload = unseen_start(m).then(|| {
+                        Refusal::new(ValidatorId::EngineUnsupported, format!("{m}: a run loaded a page, and WebDriver Classic ({engine}) runs strobe's page scripts only after the page's own, so what the new page did first went unseen"))
+                            .fix("keep the run on one page (load it in prepare or reset), or measure it in Chromium or Firefox")
+                    });
+                    if let Some(r) = validity::engine_refusal(engine, m).or(webgpu).or(preload) {
+                        values.remove(m);
+                        refused.insert(m.clone(), r);
+                    }
+                }
+                if c.burst > 0 {
+                    let line = probe::present::frames::burst_refusal(c.burst);
+                    let names: Vec<String> = declared_metrics(s).into_iter().cloned().chain(values.keys().cloned()).filter(|m| m.starts_with("interaction.")).collect();
+                    for m in names {
+                        values.remove(&m);
+                        if let Some(r) = Refusal::from_line(&line) {
+                            refused.insert(m, r);
+                        }
+                    }
+                }
+                // Undeclared ones go too (default secondaries, descriptive rows): no value the engine cannot give.
+                values.retain(|k, _| !(no_webgpu && k.starts_with("canvas.")) && !unseen_start(k) && validity::engine_refusal(engine, k).is_none());
+                let phases = metrics::phase_frames(&data);
+                let frames = metrics::run_frames(&data);
+                // Traceless, the frame pacing per run (`intervals`) comes from the OS's presents where this OS
+                // tells when a frame was handed over (Windows).
+                let intervals = match (&case_presents, values.get("display.hz")) {
+                    (Some(p), Some(hz)) if !p.no_begin => present_intervals(p, &browser.pids(), &measured.iter().map(|r| r.timed.clone()).collect::<Vec<_>>(), 1000.0 / hz),
+                    _ => metrics::run_intervals(&data),
+                };
+                if case_presents.is_some() {
+                    for (j, r) in measured.iter().enumerate() {
+                        let (sent, changes, _) = run_inputs_kept.get(first + j).cloned().unwrap_or_default();
+                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true, "press_ns": s.press, "acted": s.acted, "burst": s.burst })).collect();
+                        frames_runs.insert(key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }));
+                    }
+                    os_presents = case_presents;
+                }
+                let mut steps = steps.borrow().clone();
+                steps.extend(c.steps.iter().cloned());
+                blocks.push(Block {
+                    variant: v.role.to_string(),
+                    pair,
+                    values,
+                    run_ms,
+                    warmup: local.start,
+                    speed_ratio: ratio,
+                    nodes,
+                    recording: None,
+                    phases,
+                    frames,
+                    intervals,
+                    steps,
+                    background: background.clone(),
+                    leak: leak.clone(),
+                    refused,
+                    locked: false,
+                    display: None,
+                    screen: Some(screen.clone()),
+                    reserve: None,
+                    shown: Some(shown::Shown { start: c.start.clone(), end }),
+                    overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, ..Overhead::default() }),
+                    process_set: Some(programs(&browser.processes())),
+                    fixture_connected: None,
+                    client: content,
+                    frame: false,
+                    browser: Some(seen.clone()),
+                    directions: BTreeMap::new(),
+                    same: c.same.take(local.clone()),
+                    ops: journey::ops(&run_counts.get(range.clone()).unwrap_or_default().iter().collect::<Vec<_>>()),
+                    input,
+                    reduced_motion,
+                });
             }
-        }
-        // Undeclared ones go too (default secondaries, descriptive rows): no value the engine cannot give.
-        values.retain(|k, _| !(no_webgpu && k.starts_with("canvas.")) && !unseen_start(k) && validity::engine_refusal(engine, k).is_none());
-        let phases = metrics::phase_frames(&data);
-        let frames = metrics::run_frames(&data);
-        // Traceless, the frame pacing per run (`intervals`) comes from the OS's presents where this OS
-        // tells when a frame was handed over (Windows).
-        let intervals = match (&os_presents, values.get("display.hz")) {
-            (Some(p), Some(hz)) if !p.no_begin => present_intervals(p, &browser.pids(), &measured.iter().map(|r| r.timed.clone()).collect::<Vec<_>>(), 1000.0 / hz),
-            _ => metrics::run_intervals(&data),
-        };
-        // From outside there is no trace to keep: the block's numbers are in result.json. A Firefox block
-        // keeps its OS presents for `query <rec> frames`.
-        let recording = if (keep && (!outside || x.video)) || set == Set::Memory {
-            // The actions first: the video's markers take their measured reactions from them.
-            keep_actions(ctx, &dir)?;
-            // The video: every run on its time (warmup ones too), the inputs and, without a trace, the phases.
+            // From outside there is no trace to keep: the block's numbers are in result.json. A Firefox block
+            // keeps its OS presents for `query <rec> frames`.
+            if !((keep && (!outside || x.video)) || set == Set::Memory) {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Ok((blocks, None));
+            }
+            // The actions first: the video's markers take their measured reactions from them. A batch's
+            // whole log goes with it, each case's subset to its result (`batch`).
+            let actions = ctx.runner.take_actions();
+            if !actions.is_empty() {
+                actions.write(&dir.join(store::actions::FILE))?;
+            }
+            // The video: every run on its time (warmup ones too), the inputs and, without a trace, the phases;
+            // in a batch each case's span too.
             let video = match stopped.take() {
                 Some(Ok(st)) => {
-                    let filmed: Vec<super::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, range.contains(&i))).collect();
-                    let marks: Vec<(String, u64)> = if traceless { run_marks.iter().flatten().cloned().collect() } else { video_marks.take() };
+                    let filmed: Vec<super::video::Run> = page_cases
+                        .iter()
+                        .flat_map(|(_, c)| {
+                            let (local, _) = measured_of(c);
+                            c.runs.iter().enumerate().map(move |(i, r)| (format!("run:{}", c.base + i), r.t0, r.t1, local.contains(&i)))
+                        })
+                        .collect();
+                    let mut marks: Vec<(String, u64)> = if traceless { run_marks.iter().flatten().cloned().collect() } else { video_marks.take() };
+                    marks.extend(case_marks.take());
                     st.keep(&dir, &filmed, &video_sent.take(), &marks)
-                        .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: the video was not kept: {}", s.label(), e.message))))
+                        .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: the video was not kept: {}", s0.label(), e.message))))
                         .ok()
                 }
                 Some(Err(e)) => {
-                    ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: no video: {}", s.label(), e.message)));
+                    ctx.warnings.push(validity::warn("Video", format!("{} · {side} block: no video: {}", s0.label(), e.message)));
                     None
                 }
                 None => None,
             };
+            let measured_runs: usize = page_cases.iter().map(|(_, c)| measured_of(c).0.len()).sum();
+            let duration: f64 = blocks.iter().flat_map(|b| &b.run_ms).sum();
             let mut meta = json!({
                 // A `url()` target loads its address whatever the variant: no build of it ran.
-                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role,
+                "id": id, "kind": "block", "experiment": ctx.exp, "seed": ctx.seed, "series": s0.label(), "variant": v.role,
                 "variant_label": if fixed_page { url.clone() } else { v.label.clone() }, "variant_git": if fixed_page { Value::Null } else { variant_git(v) },
-                "target": url, "probes": set, "token": token, "runs": measured.len(), "values": values, "duration_ms": run_ms.iter().sum::<f64>() as u64,
+                "target": url, "probes": set, "token": token, "runs": measured_runs, "values": if batch { json!({}) } else { json!(blocks[0].values) }, "duration_ms": duration as u64,
                 "created": super::record::now_iso(), "valid": true, "env": host::env(), "browser": browser.version(), "engine": engine, "headless": headless, "input": input, "background": background, "screen": screen,
                 // Rule 3: a block with profilers, a census or a video describes the profiled (filmed) page.
                 "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" },
-                "os": spans.first().zip(spans.last()).map(|(a, b)| samples.window(a.1, b.2)), "video": video,
+                "os": samples.window(page_cases[0].1.runs.first().map_or(0, |r| r.t0), page_cases[page_cases.len() - 1].1.runs.last().map_or(0, |r| r.t1)), "video": video,
             });
+            if batch {
+                meta["batch"] = batch::meta(page_cases.iter().map(|(k, c)| (&cases[*k], measured_of(c).1)).zip(&blocks).map(|((s, r), b)| (s, r, b)));
+            }
             if !census.is_empty() {
                 meta["census"] = json!(census);
             }
@@ -5911,73 +6381,46 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
                 meta["leaks"] = l["suspects"].clone();
                 meta["leak"] = json!({ "js_heap": l["js_heap"], "dom_nodes": l["dom_nodes"], "runs": l["runs"] });
             }
-            // A traceless block's frames are its OS presents: kept as a native block keeps them, with the
-            // runs' spans, inputs and the page's changes, which `query <rec> frames` reads.
             if let Some(p) = &os_presents {
                 crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
-                let inputs = &run_inputs_kept;
-                let per: serde_json::Map<String, Value> = measured
-                    .iter()
-                    .enumerate()
-                    .map(|(j, r)| {
-                        let (sent, changes, _) = inputs.get(first + j).cloned().unwrap_or_default();
-                        let sent: Vec<Value> = sent.iter().map(|s| json!({ "t_ns": s.t_ns, "kind": if s.scroll { "scroll" } else { "discrete" }, "first": true, "press_ns": s.press, "acted": s.acted, "burst": s.burst })).collect();
-                        (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": sent, "marks": run_marks.get(first + j), "changes": changes }))
-                    })
-                    .collect();
-                store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": values.get("display.hz"), "runs": per }))?;
+                store::write_json(&dir.join("frames.json"), &json!({ "pids": browser.pids(), "display_hz": blocks[0].values.get("display.hz"), "runs": frames_runs }))?;
             }
             store::write_json(&dir.join("meta.json"), &meta)?;
             if let Some(d) = draft.take() {
                 d.keep();
             }
-            Some(id)
-        } else {
-            let _ = std::fs::remove_dir_all(&dir);
-            None
+            for b in &mut blocks {
+                b.recording = Some(id.clone());
+            }
+            Ok((blocks, batch.then_some(actions)))
+        })();
+        let mut out: Vec<Result<Block>> = match finished {
+            Ok((blocks, actions)) => {
+                return Ok(Launch { cases: blocks.into_iter().map(Ok).chain(failed.map(Err)).collect(), abort, notes, actions, log_at, case_ms });
+            }
+            Err(e) => page_cases.iter().map(|_| Err(e.clone())).collect(),
         };
-        Ok(Block {
-            variant: v.role.to_string(),
-            pair,
-            values,
-            run_ms,
-            warmup: warm.len(),
-            speed_ratio: ratio,
-            nodes,
-            recording,
-            phases,
-            frames,
-            intervals,
-            steps: steps.borrow().clone(),
-            background,
-            leak,
-            refused,
-            locked: false,
-            display: None,
-            screen: Some(screen),
-            reserve: None,
-            shown: Some(shown::Shown { start, end }),
-            overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, ..Overhead::default() }),
-            process_set: Some(programs(&browser.processes())),
-            fixture_connected: None,
-            client: content,
-            frame: false,
-            browser: Some(seen),
-            directions: BTreeMap::new(),
-            same: same.take(range.clone()),
-            ops: journey::ops(&run_counts.get(range.clone()).unwrap_or_default().iter().collect::<Vec<_>>()),
-            input,
-            reduced_motion,
-        })
+        out.extend(failed.map(Err));
+        Ok(Launch { cases: out, abort, notes, actions: None, log_at, case_ms })
     })();
     lapped.set(Instant::now());
     browser.close();
-    let result = result.map(|mut b| {
-        b.steps.push(("close".into(), lapped.get().elapsed().as_secs_f64() * 1e3));
-        b
+    let close_ms = lapped.get().elapsed().as_secs_f64() * 1e3;
+    let mut result = result.map(|mut l| {
+        for b in l.cases.iter_mut().flatten() {
+            b.steps.push(("close".into(), close_ms));
+        }
+        l
     });
-    if let Some(g) = &guard {
-        g.check("after a block")?;
+    if let Some(g) = &guard
+        && let Err(e) = g.check("after a block")
+    {
+        match &mut result {
+            Ok(l) => {
+                l.abort.get_or_insert(e);
+            }
+            Err(_) => return Err(e),
+        }
     }
     result
 }

@@ -101,6 +101,7 @@ pub const FLAGS: &[(&str, Kind, &str)] = &[
     ("range", Value, "track"),
     ("every", Number, "track"),
     ("blocks", Number, "bench track"),
+    ("batch", Number, "bench"),
     ("again", Switch, "track"),
     ("confirm", Switch, "track"),
     ("no-confirm", Switch, "track"),
@@ -341,6 +342,7 @@ Use
         [--probes memory --repeat N]   (a leak run per variant instead of pairs)
         [--pixels | --pixels-only]     (compare base and head at the case's page.snapshot()s, after or instead of timing)
         [--video]                      (film untimed: the check run, or one warmed run per side after the timed pairs)
+        [--check --batch N]            (up to N run cases per launch, each held to the launch's start after its reset)
         [--pin auto|none|ccdN|<cpus>]  (auto: the V-Cache CCD; equal CCDs: the first; a hybrid CPU: its fastest cores;
                                         otherwise all but the last 1-2 whole cores, which strobe and the runner get;
                                         fewer than 4 cores, more than 64 CPUs, or macOS: unpinned)

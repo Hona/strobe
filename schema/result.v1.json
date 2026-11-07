@@ -16,6 +16,18 @@
     "decided": { "type": "boolean", "description": "experiment: every series' primary got a verdict and nothing stopped the bench." },
     "passed": { "type": "boolean", "description": "check: every case passed." },
     "parity": { "type": ["string", "null"], "description": "check of several targets: the parity matrix, as the text output prints it." },
+    "batch": {
+      "type": ["object", "null"],
+      "description": "check --batch N (SPEC 5.6): run cases shared launches. size: N; launches; cases: the cases they ran; failed_launches: those that failed before a case ran; launch_ms_mean: a launch's own time besides its cases (start, prepare, setup, trace, recording, close), over the launches that ran a case; saved_ms: that time for each case after a launch's first, what a launch per case would have added. Null without --batch.",
+      "properties": {
+        "size": { "type": "integer" },
+        "launches": { "type": "integer" },
+        "cases": { "type": "integer" },
+        "failed_launches": { "type": "integer" },
+        "launch_ms_mean": { "type": ["number", "null"] },
+        "saved_ms": { "type": "number" }
+      }
+    },
     "env": {
       "type": "object",
       "description": "The device: OS, CPU, GPU, displays, power, strobe's build.",
@@ -405,6 +417,9 @@
           "description": "check: the actions of a case without a recording (it failed, or its kind keeps none): path (<case>.actions.json.gz, or failed-<case>.actions.json.gz, beside result.json, owner-only), count, and failed. strobe query <exp> actions reads them.",
           "properties": { "path": { "type": "string" }, "count": { "type": "integer" }, "failed": { "type": "boolean" } }
         },
+        "batch_id": { "type": "integer", "description": "check --batch: the launch that ran the case (from 1); cases of one launch share its recording, whose meta.json batch lists them." },
+        "batch_seq": { "type": "integer", "description": "check --batch: the case's place in its launch (from 1): the first ran cold, the others after the cases before them." },
+        "batch_note": { "type": "string", "description": "check --batch: the case after this one did not find the screen it expects after this case's reset, and ran in a fresh launch." },
         "session_locked": { "type": "boolean" },
         "screen": { "type": ["object", "null"] },
         "hero": { "type": "boolean", "description": "implementations: the case says hero: true." },

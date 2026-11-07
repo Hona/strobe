@@ -122,6 +122,9 @@ pub struct ActionRecord {
     /// Its place in the block, from 0.
     pub seq: u32,
     pub hook: Hook,
+    /// The case a run or reset action belongs to, in a launch that ran several (`--check --batch`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub case: Option<String>,
     /// The block's run (warmup included, from 0) it belongs to: a run's, and its reset's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<u32>,
@@ -224,7 +227,7 @@ impl ActionLog {
         };
         let mut rest = rest;
         let args_truncated = rest.iter_mut().fold(false, |cut, v| bound(v) | cut);
-        Some(ActionRecord { seq: 0, hook, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, measured: false, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
+        Some(ActionRecord { seq: 0, hook, case: None, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, measured: false, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
     }
 
     /// Each timed run action that ended `ok` gets its latency sample, from the block's per-input outcomes (`each`: by when
@@ -240,6 +243,13 @@ impl ActionLog {
                 a.sample = Some(Sample { edge: SampleEdge::Unmatched, latency_ms: None });
             }
         }
+    }
+
+    /// A batch's log for one case (`case`): its runs' and resets' actions, and with `launch` the
+    /// launch's own (prepare, setup, teardown), which name no case.
+    pub fn of_case(&self, case: &str, launch: bool) -> ActionLog {
+        let actions = self.actions.iter().filter(|a| a.case.as_deref() == Some(case) || (launch && a.case.is_none())).cloned().collect();
+        ActionLog { seed: self.seed, truncated: self.truncated, actions }
     }
 
     /// Writes the log gzipped at `path` (owner-only): a recording's `actions.json.gz`, or beside a

@@ -173,7 +173,10 @@ export interface Context<P> extends Seeded {
    * (`await ctx.ui.openSession()`). A name this target's `ui` lacks is a parity gap (`ParityGap`).
    */
   ui: Record<string, any>
-  /** The case this block runs: a block always belongs to one case. */
+  /**
+   * The case this hook runs for. A block belongs to one case; with `--check --batch` one launch runs several, and
+   * `run` and `reset` get each its own (`setup` runs once for them all: reading this there refuses the batch).
+   */
   case: string
   /** Marks a named span inside a run; every metric can be sliced by it, and `phase.<name>` is its wall time. */
   phase<T>(name: string, fn: () => T | Promise<T>): Promise<T>
@@ -277,7 +280,10 @@ export interface MockResponse {
 export type MockHandler = (request: MockRequest) => MockResponse | undefined | Promise<MockResponse | undefined>
 
 export interface PrepareContext<P> extends Seeded {
-  /** The case this block runs, so one file can give each case its own fixture. */
+  /**
+   * The case this block runs, so one file can give each case its own fixture. `--check --batch` runs `prepare` once
+   * for several cases: reading this then refuses the batch (usage error).
+   */
   case: string
   params: P
   target: string
@@ -681,8 +687,16 @@ export interface Bench<Params extends Record<string, ParamValues>> {
   params?: Params
   /** A process every block talks to (a server with seeded data): see {@link fixture}. */
   fixture?: Fixture
-  /** Once per block, after load. Never measured. */
+  /**
+   * Once per block, after load. Never measured. With `strobe bench --check --batch N` one launch runs it once for
+   * up to N cases: reading `ctx.case` here refuses the batch (usage error).
+   */
   setup?(ctx: SetupContext<Values<Params>>): unknown
+  /**
+   * The reset of every run case that has none of its own (`reset` on a case wins): puts the app back between runs,
+   * never measured. With `--check --batch` it is also what brings the page back for the next case of the launch.
+   */
+  reset?: ((ctx: Context<Values<Params>>) => unknown) | PerTarget<Values<Params>>
   /** Once per block, when it closes. Never measured. */
   teardown?(ctx: Context<Values<Params>>): unknown
   cases: Record<string, Case<Values<Params>>>

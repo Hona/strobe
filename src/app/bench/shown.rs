@@ -299,6 +299,9 @@ pub(super) struct Starts {
     /// (a level meter, a clock in a field): no reset governs them, so they are not compared.
     live: std::collections::BTreeSet<String>,
     on: bool,
+    /// In a batch's launch (`--check --batch`): the case whose runs come now, and its first run's index
+    /// among the launch's runs, which the messages count from.
+    case: Option<(String, usize)>,
 }
 
 impl Starts {
@@ -306,7 +309,27 @@ impl Starts {
     /// start matters: attribution, leak runs (a leak case may grow what it leaves on purpose) and
     /// pixel blocks (`--pixels`).
     pub(super) fn new(s: &Series, x: &Exec) -> Starts {
-        Starts { first: None, live: Default::default(), on: s.reset_check && !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none() }
+        Starts { first: None, live: Default::default(), on: Starts::wanted(s, x), case: None }
+    }
+
+    fn wanted(s: &Series, x: &Exec) -> bool {
+        s.reset_check && !matches!(x.set, Set::Attribution | Set::Memory) && x.pixels.is_none()
+    }
+
+    /// The case whose runs come next in the launch: its own `resetCheck` says whether its starts are
+    /// held to the launch's first one. `base`: in a batch, its first run's index among the launch's
+    /// runs (the runs `check` numbers), so the messages name the case and its own runs.
+    pub(super) fn case(&mut self, s: &Series, x: &Exec, base: Option<usize>) {
+        self.on = Starts::wanted(s, x);
+        self.case = base.map(|b| (s.case.clone(), b));
+    }
+
+    /// Run `run` (of the launch) as the messages name it.
+    fn name(&self, run: usize) -> String {
+        match &self.case {
+            Some((case, base)) => format!("{case}'s run {}", run - base),
+            None => format!("run {run}"),
+        }
     }
 
     /// The first start, read until it holds still, so a tree a lazy provider is still building, a
@@ -376,7 +399,7 @@ impl Starts {
         }
         if self.first.is_none() {
             if let Some(now) = self.reference(read, run == 1 && !after) {
-                self.first = Some((format!("run {run}"), self.held(&now)));
+                self.first = Some((self.name(run), self.held(&now)));
             }
             return Ok(());
         }
@@ -409,7 +432,12 @@ impl Starts {
                 }
             }
         }
-        let when = if after { format!("a run after the last (run {}) would start", run.saturating_sub(1)) } else { format!("run {run} started") };
+        let when = match (&self.case, after) {
+            // In a batch the next case starts where this case's last run and reset left the page or app.
+            (Some(_), true) => format!("the next case of the launch would start, after {} and its reset,", self.name(run.saturating_sub(1))),
+            (None, true) => format!("a run after the last (run {}) would start", run.saturating_sub(1)),
+            (_, false) => format!("{} started", self.name(run)),
+        };
         let list = |v: &[String]| {
             let more = if v.len() > 3 { format!(" and {} more", v.len() - 3) } else { String::new() };
             format!("{}{more}", v.iter().take(3).cloned().collect::<Vec<_>>().join("; "))

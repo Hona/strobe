@@ -466,7 +466,7 @@ strobe bench <file.bench.ts> --head <variant> [--base <variant>]
              [--why auto|always|never] [--trace lean|full] [--power high|keep]
              [--reserve-cpus auto|on|off] [--noworse <pct>|<metric>=<pct>,…] [--plan [--effect <pct>] [--pilot]]
              [--unlock-wait <duration>] [--require-verdict] [--require-parity] [--engine chromium|firefox|webkit] [--headless]
-             [--seed <n>] [--video] [--json]
+             [--seed <n>] [--video] [--check --batch <n>] [--json]
 strobe plan <file.bench.ts> …           the same as bench … --plan: estimate, run nothing (§9.1)
 strobe bench --stop <exp>
 strobe bench --resume <exp>
@@ -547,6 +547,41 @@ last 10 lines the bench file's hooks wrote to the console during it (`console.lo
 rest stay in the experiment's `runner.log`, whose path it names). Each passing case keeps its
 block's recording and prints it (`rec  rec_… · strobe query rec_… threads`), and `query <exp> <view>`
 on a check of one case answers from that recording (with several, it lists them).
+**Many cases per launch** (`--check --batch N`): run cases that one launch can hold share it, its
+`prepare` and its `setup`, up to N at a time, so a file of many small cases (a fuzzer's) checks in a
+fraction of the time. Cases share a launch when they run on one target (so one engine, headless
+mode, emulated device and motion) with the same params (a fixture's, a seed folder's and the hooks'
+own), GPU cache and way of measuring (from outside or not), in the file's order; a launch case, a
+`cli()` case and a Linux series that counts instructions in a block of its own each keep a launch of
+their own. Each case runs as alone: run → reset → run → reset when it has a reset (the file's
+`reset`, `bench({ reset })`, when the case has none of its own). After each case strobe checks
+before the next one runs: the page still answers (a renderer the case crashed fails it,
+`RunIncomplete`), the app is still running, the profile's guard holds, the case's start check
+against the launch's first start (`ResetIncomplete`, its message naming the case and its runs: "the
+next case of the launch would start, after X's run 2 and its reset, from a different state than A's
+run 1 did"), its `expect` after the runs (`WrongScreen`), the OS input it was given, the window's
+size (`page.window`), the window's visibility and the browser's own processes. A case that fails ends
+its launch, and the next case gets a fresh one; so does a case with `resetCheck: false` (it passes
+or fails on its own, and no case may start from what it built). A later case whose `expect` does
+not hold on the screen the case before it left is not run there: it runs in a fresh launch, and
+the case before gets the note `batch  after its reset the screen was not what <next> expects …`.
+A launch that fails before any case ran (its launch, prepare or setup) fails its first case, as
+without `--batch`; three such launches in a row stop the bench (exit 1), as does a disturbed
+guard. `prepare`, a `url` function and `setup` run once for a launch's cases, so a file whose
+`prepare`, `url` function or `setup` reads `ctx.case` is refused (usage error, exit 2, at its first
+launch); `run` and `reset` get each case's own `ctx.case`, `ctx.seed` and `ctx.random()`. A launch
+keeps one recording, its trace marked `case:<i>:<name>:start|end` around each case, its runs
+numbered across its cases (`run:<i>`), its `meta.json` `batch` listing each case's label, measured
+runs and values, its action log naming each run's and reset's case (§9.6), and with `--video` one
+film of the launch with each case's span. `result.json` has `batch` (`size`, `launches`, `cases`,
+`failed_launches`, `launch_ms_mean`: a launch's own time besides its cases, and `saved_ms`: that
+time for each case after a launch's first) and each series `batch_id` (its launch, from 1) and
+`batch_seq` (its place there); the text marks each case `· launch 3.2` and ends with `batch  40
+cases in 10 launches (--batch 10): about 3.1 min saved against a launch per case (…)`. A later
+case runs in a page or app the cases before it warmed: its values are a check's, not a cold
+launch's. `--batch` is a usage error without `--check`, and with `--why always`, `--pixels`,
+`--pixels-only`, `--probes memory`, `--blocks`, `--aa` and `--base`: a timed block is one fresh
+launch per case (the unit of a verdict), and the others are one case's block each.
 `--check --why always` also runs one attribution block per passing series on `--head` (warmed as in
 a bench, then `--runs` measured runs, default 5; views name the warmup runs the trace also holds)
 and prints its recording, to profile one build before there is anything to compare.
@@ -2331,7 +2366,9 @@ after `timeout`, default 30 s; the call registers its watch at once and then pol
 answered at once, so strobe serves the hook's other calls meanwhile and `const saved =
 ctx.waitForLine(/saved/); await page.click(…); await saved` misses nothing and never deadlocks;
 output lines no watch waits for are dropped), `fixture` (the block's fixture: `{ url, port, pid }`, or null, §9.10), `case` (the case the block runs, also in `prepare`, `setup` and a `url` function, so one
-file can give each case its own fixture), `params`, `target` (its name), `variant` (`base` or
+file can give each case its own fixture; with `--check --batch` a launch runs several cases, `run`
+and `reset` get each its own, and reading it in `prepare`, a `url` function or `setup`, which run
+once for them all, refuses the batch, §5.6), `params`, `target` (its name), `variant` (`base` or
 `head`, for logging only), `url`, `root` (the variant's folder), `prepared`, `seed` and `random()`
 (below; also in `prepare` and a launch's `before`), in `prepare` and `setup`
 `addInitScript(script, arg?)`, and in `prepare` only `playwright` and `mock(pattern, handler)`.
@@ -2361,8 +2398,9 @@ that keep them only: `--check` (and pixels) blocks, kept blocks (`--keep`, each 
 attribution and memory blocks, and attribution launches. Those cost no round trip to the target, two
 host-clock reads and a bounded copy of the arguments per call (inside a run, strobe's own cost,
 §8.2); every other timed block reads no clock and copies nothing for them (`Runner::collect_actions`).
-Each record (`store::actions::ActionRecord`) has `seq`, `hook`, `run` (the block's run from 0,
-warmup included; a reset has its run's), `untimed`, `phase` (the innermost; a hook starts with none
+Each record (`store::actions::ActionRecord`) has `seq`, `hook`, `case` (a run's and a reset's in a
+launch of several cases, `--check --batch`; none otherwise), `run` (the block's run from 0, warmup
+included, counted over the launch's cases; a reset has its run's), `untimed`, `phase` (the innermost; a hook starts with none
 open), `t_ns` (when its input went out, host clock: the driver's own send time of its first
 measured input, a click's release, a key press or a scroll's first step, else of its first input of
 any kind, else, for a call that sent none, when strobe got the request) and `end_ns` (when strobe
@@ -2385,7 +2423,10 @@ starts at its `block` call and holds at most 100,000 actions (`truncated` past t
 takes it as `actions.json.gz` (§14.1); a `--check` case without a recording (it failed, or its kind
 keeps none: a script, a command, a launch, a page measured from outside) keeps it beside its
 `result.json` as `<case>.actions.json.gz`, or `failed-<case>.actions.json.gz` (the case's `actions:
-{ path, count, failed }`, and a line under it). `query <rec|exp> actions` shows them (§11.1).
+{ path, count, failed }`, and a line under it). A batch's launch keeps its whole log in its
+recording, and a case of it without one (it failed, or the launch kept none) its own part: its
+actions, and the first case also the launch's (`prepare`, `setup`). `query <rec|exp> actions` shows
+them (§11.1), each run's and reset's with its case.
 
 **Untimed stretches** (`await ctx.untimed(fn)`): a wait inside a run that is not the journey, such
 as letting the app go idle between two clicks (`await ctx.untimed(() => page.idle())`), leaves the

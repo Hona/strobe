@@ -94,6 +94,10 @@ pub struct Runner {
     runs: u32,
     untimed: bool,
     phases: Vec<String>,
+    /// A batch (`--check --batch`): each run's and reset's actions name their case (`ActionRecord::case`).
+    batch: bool,
+    /// A launch hook (prepare, a `url` function, setup) read `ctx.case` since the last `took_case`.
+    read_case: bool,
 }
 
 /// What the runner reports about a bench file.
@@ -151,7 +155,7 @@ impl Runner {
             }
         });
         let pid = child.pid();
-        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log, seed: None, used_random: false, actions: RefCell::default(), collect: false, runs: 0, untimed: false, phases: Vec::new() };
+        let mut runner = Runner { child: Some(child), pid, conn, lines: rx, next: 1, log, seed: None, used_random: false, actions: RefCell::default(), collect: false, runs: 0, untimed: false, phases: Vec::new(), batch: false, read_case: false };
         runner.wait_ready()?;
         Ok(runner)
     }
@@ -198,6 +202,7 @@ impl Runner {
         }
         // A reset belongs to the run before it.
         let run = matches!(hook, Some(Hook::Run | Hook::Reset)).then(|| self.runs.checked_sub(1)).flatten();
+        let case = args["case"].as_str().filter(|_| self.batch && matches!(hook, Some(Hook::Run | Hook::Reset))).map(str::to_string);
         self.write(&json!({ "id": id, "op": op, "args": args }))?;
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -213,6 +218,7 @@ impl Runner {
             let Ok(msg) = serde_json::from_str::<Value>(&line) else { continue };
             if msg.get("id").and_then(Value::as_u64) == Some(id) {
                 self.used_random |= msg["used_random"] == true;
+                self.read_case |= msg["read_case"] == true;
                 if let Some(err) = msg.get("error").and_then(Value::as_str) {
                     let stack = msg.get("stack").and_then(Value::as_str).unwrap_or("");
                     let first = stack.lines().find(|l| l.contains(".bench.")).unwrap_or("").trim();
@@ -235,6 +241,7 @@ impl Runner {
                 crate::driver::take_sending();
                 let served = serve(&req_op, &args);
                 if let Some(mut a) = action {
+                    a.case.clone_from(&case);
                     // What the driver said it sent: its send time, a click's press, what it aimed at.
                     let sending = crate::driver::take_sending();
                     a.t_ns = sending.t_ns.unwrap_or(a.t_ns);
@@ -300,6 +307,22 @@ impl Runner {
     /// are measured (`ActionLog::join`); `runs`: the measured runs' host-clock spans.
     pub fn join_samples(&self, each: &[(u64, crate::store::actions::Sample)], runs: &[(u64, u64)]) {
         self.actions.borrow_mut().join(each, runs);
+    }
+
+    /// Whether each run's and reset's actions name their case: a batch's launch runs several.
+    pub fn batch(&mut self, on: bool) {
+        self.batch = on;
+    }
+
+    /// Whether a hook read `ctx.case` since the last call (a batch's prepare, `url` function or setup
+    /// runs once for several cases); cleared.
+    pub fn took_case(&mut self) -> bool {
+        std::mem::take(&mut self.read_case)
+    }
+
+    /// runner.log's length now: what the hooks printed from here on is the next case's.
+    pub fn log_len(&self) -> u64 {
+        std::fs::metadata(&self.log).map(|m| m.len()).unwrap_or(0)
     }
 
     /// The current (or last) block's actions since its `block` call, taken: written once.

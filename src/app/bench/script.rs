@@ -126,7 +126,13 @@ impl Host {
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let line = self.lines.recv_timeout(left).map_err(|_| Error::timeout(format!("the process host did not answer in {} s", timeout.as_secs())))?;
+            let line = self.lines.recv_timeout(left).map_err(|e| match e {
+                std::sync::mpsc::RecvTimeoutError::Timeout => Error::timeout(format!("the process host did not answer in {} s", timeout.as_secs())),
+                std::sync::mpsc::RecvTimeoutError::Disconnected => match self.child.exited() {
+                    Some(code) => Error::msg(format!("the process host exited (code {code})")),
+                    None => Error::msg("the process host closed its connection"),
+                },
+            })?;
             let Ok(v) = serde_json::from_str::<Value>(&line) else { continue };
             if v["id"] == json!(id) {
                 if let Some(e) = v["error"].as_str() {
@@ -170,7 +176,11 @@ fn cycles(pid: u32) -> (super::super::record::Cycles, Option<u64>) {
 /// (MB), its phase marks, what the OS counted for the host's processes, and its span.
 type ScriptRun = (f64, f64, BTreeMap<String, f64>, f64, Vec<(String, u64)>, probe::wakes::Counted, metrics::Timed);
 
-pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+/// One host process for the cases of one launch: one case, or a chunk of them with `--check --batch`
+/// (SPEC §5.6), each case's runs after the case before it.
+pub(super) fn chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
+    let batch = ctx.batch.is_some();
     let (set, keep) = (x.set, x.keep);
     let target = ctx.describe["targets"][&s.target].clone();
     let root = v.root.clone().ok_or_else(|| Error::msg(format!("{}: a script target runs in a variant's folder (a directory or a git ref)", v.role)))?;
@@ -184,8 +194,6 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     let entry = place(Path::new(ctx.describe["file"].as_str().unwrap_or(".")), target["entry"].as_str().unwrap_or(""), &root)?;
     let log = store::experiment_dir(&ctx.exp)?.join("script.log");
     let host = RefCell::new(Host::spawn(&target, &entry, &root, ctx.pin, profiles.as_deref(), &log)?);
-    // `js.heap.retained`: the post-GC heap a run leaves behind, read outside its timed span.
-    let heap = std::iter::once(&s.primary).chain(&s.metrics).any(|m| m == "js.heap.retained");
     let heap_mb = || -> Result<f64> { Ok(host.borrow_mut().request(json!({ "op": "heap" }), Duration::from_secs(120))?.as_f64().unwrap_or(f64::NAN) / (1024.0 * 1024.0)) };
     steps.push(("launch".into(), launched.elapsed().as_secs_f64() * 1e3));
     let pid = host.borrow().pid();
@@ -217,132 +225,165 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         }
     };
     let t = Duration::from_secs(600);
-    let result = (|| -> Result<Block> {
+    let result = (|| -> Result<Launch> {
         let root_text = root.display().to_string();
         ctx.runner.call("block", json!({ "case": s.case, "params": s.params, "target": s.target, "variant": v.role, "url": "", "root": root_text }), t, &serve)?;
-        let mut lapped = Instant::now();
+        let lapped = Instant::now();
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+        super::batch::launch_hook_case(ctx, "the bench file's setup")?;
         hooks.check_fixture();
         steps.push(("setup".into(), lapped.elapsed().as_secs_f64() * 1e3));
-        lapped = Instant::now();
-        let mut runs: Vec<ScriptRun> = Vec::new();
-        let mut ends: Vec<Option<(f64, Option<u64>)>> = Vec::new();
-        // Steady once two runs cost the same CPU (SPEC §9.2).
-        let mut warmup = super::block::Warmup::new(s, x);
         let perf = x.counters.then(probe::wakes::Perf::new);
-        while warmup.more(runs.len()) {
-            let h0 = if heap { heap_mb()? } else { f64::NAN };
-            hooks.begin(&format!("run:{}", runs.len()));
-            let listed = probe::wakes::wall_us();
-            let k0 = probe::wakes::Counters::take(listed, &host::tree_pids(pid), perf.as_ref());
-            edges.borrow_mut().clear();
-            let c0 = cycles(pid);
-            cost.start();
-            let t0 = host::now_ns();
-            ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out"))?;
-            let t1 = host::now_ns();
-            cost.end();
-            let c1 = cycles(pid);
-            let counted = probe::wakes::counted(&k0, &probe::wakes::Counters::take(probe::wakes::wall_us(), &host::tree_pids(pid), perf.as_ref()));
-            hooks.end();
-            let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
-            // CPU over the timed parts, each process against its own readings at their edges (a stretch
-            // the run never ended ends with it), at the cycle clock's rate over the run.
-            let mut e = edges.take();
-            if e.len() % 2 == 1 {
-                e.push(c1.0.clone());
+        let mut launch = Launch::default();
+        // The launch's runs so far: a case's runs are numbered after the ones before it.
+        let mut base = 0usize;
+        for (k, s) in cases.iter().enumerate() {
+            if k > 0 && stop_requested() {
+                break;
             }
-            let mut at: Vec<&super::super::record::Cycles> = vec![&c0.0];
-            at.extend(e.iter());
-            at.push(&c1.0);
-            let used = match (c0.1, c1.1) {
-                (Some(a), Some(b)) if b > a && c1.0.values().any(|c| *c > 0) => super::super::record::cycles_timed(&at, |_| true) as f64 / (b - a) as f64 * ((t1 - t0) as f64 / 1e6),
-                _ => f64::NAN,
-            };
-            let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
-            // The host's memory as the run left it, before its reset (SPEC §9.6), where this run may be
-            // the last measured one.
-            ends.push(warmup.may_end(runs.len()).then(|| {
-                let tree = host::process_tree(pid);
-                (tree.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&tree.iter().map(|p| p.pid).collect::<Vec<_>>()))
-            }));
-            runs.push((timed.ns() as f64 / 1e6, used, hooks.counts(), retained, hooks.take_marks(), counted, timed));
-            if s.reset {
-                ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
+            launch.log_at.push(ctx.runner.log_len());
+            let lapped = Instant::now();
+            // `js.heap.retained`: the post-GC heap a run leaves behind, read outside its timed span.
+            let heap = std::iter::once(&s.primary).chain(&s.metrics).any(|m| m == "js.heap.retained");
+            let r = (|| -> Result<Block> {
+                let mut runs: Vec<ScriptRun> = Vec::new();
+                let mut ends: Vec<Option<(f64, Option<u64>)>> = Vec::new();
+                // Steady once two runs cost the same CPU (SPEC §9.2).
+                let mut warmup = super::block::Warmup::new(s, x);
+                while warmup.more(runs.len()) {
+                    let h0 = if heap { heap_mb()? } else { f64::NAN };
+                    hooks.begin(&format!("run:{}", base + runs.len()));
+                    let listed = probe::wakes::wall_us();
+                    let k0 = probe::wakes::Counters::take(listed, &host::tree_pids(pid), perf.as_ref());
+                    edges.borrow_mut().clear();
+                    let c0 = cycles(pid);
+                    cost.start();
+                    let t0 = host::now_ns();
+                    ctx.runner.call("run", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out"))?;
+                    let t1 = host::now_ns();
+                    cost.end();
+                    let c1 = cycles(pid);
+                    let counted = probe::wakes::counted(&k0, &probe::wakes::Counters::take(probe::wakes::wall_us(), &host::tree_pids(pid), perf.as_ref()));
+                    hooks.end();
+                    let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
+                    // CPU over the timed parts, each process against its own readings at their edges (a stretch
+                    // the run never ended ends with it), at the cycle clock's rate over the run.
+                    let mut e = edges.take();
+                    if e.len() % 2 == 1 {
+                        e.push(c1.0.clone());
+                    }
+                    let mut at: Vec<&super::super::record::Cycles> = vec![&c0.0];
+                    at.extend(e.iter());
+                    at.push(&c1.0);
+                    let used = match (c0.1, c1.1) {
+                        (Some(a), Some(b)) if b > a && c1.0.values().any(|c| *c > 0) => super::super::record::cycles_timed(&at, |_| true) as f64 / (b - a) as f64 * ((t1 - t0) as f64 / 1e6),
+                        _ => f64::NAN,
+                    };
+                    let retained = if heap { heap_mb()? - h0 } else { f64::NAN };
+                    // The host's memory as the run left it, before its reset (SPEC §9.6), where this run may be
+                    // the last measured one.
+                    ends.push(warmup.may_end(runs.len()).then(|| {
+                        let tree = host::process_tree(pid);
+                        (tree.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&tree.iter().map(|p| p.pid).collect::<Vec<_>>()))
+                    }));
+                    runs.push((timed.ns() as f64 / 1e6, used, hooks.counts(), retained, hooks.take_marks(), counted, timed));
+                    if s.reset {
+                        ctx.runner.call("reset", json!({ "case": s.case }), t, &serve).map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
+                    }
+                    // Without CPU (cycles that are not time), steady by wall time.
+                    warmup.after(&runs.iter().map(|r| if r.1.is_finite() { r.1 } else { r.0 }).collect::<Vec<_>>());
+                }
+                // In a batch the host must outlive the case: one it ended fails the case that did it.
+                if batch && let Some(code) = host.borrow_mut().child.exited() {
+                    return Err(super::super::record::exited(code, &format!("after {}'s runs", s.case), None));
+                }
+                let first = warmup.first().unwrap_or(0);
+                let local = first..warmup.measured().end.clamp(first, runs.len());
+                let (strobe_pct, runner_pct) = cost.share(base + local.start..base + local.end);
+                let mut steps = steps.clone();
+                steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
+                let measured = &runs[local.clone()];
+                let key = |j: usize| format!("run:{}", base + first + j);
+                let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+                extra.insert("run.duration".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.0)).collect());
+                if measured.iter().all(|r| r.1.is_finite()) {
+                    extra.insert("cpu.work".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.1)).collect());
+                    extra.insert("cpu.app.total".into(), measured.iter().enumerate().filter(|(_, r)| r.0 > 0.0).map(|(j, r)| (key(j), 100.0 * r.1 / r.0)).collect());
+                }
+                if heap {
+                    extra.insert("js.heap.retained".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.3)).collect());
+                }
+                let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.2, r.4.as_slice(), &r.6)).collect();
+                extra.extend(super::block::per_run_hooks(s, &key, &hooked));
+                let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.5)).collect();
+                let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
+                extra.extend(counts);
+                let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
+                if warmup.unsteady() {
+                    values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
+                }
+                // Never a reading from after the reset in its place: no value.
+                let (private_mb, pss) = local.end.checked_sub(1).and_then(|i| ends.get(i).copied().flatten()).unwrap_or((0.0, None));
+                if private_mb > 0.0 {
+                    values.insert("memory.app.private".into(), private_mb);
+                }
+                if let Some(b) = pss {
+                    values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+                }
+                let mut refused = uncounted;
+                refuse_not_on_this_os(s, &mut values, &mut refused);
+                super::block::untimed_state(s, &measured.iter().map(|r| &r.6).collect::<Vec<_>>(), &mut values, &mut refused);
+                base += runs.len();
+                Ok(Block {
+                    variant: v.role.to_string(),
+                    pair,
+                    values,
+                    run_ms: measured.iter().map(|r| r.0).collect(),
+                    warmup: first,
+                    speed_ratio: None,
+                    nodes: Vec::new(),
+                    recording: None,
+                    phases: BTreeMap::new(),
+                    frames: Vec::new(),
+                    intervals: Vec::new(),
+                    steps,
+                    background: Vec::new(),
+                    leak: None,
+                    refused,
+                    locked: false,
+                    display: None,
+                    screen: None,
+                    reserve: None,
+                    shown: None,
+                    overhead: Some(Overhead { strobe_pct, runner_pct, ..Overhead::default() }),
+                    process_set: Some(programs(&host::process_tree(pid))),
+                    fixture_connected: None,
+                    client: None,
+                    frame: false,
+                    browser: None,
+                    directions: BTreeMap::new(),
+                    ..Block::default()
+                })
+            })();
+            let end = r.is_err() || !s.reset_check;
+            launch.case_ms.push(lapped.elapsed().as_secs_f64() * 1e3);
+            launch.cases.push(r);
+            // Runs that build on each other on purpose (`resetCheck: false`) leave a state no later case
+            // may start from: the launch ends with it, as with a failed case.
+            if end {
+                break;
             }
-            // Without CPU (cycles that are not time), steady by wall time.
-            warmup.after(&runs.iter().map(|r| if r.1.is_finite() { r.1 } else { r.0 }).collect::<Vec<_>>());
         }
-        let first = warmup.first().unwrap_or(0);
-        let range = first..warmup.measured().end.clamp(first, runs.len());
-        let (strobe_pct, runner_pct) = cost.share(range.clone());
-        steps.push(("runs".into(), lapped.elapsed().as_secs_f64() * 1e3));
-        let measured = &runs[range.clone()];
-        let key = |j: usize| format!("run:{}", first + j);
-        let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-        extra.insert("run.duration".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.0)).collect());
-        if measured.iter().all(|r| r.1.is_finite()) {
-            extra.insert("cpu.work".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.1)).collect());
-            extra.insert("cpu.app.total".into(), measured.iter().enumerate().filter(|(_, r)| r.0 > 0.0).map(|(j, r)| (key(j), 100.0 * r.1 / r.0)).collect());
+        if launch.cases.iter().any(Result::is_ok) {
+            let _ = ctx.runner.call("close", json!({}), t, &serve);
         }
-        if heap {
-            extra.insert("js.heap.retained".into(), measured.iter().enumerate().map(|(j, r)| (key(j), r.3)).collect());
-        }
-        let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.2, r.4.as_slice(), &r.6)).collect();
-        extra.extend(super::block::per_run_hooks(s, &key, &hooked));
-        let counted: Vec<(String, &probe::wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.5)).collect();
-        let (counts, uncounted) = probe::wakes::counter_metrics(&counted, declared_metrics(s));
-        extra.extend(counts);
-        let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
-        if warmup.unsteady() {
-            values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
-        }
-        // Never a reading from after the reset in its place: no value.
-        let (private_mb, pss) = range.end.checked_sub(1).and_then(|i| ends.get(i).copied().flatten()).unwrap_or((0.0, None));
-        if private_mb > 0.0 {
-            values.insert("memory.app.private".into(), private_mb);
-        }
-        if let Some(b) = pss {
-            values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
-        }
-        let _ = ctx.runner.call("close", json!({}), t, &serve);
-        let mut refused = uncounted;
-        refuse_not_on_this_os(s, &mut values, &mut refused);
-        super::block::untimed_state(s, &measured.iter().map(|r| &r.6).collect::<Vec<_>>(), &mut values, &mut refused);
-        Ok(Block {
-            variant: v.role.to_string(),
-            pair,
-            values,
-            run_ms: measured.iter().map(|r| r.0).collect(),
-            warmup: first,
-            speed_ratio: None,
-            nodes: Vec::new(),
-            recording: None,
-            phases: BTreeMap::new(),
-            frames: Vec::new(),
-            intervals: Vec::new(),
-            steps: steps.clone(),
-            background: Vec::new(),
-            leak: None,
-            refused,
-            locked: false,
-            display: None,
-            screen: None,
-            reserve: None,
-            shown: None,
-            overhead: Some(Overhead { strobe_pct, runner_pct, ..Overhead::default() }),
-            process_set: Some(programs(&host::process_tree(pid))),
-            fixture_connected: None,
-            client: None,
-            frame: false,
-            browser: None,
-            directions: BTreeMap::new(),
-            ..Block::default()
-        })
+        Ok(launch)
     })();
     host.into_inner().exit();
-    let mut block = result?;
-    if let Some(dir) = profiles.filter(|_| keep || set == Set::Attribution) {
+    let mut launch = result?;
+    if let Some(dir) = profiles.filter(|_| keep || set == Set::Attribution)
+        && let Some(Ok(block)) = launch.cases.first_mut()
+    {
         // The runtime names its own files: the newest of each kind is this process's.
         let newest = |ext: &str| {
             std::fs::read_dir(&dir)
@@ -375,5 +416,5 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         draft.keep();
         block.recording = Some(id);
     }
-    Ok(block)
+    Ok(launch)
 }

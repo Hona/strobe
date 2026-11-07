@@ -188,7 +188,7 @@ pub fn vsync_ms(v: &[Vsync]) -> Option<f64> {
 }
 
 /// Everything strobe reads from one block's trace.
-#[derive(Debug, Default, Serialize)]
+#[derive(Clone, Debug, Default, Serialize)]
 pub struct BlockData {
     pub windows: Vec<Window>,
     /// Per window key.

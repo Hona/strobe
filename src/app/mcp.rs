@@ -88,6 +88,7 @@ const TOOLS: &[Tool] = &[
             ("base", "baseline variant: an absolute directory, a git ref (e.g. origin/dev), url:<href>, cmd:<line> (a cli() target's command line); or a target of the file, target[=variant]: base and head naming two targets compare two implementations"),
             ("aa", "same build on both sides (checks the method)"),
             ("check", "validate the file: each case once on head, pass or fail with a screenshot, no statistics"),
+            ("batch", "with check: up to N run cases per launch (one prepare and setup), each held to the launch's start after its reset; a failing or dirty case ends its launch and the next case gets a fresh one"),
             ("headless", "page targets in a headless browser (check and timed blocks): no display needed, runs through a locked session; frame, input-latency and GPU-use metrics refused (Headless)"),
             ("engine", "page targets' browser engine: chromium or firefox; the file's targets of that engine, else every page target in it"),
             ("blocks", "N timed blocks of head alone and their values, nothing compared (what track records for a commit)"),

@@ -147,7 +147,10 @@ fn frame_metric(metric: &str) -> bool {
     ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| metric.starts_with(p))
 }
 
-pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> Result<Block> {
+/// One launch of a native app for its cases: one case, or a chunk of them with `--check --batch`
+/// (SPEC §5.6), each case's runs after the case before it.
+pub(super) fn chunk(ctx: &mut Ctx, cases: &[Series], v: &Variant, pair: usize, x: &Exec) -> Result<Launch> {
+    let s = &cases[0];
     let set = x.set;
     let target = ctx.describe["targets"][&s.target].clone();
     let app = with_gpu_cache(ctx, s, v, &target, app(v, &target, &ctx.config)?)?;
@@ -182,10 +185,10 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
         wakes::Timeline::start(move || host::process_set(root, Some(&dir)).iter().map(|p| p.pid).collect())
     });
     let mut steps = vec![("launch".to_string(), launched.elapsed().as_secs_f64() * 1e3)];
-    let result = runs(ctx, s, v, pair, x, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
-    if let (Some(t), Ok(b)) = (timeline, &result) {
+    let result = runs(ctx, cases, v, pair, x, &target, &app, &home, &mut n, &guard, &drive, &mut steps, ratio);
+    if let (Some(t), Ok(l)) = (timeline, &result) {
         let t = t.stop();
-        if let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) {
+        if let Some(dir) = l.recordings().first().and_then(|id| store::resolve(id).ok()) {
             let _ = crate::symbol::write_gz(&dir.join("timeline.json.gz"), &t);
         }
     }
@@ -195,12 +198,22 @@ pub(super) fn block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exe
     }
     drop(drive);
     n.close(true);
-    guard.check("after a block")?;
-    result.map(|mut b| {
-        b.steps = steps;
-        b.steps.push(("close".into(), closing.elapsed().as_secs_f64() * 1e3));
-        b
-    })
+    let close_ms = closing.elapsed().as_secs_f64() * 1e3;
+    let mut result = result.map(|mut l| {
+        for b in l.cases.iter_mut().flatten() {
+            b.steps.push(("close".into(), close_ms));
+        }
+        l
+    });
+    if let Err(e) = guard.check("after a block") {
+        match &mut result {
+            Ok(l) => {
+                l.abort.get_or_insert(e);
+            }
+            Err(_) => return Err(e),
+        }
+    }
+    result
 }
 
 /// `VariantMismatch` when base and head drew on different adapters or at different scales: a
@@ -221,10 +234,25 @@ fn admit_setup(ctx: &mut Ctx, s: &Series, v: &Variant, adapter: Option<&str>, sc
     Ok(())
 }
 
+/// What one case of a native launch ran (`runs`), kept until the launch's probes stop.
+struct NativeCase {
+    /// Its first run's index among the launch's runs: its runs are `run:<base + i>`.
+    base: usize,
+    runs: Vec<Run>,
+    warmup: super::block::Warmup,
+    same: super::journey::Same,
+    start: Option<shown::Screen>,
+    /// What the window showed after its runs (a batch reads it before the next case; one case after the probes stop).
+    end: Option<shown::Screen>,
+    /// A leak run's memory readings.
+    readings: Vec<memory::Reading>,
+    steps: Vec<(String, f64)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn runs(
     ctx: &mut Ctx,
-    s: &Series,
+    cases: &[Series],
     v: &Variant,
     pair: usize,
     x: &Exec,
@@ -236,7 +264,9 @@ fn runs(
     drive: &Drive,
     steps: &mut Vec<(String, f64)>,
     ratio: Option<f64>,
-) -> Result<Block> {
+) -> Result<Launch> {
+    let s = &cases[0];
+    let batch = ctx.batch.is_some();
     let (set, keep) = (x.set, x.keep);
     let lapped = Cell::new(Instant::now());
     let lap = |name: &str, steps: &mut Vec<(String, f64)>| {
@@ -361,7 +391,7 @@ fn runs(
             other => Err(Error::msg(format!("unknown runner request {other}"))),
         }
     };
-    let t = s.hook_timeout();
+    let t = cases.iter().map(Series::hook_timeout).max().unwrap_or_default();
     let env = home.environment(app);
     // An app that exited is refused, never measured as a gone process (a windowless one has no window
     // whose loss would say so): its exit code and last output lines, when its output is read.
@@ -384,26 +414,17 @@ fn runs(
     let setup = ctx.runner.call("setup", json!({}), t, &serve);
     super::super::record::app_gone(n, "before the runs", |_| last())?;
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
+    super::batch::launch_hook_case(ctx, "the bench file's setup")?;
     hooks.check_fixture();
-    // `expect.same` (SPEC §9.10): read through the session after setup, each run and each reset.
-    // A windowless app shows nothing to read.
-    let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
-    let read_same = |when| same.read(when, &|sel| drive.get()?.text(sel, Duration::from_secs(2)));
-    if same.on() {
-        read_same(super::journey::When::Setup)?;
-    }
     lap("setup", steps);
     // What the window shows before the runs: its titles and pixels, and its tree only when setup
-    // already drove the app (reading it now would connect strobe to the app for the runs).
+    // already drove the app (reading it now would connect strobe to the app for the runs). A later case
+    // of a batch starts from what the case before it left (its end).
     let main = n.window.as_ref().map(|w| w.hwnd);
-    let start = (!windowless).then(|| {
+    let mut start_screen = (!windowless).then(|| {
         let se = drive.session.get().ok_or_else(|| "not read before the runs (the case had not driven the app yet)".to_string());
         shown::native(ctx, s, v, pair, "start", &n.pids(), main, se)
     });
-    if let Some(sc) = &start {
-        let se = drive.session.get();
-        shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
-    }
     // `--video` (an untimed block): the app's main window from before the first run to after the last.
     if x.video {
         match crate::app::video::Recorder::start(n.window.as_ref(), None, false) {
@@ -416,17 +437,12 @@ fn runs(
     let sampled = Instant::now();
     // The thread that owns the main window: the app's UI thread, whose CPU is `ui.cpu`.
     let ui_tid = n.window.as_ref().and_then(|w| host::window_thread(w.hwnd));
-    let run_timeout = s.run_timeout();
-    let mut runs: Vec<Run> = Vec::new();
-    // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
-    // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
-    let mut warmup = super::block::Warmup::new(s, x);
     let perf = x.counters.then(wakes::Perf::new);
     let leak = set == Set::Memory;
-    let mut readings: Vec<memory::Reading> = Vec::new();
     // Every run starts from the same state, read through the session the case drives the app with (none:
     // nothing read, so strobe connects to no app the case did not drive). An untimed block (`--check`)
     // opens it before run 1 when the case drives the app only from its runs, so one run is checked too.
+    // A later case of a batch starts from what the case before it left, held to the launch's first start.
     let mut starts = shown::Starts::new(s, x);
     if x.untimed && starts.on() && !windowless && drive.session.get().is_none() {
         let _ = drive.get();
@@ -447,495 +463,683 @@ fn runs(
         Some(se) => se.wait_change(changes_seen.get(), t),
         None => std::thread::sleep(t),
     };
-    while warmup.more(runs.len()) {
-        let i = runs.len();
-        if !windowless {
-            n.raise();
+    let mut ran: Vec<Result<NativeCase>> = Vec::new();
+    let mut notes: Vec<(usize, String)> = Vec::new();
+    let mut abort: Option<Error> = None;
+    // The launch's runs so far: a case's runs are numbered after the ones before it.
+    let mut launch_runs = 0usize;
+    // Each case's marks on the host clock, for the video.
+    let mut case_marks: Vec<(String, u64)> = Vec::new();
+    let mut log_at: Vec<u64> = Vec::new();
+    let mut case_ms: Vec<f64> = Vec::new();
+    for (k, s) in cases.iter().enumerate() {
+        if k > 0 && stop_requested() {
+            break;
         }
-        // What the run starts from, read (and settled) before anything of the run is listed or timed.
-        if starts.on()
-            && let Some(se) = drive.session.get()
+        let case_began = Instant::now();
+        log_at.push(ctx.runner.log_len());
+        // A later case starts from what the case before it left: on a screen its expect does not show it
+        // is never measured from there, it goes to a fresh launch, and the case before is noted.
+        if k > 0
+            && let Some(sc) = &start_screen
         {
-            se.set_pids(&n.pids());
-            starts.check(i + 1, false, &read_start, &wait_start)?;
-        }
-        if let Some(se) = drive.session.get() {
-            se.window_start(i + 1, false, starts.on())?;
-        }
-        // The capture follows windows that opened since (the drivers' settles read it without looking).
-        if let Some(p) = presents.borrow_mut().as_mut() {
-            p.track(&n.pids());
-        }
-        let began = Instant::now();
-        // One read of the app's processes per end of a run: what the session follows, what the
-        // snapshot covers, and (at the end) the cycles.
-        let listed = wakes::wall_us();
-        let pids = n.pids();
-        if let Some(se) = drive.session.get() {
-            se.set_pids(&pids);
-            se.take_log();
-            se.take_reads();
-        }
-        edges.borrow_mut().clear();
-        reads_before.set((0, 0.0));
-        hooks.begin(&format!("run:{i}"));
-        // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
-        let running = n.exited().is_none();
-        let snap0 = Snapshot::take_since(listed, &pids, perf.as_ref());
-        let c0 = cycles(n);
-        cost.start();
-        let t0 = host::now_ns();
-        let ran = ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve);
-        let t1 = host::now_ns();
-        cost.end();
-        let procs1 = n.processes();
-        let c1 = (per_process(&procs1), host::tsc());
-        let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
-        // A launcher that hands over to the app and exits cleanly (code 0) is not the app ending: what
-        // its process set still holds goes on (each process's CPU is its own difference).
-        match n.exited() {
-            Some(code) if running && (code != 0 || procs1.is_empty()) => return Err(super::super::record::exited(code, &format!("during run {}", i + 1), last().as_deref())),
-            _ => super::super::record::app_gone(n, &format!("before run {}", i + 1), |_| last())?,
-        }
-        ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
-        hooks.end();
-        let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
-        let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
-        log.marks.extend(hooks.take_marks());
-        log.drags = log.timed_drags(&timed);
-        let reads = drive.session.get().map(Session::take_reads).unwrap_or_default();
-        let reads = (reads.0 + reads_before.get().0, reads.1 + reads_before.get().1);
-        let elements = drive.session.get().and_then(|se| se.count_elements().ok());
-        // The readings at the run's start, each untimed stretch's edges and the run's end: each pair a
-        // timed part. A stretch the run never ended (it threw) ends with the run.
-        let mut e = edges.take();
-        let end: Edge = (c1.0.clone(), snap1.clone());
-        if e.len() % 2 == 1 {
-            e.push(end.clone());
-        }
-        let mut edge_list: Vec<&Edge> = e.iter().collect();
-        let start: Edge = (c0.0.clone(), snap0.clone());
-        edge_list.insert(0, &start);
-        edge_list.push(&end);
-        let cycles_at: Vec<&Cycles> = edge_list.iter().map(|x| &x.0).collect();
-        let parts: Vec<Span> = edge_list.as_chunks::<2>().0.iter().map(|[a, b]| wakes::span(&a.1, &b.1)).collect();
-        let whole_ms = (t1 - t0) as f64 / 1e6;
-        runs.push(Run {
-            ms: timed.ns() as f64 / 1e6,
-            cpu: cpu_ms(&cycles_at, &c0, &c1, whole_ms),
-            cpu_whole: cpu_ms(&[&c0.0, &c1.0], &c0, &c1, whole_ms),
-            span: Span::joined(parts),
-            timed,
-            counts: hooks.counts(),
-            log,
-            changes: Vec::new(),
-            window_end: t1,
-            elements,
-            reads,
-            t0,
-            t1,
-            total: 0.0,
-            end: None,
-        });
-        // The last measured input's change: an app may announce it after the run's `until` (a read).
-        if let Some(se) = drive.session.get() {
-            if let Some(last) = runs[i].log.sent(&runs[i].timed).iter().map(|s| s.t_ns).max() {
-                let left = (last + 1_000_000_000).saturating_sub(host::now_ns());
-                se.wait_change_after(last, Instant::now() + Duration::from_nanos(left));
+            let se = drive.session.get();
+            if let Err(e) = shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5)))) {
+                notes.push((k - 1, super::batch::left_screen(s, &e)));
+                break;
             }
-            runs[i].window_end = host::now_ns();
         }
-        if same.on() {
-            read_same(super::journey::When::Run)?;
-        }
-        // A key or button the run left held would be down in the next one.
-        if let Some(se) = drive.session.get() {
-            se.release_all();
-        }
-        // What the run left, before the reset can release it.
-        if !leak && warmup.may_end(i) {
-            let procs = n.processes();
-            let private_mb = procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
-            runs[i].end = Some((private_mb, host::pss_bytes(&n.pids()), memory::Reading::take(&procs, "at the end of the last measured run, before its reset")));
-        }
-        if s.reset {
-            ctx.runner
-                .call("reset", json!({ "case": s.case }), run_timeout, &serve)
-                .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
-            if let Some(se) = drive.session.get() {
-                se.release_all();
-            }
+        let base = launch_runs;
+        let mark = format!("case:{k}:{}", super::batch::mark_name(&s.case));
+        let r = (|| -> Result<NativeCase> {
+            let began = Instant::now();
+            // `expect.same` (SPEC §9.10): read through the session before the case's runs, after each run
+            // and each reset. A windowless app shows nothing to read.
+            let same = super::journey::Same::new(s, &ctx.describe["targets"])?.unless(windowless);
+            let read_same = |when| same.read(when, &|sel| drive.get()?.text(sel, Duration::from_secs(2)));
             if same.on() {
-                read_same(super::journey::When::Reset)?;
+                read_same(super::journey::When::Setup)?;
+            }
+            let start = start_screen.clone();
+            if k == 0
+                && let Some(sc) = &start
+            {
+                let se = drive.session.get();
+                shown::expect(&s.expect, sc, "before the runs", se.is_some(), &|sel| se.map_or(Ok(true), |se| se.shows(sel, Duration::from_secs(5))))?;
+            }
+            starts.case(s, x, batch.then_some(base));
+            if batch {
+                case_marks.push((format!("{mark}:start"), host::now_ns()));
+            }
+            let run_timeout = s.run_timeout();
+            let mut runs: Vec<Run> = Vec::new();
+            // Steady once two runs do the same work (SPEC §9.2). A leak run (`--probes memory`, SPEC §8.6):
+            // 2 × N runs after warmup, the processes' memory read before the first and after each, between runs.
+            let mut warmup = super::block::Warmup::new(s, x);
+            let mut readings: Vec<memory::Reading> = Vec::new();
+            while warmup.more(runs.len()) {
+                let i = runs.len();
+                // Its place among the launch's runs.
+                let g = base + i;
+                if !windowless {
+                    n.raise();
+                }
+                // What the run starts from, read (and settled) before anything of the run is listed or timed.
+                if starts.on()
+                    && let Some(se) = drive.session.get()
+                {
+                    se.set_pids(&n.pids());
+                    starts.check(g + 1, false, &read_start, &wait_start)?;
+                }
+                if let Some(se) = drive.session.get() {
+                    se.window_start(g + 1, false, starts.on())?;
+                }
+                // The capture follows windows that opened since (the drivers' settles read it without looking).
+                if let Some(p) = presents.borrow_mut().as_mut() {
+                    p.track(&n.pids());
+                }
+                let began = Instant::now();
+                // One read of the app's processes per end of a run: what the session follows, what the
+                // snapshot covers, and (at the end) the cycles.
+                let listed = wakes::wall_us();
+                let pids = n.pids();
+                if let Some(se) = drive.session.get() {
+                    se.set_pids(&pids);
+                    se.take_log();
+                    se.take_reads();
+                }
+                edges.borrow_mut().clear();
+                reads_before.set((0, 0.0));
+                hooks.begin(&format!("run:{g}"));
+                // The process's CPU goes with it when it exits, so a run it exits in is no run of the app.
+                let running = n.exited().is_none();
+                let snap0 = Snapshot::take_since(listed, &pids, perf.as_ref());
+                let c0 = cycles(n);
+                cost.start();
+                let t0 = host::now_ns();
+                let ran = ctx.runner.call("run", json!({ "case": s.case }), run_timeout, &serve);
+                let t1 = host::now_ns();
+                cost.end();
+                let procs1 = n.processes();
+                let c1 = (per_process(&procs1), host::tsc());
+                let snap1 = Snapshot::take_since(wakes::wall_us(), &procs1.iter().map(|p| p.pid).collect::<Vec<_>>(), perf.as_ref());
+                // A launcher that hands over to the app and exits cleanly (code 0) is not the app ending: what
+                // its process set still holds goes on (each process's CPU is its own difference).
+                match n.exited() {
+                    Some(code) if running && (code != 0 || procs1.is_empty()) => return Err(super::super::record::exited(code, &format!("during {}'s run {}", s.case, i + 1), last().as_deref())),
+                    _ => super::super::record::app_gone(n, &format!("before {}'s run {}", s.case, i + 1), |_| last())?,
+                }
+                ran.map_err(|e| crate::runner::incomplete(&format!("{} run", s.case), "run", e, "", "the run threw or timed out; fix the bench file or the app"))?;
+                hooks.end();
+                let timed = metrics::Timed { t0, t1, untimed: hooks.untimed_stretches() };
+                let mut log = drive.session.get().map(Session::take_log).unwrap_or_default();
+                log.marks.extend(hooks.take_marks());
+                log.drags = log.timed_drags(&timed);
+                let reads = drive.session.get().map(Session::take_reads).unwrap_or_default();
+                let reads = (reads.0 + reads_before.get().0, reads.1 + reads_before.get().1);
+                let elements = drive.session.get().and_then(|se| se.count_elements().ok());
+                // The readings at the run's start, each untimed stretch's edges and the run's end: each pair a
+                // timed part. A stretch the run never ended (it threw) ends with the run.
+                let mut e = edges.take();
+                let end: Edge = (c1.0.clone(), snap1.clone());
+                if e.len() % 2 == 1 {
+                    e.push(end.clone());
+                }
+                let mut edge_list: Vec<&Edge> = e.iter().collect();
+                let start: Edge = (c0.0.clone(), snap0.clone());
+                edge_list.insert(0, &start);
+                edge_list.push(&end);
+                let cycles_at: Vec<&Cycles> = edge_list.iter().map(|x| &x.0).collect();
+                let parts: Vec<Span> = edge_list.as_chunks::<2>().0.iter().map(|[a, b]| wakes::span(&a.1, &b.1)).collect();
+                let whole_ms = (t1 - t0) as f64 / 1e6;
+                runs.push(Run {
+                    ms: timed.ns() as f64 / 1e6,
+                    cpu: cpu_ms(&cycles_at, &c0, &c1, whole_ms),
+                    cpu_whole: cpu_ms(&[&c0.0, &c1.0], &c0, &c1, whole_ms),
+                    span: Span::joined(parts),
+                    timed,
+                    counts: hooks.counts(),
+                    log,
+                    changes: Vec::new(),
+                    window_end: t1,
+                    elements,
+                    reads,
+                    t0,
+                    t1,
+                    total: 0.0,
+                    end: None,
+                });
+                // The last measured input's change: an app may announce it after the run's `until` (a read).
+                if let Some(se) = drive.session.get() {
+                    if let Some(last) = runs[i].log.sent(&runs[i].timed).iter().map(|s| s.t_ns).max() {
+                        let left = (last + 1_000_000_000).saturating_sub(host::now_ns());
+                        se.wait_change_after(last, Instant::now() + Duration::from_nanos(left));
+                    }
+                    runs[i].window_end = host::now_ns();
+                }
+                if same.on() {
+                    read_same(super::journey::When::Run)?;
+                }
+                // A key or button the run left held would be down in the next one.
+                if let Some(se) = drive.session.get() {
+                    se.release_all();
+                }
+                // What the run left, before the reset can release it.
+                if !leak && warmup.may_end(i) {
+                    let procs = n.processes();
+                    let private_mb = procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0);
+                    runs[i].end = Some((private_mb, host::pss_bytes(&n.pids()), memory::Reading::take(&procs, "at the end of the last measured run, before its reset")));
+                }
+                if s.reset {
+                    ctx.runner
+                        .call("reset", json!({ "case": s.case }), run_timeout, &serve)
+                        .map_err(|e| crate::runner::incomplete(&format!("{} reset", s.case), "reset", e, "", "fix the case's reset"))?;
+                    if let Some(se) = drive.session.get() {
+                        se.release_all();
+                    }
+                    if same.on() {
+                        read_same(super::journey::When::Reset)?;
+                    }
+                }
+                runs[i].total = began.elapsed().as_secs_f64() * 1e3;
+                if let (true, Some(f)) = (leak, warmup.first()) {
+                    readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - f)));
+                }
+                // Without CPU (cycles that are not time, `host::cycles_refused`), steady by wall time.
+                if warmup.after(&runs.iter().map(|r| if r.cpu.is_finite() { r.cpu } else { r.ms }).collect::<Vec<_>>()) && leak {
+                    readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
+                }
+            }
+            let first = warmup.first().unwrap_or(0);
+            let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
+            let steps = vec![("warmup".to_string(), warm_ms), ("runs".to_string(), (began.elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0))];
+            // In a batch the app must outlive the case: one it ended fails the case that did it.
+            if batch {
+                super::super::record::app_gone(n, &format!("after {}'s runs", s.case), |_| last())?;
+            }
+            starts.check(base + runs.len() + 1, true, &read_start, &wait_start)?;
+            if let Some(se) = drive.session.get() {
+                se.window_start(base + runs.len() + 1, true, starts.on())?;
+            }
+            // A batch reads the case's end now, before the next case changes it; one case reads it once
+            // every probe has stopped (below).
+            let end = match (batch, &start) {
+                (true, Some(_)) => {
+                    n.check_visible()?;
+                    let end = shown::native(ctx, s, v, pair, "end", &n.pids(), n.window.as_ref().map(|w| w.hwnd), drive.get().map_err(|e| e.message));
+                    shown::expect(&s.expect, &end, "after the runs", true, &|sel| drive.get().and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
+                    Some(end)
+                }
+                _ => None,
+            };
+            if batch {
+                case_marks.push((format!("{mark}:end"), host::now_ns()));
+            }
+            Ok(NativeCase { base, runs, warmup, same, start, end, readings, steps })
+        })();
+        case_ms.push(case_began.elapsed().as_secs_f64() * 1e3);
+        match r {
+            Ok(c) => {
+                launch_runs = c.base + c.runs.len();
+                if c.end.is_some() {
+                    start_screen = c.end.clone();
+                }
+                ran.push(Ok(c));
+                // The user's own state, after each case of a batch: a disturbed one stops the bench.
+                if batch && let Err(e) = guard.check(&format!("after {}", s.label())) {
+                    abort = Some(e);
+                    break;
+                }
+                // Runs that build on each other on purpose (`resetCheck: false`) leave a state no later case
+                // may start from: the launch ends with it.
+                if !s.reset_check {
+                    break;
+                }
+            }
+            Err(e) => {
+                ran.push(Err(e));
+                break;
             }
         }
-        runs[i].total = began.elapsed().as_secs_f64() * 1e3;
-        if let (true, Some(f)) = (leak, warmup.first()) {
-            readings.push(memory::Reading::take(&n.processes(), format!("after run {}", i + 1 - f)));
-        }
-        // Without CPU (cycles that are not time, `host::cycles_refused`), steady by wall time.
-        if warmup.after(&runs.iter().map(|r| if r.cpu.is_finite() { r.cpu } else { r.ms }).collect::<Vec<_>>()) && leak {
-            readings.push(memory::Reading::take(&n.processes(), "after warmup (before run 1)"));
-        }
     }
-    starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
-    if let Some(se) = drive.session.get() {
-        se.window_start(runs.len() + 1, true, starts.on())?;
-    }
-    let mut stopped = video.take().map(crate::app::video::Recorder::stop);
-    let unsteady = warmup.unsteady();
-    let first = warmup.first().unwrap_or(0);
-    let warm_ms: f64 = runs[..first].iter().map(|r| r.total).sum::<f64>() + 0.0;
-    steps.push(("warmup".into(), warm_ms));
-    steps.push(("runs".into(), (lapped.get().elapsed().as_secs_f64() * 1e3 - warm_ms).max(0.0)));
     lapped.set(Instant::now());
-    // Each run's changes, to the end of its window.
-    let changes = drive.session.get().map(Session::changes).unwrap_or_default();
-    for r in &mut runs {
-        r.changes = changes.iter().filter(|c| c.0 >= r.t0 && c.0 <= r.window_end).map(|&(at, feedback)| frames::notified(at, feedback)).collect();
-    }
-    let range = first..warmup.measured().end.clamp(first, runs.len());
-    let (strobe_pct, runner_pct) = cost.share(range.clone());
-    let samples = sampler.stop();
-    let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
-    let presents = presents.borrow_mut().take().map(|c| c.stop());
-    let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
-    let procs1 = (host::now_ns(), host::all_processes());
-    if !windowless {
-        n.check_visible()?;
-    }
-    // What the window showed after the runs, its tree included: every probe has stopped.
-    let shown = match start {
-        Some(start) => {
-            let main = n.window.as_ref().map(|w| w.hwnd);
-            let end = shown::native(ctx, s, v, pair, "end", &n.pids(), main, drive.get().map_err(|e| e.message));
-            shown::expect(&s.expect, &end, "after the runs", true, &|sel| drive.get().and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
-            Some(shown::Shown { start, end })
+    let mut native_cases: Vec<(usize, NativeCase)> = Vec::new();
+    let mut failed: Option<Error> = None;
+    for (k, r) in ran.into_iter().enumerate() {
+        match r {
+            Ok(c) => native_cases.push((k, c)),
+            Err(e) => failed = Some(e),
         }
-        None => None,
-    };
-    let measured = &runs[range.clone()];
-    let key = |j: usize| format!("run:{}", first + j);
-    let per_run = |f: &dyn Fn(&Run) -> f64| -> BTreeMap<String, f64> { measured.iter().enumerate().map(|(j, r)| (key(j), f(r))).filter(|(_, x)| x.is_finite()).collect() };
-    let gpu_runs: Vec<probe::os::Summary> = measured.iter().map(|r| samples.window(r.t0, r.t1)).collect();
-    // Every adapter the app's GPU work ran on in the measured runs, busiest first: a process may
-    // draw on one GPU and compute on another, and each is attributed on its own.
-    let mut by_adapter: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    for g in &gpu_runs {
-        for (a, engines) in &g.gpu_adapters {
-            for (e, pct) in engines {
-                *by_adapter.entry(a.clone()).or_default().entry(e.clone()).or_default() += pct / gpu_runs.len().max(1) as f64;
+    }
+    // No case passed: the launch closes as a failed block does, its probes dropped.
+    if native_cases.is_empty() {
+        return Ok(Launch { cases: failed.map(|e| vec![Err(e)]).unwrap_or_default(), abort, notes, actions: None, log_at, case_ms });
+    }
+    let finished = (|| -> Result<(Vec<Result<Block>>, Kept)> {
+        let s0 = &cases[native_cases[0].0];
+        let mut stopped = video.take().map(crate::app::video::Recorder::stop);
+        // Each case's measured runs, by their index in the case (`local`) and among the launch's runs.
+        let measured_of = |c: &NativeCase| {
+            let first = c.warmup.first().unwrap_or(0);
+            let local = first..c.warmup.measured().end.clamp(first, c.runs.len());
+            (local.clone(), c.base + local.start..c.base + local.end)
+        };
+        // Each run's changes, to the end of its window.
+        let changes = drive.session.get().map(Session::changes).unwrap_or_default();
+        for (_, c) in native_cases.iter_mut() {
+            for r in &mut c.runs {
+                r.changes = changes.iter().filter(|c| c.0 >= r.t0 && c.0 <= r.window_end).map(|&(at, feedback)| frames::notified(at, feedback)).collect();
             }
         }
-    }
-    let mut adapters: Vec<String> = by_adapter.keys().cloned().collect();
-    adapters.sort_by(|a, b| by_adapter[b].values().sum::<f64>().total_cmp(&by_adapter[a].values().sum::<f64>()));
-    let adapter = adapters.first().cloned().or_else(|| gpu_runs.iter().find_map(|g| g.gpu_adapter.clone()));
-    // `SoftwareGpu` from outside: an adapter the app's GPU work ran on is a software one.
-    if let Some(a) = adapters.iter().chain(adapter.iter()).find(|a| validity::is_software_gpu(a)) {
-        return Err(Error::refused(
-            "SoftwareGpu",
-            format!("the app renders on a software adapter ({a})"),
-            "run on a machine with a GPU; GPU and frame numbers from software rendering describe no real device",
-        ));
-    }
-    if !ctx.gpu_checked && adapter.is_some() {
-        let devices = if adapters.is_empty() { adapter.iter().cloned().collect() } else { adapters.clone() };
-        ctx.gpu = json!({ "devices": devices });
-        ctx.gpu_checked = true;
-    }
-    // The display path the window shows on, for the refresh period and `CrossAdapterScanout`: an app
-    // that draws on one adapter while another drives its monitor pays a copy across the bus per frame.
-    let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
-    if let Some(d) = &display {
-        let luid = |name: &str| samples.adapters.iter().find(|a| a.name == name).map(|a| a.luid);
-        let drawing: Vec<&String> = adapters.iter().filter(|a| by_adapter[*a].get("3D").copied().unwrap_or(0.0) > 0.0).collect();
-        // An adapter the OS does not name for the display (id 0, or none of the sampled ones: a
-        // single-GPU Mac) is unknown, not another adapter.
-        let known = d.adapter_luid != 0 && samples.adapters.iter().any(|a| a.luid == d.adapter_luid);
-        if known && !drawing.is_empty() && !drawing.iter().any(|a| luid(a) == Some(d.adapter_luid)) && !ctx.warnings.iter().any(|w| w.id == "CrossAdapterScanout") {
-            let scanout = samples.adapters.iter().find(|a| a.luid == d.adapter_luid).map_or_else(|| format!("adapter 0x{:x}", d.adapter_luid), |a| a.name.clone());
-            ctx.warnings.push(validity::info(
-                "CrossAdapterScanout",
-                format!(
-                    "{} block: the app draws on {} while {scanout} drives its window's display ({}): each frame crosses between adapters, as it does for the app's users on this kind of machine",
-                    v.role,
-                    drawing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" and "),
-                    d.device
-                ),
+        let samples = sampler.stop();
+        let sampler_pct = samples.cpu_ms.map(|c| 100.0 * c / (sampled.elapsed().as_secs_f64() * 1e3).max(1.0));
+        let presents = presents.borrow_mut().take().map(|c| c.stop());
+        let stacks = stacks.map(|r| r.and_then(|c| c.stop()));
+        let procs1 = (host::now_ns(), host::all_processes());
+        if !windowless {
+            n.check_visible()?;
+        }
+        // What the window showed after the runs, its tree included: every probe has stopped (a batch read
+        // each case's before the next one ran).
+        let mut shown_all: Vec<Option<shown::Shown>> = Vec::new();
+        for (k, c) in &native_cases {
+            shown_all.push(match (&c.start, &c.end) {
+                (Some(start), Some(end)) => Some(shown::Shown { start: start.clone(), end: end.clone() }),
+                (Some(start), None) => {
+                    let main = n.window.as_ref().map(|w| w.hwnd);
+                    let end = shown::native(ctx, &cases[*k], v, pair, "end", &n.pids(), main, drive.get().map_err(|e| e.message));
+                    shown::expect(&cases[*k].expect, &end, "after the runs", true, &|sel| drive.get().and_then(|se| se.shows(sel, Duration::from_secs(5))))?;
+                    Some(shown::Shown { start: start.clone(), end })
+                }
+                (None, _) => None,
+            });
+        }
+        // The display path the window shows on, for the refresh period and `CrossAdapterScanout`.
+        let display = n.window.as_ref().and_then(|w| host::display_of(w.hwnd));
+        let pids = n.pids();
+        let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
+        let background = busiest_others(&procs0, &procs1);
+        let screen = screen_state(&procs0, &procs1);
+        let mut present_pct = None;
+        let mut blocks: Vec<Result<Block>> = Vec::new();
+        let mut adapter_of_launch: Option<String> = None;
+        let mut readings_all: Vec<memory::Reading> = Vec::new();
+        for ((k, c), shown) in native_cases.iter_mut().zip(shown_all) {
+            let s = &cases[*k];
+            let (local, range) = measured_of(c);
+            let first = range.start;
+            let unsteady = c.warmup.unsteady();
+            let (strobe_pct, runner_pct) = cost.share(range.clone());
+            let measured = &c.runs[local.clone()];
+            let key = |j: usize| format!("run:{}", first + j);
+            let per_run = |f: &dyn Fn(&Run) -> f64| -> BTreeMap<String, f64> { measured.iter().enumerate().map(|(j, r)| (key(j), f(r))).filter(|(_, x)| x.is_finite()).collect() };
+            let gpu_runs: Vec<probe::os::Summary> = measured.iter().map(|r| samples.window(r.t0, r.t1)).collect();
+            // Every adapter the app's GPU work ran on in the measured runs, busiest first: a process may
+            // draw on one GPU and compute on another, and each is attributed on its own.
+            let mut by_adapter: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+            for g in &gpu_runs {
+                for (a, engines) in &g.gpu_adapters {
+                    for (e, pct) in engines {
+                        *by_adapter.entry(a.clone()).or_default().entry(e.clone()).or_default() += pct / gpu_runs.len().max(1) as f64;
+                    }
+                }
+            }
+            let mut adapters: Vec<String> = by_adapter.keys().cloned().collect();
+            adapters.sort_by(|a, b| by_adapter[b].values().sum::<f64>().total_cmp(&by_adapter[a].values().sum::<f64>()));
+            let adapter = adapters.first().cloned().or_else(|| gpu_runs.iter().find_map(|g| g.gpu_adapter.clone()));
+            // `SoftwareGpu` from outside: an adapter the app's GPU work ran on is a software one.
+            if let Some(a) = adapters.iter().chain(adapter.iter()).find(|a| validity::is_software_gpu(a)) {
+                blocks.push(Err(Error::refused(
+                    "SoftwareGpu",
+                    format!("the app renders on a software adapter ({a})"),
+                    "run on a machine with a GPU; GPU and frame numbers from software rendering describe no real device",
+                )));
+                continue;
+            }
+            if !ctx.gpu_checked && adapter.is_some() {
+                let devices = if adapters.is_empty() { adapter.iter().cloned().collect() } else { adapters.clone() };
+                ctx.gpu = json!({ "devices": devices });
+                ctx.gpu_checked = true;
+            }
+            // The display path the window shows on, for the refresh period and `CrossAdapterScanout`: an app
+            // that draws on one adapter while another drives its monitor pays a copy across the bus per frame.
+            if let Some(d) = &display {
+                let luid = |name: &str| samples.adapters.iter().find(|a| a.name == name).map(|a| a.luid);
+                let drawing: Vec<&String> = adapters.iter().filter(|a| by_adapter[*a].get("3D").copied().unwrap_or(0.0) > 0.0).collect();
+                // An adapter the OS does not name for the display (id 0, or none of the sampled ones: a
+                // single-GPU Mac) is unknown, not another adapter.
+                let known = d.adapter_luid != 0 && samples.adapters.iter().any(|a| a.luid == d.adapter_luid);
+                if known && !drawing.is_empty() && !drawing.iter().any(|a| luid(a) == Some(d.adapter_luid)) && !ctx.warnings.iter().any(|w| w.id == "CrossAdapterScanout") {
+                    let scanout = samples.adapters.iter().find(|a| a.luid == d.adapter_luid).map_or_else(|| format!("adapter 0x{:x}", d.adapter_luid), |a| a.name.clone());
+                    ctx.warnings.push(validity::info(
+                        "CrossAdapterScanout",
+                        format!(
+                            "{} block: the app draws on {} while {scanout} drives its window's display ({}): each frame crosses between adapters, as it does for the app's users on this kind of machine",
+                            v.role,
+                            drawing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" and "),
+                            d.device
+                        ),
+                    ));
+                }
+            }
+            if !windowless && let Err(e) = admit_setup(ctx, s, v, adapter.as_deref(), n.window.as_ref().map(|w| w.scale())) {
+                blocks.push(Err(e));
+                continue;
+            }
+            adapter_of_launch = adapter_of_launch.or(adapter.clone());
+            let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
+            extra.insert("run.duration".into(), per_run(&|r| r.ms));
+            extra.insert("cpu.work".into(), per_run(&|r| r.cpu));
+            extra.insert("cpu.app.total".into(), per_run(&|r| if r.ms > 0.0 { 100.0 * r.cpu / r.ms } else { f64::NAN }));
+            if measured.iter().all(|r| !r.span.threads.is_empty()) {
+                extra.insert("cpu.wakes".into(), per_run(&|r| r.span.wakes_per_s()));
+                extra.insert("io.read".into(), per_run(&|r| r.span.io_read as f64));
+                extra.insert("io.write".into(), per_run(&|r| r.span.io_write as f64));
+            }
+            // The UI thread (the main window's), from its own cycle counter and context switches.
+            if let Some(tid) = ui_tid {
+                let ui = |r: &Run| r.span.threads.iter().find(|t| t.tid == tid).cloned();
+                extra.insert("ui.cpu".into(), per_run(&|r| ui(r).and_then(|t| t.cpu_ms).unwrap_or(f64::NAN)));
+                if super::super::outside::not_on_this_os("ui.wakes").is_none() {
+                    extra.insert("ui.wakes".into(), per_run(&|r| ui(r).map_or(f64::NAN, |t| if r.span.ms > 0.0 { t.switches as f64 / (r.span.ms / 1e3) } else { f64::NAN })));
+                }
+            }
+            let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().enumerate().filter_map(|(j, g)| Some((key(j), g.gpu_3d_pct?))).collect();
+            if !gpu_3d.is_empty() {
+                extra.insert("gpu.process.3d".into(), gpu_3d);
+            }
+            // The bench file's `ctx.count`, and `phase.<name>` from strobe's own marks.
+            let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice(), &r.timed)).collect();
+            extra.extend(super::block::per_run_hooks(s, &key, &hooked));
+            // strobe's own reads of the app's tree inside the runs (`ObserverCost`).
+            extra.insert("driver.reads".into(), per_run(&|r| r.reads.0 as f64));
+            extra.insert("driver.read_ms".into(), per_run(&|r| r.reads.1));
+            // Drags: the moves strobe posted, beside the frames the app drew.
+            if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
+                extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
+                extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
+            }
+            let counted: Vec<(String, &wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.span.counted)).collect();
+            let (counts, mut refused) = wakes::counter_metrics(&counted, declared_metrics(s));
+            extra.extend(counts);
+            // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
+            let foreign: Vec<f64> = gpu_runs
+                .iter()
+                .zip(measured)
+                .filter(|_| !pinned.is_empty())
+                .filter_map(|(w, r)| {
+                    let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
+                    let whole = r.t1.saturating_sub(r.t0) as f64 / 1e6;
+                    let cpu = if whole > 0.0 { 100.0 * r.cpu_whole / whole } else { f64::NAN };
+                    cpu.is_finite().then(|| (busy - cpu).max(0.0))
+                })
+                .collect();
+            let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
+            // Presented frames from the OS, and input latency from strobe's own inputs to them.
+            let mut reactions = frames::Reactions::default();
+            match &presents {
+                Some(Ok(p)) => {
+                    // Spin and windows nobody may capture are the app's whole runs; frames and inputs their timed stretches.
+                    let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
+                    let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
+                    let f = frames::native_values(p, &pids, &timed, display.as_ref());
+                    let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
+                    let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
+                    for r in measured {
+                        reactions.add(frames::reactions(&r.log.sent(&r.timed), &r.changes, &p.presents, &pids, quiet));
+                    }
+                    // Frames at background priority describe no person's machine: no samples either
+                    // (`priority_state`; a software adapter refused the block above).
+                    if ctx.qos.is_none() && ctx.target_qos.is_none() {
+                        ctx.runner.join_samples(&frames::Outcome::samples(&reactions.each), &spans);
+                    }
+                    // SPEC §19: the present session's consumer may use 0.5% of a core (`Overhead`, warned for
+                    // timed blocks); past 2% it competes with the app it measures, and its frames describe a
+                    // disturbed run.
+                    let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
+                    let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
+                    present_pct = overhead;
+                    let spun = refresh.and_then(|ms| frames::unpaced(&p.presents, &pids, &spans, ms));
+                    // A spin the toolkit cannot see (composited while locked, a display asleep): said for
+                    // every series, declared frame metrics or not, with the display's own rate when no
+                    // vertical blanks came.
+                    if let Some((fps, hz)) = frames::spin(&p.presents, &pids, &spans, refresh.map(|ms| 1000.0 / ms).or_else(|| display.as_ref().map(|d| d.hz)))
+                        && !ctx.warnings.iter().any(|w| w.id == "UnpacedSpin")
+                    {
+                        let state = screen_state(&procs0, &procs1);
+                        ctx.warnings.push(validity::warn(
+                            "UnpacedSpin",
+                            format!(
+                                "{} block: the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display (pacing broken{}), so it draws as fast as it can and its CPU and GPU numbers describe that spin",
+                                v.role,
+                                match (state["session"].as_str(), state["display"].as_str()) {
+                                    (Some("locked"), _) => ", composited while the session is locked".to_string(),
+                                    (_, Some(d)) if d != "on" => format!(", the display {d}"),
+                                    _ => String::new(),
+                                }
+                            ),
+                        ));
+                    }
+                    let frames_refused = match overhead {
+                        Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
+                        _ => f.refused.clone().or(spun),
+                    };
+                    match frames_refused {
+                        Some(why) => {
+                            for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
+                                refused.insert(m.clone(), line(&why));
+                            }
+                        }
+                        None => {
+                            // The OS frames replace block_values' own (a native block has no Chrome
+                            // frames, so its frames.n is 0 there).
+                            values.extend(f.values);
+                            for m in std::iter::once(&s.primary).chain(&s.metrics) {
+                                if let Some(w) = f.partial.get(m) {
+                                    refused.entry(m.clone()).or_insert_with(|| line(w));
+                                }
+                            }
+                            // Only what the series declares is listed refused; the rest has no value.
+                            let mut why = BTreeMap::new();
+                            reactions.values(p.events_lost, &mut values, &mut why);
+                            for m in std::iter::once(&s.primary).chain(&s.metrics) {
+                                if let Some(w) = why.get(m) {
+                                    refused.entry(m.clone()).or_insert_with(|| line(w));
+                                }
+                            }
+                        }
+                    }
+                    if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
+                        ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", side_of(ctx, v), p.events_lost)));
+                    }
+                }
+                Some(Err(e)) => presents_err = Some(e.message.clone()),
+                None => {}
+            }
+            if let Some(why) = &presents_err {
+                // Said once for the bench, so frames that never show are not mistaken for none being drawn.
+                if !ctx.warnings.iter().any(|w| w.id == "NoPresentSource") {
+                    ctx.warnings.push(validity::info("NoPresentSource", format!("frames refused: the OS present events gave nothing ({why}); frames.* and interaction.* are missing from every block")));
+                }
+                for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
+                    refused.entry(m.clone()).or_insert_with(|| Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {why}")));
+                }
+            }
+            // Inputs given through accessibility actions skip hit testing and pointer handling: they are
+            // never an interaction, and a series that only gave such inputs says so.
+            let patterns = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "pattern").count();
+            let real = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "discrete" || i.kind == "scroll").count();
+            if patterns > 0 && real == 0 {
+                for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
+                    refused.insert(
+                        m.clone(),
+                        Refusal::new(
+                            ValidatorId::PatternInput,
+                            format!("{m}: the runs acted through accessibility actions (page.act), which skip hit testing and pointer handling; click, type or press for input latency"),
+                        ),
+                    );
+                }
+            }
+            // The memory the last measured run left, read before its reset (a leak run reads it between its
+            // runs): private bytes, PSS and what holds them (host, GPU, files, images).
+            // Never a reading from after the reset in its place: no value.
+            let end = match measured.last().and_then(|r| r.end.clone()) {
+                Some((m, p, r)) => (m, p, Some(r)),
+                None if leak => {
+                    let procs = n.processes();
+                    (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&n.pids()), None)
+                }
+                None => (0.0, None, None),
+            };
+            if end.0 > 0.0 {
+                values.insert("memory.app.private".into(), end.0);
+            }
+            if let Some(b) = end.1 {
+                values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
+            }
+            if let Some(r) = end.2 {
+                c.readings.push(r);
+            }
+            if let Some(r) = c.readings.last() {
+                values.extend(r.values().into_iter().map(|(k, x)| (k.to_string(), x)));
+            }
+            let leak_result = leak.then(|| native_leak(&c.readings, x.runs));
+            if let Some(v) = gpu_runs.last().and_then(|g| g.vram_dedicated_mb) {
+                values.insert("gpu.vram".into(), v);
+            }
+            // An integrated GPU has no dedicated memory: its allocations are all in system memory.
+            if let Some(v) = gpu_runs.last().and_then(|g| g.vram_shared_mb) {
+                values.insert("gpu.shared".into(), v);
+            }
+            if !foreign.is_empty() {
+                values.insert("cpu.foreign".into(), metrics::median(&foreign));
+                values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
+            }
+            if unsteady {
+                values.insert("warmup.unsteady".into(), if c.warmup.grew() { 2.0 } else { 1.0 });
+            }
+            // A metric no run gave a number for (an empty per-run map's median) is missing, not a value.
+            values.retain(|_, x| x.is_finite());
+            let have = Have { ui_thread: ui_tid.is_some(), windowless, gpu: (!super::super::outside::gpu_read(&samples)).then(|| samples.gpu_unreadable.clone()), pinned: !pinned.is_empty() };
+            for m in std::iter::once(&s.primary).chain(&s.metrics) {
+                if values.contains_key(m) || refused.contains_key(m) {
+                    continue;
+                }
+                refused.insert(m.clone(), missing(m, &have));
+            }
+            super::block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
+            for m in refused.keys() {
+                values.remove(m);
+            }
+            if let Some(why) = refused.get(&s.primary) {
+                // Most refusals already begin with the metric they refuse; the rest (a whole block's frames) get it.
+                let named = why.summary.starts_with(&format!("{}:", s.primary)) || why.summary.starts_with(&format!("{} ", s.primary));
+                let summary = if named { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) };
+                blocks.push(Err(Refusal { summary, fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into()));
+                continue;
+            }
+            readings_all.extend(c.readings.iter().cloned());
+            let mut steps = steps.clone();
+            steps.extend(c.steps.iter().cloned());
+            blocks.push(Ok(Block {
+                variant: v.role.to_string(),
+                pair,
+                values,
+                run_ms: measured.iter().map(|r| r.ms).collect(),
+                warmup: local.start,
+                speed_ratio: ratio,
+                // `StateDrift`: the app's accessibility element count at each run's end, as a page's DOM nodes.
+                nodes: measured.iter().filter_map(|r| r.elements.map(|e| e as u64)).collect(),
+                recording: None,
+                background: background.clone(),
+                refused,
+                leak: leak_result,
+                screen: Some(screen.clone()),
+                shown,
+                overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
+                process_set: Some(programs(&n.processes())),
+                // macOS's window list gives a window's frame, title bar included, not its content area: kept
+                // as the frame (`admit_window` allows a page's side the title bar). As setup began when a
+                // `page.window` sized it since (a run may leave it sized).
+                client: if drive.session.get().is_some_and(Session::window_sized) { client_before } else { n.window.as_ref().map(client_of) },
+                frame: cfg!(target_os = "macos"),
+                directions: BTreeMap::new(),
+                same: c.same.take(local.clone()),
+                ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
+                ..Block::default()
+            }));
+        }
+        if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
+            ctx.warnings.push(validity::warn(
+                "CursorNotParked",
+                format!("{} block: the OS cursor could not be moved onto the pointer's points (a locked session?), so the app's hover tracking saw the cursor elsewhere", v.role),
             ));
         }
-    }
-    if !windowless {
-        admit_setup(ctx, s, v, adapter.as_deref(), n.window.as_ref().map(|w| w.scale()))?;
-    }
-    let mut extra: BTreeMap<String, BTreeMap<String, f64>> = BTreeMap::new();
-    extra.insert("run.duration".into(), per_run(&|r| r.ms));
-    extra.insert("cpu.work".into(), per_run(&|r| r.cpu));
-    extra.insert("cpu.app.total".into(), per_run(&|r| if r.ms > 0.0 { 100.0 * r.cpu / r.ms } else { f64::NAN }));
-    if measured.iter().all(|r| !r.span.threads.is_empty()) {
-        extra.insert("cpu.wakes".into(), per_run(&|r| r.span.wakes_per_s()));
-        extra.insert("io.read".into(), per_run(&|r| r.span.io_read as f64));
-        extra.insert("io.write".into(), per_run(&|r| r.span.io_write as f64));
-    }
-    // The UI thread (the main window's), from its own cycle counter and context switches.
-    if let Some(tid) = ui_tid {
-        let ui = |r: &Run| r.span.threads.iter().find(|t| t.tid == tid).cloned();
-        extra.insert("ui.cpu".into(), per_run(&|r| ui(r).and_then(|t| t.cpu_ms).unwrap_or(f64::NAN)));
-        if super::super::outside::not_on_this_os("ui.wakes").is_none() {
-            extra.insert("ui.wakes".into(), per_run(&|r| ui(r).map_or(f64::NAN, |t| if r.span.ms > 0.0 { t.switches as f64 / (r.span.ms / 1e3) } else { f64::NAN })));
+        // Teardown before the recording, which keeps its actions too.
+        if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
+            && !ctx.warnings.iter().any(|w| w.id == "Teardown")
+        {
+            ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side_of(ctx, v), e.message)));
         }
-    }
-    let gpu_3d: BTreeMap<String, f64> = gpu_runs.iter().enumerate().filter_map(|(j, g)| Some((key(j), g.gpu_3d_pct?))).collect();
-    if !gpu_3d.is_empty() {
-        extra.insert("gpu.process.3d".into(), gpu_3d);
-    }
-    // The bench file's `ctx.count`, and `phase.<name>` from strobe's own marks.
-    let hooked: Vec<super::block::Hooked> = measured.iter().map(|r| (&r.counts, r.log.marks.as_slice(), &r.timed)).collect();
-    extra.extend(super::block::per_run_hooks(s, &key, &hooked));
-    // strobe's own reads of the app's tree inside the runs (`ObserverCost`).
-    extra.insert("driver.reads".into(), per_run(&|r| r.reads.0 as f64));
-    extra.insert("driver.read_ms".into(), per_run(&|r| r.reads.1));
-    // Drags: the moves strobe posted, beside the frames the app drew.
-    if measured.iter().any(|r| crate::driver::input_pacing(&r.log.drags).is_some()) {
-        extra.insert("input.rate".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.0)));
-        extra.insert("input.gap.p95".into(), per_run(&|r: &Run| crate::driver::input_pacing(&r.log.drags).map_or(f64::NAN, |p| p.1)));
-    }
-    let counted: Vec<(String, &wakes::Counted)> = measured.iter().enumerate().map(|(j, r)| (key(j), &r.span.counted)).collect();
-    let (counts, mut refused) = wakes::counter_metrics(&counted, declared_metrics(s));
-    extra.extend(counts);
-    // Other work on the CPUs the target is pinned to (SPEC §10.2 Background), as for pages.
-    let pinned: Vec<u32> = ctx.pin.map(|m| (0..64).filter(|c| m >> c & 1 == 1).collect()).unwrap_or_default();
-    let foreign: Vec<f64> = gpu_runs
-        .iter()
-        .zip(measured)
-        .filter(|_| !pinned.is_empty())
-        .filter_map(|(w, r)| {
-            let busy: f64 = w.cores.iter().filter(|c| pinned.contains(&c.cpu)).map(|c| c.busy_pct).collect::<Option<Vec<f64>>>()?.iter().sum();
-            let whole = r.t1.saturating_sub(r.t0) as f64 / 1e6;
-            let cpu = if whole > 0.0 { 100.0 * r.cpu_whole / whole } else { f64::NAN };
-            cpu.is_finite().then(|| (busy - cpu).max(0.0))
-        })
-        .collect();
-    let mut values = metrics::block_values(&metrics::BlockData::default(), "run", &extra);
-    // Presented frames from the OS, and input latency from strobe's own inputs to them.
-    let pids = n.pids();
-    let mut reactions = frames::Reactions::default();
-    let mut present_pct = None;
-    match &presents {
-        Some(Ok(p)) => {
-            // Spin and windows nobody may capture are the app's whole runs; frames and inputs their timed stretches.
-            let spans: Vec<(u64, u64)> = measured.iter().map(|r| (r.t0, r.t1)).collect();
-            let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
-            let f = frames::native_values(p, &pids, &timed, display.as_ref());
-            let refresh = f.values.get("display.hz").map(|hz| 1000.0 / hz);
-            let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
-            for r in measured {
-                reactions.add(frames::reactions(&r.log.sent(&r.timed), &r.changes, &p.presents, &pids, quiet));
-            }
-            // Frames at background priority describe no person's machine: no samples either
-            // (`priority_state`; a software adapter refused the block above).
-            if ctx.qos.is_none() && ctx.target_qos.is_none() {
-                ctx.runner.join_samples(&frames::Outcome::samples(&reactions.each), &spans);
-            }
-            // SPEC §19: the present session's consumer may use 0.5% of a core (`Overhead`, warned for
-            // timed blocks); past 2% it competes with the app it measures, and its frames describe a
-            // disturbed run.
-            let span_ms = p.t1_ns.saturating_sub(p.t0_ns) as f64 / 1e6;
-            let overhead = p.consumer_cpu_ms.filter(|_| span_ms > 0.0).map(|c| 100.0 * c / span_ms);
-            present_pct = overhead;
-            let spun = refresh.and_then(|ms| frames::unpaced(&p.presents, &pids, &spans, ms));
-            // A spin the toolkit cannot see (composited while locked, a display asleep): said for
-            // every series, declared frame metrics or not, with the display's own rate when no
-            // vertical blanks came.
-            if let Some((fps, hz)) = frames::spin(&p.presents, &pids, &spans, refresh.map(|ms| 1000.0 / ms).or_else(|| display.as_ref().map(|d| d.hz)))
-                && !ctx.warnings.iter().any(|w| w.id == "UnpacedSpin")
-            {
-                let state = screen_state(&procs0, &procs1);
-                ctx.warnings.push(validity::warn(
-                    "UnpacedSpin",
-                    format!(
-                        "{} block: the app presented {fps:.0} frames a second on a {hz:.0} Hz display: its presents finish without waiting for the display (pacing broken{}), so it draws as fast as it can and its CPU and GPU numbers describe that spin",
-                        v.role,
-                        match (state["session"].as_str(), state["display"].as_str()) {
-                            (Some("locked"), _) => ", composited while the session is locked".to_string(),
-                            (_, Some(d)) if d != "on" => format!(", the display {d}"),
-                            _ => String::new(),
-                        }
-                    ),
-                ));
-            }
-            let frames_refused = match overhead {
-                Some(o) if o > 2.0 => Some(format!("OverheadBudget: the OS present session's consumer used {o:.2}% of a core (budget 0.5%), so the frames it saw describe a disturbed run")),
-                _ => f.refused.clone().or(spun),
-            };
-            match frames_refused {
-                Some(why) => {
-                    for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
-                        refused.insert(m.clone(), line(&why));
-                    }
-                }
-                None => {
-                    // The OS frames replace block_values' own (a native block has no Chrome
-                    // frames, so its frames.n is 0 there).
-                    values.extend(f.values);
-                    for m in std::iter::once(&s.primary).chain(&s.metrics) {
-                        if let Some(w) = f.partial.get(m) {
-                            refused.entry(m.clone()).or_insert_with(|| line(w));
-                        }
-                    }
-                    // Only what the series declares is listed refused; the rest has no value.
-                    let mut why = BTreeMap::new();
-                    reactions.values(p.events_lost, &mut values, &mut why);
-                    for m in std::iter::once(&s.primary).chain(&s.metrics) {
-                        if let Some(w) = why.get(m) {
-                            refused.entry(m.clone()).or_insert_with(|| line(w));
-                        }
-                    }
-                }
-            }
-            if p.events_lost > 0 && !ctx.warnings.iter().any(|w| w.id == "PresentsLost") {
-                ctx.warnings.push(validity::warn("PresentsLost", format!("{} block: the present session lost {} events; frame counts may be short", side_of(ctx, v), p.events_lost)));
-            }
+        let kept: Vec<&NativeCase> = native_cases.iter().zip(&blocks).filter(|(_, b)| b.is_ok()).map(|((_, c), _)| c).collect();
+        if kept.is_empty() || !(keep || set == Set::Attribution) {
+            return Ok((blocks, None));
         }
-        Some(Err(e)) => presents_err = Some(e.message.clone()),
-        None => {}
-    }
-    if let Some(why) = &presents_err {
-        // Said once for the bench, so frames that never show are not mistaken for none being drawn.
-        if !ctx.warnings.iter().any(|w| w.id == "NoPresentSource") {
-            ctx.warnings.push(validity::info("NoPresentSource", format!("frames refused: the OS present events gave nothing ({why}); frames.* and interaction.* are missing from every block")));
-        }
-        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| frame_metric(m)) {
-            refused.entry(m.clone()).or_insert_with(|| Refusal::new(ValidatorId::NoPresentSource, format!("{m}: OS present events: {why}")));
-        }
-    }
-    // Inputs given through accessibility actions skip hit testing and pointer handling: they are
-    // never an interaction, and a series that only gave such inputs says so.
-    let patterns = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "pattern").count();
-    let real = measured.iter().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "discrete" || i.kind == "scroll").count();
-    if patterns > 0 && real == 0 {
-        for m in std::iter::once(&s.primary).chain(&s.metrics).filter(|m| m.starts_with("interaction.") || m.starts_with("scroll.latency")) {
-            refused.insert(
-                m.clone(),
-                Refusal::new(
-                    ValidatorId::PatternInput,
-                    format!("{m}: the runs acted through accessibility actions (page.act), which skip hit testing and pointer handling; click, type or press for input latency"),
-                ),
-            );
-        }
-    }
-    // The memory the last measured run left, read before its reset (a leak run reads it between its
-    // runs): private bytes, PSS and what holds them (host, GPU, files, images).
-    // Never a reading from after the reset in its place: no value.
-    let end = match measured.last().and_then(|r| r.end.clone()) {
-        Some((m, p, r)) => (m, p, Some(r)),
-        None if leak => {
-            let procs = n.processes();
-            (procs.iter().map(|p| p.private_bytes).sum::<u64>() as f64 / (1024.0 * 1024.0), host::pss_bytes(&n.pids()), None)
-        }
-        None => (0.0, None, None),
-    };
-    if end.0 > 0.0 {
-        values.insert("memory.app.private".into(), end.0);
-    }
-    if let Some(b) = end.1 {
-        values.insert("memory.app.pss".into(), b as f64 / (1024.0 * 1024.0));
-    }
-    if let Some(r) = end.2 {
-        readings.push(r);
-    }
-    if let Some(r) = readings.last() {
-        values.extend(r.values().into_iter().map(|(k, x)| (k.to_string(), x)));
-    }
-    let leak_result = leak.then(|| native_leak(&readings, x.runs));
-    if let Some(v) = gpu_runs.last().and_then(|g| g.vram_dedicated_mb) {
-        values.insert("gpu.vram".into(), v);
-    }
-    // An integrated GPU has no dedicated memory: its allocations are all in system memory.
-    if let Some(v) = gpu_runs.last().and_then(|g| g.vram_shared_mb) {
-        values.insert("gpu.shared".into(), v);
-    }
-    if !foreign.is_empty() {
-        values.insert("cpu.foreign".into(), metrics::median(&foreign));
-        values.insert("cpu.foreign.max".into(), foreign.iter().copied().fold(0.0, f64::max));
-    }
-    if unsteady {
-        values.insert("warmup.unsteady".into(), if warmup.grew() { 2.0 } else { 1.0 });
-    }
-    // A metric no run gave a number for (an empty per-run map's median) is missing, not a value.
-    values.retain(|_, x| x.is_finite());
-    let have = Have { ui_thread: ui_tid.is_some(), windowless, gpu: (!super::super::outside::gpu_read(&samples)).then(|| samples.gpu_unreadable.clone()), pinned: !pinned.is_empty() };
-    for m in std::iter::once(&s.primary).chain(&s.metrics) {
-        if values.contains_key(m) || refused.contains_key(m) {
-            continue;
-        }
-        refused.insert(m.clone(), missing(m, &have));
-    }
-    super::block::untimed_state(s, &measured.iter().map(|r| &r.timed).collect::<Vec<_>>(), &mut values, &mut refused);
-    for m in refused.keys() {
-        values.remove(m);
-    }
-    if let Some(why) = refused.get(&s.primary) {
-        // Most refusals already begin with the metric they refuse; the rest (a whole block's frames) get it.
-        let named = why.summary.starts_with(&format!("{}:", s.primary)) || why.summary.starts_with(&format!("{} ", s.primary));
-        let summary = if named { why.summary.clone() } else { format!("{}: {}", s.primary, why.summary) };
-        return Err(Refusal { summary, fix: why.fix.clone().or_else(|| Some("pick a primary this target can measure".into())), ..why.clone() }.into());
-    }
-    if drive.session.get().and_then(Session::parked) == Some(false) && !ctx.warnings.iter().any(|w| w.id == "CursorNotParked") {
-        ctx.warnings.push(validity::warn(
-            "CursorNotParked",
-            format!("{} block: the OS cursor could not be moved onto the pointer's points (a locked session?), so the app's hover tracking saw the cursor elsewhere", v.role),
-        ));
-    }
-    let background = busiest_others(&procs0, &procs1);
-    let screen = screen_state(&procs0, &procs1);
-    let spans: Vec<Span> = measured.iter().map(|r| r.span.clone()).collect();
-    // Teardown before the recording, which keeps its actions too.
-    if let Err(e) = ctx.runner.call("close", json!({}), t, &serve)
-        && !ctx.warnings.iter().any(|w| w.id == "Teardown")
-    {
-        ctx.warnings.push(validity::warn("Teardown", format!("{} block: {}", side_of(ctx, v), e.message)));
-    }
-    let recording = if keep || set == Set::Attribution {
         // Discarded on any error before its meta.json: no recording is left half written.
         let (id, draft) = store::new_recording()?;
         let dir = draft.dir().to_path_buf();
+        // The measured runs of every case kept, by their key among the launch's runs.
+        let all: Vec<(String, &Run)> = kept
+            .iter()
+            .flat_map(|c| {
+                let (local, range) = measured_of(c);
+                c.runs[local].iter().enumerate().map(move |(j, r)| (format!("run:{}", range.start + j), r))
+            })
+            .collect();
+        let spans: Vec<Span> = all.iter().map(|(_, r)| r.span.clone()).collect();
         let names: BTreeMap<u32, String> =
             spans.iter().flat_map(|s| s.threads.iter().map(|t| t.tid)).collect::<std::collections::BTreeSet<_>>().into_iter().filter_map(|t| Some((t, host::thread_name(t)?))).collect();
         store::write_json(&dir.join("threads.json"), &json!(wakes::by_thread(&spans, &names, &wakes::modules(&spans))))?;
-        let run_rows: Vec<Value> = measured
+        let run_rows: Vec<Value> = all
             .iter()
-            .enumerate()
-            .map(|(j, r)| json!({ "run": key(j), "ms": r.ms, "cpu_ms": r.cpu, "switches": r.span.switches, "wakes_per_s": r.span.wakes_per_s(), "io_read": r.span.io_read, "io_write": r.span.io_write, "counts": r.counts, "elements": r.elements }))
+            .map(|(key, r)| json!({ "run": key, "ms": r.ms, "cpu_ms": r.cpu, "switches": r.span.switches, "wakes_per_s": r.span.wakes_per_s(), "io_read": r.span.io_read, "io_write": r.span.io_write, "counts": r.counts, "elements": r.elements }))
             .collect();
         store::write_json(&dir.join("runs.json"), &json!(run_rows))?;
-        let per: serde_json::Map<String, Value> =
-            measured.iter().enumerate().map(|(j, r)| (key(j), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
-        store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "display_hz": values.get("display.hz"), "runs": per }))?;
+        let per: serde_json::Map<String, Value> = all.iter().map(|(key, r)| (key.clone(), json!({ "t0_ns": r.t0, "t1_ns": r.t1, "untimed": r.timed.untimed, "inputs": r.log.inputs, "marks": r.log.marks, "changes": r.changes }))).collect();
+        let first_ok = blocks.iter().flatten().next();
+        store::write_json(&dir.join("frames.json"), &json!({ "pids": pids, "display_hz": first_ok.and_then(|b| b.values.get("display.hz")), "runs": per }))?;
         if let Some(Ok(p)) = &presents {
             crate::symbol::write_gz(&dir.join("presents.json.gz"), p)?;
         }
-        store::write_json(&dir.join("memory.json"), &json!({ "readings": readings }))?;
-        // The actions first: the video's markers take their measured reactions from them.
-        super::keep_actions(ctx, &dir)?;
-        // The video: every run on its time (warmup ones too), the inputs strobe posted, the phases.
+        store::write_json(&dir.join("memory.json"), &json!({ "readings": readings_all }))?;
+        // The actions first: the video's markers take their measured reactions from them. A batch's whole
+        // log goes with it, each case's part to its result (`batch`).
+        let actions = ctx.runner.take_actions();
+        if !actions.is_empty() {
+            actions.write(&dir.join(store::actions::FILE))?;
+        }
+        // The video: every run on its time (warmup ones too), the inputs strobe posted, the phases, and in a
+        // batch each case's span.
         let video = match stopped.take() {
             Some(Ok(st)) => {
-                let filmed: Vec<crate::app::video::Run> = runs.iter().enumerate().map(|(i, r)| (format!("run:{i}"), r.t0, r.t1, range.contains(&i))).collect();
-                let sent: Vec<crate::app::video::Sent> = runs
+                let filmed: Vec<crate::app::video::Run> = native_cases
                     .iter()
-                    .flat_map(|r| &r.log.inputs)
-                    .filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first))
-                    .map(|i| crate::app::video::Sent { t_ns: i.t_ns, press_ns: i.press_ns })
+                    .flat_map(|(_, c)| {
+                        let (local, _) = measured_of(c);
+                        c.runs.iter().enumerate().map(move |(i, r)| (format!("run:{}", c.base + i), r.t0, r.t1, local.contains(&i)))
+                    })
                     .collect();
-                let marks: Vec<(String, u64)> = runs.iter().flat_map(|r| r.log.marks.iter().cloned()).collect();
+                let runs = native_cases.iter().flat_map(|(_, c)| &c.runs);
+                let sent: Vec<crate::app::video::Sent> =
+                    runs.clone().flat_map(|r| &r.log.inputs).filter(|i| i.kind == "discrete" || (i.kind == "scroll" && i.first)).map(|i| crate::app::video::Sent { t_ns: i.t_ns, press_ns: i.press_ns }).collect();
+                let mut marks: Vec<(String, u64)> = runs.flat_map(|r| r.log.marks.iter().cloned()).collect();
+                marks.extend(case_marks.iter().cloned());
                 st.keep(&dir, &filmed, &sent, &marks)
-                    .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {} block: the video was not kept: {}", s.label(), side_of(ctx, v), e.message))))
+                    .map_err(|e| ctx.warnings.push(validity::warn("Video", format!("{} · {} block: the video was not kept: {}", s0.label(), side_of(ctx, v), e.message))))
                     .ok()
             }
             Some(Err(e)) => {
-                ctx.warnings.push(validity::warn("Video", format!("{} · {} block: no video: {}", s.label(), side_of(ctx, v), e.message)));
+                ctx.warnings.push(validity::warn("Video", format!("{} · {} block: no video: {}", s0.label(), side_of(ctx, v), e.message)));
                 None
             }
             None => None,
@@ -949,10 +1153,10 @@ fn runs(
                 // runs: keeping only the measured runs' span dropped every one of them.
                 // The runs' timed parts: `ctx.untimed` stretches are none of the case's.
                 if !d.untimed {
-                    d.samples.retain(|x| measured.iter().any(|r| x.0 >= r.t0 && x.0 <= r.t1 && !r.timed.untimed_at(x.0)));
+                    d.samples.retain(|x| all.iter().any(|(_, r)| x.0 >= r.t0 && x.0 <= r.t1 && !r.timed.untimed_at(x.0)));
                 }
                 if let Some(w) = d.waits.as_mut() {
-                    w.clip(&measured.iter().flat_map(|r| r.timed.segments()).collect::<Vec<_>>());
+                    w.clip(&all.iter().flat_map(|(_, r)| r.timed.segments()).collect::<Vec<_>>());
                 }
                 crate::symbol::write_gz(&dir.join("deep.json.gz"), &d)?;
                 format!(
@@ -966,52 +1170,39 @@ fn runs(
             None if set == Set::Attribution => crate::probe::stacks::no_stacks().into(),
             None => String::new(),
         };
-        store::write_json(
-            &dir.join("meta.json"),
-            &json!({
-                "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "seed": ctx.seed, "series": s.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
-                "target": app.exe, "probes": set, "runs": measured.len(), "values": values, "refused": super::refusal_map(&refused), "duration_ms": measured.iter().map(|r| r.ms).sum::<f64>() as u64,
-                "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter, "background": background, "ui_thread": ui_tid,
-                "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
-                // The OS and GPU samples over the measured runs, for `query gpu`.
-                "os": samples.window(measured[0].t0, measured[measured.len() - 1].t1), "leak": leak_result,
-                "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" }, "video": video,
-                "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
-            }),
-        )?;
+        let (t0, t1) = (all.first().map_or(0, |r| r.1.t0), all.last().map_or(0, |r| r.1.t1));
+        let mut meta = json!({
+            "id": id, "kind": "block", "native": true, "experiment": ctx.exp, "seed": ctx.seed, "series": s0.label(), "variant": v.role, "variant_label": v.label, "variant_git": variant_git(v),
+            "target": app.exe, "probes": set, "runs": all.len(),
+            "values": if batch { json!({}) } else { json!(first_ok.map(|b| &b.values)) },
+            "refused": if batch { json!({}) } else { first_ok.map(|b| super::refusal_map(&b.refused)).unwrap_or(Value::Null) },
+            "duration_ms": all.iter().map(|(_, r)| r.ms).sum::<f64>() as u64,
+            "created": super::super::record::now_iso(), "valid": true, "env": host::env(), "window": n.window, "gpu_adapter": adapter_of_launch, "background": background, "ui_thread": ui_tid,
+            "gpu_cache": home.gpu_warm.map(|w| if w { "warm" } else { "cold" }), "screen": screen,
+            // The OS and GPU samples over the measured runs, for `query gpu`.
+            "os": samples.window(t0, t1), "leak": first_ok.and_then(|b| b.leak.clone()),
+            "timing": if (set == Set::Timing || set == Set::Lean) && !x.video { "clean" } else { "perturbed" }, "video": video,
+            "note": if set == Set::Attribution { format!("a native block's attribution: OS samples, not timed; {stacks_note}") } else { String::new() },
+        });
+        if batch {
+            let done: Vec<(&Series, std::ops::Range<usize>, &Block)> =
+                native_cases.iter().zip(&blocks).filter_map(|((k, c), b)| Some((&cases[*k], measured_of(c).1, b.as_ref().ok()?))).collect();
+            meta["batch"] = super::batch::meta(done.into_iter());
+        }
+        store::write_json(&dir.join("meta.json"), &meta)?;
         draft.keep();
-        Some(id)
-    } else {
-        None
-    };
+        for b in blocks.iter_mut().flatten() {
+            b.recording = Some(id.clone());
+        }
+        Ok((blocks, batch.then_some(actions)))
+    })();
     lap("analyse", steps);
-    Ok(Block {
-        variant: v.role.to_string(),
-        pair,
-        values,
-        run_ms: measured.iter().map(|r| r.ms).collect(),
-        warmup: first,
-        speed_ratio: ratio,
-        // `StateDrift`: the app's accessibility element count at each run's end, as a page's DOM nodes.
-        nodes: measured.iter().filter_map(|r| r.elements.map(|e| e as u64)).collect(),
-        recording,
-        background,
-        refused,
-        leak: leak_result,
-        screen: Some(screen),
-        shown,
-        overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
-        process_set: Some(programs(&n.processes())),
-        // macOS's window list gives a window's frame, title bar included, not its content area: kept
-        // as the frame (`admit_window` allows a page's side the title bar). As setup began when a
-        // `page.window` sized it since (a run may leave it sized).
-        client: if drive.session.get().is_some_and(Session::window_sized) { client_before } else { n.window.as_ref().map(client_of) },
-        frame: cfg!(target_os = "macos"),
-        directions: BTreeMap::new(),
-        same: same.take(range.clone()),
-        ops: super::journey::ops(&measured.iter().map(|r| &r.counts).collect::<Vec<_>>()),
-        ..Block::default()
-    })
+    let mut out: Vec<Result<Block>> = match finished {
+        Ok((blocks, actions)) => return Ok(Launch { cases: blocks.into_iter().chain(failed.map(Err)).collect(), abort, notes, actions, log_at, case_ms }),
+        Err(e) => native_cases.iter().map(|_| Err(e.clone())).collect(),
+    };
+    out.extend(failed.map(Err));
+    Ok(Launch { cases: out, abort, notes, actions: None, log_at, case_ms })
 }
 
 /// A native leak run's verdict (SPEC §8.6): growth per run of the processes' host memory (heap,

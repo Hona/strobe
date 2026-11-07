@@ -767,7 +767,14 @@ pub fn system_busy(ms: u64) -> f64 {
 /// Apple Silicon has no per-cluster L3 to pin to: no cache groups, and with no CPU affinity no
 /// cores to name either. The core kinds are in `cpu_name`.
 pub fn topology() -> Topology {
-    Topology { logical: std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1), groups: Vec::new(), cores: Vec::new() }
+    let allowed = super::allowed();
+    Topology { logical: allowed.count, allowed: allowed.mask, limit: allowed.limit.clone(), groups: Vec::new(), cores: Vec::new() }
+}
+
+/// Every CPU: macOS has no affinity to narrow.
+pub(super) fn allowed() -> super::Allowed {
+    let n = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    super::Allowed { mask: if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }, count: n, limit: None }
 }
 
 pub fn os_name() -> String {

@@ -279,27 +279,52 @@ pub fn memory_map(pid: u32) -> Option<super::MemoryMap> {
 }
 
 pub fn topology() -> Topology {
-    let logical = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
-    let mut groups = Vec::new();
+    let allowed = super::allowed();
+    let all = allowed.mask;
+    // L3 groups and physical cores of processor group 0 (strobe's masks) within the allowed CPUs;
+    // a core's efficiency class is higher on the faster cores of a hybrid CPU, 0 on every core of
+    // others.
+    let mut groups: Vec<CacheGroup> = Vec::new();
     processor_info(RelationCache, |info| {
         let cache = unsafe { &info.Anonymous.Cache };
-        if cache.Level == 3 {
-            let mask = unsafe { cache.Anonymous.GroupMask.Mask } as u64;
+        let g = unsafe { cache.Anonymous.GroupMask };
+        let mask = g.Mask as u64 & all;
+        if cache.Level == 3 && g.Group == 0 && mask != 0 && !groups.iter().any(|x| x.mask == mask) {
             groups.push(CacheGroup { mask, cpus: mask.count_ones(), l3_mb: cache.CacheSize / (1024 * 1024) });
         }
     });
-    // Physical cores of processor group 0 (strobe's masks), each with its SMT siblings; the
-    // efficiency class is higher on faster cores of a hybrid CPU and 0 everywhere on others.
+    groups.sort_by_key(|g| g.mask.trailing_zeros());
     let mut cores = Vec::new();
     processor_info(RelationProcessorCore, |info| {
         let p = unsafe { &info.Anonymous.Processor };
         let g = p.GroupMask[0];
-        if p.GroupCount >= 1 && g.Group == 0 && g.Mask != 0 {
-            cores.push(Core { mask: g.Mask as u64, class: p.EfficiencyClass });
+        let mask = g.Mask as u64 & all;
+        if p.GroupCount >= 1 && g.Group == 0 && mask != 0 {
+            cores.push(Core { mask, class: p.EfficiencyClass });
         }
     });
     cores.sort_by_key(|c| c.mask.trailing_zeros());
-    Topology { logical, groups, cores }
+    Topology { logical: allowed.count, allowed: all, limit: allowed.limit.clone(), groups, cores }
+}
+
+/// The CPUs this process may use now (`GetProcessAffinityMask`), how many in all, and why its mask
+/// cannot name them all (more than one processor group). `host::allowed` reads it once, before
+/// strobe narrows it.
+pub(super) fn allowed() -> super::Allowed {
+    use windows_sys::Win32::System::Threading::{ALL_PROCESSOR_GROUPS, GetActiveProcessorCount, GetActiveProcessorGroupCount};
+    let (mut proc_mask, mut sys_mask) = (0usize, 0usize);
+    let mask = match unsafe { GetProcessAffinityMask(GetCurrentProcess(), &mut proc_mask, &mut sys_mask) } {
+        0 => {
+            let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64);
+            if n >= 64 { u64::MAX } else { (1u64 << n) - 1 }
+        }
+        _ => proc_mask as u64,
+    };
+    if unsafe { GetActiveProcessorGroupCount() } > 1 {
+        let count = unsafe { GetActiveProcessorCount(ALL_PROCESSOR_GROUPS) };
+        return super::Allowed { mask, count, limit: Some(format!("more than one processor group ({count} CPUs, over 64): strobe's CPU masks name one group")) };
+    }
+    super::Allowed { mask, count: mask.count_ones(), limit: None }
 }
 
 /// Each record `GetLogicalProcessorInformationEx` returns for `relation`.
@@ -337,7 +362,7 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
         if GetProcessAffinityMask(h, &mut proc_mask, &mut sys_mask) == 0 {
             return None;
         }
-        let target = if mask == 0 { sys_mask } else { mask as usize & sys_mask };
+        let target = if mask == 0 { super::allowed().mask as usize } else { mask as usize & sys_mask };
         if target == 0 || SetProcessAffinityMask(h, target) == 0 {
             return None;
         }

@@ -7159,8 +7159,7 @@ struct Unpinned(Option<u64>);
 
 impl Unpinned {
     fn start() -> Unpinned {
-        let n = host::topology().logical.min(64);
-        let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+        let all = host::topology().all();
         if super::in_daemon() {
             if THREAD_PIN.with(|p| p.get()).is_some() {
                 host::set_thread_affinity(all);
@@ -7244,7 +7243,7 @@ fn http_ok(url: &str) -> bool {
 }
 
 pub(crate) fn pinning(spec: &str, topo: &host::Topology) -> Result<(Option<u64>, Option<u64>, String)> {
-    let all: u64 = if topo.logical >= 64 { u64::MAX } else { (1u64 << topo.logical) - 1 };
+    let all = topo.all();
     let pick = |g: &host::CacheGroup, i: usize| (Some(g.mask), Some(all & !g.mask), format!("CCD{i} ({} MB L3, {} CPUs) · runner on the other CPUs", g.l3_mb, g.cpus));
     match spec {
         "none" => Ok((None, None, "unpinned".into())),

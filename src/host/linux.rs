@@ -367,15 +367,16 @@ pub(super) fn cpu_list(s: &str) -> u64 {
 }
 
 pub fn topology() -> Topology {
-    let logical = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(1);
+    let allowed = super::allowed();
+    let all = allowed.mask;
     let mut groups: Vec<CacheGroup> = Vec::new();
-    for cpu in 0..logical.min(64) {
+    for cpu in super::bits(all) {
         for idx in std::fs::read_dir(format!("/sys/devices/system/cpu/cpu{cpu}/cache")).into_iter().flatten().flatten() {
             let d = idx.path();
             if read(d.join("level")).is_none_or(|l| l.trim() != "3") {
                 continue;
             }
-            let mask = read(d.join("shared_cpu_list")).map(|s| cpu_list(&s)).unwrap_or(0);
+            let mask = read(d.join("shared_cpu_list")).map(|s| cpu_list(&s) & all).unwrap_or(0);
             let size = read(d.join("size")).unwrap_or_default();
             let size = size.trim();
             let kb = size.trim_end_matches(['K', 'M']).parse::<u32>().unwrap_or(0) * if size.ends_with('M') { 1024 } else { 1 };
@@ -385,18 +386,37 @@ pub fn topology() -> Topology {
         }
     }
     groups.sort_by_key(|g| g.mask.trailing_zeros());
-    Topology { logical, groups, cores: cores(logical) }
+    Topology { logical: allowed.count, allowed: all, limit: allowed.limit.clone(), groups, cores: cores(all) }
 }
 
-/// Physical cores from each CPU's `thread_siblings_list` (a vCPU without one, or listing only
-/// itself, is its own core). Core kinds: Intel hybrid CPUs list their efficiency cores in
-/// `/sys/devices/cpu_atom/cpus`; elsewhere (Arm big.LITTLE) each kind has its own `cpu_capacity`.
-fn cores(logical: u32) -> Vec<Core> {
-    let n = logical.min(64);
-    let all = if n >= 64 { u64::MAX } else { (1u64 << n) - 1 };
+/// The CPUs this thread may use now (`sched_getaffinity`): the first 64 as a mask, how many in all,
+/// and why the mask cannot name them all. `host::allowed` reads it once, before strobe narrows it.
+pub(super) fn allowed() -> super::Allowed {
+    let mut set: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) } != 0 {
+        // More CPUs than a cpu_set_t holds: the online ones, with the same limit.
+        let online = read("/sys/devices/system/cpu/online").unwrap_or_default();
+        let mask = cpu_list(&online);
+        return super::Allowed { mask, count: mask.count_ones(), limit: Some("more CPUs than strobe's affinity calls read: its CPU masks name the first 64".into()) };
+    }
+    let size = libc::CPU_SETSIZE as usize;
+    let mask = (0..64).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).fold(0u64, |m, c| m | 1 << c);
+    let count = (0..size).filter(|&c| unsafe { libc::CPU_ISSET(c, &set) }).count() as u32;
+    let limit = (count > mask.count_ones()).then(|| format!("strobe may use {count} CPUs, some numbered 64 or more: its CPU masks name the first 64"));
+    super::Allowed { mask, count, limit }
+}
+
+/// Physical cores of the CPUs in `all`, from each CPU's `thread_siblings_list` (a vCPU without
+/// one, or listing only itself, is its own core). Core kinds: Intel hybrid CPUs list their
+/// efficiency cores in `/sys/devices/cpu_atom/cpus`; elsewhere (Arm big.LITTLE) each kind has its
+/// own `cpu_capacity`.
+fn cores(all: u64) -> Vec<Core> {
     let cpu = |c: u32, f: &str| read(format!("/sys/devices/system/cpu/cpu{c}/{f}"));
-    let atom = read("/sys/devices/cpu_atom/cpus").map(|s| cpu_list(&s));
-    let capacity: Vec<Option<u32>> = (0..n).map(|c| cpu(c, "cpu_capacity").and_then(|s| s.trim().parse().ok())).collect();
+    let atom = read("/sys/devices/cpu_atom/cpus").map(|s| cpu_list(&s)).filter(|&m| m != 0);
+    let mut capacity = [None::<u32>; 64];
+    for c in super::bits(all) {
+        capacity[c as usize] = cpu(c, "cpu_capacity").and_then(|s| s.trim().parse().ok());
+    }
     let mut kinds: Vec<u32> = capacity.iter().flatten().copied().collect();
     kinds.sort_unstable();
     kinds.dedup();
@@ -408,7 +428,7 @@ fn cores(logical: u32) -> Vec<Core> {
         }
     };
     let mut cores: Vec<Core> = Vec::new();
-    for c in 0..n {
+    for c in super::bits(all) {
         let siblings = cpu(c, "topology/thread_siblings_list").map(|s| cpu_list(&s) & all).filter(|m| (m >> c) & 1 == 1).unwrap_or(1 << c);
         if !cores.iter().any(|k| k.mask & siblings != 0) {
             cores.push(Core { mask: siblings, class: class(c) });
@@ -457,10 +477,11 @@ pub(super) fn set_affinity_of(tid: libc::pid_t, mask: u64) -> bool {
     unsafe { libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0 }
 }
 
-/// Every thread of this process (children started afterwards inherit it); 0 is every CPU.
+/// Every thread of this process (children started afterwards inherit it); 0 is every CPU strobe
+/// may use (`host::allowed`: `available_parallelism` counts the mask strobe narrowed).
 pub fn set_affinity(mask: u64) -> Option<u64> {
     let old = affinity_of(0)?;
-    let all = (0..std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(64)).fold(0u64, |m, c| m | 1 << c);
+    let all = super::allowed().mask;
     let target = if mask == 0 { all } else { mask & all };
     if target == 0 {
         return None;

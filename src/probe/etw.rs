@@ -239,6 +239,13 @@ impl<O: Send + 'static> Running<O> {
         let thread = std::thread::Builder::new()
             .name("strobe-etw".into())
             .spawn(move || {
+                // Above normal priority: on the few CPUs `--pin auto` leaves strobe and the runner,
+                // a consumer queued behind them would let ETW drop buffers. It runs on strobe's
+                // CPUs, never the target's.
+                unsafe {
+                    use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL};
+                    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+                }
                 let k0 = crate::host::thread_cycles();
                 struct Ctx<H> {
                     h: H,

@@ -689,11 +689,18 @@ pub struct Core {
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Topology {
+    /// How many logical CPUs strobe may use (`allowed`).
     pub logical: u32,
+    /// The CPUs strobe may use: its affinity when it started, before it narrowed its own
+    /// (`OwnAffinity`), so cpusets, `taskset` and offline or non-contiguous CPUs count.
+    pub allowed: u64,
+    /// Why strobe's 64-bit CPU masks cannot name every CPU it may use (CPUs numbered 64 or more,
+    /// more than one Windows processor group): `--pin auto` leaves the target unpinned then.
+    pub limit: Option<String>,
+    /// The L3 groups, within `allowed`.
     pub groups: Vec<CacheGroup>,
-    /// The physical cores of the first 64 logical CPUs, by first CPU; none on macOS (no CPU
-    /// affinity). Where the OS says nothing of SMT (most virtual machines' vCPUs) each logical CPU is
-    /// its own core.
+    /// The physical cores within `allowed`, by first CPU; none on macOS (no CPU affinity). Where
+    /// the OS says nothing of SMT (most virtual machines' vCPUs) each logical CPU is its own core.
     pub cores: Vec<Core>,
 }
 
@@ -702,7 +709,8 @@ pub struct Topology {
 pub struct AutoPin {
     /// The target's CPUs; None leaves it unpinned.
     pub target: Option<u64>,
-    /// Every other CPU: strobe's, the runner's and those of the processes kept off the target's.
+    /// Every other allowed CPU: strobe's and the runner's (and where `--reserve-cpus` moves this
+    /// user's other processes). Never empty when `target` is set.
     pub reserved: Option<u64>,
     /// What was picked and why, in one line.
     pub reason: String,
@@ -719,57 +727,100 @@ impl Topology {
         self.groups.iter().find(|g| g.l3_mb == max)
     }
 
-    /// Every logical CPU strobe's masks cover (the first 64).
+    /// Every CPU strobe may use (`allowed`).
     pub fn all(&self) -> u64 {
-        if self.logical >= 64 { u64::MAX } else { (1u64 << self.logical) - 1 }
+        self.allowed
     }
 
-    /// Where `--pin auto` puts the target, and strobe, the runner and the user's other processes
-    /// apart from it (SPEC §9.4):
-    /// - L3 groups that differ: the target on the largest (3D V-Cache), the rest on the others.
-    /// - Equal L3 groups: the target on the first, the rest on the others.
-    /// - One L3 (or none known) and 4 or more logical CPUs: max(1, cores/4) whole physical cores
-    ///   (SMT siblings together; the last ones, efficiency cores first on a hybrid CPU) kept for
-    ///   the rest, the target on every other core.
-    /// - Fewer CPUs, or macOS (no CPU affinity): unpinned, saying why.
+    /// Where `--pin auto` puts the target, with strobe and the runner on every other allowed CPU
+    /// (SPEC §9.4). The target never shares a physical core with them and never mixes core kinds:
+    /// - L3 groups that differ: the target on the largest (3D V-Cache).
+    /// - Equal L3 groups: the target on the first, when it holds 4 or more cores of one kind.
+    /// - Hybrid CPU: the target on the fastest kind of core when there are 4 or more of them,
+    ///   strobe and the runner on the slower ones.
+    /// - One kind, 4 or more cores: the last cores/4 (1 or 2) whole cores kept apart, the target on
+    ///   the rest.
+    /// - Fewer cores, CPUs the masks cannot name, or macOS (no CPU affinity): unpinned, naming the
+    ///   `--pin` list that would pin anyway where there is one.
     pub fn auto_pin(&self) -> AutoPin {
         let unpinned = |why: String| AutoPin { target: None, reserved: None, reason: format!("unpinned ({why})") };
         if cfg!(target_os = "macos") {
             return unpinned("macOS has no CPU affinity: the OS places every thread".into());
         }
+        if let Some(why) = &self.limit {
+            return unpinned(why.clone());
+        }
         let all = self.all();
-        let split = |target: u64, what: String| AutoPin {
-            target: Some(target),
-            reserved: Some(all & !target),
-            reason: format!("{what} · strobe, the runner and other processes on CPUs {}", cpu_text(all & !target)),
+        let cores: Vec<Core> = if self.cores.is_empty() { bits(all).map(|c| Core { mask: 1 << c, class: 0 }).collect() } else { self.cores.clone() };
+        let split = |target: u64, what: String| -> Option<AutoPin> {
+            let reserved = all & !target;
+            (target & all != 0 && reserved != 0).then(|| AutoPin {
+                target: Some(target & all),
+                reserved: Some(reserved),
+                reason: format!("{what} · strobe and the runner on CPUs {}", cpu_text(reserved)),
+            })
         };
         if self.groups.len() > 1 {
-            let (i, g, why) = match self.vcache() {
-                Some(v) => (self.groups.iter().position(|x| x.mask == v.mask).unwrap_or(0), v, "V-Cache".to_string()),
-                None => (0, &self.groups[0], format!("first of {} equal L3 groups", self.groups.len())),
+            let pick = match self.vcache() {
+                Some(v) => Some((v, "V-Cache".to_string())),
+                None => {
+                    let g = &self.groups[0];
+                    let inside: Vec<&Core> = cores.iter().filter(|c| c.mask & !g.mask == 0).collect();
+                    (inside.len() >= 4 && inside.iter().all(|c| c.class == inside[0].class)).then(|| (g, format!("first of {} equal L3 groups", self.groups.len())))
+                }
             };
-            return split(g.mask & all, format!("CCD{i} ({} MB L3, {} CPUs) · {why}", g.l3_mb, g.cpus));
+            if let Some(p) = pick.and_then(|(g, why)| {
+                let i = self.groups.iter().position(|x| x.mask == g.mask).unwrap_or(0);
+                split(g.mask, format!("CCD{i} ({} MB L3, {} CPUs) · {why}", g.l3_mb, g.cpus))
+            }) {
+                return p;
+            }
         }
-        if self.logical < 4 {
-            return unpinned(match self.logical {
-                0 | 1 => "1 CPU: nothing to keep apart".into(),
-                n => format!("{n} CPUs, too few to keep one apart by default: --pin {} pins the target there and leaves CPU {} to strobe", cpu_text(all & !(1 << (n - 1))), n - 1),
-            });
+        let fastest = cores.iter().map(|c| c.class).max().unwrap_or(0);
+        let fast: Vec<&Core> = cores.iter().filter(|c| c.class == fastest).collect();
+        if fast.len() < cores.len() {
+            let mask = fast.iter().fold(0u64, |m, c| m | c.mask);
+            let n = fast.len();
+            if n >= 4
+                && let Some(p) = split(mask, format!("CPUs {} · the {n} fastest cores of {}", cpu_text(mask), cores.len()))
+            {
+                return p;
+            }
+            return unpinned(format!("{n} fastest cores, too few to keep the slower ones apart by default: --pin {} pins the target to them", cpu_text(mask)));
         }
-        let cores: Vec<Core> = if self.cores.is_empty() { (0..self.logical.min(64)).map(|c| Core { mask: 1 << c, class: 0 }).collect() } else { self.cores.clone() };
-        let keep = (cores.len() / 4).max(1);
-        // The slowest kind first, then the last cores of each kind.
+        if cores.len() < 4 {
+            let Some(last) = cores.iter().max_by_key(|c| c.mask.trailing_zeros()) else { return unpinned("no CPU known".into()) };
+            let rest = all & !last.mask;
+            if rest == 0 {
+                return unpinned("1 core: nothing to keep apart".into());
+            }
+            return unpinned(format!("{} cores, too few to keep one apart by default: --pin {} pins the target there and leaves CPUs {} to strobe", cores.len(), cpu_text(rest), cpu_text(last.mask)));
+        }
+        let keep = (cores.len() / 4).clamp(1, 2);
         let mut order: Vec<&Core> = cores.iter().collect();
-        order.sort_by_key(|c| (c.class, std::cmp::Reverse(c.mask.trailing_zeros())));
+        order.sort_by_key(|c| std::cmp::Reverse(c.mask.trailing_zeros()));
         let kept = order.iter().take(keep).fold(0u64, |m, c| m | c.mask);
         let target = all & !kept;
-        if target == 0 {
-            return unpinned("no core left for the target".into());
-        }
-        let slowest = order[0].class;
-        let efficiency = if cores.iter().any(|c| c.class != slowest) && order.iter().take(keep).all(|c| c.class == slowest) { " (efficiency cores)" } else { "" };
-        split(target, format!("CPUs {} · one L3: {keep} of {} cores kept apart{efficiency}", cpu_text(target), cores.len()))
+        split(target, format!("CPUs {} · {keep} of {} cores kept apart", cpu_text(target), cores.len())).unwrap_or_else(|| unpinned("no core left for the target".into()))
     }
+}
+
+/// The CPUs strobe may use and what its masks cannot name, read once: the first call comes before
+/// strobe narrows its own affinity (`set_affinity`, `set_thread_affinity` and `topology` read it).
+pub(crate) struct Allowed {
+    pub mask: u64,
+    pub count: u32,
+    pub limit: Option<String>,
+}
+
+pub(crate) fn allowed() -> &'static Allowed {
+    static ALLOWED: std::sync::OnceLock<Allowed> = std::sync::OnceLock::new();
+    ALLOWED.get_or_init(os::allowed)
+}
+
+/// The CPU numbers in a mask.
+pub(crate) fn bits(mask: u64) -> impl Iterator<Item = u32> {
+    (0..64).filter(move |c| (mask >> c) & 1 == 1)
 }
 
 /// A CPU mask as a list: `0-5,8,10-11`.
@@ -791,6 +842,7 @@ pub fn cpu_text(mask: u64) -> String {
 }
 
 pub fn topology() -> Topology {
+    allowed();
     #[cfg(windows)]
     {
         win::topology()
@@ -801,8 +853,10 @@ pub fn topology() -> Topology {
     }
 }
 
-/// Restricts this process (and the children it starts afterwards) to `mask`; returns the old mask.
+/// Restricts this process (and the children it starts afterwards) to `mask` (0: every allowed CPU);
+/// returns the old mask.
 pub fn set_affinity(mask: u64) -> Option<u64> {
+    allowed();
     #[cfg(windows)]
     {
         win::set_affinity(mask)
@@ -821,6 +875,7 @@ pub fn set_affinity(mask: u64) -> Option<u64> {
 
 /// Restricts the calling thread to `mask`.
 pub fn set_thread_affinity(mask: u64) {
+    allowed();
     #[cfg(windows)]
     win::set_thread_affinity(mask);
     #[cfg(target_os = "linux")]

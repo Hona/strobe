@@ -660,6 +660,8 @@ pub fn leave(args: &Args) -> Result<Output> {
             s.line("✓", "path", format!("removed {want}"));
         }
     }
+    // The daemon is gone now: what it held on a phone (stay awake, tunnels) is put back before its journals go.
+    crate::host::adb::restore_stale();
     if args.has("yes") {
         let _ = std::fs::remove_dir_all(paths::state_dir());
         s.line("✓", "state", "removed (recordings and experiments included)");

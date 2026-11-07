@@ -1,5 +1,6 @@
 //! This machine: paths, the monotonic clock, processes, CPU topology, power and displays.
 
+pub(crate) mod adb;
 pub mod build;
 pub mod git;
 pub mod http;

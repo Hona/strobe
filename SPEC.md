@@ -6719,6 +6719,21 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
     wait, a track of each thread's off-CPU stretches) and present-side GPU timing (`probe/present/*`:
     per-frame GPU busy from the OS's GPU queue events, so `frames.viz.*` gets a busy-time sibling for
     native apps); both belong with the present and Perfetto owners.
+- **Android devices over adb (mobile M1.1, `host::adb`; no user-facing command yet)**: a client of the
+  adb server's smart-socket protocol (devices, shell v2 with exit codes and separate streams,
+  forward/reverse tcp and localabstract, sync push/pull/STAT v2); `adb start-server` only when no
+  server answers (adb found by absolute path: `ANDROID_HOME`, `ANDROID_SDK_ROOT`, PATH, the default
+  SDK folder). Device facts in one shell round trip (model, SoC, Android, fingerprint, emulator
+  evidence, display, battery, thermal status and headroom, Battery Saver, screen, keyguard, stay
+  awake); a device whose properties do not come back is an error, never a clean device. A stay-awake
+  guard (`svc power stayon`, journaled owner-only in `<state>/adb/stayon-<phone>.json`) puts the
+  user's setting back only while the phone still holds what strobe set, matched by hardware serial
+  across USB and Wi-Fi; tunnels are journaled in `<state>/adb/tunnels-<pid>.json`. Every strobe
+  start and `strobe leave` run `adb::restore_stale()`, which does nothing (no folder, no adb) when no
+  journal is there. The per-phone slot locks this computer (`<run>/phones/<phone>.slot`) and the
+  phone itself (toybox `flock` held by an open shell stream; the kernel frees it when the stream
+  closes), so another computer's strobe is refused `ConcurrentBench` naming that host. Checked on
+  Android 15 emulators (x86_64 WHPX on adais, arm64 HVF on air); no real phone yet.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

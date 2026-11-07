@@ -5951,12 +5951,21 @@ Desktop input (13.1, `DeviceMismatch`), checked with `scripts/dev/input.bench.ts
 what the page matched). Before: on vps (no mouse) headless Chromium 156 and Firefox 159 matched
 `(hover: none)`, neither `(pointer: fine)` nor `(pointer: coarse)`, 0 touch points; adais (Windows) and air
 (macOS), headless and headed, already matched hover and a fine pointer. After: all of those match
-`(hover: hover)`, `(pointer: fine)` and `(any-pointer: fine)` with 0 touch points, Safari headed on air
-too; WPE headless on vps is refused `DeviceMismatch` (no setting), as is Chromium through a
-`STROBE_BROWSER` wrapper that rewrote strobe's `--blink-settings` to a touch device's (a bench block and a
-`record`). A launch case passed headless in both engines; a `--blocks` run's env line read `Chrome/156 ·
-desktop input · headless (no display)`. Not run: WebKitGTK headed (vps has no display), a machine with
-a touch screen (touch points refuse; nothing removes them yet), headed pages on adais (locked).
+`(hover: hover)`, `(pointer: fine)` and `(any-pointer: fine)`, not `(any-pointer: coarse)`, no
+`ontouchstart`, 0 touch points, Safari headed on air too; WPE headless on vps is refused `DeviceMismatch`
+(`touch`: coarse, `ontouchstart`, no hover). Touch turned back on through wrappers was refused `hybrid`
+with what the page saw: Chromium (strobe's settings rewritten to `maxTouchPoints=5`, coarse available,
+`--touch-events=enabled`: 5 points, coarse, `ontouchstart`) in a run case, a launch case (on the blank
+page, before its timed navigation) and a `record`; Firefox (`dom.maxtouchpoints.testing.value` 5 and
+`dom.w3c_touch_events.enabled` 1 appended to the profile's `user.js`: 5 points; `ontouchstart` stayed
+false on vps, which has no touch device, so the 0 of that preference is from its source, not observed)
+in a run and a launch case. An app's page: a command target's Chromium on air saw `desktop` (the
+result's `input`), a `cdp:` attach recorded `desktop` in its meta on air and warned `NoPointer` on vps
+(where `SoftwareGpu` then refused it). The ledger named the change against a pre-input build's
+experiment (`... headless → ... headless desktop input`) and none against this build's. A `--blocks`
+run's env line read `Chrome/156 · desktop input · headless (no display)`. Not run: a real touch screen,
+WebKitGTK under `xvfb-run` (refused `SoftwareGpu` on vps before its input was read), headed pages on
+adais (locked), a page against an app on a machine where they disagree (`VariantMismatch`).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

@@ -1510,7 +1510,7 @@ re-read 0.21-0.26% (about 20 ms each, almost all of it the browser processes' `s
 never used), the DRM file scan of the display-only device 0.19-0.23%, `/proc/stat` each tick 0.08%,
 strobe's own readings 0.05%; hypervisor steal over those blocks was 0 (`/proc/stat`), so none of it
 was steal billed to the thread (KVM's steal clock keeps steal out of a thread's CPU time anyway).
-With both changes the same blocks read 0.31-0.36%. Budget: 0.5% of one core, and the sampler measures its
+With both changes the same blocks read 0.31-0.40% (six blocks). Budget: 0.5% of one core, and the sampler measures its
 own CPU cycle-exact (rule 2); on adais it costs 0.23–0.42%. Samplers read OS APIs directly and never
 spawn processes (§13.6). On macOS the per-process GPU reader keeps the accelerators and the set's
 GPU clients open between ticks (each client's owner is read once, every client is listed again each
@@ -6887,7 +6887,7 @@ macOS window placement and pixels (they need Accessibility and Screen Recording)
     out `Background`. Steal read 0 throughout on vps.
   - The OS sampler (§8.5) read 0.57-0.65% of a core against its 0.5% budget: the set's re-read
     reading every browser process's `smaps_rollup` it never used, and a scan of every browser file
-    descriptor each second for DRM files on a display-only device. Now 0.31-0.36%.
+    descriptor each second for DRM files on a display-only device. Now 0.31-0.40%.
 
 ## 25. Continuous benchmarking (`track`, `history`)
 

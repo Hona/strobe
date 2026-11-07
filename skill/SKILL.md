@@ -526,6 +526,7 @@ Fewer than 6 pairs never gets a verdict.
 
 - Validate a new file with `--check` first: each case once, pass or fail with a screenshot.
 - No display (locked, a server)? `--headless` runs page cases (check or timed) with frame and latency metrics refused.
+- Page targets are desktops, headless too: strobe gives the page a fine pointer that hovers (`(hover: hover)`, `(pointer: fine)`, no touch points), so a site never takes its touch paths in a desktop bench. Checked before `setup`; a page that sees otherwise is refused `DeviceMismatch` (a touch screen, WPE headless on Linux). No `STROBE_BROWSER` wrapper with hover/pointer `--blink-settings` is needed (strobe's replaces a wrapper's).
 - Comparing engines? `cpu.work` is the one primary both have; a Firefox page's main-thread split does not exist.
 - WebKit pages: `--engine webkit` (macOS: Safari Technology Preview, else Safari, headed only; Linux: WebKitGTK headed, WPE with `--headless`; never on Windows).
   - Exit 3 "remote automation is off": a person runs `safaridriver --enable` once (admin password).

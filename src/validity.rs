@@ -88,7 +88,7 @@ pub fn desktop_input(page: &Page) -> Result<()> {
     }
     let seen = queries.iter().enumerate().map(|(i, q)| format!("{q} {}", v[i])).chain([format!("navigator.maxTouchPoints {}", v[3])]).collect::<Vec<_>>().join(", ");
     let fix = match page.engine() {
-        WebEngine::Chromium => "strobe launches Chromium with a fine pointer that hovers (--blink-settings): a STROBE_BROWSER wrapper that passes its own --blink-settings replaces them, and a touch screen adds touch points; drop the wrapper's, or measure on a machine without a touch screen",
+        WebEngine::Chromium => "strobe launches Chromium with a fine pointer that hovers (--blink-settings): a touch screen adds touch points, and a STROBE_BROWSER wrapper that rewrites strobe's arguments can drop them; measure on a machine without a touch screen, with strobe's arguments as they are",
         WebEngine::Firefox => "strobe sets Firefox's ui.primaryPointerCapabilities and ui.allPointerCapabilities to a fine pointer that hovers: a touch screen adds touch points; measure on a machine without one",
         WebEngine::Webkit => "WebKit has no setting for the input devices a page sees: measure it headed on a machine with a mouse and no touch screen, or the page in Chromium or Firefox",
     };

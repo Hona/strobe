@@ -119,7 +119,8 @@ fn playwright_chromium(root: &Path, rel: &str) -> Vec<PathBuf> {
 /// hovers, in Blink's `ui::PointerType` and `ui::HoverType` bits (ui/base/pointer/pointer_device.h:
 /// `POINTER_TYPE_FINE` 1 << 2, `HOVER_TYPE_HOVER` 1 << 1). Without it a machine with no mouse (a server, a
 /// VM) has its pages match (hover: none) and no pointer. DevTools' media emulation has no hover or pointer.
-/// Chromium keeps only the last `--blink-settings`: any other Blink setting strobe passes joins this list.
+/// Chromium keeps only the last `--blink-settings` before the page's URL (one after it is ignored): any
+/// other Blink setting strobe passes joins this list, and it replaces one a `STROBE_BROWSER` wrapper puts first.
 const DESKTOP_INPUT: &str = "--blink-settings=primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2";
 
 /// Launches a fresh Chromium. `cpus`, when set, is the affinity mask the browser and its children get.

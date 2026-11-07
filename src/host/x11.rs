@@ -229,6 +229,83 @@ pub fn place_window(w: &TopWindow, px: i32, py: i32, client: Option<(u32, u32)>)
     });
 }
 
+/// Whether the window manager keeps `win` maximized both ways (`_NET_WM_STATE`).
+fn maximized(x: &X, win: Window) -> bool {
+    let state = prop32(x, win, "_NET_WM_STATE");
+    ["_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ"].iter().all(|n| atom(x, n).is_some_and(|a| state.contains(&a)))
+}
+
+/// Whether the window manager keeps a maximized state (`_NET_SUPPORTED`).
+fn supports_maximized(x: &X) -> bool {
+    let supported = prop32(x, x.root, "_NET_SUPPORTED");
+    ["_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ"].iter().all(|n| atom(x, n).is_some_and(|a| supported.contains(&a)))
+}
+
+/// Adds (1) or removes (0) the maximized state through the window manager; false when it has none.
+fn set_maximized(x: &X, win: Window, on: bool) -> Option<bool> {
+    let (state, v, h) = (atom(x, "_NET_WM_STATE")?, atom(x, "_NET_WM_STATE_MAXIMIZED_VERT")?, atom(x, "_NET_WM_STATE_MAXIMIZED_HORZ")?);
+    if !supports_maximized(x) {
+        return Some(false);
+    }
+    let ev = ClientMessageEvent::new(32, win, state, [u32::from(on), v, h, 1, 0]);
+    x.conn.send_event(false, x.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev).ok()?;
+    x.conn.flush().ok()?;
+    Some(true)
+}
+
+pub fn window_placement(id: isize) -> Option<super::Placement> {
+    let w = window_state(id)?;
+    let s = w.scale();
+    let frame = [w.rect.0 as f64, w.rect.1 as f64, w.rect.2 as f64, w.rect.3 as f64];
+    let work = work_area(((frame[0] + frame[2] / 2.0) / s, (frame[1] + frame[3] / 2.0) / s))?.work.map(|v| v * s);
+    // Without a manager's maximized state (none, or one without it), a frame that fills the work area.
+    let fills = frame.iter().zip(work).all(|(a, b)| (a - b).abs() <= 1.0);
+    let max = with(|x| Some(if supports_maximized(x) { maximized(x, id as Window) } else { fills })).unwrap_or(fills);
+    Some(super::Placement { frame, client: (w.client.0 as f64, w.client.1 as f64), work, per_dip: s, maximized: max })
+}
+
+/// The frame as the client window's place and size (the frame less `_NET_FRAME_EXTENTS`), through
+/// `_NET_MOVERESIZE_WINDOW` (static gravity: the client's own place) when the manager has it, else
+/// directly; out of the maximized state first.
+pub fn set_window_frame(id: isize, frame: [f64; 4]) -> crate::model::Result<()> {
+    let ok = with(|x| {
+        let win = id as Window;
+        if maximized(x, win) {
+            set_maximized(x, win, false)?;
+            // The manager restores its own saved frame first; the new one goes after it.
+            let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+            while maximized(x, win) && std::time::Instant::now() < until {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        let i = info(x, win)?;
+        let at = x.conn.translate_coordinates(win, x.root, 0, 0).ok()?.reply().ok()?;
+        let (l, t) = (at.dst_x as i32 - i.rect.0, at.dst_y as i32 - i.rect.1);
+        let (r, b) = (i.rect.2 - i.client.0 - l, i.rect.3 - i.client.1 - t);
+        let [fx, fy, fw, fh] = frame.map(|v| v.round() as i32);
+        let (cx, cy, cw, ch) = (fx + l, fy + t, (fw - l - r).max(1) as u32, (fh - t - b).max(1) as u32);
+        let moveresize = atom(x, "_NET_MOVERESIZE_WINDOW")?;
+        if prop32(x, x.root, "_NET_SUPPORTED").contains(&moveresize) {
+            let flags = 10 | (1 << 8) | (1 << 9) | (1 << 10) | (1 << 11) | (2 << 12);
+            let ev = ClientMessageEvent::new(32, win, moveresize, [flags, cx as u32, cy as u32, cw, ch]);
+            x.conn.send_event(false, x.root, EventMask::SUBSTRUCTURE_REDIRECT | EventMask::SUBSTRUCTURE_NOTIFY, ev).ok()?;
+        } else {
+            x.conn.configure_window(win, &ConfigureWindowAux::new().x(cx).y(cy).width(cw).height(ch)).ok()?;
+        }
+        x.conn.flush().ok()
+    });
+    ok.ok_or_else(|| crate::model::Error::msg("page.window(): the X server did not take the window's new frame (the window closed, or no display)"))
+}
+
+/// The window manager's maximized state, else (a manager without it) a frame of the work area.
+pub fn maximize_window(id: isize, work: [f64; 4]) -> crate::model::Result<()> {
+    match with(|x| set_maximized(x, id as Window, true)) {
+        Some(true) => Ok(()),
+        Some(false) => set_window_frame(id, work),
+        None => Err(crate::model::Error::msg("page.window(\"maximize\"): the X server took no message (the window closed, or no display)")),
+    }
+}
+
 /// Keeps every viewable window of `pids` above others without focusing it; returns how many.
 pub fn raise_windows(pids: &[u32]) -> usize {
     with(|x| {

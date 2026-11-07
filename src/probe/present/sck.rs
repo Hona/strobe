@@ -214,14 +214,15 @@ impl Drop for Prev {
 /// window changed under it, and redraws a window's edges with the same pixels: only a changed pixel
 /// is a new frame of the app's. A frame with no such rectangle is not read at all (most of an idle
 /// window's frames: its corners and title-bar buttons; locking one cost 40 to 80 µs on air). The
-/// first readable frame is the window as it was. None when the frame has no readable pixels.
+/// first readable frame is the window as it was; a frame of another size than the last (the stream
+/// follows a resized window) is a new one. None when the frame has no readable pixels.
 fn pixels_changed(image: *mut c_void, rects: &[CGRect], prev: &mut Prev) -> Option<bool> {
     if rects.is_empty() && prev.pixels.is_some() {
         return Some(false);
     }
     let now = Pixels::lock(image)?;
     let same_size = prev.pixels.is_some_and(|p| (p.w, p.h) == (now.w, now.h));
-    let changed = same_size && prev.pixels.is_some_and(|was| differs(&now, &was, rects));
+    let changed = if same_size { prev.pixels.is_some_and(|was| differs(&now, &was, rects)) } else { prev.pixels.is_some() };
     if changed || !same_size {
         prev.keep(image, now);
     } else {
@@ -402,8 +403,10 @@ pub(crate) fn description(e: Id) -> String {
 struct Stream {
     stream: Id,
     output: Id,
-    /// The window's frame when its stream started (the source rectangle follows a moved window).
+    /// The window's frame its stream's source rectangle is (it follows a moved or resized window).
     rect: Option<(i32, i32, i32, i32)>,
+    /// The display it streams from, in global points: a source rectangle is the window's frame on it.
+    display: CGRect,
 }
 
 /// Per stream, what its output object writes into.
@@ -412,9 +415,8 @@ struct Sink {
     window: u32,
     shared: Arc<Mutex<Shared>>,
     live: Arc<Live>,
-    /// The frames' size in pixels and pixels per point, for their dirty rectangles.
-    size: (f64, f64),
-    scale: f64,
+    /// The frames' size in pixels and pixels per point, for their dirty rectangles (a resize changes them).
+    geometry: Mutex<((f64, f64), f64)>,
     /// The last counted frame (`pixels_changed`).
     prev: Mutex<Prev>,
     /// The first complete frame is the window as it was when the stream started, not a new one.
@@ -558,7 +560,8 @@ extern "C" fn on_frame(this: Id, _cmd: Sel, _stream: Id, sbuf: *mut c_void, kind
     let first = status == Some(0) && drew && !sink.seen_first.swap(true, std::sync::atomic::Ordering::Relaxed);
     let mut changed = false;
     if status == Some(0) {
-        let own = if rects.is_null() { vec![CGRect { origin: Default::default(), size: crate::host::macos::CGSize { width: sink.size.0, height: sink.size.1 } }] } else { app_rects(&dirty, sink.size.0, sink.size.1, sink.scale) };
+        let (size, scale) = *sink.geometry.lock().unwrap_or_else(|e| e.into_inner());
+        let own = if rects.is_null() { vec![CGRect { origin: Default::default(), size: crate::host::macos::CGSize { width: size.0, height: size.1 } }] } else { app_rects(&dirty, size.0, size.1, scale) };
         let mut prev = sink.prev.lock().unwrap_or_else(|e| e.into_inner());
         // The first frame only fills `prev`; without readable pixels, a dirty rectangle of the app's counts.
         changed = pixels_changed(unsafe { CMSampleBufferGetImageBuffer(sbuf) }, &own, &mut prev).unwrap_or(!own.is_empty()) && !first;
@@ -662,9 +665,19 @@ impl Capture {
             w.pids = pids.to_vec();
             w.note(&on)
         };
-        // A window that moved or resized gets a new stream: its source rectangle is the old frame.
-        let moved: Vec<u32> = self.streams.iter().filter(|(id, s)| unshared.contains(id) || on.iter().any(|w| w.id == **id && Some(w.rect) != s.rect)).map(|(id, _)| *id).collect();
-        for id in moved {
+        // A window that moved or resized on its display keeps its stream, its source rectangle and size
+        // updated in place (a stream started mid-run would miss frames while it starts); one that
+        // went to another display, or failed to update, gets a new stream.
+        type Frame = (i32, i32, i32, i32);
+        let moved: Vec<(u32, Option<Frame>)> = self
+            .streams
+            .iter()
+            .filter_map(|(id, s)| if unshared.contains(id) { Some((*id, None)) } else { on.iter().find(|w| w.id == *id && Some(w.rect) != s.rect).map(|w| (*id, Some(w.rect))) })
+            .collect();
+        for (id, rect) in moved {
+            if rect.is_some_and(|r| self.update(id, r)) {
+                continue;
+            }
             if let Some(s) = self.streams.remove(&id) {
                 self.drop_stream(s);
             }
@@ -678,6 +691,66 @@ impl Capture {
             self.failed = Some(e.message);
         }
         unsafe { objc_autoreleasePoolPop(pool) };
+    }
+
+    /// The next `track` looks at the windows at once: one of them was just sized (`page.window`).
+    pub fn resized(&mut self) {
+        self.tracked = None;
+    }
+
+    /// A configuration for a window's frame `source` (points on its display): half its size in
+    /// points, at least 32 pixels a side, and the frame size and pixels per point that go with it.
+    fn config(source: CGRect) -> (Id, (f64, f64), f64) {
+        let config: Id = send!(Id; class("SCStreamConfiguration"), "alloc");
+        let config: Id = send!(Id; config, "init");
+        let scale = 0.5;
+        let (w, h) = ((source.size.width * scale).round().max(32.0), (source.size.height * scale).round().max(32.0));
+        send!((); config, "setSourceRect:", CGRect = source);
+        send!((); config, "setWidth:", usize = w as usize);
+        send!((); config, "setHeight:", usize = h as usize);
+        send!((); config, "setPixelFormat:", u32 = BGRA);
+        send!((); config, "setShowsCursor:", i8 = 0);
+        // Strobe keeps one frame (the last that counted) besides the one it reads.
+        send!((); config, "setQueueDepth:", isize = 8);
+        // As often as the window changes (the window server composites at most once a refresh).
+        send!((); config, "setMinimumFrameInterval:", CMTime = CMTime { value: 1, timescale: 1000, flags: 1, epoch: 0 });
+        (config, (w, h), w / source.size.width.max(1.0))
+    }
+
+    /// Points window `id`'s running stream at its frame `rect` (global points) through
+    /// `updateConfiguration:completionHandler:`, while its centre stays on the stream's display; false
+    /// when it cannot (another display, or the update failed): it then needs a new stream.
+    fn update(&mut self, id: u32, rect: (i32, i32, i32, i32)) -> bool {
+        let Some(s) = self.streams.get(&id) else { return false };
+        let d = s.display;
+        let (cx, cy) = (rect.0 as f64 + rect.2 as f64 / 2.0, rect.1 as f64 + rect.3 as f64 / 2.0);
+        if !(cx >= d.origin.x && cx < d.origin.x + d.size.width && cy >= d.origin.y && cy < d.origin.y + d.size.height) {
+            return false;
+        }
+        let source = CGRect {
+            origin: crate::host::macos::CGPoint { x: rect.0 as f64 - d.origin.x, y: rect.1 as f64 - d.origin.y },
+            size: crate::host::macos::CGSize { width: rect.2 as f64, height: rect.3 as f64 },
+        };
+        let (config, size, scale) = Self::config(source);
+        let stream = s.stream;
+        let done = with_completion(Duration::from_secs(2), true, |b| send!((); stream, "updateConfiguration:completionHandler:", Id = config, *mut Block = b));
+        unsafe { objc_release(config) };
+        match done {
+            Some((_, e)) if e.is_null() => {}
+            Some((_, e)) => {
+                unsafe { objc_release(e) };
+                return false;
+            }
+            None => return false,
+        }
+        let sink = unsafe { object_getIvar(s.output, class_getInstanceVariable(output_class(), c"sink".as_ptr())) } as *const Sink;
+        if !sink.is_null() {
+            *unsafe { &*sink }.geometry.lock().unwrap_or_else(|e| e.into_inner()) = (size, scale);
+        }
+        if let Some(s) = self.streams.get_mut(&id) {
+            s.rect = Some(rect);
+        }
+        true
     }
 
     fn open(&mut self, ids: &[u32]) -> Result<()> {
@@ -712,7 +785,7 @@ impl Capture {
             let on = displays.iter().find(|(_, r)| cx >= r.origin.x && cx < r.origin.x + r.size.width && cy >= r.origin.y && cy < r.origin.y + r.size.height).or(displays.first());
             let Some(&(display, dframe)) = on else { continue };
             let source = CGRect { origin: crate::host::macos::CGPoint { x: frame.origin.x - dframe.origin.x, y: frame.origin.y - dframe.origin.y }, size: frame.size };
-            if let Err(e) = self.stream(w, display, source, id, state.as_ref().map_or(0, |s| s.pid), state.map(|s| s.rect)) {
+            if let Err(e) = self.stream(w, (display, dframe), source, id, state.as_ref().map_or(0, |s| s.pid), state.map(|s| s.rect)) {
                 self.failed = Some(e.message);
             }
         }
@@ -720,25 +793,13 @@ impl Capture {
         Ok(())
     }
 
-    /// A stream of `window` alone on `display`, of its frame `source` (points on that display).
-    fn stream(&mut self, window: Id, display: Id, source: CGRect, id: u32, pid: u32, rect: Option<(i32, i32, i32, i32)>) -> Result<()> {
+    /// A stream of `window` alone on `display` (with its frame in global points), of its frame
+    /// `source` (points on that display).
+    fn stream(&mut self, window: Id, (display, dframe): (Id, CGRect), source: CGRect, id: u32, pid: u32, rect: Option<(i32, i32, i32, i32)>) -> Result<()> {
         let only: Id = send!(Id; class("NSArray"), "arrayWithObject:", Id = window);
         let filter: Id = send!(Id; class("SCContentFilter"), "alloc");
         let filter: Id = send!(Id; filter, "initWithDisplay:includingWindows:", Id = display, Id = only);
-        let config: Id = send!(Id; class("SCStreamConfiguration"), "alloc");
-        let config: Id = send!(Id; config, "init");
-        // Half the window's size in points, at least 32 pixels a side.
-        let scale = 0.5;
-        let (w, h) = ((source.size.width * scale).round().max(32.0), (source.size.height * scale).round().max(32.0));
-        send!((); config, "setSourceRect:", CGRect = source);
-        send!((); config, "setWidth:", usize = w as usize);
-        send!((); config, "setHeight:", usize = h as usize);
-        send!((); config, "setPixelFormat:", u32 = BGRA);
-        send!((); config, "setShowsCursor:", i8 = 0);
-        // Strobe keeps one frame (the last that counted) besides the one it reads.
-        send!((); config, "setQueueDepth:", isize = 8);
-        // As often as the window changes (the window server composites at most once a refresh).
-        send!((); config, "setMinimumFrameInterval:", CMTime = CMTime { value: 1, timescale: 1000, flags: 1, epoch: 0 });
+        let (config, size, scale) = Self::config(source);
         let stream: Id = send!(Id; class("SCStream"), "alloc");
         let stream: Id = send!(Id; stream, "initWithFilter:configuration:delegate:", Id = filter, Id = config, Id = std::ptr::null_mut());
         unsafe {
@@ -749,13 +810,13 @@ impl Capture {
             return Err(Error::msg("ScreenCaptureKit made no stream for the window"));
         }
         let output: Id = send!(Id; output_class(), "new");
-        let sink = Box::new(Sink { pid, window: id, shared: self.shared.clone(), live: self.live.clone(), size: (w, h), scale: w / source.size.width.max(1.0), prev: Mutex::new(Prev::default()), seen_first: false.into() });
+        let sink = Box::new(Sink { pid, window: id, shared: self.shared.clone(), live: self.live.clone(), geometry: Mutex::new((size, scale)), prev: Mutex::new(Prev::default()), seen_first: false.into() });
         unsafe { object_setIvar(output, class_getInstanceVariable(output_class(), c"sink".as_ptr()), Box::into_raw(sink) as Id) };
         let mut err: Id = std::ptr::null_mut();
         let added: i8 = send!(i8; stream, "addStreamOutput:type:sampleHandlerQueue:error:", Id = output, isize = 0, *mut c_void = self.queue, *mut Id = &mut err);
         if added == 0 {
             let why = description(err);
-            self.drop_stream(Stream { stream, output, rect });
+            self.drop_stream(Stream { stream, output, rect, display: dframe });
             return Err(Error::msg(format!("ScreenCaptureKit would not take strobe's frame output: {why}")));
         }
         let started = with_completion(Duration::from_secs(5), true, |b| send!((); stream, "startCaptureWithCompletionHandler:", *mut Block = b));
@@ -764,12 +825,12 @@ impl Capture {
             Some((_, e)) => {
                 let why = description(e);
                 unsafe { objc_release(e) };
-                self.drop_stream(Stream { stream, output, rect });
+                self.drop_stream(Stream { stream, output, rect, display: dframe });
                 return Err(Error::msg(format!("ScreenCaptureKit did not start: {why}")));
             }
             None => {
                 // It may still start: stopped and drained like any other, so it captures nothing on.
-                self.drop_stream(Stream { stream, output, rect });
+                self.drop_stream(Stream { stream, output, rect, display: dframe });
                 return Err(Error::msg("ScreenCaptureKit did not start the window's stream in 5 s"));
             }
         }
@@ -779,7 +840,7 @@ impl Capture {
         while Instant::now() < until && !unsafe { &*sink }.seen_first.load(std::sync::atomic::Ordering::Relaxed) {
             std::thread::sleep(Duration::from_millis(5));
         }
-        self.streams.insert(id, Stream { stream, output, rect });
+        self.streams.insert(id, Stream { stream, output, rect, display: dframe });
         Ok(())
     }
 

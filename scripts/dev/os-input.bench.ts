@@ -76,6 +76,20 @@ export default bench({
     scroll: on(({ page }) => page.scroll("#list", { by: 400 }, { until: text("#pos", "top: moved") }), ["scroll.latency.p50", "cpu.work"]),
     wheel: on(({ page }) => page.wheel("#list", { dy: 200 }, { until: text("#pos", "top: moved") }), ["scroll.latency.p50", "cpu.work"]),
     drag: on(({ page }) => page.drag("#box", [[0, 0], [200, 0]], { duration: 400, until: text("#moved", "x: far") }), ["input.rate", "cpu.work"]),
+    // The window resized mid-run: strobe's map from page to screen follows the size it asked for, and the
+    // moves it posts after are checked to land where that map says; restored in reset.
+    resize: {
+      ...on(async ({ page }) => {
+        await page.window({ resize: { width: 560, height: 600 } })
+        await page.hover("#hover", { until: "#hover[data-hovered]" })
+        await page.type("#field", "hello", { until: text("#echo", "echo:hello") })
+      }),
+      reset: async ({ page }: any) => {
+        await page.window("restore")
+        await page.eval(reset)
+        await page.move(4, 4)
+      },
+    },
     // Keys go to what has focus: a click into the page first (untimed) gives the page focus.
     "held key": on(async ({ page, untimed }) => {
       await untimed(() => page.click("#area"))

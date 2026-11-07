@@ -45,5 +45,29 @@ export default bench({
       },
     },
     frames: { primary: "cpu.work", metrics: ["frames.presented.count", "interaction.p95"], run: ({ page }) => page.click("add", { until: "frame" }) },
+    // Every element, with rects in the window's client area (what page.move takes) and actionable by hit test.
+    tree: {
+      primary: "cpu.work",
+      async run({ page }) {
+        const all = await page.query()
+        console.error("tree", JSON.stringify(all.filter((e) => e.key)))
+        const add = all.find((e) => e.key === "add")
+        if (!add?.actionable || add.rect[0] < 0 || add.rect[1] < 0 || add.rect[0] > 640) throw new Error(`add: ${JSON.stringify(add)}`)
+        await page.move(add.rect[0] + add.rect[2] / 2, add.rect[1] + add.rect[3] / 2)
+      },
+    },
+    // The window resized and maximized through the window manager, and restored in reset.
+    window: {
+      primary: "cpu.work",
+      async run({ page }) {
+        await page.window({ resize: { width: 800, height: 500 } })
+        await page.window("maximize")
+        await page.click("check", { until: "idle" })
+      },
+      reset: async ({ page }) => {
+        await page.window("restore")
+        await page.act("check", "toggle", { until: "idle" })
+      },
+    },
   },
 })

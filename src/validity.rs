@@ -47,16 +47,6 @@ fn software_text(gpu: &Gpu) -> String {
     format!("the target renders on a software adapter ({}; compositing {})", gpu.devices.join(", "), gpu.compositing)
 }
 
-/// `SoftwareGpu` for a whole target, where every metric it gives is drawn (a native app's frames).
-pub fn software_gpu(gpu: Gpu) -> Result<Gpu> {
-    if gpu.software {
-        return Err(Refusal::new(ValidatorId::SoftwareGpu, software_text(&gpu))
-            .fix("run headed on a machine with a GPU; frame and GPU metrics from software rendering describe no real device")
-            .into());
-    }
-    Ok(gpu)
-}
-
 /// `SoftwareGpu` per metric (SPEC §10.1), for a headed page drawn by a software rasterizer (a virtual
 /// display, a machine without a GPU): a `primary` that is drawn (`software_drawn`) refuses the block;
 /// otherwise each of `declared` that is drawn comes back refused, for the caller to take its value out

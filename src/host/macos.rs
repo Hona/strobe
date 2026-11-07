@@ -1347,10 +1347,59 @@ pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u
     }
     // The window may have moved since `w` was read (AppKit places a new window after it shows).
     let w = &window_state(w.hwnd).unwrap_or_else(|| w.clone());
-    let Some(app) = Cf::new(unsafe { AXUIElementCreateApplication(w.pid as i32) }) else { return };
+    with_ax_window(w, |win| {
+        let p = CGPoint { x: x as f64, y: y as f64 };
+        let pv = Cf(unsafe { AXValueCreate(1, &p as *const _ as *const c_void) });
+        unsafe { AXUIElementSetAttributeValue(win, cfstr("AXPosition").0, pv.0) };
+        if let Some((cw, ch)) = client {
+            let s = CGSize { width: cw as f64, height: ch as f64 };
+            let sv = Cf(unsafe { AXValueCreate(2, &s as *const _ as *const c_void) });
+            unsafe { AXUIElementSetAttributeValue(win, cfstr("AXSize").0, sv.0) };
+        }
+    });
+}
+
+pub fn window_placement(id: isize) -> Option<super::Placement> {
+    let w = window_state(id)?;
+    let frame = [w.rect.0 as f64, w.rect.1 as f64, w.rect.2 as f64, w.rect.3 as f64];
+    let work = work_area((frame[0] + frame[2] / 2.0, frame[1] + frame[3] / 2.0))?.work;
+    // Within a point each way, as AX and CoreGraphics may round apart.
+    let maximized = frame.iter().zip(work).all(|(a, b)| (a - b).abs() <= 1.0);
+    Some(super::Placement { frame, client: (frame[2], frame[3]), work, per_dip: 1.0, maximized })
+}
+
+/// Sets the window's frame through its accessibility element (`AXPosition`, `AXSize`, then the
+/// position again: AppKit keeps a frame below the menu bar and inside the display, so a size set at
+/// the old place may have moved it).
+pub fn set_window_frame(id: isize, frame: [f64; 4]) -> crate::model::Result<()> {
+    if !accessibility_trusted() {
+        let (who, pane) = (responsible_app(), accessibility_pane());
+        return Err(crate::model::Error::usage(format!("page.window() sizes another app's window through the accessibility permission, which {who} (the app strobe runs under) does not have: {pane}")));
+    }
+    let w = window_state(id).ok_or_else(|| crate::model::Error::msg("page.window(): the window closed"))?;
+    let set = |win: CFTypeRef, name: &str, kind: u32, v: *const c_void| {
+        let v = Cf(unsafe { AXValueCreate(kind, v) });
+        unsafe { AXUIElementSetAttributeValue(win, cfstr(name).0, v.0) }
+    };
+    let (p, s) = (CGPoint { x: frame[0], y: frame[1] }, CGSize { width: frame[2], height: frame[3] });
+    let mut code = 0;
+    let found = with_ax_window(&w, |win| {
+        code = set(win, "AXPosition", 1, &p as *const _ as *const c_void) | set(win, "AXSize", 2, &s as *const _ as *const c_void) | set(win, "AXPosition", 1, &p as *const _ as *const c_void);
+    });
+    match (found, code) {
+        (false, _) => Err(crate::model::Error::msg("page.window(): the window has no accessibility element of its frame")),
+        (true, 0) => Ok(()),
+        (true, e) => Err(crate::model::Error::msg(format!("page.window(): macOS refused the window's new frame (AX error {e})"))),
+    }
+}
+
+/// Calls `f` with the accessibility element of `w`'s app whose frame is `w`'s (within a point each
+/// way, as `a11y::ax` matches frames: AX and CoreGraphics may round apart); false when none is.
+fn with_ax_window(w: &super::TopWindow, f: impl FnOnce(CFTypeRef)) -> bool {
+    let Some(app) = Cf::new(unsafe { AXUIElementCreateApplication(w.pid as i32) }) else { return false };
     let mut list: CFTypeRef = std::ptr::null();
     if unsafe { AXUIElementCopyAttributeValue(app.0, cfstr("AXWindows").0, &mut list) } != 0 {
-        return;
+        return false;
     }
     let list = Cf(list);
     for win in cf_array(list.0) {
@@ -1370,16 +1419,10 @@ pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u
         if !(near(pos.x, w.rect.0) && near(pos.y, w.rect.1) && near(size.width, w.rect.2) && near(size.height, w.rect.3)) {
             continue;
         }
-        let p = CGPoint { x: x as f64, y: y as f64 };
-        let pv = Cf(unsafe { AXValueCreate(1, &p as *const _ as *const c_void) });
-        unsafe { AXUIElementSetAttributeValue(win, cfstr("AXPosition").0, pv.0) };
-        if let Some((cw, ch)) = client {
-            let s = CGSize { width: cw as f64, height: ch as f64 };
-            let sv = Cf(unsafe { AXValueCreate(2, &s as *const _ as *const c_void) });
-            unsafe { AXUIElementSetAttributeValue(win, cfstr("AXSize").0, sv.0) };
-        }
-        return;
+        f(win);
+        return true;
     }
+    false
 }
 
 /// The largest window of `pids` shrunk to 16×16 averaged BGRA cells, from `CGWindowListCreateImage`

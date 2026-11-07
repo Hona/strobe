@@ -152,12 +152,12 @@ impl Same {
 /// A run's count of one input call, kept beside the bench file's counts (`Hooks::op`).
 pub(super) const OP: &str = "\u{1}op.";
 
-/// How much input a page call gives: one per call, a typed character each (`type`); None for calls
+/// How much input a page call gives: one per call (a `window` sizing too), a typed character each (`type`); None for calls
 /// that give none (waits, reads, `goto`).
 pub(super) fn op_count(call: &str, args: &[Value]) -> Option<f64> {
     match call {
         "type" => Some(args.get(1).and_then(Value::as_str).map_or(0, |t| t.chars().count()) as f64),
-        "click" | "press" | "scroll" | "wheel" | "drag" | "down" | "up" | "hover" | "move" | "act" => Some(1.0),
+        "click" | "press" | "scroll" | "wheel" | "drag" | "down" | "up" | "hover" | "move" | "act" | "window" => Some(1.0),
         _ => None,
     }
 }

@@ -148,7 +148,7 @@ const page = {
   snapshot: (name: string) => driver("snapshot", name),
   scroll: (selector: unknown, delta: object, o = {}) => driver("scroll", alias(selector), delta, opts(o)),
   wheel: (selector: unknown, delta: object, o = {}) => driver("wheel", alias(selector), delta, opts(o)),
-  window: (action: string, o = {}) => driver("window", action, opts(o)),
+  window: (action: unknown, o = {}) => driver("window", action, opts(o)),
   act: (selector: unknown, action: string, o = {}) => driver("act", alias(selector), action, opts(o)),
   query: (selector: unknown, o = {}) => driver("query", alias(selector), opts(o)),
   waitFor: (selector: unknown, o = {}) => driver("waitFor", alias(selector), opts(o)),

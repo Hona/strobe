@@ -252,6 +252,17 @@ impl PresentCapture {
         }
     }
 
+    /// `track` at once after a window of `pids` was sized (`page.window`): a window source follows the
+    /// new frame now rather than at its next look (macOS updates the stream's configuration in place).
+    pub fn resized(&mut self, pids: &[u32]) {
+        #[cfg(target_os = "macos")]
+        {
+            let PresentCapture::Screen(c) = self;
+            c.resized();
+        }
+        self.track(pids);
+    }
+
     /// While the session runs: `Live::view` of `pids` after `after`, waiting up to `wait`.
     pub fn live(&mut self, pids: &[u32], after: u64, wait: std::time::Duration) -> crate::model::Result<LiveView> {
         match self {

@@ -4655,6 +4655,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
     };
     let result = (|| -> Result<Block> {
         let seen = browser_seen(ctx, s, v, headless, !matches!(set, Set::Attribution | Set::Memory), &browser)?;
+        let software = seen.software;
         let page: Page = match (&browser, app) {
             (WebBrowser::Chromium(b), true) => electron::main_page(b)?.into(),
             (WebBrowser::Chromium(_), false) | (WebBrowser::Firefox(_) | WebBrowser::Webkit(_), _) => browser.page()?,
@@ -4736,6 +4737,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
         let token = id.trim_start_matches("rec_").to_string();
         let mut driver = Driver::new(page.clone(), token.clone());
         driver.pixels = x.pixels.clone();
+        driver.headless = headless;
         // This run's `count.<name>` values (the bench file's `ctx.count` and the page's counter global)
         // and the run's key, which names its phase marks.
         let hooks = block::Hooks::new(ctx, || browser.processes().iter().map(|p| p.pid).collect());
@@ -5088,6 +5090,12 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             driver.watch(presents_rc.clone(), browser.pids(), refresh);
         }
         lap("checks");
+        // `page.window` in setup sizes the browser's window: the driver follows its processes from now.
+        driver.set_pids(browser.pids());
+        // The page's viewport in CSS pixels (device-independent at zoom 1) and its scale, before any
+        // `page.window`.
+        let read_content = || page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
+        let content_before = read_content();
         ctx.runner.call("setup", json!({}), t, &serve).map_err(|e| crate::runner::incomplete("setup", "setup", e, &snapshot(&page, &ctx.exp, "setup"), "fix the bench file's setup"))?;
         if late_init.get() && !ctx.warnings.iter().any(|w| w.id == "InitScript") {
             ctx.warnings.push(validity::info("InitScript", format!("{}: {engine} has no preload script: ctx.addInitScript ran after the first document's own scripts; a block that loads another document is refused", s.label())));
@@ -5444,6 +5452,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             let i = runs.len();
             nodes_all.push(driver.nodes().unwrap_or(0));
             starts.check(i + 1, false, &read_start, &wait_start)?;
+            driver.window_start(i + 1, false, starts.on())?;
             let profile = profiled && warmup.measures(i);
             // A check's run after its reset is never measured: the trace names it a warmup run, so no
             // view of the recording counts it.
@@ -5497,6 +5506,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             }
         }
         starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
+        driver.window_start(runs.len() + 1, true, starts.on())?;
         // A block whose first speed check ran slow is accepted only if the check holds at speed right
         // after its measured runs too (no wait): a slowdown that came back over the runs refuses it.
         if let Some(first) = &first_slow {
@@ -5567,9 +5577,10 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             // Never a reading from after the reset in its place: no value.
             None => (0.0, None),
         };
-        // What the page had to draw in: its viewport in CSS pixels (device-independent at zoom 1) and
-        // its scale, compared with the other side's content area (`admit_window`).
-        let content = page.eval("[innerWidth, innerHeight, devicePixelRatio]").ok().and_then(|v| Some([v[0].as_f64()?, v[1].as_f64()?, v[2].as_f64()?]));
+        // What the page had to draw in, compared with the other side's content area (`admit_window`):
+        // as setup began when a `page.window` sized it since (a run, or a reset left out, may leave it
+        // sized), else now.
+        let content = if driver.window_sized() { content_before } else { read_content() };
         // What reached the screen in the measured runs (Firefox, headed), and the inputs it showed.
         let presents = presents.map(|r| r.and_then(|_| presents_rc.borrow_mut().take().ok_or_else(|| Error::msg("the present capture ended early"))).and_then(|c| c.stop()));
         let dir = match (&draft, keep) {
@@ -5782,7 +5793,7 @@ fn run_block(ctx: &mut Ctx, s: &Series, v: &Variant, pair: usize, x: &Exec) -> R
             values.remove("frames.n");
             if let Some(p) = presents {
                 let timed: Vec<metrics::Timed> = measured.iter().map(|r| r.timed.clone()).collect();
-                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(range.clone()).unwrap_or_default(), &mut values, &mut os_refused);
+                os_presents = os_frames(ctx, s, v, p, &browser.pids(), &timed, run_inputs_kept.get(range.clone()).unwrap_or_default(), software, &mut values, &mut os_refused);
             }
         }
         if canvas {
@@ -7198,11 +7209,15 @@ fn os_frames(
     pids: &[u32],
     timed: &[metrics::Timed],
     inputs: &[RunInputs],
+    software: bool,
     values: &mut BTreeMap<String, f64>,
     refused: &mut BTreeMap<String, Refusal>,
 ) -> Option<probe::present::Presents> {
     use probe::present::frames;
     let spans: &[(u64, u64)] = &timed.iter().map(|r| (r.t0, r.t1)).collect::<Vec<_>>();
+    // Frames that describe no device (a software rasterizer's, a target at background priority) give
+    // the action log no samples either (`software_state`, `priority_state` refuse their metrics).
+    let samples = !software && ctx.qos.is_none() && ctx.target_qos.is_none();
     let declared: Vec<String> = declared_metrics(s).into_iter().cloned().collect();
     let frame_metric = |m: &str| ["frames.", "interaction.", "scroll.", "display."].iter().any(|p| m.starts_with(p));
     let line = |why: &str| Refusal::from_line(why).unwrap_or_else(|| Refusal::new(ValidatorId::NoPresentSource, why));
@@ -7241,6 +7256,9 @@ fn os_frames(
         let mut reactions = frames::Reactions::default();
         for (sent, changes, _) in inputs {
             reactions.add(frames::reactions(sent, changes, &p.presents, pids, quiet));
+        }
+        if samples {
+            ctx.runner.join_samples(&frames::Outcome::samples(&reactions.each), spans);
         }
         let mut why = BTreeMap::new();
         reactions.values(p.events_lost, values, &mut why);

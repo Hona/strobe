@@ -532,6 +532,77 @@ pub fn place_window(w: &TopWindow, x: i32, y: i32, client: Option<(u32, u32)>) {
     os::place_window(w, x, y, client);
 }
 
+/// Where a top-level window is, for `page.window` sizing (SPEC §9.6), in the OS's own screen units
+/// (physical pixels on Windows and X11, points on macOS): its frame, its client area's size (macOS: the
+/// frame's, as CoreGraphics gives no other), the work area of the display it is on, screen units per
+/// device-independent pixel, and whether it is maximized: the OS's state where it keeps one and strobe
+/// asks for it (X11's window manager), else a frame that fills the work area (Windows, where strobe
+/// never sends the activating maximize command; macOS; X11 without a manager that keeps the state).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Placement {
+    pub frame: [f64; 4],
+    pub client: (f64, f64),
+    pub work: [f64; 4],
+    pub per_dip: f64,
+    pub maximized: bool,
+}
+
+/// A window's `Placement` now; None once it is gone.
+pub fn window_placement(hwnd: isize) -> Option<Placement> {
+    #[cfg(windows)]
+    {
+        win::window_placement(hwnd)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::window_placement(hwnd)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        x11::window_placement(hwnd)
+    }
+}
+
+/// Puts a window's frame at `frame` (`Placement` units), out of the maximized state first, without
+/// activating it. Asked of the OS; the window takes it on its own time.
+pub fn set_window_frame(hwnd: isize, frame: [f64; 4]) -> crate::model::Result<()> {
+    #[cfg(windows)]
+    {
+        win::set_window_frame(hwnd, frame)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_window_frame(hwnd, frame)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        x11::set_window_frame(hwnd, frame)
+    }
+}
+
+/// Maximizes a window without activating it: a frame of the display's work area `work` (Windows: with
+/// the frame's invisible resize borders outside it; macOS: never the zoom button, which may take the
+/// window to a full-screen Space), or X11's maximized state where the window manager keeps one.
+pub fn maximize_window(hwnd: isize, work: [f64; 4]) -> crate::model::Result<()> {
+    #[cfg(windows)]
+    {
+        win::maximize_window(hwnd, work)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos::set_window_frame(hwnd, work)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        x11::maximize_window(hwnd, work)
+    }
+}
+
+/// Takes a window out of the maximized state and back to `frame` (`Placement` units).
+pub fn restore_window(hwnd: isize, frame: [f64; 4]) -> crate::model::Result<()> {
+    set_window_frame(hwnd, frame)
+}
+
 /// Every process on the machine, from one system snapshot (no process is opened, so protected
 /// processes are included).
 pub fn all_processes() -> Vec<ProcInfo> {

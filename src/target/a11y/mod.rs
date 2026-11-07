@@ -119,13 +119,14 @@ const GRAMMAR: &str = "a base (an element key or key path on a native app, \"nav
 
 /// Splits a selector string at whitespace outside quotes, brackets and parentheses. A quote opens a
 /// quoted value only at a value's start (after `=`, `(`, `[` or a space), so `text=don't` is one
-/// word; inside one, a backslash keeps the next character (`\"`).
+/// word; a backslash keeps the next character, inside quotes (`\"`) and outside (a CSS escape such as
+/// `#a\ b` or `#a\(1\)`, as `page.query`'s paths hold).
 fn tokens(s: &str) -> Result<Vec<String>> {
     let (mut out, mut cur, mut depth, mut quote, mut escaped) = (Vec::new(), String::new(), 0i32, None::<char>, false);
     for c in s.chars() {
         match (quote, c) {
-            (Some(_), _) if escaped => escaped = false,
-            (Some(_), '\\') => escaped = true,
+            (_, _) if escaped => escaped = false,
+            (_, '\\') => escaped = true,
             (Some(q), c) if c == q => quote = None,
             (Some(_), _) => {}
             (None, '"' | '\'') if cur.is_empty() || cur.ends_with(['=', '(', '[']) => quote = Some(c),
@@ -238,18 +239,30 @@ impl Selector {
         {
             return Err(bad(format!("unknown role {r:?} (roles: {})", ROLES.iter().map(|r| r.0).collect::<Vec<_>>().join(", "))));
         }
+        // `*` alone: every element (a native app's tree has no CSS, so there it is no base).
+        let star = base.len() == 1 && base[0] == "*";
         let base = match (dialect, base.len()) {
             (_, 0) => Base::Any,
+            (Dialect::Native, 1) if star => Base::Any,
             (Dialect::Page, _) => Base::Css(base.join(" ")),
             (Dialect::Native, 1) if !base[0].starts_with(['[', '.', '#']) && !base[0].contains(">>>") => Base::Key(base[0].split('/').map(str::to_string).collect()),
             (Dialect::Native, _) => {
                 return Err(bad("a native app's elements are found through its accessibility tree, not CSS: the base is one element key or key path".into()));
             }
         };
-        if base == Base::Any && role.is_none() && text.is_none() && !focus {
-            return Err(bad("an empty selector matches nothing".into()));
+        if base == Base::Any && !star && role.is_none() && text.is_none() && !focus {
+            return Err(bad("an empty selector matches nothing (\"*\" matches every element)".into()));
         }
         Ok(Selector { base, role, exact, focus, text, index: index.unwrap_or(0), source })
+    }
+
+    /// `*`: every visible element (`page.query` without a selector).
+    pub fn every(dialect: Dialect) -> Selector {
+        let base = match dialect {
+            Dialect::Native => Base::Any,
+            Dialect::Page => Base::Css("*".into()),
+        };
+        Selector { base, role: None, exact: false, focus: false, text: None, index: 0, source: "*".into() }
     }
 
     /// What a page's helper (`__strobe.find`) takes.

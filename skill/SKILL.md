@@ -105,7 +105,7 @@ strobe query <rec_… | a..b | exp_…> <view> [args]
 ```
 
 - Views: `summary` `frames` `threads` `gpu` `hotspots` `waits` `alloc` `layout` `style` `shifts` `gc` `heap` `leaks` `memory` `insights` `actions` `sql`.
-- `actions [--phase <name>] [--top N] [--reveal]`: what a bench block's hooks sent the target, in order (hook, run, phase, call, selector, outcome).
+- `actions [--phase <name>] [--top N] [--reveal]`: what a bench block's hooks sent the target, in order (hook, run, phase, call, selector, the element hit, outcome, latency sample).
   - On a kept bench recording, or `exp_…` (every check case's, and the recordings a comparison kept); typed text, `act` values, `ctx.call` arguments and `ctx.exec` lines show as their length unless `--reveal`.
 - `hotspots` and `alloc` take `--by function|file|package` (`hotspots`: `--native`, `--thread <name>` for native samples).
 - `waits --thread <name> --phase <name> --by function|package`: where threads were off their CPUs and who woke them.
@@ -307,7 +307,12 @@ export default bench({
   - `input.rate` and `input.gap.p95` show how evenly the moves went out, beside the frames.
   - Use it for drags, not awaited `move`s.
 - `scroll`, `wheel(sel, { dy })`.
-- `window("close")`, `act`, `query` (native).
+- `query(sel?, { actionable })`: elements on pages too (strobe's probe, not the browser's accessibility tree): key, path (finds it again), role, name, value (a password as its length), rect (what `move` takes), actionable, focused, enabled, checked, expanded, selected.
+  - One read (`driver.reads`): discover in setup, `--check` or `ctx.untimed`.
+- `window("maximize" | "restore" | { resize: { width, height } })`: native apps and headed pages, through the OS, never taking focus.
+  - Content size in DIP (a page's viewport); `restore` puts back run 1's size: call it in `reset` (later runs must start there: `ResetIncomplete`).
+  - `DisplayTooSmall`: does not fit the display; `VariantMismatch`: the app keeps its size; `Headless` on headless pages.
+- `window("close")`, `act` (native).
 - `waitFor`: `{ text, exact }`; `:focus` works.
 - `idle`, `wait`.
 - `snapshot(name)`: pixels for `--pixels`; nothing in timed runs.
@@ -378,7 +383,7 @@ export default bench({
   - macOS: AX, Quartz events (keys to the app, which they bring to the front; clicks and wheel at the point, as a person's).
   - Linux: AT-SPI, XTest, keys focus its window; X11 or XWayland only: a native Wayland window is invisible, so `unset: ["WAYLAND_DISPLAY"]` in the app profile.
 - Selectors are accessibility ids or key paths (`"slider/knob"`) with the filters above (`role=button text="Save"`).
-- `page.query("role=button")` lists what matches with key, name, value, `checked` and `enabled` (find the keys with it; assert a toggle's state with `checked`).
+- `page.query("role=button")` lists what matches with key, name, value, `checked`, `enabled` and `actionable`, rects in the window's client area (find the keys with it; assert a toggle's state with `checked`).
 - `page.act(sel, "invoke")` is an accessibility action (no input latency); `act(sel, "setValue", { value })` fails when the app does not take the value.
 - Idle cases are `run: ({ page }) => page.wait(5000)`; launches `until: { window: "settled" }` or a selector.
 - Native targets wait for a line the app writes (`{ line, at }`, `at` on strobe's clock):

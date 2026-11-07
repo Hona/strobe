@@ -103,6 +103,9 @@ fn view(title: &str, log: &ActionLog, args: &Args, top: usize) -> (String, Value
             Outcome::Error { message } => format!("error: {}", clip(message, 60)),
         };
         let mut marks = String::new();
+        if let Some(s) = &a.sample {
+            marks += &format!(" · sample {}", s.text());
+        }
         if a.untimed {
             marks += " untimed";
         }

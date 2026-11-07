@@ -329,6 +329,44 @@ pub struct Reactions {
     pub unchanged: usize,
     /// Keys typed in a burst: `interaction.*` is refused when there are any.
     pub burst: usize,
+    /// Each input's own outcome, by when it was sent (`Sent::t_ns`): the action log's `sample`.
+    pub each: Vec<(u64, Outcome)>,
+}
+
+/// What one input came to.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Outcome {
+    /// An `interaction.*` sample from this edge, of this many ms.
+    Timed(Edge, f64),
+    /// A `scroll.latency.*` sample, ms.
+    Scroll(f64),
+    /// The model did not change after it.
+    Unchanged,
+    /// The target was still drawing, or still answering an earlier input.
+    Busy,
+    /// No frame showed its change within a second.
+    Unshown,
+}
+
+impl Outcome {
+    /// As the action log keeps it (`store::actions::Sample`): an input no frame showed is `unmatched`.
+    pub fn sample(self) -> crate::store::actions::Sample {
+        use crate::store::actions::{Sample, SampleEdge};
+        let (edge, latency_ms) = match self {
+            Outcome::Timed(Edge::Press, ms) => (SampleEdge::Press, Some(ms)),
+            Outcome::Timed(Edge::Sent, ms) => (SampleEdge::Sent, Some(ms)),
+            Outcome::Scroll(ms) => (SampleEdge::Scroll, Some(ms)),
+            Outcome::Unchanged => (SampleEdge::Unchanged, None),
+            Outcome::Busy => (SampleEdge::Busy, None),
+            Outcome::Unshown => (SampleEdge::Unmatched, None),
+        };
+        Sample { edge, latency_ms }
+    }
+
+    /// Every input's, as the action log keeps them, by when each was sent.
+    pub fn samples(each: &[(u64, Outcome)]) -> Vec<(u64, crate::store::actions::Sample)> {
+        each.iter().map(|(t, o)| (*t, o.sample())).collect()
+    }
 }
 
 /// The longest an input waits for its frame: past this its present is something else's.
@@ -372,6 +410,10 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
     let mut answered: Vec<u64> = Vec::new();
     out.burst = sent.iter().filter(|s| s.burst).count();
     for (k, s) in sent.iter().enumerate() {
+        // A key typed in a burst is no one's sample (`interaction.*` refuses the block) and claims nothing.
+        if s.burst {
+            continue;
+        }
         let next = sent.get(k + 1).map_or(u64::MAX, |n| n.press.unwrap_or(n.t_ns));
         // A click that acted on its press: the page says so (`acted`), else its first change after the
         // press that is no press feedback came before the release, and nothing changed again between
@@ -413,11 +455,13 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
                 claimed[i] = true;
                 bump(&mut out.tried);
                 bump(&mut out.busy);
+                out.each.push((s.t_ns, Outcome::Busy));
                 seen.push((s.t_ns, Some(changes[i].1)));
                 continue;
             }
             Pick::Unchanged => {
                 out.unchanged += 1;
+                out.each.push((s.t_ns, Outcome::Unchanged));
                 seen.push((s.t_ns, None));
                 continue;
             }
@@ -432,14 +476,19 @@ pub fn reactions(sent: &[Sent], changes: &[Change], presents: &[Present], pids: 
         answered.extend(shown.map(|p| p.screen_ns));
         if drawing(t) || behind {
             bump(&mut out.busy);
+            out.each.push((s.t_ns, Outcome::Busy));
             continue;
         }
         match shown {
             Some(p) => {
                 let ms = (p.screen_ns - t) as f64 / 1e6;
                 if s.scroll { out.scroll.push(ms) } else { out.interaction.push((ms, edge)) }
+                out.each.push((s.t_ns, if s.scroll { Outcome::Scroll(ms) } else { Outcome::Timed(edge, ms) }));
             }
-            None => bump(&mut out.unshown),
+            None => {
+                bump(&mut out.unshown);
+                out.each.push((s.t_ns, Outcome::Unshown));
+            }
         }
     }
     out
@@ -455,6 +504,7 @@ impl Reactions {
         self.unshown = (self.unshown.0 + o.unshown.0, self.unshown.1 + o.unshown.1);
         self.unchanged += o.unchanged;
         self.burst += o.burst;
+        self.each.extend(o.each);
     }
 
     /// The interaction samples timed from a click's press.

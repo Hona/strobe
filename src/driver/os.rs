@@ -5,7 +5,8 @@
 //! their page point goes to the screen through a map strobe measures at the block's start, from where
 //! posted pointer moves landed in the page (which also proves posted input reaches it), never from an
 //! engine's own idea of where its viewport is. The map holds while the window and the page's viewport
-//! stay where they were: checked after every run and reset (`placed`). Each kind of input is checked
+//! stay where they were, or as a `page.window` strobe was asked for left them (the map follows that
+//! size, `commanded`): checked after every run and reset (`placed`). Each kind of input is checked
 //! again as the block goes: a key, button or wheel strobe posted that no trusted event in the page
 //! matched refuses the block `InputMismatch` instead of timing input the page never got. Interaction
 //! latency then follows the native rule (SPEC §7.4), with the page's own changes (`CHANGES_SCRIPT`: DOM
@@ -32,14 +33,14 @@ pub const INPUT: &[&str] = &["click", "hover", "move", "type", "press", "down", 
 
 /// Installed in every document before its scripts: counts the trusted inputs that reached the page in
 /// `COUNTED`'s order (key downs and ups, button presses and releases, wheel turns, pointer moves), keeps
-/// the first pointer moves (where a posted move landed), and counts what moves or resizes the viewport
+/// the last 16 pointer moves (where a posted move landed), and counts what moves or resizes the viewport
 /// (`resize`, `fullscreenchange`, the visual viewport's `resize`). Listeners only, passive, at the
 /// window's capture phase ahead of the page's own.
 const SCRIPT: &str = r#"window.__strobeOs ??= (() => {
   const s = { n: [0, 0, 0, 0, 0, 0], moves: [], viewport: 0 }
   const on = (t, e, f) => t?.addEventListener(e, f, { capture: true, passive: true })
   ;["keydown", "keyup", "pointerdown", "pointerup", "wheel", "pointermove"].forEach((e, i) => on(window, e, (ev) => { if (ev.isTrusted) s.n[i]++ }))
-  on(window, "pointermove", (e) => { if (e.isTrusted && s.moves.length < 16) s.moves.push([e.clientX, e.clientY]) })
+  on(window, "pointermove", (e) => { if (e.isTrusted) { s.moves.push([e.clientX, e.clientY]); if (s.moves.length > 16) s.moves.shift() } })
   for (const [t, e] of [[window, "resize"], [window, "fullscreenchange"], [window.visualViewport, "resize"]]) on(t, e, () => { s.viewport++ })
   return s
 })(), true
@@ -98,6 +99,18 @@ pub struct OsInput {
     /// The series reads `expect.same`, which shows whether a menu chord did on the page what it did on
     /// the other side (macOS, `press`).
     pub vouched: Cell<bool>,
+    /// The window's frame as the input thread reads it (`Poster::frame`) when strobe last mapped the page.
+    frame: Cell<(f64, f64, f64, f64)>,
+    /// The viewport resizes the page counted since `begin` that a `page.window` strobe asked for made:
+    /// `placed` refuses only those past them.
+    resized: Cell<f64>,
+    /// After a map strobe worked out from a size it asked for (`commanded`), the page points the pointer
+    /// moves posted since should land on: `placed` checks the newest against where the moves landed.
+    expect: RefCell<Option<Vec<(f64, f64)>>>,
+    /// Where such a move should have landed and where the page saw moves instead (`look_landed`).
+    missed: RefCell<Option<String>>,
+    /// The display's device pixels per screen unit when strobe last mapped the page (`device_per_unit`).
+    backing: Cell<f64>,
 }
 
 fn refused(summary: String) -> Error {
@@ -121,6 +134,12 @@ pub fn unreachable(engine: WebEngine, headless: bool) -> Option<Refusal> {
         Refusal::new(ValidatorId::InputMismatch, "Safari keeps the window of a WebDriver session from every input but its driver's, so the OS's input never reaches the page")
             .fix("compare the Safari page with Safari pages only (input through its driver on every side), or keep input out of its runs (setup and reset may use it)")
     })
+}
+
+/// The display's device pixels per OS screen unit under a window: its backing scale on macOS (screen
+/// units are points), 1 elsewhere (physical pixels).
+fn device_per_unit(hwnd: isize) -> f64 {
+    if cfg!(target_os = "macos") { host::window_state(hwnd).map_or(1.0, |w| w.scale()).max(0.01) } else { 1.0 }
 }
 
 /// The page's `VIEWPORT` now.
@@ -183,9 +202,70 @@ impl OsInput {
             parked: Cell::new(None),
             pacer: super::Pacer::default(),
             vouched: Cell::new(false),
+            frame: Cell::new((0.0, 0.0, 0.0, 0.0)),
+            resized: Cell::new(0.0),
+            expect: RefCell::new(None),
+            missed: RefCell::new(None),
+            backing: Cell::new(1.0),
         };
         os.map(page)?;
         Ok(os)
+    }
+
+    /// The browser's processes strobe follows.
+    pub fn pids(&self) -> Vec<u32> {
+        self.pids.borrow().clone()
+    }
+
+    /// Before a `page.window` strobe asked for: the move check of an earlier one (`look_landed`), which
+    /// the new map would replace, and the page's count of viewport resizes so far (`commanded` adds what
+    /// comes after it).
+    pub fn sizing(&self, page: &Page) -> Result<f64> {
+        self.look_landed(page)?;
+        Ok(page.eval("window.__strobeOs?.viewport ?? 0")?.as_f64().unwrap_or(0.0))
+    }
+
+    /// After a `page.window` strobe asked for and saw the window take: the map from page to screen follows
+    /// the new size without probes (a run is going): the viewport keeps its left edge's and bottom
+    /// edge's distances from the window's frame (a browser's toolbar is on top, and may change its height
+    /// as the window maximizes), and its scale (screen units per CSS pixel) changes as the device pixels
+    /// per CSS pixel over the screen's device pixels per unit do (macOS: points, so a window that moves
+    /// between a Retina and a 1x display keeps a point per CSS pixel), those distances with it. Checked
+    /// in `placed`, from where the pointer moves strobe posts after it land in the page. The viewport
+    /// resizes the page counted since `before` (`sizing`) are this one's.
+    pub fn commanded(&self, page: &Page, before: f64) -> Result<()> {
+        let pids = self.pids();
+        let w = host::main_window(&pids).ok_or_else(|| no_window(&pids))?;
+        if w.hwnd != self.top.get() {
+            return Err(refused("the browser's window was replaced as strobe sized it, so the page's points no longer map to the screen".into()));
+        }
+        if let Some(c) = self.presents.borrow_mut().as_mut() {
+            c.resized(&pids);
+        }
+        // The page's resize events come on its next frames.
+        page.eval("new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(() => r(true))))")?;
+        let (old, new) = (self.frame.get(), self.poster.frame(w.hwnd)?);
+        let view = viewport(page)?;
+        let at = |v: &[f64], i: usize| v.get(i).copied().unwrap_or(0.0);
+        let (o, k) = (self.origin.get(), self.scale.get());
+        let was = self.viewport.borrow().clone();
+        let backing = device_per_unit(w.hwnd);
+        let (d0, d1) = (at(&was, 4) / self.backing.get(), at(&view, 4) / backing);
+        let ratio = if d0 > 0.0 && d1 > 0.0 { d1 / d0 } else { 1.0 };
+        let k2 = (k.0 * ratio, k.1 * ratio);
+        let left = (o.0 - old.0) * ratio;
+        let bottom = (old.1 + old.3 - (o.1 + at(&was, 3) * k.1)) * ratio;
+        self.origin.set((new.0 + left, new.1 + new.3 - bottom - at(&view, 3) * k2.1));
+        self.scale.set(k2);
+        self.backing.set(backing);
+        self.frame.set(new);
+        self.geometry.set((w.rect, w.client));
+        *self.viewport.borrow_mut() = view;
+        let now = page.eval("window.__strobeOs?.viewport ?? 0")?.as_f64().unwrap_or(0.0);
+        self.resized.set(self.resized.get() + (now - before).max(0.0));
+        page.eval("window.__strobeOs && (__strobeOs.moves = []), true")?;
+        *self.expect.borrow_mut() = Some(Vec::new());
+        Ok(())
     }
 
     /// Maps the page onto the screen again when its window or viewport moved, resized, zoomed or was
@@ -202,20 +282,67 @@ impl OsInput {
     /// for where it was. After each run and reset (`what`), outside its span.
     /// The page's own word counts too: a `resize`, `fullscreenchange` or visual viewport `resize` since
     /// `begin` refuses even when the viewport came back (resized and restored within the run).
+    /// A size strobe asked for (`page.window`, `commanded`) is no such change: only what came besides it,
+    /// and a map worked out for it that the pointer moves posted since do not land on.
     pub fn placed(&self, page: &Page, what: &str) -> Result<()> {
         let why = match self.moved(page)? {
             Some(why) => Some(why.to_string()),
-            None => match page.eval("window.__strobeOs?.viewport ?? 0")?.as_f64().unwrap_or(0.0) {
-                0.0 => None,
-                n => Some(format!("the page's viewport resized {n} time(s) (resize, fullscreenchange or a visual viewport resize)")),
+            None => match page.eval("window.__strobeOs?.viewport ?? 0")?.as_f64().unwrap_or(0.0) - self.resized.get() {
+                n if n <= 0.0 => None,
+                n => Some(format!("the page's viewport resized {n} time(s) (resize, fullscreenchange or a visual viewport resize) besides any page.window strobe was asked for")),
             },
         };
+        if why.is_none() {
+            self.landed(page, what)?;
+        }
         match why {
             Some(why) => Err(Refusal::new(ValidatorId::InputMismatch, format!("{why} during the {what}: strobe's OS input after that went to screen points mapped for where the page was"))
                 .fix("keep the browser's window, its size and the page's zoom as they are while the runs go (setup may change them: strobe maps the page again after it)")
                 .into()),
             None => Ok(()),
         }
+    }
+
+    /// After a map worked out from a size strobe asked for: the newest pointer move strobe posted to a new
+    /// point since is among the trusted moves the page saw last (its last 16), within 2 page pixels of
+    /// where the map put it, else `InputMismatch`. Moves the page saw that strobe did not post (a
+    /// browser's own as the window changes under the cursor, the cursor put back where the user left it
+    /// after the runs) are no evidence either way. Once one landed, the map has proved itself and is
+    /// checked no more; until strobe posts a move there is nothing to check.
+    fn landed(&self, page: &Page, what: &str) -> Result<()> {
+        self.look_landed(page)?;
+        match self.missed.take() {
+            Some(why) => Err(refused(format!("after the window size strobe was asked for (page.window), the last pointer move strobe posted in the {what} {why}: input went to points mapped for another place"))),
+            None => Ok(()),
+        }
+    }
+
+    /// `landed`'s look, waiting up to 500 ms for the move to arrive (a browser dispatches moves once a
+    /// frame), before anything else moves the pointer: `Driver::release_all` puts the cursor back where
+    /// the user left it, and a browser that coalesces moves keeps only that one. A miss is kept for
+    /// `placed` to refuse.
+    pub(super) fn look_landed(&self, page: &Page) -> Result<()> {
+        let Some(want) = self.expect.borrow().as_ref().and_then(|e| e.last().copied()) else { return Ok(()) };
+        let until = Instant::now() + Duration::from_millis(500);
+        let (near, m, any) = loop {
+            let v = page.eval("JSON.stringify(window.__strobeOs?.moves ?? [])")?;
+            let moves: Vec<[f64; 2]> = v.as_str().and_then(|s| serde_json::from_str(s).ok()).unwrap_or_default();
+            let (near, m) = moves.iter().map(|m| ((want.0 - m[0]).hypot(want.1 - m[1]), *m)).fold((f64::INFINITY, [0.0; 2]), |a, b| if b.0 < a.0 { b } else { a });
+            if near <= 2.0 || Instant::now() >= until {
+                break (near, m, !moves.is_empty());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        *self.expect.borrow_mut() = None;
+        if near > 2.0 {
+            let (o, k) = (self.origin.get(), self.scale.get());
+            let seen = if any { format!("the nearest the page saw landed at ({:.0}, {:.0}), {near:.0} page pixels away", m[0], m[1]) } else { "the page saw no pointer move".to_string() };
+            *self.missed.borrow_mut() = Some(format!(
+                "should have landed at ({:.0}, {:.0}) in the page by the map strobe worked out for the new size (origin ({:.0}, {:.0}), scale {:.3}), and {seen}",
+                want.0, want.1, o.0, o.1, k.0
+            ));
+        }
+        Ok(())
     }
 
     /// What changed since the last map, if anything: the window (replaced, moved or resized, from the
@@ -314,6 +441,9 @@ impl OsInput {
         }
         self.origin.set(origin);
         self.scale.set(scale);
+        self.frame.set(r);
+        self.backing.set(device_per_unit(w.hwnd));
+        *self.expect.borrow_mut() = None;
         self.top.set(w.hwnd);
         self.geometry.set((w.rect, w.client));
         *self.viewport.borrow_mut() = view;
@@ -359,6 +489,7 @@ impl OsInput {
     }
 
     fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
+        super::sent(t_ns, kind == "discrete" || (kind == "scroll" && first), None);
         self.last_input.set(t_ns);
         self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None, burst: false });
     }
@@ -399,6 +530,10 @@ impl OsInput {
         let p = t.point();
         if self.moved_to.replace(Some(p)) != Some(p) {
             self.count(MOVE);
+            if let Some(e) = self.expect.borrow_mut().as_mut() {
+                let (o, k) = (self.origin.get(), self.scale.get());
+                e.push(((p.0 as f64 - o.0) / k.0, (p.1 as f64 - o.1) / k.1));
+            }
         }
         Ok(at)
     }
@@ -453,6 +588,7 @@ impl OsInput {
     /// page's trusted events from zero, so one stretch's input never covers for another's.
     pub fn begin(&self, page: &Page) -> Result<()> {
         self.posted.set([0; 6]);
+        self.resized.set(0.0);
         let v = page.eval("window.__strobeOs && (__strobeOs.n.fill(0), __strobeOs.viewport = 0), performance.timeOrigin")?;
         self.document.set(v.as_f64().unwrap_or(0.0));
         Ok(())
@@ -572,6 +708,9 @@ impl Driver {
                     {
                         i.burst = true;
                     }
+                }
+                if typing == super::Typing::Burst {
+                    super::unmeasured();
                 }
                 (o, last)
             }
@@ -756,6 +895,7 @@ impl Driver {
                 && let Some(i) = os.log.borrow_mut().inputs.last_mut()
             {
                 i.press_ns = Some(pressed);
+                super::sent(last, true, Some(pressed));
             }
         }
         Ok(last)

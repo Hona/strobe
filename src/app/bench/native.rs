@@ -379,6 +379,8 @@ fn runs(
         drive.follow(n);
     }
     lap("checks", steps);
+    // The window's client area before any `page.window` (`admit_window`).
+    let client_before = n.window.as_ref().map(client_of);
     let setup = ctx.runner.call("setup", json!({}), t, &serve);
     super::super::record::app_gone(n, "before the runs", |_| last())?;
     setup.map_err(|e| crate::runner::incomplete("setup", "setup", e, "", "fix the bench file's setup"))?;
@@ -456,6 +458,9 @@ fn runs(
         {
             se.set_pids(&n.pids());
             starts.check(i + 1, false, &read_start, &wait_start)?;
+        }
+        if let Some(se) = drive.session.get() {
+            se.window_start(i + 1, false, starts.on())?;
         }
         // The capture follows windows that opened since (the drivers' settles read it without looking).
         if let Some(p) = presents.borrow_mut().as_mut() {
@@ -574,6 +579,9 @@ fn runs(
         }
     }
     starts.check(runs.len() + 1, true, &read_start, &wait_start)?;
+    if let Some(se) = drive.session.get() {
+        se.window_start(runs.len() + 1, true, starts.on())?;
+    }
     let mut stopped = video.take().map(crate::app::video::Recorder::stop);
     let unsteady = warmup.unsteady();
     let first = warmup.first().unwrap_or(0);
@@ -724,6 +732,11 @@ fn runs(
             let quiet = frames::quiet_ns(refresh.unwrap_or(1000.0 / 60.0));
             for r in measured {
                 reactions.add(frames::reactions(&r.log.sent(&r.timed), &r.changes, &p.presents, &pids, quiet));
+            }
+            // Frames at background priority describe no person's machine: no samples either
+            // (`priority_state`; a software adapter refused the block above).
+            if ctx.qos.is_none() && ctx.target_qos.is_none() {
+                ctx.runner.join_samples(&frames::Outcome::samples(&reactions.each), &spans);
             }
             // SPEC §19: the present session's consumer may use 0.5% of a core (`Overhead`, warned for
             // timed blocks); past 2% it competes with the app it measures, and its frames describe a
@@ -990,8 +1003,9 @@ fn runs(
         overhead: Some(Overhead { strobe_pct, runner_pct, sampler_pct, present_pct, ..Overhead::default() }),
         process_set: Some(programs(&n.processes())),
         // macOS's window list gives a window's frame, title bar included, not its content area: kept
-        // as the frame (`admit_window` allows a page's side the title bar).
-        client: n.window.as_ref().map(client_of),
+        // as the frame (`admit_window` allows a page's side the title bar). As setup began when a
+        // `page.window` sized it since (a run may leave it sized).
+        client: if drive.session.get().is_some_and(Session::window_sized) { client_before } else { n.window.as_ref().map(client_of) },
         frame: cfg!(target_os = "macos"),
         directions: BTreeMap::new(),
         same: same.take(range.clone()),

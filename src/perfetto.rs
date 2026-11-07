@@ -585,8 +585,9 @@ impl Builder {
         }
     }
 
-    /// What a bench block's hooks sent the target (`actions.json.gz`): each call a slice from when strobe
-    /// got it to its answer, on the host clock, warmup runs, setup and resets included. Typed text and
+    /// What a bench block's hooks sent the target (`actions.json.gz`): each call a slice from when its
+    /// input went out (a single click's press) to strobe's answer, on the host clock, warmup runs, setup
+    /// and resets included, with its latency sample where it has one. Typed text and
     /// arguments stay out of the trace (`query <rec> actions --reveal` shows them).
     fn actions(&mut self, dir: &Path) {
         let Ok(Some(log)) = store::actions::ActionLog::read(&dir.join(store::actions::FILE)) else { return };
@@ -616,6 +617,9 @@ impl Builder {
             if let Some(h) = &a.hit {
                 args.push(("hit".into(), json!(format!("{} {:?}", h.role, h.name))));
             }
+            if let Some(s) = &a.sample {
+                args.push(("sample".into(), json!(s.text())));
+            }
             args.push((
                 "outcome".into(),
                 json!(match &a.outcome {
@@ -624,7 +628,8 @@ impl Builder {
                     store::actions::Outcome::Error { message } => format!("error: {message}"),
                 }),
             ));
-            self.slice(track, MONOTONIC, a.t_ns, a.end_ns, &name, &args);
+            // From a single click's press: what the press drew is the input's too.
+            self.slice(track, MONOTONIC, a.press_ns.unwrap_or(a.t_ns).min(a.t_ns), a.end_ns, &name, &args);
             self.count("inputs");
         }
     }

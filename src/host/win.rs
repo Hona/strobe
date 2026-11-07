@@ -1019,6 +1019,97 @@ pub fn place_window(w: &super::TopWindow, x: i32, y: i32, client: Option<(u32, u
     }
 }
 
+/// Runs `f` with this thread per-monitor DPI aware, so window and monitor rectangles are physical
+/// pixels on every display (strobe's own threads are not otherwise).
+fn per_monitor<T>(f: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::UI::HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetThreadDpiAwarenessContext};
+    let before = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+    let out = f();
+    if !before.is_null() {
+        unsafe { SetThreadDpiAwarenessContext(before) };
+    }
+    out
+}
+
+/// The frame's invisible resize borders (left, top, right, bottom), physical pixels: the window rect
+/// less what DWM draws of it (`DWMWA_EXTENDED_FRAME_BOUNDS`). Per-monitor aware callers only.
+unsafe fn invisible_borders(h: windows_sys::Win32::Foundation::HWND, r: &windows_sys::Win32::Foundation::RECT) -> [f64; 4] {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
+    let mut e: RECT = unsafe { zeroed() };
+    if unsafe { DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS as u32, &mut e as *mut RECT as *mut _, size_of::<RECT>() as u32) } < 0 {
+        return [0.0; 4];
+    }
+    [(e.left - r.left).max(0) as f64, (e.top - r.top).max(0) as f64, (r.right - e.right).max(0) as f64, (r.bottom - e.bottom).max(0) as f64]
+}
+
+/// Read per-monitor DPI aware, so every rectangle is physical pixels on any display (`window_state`
+/// runs in strobe's own unaware context). Maximized: Windows' own state, or a frame whose visible part
+/// fills the work area (what `maximize_window` makes).
+pub fn window_placement(hwnd: isize) -> Option<super::Placement> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{MONITORINFO, MonitorFromWindow};
+    use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetClientRect, GetWindowRect, IsWindow, IsZoomed};
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    per_monitor(|| unsafe {
+        if IsWindow(h) == 0 {
+            return None;
+        }
+        let (mut r, mut c): (RECT, RECT) = (zeroed(), zeroed());
+        GetWindowRect(h, &mut r);
+        GetClientRect(h, &mut c);
+        let mut info: MONITORINFO = zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(h, MONITOR_DEFAULTTONEAREST), &mut info) == 0 {
+            return None;
+        }
+        let rect = |r: RECT| [r.left as f64, r.top as f64, (r.right - r.left) as f64, (r.bottom - r.top) as f64];
+        let (frame, work) = (rect(r), rect(info.rcWork));
+        let [l, t, rr, b] = invisible_borders(h, &r);
+        let shown = [frame[0] + l, frame[1] + t, frame[2] - l - rr, frame[3] - t - b];
+        let fills = shown.iter().zip(work).all(|(a, w)| (a - w).abs() <= 1.0);
+        Some(super::Placement {
+            frame,
+            client: ((c.right - c.left) as f64, (c.bottom - c.top) as f64),
+            work,
+            per_dip: GetDpiForWindow(h).max(96) as f64 / 96.0,
+            maximized: IsZoomed(h) != 0 || fills,
+        })
+    })
+}
+
+/// Out of the maximized state (`SW_SHOWNOACTIVATE`), then the frame (`SetWindowPos`): both posted to
+/// the app's queue in that order, without activating it or changing its place among the windows.
+pub fn set_window_frame(hwnd: isize, frame: [f64; 4]) -> crate::model::Result<()> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE, SWP_ASYNCWINDOWPOS, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos, ShowWindowAsync};
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    let [x, y, w, ht] = frame.map(|v| v.round() as i32);
+    per_monitor(|| unsafe {
+        if IsZoomed(h) != 0 {
+            ShowWindowAsync(h, SW_SHOWNOACTIVATE);
+        }
+        if SetWindowPos(h, std::ptr::null_mut(), x, y, w, ht, SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS) == 0 {
+            return Err(crate::model::Error::msg("page.window(): Windows did not take the window's new size (SetWindowPos)"));
+        }
+        Ok(())
+    })
+}
+
+/// A frame whose visible part is the work area `work` (its invisible resize borders outside it), set
+/// as any other (`set_window_frame`): never `SC_MAXIMIZE`, which activates the window and takes focus.
+pub fn maximize_window(hwnd: isize, work: [f64; 4]) -> crate::model::Result<()> {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+    let h = hwnd as windows_sys::Win32::Foundation::HWND;
+    let [l, t, r, b] = per_monitor(|| unsafe {
+        let mut rect: RECT = zeroed();
+        GetWindowRect(h, &mut rect);
+        invisible_borders(h, &rect)
+    });
+    set_window_frame(hwnd, [work[0] - l, work[1] - t, work[2] + l + r, work[3] + t + b])
+}
+
 pub fn refresh_at(x: i32, y: i32) -> Option<u32> {
     unsafe {
         let mon = MonitorFromPoint(POINT { x, y }, MONITOR_DEFAULTTONEAREST);

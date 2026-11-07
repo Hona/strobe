@@ -232,8 +232,13 @@ impl Runner {
                 let req_op = msg.get("op").and_then(Value::as_str).unwrap_or("").to_string();
                 let args = msg.get("args").cloned().unwrap_or(Value::Null);
                 let action = hook.filter(|_| self.collect).and_then(|h| ActionLog::of_request(h, run, self.untimed, self.phases.last().cloned(), &req_op, &args, host::now_ns()));
+                crate::driver::take_sending();
                 let served = serve(&req_op, &args);
                 if let Some(mut a) = action {
+                    // What the driver said it sent: its send time, a click's press, what it aimed at.
+                    let sending = crate::driver::take_sending();
+                    a.t_ns = sending.t_ns.unwrap_or(a.t_ns);
+                    (a.press_ns, a.hit, a.measured) = (sending.press_ns, sending.hit, sending.measured);
                     a.end_ns = host::now_ns();
                     a.outcome = Outcome::of(&served);
                     self.actions.borrow_mut().push(a);
@@ -289,6 +294,12 @@ impl Runner {
     /// keeps them does, so an ordinary timed block reads no clock and copies nothing for them.
     pub fn collect_actions(&mut self, on: bool) {
         self.collect = on;
+    }
+
+    /// The block's per-input latency outcomes (by send time), joined to its run actions once the runs
+    /// are measured (`ActionLog::join`); `runs`: the measured runs' host-clock spans.
+    pub fn join_samples(&self, each: &[(u64, crate::store::actions::Sample)], runs: &[(u64, u64)]) {
+        self.actions.borrow_mut().join(each, runs);
     }
 
     /// The current (or last) block's actions since its `block` call, taken: written once.

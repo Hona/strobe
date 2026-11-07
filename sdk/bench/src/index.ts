@@ -33,13 +33,53 @@ export interface Options {
   window?: string
 }
 
+/** What {@link Page.window} does: size a window (native apps and headed pages), or show, hide, minimize, focus or close one (native apps). */
+export type WindowAction = "maximize" | "restore" | { resize: { width: number; height: number } } | "show" | "hide" | "minimize" | "focus" | "close"
+
+export interface QueryOptions extends Options {
+  /**
+   * Only elements a person could act on now: enabled, not inert, with a visible part (clipped by the viewport and
+   * its scroll containers) where a hit test at its centre (pages: then its quarters' centres) finds the element,
+   * without scrolling. strobe hit-tests at most 500
+   * times per call; with more candidates it refuses rather than list some.
+   */
+  actionable?: boolean
+}
+
+/** One element {@link Page.query} found. */
+export interface QueriedElement {
+  /** Its own id: a page element's `id`, a native element's automation id (AutomationId, AXIdentifier, AccessibleId); "" without. */
+  key: string
+  /** A selector that finds this element again: a page's CSS (`>>>` into shadow roots, `:host >` for a root's own child), a native app's key path. */
+  path: string
+  /** ARIA's role name. */
+  role: string
+  name: string
+  /** A field's value; a password's as its length (`"8 characters"`). */
+  value?: string
+  /** [x, y, width, height] of its visible part (else its box) in the viewport (CSS pixels) or the window's client area (device-independent pixels), the points `page.move` takes. */
+  rect: number[]
+  /** Enabled, not inert, on the screen and hit-tested to itself; null past the call's 500 hit tests. */
+  actionable: boolean | null
+  focused: boolean
+  enabled: boolean
+  /** A check box's, radio's, switch's or toggle's state; null for others. */
+  checked: boolean | null
+  /** A disclosure's state (aria-expanded, details); null for others and on native apps. */
+  expanded: boolean | null
+  /** An option's or tab's state (aria-selected); null for others and on native apps. */
+  selected: boolean | null
+  /** Native apps: the window it is in. */
+  window?: number
+}
+
 /**
  * Drives the target. On a native target strobe drives the app through the OS's accessibility tree (UI Automation,
  * macOS AX, Linux AT-SPI) and input of the OS's own (Windows: posted messages, the app never takes focus; macOS:
  * Quartz events posted to the app, which comes to the front for keys; Linux: XTest). Selectors are one grammar on
  * both ({@link Selector}): their base is CSS on a page, an accessibility id on a native app. Keys are Playwright's
  * names from one table on every target (`"F9"`, `"PageUp"`, `"Delete"`, `"Control+Shift+P"`): a named key is that
- * key, never its name typed as text. `goto` and `eval` are page-only; `act` and `query` are native-only.
+ * key, never its name typed as text. `goto` and `eval` are page-only; `act` is native-only.
  */
 export interface Page {
   /** Opens `url`; a relative path resolves against the current page. */
@@ -91,8 +131,18 @@ export interface Page {
   scroll(selector: Element, delta: { by?: number; byX?: number; speed?: number }, opts?: Options): Promise<void>
   /** One mouse-wheel event of `dx`, `dy` (pixels; + is down and right) over `selector`, or the window's centre with `""`, with the keys `down` holds (`down("Control")` first: a zoom). */
   wheel(selector: Element, delta: { dx?: number; dy?: number }, opts?: Options): Promise<void>
-  /** Native targets: shows, hides, minimizes, focuses or closes a window (`opts.window`, default the main one). `close` is the title bar's close (the app's own close path). */
-  window(action: "show" | "hide" | "minimize" | "focus" | "close", opts?: Options): Promise<void>
+  /**
+   * Sizes a window through the OS without taking focus, on native apps and headed pages ({@link WindowAction}):
+   * `"maximize"`, `"restore"` (back to the size and state run 1 started from) or `{ resize: { width, height } }` of the
+   * content in device-independent pixels (a page's viewport, the viewport unit; a native app's client area, on macOS
+   * its whole frame). Waits up to a second for the window to take it. A size that does not fit the display refuses
+   * `DisplayTooSmall`; one the app will not take (its least or most size) `VariantMismatch`; a headless page `Headless`.
+   * Once a block sized the window, every run must start at the first run's size (`ResetIncomplete`): restore it in
+   * `reset`. Native apps also take `"show"`, `"hide"`, `"minimize"`, `"focus"` and `"close"` (`opts.window`, default the
+   * main one; `close` is the title bar's close, the app's own path). It is no interaction sample: measure it with a
+   * phase, `frames.*` or `cpu.*`.
+   */
+  window(action: WindowAction, opts?: Options): Promise<void>
   /**
    * Native targets: an accessibility action on an element (UI Automation's patterns): `invoke`, `toggle`, `setValue`
    * (`opts.value`), `expand`, `collapse`, `select`, `scrollIntoView`, `focus`. It skips hit testing and pointer
@@ -100,8 +150,13 @@ export interface Page {
    * back and fails when the app did not take it within a second.
    */
   act(selector: Element, action: "invoke" | "toggle" | "setValue" | "expand" | "collapse" | "select" | "scrollIntoView" | "focus", opts?: Options & { value?: string | number }): Promise<void>
-  /** Native targets: the visible elements `selector` matches now: key, path, role, name, value, rect (screen pixels; points on macOS), focused, enabled, checked (a switch, check box, radio or toggle button's state; null for others). */
-  query(selector: Element, opts?: Options): Promise<{ key: string; path: string; role: string; name: string; value?: string; rect: number[]; focused: boolean; enabled: boolean; checked: boolean | null }[]>
+  /**
+   * The visible elements `selector` matches now, in tree order ({@link QueriedElement}); without one (or `"*"`) every
+   * visible element (on a page: those with a role, an id or a way to take input). On pages through strobe's own page
+   * probe (shadow roots included), on native apps through the accessibility tree. One read, counted in
+   * `driver.reads`: discover in setup, `--check` or `ctx.untimed`, not in a timed step.
+   */
+  query(selector?: Element, opts?: QueryOptions): Promise<QueriedElement[]>
   /** Resolves when a visible element matches `selector` (holding `text`, if given). Re-checked on every DOM, tree and focus change, so `:focus` works. */
   waitFor(selector: Element, opts?: { text?: string; exact?: boolean; timeout?: number }): Promise<void>
   /** Resolves when nothing in the DOM changed and no frame ran long for 300 ms. */

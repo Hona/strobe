@@ -3,9 +3,11 @@
 
 pub mod native;
 pub mod os;
+pub mod window;
 
 use crate::model::{Error, Refusal, Result, ValidatorId};
 use crate::probe::present::frames::Sent;
+use crate::store::actions::Hit;
 use crate::target::a11y::keys::{self, Button, Key, Mods, Named};
 use crate::target::a11y::{Dialect, Selector};
 use crate::target::bidi;
@@ -14,6 +16,60 @@ use crate::target::web::WebPage as Page;
 use serde_json::{Value, json};
 use std::cell::{Cell, RefCell};
 use std::time::{Duration, Instant};
+
+/// What one driver call sent, for the block's action log (SPEC §14.1 `actions.json.gz`): when its
+/// first measured input went out (a click's release, a key press, a scroll's first step; else its
+/// first input of any kind), that input's press (a single click), and what its aim found. Each driver
+/// says it as it sends, from what it already knows (its own clock reads, the aim's one look at the
+/// target): no extra call to the target. The runner takes it after each call (`take_sending`).
+#[derive(Clone, Debug, Default)]
+pub struct Sending {
+    pub t_ns: Option<u64>,
+    /// `t_ns` is an input a latency sample may come from.
+    pub measured: bool,
+    pub press_ns: Option<u64>,
+    pub hit: Option<Hit>,
+}
+
+thread_local! {
+    /// The current call's `Sending`: the drivers run on the thread that serves the runner.
+    static SENDING: RefCell<Sending> = RefCell::default();
+}
+
+/// An input went out at `t_ns` (`measured`: one a latency sample may come from, with a single
+/// click's `press`). The call keeps its first measured input, else its first input; a press given
+/// later for the kept input fills it in.
+pub(crate) fn sent(t_ns: u64, measured: bool, press: Option<u64>) {
+    SENDING.with_borrow_mut(|s| {
+        if measured && !s.measured {
+            (s.t_ns, s.measured, s.press_ns) = (Some(t_ns), true, press);
+        } else if measured && s.t_ns == Some(t_ns) && press.is_some() {
+            s.press_ns = press;
+        } else if s.t_ns.is_none() {
+            s.t_ns = Some(t_ns);
+        }
+    });
+}
+
+/// The call's inputs are none a sample may come from after all (keys typed in a burst).
+pub(crate) fn unmeasured() {
+    SENDING.with_borrow_mut(|s| s.measured = false);
+}
+
+/// The element the call's input aims at (its first aim).
+pub(crate) fn aimed(hit: Hit) {
+    SENDING.with_borrow_mut(|s| {
+        s.hit.get_or_insert(hit);
+    });
+}
+
+/// The last call's `Sending`, taken (the runner clears it before a call, and reads it after).
+pub fn take_sending() -> Sending {
+    SENDING.take()
+}
+
+/// `page.query`'s hit tests (`actionable`) at most, per call: an element costs up to five.
+pub(crate) const QUERY_HITS: u32 = 500;
 
 /// The longest strobe waits for a target to settle before a measured input: a target still drawing
 /// then (an animation, a caret, a press ripple) is not at rest, and the input is no sample (SPEC 7.4).
@@ -461,7 +517,9 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
   // An input's whole look at the page in one call (`driver.reads` counts it once): wait for the element,
   // then its centre (scrolled into view) and whether focus is in it; the wait's timeout rejects.
   // With `focus` (a click into a field before typing), a field focus is already in is not aimed at: no click goes there.
-  s.aim = (q, timeout, label, focus) => s.waitEl(q, timeout, label).then((el) => (focus && focusedIn(el) ? { focused: true } : { ...s.box(el), focused: focusedIn(el) }))
+  // What the action log keeps of the element an input aims at (`hit`): read from the box the aim just laid out.
+  const about = (el) => { const r = el.getBoundingClientRect(); return { role: roleOf(el), key: el.id || "", name: nameOf(el), rect: [r.left, r.top, r.width, r.height] } }
+  s.aim = (q, timeout, label, focus) => s.waitEl(q, timeout, label).then((el) => (focus && focusedIn(el) ? { focused: true, ...about(el) } : { ...s.box(el), focused: focusedIn(el), ...about(el) }))
   // What `expect.same` compares: a field's value, else the element's text; null when it never showed.
   s.text = (q, timeout) => s.waitEl(q, timeout, "").then((el) => {
     const v = !el ? null : /^(input|textarea|select)$/.test(el.localName) ? el.value : (el.innerText ?? el.textContent)
@@ -486,6 +544,91 @@ pub(crate) const HELPER: &str = r#"window.__strobe ??= (() => {
     setTimeout(() => finish(false), ms)
   })
   s.nodes = () => document.getElementsByTagName("*").length
+  // An element's name as a person reads it, at most 120 characters: its label (aria-label, aria-labelledby, a
+  // field's label, alt, title), else its text (read until that is long enough, not built whole), else its placeholder.
+  const squash = (t) => (t ?? "").replace(/\s+/g, " ").trim().slice(0, 120)
+  const nameOf = (el) => {
+    const by = (el.getAttribute("aria-labelledby") ?? "").split(/\s+/).filter(Boolean).map((id) => el.getRootNode().getElementById?.(id)?.textContent ?? "").join(" ")
+    const own = squash(el.getAttribute("aria-label") || by || el.labels?.[0]?.textContent || el.getAttribute("alt") || el.getAttribute("title"))
+    if (own) return own
+    let text = ""
+    const w = document.createTreeWalker(el, NodeFilter.SHOW_TEXT)
+    for (let n = w.nextNode(); n && text.length < 240; n = w.nextNode()) text += n.data + " "
+    return squash(text) || squash(el.getAttribute("placeholder"))
+  }
+  const tri = (v) => (v === "true" ? true : v === "false" ? false : null)
+  // `page.query` (SPEC §9.6): the visible elements a selector matches, in tree order and through shadow roots, each as
+  // a native app's query gives it, in viewport CSS pixels; `*` alone: those with a role, an id or a way to take input.
+  // `actionable`: enabled, not inert, with a visible part (the box clipped by the viewport and every ancestor that
+  // clips it, as input aims) that a hit test at its centre (then its quarters' centres) finds the element at, with no
+  // scrolling; at most `hits` hit tests in all, null past them (`cut`). Only
+  // actionable ones with `only`. Read once, on the page's main thread; its time is strobe's (`driver.read_ms`).
+  s.query = (q, hits, only) => {
+    const t0 = performance.now()
+    try {
+      const deep = (root, out) => { for (const el of root.querySelectorAll("*")) { out.push(el); if (el.shadowRoot) deep(el.shadowRoot, out) } return out }
+      const every = q.css === "*" && q.role == null && q.text == null && !q.focus
+      const bare = q.css == null && q.role == null && q.text != null
+      const all = bare ? holders(q.text, q.exact) : q.css == null || q.css === "*" ? deep(document, []) : query(document, q.css.split(">>>").map((p) => p.trim()))
+      const interactive = (el) => el.tabIndex >= 0 || el.isContentEditable || el.hasAttribute("onclick")
+      let found = all.filter((el) => (q.role == null || isRole(el, q.role)) && (!q.focus || el.matches(":focus")) && has(el, q.text, q.exact) && (!every || roleOf(el) || el.id || interactive(el)) && visible(el))
+      if (q.text != null) {
+        const outer = new Set()
+        for (const el of found) for (let p = up(el); p && !outer.has(p); p = up(p)) outer.add(p)
+        found = found.filter((el) => !outer.has(el))
+      }
+      const at = q.index ?? 0
+      found = at < 0 ? found.slice(Math.max(0, found.length + at)) : found.slice(at)
+      // A selector that finds the element again: from the nearest id unique in its root, else the root, by
+      // child position, `>>>` into shadow roots.
+      const ids = new Map(), paths = new Map()
+      const unique = (root, id) => {
+        if (!ids.has(root)) { const n = new Map(); for (const e of root.querySelectorAll("[id]")) n.set(e.id, (n.get(e.id) ?? 0) + 1); ids.set(root, n) }
+        return ids.get(root).get(id) === 1
+      }
+      const pathOf = (el) => {
+        if (paths.has(el)) return paths.get(el)
+        const root = el.getRootNode()
+        let p
+        if (el.id && unique(root, el.id)) p = (root.host ? pathOf(root.host) + " >>> " : "") + '#' + CSS.escape(el.id)
+        else if (el === document.documentElement) p = "html"
+        else {
+          const step = CSS.escape(el.localName) + ":nth-child(" + ([...(el.parentNode?.children ?? [])].indexOf(el) + 1) + ")"
+          // A shadow root's own child is anchored to it (`:host >`): by position alone it would match a deeper one too.
+          p = el.parentElement ? pathOf(el.parentElement) + " > " + step : root.host ? pathOf(root.host) + " >>> :host > " + step : step
+        }
+        paths.set(el, p)
+        return p
+      }
+      let left = hits, over = false
+      const hitAt = (el, part) => {
+        const [x, y] = mid(part), qx = (part.x1 - part.x0) / 4, qy = (part.y1 - part.y0) / 4
+        for (const [ax, ay] of [[x, y], [x - qx, y - qy], [x + qx, y - qy], [x - qx, y + qy], [x + qx, y + qy]]) {
+          if (left <= 0) { over = true; return null }
+          left--
+          if (!reaches(el, ax, ay)) return true
+        }
+        return false
+      }
+      const out = []
+      for (const el of found) {
+        const r = el.getBoundingClientRect(), part = partOf(el)
+        const enabled = !el.matches(":disabled") && !el.closest("[aria-disabled=true]")
+        const actionable = enabled && !el.closest("[inert]") && shows(part) ? hitAt(el, part) : false
+        if (only && actionable !== true) continue
+        const role = roleOf(el), input = el instanceof HTMLInputElement, toggle = input && (el.type === "checkbox" || el.type === "radio")
+        const checked = toggle ? (el.indeterminate ? null : el.checked) : tri(el.getAttribute("aria-checked"))
+        const expanded = el.localName === "details" ? el.open : el.localName === "summary" && el.parentElement?.localName === "details" ? el.parentElement.open : tri(el.getAttribute("aria-expanded"))
+        const selected = el instanceof HTMLOptionElement ? el.selected : tri(el.getAttribute("aria-selected"))
+        const value = input && el.type === "password" ? el.value.length + " characters"
+          : /^(input|textarea|select)$/.test(el.localName) && !toggle && !/^(button|submit|reset|image|file)$/.test(el.type) ? String(el.value).slice(0, 200)
+          : role === "slider" || role === "spinbutton" ? el.getAttribute("aria-valuetext") ?? el.getAttribute("aria-valuenow") ?? undefined : undefined
+        out.push({ key: el.id || "", path: pathOf(el), role, name: nameOf(el), value, rect: shows(part) ? [part.x0, part.y0, part.x1 - part.x0, part.y1 - part.y0] : [r.left, r.top, r.width, r.height],
+          actionable, focused: el.matches(":focus"), enabled, checked, expanded, selected })
+      }
+      return JSON.stringify({ found: out, cut: over })
+    } finally { s.spent += performance.now() - t0 }
+  }
   return s
 })(), true
 //# sourceURL=strobe-driver.js"#;
@@ -683,6 +826,10 @@ pub struct Driver {
     /// navigates, and between runs): a relative `goto` from a page without one (about:blank after a
     /// reset, a data: or blob: URL) resolves against it.
     base: RefCell<Option<String>>,
+    /// The page runs in a headless browser: no window for `page.window` to size.
+    pub headless: bool,
+    /// `page.window` sizing of the browser's window over the block.
+    sizer: window::Sizer,
 }
 
 impl Driver {
@@ -706,7 +853,76 @@ impl Driver {
             os: std::cell::OnceCell::new(),
             reads: Cell::new(0),
             base: RefCell::new(None),
+            headless: false,
+            sizer: window::Sizer::default(),
         }
+    }
+
+    /// The browser's window, for `page.window`: the processes strobe follows (`set_pids`, `watch`) or
+    /// those the OS input does.
+    fn browser_window(&self) -> Result<crate::host::TopWindow> {
+        let pids = match self.os.get() {
+            Some(os) => os.pids(),
+            None => self.live_pids.borrow().clone(),
+        };
+        crate::host::main_window(&pids).ok_or_else(|| Error::msg(format!("page.window(): the browser (pids {pids:?}) shows no window to size")))
+    }
+
+    /// `page.window(action)` on a page: maximizes, restores or resizes the browser's window through the
+    /// OS, the viewport being the content (`window::Sizer`). Where strobe gives the page the OS's input,
+    /// the map from page to screen follows the size strobe asked for (`OsInput::commanded`).
+    fn window(&self, action: &Value, o: &Value) -> Result<Value> {
+        let Some(sizing) = window::Sizing::parse(action)? else {
+            return Err(Error::usage(format!(
+                "page.window({action}): a page's window is maximized, restored or resized (\"maximize\", \"restore\", {{ resize: {{ width, height }} }}); showing, hiding, minimizing, focusing and closing are a native app's"
+            )));
+        };
+        if self.headless {
+            return Err(Refusal::new(ValidatorId::Headless, "page.window() sizes the browser's window through the OS, and a headless browser has none").fix("run the case headed (drop --headless and the target's headless) to size its window").into());
+        }
+        let w = self.browser_window()?;
+        // The viewport in device-independent pixels: CSS pixels times the device pixels per CSS pixel,
+        // over the window's device pixels per DIP (1 at page zoom 100%).
+        let content = || -> Result<(f64, f64)> {
+            let v = self.page.eval("[innerWidth, innerHeight, devicePixelRatio]")?;
+            let n = |i: usize| v[i].as_f64().unwrap_or(0.0);
+            let k = crate::host::window_state(w.hwnd).map_or(1.0, |s| s.scale()).max(0.01);
+            let r = if n(2) > 0.0 { n(2) / k } else { 1.0 };
+            Ok((n(0) * r, n(1) * r))
+        };
+        let before = match self.os.get() {
+            Some(os) => os.sizing(&self.page)?,
+            None => 0.0,
+        };
+        let asked = self.sizer.apply(w.hwnd, sizing, &content)?;
+        sent(asked, false, None);
+        // The frame capture follows the new size at once (ScreenCaptureKit: the stream's source).
+        if let Some(p) = self.live.get()
+            && let Some(c) = p.borrow_mut().as_mut()
+        {
+            c.resized(&self.live_pids.borrow());
+        }
+        if let Some(os) = self.os.get() {
+            os.commanded(&self.page, before)?;
+        }
+        self.until(o)
+    }
+
+    /// Before run `run` (1-based; `after`: after the last): the browser window's size as each run
+    /// starts, held to the first run's once the block sized it (`window::Sizer::check`). `on`: the block
+    /// checks what runs start from (`resetCheck`).
+    /// Run 1's start is read whatever `on` says: it is where `restore` goes back to.
+    pub fn window_start(&self, run: usize, after: bool, on: bool) -> Result<()> {
+        if self.headless || ((run != 1 || after) && !(on && self.sizer.commanded())) {
+            return Ok(());
+        }
+        let now = self.browser_window().ok().and_then(|w| window::Start::of(w.hwnd));
+        self.sizer.check(run, after, on, now)
+    }
+
+    /// Whether a `page.window` sized the browser's window in this block.
+    pub fn window_sized(&self) -> bool {
+        self.sizer.commanded()
     }
 
     /// Keeps `at` (the page's location) as the base when it is a document's own hierarchical address.
@@ -809,6 +1025,7 @@ impl Driver {
             let quiet = self.settle(Duration::ZERO)?;
             for _ in 1..=count {
                 let pressed = crate::host::now_ns();
+                sent(pressed, false, None);
                 p.actions(json!([pointer(vec![json!({ "type": "pointerDown", "button": n })])]))?;
                 if count == 1 {
                     // Held until what the press drew is on the screen and settled (SPEC 7.4); a target
@@ -842,7 +1059,9 @@ impl Driver {
     /// An input time for `interaction.*` (a single click's release with its press, a key press, a
     /// button's `up`) or `scroll.latency.*` (a scroll's first step).
     fn input_at(&self, scroll: bool, press: Option<u64>) {
-        self.inputs.borrow_mut().push(Sent { t_ns: crate::host::now_ns(), scroll, press, acted: None, burst: false });
+        let t_ns = crate::host::now_ns();
+        sent(t_ns, true, press);
+        self.inputs.borrow_mut().push(Sent { t_ns, scroll, press, acted: None, burst: false });
     }
 
     /// Follows the page's OS presents (a headed page whose engine reports no frames of its own): a
@@ -895,6 +1114,7 @@ impl Driver {
     fn pointer_move(&self, x: f64, y: f64, paced: bool) -> Result<()> {
         let (mask, last) = self.buttons.get();
         self.pointer.set((x, y));
+        sent(crate::host::now_ns(), false, None);
         if mask != 0
             && let Some(d) = self.drags.borrow_mut().last_mut()
         {
@@ -920,7 +1140,9 @@ impl Driver {
         let mask = if down { self.buttons.get().0 | bit } else { self.buttons.get().0 & !bit };
         self.buttons.set((mask, Some(b)));
         if down {
-            self.drags.borrow_mut().push(vec![crate::host::now_ns()]);
+            let t = crate::host::now_ns();
+            sent(t, false, None);
+            self.drags.borrow_mut().push(vec![t]);
         } else if sample {
             // A release is a sample, as a native app's is (SPEC 7.4).
             self.input_at(false, None);
@@ -1010,6 +1232,8 @@ impl Driver {
     /// Lets go of every key and mouse button `down` (or a drag) left held, so the next run starts with none.
     pub fn release_all(&self) -> Result<()> {
         if let Some(os) = self.os.get() {
+            // Where the last move landed after a resize strobe asked for, before the cursor goes back.
+            os.look_landed(&self.page)?;
             os.release_all();
             return Ok(());
         }
@@ -1059,6 +1283,7 @@ impl Driver {
             "goto" => {
                 let to = s(0);
                 let url = self.goto_url(&to)?;
+                sent(crate::host::now_ns(), false, None);
                 self.page.navigate(&url, self.timeout(&opts(1)))?;
                 self.until(&opts(1))
             }
@@ -1078,9 +1303,12 @@ impl Driver {
                     Page::Chromium(_) => {}
                 }
                 self.mouse("mouseMoved", (x, y), None, held, 0, mods)?;
-                // Each press of a double or triple click carries its count, as a mouse's do.
+                // Each press of a double or triple click carries its count, as a mouse's do. Chromium's
+                // trace times a single click's events (`sent`: the action log's edges only).
                 for k in 1..=count {
+                    let pressed = crate::host::now_ns();
                     self.mouse("mousePressed", (x, y), Some(b), held | bit, k, mods)?;
+                    sent(crate::host::now_ns(), count == 1, (count == 1).then_some(pressed));
                     self.mouse("mouseReleased", (x, y), Some(b), held, k, mods)?;
                 }
                 self.until(&o)
@@ -1112,6 +1340,9 @@ impl Driver {
                         s.burst = true;
                     }
                 }
+                if typing == Typing::Burst {
+                    unmeasured();
+                }
                 self.until(&o)
             }
             "press" => {
@@ -1141,6 +1372,7 @@ impl Driver {
                 let speed = o.get("speed").and_then(Value::as_f64).unwrap_or(2000.0);
                 match &self.page {
                     Page::Chromium(p) => {
+                        sent(crate::host::now_ns(), true, None);
                         p.send_long("Input.synthesizeScrollGesture", json!({ "x": x, "y": y, "yDistance": -by, "xDistance": -by_x, "speed": speed, "gestureSourceType": "mouse", "preventFling": true }))?;
                     }
                     Page::Firefox(_) | Page::Webkit(_) => self.paced_wheel((x, y), (by_x, by), speed)?,
@@ -1172,8 +1404,9 @@ impl Driver {
                 }
                 self.until(&opts(2))
             }
-            "window" => Err(Error::usage("page.window() shows, hides, focuses or closes a native app's windows; a page has none of its own")),
-            "act" | "query" => Err(Error::usage(format!("page.{call}() reads a native app's accessibility tree; on a page use eval or Playwright in prepare"))),
+            "window" => self.window(args.first().unwrap_or(&Value::Null), &opts(1)),
+            "act" => Err(Error::usage("page.act() is a native app's accessibility action; on a page click, type or press")),
+            "query" => self.query(&sel(0), &opts(1)),
             "waitFor" => {
                 let o = opts(1);
                 self.wait_for(&Self::sel(&with_text(&sel(0), &o))?, self.timeout(&o))?;
@@ -1241,6 +1474,23 @@ impl Driver {
         opts.get("timeout").and_then(Value::as_u64).map(Duration::from_millis).unwrap_or(self.op_timeout)
     }
 
+    /// `page.query(selector?, { actionable })` on a page: one look through the page probe
+    /// (`__strobe.query`), counted in `driver.reads`; no selector is `*`.
+    fn query(&self, sel: &Value, o: &Value) -> Result<Value> {
+        let sel = if no_selector(sel) { Selector::every(Dialect::Page) } else { Self::sel(sel)? };
+        let only = o["actionable"] == true;
+        let v = self.read(&format!("__strobe.query({}, {QUERY_HITS}, {only})", sel.page_spec()), self.timeout(o))?;
+        let v: Value = v.as_str().and_then(|s| serde_json::from_str(s).ok()).ok_or_else(|| Error::msg("page.query(): the page's elements did not read"))?;
+        if only && v["cut"] == true {
+            return Err(Error::usage(format!(
+                "page.query({}, {{ actionable: true }}): more elements matched than {QUERY_HITS} hit tests can tell actionable or not, so the list would miss some",
+                sel.source
+            ))
+            .hint("narrow the selector (a role, a container's CSS), or query without actionable: elements past the hit tests read actionable: null"));
+        }
+        Ok(v["found"].clone())
+    }
+
     /// Waits for the element, then returns the point to send input at.
     fn locate(&self, sel: &Selector, opts: &Value) -> Result<(f64, f64)> {
         self.aim(sel, opts).map(|(x, y, _)| (x, y))
@@ -1264,10 +1514,17 @@ impl Driver {
         if b.is_null() {
             return Err(Error::msg(format!("no visible element matches {}", sel.source)));
         }
+        let scrolled = b["scrolled"] == true;
+        let hit = |b: &Value| {
+            let rect = b["rect"].as_array().filter(|r| r.len() == 4).map(|r| std::array::from_fn(|i| r[i].as_f64().unwrap_or(0.0)));
+            let point = b["x"].as_f64().zip(b["y"].as_f64()).map(|(x, y)| [x, y]);
+            Hit { role: b["role"].as_str().unwrap_or("").to_string(), key: b["key"].as_str().filter(|k| !k.is_empty()).map(str::to_string), name: b["name"].as_str().unwrap_or("").to_string(), point, rect, scrolled }
+        };
         if focus && b["focused"] == true && b["x"].is_null() {
+            aimed(hit(&b));
             return Ok((0.0, 0.0, true));
         }
-        if b["scrolled"] == true {
+        if scrolled {
             self.call("__strobe.frame()")?;
             b = self.read(&expr, t)?;
             let frames = self.refresh.get() * 2;
@@ -1276,6 +1533,7 @@ impl Driver {
                 None => self.settle(frames)?,
             };
         }
+        aimed(hit(&b));
         match (b["x"].as_f64(), b["y"].as_f64()) {
             (Some(x), Some(y)) => Ok((x, y, b["focused"] == true)),
             _ if b["covered"].is_string() => Err(Refusal::new(
@@ -1424,6 +1682,8 @@ impl Driver {
         self.mods.set(if down { self.mods.get() | bit } else { self.mods.get() & !bit });
         if down && bit == 0 {
             self.input_at(false, None);
+        } else {
+            sent(crate::host::now_ns(), false, None);
         }
         self.key_event(key, down, self.mods.get())
     }

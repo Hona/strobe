@@ -105,6 +105,17 @@ pub struct Sample {
     pub latency_ms: Option<f64>,
 }
 
+impl Sample {
+    /// `sent 32.7 ms`, `unchanged`: as views show it.
+    pub fn text(&self) -> String {
+        let edge = serde_json::to_value(self.edge).ok().and_then(|v| v.as_str().map(str::to_string)).unwrap_or_default();
+        match self.latency_ms {
+            Some(ms) => format!("{edge} {ms:.1} ms"),
+            None => edge,
+        }
+    }
+}
+
 /// One call a hook made to the target.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ActionRecord {
@@ -120,16 +131,18 @@ pub struct ActionRecord {
     /// The innermost `ctx.phase` it ran in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
-    /// When strobe got the call from the runner (its request's arrival) and when it answered, on the
-    /// host clock in ns (the clock of presents and marks). This is the call, not its input: the
-    /// driver's own send time (`frames::Sent::t_ns`) is later by the aim and any wait before it.
-    /// Where the driver reports them, `t_ns` becomes that send time, beside `press_ns`, `hit` and
-    /// `sample` (not yet: SPEC §24.2).
+    /// When its input went out, on the host clock in ns (the clock of presents and marks): the
+    /// driver's own send time of its first measured input (a click's release, a key press, a scroll's
+    /// first step: `frames::Sent::t_ns`), else of its first input, else (a call that sent none) when
+    /// strobe got the request. `end_ns`: when strobe answered it.
     pub t_ns: u64,
-    /// A click's press, when the driver says when it went out.
+    /// A single click's press, when the driver says when it went out.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub press_ns: Option<u64>,
     pub end_ns: u64,
+    /// `t_ns` is an input a latency sample may come from (`join`).
+    #[serde(skip)]
+    pub measured: bool,
     /// The method as the bench file called it: `click`, `type`, `goto`, `call`, `exec`, …
     pub call: String,
     /// What it aimed at as the bench file gave it (its `@name` resolved): a selector string, or the
@@ -211,7 +224,22 @@ impl ActionLog {
         };
         let mut rest = rest;
         let args_truncated = rest.iter_mut().fold(false, |cut, v| bound(v) | cut);
-        Some(ActionRecord { seq: 0, hook, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
+        Some(ActionRecord { seq: 0, hook, run, untimed, phase, t_ns, press_ns: None, end_ns: t_ns, measured: false, call, selector, hit: None, args: rest, args_truncated, outcome: Outcome::Ok, sample: None })
+    }
+
+    /// Each timed run action that ended `ok` gets its latency sample, from the block's per-input outcomes (`each`: by when
+    /// the input was sent, `frames::Reactions::each`), joined after the runs: an action whose measured
+    /// input has one gets it; one inside a run of `runs` (host-clock spans) without one is `unmatched`
+    /// (no frame showed its change in time, or nothing decided it).
+    pub fn join(&mut self, each: &[(u64, Sample)], runs: &[(u64, u64)]) {
+        let by: std::collections::HashMap<u64, &Sample> = each.iter().map(|(t, s)| (*t, s)).collect();
+        for a in self.actions.iter_mut().filter(|a| a.hook == Hook::Run && a.measured && !a.untimed && a.outcome == Outcome::Ok) {
+            if let Some(s) = by.get(&a.t_ns) {
+                a.sample = Some((*s).clone());
+            } else if a.sample.is_none() && runs.iter().any(|&(t0, t1)| a.t_ns >= t0 && a.t_ns <= t1) {
+                a.sample = Some(Sample { edge: SampleEdge::Unmatched, latency_ms: None });
+            }
+        }
     }
 
     /// Writes the log gzipped at `path` (owner-only): a recording's `actions.json.gz`, or beside a

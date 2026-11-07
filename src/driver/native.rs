@@ -90,10 +90,14 @@ mod imp {
         pacer: crate::driver::Pacer,
         /// Reads of the app's tree since the last `take_reads`, and their time (ms): `driver.reads`.
         reads: Cell<(u64, f64)>,
+        /// `page.window` sizing over the block.
+        sizer: crate::driver::window::Sizer,
     }
 
     impl Session {
         pub fn open(pids: &[u32], main: isize) -> Result<Session> {
+            let sizer = crate::driver::window::Sizer::default();
+            sizer.reference(crate::driver::window::Start::of(main));
             Ok(Session {
                 a11y: a11y::open(pids)?,
                 poster: Poster::start()?,
@@ -106,7 +110,53 @@ mod imp {
                 pressed: Cell::new(None),
                 pacer: crate::driver::Pacer::default(),
                 reads: Cell::new((0, 0.0)),
+                sizer,
             })
+        }
+
+        /// Before run `run` (1-based; `after`: after the last): the window's size as each run starts,
+        /// held to the first run's once the block sized it (`window::Sizer::check`). `on`: the block
+        /// checks what runs start from (`resetCheck`).
+        /// Run 1's start is read whatever `on` says: it is where `restore` goes back to.
+        pub fn window_start(&self, run: usize, after: bool, on: bool) -> Result<()> {
+            if (run != 1 || after) && !(on && self.sizer.commanded()) {
+                return Ok(());
+            }
+            let w = self.sizer.sized().unwrap_or(self.main.get());
+            self.sizer.check(run, after, on, crate::driver::window::Start::of(w))
+        }
+
+        /// Whether a `page.window` sized a window of the app in this block.
+        pub fn window_sized(&self) -> bool {
+            self.sizer.commanded()
+        }
+
+        /// Screen points to `win`'s client area in device-independent pixels, the points `page.move`
+        /// takes (`Poster::client_point` the other way): the client area's origin on the screen and
+        /// screen units per DIP.
+        fn client_map(&self, win: isize) -> Option<((f64, f64), f64)> {
+            let (ox, oy) = self.poster.client_point(win, 0.0, 0.0).ok()?;
+            let (ux, _) = self.poster.client_point(win, 100.0, 0.0).ok()?;
+            Some(((ox, oy), ((ux - ox) / 100.0).abs().max(0.01)))
+        }
+
+        /// What the action log keeps of node `i` as an input aims at it (`point`: a screen point).
+        fn hit_of(&self, tree: &Tree, i: usize, point: Option<(f64, f64)>) -> crate::store::actions::Hit {
+            let n = &tree.nodes[i];
+            let d = tree.describe(i);
+            let map = self.client_map(tree.windows[n.window]);
+            let to = |x: f64, y: f64| map.map_or([x, y], |((ox, oy), u)| [(x - ox) / u, (y - oy) / u]);
+            let r = tree.visible_rect(i).unwrap_or(n.rect);
+            let u = map.map_or(1.0, |m| m.1);
+            let at = to(r[0], r[1]);
+            crate::store::actions::Hit {
+                role: d["role"].as_str().unwrap_or("").to_string(),
+                key: Some(n.id.clone()).filter(|k| !k.is_empty()),
+                name: n.name.split_whitespace().collect::<Vec<_>>().join(" "),
+                point: point.map(|(x, y)| to(x, y)),
+                rect: Some([at[0], at[1], r[2] / u, r[3] / u]),
+                scrolled: false,
+            }
         }
 
         /// The reads of the app's tree since the last call, and their time (ms): `driver.reads`,
@@ -218,6 +268,7 @@ mod imp {
         }
 
         fn input(&self, t_ns: u64, kind: &'static str, first: bool) {
+            crate::driver::sent(t_ns, kind == "discrete" || (kind == "scroll" && first), None);
             self.last_input.set(t_ns);
             self.log.borrow_mut().inputs.push(Input { t_ns, kind, first, press_ns: None, burst: false });
         }
@@ -341,6 +392,7 @@ mod imp {
                 ));
             }
             let t = self.poster.target(&self.pids.borrow(), x, y)?;
+            crate::driver::aimed(self.hit_of(tree, i, Some((x, y))));
             Ok((x, y, t))
         }
 
@@ -748,6 +800,7 @@ mod imp {
                     && let Some(i) = self.log.borrow_mut().inputs.last_mut()
                 {
                     i.press_ns = Some(pressed);
+                    crate::driver::sent(last, true, Some(pressed));
                 }
             }
             self.until(opts, last, presents).map_err(|e| self.moved(e, &selector, opts, aimed))
@@ -838,6 +891,63 @@ mod imp {
     }
 
     impl Session {
+        /// `page.query(selector?, { actionable, window })`: the visible elements the selector matches now
+        /// (every visible one without a selector), each with its rect in its window's client area (DIP,
+        /// the points `page.move` takes), and `actionable`: enabled, visible, and what the OS hit-tests at
+        /// its centre is it (at most `QUERY_HITS` hit tests, null past them). A secure field's value is
+        /// its length. The read and its hit tests count as one read of the tree (`driver.reads`).
+        fn query(&self, sel: &Value, o: &Value) -> Result<Value> {
+            let sel = if no_selector(sel) { Selector::every(a11y::Dialect::Native) } else { parse_sel(sel)? };
+            let only = o["actionable"] == true;
+            let at = Instant::now();
+            let tree = self.a11y.snapshot(&self.windows(o["window"].as_str())?)?;
+            let mut maps = std::collections::HashMap::new();
+            let (mut left, mut cut) = (crate::driver::QUERY_HITS, false);
+            let mut out = Vec::new();
+            for i in tree.find(&sel) {
+                let n = &tree.nodes[i];
+                let shown = tree.visible_rect(i);
+                let actionable = match shown {
+                    Some(r) if n.enabled && left > 0 => {
+                        left -= 1;
+                        Some(self.a11y.hit(i, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)?.is_ok())
+                    }
+                    Some(_) if n.enabled => {
+                        cut = true;
+                        None
+                    }
+                    _ => Some(false),
+                };
+                if only && actionable != Some(true) {
+                    continue;
+                }
+                let mut d = tree.describe(i);
+                let win = tree.windows[n.window];
+                if let Some(((ox, oy), u)) = *maps.entry(win).or_insert_with(|| self.client_map(win)) {
+                    let r = shown.unwrap_or(n.rect);
+                    d["rect"] = json!([(r[0] - ox) / u, (r[1] - oy) / u, r[2] / u, r[3] / u]);
+                }
+                let secure = n.role_text.to_ascii_lowercase().contains("secure") || n.role_text.to_ascii_lowercase().contains("password");
+                if let (true, Some(v)) = (secure, &n.value) {
+                    d["value"] = json!(format!("{} characters", v.chars().count()));
+                }
+                d["actionable"] = json!(actionable);
+                d["expanded"] = Value::Null;
+                d["selected"] = Value::Null;
+                out.push(d);
+            }
+            self.counted(at, ());
+            if only && cut {
+                return Err(Error::usage(format!(
+                    "page.query({}, {{ actionable: true }}): more elements matched than {} hit tests can tell actionable or not, so the list would miss some",
+                    sel.source,
+                    crate::driver::QUERY_HITS
+                ))
+                .hint("narrow the selector (a key path, a role, window), or query without actionable: elements past the hit tests read actionable: null"));
+            }
+            Ok(Value::Array(out))
+        }
+
         /// One page call from the runner. `pixels`: a pixels block's folder for `snapshot`.
         pub fn dispatch(&self, call: &str, args: &[Value], presents: &RefCell<Option<PresentCapture>>, pixels: Option<&std::path::Path>) -> Result<Value> {
             let s = |i: usize| args.get(i).and_then(Value::as_str).unwrap_or("").to_string();
@@ -895,6 +1005,9 @@ mod imp {
                         {
                             i.burst = true;
                         }
+                    }
+                    if typing == crate::driver::Typing::Burst {
+                        crate::driver::unmeasured();
                     }
                     self.until(&o, last, presents)?;
                 }
@@ -1001,7 +1114,8 @@ mod imp {
                 }
                 "act" => {
                     let o = opts(2);
-                    let (_, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                    let (tree, i) = self.find(&parse_sel(&sel(0))?, o["window"].as_str(), timeout(&o))?;
+                    crate::driver::aimed(self.hit_of(&tree, i, None));
                     // `{ value: 0.2 }` is as good as `{ value: "0.2" }` (a number was dropped as "").
                     let value = match &o["value"] {
                         Value::Number(n) => Some(n.to_string()),
@@ -1015,13 +1129,7 @@ mod imp {
                     }
                     self.until(&o, at, presents)?;
                 }
-                "query" => {
-                    let o = opts(1);
-                    let tree = self.snapshot(o["window"].as_str())?;
-                    let sel = parse_sel(&sel(0))?;
-                    let found: Vec<Value> = tree.find(&sel).into_iter().map(|i| tree.describe(i)).collect();
-                    return Ok(Value::Array(found));
-                }
+                "query" => return self.query(&sel(0), &opts(1)),
                 "waitFor" => {
                     let o = opts(1);
                     self.find(&parse_sel(&crate::driver::with_text(&sel(0), &o))?, o["window"].as_str(), timeout(&o))?;
@@ -1039,7 +1147,25 @@ mod imp {
                 "window" => {
                     let o = opts(1);
                     let w = self.windows(o["window"].as_str())?[0];
-                    self.poster.window(w, &s(0))?;
+                    if w == 0 {
+                        return Err(crate::model::Refusal::new(crate::model::ValidatorId::NotForTarget, "page.window(): the app shows no window (a windowless target)").fix("drop page.window from a case of a windowless target").into());
+                    }
+                    let action = args.first().cloned().unwrap_or(Value::Null);
+                    let at = match crate::driver::window::Sizing::parse(&action)? {
+                        Some(sizing) => {
+                            // The client area in DIP (macOS: the whole frame, as a native target's viewport is).
+                            let content = || host::window_placement(w).map(|p| (p.client.0 / p.per_dip, p.client.1 / p.per_dip)).ok_or_else(|| Error::msg("page.window(): the window closed"));
+                            let at = self.sizer.apply(w, sizing, &content)?;
+                            // The frame capture follows the new size at once (ScreenCaptureKit: the stream's source).
+                            if let Some(p) = presents.borrow_mut().as_mut() {
+                                p.resized(&self.pids.borrow());
+                            }
+                            at
+                        }
+                        None => self.poster.window(w, &s(0))?,
+                    };
+                    crate::driver::sent(at, false, None);
+                    self.until(&o, at, presents)?;
                 }
                 "snapshot" => {
                     let Some(dir) = pixels else { return Ok(Value::Bool(false)) };

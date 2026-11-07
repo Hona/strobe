@@ -9,7 +9,7 @@ use crate::host;
 use crate::model::{Error, Refusal, Result, ValidatorId, WebEngine};
 use serde_json::{Value, json};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub enum WebBrowser {
     Chromium(chromium::Browser),
@@ -193,10 +193,17 @@ fn room_key(engine: WebEngine, scale: Option<f64>, display: &host::WorkArea) -> 
     format!("{} · scale {} · work area {:?} of {:?}", browser_identity(engine, false), scale.map_or("display".to_string(), |s| s.to_string()), r(display.work), r(display.screen))
 }
 
+/// Keeps `r` for its room key, unless the room kept was read in a taller window: a browser's part may
+/// be smaller in a short window (Firefox's compact toolbars under 720 CSS pixels), and what a plan and
+/// a bench judge by is the most a page can be, in the tallest window, so a small page's fit never
+/// makes a large one look as if it fits.
 fn remember(engine: WebEngine, scale: Option<f64>, browser: &str, r: &Room) {
     let mut all: Value = std::fs::read(rooms_file()).ok().and_then(|b| serde_json::from_slice(&b).ok()).filter(Value::is_object).unwrap_or_else(|| json!({}));
-    let entry = json!({ "browser": browser, "area": r.area, "chrome": [r.chrome.0, r.chrome.1] });
+    let entry = json!({ "browser": browser, "area": r.area, "chrome": [r.chrome.0, r.chrome.1], "window_height": r.window[3] });
     let key = room_key(engine, scale, &r.display);
+    if all[&key]["window_height"].as_f64().is_some_and(|h| h > r.window[3] + 1.0) {
+        return;
+    }
     if all[&key] != entry {
         all[&key] = entry;
         let _ = host::paths::write_atomic(&rooms_file(), &serde_json::to_vec_pretty(&all).unwrap_or_default());
@@ -340,33 +347,61 @@ impl WebBrowser {
 
     /// Sizes the window so the page is the target's viewport, `width`×`height` CSS pixels (SPEC 9.10
     /// "Declared viewport"), never by emulating a viewport the window does not have. Headed, the window
-    /// is moved inside the display's work area where it fits there, and the page is read until it takes
-    /// the size (at most 2 s): a size this display cannot show refuses `DisplayTooSmall`, naming the
-    /// largest page this browser's window shows on it, which strobe keeps for the next plan and bench
-    /// (`known_room`). A read that is no measure (`Room::sane`: no page, a window smaller than its page,
-    /// a locked session) is neither kept nor refused by. Any other difference is left to the block's
-    /// viewport check.
+    /// is moved inside the display's work area where it fits there. Each ask is sized from a read of the
+    /// page and window that held still for 100 ms (at most 1 s before the first), so a window still
+    /// taking its last size lends no part of its own; then the page is read until it shows the size and
+    /// holds still 100 ms (at most 2 s after each ask). A browser may lay its own part out again once its
+    /// window takes a size (Firefox makes its toolbars compact in a window under 720 CSS pixels tall, and
+    /// normal again above): a page that holds still at another size, its window's part changed since the
+    /// ask, is asked again with the part it has now, at most twice. A size this display cannot show
+    /// refuses `DisplayTooSmall`, naming the largest page this browser's window shows on it, which strobe
+    /// keeps for the next plan and bench (`known_room`). A read that is no measure (`Room::sane`: no page,
+    /// a window smaller than its page, a locked session) is neither kept nor refused by. Any other
+    /// difference is left to the block's viewport check.
     pub fn fit_viewport(&self, page: &WebPage, width: u32, height: u32, headless: bool) -> Result<()> {
-        let before = if headless { None } else { room(page)? };
-        let at = before.map(|r| r.place((self.window().x, self.window().y), (width as f64 + r.chrome.0, height as f64 + r.chrome.1)));
-        self.fit_viewport_at(page, width, height, at)?;
-        if before.is_none() {
-            return Ok(());
+        if headless {
+            return self.fit_viewport_at(page, width, height, None);
         }
+        let ask = |r: &Room| self.fit_viewport_at(page, width, height, Some(r.place((self.window().x, self.window().y), (width as f64 + r.chrome.0, height as f64 + r.chrome.1))));
         // Chromium names itself by its product token (`Edg/156.0.4314.58`).
         let browser = self.version().replacen('/', " ", 1);
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        // The read the last ask was sized from (none before the first), and until when the page may take it.
+        let (mut asked, mut asks, mut deadline): (Option<Room>, u32, Instant) = (None, 0, Instant::now() + Duration::from_secs(1));
+        // The page and window as last read, and since when they hold still.
+        let (mut last, mut still) = (None, Instant::now());
         let r = loop {
-            let Some(r) = room(page)? else { return Ok(()) };
-            let shown = (r.page.0 - width as f64).abs() <= 1.0 && (r.page.1 - height as f64).abs() <= 1.0 && r.inside();
-            if shown {
-                if r.sane() {
-                    remember(self.engine(), self.window().scale, &browser, &r);
-                }
-                return Ok(());
+            let Some(r) = room(page)? else {
+                // No display strobe can read: sized by the browser's own reads alone.
+                return if asked.is_none() { self.fit_viewport_at(page, width, height, None) } else { Ok(()) };
+            };
+            let now = Some((r.page, r.window));
+            if now != last {
+                (last, still) = (now, Instant::now());
             }
-            if std::time::Instant::now() >= deadline {
-                break r;
+            let held = still.elapsed() >= Duration::from_millis(100);
+            let late = Instant::now() >= deadline;
+            let ask_now = match asked {
+                None => held || late,
+                Some(a) => {
+                    let shown = (r.page.0 - width as f64).abs() <= 1.0 && (r.page.1 - height as f64).abs() <= 1.0 && r.inside();
+                    if shown && held {
+                        if r.sane() {
+                            remember(self.engine(), self.window().scale, &browser, &r);
+                        }
+                        return Ok(());
+                    }
+                    let relaid = (r.chrome.0 - a.chrome.0).abs() > 1.0 || (r.chrome.1 - a.chrome.1).abs() > 1.0;
+                    let again = relaid && held && asks < 3 && r.sane();
+                    if !again && late {
+                        break r;
+                    }
+                    again
+                }
+            };
+            if ask_now {
+                ask(&r)?;
+                (asked, asks, deadline, last) = (Some(r), asks + 1, Instant::now() + Duration::from_secs(2), None);
+                continue;
             }
             std::thread::sleep(Duration::from_millis(50));
         };

@@ -191,35 +191,51 @@ impl Sizer {
             }
         };
         let near = |c: (f64, f64), w: (f64, f64)| (c.0 - w.0).abs() <= NEAR_DIP && (c.1 - w.1).abs() <= NEAR_DIP;
+        // The window's own part (DIP): its frame less its content.
+        let part = |p: &Placement, c: (f64, f64)| (p.frame[2] / p.per_dip - c.0, p.frame[3] / p.per_dip - c.1);
         // Until the window took it and its content held still for 100 ms, at most `SETTLE`: the content
-        // and the window's place then.
-        let settle = || -> Result<((f64, f64), Placement)> {
+        // and the window's place then. A window whose content moved off `from` (what it was as strobe
+        // asked) and whose frame and content then hold still 100 ms short of the size, its own part no
+        // longer `asked_part`, has laid its part out again: no use waiting more. (Content that has not
+        // moved yet is an app still taking the frame, whose part only looks changed.)
+        let settle = |from: (f64, f64), asked_part: (f64, f64)| -> Result<((f64, f64), Placement)> {
             let deadline = Instant::now() + SETTLE;
-            let (mut last, mut still) = (content()?, Instant::now());
+            let (mut last, mut still) = ((content()?, host::window_placement(hwnd).ok_or_else(gone)?.frame), Instant::now());
             loop {
                 std::thread::sleep(Duration::from_millis(20));
                 let now = content()?;
                 let placed = host::window_placement(hwnd).ok_or_else(gone)?;
-                if now != last {
-                    (last, still) = (now, Instant::now());
+                if (now, placed.frame) != last {
+                    (last, still) = ((now, placed.frame), Instant::now());
                 }
-                let took = match want {
-                    Some(w) => near(now, w),
-                    None => placed.maximized,
+                let held = still.elapsed() >= Duration::from_millis(100);
+                let (took, relaid) = match want {
+                    Some(w) => (near(now, w), !near(now, from) && !near(part(&placed, now), asked_part)),
+                    None => (placed.maximized, false),
                 };
-                if (took && still.elapsed() >= Duration::from_millis(100)) || Instant::now() >= deadline {
-                    return Ok((last, placed));
+                if (held && (took || relaid)) || Instant::now() >= deadline {
+                    return Ok((now, placed));
                 }
             }
         };
         let clamped = |p: &Placement| p.frame[2] >= p.work[2] - SLACK_DIP * p.per_dip || p.frame[3] >= p.work[3] - SLACK_DIP * p.per_dip;
-        let (mut last, mut placed) = settle()?;
+        let asked_part = match s {
+            Sizing::Restore => part(&saved, saved_c),
+            Sizing::Maximize | Sizing::Resize(..) => part(&p0, c0),
+        };
+        let (mut last, mut placed) = settle(c0, asked_part)?;
         // A window's own part may change as it takes a size (a browser lays out its toolbars again):
-        // measured once more and asked again, once, at the scale and in the work area it has now.
+        // measured once more and asked again, once, at the scale and in the work area it has now; a size
+        // that no longer fits that work area with the new part refuses as the first would have.
         if let Some(w) = want.filter(|w| !near(last, *w) && !clamped(&placed)) {
-            let (f, k) = (placed.frame, placed.per_dip);
-            host::set_window_frame(hwnd, inside(&placed, (f[2] + (w.0 - last.0) * k, f[3] + (w.1 - last.1) * k)))?;
-            (last, placed) = settle()?;
+            let (f, k, work) = (placed.frame, placed.per_dip, placed.work);
+            let size = (f[2] + (w.0 - last.0) * k, f[3] + (w.1 - last.1) * k);
+            if size.0 > work[2] + 2.0 * SLACK_DIP * k || size.1 > work[3] + SLACK_DIP * k {
+                return Err(too_small(s, size, (f[2] - last.0 * k, f[3] - last.1 * k), work, k));
+            }
+            let from = last;
+            host::set_window_frame(hwnd, inside(&placed, size))?;
+            (last, placed) = settle(from, part(&placed, from))?;
         }
         match want {
             Some(w) if !near(last, w) => {

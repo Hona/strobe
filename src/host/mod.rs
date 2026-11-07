@@ -4,6 +4,7 @@ pub(crate) mod adb;
 pub mod build;
 pub mod git;
 pub mod http;
+pub mod ios;
 pub mod paths;
 pub mod power;
 pub mod reserve;

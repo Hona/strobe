@@ -44,6 +44,23 @@ msvc-demangler = "0.11"
 # Result cards and badges (`report --format card|badge`): SVG text set in the embedded font, outlined, and
 # rasterized to PNG; pure Rust (usvg, rustybuzz, tiny-skia), no system fonts.
 resvg = { version = "0.49", default-features = false, features = ["text"] }
+# iOS devices (host/ios.rs): usbmuxd, lockdownd and their services speak XML and binary property lists.
+plist = { version = "1", default-features = false }
+# iOS devices: lockdownd sessions and services run over mutual TLS with the pair record's certificates.
+# No built-in crypto backend (ring and aws-lc-rs need a C compiler): host/ios/tls.rs supplies a minimal
+# one over the RustCrypto crates below, all pure Rust.
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+# iOS TLS: AES-GCM records.
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "alloc"] }
+# iOS TLS: HMAC for the TLS 1.2 PRF and TLS 1.3 HKDF.
+hmac = "0.12"
+# iOS TLS: signing with the pair record's RSA host key and checking the device's RSA signatures.
+rsa = { version = "0.9", default-features = false, features = ["std", "u64_digit", "sha2"] }
+# iOS TLS: X25519 and P-256 key exchange.
+x25519-dalek = { version = "2", default-features = false, features = ["zeroize"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdh", "std"] }
+# iOS TLS: the OS random source for the RustCrypto keys (getrandom 0.2, already in the tree).
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [target.'cfg(unix)'.dependencies]
 # Linux and macOS system calls (affinity, CPU clocks, sysctl, proc_pidinfo, perf_event_open, dlopen); bindings only, no C build.

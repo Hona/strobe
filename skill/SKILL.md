@@ -16,6 +16,8 @@ strobe status [--calibrate]
 ```
 
 - Environment, validity preflight, recent handles.
+- `ios`: phones on a cable: model, iOS, USB/Wi-Fi, battery, temperature, locked; never the name.
+- Read-only toward the phone: an untrusted one needs the user to unlock it and tap Trust.
 
 ### `strobe record`
 

@@ -229,7 +229,7 @@ validity/       validators, analysers, calibration, A/A (§10)
 symbol/         source maps, packages, owners, PDBs (§12)
 report/         views → text, JSON, markdown, HTML (§11)
 mcp/            MCP server: Streamable HTTP for the daemon, stdio (hidden)
-host/           paths, processes, sockets, autostart, opencode registration, mesh, git
+host/           paths, processes, sockets, autostart, opencode registration, mesh, git, iOS devices
 ui/             embedded viewer and calibration assets
 ```
 
@@ -368,6 +368,20 @@ Reports: environment (§9.4 provenance fields), a validity preflight (idle load 
 engine, attachable targets (running apps and their bridge state, CDP endpoints found through
 `DevToolsActivePort` files, installed apps), recordings disk use, last calibration.
 `--calibrate` runs the full calibration (§10.3).
+
+iOS devices (`ios` row, `ios.devices` in JSON): every phone the OS's usbmuxd sees, read beside the
+idle-load sample within 1.5 s for all of them (`--fast`: 250 ms, without the temperature): model
+(`ProductType`), iOS version, link (USB, Wi-Fi or both), battery level and charging (lockdownd's
+battery domain), battery temperature (diagnostics_relay's `IOPMPowerSource`, kept only between 0
+and 100 °C), and locked (on the lock screen with a passcode). A phone only on Wi-Fi is listed, not
+read. Never the phone's name: a personal phone's name is its owner's. The JSON carries the full
+UDID, to select the phone as a target; the text prints its last 8 characters (a current UDID's
+first 8 are the chip id, the same for every phone of a model). No usbmuxd (Windows without Apple
+Mobile Device Service, Linux without the usbmuxd package) is information, not a problem; Linux's
+usbmuxd runs only while a phone is plugged in, so an installed one without a socket reads as no
+phone. strobe reads with the trust the user already gave this computer (the
+pair record usbmuxd keeps) and is read-only toward the phone: it never pairs, sets a value or
+installs anything; an untrusted phone says to unlock it and tap Trust.
 
 ### 5.5 `strobe record`
 
@@ -5453,6 +5467,7 @@ code is and where it chose differently, so nobody reads a promise as a feature.
 | native | native targets (§13.7): `native()` bench targets, `record` of a native app, outside-in `cpu.wakes`, `io.*`, per-thread wakes and names, `ui.cpu` and `ui.wakes` (the main window's thread), window placement and checks, window-condition launches; driving through the OS accessibility tree (Windows UI Automation: selectors by key path, role, text, focus; event-driven waits; `page.act`, `page.query`) with posted window messages (pointer at hit-tested points with the cursor parked, keys with modifiers in the shared key state), selector launches timed to the frame that showed the element, `interaction.*` and `scroll.latency.*` from strobe's inputs to OS presents (§7.4), phase marks and `hotspots --phase`; `{cache}` builds with copied outputs; windowless (`window: false`) targets and milestone launches; benches on a locked session (§10.5); validators `VariantMismatch` (adapter, scale), `UnpacedSpin` (from presents), `NoPresentSource`, `AmbiguousInteraction`, `PatternInput`, native `DevBuild` (debug C runtime), `SoftwareGpu`, `Throttled`; native stacks in attribution blocks (phase 6 row) | `frames.presented.*` from outside; macOS driving and ScreenCaptureKit frames not yet run with the permissions granted (§24.1) |
 | webview | apps on the OS's webview (§13.8): `kind: "webview"` profiles, `webview()` bench targets, `record app:<id>`; Windows WebView2 attached over CDP through its environment variables (checked on adais, locked, with a release Tauri v2 app: launch, the user's own WEBVIEW2_* removed, strobe's arguments beside the app's, browser pid in the process set, page eval, trace, CPU and memory over the app and its WebView2 processes, attribution and memory recordings, WebView2's GPU caches kept per executable, closing in 5 s instead of 11.5 s for a 1 s recording); Linux and macOS refused `EngineUnsupported` before anything launches (vps) | WebKit drivers (the WebKitGTK inspector route is checked, §13.8); on an unlocked Windows session: frames, input latency, window sizing to `viewport` and a `bench --check` of a `webview()` target; the override refusal against a real WebView2 policy; `look` of a webview profile reads its accessibility tree, not its page |
 | 6 | Windows: the deep helper (§13.4), OS present events (`record pid:|proc:`, `--os-frames`), native stacks and PDB symbols (`hotspots`, insights, reports) | context switches, core residency, symbols.electronjs.org; Linux perf stacks and macOS `sample` stacks with DWARF symbols are built (§13.4) |
+| ios | `host/ios.rs` (§5.4): usbmuxd (`/var/run/usbmuxd`, Windows 127.0.0.1:27015, `USBMUXD_SOCKET_ADDRESS`), `ListDevices`, `ReadPairRecord`, `Connect`; lockdownd `QueryType`, `GetValue`, `StartSession` with mutual TLS (rustls over a minimal in-tree crypto provider on the RustCrypto crates, `host/ios/tls.rs`: AES-GCM, X25519 and P-256, RSA; the device pinned by the pair record's DeviceCertificate SubjectPublicKeyInfo), `StartService` with `EnableServiceSSL`; diagnostics_relay `IORegistry` of `IOPMPowerSource`; one deadline over every read and write; the `status` row. Checked: builds and clippy on Windows, macOS and Linux; `ListDevices` on air with no phone returns an empty list; adais without Apple Mobile Device Service reports no usbmuxd; vps without usbmuxd says so; against a stand-in usbmuxd, lockdownd and diagnostics_relay on Node's TLS (OpenSSL) on adais: TLS 1.3 and 1.2, AES-128 and AES-256, X25519 and P-256 with the client certificate, a wrong device certificate refused, no pair record named, a silent device cut at the deadline (status 3.5 s in all, 0.65 s with `--fast`) | a real phone: the session handshake against iOS's TLS, the battery read and whether lockdownd still starts `com.apple.webinspector` on iOS 18/26 or it needs RemoteXPC; Web Inspector, device logs, crash reports, driven Safari benches |
 | 7 | history: `strobe track` (points, E-divisive change points, paired confirmation, bisect to the culprit, alert hooks, daemon schedules), `history`, `query history` and `query changes`, `report history` (§25) | CI budgets, mesh; cheap paired points (each commit against the previous tracked one) |
 
 Query views built: `summary` (with per-run style, layout and paint), `frames`, `threads` (a native recording's: its threads' wakes and CPU;

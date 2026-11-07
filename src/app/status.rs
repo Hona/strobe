@@ -14,6 +14,10 @@ pub fn run(args: &Args) -> Result<Output> {
     if let Some(p) = args.pos.first() {
         return Err(Error::usage(format!("status takes no target ({p}): it checks this device; strobe look {p} checks that a target loads")));
     }
+    // Cabled iOS devices, read beside the idle-load sample, within its time (SPEC §19); `--fast` skips
+    // the battery temperature (one more service and handshake).
+    let fast = args.has("fast");
+    let ios = std::thread::spawn(move || host::ios::summaries(std::time::Duration::from_millis(if fast { 250 } else { 1500 }), !fast));
     let env = host::env();
     let topo = host::topology();
     let busy = host::system_busy(if args.has("fast") { 300 } else { 3000 });
@@ -97,6 +101,7 @@ pub fn run(args: &Args) -> Result<Output> {
         problems.push(format!("CPU time metrics are refused: {why}"));
     }
     let cycle_clock = host::cycle_clock_text();
+    let ios = ios.join().unwrap_or_else(|_| Err(Error::msg("the iOS device read panicked")));
     let calibration = if args.has("calibrate") { super::up::calibrate(true)? } else { state.get("last_calibration").cloned().unwrap_or(Value::Null) };
     if calibration.is_null() {
         problems.push("no calibration yet (strobe up)".into());
@@ -111,6 +116,7 @@ pub fn run(args: &Args) -> Result<Output> {
         "deep": { "access": deep, "presents": deep.presents(), "detail": deep_text },
         "native": { "ready": native_ok, "detail": native_text },
         "cycle_clock": { "detail": cycle_clock, "refused": cycles_refused },
+        "ios": match &ios { Ok(d) => json!({ "devices": d }), Err(e) => json!({ "devices": [], "detail": e.message }) },
     });
     let mark = |ok: bool| if ok { "✓" } else { "!" };
     let mut t = String::new();
@@ -127,6 +133,15 @@ pub fn run(args: &Args) -> Result<Output> {
     t += &format!("  {} browser    {browser_text}\n", mark(browser.is_some()));
     t += &format!("  {} firefox    {}\n", if firefox.is_some() { "✓" } else { "i" }, firefox_text.as_deref().unwrap_or("none (only for --engine firefox)"));
     t += &format!("  {} webkit     {}\n", if webkit { "✓" } else { "i" }, webkit_text);
+    match &ios {
+        Ok(d) if d.is_empty() => t += "  i ios        none on a cable\n",
+        Ok(d) => {
+            for (i, s) in d.iter().enumerate() {
+                t += &format!("  {} {}{}\n", if s.problem.is_none() { "✓" } else { "!" }, if i == 0 { "ios        " } else { "           " }, host::ios::describe(s));
+            }
+        }
+        Err(e) => t += &format!("  i ios        {}{}\n", e.message, e.hint.as_ref().map(|h| format!(" ({h})")).unwrap_or_default()),
+    }
     t += &format!("  {} bun        {}\n", mark(bun.is_some()), bun.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| "none".into()));
     t += &format!("  {} deep       {}\n", mark(deep.presents() && deep.helper), deep_text);
     t += &format!("  {} native     {}\n", mark(native_ok), native_text);

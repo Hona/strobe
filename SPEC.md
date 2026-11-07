@@ -582,7 +582,8 @@ guard. `prepare`, a `url` function and `setup` run once for a launch's cases, so
 launch); `run` and `reset` get each case's own `ctx.case`, `ctx.seed` and `ctx.random()`. A launch
 keeps one recording, its trace marked `case:<i>:<name>:start|end` around each case, its runs
 numbered across its cases (`run:<i>`), its `meta.json` `batch` listing each case's label, measured
-runs and values, its action log naming each run's and reset's case (§9.6), and with `--video` one
+runs and values (`query <rec> summary` lists them, and `query <exp> actions` shows each case only
+its own actions), its action log naming each run's and reset's case (§9.6), and with `--video` one
 film of the launch with each case's span. `result.json` has `batch` (`size`, `launches`, `cases`,
 `failed_launches`, `launch_ms_mean`: a launch's own time besides its cases, and `saved_ms`: that
 time for each case after a launch's first) and each series `batch_id` (its launch, from 1) and
@@ -6547,7 +6548,14 @@ process host exited (code 3)"); a file whose setup throws stopped after three la
 page file (two cases × two params) took 33 s with `--batch 5` against 67 s, two launches (one per
 params value), and its navigation file, whose `prepare` reads `ctx.case`, was refused with exit 2.
 Clippy `-D warnings` clean on Windows, macOS (air) and Linux (vps). Not run: a windowed native app and
-a headed page in a batch (adais's session is locked).
+a headed page in a batch (adais's session is locked). One block is a launch of one case and takes the
+same path: an A/A (`--aa --pairs 8 --why always`, a headless page series and a script series) on vps
+with this build and with the main before it gave the same block steps in the same order (`quiet
+launch attach prepare load checks setup warmup runs trace analyse close`; attribution blocks also
+`maps`, `heap`), the same files in every attribution and kept recording and the same meta.json keys,
+the same value keys (but one `warmup.unsteady`), no verdict in either, and block medians within run
+to run noise (`cpu.work` +1.3%, `main.work` −0.3%, `run.duration` −0.5% on the page; the script's
+`cpu.work` −0.5%).
 
 Not built: times on macOS samples, per-thread wakes on macOS (root only). Not checked on hardware: Linux DRM client statistics (the VM's virtio GPU prints
 none, so it reads unreadable), Linux display refresh, macOS GPU time against a GPU-bound app,

@@ -279,7 +279,7 @@ pub fn launch(window: &Window, headless: bool, cpus: Option<u64>) -> Result<Brow
         return Err(Refusal::new(ValidatorId::NoPresentSource, "a headed WebKitGTK page needs a display, and this session has none (no DISPLAY or WAYLAND_DISPLAY)")
             // Not WPE headless: its pages see no pointer at all, which a desktop page target refuses
             // (`DeviceMismatch`).
-            .fix("run on a desktop session, under a virtual X server (xvfb-run -a strobe ...: frame and present metrics are refused there), or measure the page in Chromium or Firefox")
+            .fix("run on a desktop session or under a virtual X server (xvfb-run -a strobe ...), or measure the page in Chromium or Firefox")
             .into());
     }
     let mut started = Started::new(&install.browser);

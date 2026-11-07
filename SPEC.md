@@ -4078,10 +4078,10 @@ is the stable path: Safari's BiDi is not usable yet.
   with the window brought forward where macOS lets it; a Safari that does not answer them behind other
   apps refuses `WindowHidden` (the block waits until nobody has used the Mac for a minute).
 - Desktop input: WebKit has no setting for the input devices a page sees, so a page sees the machine's.
-  WPE's headless view (2.48, vps) matches `(hover: none)` and no pointer: every WPE headless page block
-  is refused `DeviceMismatch`, so a headed WebKitGTK page without a display is told to run under
-  `xvfb-run -a` (its virtual pointer is a mouse) or in Chromium or Firefox, not `--headless`. Safari
-  headed reports the machine's mouse or trackpad.
+  WPE's headless view (2.48, vps) is a touch device: `(hover: none)`, `(any-pointer: coarse)`, no fine
+  pointer, `ontouchstart` (0 touch points): every WPE headless page block is refused `DeviceMismatch`
+  (`touch`), so a headed WebKitGTK page without a display is told to run under `xvfb-run -a` or in
+  Chromium or Firefox, not `--headless`. Safari headed reports the machine's mouse or trackpad.
 - Known differences from a person's browser, where the engine gives no switch: the page's own first
   scripts see `navigator.webdriver` true (no preload), and Safari plays the page's sound (no mute).
 - Frames and interaction as Firefox's (OS presents; macOS ScreenCaptureKit needs Screen Recording);

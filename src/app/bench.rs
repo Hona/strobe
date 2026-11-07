@@ -4676,7 +4676,8 @@ fn restate_recording(ctx: &Ctx, s: &Series, b: &Block) {
     let Some(dir) = b.recording.as_deref().and_then(|id| store::resolve(id).ok()) else { return };
     let Ok(mut meta) = store::read_json(&dir.join("meta.json")) else { return };
     // A batch's recording holds each case's values by its label (`batch::meta`).
-    match meta["batch"].as_array_mut().and_then(|a| a.iter_mut().find(|c| c["label"] == s.label().as_str())) {
+    // `get_mut`: indexing would add a null `batch` to every other recording.
+    match meta.get_mut("batch").and_then(Value::as_array_mut).and_then(|a| a.iter_mut().find(|c| c["label"] == s.label().as_str())) {
         Some(c) => {
             c["values"] = json!(b.values);
             c["refused"] = refusal_map(&b.refused);
